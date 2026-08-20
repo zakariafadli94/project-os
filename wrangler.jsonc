@@ -3,6 +3,9 @@
   "name": "project-os-guard",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-20",
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   "durable_objects": {
     "bindings": [
       { "name": "PROJECT_GUARD", "class_name": "ProjectGuard" },

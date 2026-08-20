@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
+import { renderDecision } from "../src/render/decision";
 import { renderHandoff } from "../src/render/handoff";
 import { renderPlan } from "../src/render/plan";
 import { renderProject } from "../src/render/project";
@@ -33,6 +34,16 @@ function sampleState() {
     created_at: "2026-08-20T18:00:00.000Z",
     updated_at: "2026-08-20T18:00:00.000Z"
   };
+  state.decisions["DEC-ARCH0001"] = {
+    decision_id: "DEC-ARCH0001",
+    title: "Canonical architecture",
+    decision: "Use the guarded architecture.",
+    reason: "Deterministic persistence.",
+    impacts: ["Project state"],
+    status: "accepted",
+    created_at: "2026-08-20T18:00:00.000Z",
+    updated_at: "2026-08-20T18:00:00.000Z"
+  };
   return state;
 }
 
@@ -45,6 +56,34 @@ describe("Markdown renderers", () => {
     expect(output).toContain("Waiting for client");
     expect(output).toContain("## Next actions");
     expect(output).toContain("MACHINE-MANAGED");
+  });
+
+  it("adds deterministic project-scoped frontmatter to root views", () => {
+    const state = sampleState();
+    const project = renderProject(state);
+    expect(project).toContain("project_id: PRJ-0001");
+    expect(project).toContain("project_slug: agency");
+    expect(project).toContain("project_name: Agency");
+    expect(project).toContain("note_id: PROJECT");
+    expect(project).toContain("note_type: project");
+    expect(project).toContain("canonical: true");
+    expect(project).toContain("revision: 7");
+
+    expect(renderState(state)).toContain("note_id: STATE");
+    expect(renderPlan(state)).toContain("note_id: PLAN");
+    expect(renderHandoff(state)).toContain("note_id: HANDOFF");
+  });
+
+  it("uses project-scoped decision links and decision frontmatter", () => {
+    const state = sampleState();
+    const handoff = renderHandoff(state);
+    expect(handoff).toContain("[[DECISIONS/DEC-ARCH0001|Canonical architecture]]");
+    expect(handoff).not.toContain("[[DEC-ARCH0001]]");
+
+    const decision = renderDecision(state, state.decisions["DEC-ARCH0001"]);
+    expect(decision).toContain("project_id: PRJ-0001");
+    expect(decision).toContain("note_id: DEC-ARCH0001");
+    expect(decision).toContain("note_type: decision");
   });
 
   it("renders stable project, plan and handoff documents", () => {

@@ -12,16 +12,10 @@
       { "name": "REGISTRY_GUARD", "class_name": "RegistryGuard" }
     ]
   },
-  "exports": {
-    "ProjectGuard": {
-      "type": "durable-object",
-      "state": "created",
-      "storage": "sqlite"
-    },
-    "RegistryGuard": {
-      "type": "durable-object",
-      "state": "created",
-      "storage": "sqlite"
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ProjectGuard", "RegistryGuard"]
     }
-  }
+  ]
 }

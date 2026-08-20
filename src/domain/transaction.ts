@@ -7,6 +7,8 @@ const slug = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 const nonEmpty = z.string().trim().min(1);
 const timestamp = z.string().datetime({ offset: true });
 
+export const AUTO_PROJECT_ID = "PRJ-AUTO" as const;
+
 export const operationValues = [
   "project.create",
   "project.pause",
@@ -38,7 +40,7 @@ const common = { ...baseCommon, project_id: projectId };
 
 const projectCreate = z.strictObject({
   ...baseCommon,
-  project_id: projectId.nullable(),
+  project_id: z.union([projectId, z.literal(AUTO_PROJECT_ID)]),
   operation: z.literal("project.create"),
   payload: z.strictObject({
     name: nonEmpty,
@@ -56,23 +58,12 @@ const projectArchive = z.strictObject({ ...common, operation: z.literal("project
 const decisionAccept = z.strictObject({
   ...common,
   operation: z.literal("decision.accept"),
-  payload: z.strictObject({
-    decision_id: stableId("DEC"),
-    title: nonEmpty,
-    decision: nonEmpty,
-    reason: nonEmpty,
-    impacts: z.array(nonEmpty).default([])
-  })
+  payload: z.strictObject({ decision_id: stableId("DEC"), title: nonEmpty, decision: nonEmpty, reason: nonEmpty, impacts: z.array(nonEmpty).default([]) })
 });
-
 const decisionSupersede = z.strictObject({
   ...common,
   operation: z.literal("decision.supersede"),
-  payload: z.strictObject({
-    decision_id: stableId("DEC"),
-    replacement_decision_id: stableId("DEC"),
-    reason: nonEmpty
-  })
+  payload: z.strictObject({ decision_id: stableId("DEC"), replacement_decision_id: stableId("DEC"), reason: nonEmpty })
 });
 
 const taskCreate = z.strictObject({

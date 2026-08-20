@@ -94,7 +94,9 @@ export class ProjectGuard extends DurableObject<Env> {
         committed_at: tx.created_at
       };
 
-      await this.repository.writeCommit(result.state, result.event, receipt);
+      await this.repository.writeCommit(result.state, result.event, receipt, {
+        publishReceipt: tx.operation !== "project.create"
+      });
       this.persistCommit(result.state, receipt);
       return Response.json(receipt);
     });

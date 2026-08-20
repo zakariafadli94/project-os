@@ -31,7 +31,9 @@ async function createProject(transaction: unknown): Promise<Receipt> {
 }
 
 describe("RegistryGuard", () => {
-  beforeEach(() => installDropboxMock());
+  let dropbox: ReturnType<typeof installDropboxMock>;
+
+  beforeEach(() => { dropbox = installDropboxMock(); });
   afterEach(() => vi.restoreAllMocks());
 
   it("allocates unique monotonic project IDs under concurrent creation", async () => {
@@ -44,6 +46,15 @@ describe("RegistryGuard", () => {
       "PRJ-0001", "PRJ-0002", "PRJ-0003", "PRJ-0004",
       "PRJ-0005", "PRJ-0006", "PRJ-0007", "PRJ-0008"
     ]);
+  });
+
+  it("publishes the final Dropbox receipt only after registry creation completes", async () => {
+    const tx = createRequest(90, "receipt-order");
+    const receipt = await createProject(tx);
+
+    expect(receipt.status).toBe("committed");
+    expect(dropbox.files.has("/PROJECT_OS/SYSTEM/PROJECT_REGISTRY.json")).toBe(true);
+    expect(dropbox.files.has(`/PROJECT_OS/RECEIPTS/${tx.transaction_id}.json`)).toBe(true);
   });
 
   it("replays project.create idempotently with the original allocated project ID", async () => {

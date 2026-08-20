@@ -163,6 +163,7 @@ export class RegistryGuard extends DurableObject<Env> {
 
     const entries = this.registryEntries();
     await this.repository.writeRegistry({ schema_version: "1.0", projects: entries }, renderRegistry(entries));
+    await this.repository.writeReceipt(receipt);
 
     this.ctx.storage.sql.exec(
       "UPDATE requests SET status = 'committed', receipt_json = ? WHERE transaction_id = ?",

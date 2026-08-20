@@ -73,6 +73,27 @@ describe("Worker routing", () => {
     expect(mock.files.has(`/PROJECT_OS/TRANSACTIONS/incoming/${transaction.transaction_id}.json`)).toBe(false);
   });
 
+  it("recovers an unprocessed incoming transaction from the scheduled handler", async () => {
+    const mock = installDropboxMock();
+    const transaction = {
+      schema_version: "1.0",
+      transaction_id: "TXN-CRON-00000000001",
+      project_id: "PRJ-AUTO",
+      base_revision: 0,
+      operation: "project.create",
+      created_at: "2026-08-20T18:00:00.000Z",
+      payload: { name: "Cron Project", slug: "cron-project", aliases: [], objective: "Recover missed webhook" }
+    };
+    mock.files.set(`/PROJECT_OS/TRANSACTIONS/incoming/${transaction.transaction_id}.json`, JSON.stringify(transaction));
+
+    const ctx = createExecutionContext();
+    await worker.scheduled?.({ cron: "*/5 * * * *", scheduledTime: Date.now(), noRetry: () => undefined } as ScheduledController, testEnv, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(mock.files.has(`/PROJECT_OS/TRANSACTIONS/committed/${transaction.transaction_id}.json`)).toBe(true);
+    expect(mock.files.has(`/PROJECT_OS/TRANSACTIONS/incoming/${transaction.transaction_id}.json`)).toBe(false);
+  });
+
   it("requires authentication and strict schema on direct transaction ingress", async () => {
     const ctx = createExecutionContext();
     const unauthorized = await worker.fetch(new Request("https://example.com/v1/transactions", { method: "POST", body: "{}" }), testEnv, ctx);

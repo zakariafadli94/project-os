@@ -32,7 +32,9 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
 }
 
 describe("ProjectGuard", () => {
-  beforeEach(() => installDropboxMock());
+  let dropbox: ReturnType<typeof installDropboxMock>;
+
+  beforeEach(() => { dropbox = installDropboxMock(); });
   afterEach(() => vi.restoreAllMocks());
 
   it("commits project creation at revision 1 and replays idempotently", async () => {
@@ -44,6 +46,14 @@ describe("ProjectGuard", () => {
     expect(first.status).toBe("committed");
     expect(first.new_revision).toBe(1);
     expect(replay).toEqual(first);
+  });
+
+  it("does not publish the final Dropbox receipt for project.create", async () => {
+    const projectId = "PRJ-1099";
+    const tx = createTx(projectId, "TXN-PROJECT-1099-0001");
+    await submit(projectId, tx);
+
+    expect(dropbox.files.has(`/PROJECT_OS/RECEIPTS/${tx.transaction_id}.json`)).toBe(false);
   });
 
   it("increments revisions monotonically across valid task mutations", async () => {

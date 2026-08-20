@@ -24,5 +24,5 @@ export function renderHandoff(state: ProjectState): string {
     ? currentPhase.next_actions.map((action) => `- ${action}`).join("\n")
     : activeTasks;
 
-  return `${MANAGED_NOTICE}\n# Handoff — ${state.name}\n\nProject ID: ${state.project_id}\nRevision: ${state.revision}\nStatus: ${state.status}\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Current phase\n\n${currentPhase ? `${currentPhase.phase_id} — ${currentPhase.title}` : "None"}\n\n## Current work\n\n${activeTasks}\n\n## Blockers\n\n${blockers}\n\n## Important accepted decisions\n\n${decisions}\n\n## Next work\n\n${next || "- None"}\n\n## Read deeper when needed\n\n- [[PROJECT]]\n- [[STATE]]\n- [[PLAN]]\n- `DECISIONS/`\n- `RESEARCH/`\n`;
+  return `${MANAGED_NOTICE}\n# Handoff — ${state.name}\n\nProject ID: ${state.project_id}\nRevision: ${state.revision}\nStatus: ${state.status}\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Current phase\n\n${currentPhase ? `${currentPhase.phase_id} — ${currentPhase.title}` : "None"}\n\n## Current work\n\n${activeTasks}\n\n## Blockers\n\n${blockers}\n\n## Important accepted decisions\n\n${decisions}\n\n## Next work\n\n${next || "- None"}\n\n## Read deeper when needed\n\n- [[PROJECT]]\n- [[STATE]]\n- [[PLAN]]\n- DECISIONS/\n- RESEARCH/\n`;
 }

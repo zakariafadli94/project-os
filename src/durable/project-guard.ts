@@ -8,10 +8,12 @@ import { DropboxClient } from "../dropbox/client";
 import { ProjectRepository } from "../dropbox/repository";
 
 interface TransactionRow {
+  [key: string]: SqlStorageValue;
   receipt_json: string;
 }
 
 interface StateRow {
+  [key: string]: SqlStorageValue;
   state_json: string;
 }
 

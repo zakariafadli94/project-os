@@ -28,16 +28,17 @@ export const operationValues = [
   "deliverable.complete"
 ] as const;
 
-const common = {
+const baseCommon = {
   schema_version: z.literal("1.0"),
   transaction_id: transactionId,
-  project_id: projectId,
   base_revision: z.number().int().nonnegative(),
   created_at: timestamp
 };
+const common = { ...baseCommon, project_id: projectId };
 
 const projectCreate = z.strictObject({
-  ...common,
+  ...baseCommon,
+  project_id: projectId.nullable(),
   operation: z.literal("project.create"),
   payload: z.strictObject({
     name: nonEmpty,
@@ -47,29 +48,10 @@ const projectCreate = z.strictObject({
   })
 });
 
-const projectPause = z.strictObject({
-  ...common,
-  operation: z.literal("project.pause"),
-  payload: z.strictObject({ reason: nonEmpty })
-});
-
-const projectResume = z.strictObject({
-  ...common,
-  operation: z.literal("project.resume"),
-  payload: z.strictObject({ reason: nonEmpty.optional() })
-});
-
-const projectComplete = z.strictObject({
-  ...common,
-  operation: z.literal("project.complete"),
-  payload: z.strictObject({ summary: nonEmpty.optional() })
-});
-
-const projectArchive = z.strictObject({
-  ...common,
-  operation: z.literal("project.archive"),
-  payload: z.strictObject({ reason: nonEmpty })
-});
+const projectPause = z.strictObject({ ...common, operation: z.literal("project.pause"), payload: z.strictObject({ reason: nonEmpty }) });
+const projectResume = z.strictObject({ ...common, operation: z.literal("project.resume"), payload: z.strictObject({ reason: nonEmpty.optional() }) });
+const projectComplete = z.strictObject({ ...common, operation: z.literal("project.complete"), payload: z.strictObject({ summary: nonEmpty.optional() }) });
+const projectArchive = z.strictObject({ ...common, operation: z.literal("project.archive"), payload: z.strictObject({ reason: nonEmpty }) });
 
 const decisionAccept = z.strictObject({
   ...common,
@@ -96,103 +78,46 @@ const decisionSupersede = z.strictObject({
 const taskCreate = z.strictObject({
   ...common,
   operation: z.literal("task.create"),
-  payload: z.strictObject({
-    task_id: stableId("TASK"),
-    title: nonEmpty,
-    description: nonEmpty.optional(),
-    phase_id: stableId("PHASE").optional()
-  })
+  payload: z.strictObject({ task_id: stableId("TASK"), title: nonEmpty, description: nonEmpty.optional(), phase_id: stableId("PHASE").optional() })
 });
-
-const taskStart = z.strictObject({
-  ...common,
-  operation: z.literal("task.start"),
-  payload: z.strictObject({ task_id: stableId("TASK") })
-});
-
-const taskComplete = z.strictObject({
-  ...common,
-  operation: z.literal("task.complete"),
-  payload: z.strictObject({
-    task_id: stableId("TASK"),
-    result: nonEmpty.optional()
-  })
-});
-
-const taskBlock = z.strictObject({
-  ...common,
-  operation: z.literal("task.block"),
-  payload: z.strictObject({ task_id: stableId("TASK"), reason: nonEmpty })
-});
+const taskStart = z.strictObject({ ...common, operation: z.literal("task.start"), payload: z.strictObject({ task_id: stableId("TASK") }) });
+const taskComplete = z.strictObject({ ...common, operation: z.literal("task.complete"), payload: z.strictObject({ task_id: stableId("TASK"), result: nonEmpty.optional() }) });
+const taskBlock = z.strictObject({ ...common, operation: z.literal("task.block"), payload: z.strictObject({ task_id: stableId("TASK"), reason: nonEmpty }) });
 
 const phaseCreate = z.strictObject({
   ...common,
   operation: z.literal("plan.phase.create"),
-  payload: z.strictObject({
-    phase_id: stableId("PHASE"),
-    title: nonEmpty,
-    objective: nonEmpty.optional()
-  })
+  payload: z.strictObject({ phase_id: stableId("PHASE"), title: nonEmpty, objective: nonEmpty.optional() })
 });
-
 const phaseUpdate = z.strictObject({
   ...common,
   operation: z.literal("plan.phase.update"),
-  payload: z.strictObject({
-    phase_id: stableId("PHASE"),
-    title: nonEmpty.optional(),
-    objective: nonEmpty.optional(),
-    next_actions: z.array(nonEmpty).optional()
-  }).refine((value) => value.title !== undefined || value.objective !== undefined || value.next_actions !== undefined, {
-    message: "plan.phase.update requires at least one change"
-  })
+  payload: z.strictObject({ phase_id: stableId("PHASE"), title: nonEmpty.optional(), objective: nonEmpty.optional(), next_actions: z.array(nonEmpty).optional() }).refine(
+    (value) => value.title !== undefined || value.objective !== undefined || value.next_actions !== undefined,
+    { message: "plan.phase.update requires at least one change" }
+  )
 });
-
-const phaseComplete = z.strictObject({
-  ...common,
-  operation: z.literal("plan.phase.complete"),
-  payload: z.strictObject({ phase_id: stableId("PHASE") })
-});
+const phaseComplete = z.strictObject({ ...common, operation: z.literal("plan.phase.complete"), payload: z.strictObject({ phase_id: stableId("PHASE") }) });
 
 const constraintAdd = z.strictObject({
   ...common,
   operation: z.literal("constraint.add"),
-  payload: z.strictObject({
-    constraint_id: stableId("CON"),
-    title: nonEmpty,
-    description: nonEmpty
-  })
+  payload: z.strictObject({ constraint_id: stableId("CON"), title: nonEmpty, description: nonEmpty })
 });
-
 const researchAdd = z.strictObject({
   ...common,
   operation: z.literal("research.add"),
-  payload: z.strictObject({
-    research_id: stableId("RES"),
-    title: nonEmpty,
-    body: nonEmpty,
-    source: nonEmpty.optional()
-  })
+  payload: z.strictObject({ research_id: stableId("RES"), title: nonEmpty, body: nonEmpty, source: nonEmpty.optional() })
 });
-
 const deliverableAdd = z.strictObject({
   ...common,
   operation: z.literal("deliverable.add"),
-  payload: z.strictObject({
-    deliverable_id: stableId("DEL"),
-    title: nonEmpty,
-    description: nonEmpty.optional(),
-    reference: nonEmpty.optional()
-  })
+  payload: z.strictObject({ deliverable_id: stableId("DEL"), title: nonEmpty, description: nonEmpty.optional(), reference: nonEmpty.optional() })
 });
-
 const deliverableComplete = z.strictObject({
   ...common,
   operation: z.literal("deliverable.complete"),
-  payload: z.strictObject({
-    deliverable_id: stableId("DEL"),
-    outcome: nonEmpty.optional()
-  })
+  payload: z.strictObject({ deliverable_id: stableId("DEL"), outcome: nonEmpty.optional() })
 });
 
 export const transactionSchema = z.discriminatedUnion("operation", [

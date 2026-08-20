@@ -59,6 +59,10 @@ const worker = {
     }
 
     return Response.json({ error: "not_found" }, { status: 404 });
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(processInbox(env));
   }
 } satisfies ExportedHandler<Env>;
 
@@ -127,7 +131,7 @@ async function processInbox(env: Env): Promise<void> {
     try {
       receipt = await routeTransaction(env, transaction);
     } catch (error) {
-      // Leave the source in incoming so the next verified webhook can retry it.
+      // Keep the source in incoming. The next webhook or scheduled recovery retries it safely.
       console.error("Project OS transaction processing failed", transaction.transaction_id, error);
       continue;
     }

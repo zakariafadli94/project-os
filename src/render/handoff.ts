@@ -1,0 +1,28 @@
+import type { ProjectState } from "../domain/project-state";
+import { MANAGED_NOTICE } from "./shared";
+
+export function renderHandoff(state: ProjectState): string {
+  const currentPhase = state.current_phase_id ? state.plan_phases[state.current_phase_id] : undefined;
+  const activeTasks = Object.values(state.tasks)
+    .filter((task) => task.status === "active" || task.status === "pending")
+    .sort((a, b) => a.task_id.localeCompare(b.task_id))
+    .slice(0, 10)
+    .map((task) => `- ${task.task_id} — ${task.title} (${task.status})`)
+    .join("\n") || "- None";
+  const blockers = Object.values(state.tasks)
+    .filter((task) => task.status === "blocked")
+    .sort((a, b) => a.task_id.localeCompare(b.task_id))
+    .map((task) => `- ${task.task_id} — ${task.title}: ${task.blocked_reason ?? "Blocked"}`)
+    .join("\n") || "- None";
+  const decisions = Object.values(state.decisions)
+    .filter((decision) => decision.status === "accepted")
+    .sort((a, b) => b.decision_id.localeCompare(a.decision_id))
+    .slice(0, 8)
+    .map((decision) => `- [[${decision.decision_id}]] — ${decision.title}`)
+    .join("\n") || "- None";
+  const next = currentPhase?.next_actions?.length
+    ? currentPhase.next_actions.map((action) => `- ${action}`).join("\n")
+    : activeTasks;
+
+  return `${MANAGED_NOTICE}\n# Handoff — ${state.name}\n\nProject ID: ${state.project_id}\nRevision: ${state.revision}\nStatus: ${state.status}\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Current phase\n\n${currentPhase ? `${currentPhase.phase_id} — ${currentPhase.title}` : "None"}\n\n## Current work\n\n${activeTasks}\n\n## Blockers\n\n${blockers}\n\n## Important accepted decisions\n\n${decisions}\n\n## Next work\n\n${next || "- None"}\n\n## Read deeper when needed\n\n- [[PROJECT]]\n- [[STATE]]\n- [[PLAN]]\n- `DECISIONS/`\n- `RESEARCH/`\n`;
+}

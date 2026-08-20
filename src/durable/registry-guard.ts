@@ -7,6 +7,7 @@ import { ProjectRepository } from "../dropbox/repository";
 import { renderRegistry, type RegistryEntry } from "../render/registry";
 
 interface RequestRow {
+  [key: string]: SqlStorageValue;
   transaction_json: string;
   project_id: string | null;
   status: string;
@@ -14,6 +15,7 @@ interface RequestRow {
 }
 
 interface ProjectRow {
+  [key: string]: SqlStorageValue;
   project_id: string;
   name: string;
   slug: string;
@@ -23,7 +25,10 @@ interface ProjectRow {
   updated_at: string;
 }
 
-interface MetaRow { value: string; }
+interface MetaRow {
+  [key: string]: SqlStorageValue;
+  value: string;
+}
 
 export class RegistryGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;

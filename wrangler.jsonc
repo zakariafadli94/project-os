@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "project-os-guard",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-20",
+  "durable_objects": {
+    "bindings": [
+      { "name": "PROJECT_GUARD", "class_name": "ProjectGuard" },
+      { "name": "REGISTRY_GUARD", "class_name": "RegistryGuard" }
+    ]
+  },
+  "exports": {
+    "ProjectGuard": {
+      "type": "durable-object",
+      "state": "created",
+      "storage": "sqlite"
+    },
+    "RegistryGuard": {
+      "type": "durable-object",
+      "state": "created",
+      "storage": "sqlite"
+    }
+  }
+}

@@ -19,10 +19,19 @@ import {
   transactionPath
 } from "./paths";
 
+export interface CommitWriteOptions {
+  publishReceipt?: boolean;
+}
+
 export class ProjectRepository {
   constructor(private readonly transport: DropboxTransport) {}
 
-  async writeCommit(state: ProjectState, event: DomainEvent, receipt: Receipt): Promise<void> {
+  async writeCommit(
+    state: ProjectState,
+    event: DomainEvent,
+    receipt: Receipt,
+    options: CommitWriteOptions = {}
+  ): Promise<void> {
     await this.safeAdd(eventPath(state.project_id, state.slug, event.event_id), pretty(event));
 
     if (event.type === "decision.accept") {
@@ -53,7 +62,9 @@ export class ProjectRepository {
       updated_at: state.updated_at
     }), "overwrite");
 
-    await this.writeReceipt(receipt);
+    if (options.publishReceipt !== false) {
+      await this.writeReceipt(receipt);
+    }
   }
 
   async writeReceipt(receipt: Receipt): Promise<void> {

@@ -20,7 +20,9 @@ The Worker name must match `name` in `wrangler.jsonc`.
 - `ProjectGuard` → binding `PROJECT_GUARD`
 - `RegistryGuard` → binding `REGISTRY_GUARD`
 
-Do not create these namespaces manually when Wrangler can reconcile them from the repository configuration.
+It also declares a scheduled recovery trigger every five minutes. The cron calls the same inbox processor as the Dropbox webhook; it exists only to recover missed webhook delivery or transient processing failures.
+
+Do not create Durable Object namespaces manually when Wrangler can reconcile them from repository configuration.
 
 ## 2. Cloudflare secrets
 
@@ -94,7 +96,7 @@ The exact `<Dropbox app folder>` name is determined by the Dropbox app configura
 
 No empty project hierarchy needs to be created manually. The first committed writes create folders lazily through Dropbox file paths.
 
-## 5. Dropbox webhook
+## 5. Dropbox webhook and scheduled recovery
 
 After the Cloudflare Worker has a stable `workers.dev` URL, register this webhook in the Dropbox app console:
 
@@ -113,6 +115,8 @@ The webhook notification is only a wake-up signal. Project OS scans only:
 ```
 
 It does not scan or interpret arbitrary Dropbox files.
+
+A Cloudflare scheduled trigger runs every five minutes and executes the same inbox scan. Successfully processed transactions have already been removed from `incoming/`, while failed transient operations remain there and are retried idempotently.
 
 ## 6. ChatGPT transaction ingress
 
@@ -135,6 +139,8 @@ A new project uses:
 ```
 
 `RegistryGuard` replaces `PRJ-AUTO` with the next canonical `PRJ-xxxx`; ChatGPT never allocates canonical project IDs itself.
+
+For `project.create`, the per-project guard writes the project state/event first but intentionally does not publish the final Dropbox receipt. `RegistryGuard` then updates the global registry and only after that succeeds writes the `committed` receipt. This prevents a user-visible success proof from existing while the global registry is still stale.
 
 For non-creation transactions, `project_id` must be an existing `PRJ-xxxx`.
 
@@ -163,6 +169,8 @@ And the following behavioral tests must pass:
 - duplicate transaction replay commits once;
 - global project allocation never duplicates a project ID;
 - duplicate project identity is rejected;
+- `project.create` does not publish a final receipt until registry persistence succeeds;
+- scheduled recovery processes an incoming transaction even without a webhook;
 - stale additive research can apply by explicit rule;
 - stale L2 direction changes conflict;
 - Durable Object eviction preserves state/idempotency;
@@ -182,6 +190,7 @@ Once validation on `feat/project-os-v1` is green:
 4. confirm `GET /health` returns `{ "status": "ok" }`;
 5. register/verify the Dropbox webhook;
 6. send one pilot `project.create` transaction;
-7. confirm the receipt, project folder, event, state, handoff and Obsidian sync.
+7. confirm the receipt, project folder, event, state, handoff and Obsidian sync;
+8. leave the pilot transaction path idle long enough to confirm the scheduled recovery trigger is deployed and healthy.
 
 Do not bulk-migrate projects until the pilot completes end-to-end.

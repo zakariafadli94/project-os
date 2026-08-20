@@ -1,0 +1,70 @@
+import { vi } from "vitest";
+
+export function installDropboxMock() {
+  const files = new Map<string, string>();
+  const calls: string[] = [];
+
+  const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const request = input instanceof Request ? input : new Request(String(input), init);
+    const url = new URL(request.url);
+    calls.push(`${request.method} ${url.pathname}`);
+
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/oauth2/token") {
+      return Response.json({ access_token: "test-access-token", expires_in: 14400 });
+    }
+
+    if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/upload") {
+      const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string; mode?: "add" | "overwrite" };
+      if (!arg.path) return new Response("missing path", { status: 400 });
+      const content = await request.text();
+      if (arg.mode === "add" && files.has(arg.path)) {
+        return new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
+          status: 409,
+          headers: { "x-dropbox-request-id": "req-conflict" }
+        });
+      }
+      files.set(arg.path, content);
+      return Response.json({ name: arg.path.split("/").at(-1), path_display: arg.path });
+    }
+
+    if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/download") {
+      const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string };
+      if (!arg.path || !files.has(arg.path)) {
+        return new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 });
+      }
+      return new Response(files.get(arg.path), { status: 200 });
+    }
+
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/move_v2") {
+      const body = JSON.parse(await request.text()) as { from_path: string; to_path: string };
+      const content = files.get(body.from_path);
+      if (content === undefined) {
+        return new Response(JSON.stringify({ error_summary: "from_lookup/not_found/" }), { status: 409 });
+      }
+      if (files.has(body.to_path)) {
+        return new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 });
+      }
+      files.delete(body.from_path);
+      files.set(body.to_path, content);
+      return Response.json({ metadata: { path_display: body.to_path } });
+    }
+
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder") {
+      const body = JSON.parse(await request.text()) as { path: string };
+      const prefix = `${body.path}/`;
+      const entries = [...files.keys()]
+        .filter((path) => path.startsWith(prefix) && !path.slice(prefix.length).includes("/"))
+        .sort()
+        .map((path) => ({ ".tag": "file", name: path.slice(prefix.length), path_display: path, path_lower: path.toLowerCase() }));
+      return Response.json({ entries, cursor: "done", has_more: false });
+    }
+
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder/continue") {
+      return Response.json({ entries: [], cursor: "done", has_more: false });
+    }
+
+    throw new Error(`Unhandled outbound request in Dropbox mock: ${request.method} ${request.url}`);
+  });
+
+  return { files, calls, spy };
+}

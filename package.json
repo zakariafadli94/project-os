@@ -6,8 +6,9 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "types": "wrangler types",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test",
+    "check": "npm run types && npm run typecheck && npm test",
     "deploy": "wrangler deploy"
   },
   "dependencies": {

@@ -3,11 +3,7 @@ export type TaskStatus = "pending" | "active" | "blocked" | "completed";
 export type PhaseStatus = "pending" | "active" | "completed";
 export type DecisionStatus = "accepted" | "superseded";
 
-// Legacy statuses remain accepted in-memory during the incremental rollout.
-// normalizeProjectState maps them to the normative V2 compatibility states.
 export type DeliverableStatus =
-  | "pending"
-  | "completed"
   | "planned"
   | "in_progress"
   | "review"
@@ -99,7 +95,6 @@ export interface DeliverableRecord {
   status: DeliverableStatus;
   acceptance_note?: string;
   accepted_at?: string;
-  supersedes?: string;
   superseded_by?: string;
   superseded_reason?: string;
   abandoned_reason?: string;

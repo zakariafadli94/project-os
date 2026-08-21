@@ -91,7 +91,7 @@ export interface DeliverableRecord {
   owner?: string;
   version?: string;
   phase_id?: string;
-  decision_ids?: string[];
+  decision_ids: string[];
   status: DeliverableStatus;
   acceptance_note?: string;
   accepted_at?: string;

@@ -69,23 +69,17 @@ export class DropboxClient implements DropboxTransport {
 
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
     const token = await this.accessToken();
-    const response = await fetch("https://content.dropboxapi.com/2/files/upload", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/octet-stream",
-        "Dropbox-API-Arg": JSON.stringify({
-          path,
-          mode,
-          autorename: false,
-          mute: true,
-          strict_conflict: mode === "add"
-        })
-      },
-      body: content
-    });
+    let response = await this.uploadRequest(token, path, content, mode);
     if (response.ok) return;
-    const text = await response.text();
+
+    let text = await response.text();
+    if (response.status === 409 && text.includes("not_found")) {
+      await this.ensureParentFolders(token, path);
+      response = await this.uploadRequest(token, path, content, mode);
+      if (response.ok) return;
+      text = await response.text();
+    }
+
     if (response.status === 409) {
       throw new DropboxConflictError(`Dropbox upload conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
     }
@@ -160,6 +154,48 @@ export class DropboxClient implements DropboxTransport {
         },
         body: JSON.stringify({ cursor: parsed.cursor })
       });
+    }
+  }
+
+  private async uploadRequest(token: string, path: string, content: string, mode: "add" | "overwrite"): Promise<Response> {
+    return fetch("https://content.dropboxapi.com/2/files/upload", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/octet-stream",
+        "Dropbox-API-Arg": JSON.stringify({
+          path,
+          mode,
+          autorename: false,
+          mute: true,
+          strict_conflict: mode === "add"
+        })
+      },
+      body: content
+    });
+  }
+
+  private async ensureParentFolders(token: string, filePath: string): Promise<void> {
+    const finalSlash = filePath.lastIndexOf("/");
+    if (finalSlash <= 0) return;
+    const parentPath = filePath.slice(0, finalSlash);
+    const parts = parentPath.split("/").filter(Boolean);
+    let current = "";
+
+    for (const part of parts) {
+      current += `/${part}`;
+      const response = await fetch("https://api.dropboxapi.com/2/files/create_folder_v2", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ path: current, autorename: false })
+      });
+      if (response.ok) continue;
+      const text = await response.text();
+      if (response.status === 409 && text.includes("conflict")) continue;
+      throw this.errorFromResponse(`Dropbox create_folder failed for ${current}`, response, text);
     }
   }
 

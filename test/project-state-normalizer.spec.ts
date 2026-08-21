@@ -81,4 +81,29 @@ describe("project state normalization", () => {
   it("rejects malformed state rather than permissively casting it", () => {
     expect(() => normalizeProjectState({ schema_version: "1.0", project_id: "PRJ-3001" })).toThrow();
   });
+
+  it("rejects malformed nested canonical records", () => {
+    const malformedTask = legacyState();
+    malformedTask.tasks = {
+      "TASK-3001": {
+        task_id: "TASK-3001",
+        title: "Broken task",
+        status: "unknown",
+        created_at: at,
+        updated_at: at
+      }
+    } as never;
+    expect(() => normalizeProjectState(malformedTask)).toThrow(/task/i);
+
+    const malformedResearch = legacyState();
+    malformedResearch.research = {
+      "RES-3001": {
+        research_id: "RES-3001",
+        title: 42,
+        body: "Evidence",
+        created_at: at
+      }
+    } as never;
+    expect(() => normalizeProjectState(malformedResearch)).toThrow(/research/i);
+  });
 });

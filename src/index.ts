@@ -74,8 +74,26 @@ const worker = {
     return Response.json({ error: "not_found" }, { status: 404 });
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(processInbox(env));
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    const mode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
+    console.info("Project OS scheduled inbox scan started", {
+      cron: controller.cron,
+      mode,
+      inbox: inboxPath(mode)
+    });
+    ctx.waitUntil(
+      processInbox(env)
+        .then((summary) => {
+          console.info("Project OS inbox scan completed", summary);
+        })
+        .catch((error) => {
+          console.error("Project OS scheduled inbox scan failed", {
+            message: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined
+          });
+          throw error;
+        })
+    );
   }
 } satisfies ExportedHandler<Env>;
 
@@ -84,6 +102,12 @@ export default worker;
 interface RegistryProject {
   project_id: string;
   slug: string;
+}
+
+interface InboxProcessSummary {
+  scanned: number;
+  processed: number;
+  failed: number;
 }
 
 async function materializeExistingProjects(request: Request, env: Env): Promise<Response> {
@@ -165,7 +189,7 @@ async function routeTransaction(env: Env, transaction: Transaction): Promise<Rec
   return response.json<Receipt>();
 }
 
-async function processInbox(env: Env): Promise<void> {
+async function processInbox(env: Env): Promise<InboxProcessSummary> {
   const mode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
   const client = new DropboxClient({
     appKey: env.DROPBOX_APP_KEY,
@@ -173,12 +197,28 @@ async function processInbox(env: Env): Promise<void> {
     refreshToken: env.DROPBOX_REFRESH_TOKEN
   });
   const entries = await client.listFolder(inboxPath(mode));
+  const transactionEntries = entries
+    .filter((item) => item.tag === "file" && item.name.endsWith(".json"))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const summary: InboxProcessSummary = {
+    scanned: transactionEntries.length,
+    processed: 0,
+    failed: 0
+  };
 
-  for (const entry of entries.filter((item) => item.tag === "file" && item.name.endsWith(".json")).sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const entry of transactionEntries) {
     const sourcePath = entry.path_display;
-    if (!sourcePath) continue;
+    if (!sourcePath) {
+      summary.failed += 1;
+      console.error("Project OS inbox entry missing path_display", { name: entry.name });
+      continue;
+    }
     const raw = await client.download(sourcePath);
-    if (raw === null) continue;
+    if (raw === null) {
+      summary.failed += 1;
+      console.error("Project OS inbox entry disappeared before processing", { name: entry.name, sourcePath });
+      continue;
+    }
 
     const filenameTransactionId = transactionIdFromFilename(entry.name);
     let transaction: Transaction;
@@ -197,6 +237,7 @@ async function processInbox(env: Env): Promise<void> {
         source_name: entry.name
       }, null, 2)}\n`);
       await archiveSource(client, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
+      summary.processed += 1;
       continue;
     }
 
@@ -204,6 +245,7 @@ async function processInbox(env: Env): Promise<void> {
     try {
       receipt = await routeTransaction(env, transaction);
     } catch (error) {
+      summary.failed += 1;
       console.error("Project OS transaction processing failed", transaction.transaction_id, error);
       continue;
     }
@@ -214,7 +256,10 @@ async function processInbox(env: Env): Promise<void> {
       ? canonicalTerminalPath
       : canonicalTerminalPath.replace(/\.json$/, ".source.json");
     await archiveSource(client, sourcePath, archivePath);
+    summary.processed += 1;
   }
+
+  return summary;
 }
 
 function authorized(request: Request, env: Env): boolean {

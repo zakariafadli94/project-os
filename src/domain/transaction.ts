@@ -154,7 +154,7 @@ const deliverableCreate = z.strictObject({
     reference: nonEmpty.optional(),
     owner: nonEmpty.optional(),
     phase_id: stableId("PHASE").optional(),
-    decision_ids: z.array(stableId("DEC")).default([])
+    decision_ids: z.array(stableId("DEC")).optional()
   })
 });
 const deliverableStart = z.strictObject({

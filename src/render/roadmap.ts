@@ -2,6 +2,7 @@ import type { ProjectState } from "../domain/project-state";
 import { renderProjectFrontmatter } from "./frontmatter";
 import { MANAGED_NOTICE } from "./shared";
 
+// Primary roadmap horizons follow DEC-SOPS001; secondary sections preserve operational context.
 export function renderRoadmap(state: ProjectState): string {
   const currentPhase = state.current_phase_id ? state.plan_phases[state.current_phase_id] : undefined;
   const currentDirection = currentPhase

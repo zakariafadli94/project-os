@@ -32,7 +32,7 @@ describe("registry lifecycle synchronization", () => {
   beforeEach(() => { dropbox = installDropboxMock(); });
   afterEach(() => vi.restoreAllMocks());
 
-  it("updates registry and dashboard when a project is archived", async () => {
+  it("updates registry and keeps an archived project outside the Obsidian workspace", async () => {
     const created = await createProject();
     expect(created.status).toBe("committed");
 
@@ -62,5 +62,19 @@ describe("registry lifecycle synchronization", () => {
     const dashboard = dropbox.files.get("/PROJECT_OS/WORKSPACE/PORTFOLIO/DASHBOARD.md");
     expect(dashboard).toContain("## Archived");
     expect(dashboard).toContain(`**${created.project_id}**`);
+
+    const workspaceProject = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-lifecycle-sync/PROJECT.md`;
+    const archivedProject = `/PROJECT_OS/ARCHIVE/PROJECTS/${created.project_id}-lifecycle-sync/PROJECT.md`;
+    expect(dropbox.files.has(workspaceProject)).toBe(false);
+    expect(dropbox.files.has(archivedProject)).toBe(true);
+
+    const materializeResponse = await projectStub.fetch("https://project-guard.internal/materialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "workspace-v2" })
+    });
+    expect(materializeResponse.status).toBe(200);
+    expect(dropbox.files.has(workspaceProject)).toBe(false);
+    expect(dropbox.files.has(archivedProject)).toBe(true);
   });
 });

@@ -37,15 +37,31 @@ export function installDropboxMock() {
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/move_v2") {
       const body = JSON.parse(await request.text()) as { from_path: string; to_path: string };
-      const content = files.get(body.from_path);
-      if (content === undefined) {
+      const directContent = files.get(body.from_path);
+      const sourcePrefix = `${body.from_path}/`;
+      const descendants = [...files.entries()].filter(([path]) => path.startsWith(sourcePrefix));
+
+      if (directContent === undefined && descendants.length === 0) {
         return new Response(JSON.stringify({ error_summary: "from_lookup/not_found/" }), { status: 409 });
       }
-      if (files.has(body.to_path)) {
-        return new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 });
+
+      if (directContent !== undefined) {
+        if (files.has(body.to_path)) {
+          return new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 });
+        }
+        files.delete(body.from_path);
+        files.set(body.to_path, directContent);
+      } else {
+        const destinationPrefix = `${body.to_path}/`;
+        if ([...files.keys()].some((path) => path === body.to_path || path.startsWith(destinationPrefix))) {
+          return new Response(JSON.stringify({ error_summary: "to/conflict/folder/" }), { status: 409 });
+        }
+        for (const [path, content] of descendants) {
+          files.delete(path);
+          files.set(`${body.to_path}${path.slice(body.from_path.length)}`, content);
+        }
       }
-      files.delete(body.from_path);
-      files.set(body.to_path, content);
+
       return Response.json({ metadata: { path_display: body.to_path } });
     }
 
@@ -61,6 +77,10 @@ export function installDropboxMock() {
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder/continue") {
       return Response.json({ entries: [], cursor: "done", has_more: false });
+    }
+
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/create_folder_v2") {
+      return Response.json({ metadata: { ".tag": "folder" } });
     }
 
     throw new Error(`Unhandled outbound request in Dropbox mock: ${request.method} ${request.url}`);

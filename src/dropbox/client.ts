@@ -103,16 +103,17 @@ export class DropboxClient implements DropboxTransport {
 
   async move(from: string, to: string): Promise<void> {
     const token = await this.accessToken();
-    const response = await fetch("https://api.dropboxapi.com/2/files/move_v2", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ from_path: from, to_path: to, autorename: false, allow_ownership_transfer: false })
-    });
+    let response = await this.moveRequest(token, from, to);
     if (response.ok) return;
-    const text = await response.text();
+
+    let text = await response.text();
+    if (response.status === 409 && text.includes("to/not_found")) {
+      await this.ensureParentFolders(token, to);
+      response = await this.moveRequest(token, from, to);
+      if (response.ok) return;
+      text = await response.text();
+    }
+
     if (response.status === 409) {
       throw new DropboxConflictError(`Dropbox move conflict ${from} -> ${to}`, response.headers.get("x-dropbox-request-id"), text);
     }
@@ -172,6 +173,17 @@ export class DropboxClient implements DropboxTransport {
         })
       },
       body: content
+    });
+  }
+
+  private async moveRequest(token: string, from: string, to: string): Promise<Response> {
+    return fetch("https://api.dropboxapi.com/2/files/move_v2", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ from_path: from, to_path: to, autorename: false, allow_ownership_transfer: false })
     });
   }
 

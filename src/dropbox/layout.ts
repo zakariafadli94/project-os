@@ -25,6 +25,7 @@ export function parseLayoutMode(value?: string): LayoutMode {
 }
 
 export const WORKSPACE_ROOT = `${PROJECT_OS_ROOT}/WORKSPACE`;
+export const ARCHIVE_ROOT = `${PROJECT_OS_ROOT}/ARCHIVE`;
 export const MACHINE_ROOT = `${PROJECT_OS_ROOT}/.project-os`;
 
 export type WorkspaceEntityFolder =
@@ -41,6 +42,10 @@ export type MachineTransactionStatus = "incoming" | "committed" | "rejected" | "
 
 export function workspaceProjectRoot(projectId: string, slug: string): string {
   return `${WORKSPACE_ROOT}/PROJECTS/${assertSafeProjectId(projectId)}-${assertSafeSlug(slug)}`;
+}
+
+export function archiveProjectRoot(projectId: string, slug: string): string {
+  return `${ARCHIVE_ROOT}/PROJECTS/${assertSafeProjectId(projectId)}-${assertSafeSlug(slug)}`;
 }
 
 export function workspaceProjectFile(
@@ -121,6 +126,7 @@ export const legacyPaths = {
 
 export const v2Paths = {
   workspaceProjectRoot,
+  archiveProjectRoot,
   workspaceProjectFile,
   workspaceEntityPath,
   workspacePortfolioRoot,

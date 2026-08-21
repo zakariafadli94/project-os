@@ -64,13 +64,18 @@ export async function mirrorLegacyLedger(
     const entries = await transport.listFolder(legacyRoot);
 
     for (const entry of entries
-      .filter((item) => item.tag === "file" && /^TXN-[A-Z0-9-]{10,}\.json$/.test(item.name))
+      .filter((item) => item.tag === "file" && /^TXN-[A-Z0-9-]{10,}(?:\.source)?\.json$/.test(item.name))
       .sort((a, b) => a.name.localeCompare(b.name))) {
       const sourcePath = entry.path_display;
       if (!sourcePath) continue;
-      const transactionId = entry.name.replace(/\.json$/, "");
-      await mirrorImmutableFile(transport, sourcePath, machineTransactionPath(status, transactionId));
-      transactions += 1;
+      const isSourceArtifact = entry.name.endsWith(".source.json");
+      const transactionId = entry.name.replace(/(?:\.source)?\.json$/, "");
+      const terminalPath = machineTransactionPath(status, transactionId);
+      const destinationPath = isSourceArtifact
+        ? terminalPath.replace(/\.json$/, ".source.json")
+        : terminalPath;
+      await mirrorImmutableFile(transport, sourcePath, destinationPath);
+      if (!isSourceArtifact) transactions += 1;
     }
   }
 

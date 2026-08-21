@@ -87,11 +87,13 @@ const exactRevisionOperations = new Set<Transaction["operation"]>([
   "project.resume",
   "project.complete",
   "project.archive",
+  "project.framing.update",
   "decision.accept",
   "decision.supersede",
   "plan.phase.create",
   "plan.phase.update",
-  "plan.phase.complete"
+  "plan.phase.complete",
+  "discovery.synthesis.update"
 ]);
 
 export function applyTransaction(state: ProjectState | null, tx: Transaction): TransitionResult {
@@ -147,6 +149,17 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
       if (next.status === "archived") return rejected("INVALID_PROJECT_TRANSITION", "Project is already archived");
       next.status = "archived";
       return commit(next, tx);
+
+    case "project.framing.update": {
+      const p = tx.payload;
+      if (p.objective !== undefined) next.objective = p.objective;
+      if (p.scope !== undefined) next.framing.scope = [...p.scope];
+      if (p.out_of_scope !== undefined) next.framing.out_of_scope = [...p.out_of_scope];
+      if (p.success_criteria !== undefined) next.framing.success_criteria = [...p.success_criteria];
+      if (p.stakeholders !== undefined) next.framing.stakeholders = [...p.stakeholders];
+      if (p.open_questions !== undefined) next.framing.open_questions = [...p.open_questions];
+      return commit(next, tx);
+    }
 
     case "task.create": {
       const p = tx.payload;
@@ -300,6 +313,31 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
         source: p.source,
         created_at: tx.created_at
       };
+      return commit(next, tx);
+    }
+
+    case "discovery.synthesis.update": {
+      const p = tx.payload;
+      const findings = [...(p.confirmed_findings ?? []), ...(p.provisional_findings ?? [])];
+      for (const finding of findings) {
+        for (const researchId of finding.research_ids) {
+          if (!next.research[researchId]) return rejected("RESEARCH_NOT_FOUND", `Research ${researchId} does not exist`);
+        }
+      }
+      if (p.confirmed_findings !== undefined) {
+        next.discovery.confirmed_findings = p.confirmed_findings.map((finding) => ({
+          summary: finding.summary,
+          research_ids: [...finding.research_ids]
+        }));
+      }
+      if (p.provisional_findings !== undefined) {
+        next.discovery.provisional_findings = p.provisional_findings.map((finding) => ({
+          summary: finding.summary,
+          research_ids: [...finding.research_ids]
+        }));
+      }
+      if (p.unresolved_questions !== undefined) next.discovery.unresolved_questions = [...p.unresolved_questions];
+      if (p.next_exploration !== undefined) next.discovery.next_exploration = [...p.next_exploration];
       return commit(next, tx);
     }
 

@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { evictDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -85,6 +85,68 @@ describe("ProjectGuard", () => {
       payload: { task_id: "TASK-1098", title: "Still revision one before this" }
     });
     expect(task.new_revision).toBe(2);
+  });
+
+  it("normalizes legacy stored state on read without changing revision or inventing deliverable acceptance", async () => {
+    const projectId = "PRJ-1097";
+    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const legacyState = {
+      schema_version: "1.0",
+      project_id: projectId,
+      name: "Legacy State",
+      slug: "legacy-state",
+      aliases: [],
+      objective: "Prove compatibility",
+      status: "active",
+      revision: 7,
+      current_phase_id: null,
+      constraints: {},
+      tasks: {},
+      plan_phases: {},
+      decisions: {},
+      research: {},
+      deliverables: {
+        "DEL-1097": {
+          deliverable_id: "DEL-1097",
+          title: "Historical final",
+          status: "completed",
+          created_at: at,
+          updated_at: at
+        }
+      },
+      last_event_id: "EVT-000007",
+      created_at: at,
+      updated_at: at
+    };
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO project_state (singleton, state_json) VALUES (1, ?)",
+        JSON.stringify(legacyState)
+      );
+    });
+
+    const result = await materialize(projectId);
+    expect(result).toEqual({ project_id: projectId, revision: 7, materialized: true });
+
+    const brief = dropbox.files.get("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-1097-legacy-state/BRIEF.md");
+    const deliverable = dropbox.files.get("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-1097-legacy-state/DELIVERABLES/DEL-1097.md");
+    expect(brief).toContain("Scope has not been defined yet.");
+    expect(deliverable).toContain("Status: legacy_completed");
+    expect(deliverable).toContain("Acceptance: not inferred");
+
+    const framing = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-PROJECT-1097-0008",
+      project_id: projectId,
+      base_revision: 7,
+      operation: "project.framing.update",
+      created_at: at,
+      payload: { scope: ["Compatibility test"] }
+    });
+    expect(framing.status).toBe("committed");
+    expect(framing.previous_revision).toBe(7);
+    expect(framing.new_revision).toBe(8);
   });
 
   it("increments revisions monotonically across valid task mutations", async () => {

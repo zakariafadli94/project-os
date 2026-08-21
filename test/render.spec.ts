@@ -21,6 +21,15 @@ function sampleState() {
     created_at: "2026-08-20T18:00:00.000Z",
     updated_at: "2026-08-20T18:00:00.000Z"
   };
+  state.plan_phases["PHASE-0002"] = {
+    phase_id: "PHASE-0002",
+    title: "Scale",
+    objective: "Expand repeatable acquisition",
+    next_actions: [],
+    status: "pending",
+    created_at: "2026-08-20T18:00:00.000Z",
+    updated_at: "2026-08-20T18:00:00.000Z"
+  };
   state.current_phase_id = "PHASE-0001";
   state.tasks["TASK-0001"] = {
     task_id: "TASK-0001",
@@ -113,7 +122,7 @@ describe("Markdown renderers", () => {
     expect(renderHandoff(state)).toContain("PRJ-0001");
   });
 
-  it("renders a human-readable brief, discovery view and roadmap", () => {
+  it("renders a human-readable brief, discovery view and SOP-aligned roadmap", () => {
     const state = sampleState();
 
     const brief = renderBrief(state);
@@ -130,9 +139,14 @@ describe("Markdown renderers", () => {
 
     const roadmap = renderRoadmap(state);
     expect(roadmap).toContain("# Roadmap — Agency");
+    expect(roadmap).toContain("## Current");
+    expect(roadmap).toContain("## Next");
+    expect(roadmap).toContain("## Later");
+    expect(roadmap).not.toContain("## Now");
     expect(roadmap).toContain("Launch — Go live");
     expect(roadmap).toContain("Get approval — Waiting for client");
     expect(roadmap).toContain("Publish offer");
+    expect(roadmap).toContain("Scale — Expand repeatable acquisition");
   });
 
   it("keeps human views useful for a sparse new project", () => {
@@ -146,5 +160,8 @@ describe("Markdown renderers", () => {
     expect(renderBrief(sparse)).toContain("Success criteria have not been formalized yet.");
     expect(renderDiscovery(sparse)).toContain("No research has been captured yet.");
     expect(renderRoadmap(sparse)).toContain("No roadmap phase has been defined yet.");
+    expect(renderRoadmap(sparse)).toContain("## Current");
+    expect(renderRoadmap(sparse)).toContain("## Next");
+    expect(renderRoadmap(sparse)).toContain("## Later");
   });
 });

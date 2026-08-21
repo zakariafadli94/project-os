@@ -22,14 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install dependencies
-        run: npm install
-
       - name: Verify required deployment credentials
         shell: bash
         run: |
@@ -37,6 +29,13 @@ jobs:
             echo "Required Cloudflare deployment secrets are not configured in GitHub Actions."
             exit 1
           fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install
 
       - name: Verify project
         run: npm run check

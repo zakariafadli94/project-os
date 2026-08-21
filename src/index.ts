@@ -3,7 +3,8 @@ import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
 import { DropboxClient, DropboxConflictError } from "./dropbox/client";
 import { type LayoutMode, machineTransactionPath, parseLayoutMode } from "./dropbox/layout";
-import { PROJECT_OS_ROOT, transactionPath } from "./dropbox/paths";
+import { assertSafeProjectId, PROJECT_OS_ROOT, transactionPath } from "./dropbox/paths";
+import { mirrorLegacyEvents } from "./migration/workspace-v2";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
 export { ProjectGuard } from "./durable/project-guard";
@@ -49,12 +50,13 @@ const worker = {
       return new Response("", { status: 200 });
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/admin/workspace-v2/materialize") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      return materializeExistingProjects(request, env);
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/transactions") {
-      const authorization = request.headers.get("authorization");
-      const expected = `Bearer ${env.INGRESS_TOKEN}`;
-      if (!authorization || !secureStringEqual(authorization, expected)) {
-        return Response.json({ error: "unauthorized" }, { status: 401 });
-      }
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 
       let transaction: Transaction;
       try {
@@ -78,6 +80,64 @@ const worker = {
 } satisfies ExportedHandler<Env>;
 
 export default worker;
+
+interface RegistryProject {
+  project_id: string;
+  slug: string;
+}
+
+async function materializeExistingProjects(request: Request, env: Env): Promise<Response> {
+  let projectIds: string[];
+  try {
+    const body = await request.json() as { project_ids?: unknown };
+    if (!Array.isArray(body.project_ids) || body.project_ids.length === 0 || body.project_ids.some((item) => typeof item !== "string")) {
+      throw new Error("project_ids must be a non-empty string array");
+    }
+    projectIds = [...new Set(body.project_ids.map((item) => assertSafeProjectId(item as string)))];
+  } catch (error) {
+    return Response.json({
+      error: "invalid_request",
+      message: error instanceof Error ? error.message : "Invalid materialization request"
+    }, { status: 400 });
+  }
+
+  const registryStub = env.REGISTRY_GUARD.getByName("global");
+  const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+  if (!registryResponse.ok) return Response.json({ error: "registry_unavailable" }, { status: 502 });
+  const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const byId = new Map(registry.projects.map((project) => [project.project_id, project]));
+
+  const client = new DropboxClient({
+    appKey: env.DROPBOX_APP_KEY,
+    appSecret: env.DROPBOX_APP_SECRET,
+    refreshToken: env.DROPBOX_REFRESH_TOKEN
+  });
+  const results: Array<{ project_id: string; status: "materialized"; revision: number }> = [];
+
+  for (const projectId of projectIds) {
+    const project = byId.get(projectId);
+    if (!project) return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
+
+    await mirrorLegacyEvents(client, projectId, project.slug);
+
+    const guard = env.PROJECT_GUARD.getByName(projectId);
+    const response = await guard.fetch("https://project-guard.internal/materialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "workspace-v2" })
+    });
+    if (!response.ok) {
+      return Response.json({ error: "materialization_failed", project_id: projectId, status: response.status }, { status: 502 });
+    }
+    const materialized = await response.json<{ revision: number; materialized: boolean }>();
+    if (!materialized.materialized) {
+      return Response.json({ error: "materialization_failed", project_id: projectId }, { status: 502 });
+    }
+    results.push({ project_id: projectId, status: "materialized", revision: materialized.revision });
+  }
+
+  return Response.json({ results });
+}
 
 async function routeTransaction(env: Env, transaction: Transaction): Promise<Receipt> {
   if (transaction.operation === "project.create") {
@@ -144,7 +204,6 @@ async function processInbox(env: Env): Promise<void> {
     try {
       receipt = await routeTransaction(env, transaction);
     } catch (error) {
-      // Keep the source in incoming. The next webhook or scheduled recovery retries it safely.
       console.error("Project OS transaction processing failed", transaction.transaction_id, error);
       continue;
     }
@@ -156,6 +215,11 @@ async function processInbox(env: Env): Promise<void> {
       : canonicalTerminalPath.replace(/\.json$/, ".source.json");
     await archiveSource(client, sourcePath, archivePath);
   }
+}
+
+function authorized(request: Request, env: Env): boolean {
+  const authorization = request.headers.get("authorization");
+  return Boolean(authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`));
 }
 
 function transactionIdFromFilename(filename: string): string | null {

@@ -112,6 +112,18 @@ describe("ProjectRepository", () => {
     expect(transport.uploads.at(-1)?.path).toBe(`/PROJECT_OS/RECEIPTS/${receipt.transaction_id}.json`);
   });
 
+  it("shadow registry writes legacy and V2 machine registry plus human portfolio dashboard", async () => {
+    const transport = new FakeTransport();
+    const repository = new ProjectRepository(transport, "shadow");
+    const registry = { schema_version: "1.0", projects: [] };
+
+    await repository.writeRegistry(registry, "# Project Index\n");
+
+    expect(transport.files.has("/PROJECT_OS/SYSTEM/PROJECT_REGISTRY.json")).toBe(true);
+    expect(transport.files.has("/PROJECT_OS/.project-os/registry/PROJECT_REGISTRY.json")).toBe(true);
+    expect(transport.files.has("/PROJECT_OS/WORKSPACE/PORTFOLIO/DASHBOARD.md")).toBe(true);
+  });
+
   it("v2 writes its receipt last and never publishes it after an earlier view failure", async () => {
     const transport = new FakeTransport();
     const repository = new ProjectRepository(transport, "v2");

@@ -93,7 +93,14 @@ const exactRevisionOperations = new Set<Transaction["operation"]>([
   "plan.phase.create",
   "plan.phase.update",
   "plan.phase.complete",
-  "discovery.synthesis.update"
+  "discovery.synthesis.update",
+  "deliverable.create",
+  "deliverable.start",
+  "deliverable.revise",
+  "deliverable.submit_review",
+  "deliverable.accept",
+  "deliverable.supersede",
+  "deliverable.abandon"
 ]);
 
 export function applyTransaction(state: ProjectState | null, tx: Transaction): TransitionResult {
@@ -341,6 +348,105 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
       return commit(next, tx);
     }
 
+    case "deliverable.create": {
+      const p = tx.payload;
+      if (next.deliverables[p.deliverable_id]) return rejected("DELIVERABLE_EXISTS", `Deliverable ${p.deliverable_id} already exists`);
+      if (p.phase_id && !next.plan_phases[p.phase_id]) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+      for (const decisionId of p.decision_ids ?? []) {
+        if (!next.decisions[decisionId]) return rejected("DECISION_NOT_FOUND", `Decision ${decisionId} does not exist`);
+      }
+      next.deliverables[p.deliverable_id] = {
+        deliverable_id: p.deliverable_id,
+        title: p.title,
+        description: p.description,
+        reference: p.reference,
+        owner: p.owner,
+        version: p.version,
+        phase_id: p.phase_id,
+        decision_ids: [...(p.decision_ids ?? [])],
+        status: "planned",
+        created_at: tx.created_at,
+        updated_at: tx.created_at
+      };
+      return commit(next, tx);
+    }
+
+    case "deliverable.start": {
+      const item = next.deliverables[tx.payload.deliverable_id];
+      if (!item) return rejected("DELIVERABLE_NOT_FOUND", `Deliverable ${tx.payload.deliverable_id} does not exist`);
+      if (item.status !== "planned") return rejected("INVALID_DELIVERABLE_TRANSITION", `Deliverable ${item.deliverable_id} cannot start from ${item.status}`);
+      item.status = "in_progress";
+      item.updated_at = tx.created_at;
+      return commit(next, tx);
+    }
+
+    case "deliverable.revise": {
+      const p = tx.payload;
+      const item = next.deliverables[p.deliverable_id];
+      if (!item) return rejected("DELIVERABLE_NOT_FOUND", `Deliverable ${p.deliverable_id} does not exist`);
+      if (item.status !== "in_progress" && item.status !== "review") {
+        return rejected("INVALID_DELIVERABLE_TRANSITION", `Deliverable ${item.deliverable_id} cannot be revised from ${item.status}`);
+      }
+      if (item.version === p.version) return rejected("DELIVERABLE_VERSION_UNCHANGED", "deliverable.revise requires a changed version");
+      item.version = p.version;
+      if (p.description !== undefined) item.description = p.description;
+      if (p.reference !== undefined) item.reference = p.reference;
+      item.status = "in_progress";
+      item.updated_at = tx.created_at;
+      return commit(next, tx);
+    }
+
+    case "deliverable.submit_review": {
+      const item = next.deliverables[tx.payload.deliverable_id];
+      if (!item) return rejected("DELIVERABLE_NOT_FOUND", `Deliverable ${tx.payload.deliverable_id} does not exist`);
+      if (item.status !== "in_progress") return rejected("INVALID_DELIVERABLE_TRANSITION", `Deliverable ${item.deliverable_id} cannot enter review from ${item.status}`);
+      item.status = "review";
+      item.updated_at = tx.created_at;
+      return commit(next, tx);
+    }
+
+    case "deliverable.accept": {
+      const item = next.deliverables[tx.payload.deliverable_id];
+      if (!item) return rejected("DELIVERABLE_NOT_FOUND", `Deliverable ${tx.payload.deliverable_id} does not exist`);
+      if (item.status !== "review" && item.status !== "legacy_completed") {
+        return rejected("INVALID_DELIVERABLE_TRANSITION", `Deliverable ${item.deliverable_id} cannot be accepted from ${item.status}`);
+      }
+      item.status = "accepted";
+      item.acceptance_note = tx.payload.acceptance_note;
+      item.accepted_at = tx.created_at;
+      item.updated_at = tx.created_at;
+      return commit(next, tx);
+    }
+
+    case "deliverable.supersede": {
+      const p = tx.payload;
+      if (p.deliverable_id === p.replacement_deliverable_id) return rejected("INVALID_REPLACEMENT", "A deliverable cannot supersede itself");
+      const original = next.deliverables[p.deliverable_id];
+      const replacement = next.deliverables[p.replacement_deliverable_id];
+      if (!original) return rejected("DELIVERABLE_NOT_FOUND", `Deliverable ${p.deliverable_id} does not exist`);
+      if (!replacement) return rejected("REPLACEMENT_NOT_FOUND", `Replacement ${p.replacement_deliverable_id} does not exist`);
+      if (original.status !== "accepted" || replacement.status !== "accepted") {
+        return rejected("INVALID_DELIVERABLE_TRANSITION", "Both deliverables must be accepted before supersession");
+      }
+      original.status = "superseded";
+      original.superseded_by = replacement.deliverable_id;
+      original.superseded_reason = p.reason;
+      original.updated_at = tx.created_at;
+      return commit(next, tx);
+    }
+
+    case "deliverable.abandon": {
+      const item = next.deliverables[tx.payload.deliverable_id];
+      if (!item) return rejected("DELIVERABLE_NOT_FOUND", `Deliverable ${tx.payload.deliverable_id} does not exist`);
+      if (!["planned", "in_progress", "review", "legacy_completed"].includes(item.status)) {
+        return rejected("INVALID_DELIVERABLE_TRANSITION", `Deliverable ${item.deliverable_id} cannot be abandoned from ${item.status}`);
+      }
+      item.status = "abandoned";
+      item.abandoned_reason = tx.payload.reason;
+      item.updated_at = tx.created_at;
+      return commit(next, tx);
+    }
+
     case "deliverable.add": {
       const p = tx.payload;
       if (next.deliverables[p.deliverable_id]) return rejected("DELIVERABLE_EXISTS", `Deliverable ${p.deliverable_id} already exists`);
@@ -349,7 +455,8 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
         title: p.title,
         description: p.description,
         reference: p.reference,
-        status: "pending",
+        decision_ids: [],
+        status: "planned",
         created_at: tx.created_at,
         updated_at: tx.created_at
       };
@@ -359,8 +466,10 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
     case "deliverable.complete": {
       const item = next.deliverables[tx.payload.deliverable_id];
       if (!item) return rejected("DELIVERABLE_NOT_FOUND", `Deliverable ${tx.payload.deliverable_id} does not exist`);
-      if (item.status === "completed") return rejected("DELIVERABLE_COMPLETED", `Deliverable ${item.deliverable_id} is already completed`);
-      item.status = "completed";
+      if (["completed", "legacy_completed", "accepted", "superseded", "abandoned"].includes(item.status)) {
+        return rejected("DELIVERABLE_COMPLETED", `Deliverable ${item.deliverable_id} is already terminal`);
+      }
+      item.status = "legacy_completed";
       item.outcome = tx.payload.outcome;
       item.updated_at = tx.created_at;
       return commit(next, tx);

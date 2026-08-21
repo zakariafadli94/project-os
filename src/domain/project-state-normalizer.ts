@@ -1,10 +1,15 @@
 import type {
+  ConstraintRecord,
+  DecisionRecord,
   DeliverableRecord,
   DeliverableStatus,
   DiscoveryFinding,
   DiscoverySynthesis,
+  PlanPhaseRecord,
   ProjectFraming,
-  ProjectState
+  ProjectState,
+  ResearchRecord,
+  TaskRecord
 } from "./project-state";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -21,6 +26,10 @@ function requireString(value: unknown, name: string): string {
   return value;
 }
 
+function optionalString(value: unknown, name: string): string | undefined {
+  return value === undefined ? undefined : requireString(value, name);
+}
+
 function requireNullableString(value: unknown, name: string): string | null {
   if (value === null) return null;
   return requireString(value, name);
@@ -35,6 +44,13 @@ function requireStringArray(value: unknown, name: string): string[] {
 
 function optionalStringArray(value: unknown, name: string): string[] {
   return value === undefined ? [] : requireStringArray(value, name);
+}
+
+function requireEnum<T extends string>(value: unknown, allowed: readonly T[], name: string): T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new Error(`${name} is invalid`);
+  }
+  return value as T;
 }
 
 function normalizeFraming(value: unknown): ProjectFraming {
@@ -78,52 +94,129 @@ function normalizeDiscovery(value: unknown): DiscoverySynthesis {
   };
 }
 
-function normalizeDeliverableStatus(value: unknown): DeliverableStatus {
-  if (value === "pending") return "planned";
-  if (value === "completed") return "legacy_completed";
-  const allowed: DeliverableStatus[] = [
-    "planned",
-    "in_progress",
-    "review",
-    "accepted",
-    "superseded",
-    "abandoned",
-    "legacy_completed"
-  ];
-  if (allowed.includes(value as DeliverableStatus)) return value as DeliverableStatus;
-  throw new Error(`Invalid deliverable status: ${String(value)}`);
-}
-
-function optionalString(value: unknown, name: string): string | undefined {
-  return value === undefined ? undefined : requireString(value, name);
-}
-
-function normalizeDeliverable(value: unknown, key: string): DeliverableRecord {
-  const input = requireRecord(value, `deliverables.${key}`);
+function normalizeConstraint(value: unknown, key: string): ConstraintRecord {
+  const name = `constraints.${key}`;
+  const input = requireRecord(value, name);
+  const constraintId = requireString(input.constraint_id, `${name}.constraint_id`);
+  if (constraintId !== key) throw new Error(`${name}.constraint_id must match its record key`);
   return {
-    deliverable_id: requireString(input.deliverable_id, `deliverables.${key}.deliverable_id`),
-    title: requireString(input.title, `deliverables.${key}.title`),
-    description: optionalString(input.description, `deliverables.${key}.description`),
-    reference: optionalString(input.reference, `deliverables.${key}.reference`),
-    outcome: optionalString(input.outcome, `deliverables.${key}.outcome`),
-    owner: optionalString(input.owner, `deliverables.${key}.owner`),
-    version: optionalString(input.version, `deliverables.${key}.version`),
-    phase_id: optionalString(input.phase_id, `deliverables.${key}.phase_id`),
-    decision_ids: optionalStringArray(input.decision_ids, `deliverables.${key}.decision_ids`),
-    status: normalizeDeliverableStatus(input.status),
-    acceptance_note: optionalString(input.acceptance_note, `deliverables.${key}.acceptance_note`),
-    accepted_at: optionalString(input.accepted_at, `deliverables.${key}.accepted_at`),
-    superseded_by: optionalString(input.superseded_by, `deliverables.${key}.superseded_by`),
-    superseded_reason: optionalString(input.superseded_reason, `deliverables.${key}.superseded_reason`),
-    abandoned_reason: optionalString(input.abandoned_reason, `deliverables.${key}.abandoned_reason`),
-    created_at: requireString(input.created_at, `deliverables.${key}.created_at`),
-    updated_at: requireString(input.updated_at, `deliverables.${key}.updated_at`)
+    constraint_id: constraintId,
+    title: requireString(input.title, `${name}.title`),
+    description: requireString(input.description, `${name}.description`),
+    created_at: requireString(input.created_at, `${name}.created_at`)
   };
 }
 
-function normalizeDeliverables(value: unknown): Record<string, DeliverableRecord> {
-  const input = requireRecord(value, "deliverables");
-  return Object.fromEntries(Object.entries(input).map(([key, item]) => [key, normalizeDeliverable(item, key)]));
+function normalizeTask(value: unknown, key: string): TaskRecord {
+  const name = `tasks.${key}`;
+  const input = requireRecord(value, name);
+  const taskId = requireString(input.task_id, `${name}.task_id`);
+  if (taskId !== key) throw new Error(`${name}.task_id must match its record key`);
+  return {
+    task_id: taskId,
+    title: requireString(input.title, `${name}.title`),
+    description: optionalString(input.description, `${name}.description`),
+    phase_id: optionalString(input.phase_id, `${name}.phase_id`),
+    status: requireEnum(input.status, ["pending", "active", "blocked", "completed"] as const, `${name}.status`),
+    blocked_reason: optionalString(input.blocked_reason, `${name}.blocked_reason`),
+    result: optionalString(input.result, `${name}.result`),
+    created_at: requireString(input.created_at, `${name}.created_at`),
+    updated_at: requireString(input.updated_at, `${name}.updated_at`)
+  };
+}
+
+function normalizePhase(value: unknown, key: string): PlanPhaseRecord {
+  const name = `plan_phases.${key}`;
+  const input = requireRecord(value, name);
+  const phaseId = requireString(input.phase_id, `${name}.phase_id`);
+  if (phaseId !== key) throw new Error(`${name}.phase_id must match its record key`);
+  return {
+    phase_id: phaseId,
+    title: requireString(input.title, `${name}.title`),
+    objective: optionalString(input.objective, `${name}.objective`),
+    next_actions: requireStringArray(input.next_actions, `${name}.next_actions`),
+    status: requireEnum(input.status, ["pending", "active", "completed"] as const, `${name}.status`),
+    created_at: requireString(input.created_at, `${name}.created_at`),
+    updated_at: requireString(input.updated_at, `${name}.updated_at`)
+  };
+}
+
+function normalizeDecision(value: unknown, key: string): DecisionRecord {
+  const name = `decisions.${key}`;
+  const input = requireRecord(value, name);
+  const decisionId = requireString(input.decision_id, `${name}.decision_id`);
+  if (decisionId !== key) throw new Error(`${name}.decision_id must match its record key`);
+  return {
+    decision_id: decisionId,
+    title: requireString(input.title, `${name}.title`),
+    decision: requireString(input.decision, `${name}.decision`),
+    reason: requireString(input.reason, `${name}.reason`),
+    impacts: requireStringArray(input.impacts, `${name}.impacts`),
+    status: requireEnum(input.status, ["accepted", "superseded"] as const, `${name}.status`),
+    superseded_by: optionalString(input.superseded_by, `${name}.superseded_by`),
+    superseded_reason: optionalString(input.superseded_reason, `${name}.superseded_reason`),
+    created_at: requireString(input.created_at, `${name}.created_at`),
+    updated_at: requireString(input.updated_at, `${name}.updated_at`)
+  };
+}
+
+function normalizeResearch(value: unknown, key: string): ResearchRecord {
+  const name = `research.${key}`;
+  const input = requireRecord(value, name);
+  const researchId = requireString(input.research_id, `${name}.research_id`);
+  if (researchId !== key) throw new Error(`${name}.research_id must match its record key`);
+  return {
+    research_id: researchId,
+    title: requireString(input.title, `${name}.title`),
+    body: requireString(input.body, `${name}.body`),
+    source: optionalString(input.source, `${name}.source`),
+    created_at: requireString(input.created_at, `${name}.created_at`)
+  };
+}
+
+function normalizeDeliverableStatus(value: unknown): DeliverableStatus {
+  if (value === "pending") return "planned";
+  if (value === "completed") return "legacy_completed";
+  return requireEnum(
+    value,
+    ["planned", "in_progress", "review", "accepted", "superseded", "abandoned", "legacy_completed"] as const,
+    "deliverable.status"
+  );
+}
+
+function normalizeDeliverable(value: unknown, key: string): DeliverableRecord {
+  const name = `deliverables.${key}`;
+  const input = requireRecord(value, name);
+  const deliverableId = requireString(input.deliverable_id, `${name}.deliverable_id`);
+  if (deliverableId !== key) throw new Error(`${name}.deliverable_id must match its record key`);
+  return {
+    deliverable_id: deliverableId,
+    title: requireString(input.title, `${name}.title`),
+    description: optionalString(input.description, `${name}.description`),
+    reference: optionalString(input.reference, `${name}.reference`),
+    outcome: optionalString(input.outcome, `${name}.outcome`),
+    owner: optionalString(input.owner, `${name}.owner`),
+    version: optionalString(input.version, `${name}.version`),
+    phase_id: optionalString(input.phase_id, `${name}.phase_id`),
+    decision_ids: optionalStringArray(input.decision_ids, `${name}.decision_ids`),
+    status: normalizeDeliverableStatus(input.status),
+    acceptance_note: optionalString(input.acceptance_note, `${name}.acceptance_note`),
+    accepted_at: optionalString(input.accepted_at, `${name}.accepted_at`),
+    superseded_by: optionalString(input.superseded_by, `${name}.superseded_by`),
+    superseded_reason: optionalString(input.superseded_reason, `${name}.superseded_reason`),
+    abandoned_reason: optionalString(input.abandoned_reason, `${name}.abandoned_reason`),
+    created_at: requireString(input.created_at, `${name}.created_at`),
+    updated_at: requireString(input.updated_at, `${name}.updated_at`)
+  };
+}
+
+function normalizeRecordMap<T>(
+  value: unknown,
+  name: string,
+  normalizer: (item: unknown, key: string) => T
+): Record<string, T> {
+  const input = requireRecord(value, name);
+  return Object.fromEntries(Object.entries(input).map(([key, item]) => [key, normalizer(item, key)]));
 }
 
 export function normalizeProjectState(input: unknown): ProjectState {
@@ -133,15 +226,14 @@ export function normalizeProjectState(input: unknown): ProjectState {
   const projectId = requireString(raw.project_id, "project_id");
   if (!/^PRJ-[0-9]{4,}$/.test(projectId)) throw new Error("Invalid project_id");
 
-  const status = requireString(raw.status, "status");
-  if (!["active", "paused", "completed", "archived"].includes(status)) throw new Error("Invalid project status");
+  const status = requireEnum(raw.status, ["active", "paused", "completed", "archived"] as const, "status");
   if (!Number.isInteger(raw.revision) || (raw.revision as number) < 0) throw new Error("revision must be a non-negative integer");
 
-  const constraints = requireRecord(raw.constraints, "constraints");
-  const tasks = requireRecord(raw.tasks, "tasks");
-  const planPhases = requireRecord(raw.plan_phases, "plan_phases");
-  const decisions = requireRecord(raw.decisions, "decisions");
-  const research = requireRecord(raw.research, "research");
+  const planPhases = normalizeRecordMap(raw.plan_phases, "plan_phases", normalizePhase);
+  const currentPhaseId = requireNullableString(raw.current_phase_id, "current_phase_id");
+  if (currentPhaseId !== null && !planPhases[currentPhaseId]) {
+    throw new Error("current_phase_id must reference an existing plan phase");
+  }
 
   return {
     schema_version: "1.0",
@@ -152,15 +244,15 @@ export function normalizeProjectState(input: unknown): ProjectState {
     objective: requireString(raw.objective, "objective"),
     framing: normalizeFraming(raw.framing),
     discovery: normalizeDiscovery(raw.discovery),
-    status: status as ProjectState["status"],
+    status,
     revision: raw.revision as number,
-    current_phase_id: requireNullableString(raw.current_phase_id, "current_phase_id"),
-    constraints: structuredClone(constraints) as ProjectState["constraints"],
-    tasks: structuredClone(tasks) as ProjectState["tasks"],
-    plan_phases: structuredClone(planPhases) as ProjectState["plan_phases"],
-    decisions: structuredClone(decisions) as ProjectState["decisions"],
-    research: structuredClone(research) as ProjectState["research"],
-    deliverables: normalizeDeliverables(raw.deliverables),
+    current_phase_id: currentPhaseId,
+    constraints: normalizeRecordMap(raw.constraints, "constraints", normalizeConstraint),
+    tasks: normalizeRecordMap(raw.tasks, "tasks", normalizeTask),
+    plan_phases: planPhases,
+    decisions: normalizeRecordMap(raw.decisions, "decisions", normalizeDecision),
+    research: normalizeRecordMap(raw.research, "research", normalizeResearch),
+    deliverables: normalizeRecordMap(raw.deliverables, "deliverables", normalizeDeliverable),
     last_event_id: requireNullableString(raw.last_event_id, "last_event_id"),
     created_at: requireString(raw.created_at, "created_at"),
     updated_at: requireString(raw.updated_at, "updated_at")

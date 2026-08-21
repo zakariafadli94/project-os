@@ -106,6 +106,9 @@ describe("ProjectRepository", () => {
 
     expect(transport.files.has("/PROJECT_OS/PROJECTS/PRJ-0001-agency/STATE.md")).toBe(true);
     expect(transport.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0001-agency/STATE.md")).toBe(true);
+    expect(transport.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0001-agency/BRIEF.md")).toBe(true);
+    expect(transport.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0001-agency/DISCOVERY.md")).toBe(true);
+    expect(transport.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0001-agency/ROADMAP.md")).toBe(true);
     expect(transport.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0001-agency/RESEARCH/RES-CODE0001.md")).toBe(true);
     expect(transport.files.has("/PROJECT_OS/.project-os/projects/PRJ-0001/state.json")).toBe(true);
     expect(transport.files.has(`/PROJECT_OS/RECEIPTS/${receipt.transaction_id}.json`)).toBe(true);
@@ -135,5 +138,15 @@ describe("ProjectRepository", () => {
 
     await repository.writeCommit(state, event, receipt);
     expect(transport.uploads.at(-1)?.path).toBe(machineReceiptPath(receipt.transaction_id));
+  });
+
+  it("never publishes a committed receipt when a human brief write fails", async () => {
+    const transport = new FakeTransport();
+    const repository = new ProjectRepository(transport, "v2");
+    const { state, event, receipt } = fixture();
+    transport.failOnceOn = "/BRIEF.md";
+
+    await expect(repository.writeCommit(state, event, receipt)).rejects.toThrow("transient write failure");
+    expect(transport.files.has(machineReceiptPath(receipt.transaction_id))).toBe(false);
   });
 });

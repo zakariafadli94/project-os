@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
+import { renderBrief } from "../src/render/brief";
 import { renderDecision } from "../src/render/decision";
+import { renderDiscovery } from "../src/render/discovery";
 import { renderHandoff } from "../src/render/handoff";
 import { renderPlan } from "../src/render/plan";
 import { renderProject } from "../src/render/project";
+import { renderRoadmap } from "../src/render/roadmap";
 import { renderState } from "../src/render/state";
 
 function sampleState() {
@@ -41,6 +44,19 @@ function sampleState() {
     reason: "Deterministic persistence.",
     impacts: ["Project state"],
     status: "accepted",
+    created_at: "2026-08-20T18:00:00.000Z",
+    updated_at: "2026-08-20T18:00:00.000Z"
+  };
+  state.research["RES-CUST0001"] = {
+    research_id: "RES-CUST0001",
+    title: "Customer interviews",
+    body: "Interview findings",
+    created_at: "2026-08-20T18:00:00.000Z"
+  };
+  state.deliverables["DEL-OFFER001"] = {
+    deliverable_id: "DEL-OFFER001",
+    title: "Validated offer",
+    status: "pending",
     created_at: "2026-08-20T18:00:00.000Z",
     updated_at: "2026-08-20T18:00:00.000Z"
   };
@@ -88,8 +104,47 @@ describe("Markdown renderers", () => {
 
   it("renders stable project, plan and handoff documents", () => {
     const state = sampleState();
-    expect(renderProject(state)).toContain("Launch the agency");
+    const project = renderProject(state);
+    expect(project).toContain("Launch the agency");
+    expect(project).toContain("[[BRIEF|Brief]]");
+    expect(project).toContain("[[DISCOVERY|Discovery]]");
+    expect(project).toContain("[[ROADMAP|Roadmap]]");
     expect(renderPlan(state)).toContain("PHASE-0001");
     expect(renderHandoff(state)).toContain("PRJ-0001");
+  });
+
+  it("renders a human-readable brief, discovery view and roadmap", () => {
+    const state = sampleState();
+
+    const brief = renderBrief(state);
+    expect(brief).toContain("# Brief — Agency");
+    expect(brief).toContain("Launch the agency");
+    expect(brief).toContain("Launch — Go live");
+    expect(brief).toContain("Validated offer");
+
+    const discovery = renderDiscovery(state);
+    expect(discovery).toContain("# Discovery — Agency");
+    expect(discovery).toContain("[[RESEARCH/RES-CUST0001|Customer interviews]]");
+    expect(discovery).toContain("[[DECISIONS/DEC-ARCH0001|Canonical architecture]]");
+    expect(discovery).toContain("Publish offer");
+
+    const roadmap = renderRoadmap(state);
+    expect(roadmap).toContain("# Roadmap — Agency");
+    expect(roadmap).toContain("Launch — Go live");
+    expect(roadmap).toContain("Get approval — Waiting for client");
+    expect(roadmap).toContain("Publish offer");
+  });
+
+  it("keeps human views useful for a sparse new project", () => {
+    const sparse = emptyProjectState(
+      "PRJ-0003",
+      "Agence Growth externalisé",
+      "agence-growth-externalise",
+      "Étudier et valider une agence Growth externalisée"
+    );
+
+    expect(renderBrief(sparse)).toContain("Success criteria have not been formalized yet.");
+    expect(renderDiscovery(sparse)).toContain("No research has been captured yet.");
+    expect(renderRoadmap(sparse)).toContain("No roadmap phase has been defined yet.");
   });
 });

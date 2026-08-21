@@ -46,7 +46,14 @@ export function workspaceProjectRoot(projectId: string, slug: string): string {
 export function workspaceProjectFile(
   projectId: string,
   slug: string,
-  filename: "PROJECT.md" | "STATE.md" | "PLAN.md" | "HANDOFF.md"
+  filename:
+    | "PROJECT.md"
+    | "STATE.md"
+    | "PLAN.md"
+    | "HANDOFF.md"
+    | "BRIEF.md"
+    | "DISCOVERY.md"
+    | "ROADMAP.md"
 ): string {
   return `${workspaceProjectRoot(projectId, slug)}/${filename}`;
 }

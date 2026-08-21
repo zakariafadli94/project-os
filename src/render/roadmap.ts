@@ -39,10 +39,7 @@ export function renderRoadmap(state: ProjectState): string {
 
   const deliverables = Object.values(state.deliverables)
     .sort((a, b) => a.deliverable_id.localeCompare(b.deliverable_id))
-    .map((deliverable) => {
-      const status = deliverable.status === "completed" ? "completed" : "pending";
-      return `- [[DELIVERABLES/${deliverable.deliverable_id}|${deliverable.title}]] — ${status}`;
-    });
+    .map((deliverable) => `- [[DELIVERABLES/${deliverable.deliverable_id}|${deliverable.title}]] — ${deliverable.status}`);
 
   return `${renderProjectFrontmatter(state, "ROADMAP", "roadmap")}${MANAGED_NOTICE}\n# Roadmap — ${state.name}\n\n## Current\n\n${currentDirection}\n\n### Active work\n\n${activeWork.join("\n") || "No active work is currently recorded."}\n\n### Blocked\n\n${blocked.join("\n") || "No blockers are currently recorded."}\n\n## Next\n\n${next.join("\n") || "No next actions have been defined yet."}\n\n## Later\n\n${later.join("\n") || "No later roadmap phases have been defined yet."}\n\n## Completed\n\n${completedTasks.join("\n") || "No completed work has been recorded yet."}\n\n## Deliverables\n\n${deliverables.join("\n") || "No deliverables have been recorded yet."}\n`;
 }

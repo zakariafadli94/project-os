@@ -19,6 +19,13 @@ interface StateRow {
   state_json: string;
 }
 
+const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
+  "project.pause",
+  "project.resume",
+  "project.complete",
+  "project.archive"
+]);
+
 export class ProjectGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
   private queue: Promise<void> = Promise.resolve();
@@ -86,7 +93,13 @@ export class ProjectGuard extends DurableObject<Env> {
       }
 
       const existing = this.findReceipt(tx.transaction_id);
-      if (existing) return Response.json(existing);
+      if (existing) {
+        if (existing.status === "committed" && PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
+          const currentState = this.loadState();
+          if (currentState) await this.syncRegistryStatus(currentState);
+        }
+        return Response.json(existing);
+      }
 
       if (tx.project_id === AUTO_PROJECT_ID) {
         const receipt = this.terminalReceipt(tx, "rejected", "UNALLOCATED_PROJECT_ID", "project.create must be allocated by RegistryGuard");
@@ -128,6 +141,9 @@ export class ProjectGuard extends DurableObject<Env> {
         publishReceipt: tx.operation !== "project.create"
       });
       this.persistCommit(result.state, receipt);
+      if (PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
+        await this.syncRegistryStatus(result.state);
+      }
       return Response.json(receipt);
     });
   }
@@ -145,6 +161,22 @@ export class ProjectGuard extends DurableObject<Env> {
       transactionId
     ).toArray()[0];
     return row ? JSON.parse(row.receipt_json) as Receipt : null;
+  }
+
+  private async syncRegistryStatus(state: ProjectState): Promise<void> {
+    const stub = this.env.REGISTRY_GUARD.getByName("global");
+    const response = await stub.fetch("https://registry-guard.internal/sync-status", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: state.project_id,
+        status: state.status,
+        updated_at: state.updated_at
+      })
+    });
+    if (!response.ok) {
+      throw new Error(`RegistryGuard status sync returned ${response.status}`);
+    }
   }
 
   private persistReceipt(receipt: Receipt): void {

@@ -23,8 +23,8 @@ describe("admin inbox processing", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
-      mode: "shadow",
-      inbox: "/PROJECT_OS/TRANSACTIONS/incoming",
+      mode: "v2",
+      inbox: "/PROJECT_OS/.project-os/transactions/incoming",
       scanned: 0,
       processed: 0,
       failed: 0

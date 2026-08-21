@@ -2,13 +2,24 @@ import type { Env } from "./env";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
 import { DropboxClient, DropboxConflictError } from "./dropbox/client";
+import { type LayoutMode, machineTransactionPath, parseLayoutMode } from "./dropbox/layout";
 import { PROJECT_OS_ROOT, transactionPath } from "./dropbox/paths";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
 export { ProjectGuard } from "./durable/project-guard";
 export { RegistryGuard } from "./durable/registry-guard";
 
-const INBOX = `${PROJECT_OS_ROOT}/TRANSACTIONS/incoming`;
+export function inboxPath(mode: LayoutMode): string {
+  return mode === "v2"
+    ? `${PROJECT_OS_ROOT}/.project-os/transactions/incoming`
+    : `${PROJECT_OS_ROOT}/TRANSACTIONS/incoming`;
+}
+
+function terminalTransactionPath(mode: LayoutMode, status: "committed" | "rejected" | "conflicts", transactionId: string): string {
+  return mode === "v2"
+    ? machineTransactionPath(status, transactionId)
+    : transactionPath(status, transactionId);
+}
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -95,12 +106,13 @@ async function routeTransaction(env: Env, transaction: Transaction): Promise<Rec
 }
 
 async function processInbox(env: Env): Promise<void> {
+  const mode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
   const client = new DropboxClient({
     appKey: env.DROPBOX_APP_KEY,
     appSecret: env.DROPBOX_APP_SECRET,
     refreshToken: env.DROPBOX_REFRESH_TOKEN
   });
-  const entries = await client.listFolder(INBOX);
+  const entries = await client.listFolder(inboxPath(mode));
 
   for (const entry of entries.filter((item) => item.tag === "file" && item.name.endsWith(".json")).sort((a, b) => a.name.localeCompare(b.name))) {
     const sourcePath = entry.path_display;
@@ -117,13 +129,14 @@ async function processInbox(env: Env): Promise<void> {
       }
     } catch (error) {
       const syntheticId = filenameTransactionId ?? await syntheticTransactionId(entry.name, raw);
-      await safeAdd(client, transactionPath("rejected", syntheticId), `${JSON.stringify({
+      const rejectedPath = terminalTransactionPath(mode, "rejected", syntheticId);
+      await safeAdd(client, rejectedPath, `${JSON.stringify({
         status: "rejected",
         code: "INVALID_TRANSACTION_FILE",
         message: error instanceof Error ? error.message : "Invalid transaction file",
         source_name: entry.name
       }, null, 2)}\n`);
-      await archiveSource(client, sourcePath, transactionPath("rejected", syntheticId).replace(/\.json$/, ".source.json"));
+      await archiveSource(client, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
       continue;
     }
 
@@ -137,7 +150,7 @@ async function processInbox(env: Env): Promise<void> {
     }
 
     const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
-    const canonicalTerminalPath = transactionPath(statusFolder, transaction.transaction_id);
+    const canonicalTerminalPath = terminalTransactionPath(mode, statusFolder, transaction.transaction_id);
     const archivePath = receipt.status === "committed"
       ? canonicalTerminalPath
       : canonicalTerminalPath.replace(/\.json$/, ".source.json");

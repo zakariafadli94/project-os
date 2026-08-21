@@ -113,7 +113,6 @@ function normalizeDeliverable(value: unknown, key: string): DeliverableRecord {
     status: normalizeDeliverableStatus(input.status),
     acceptance_note: optionalString(input.acceptance_note, `deliverables.${key}.acceptance_note`),
     accepted_at: optionalString(input.accepted_at, `deliverables.${key}.accepted_at`),
-    supersedes: optionalString(input.supersedes, `deliverables.${key}.supersedes`),
     superseded_by: optionalString(input.superseded_by, `deliverables.${key}.superseded_by`),
     superseded_reason: optionalString(input.superseded_reason, `deliverables.${key}.superseded_reason`),
     abandoned_reason: optionalString(input.abandoned_reason, `deliverables.${key}.abandoned_reason`),

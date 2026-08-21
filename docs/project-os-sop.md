@@ -2,91 +2,105 @@
 
 ## 1. Role
 
-This SOP is generic. It governs every business, consulting, marketing, research, operations, software, website, application or exploratory project handled inside the single ChatGPT Project named **Project OS**.
+This SOP governs every business, consulting, marketing, research, operations, software, website, application, R&D, recurring or one-shot project handled through the single ChatGPT Project named **Project OS**.
 
-The user works naturally. Never require the user to type operational commands such as `PULL`, `PUSH`, `SYNC`, `REFRESH` or `CHECKPOINT`.
+The user speaks naturally. Never require commands such as `PULL`, `PUSH`, `SYNC`, `REFRESH` or `CHECKPOINT`.
 
-ChatGPT is temporary reasoning/work memory. Dropbox/Project OS is canonical persistent project state. Obsidian is the user's human navigation and reading layer.
+ChatGPT is a working interface and temporary reasoning context. Dropbox/Project OS is canonical persistent project state. Obsidian is the human reading/navigation layer.
 
-## 2. Non-negotiable authority rule
+## 2. Authority
 
 Conversation history, ChatGPT memory and other chats are never authoritative project facts.
 
-When canonical project files are available:
+When canonical state is available:
 
-1. use them as the source of truth;
-2. treat conversation history as potentially stale;
-3. never persist a material change solely because ChatGPT inferred it;
-4. only persist durable user-accepted changes.
+1. use it as source of truth;
+2. treat chat history as potentially stale;
+3. do not persist a material change solely because the model inferred it;
+4. persist only durable accepted or operationally real facts;
+5. when generated Markdown conflicts with structured state/events, structured state/events win.
 
 ## 3. Session modes
 
-Every conversation must internally operate in one of these modes:
-
 ### PROJECT_SESSION
 
-One primary project is bound to the conversation.
-
-A conversation may mention other projects, but it must not silently switch its primary bound project. If the user clearly wants to start working substantially on another project, recommend a new chat unless the task is explicitly cross-project.
+One primary project is bound to the conversation. Do not silently switch its primary project.
 
 ### PORTFOLIO_SESSION
 
-Used for cross-project review, prioritization, comparisons and portfolio decisions. Read several projects selectively, but preserve their identities and states separately. Never merge project state merely because multiple projects are discussed together.
+Cross-project review/comparison. Keep every project state separate and use the Portfolio layer for intentional cross-project relationships.
 
 ### UNBOUND
 
-New conversation with no reliably identified project yet. Resolve an existing project, bootstrap a new project, or enter portfolio mode before making persistent project mutations.
+No project has yet been reliably resolved. Resolve an existing project, create a genuinely operational new project, or enter Portfolio mode before durable mutation.
 
-## 4. Automatic project resolution
+## 4. Project resolution
 
-At the start of meaningful project work, resolve the project against the canonical registry using, in priority order:
+Resolve against the canonical registry in this order:
 
-1. exact project ID;
+1. exact `PRJ-xxxx`;
 2. exact canonical name;
 3. exact alias;
 4. unambiguous contextual reference.
 
-If two or more projects plausibly match, ask one concise clarification. Never guess silently.
+If ambiguous, ask one concise clarification. Never guess silently.
 
-Once resolved, bind the chat internally to that `project_id`.
+After V2 cutover, the machine registry is:
 
-## 5. Automatic context pull
+```text
+.project-os/registry/PROJECT_REGISTRY.json
+```
 
-For an existing project, retrieve context automatically before answering when the answer materially depends on project state.
+During `legacy`/`shadow`, the V1 registry remains canonical at:
 
-Start with the minimum context:
+```text
+SYSTEM/PROJECT_REGISTRY.json
+```
 
-1. `HANDOFF.md`
-2. `STATE.md`
+## 5. Automatic context load
 
-Then retrieve only what the task needs:
+For an existing project, load fresh context whenever the answer materially depends on project state.
+
+Start with:
+
+```text
+HANDOFF.md
+STATE.md
+```
+
+After V2 cutover their full human paths are:
+
+```text
+WORKSPACE/PROJECTS/<PRJ>-<slug>/HANDOFF.md
+WORKSPACE/PROJECTS/<PRJ>-<slug>/STATE.md
+```
+
+Then load only what is required:
 
 - `PROJECT.md` for stable objective/scope/constraints;
-- `PLAN.md` for execution direction;
-- relevant files under `DECISIONS/` for binding decisions;
-- relevant `RESEARCH/` or `DELIVERABLES/` files for the current task.
+- `PLAN.md` for validated execution direction;
+- relevant `DECISIONS/`;
+- relevant `CONSTRAINTS/`;
+- relevant `TASKS/`;
+- relevant `RESEARCH/`;
+- relevant `DELIVERABLES/`;
+- relevant future `REFERENCES/`, `SPECS/`, or `MEETINGS/` when present.
 
-Do not load the entire project indiscriminately.
+Do not load an entire project indiscriminately.
 
-## 6. Old conversation rule
+## 6. Old-chat safety
 
-An old conversation may contain a stale project revision.
+Before any durable mutation, refresh canonical state and current revision. Never mutate from a revision remembered only from an earlier turn/chat.
 
-Before any durable mutation, always refresh the canonical current revision/state. Never write based only on the revision remembered earlier in the conversation.
-
-If the canonical revision advanced since the conversation last loaded it, continue from the canonical state and re-evaluate the intended mutation against that state.
+If canonical revision advanced, reevaluate the intended mutation against the new canonical state.
 
 ## 7. New project bootstrap
 
-When the user begins a genuinely new initiative:
+Use context already supplied and ask only for missing information that materially changes initialization.
 
-1. use all context already provided;
-2. do not force a bureaucratic questionnaire;
-3. ask only for missing information that materially changes initialization;
-4. distinguish ideas/incubation from a project worth persisting;
-5. when persistence is justified, create a `project.create` transaction.
+Distinguish brainstorming/incubation from a project worth persisting.
 
-External creation transactions always use:
+External creation uses:
 
 ```json
 {
@@ -96,117 +110,93 @@ External creation transactions always use:
 }
 ```
 
-ChatGPT never invents or reserves a canonical `PRJ-xxxx` ID. `RegistryGuard` allocates it.
+Never invent a canonical `PRJ-xxxx`. `RegistryGuard` allocates it. Use the allocated ID only after a committed receipt.
 
-After the committed receipt returns, use the allocated `project_id` from that receipt for all future work.
+## 8. Durable vs non-durable
 
-## 8. Durable vs non-durable work
+Do not automatically persist:
 
-### Do not persist automatically
-
-- brainstorming options;
+- brainstorming;
 - rejected ideas;
-- hypothetical scenarios;
+- hypotheticals;
 - exploratory calculations;
-- draft content not yet accepted as a project fact/deliverable;
-- ChatGPT recommendations that the user has not accepted.
+- unaccepted recommendations;
+- unvalidated drafts.
 
-### Persist when materially durable
+Persist when operationally real or explicitly accepted:
 
-- user explicitly accepts a decision;
-- task is created/started/completed/blocked as an actual project fact;
-- validated plan phase is created/updated/completed;
-- project lifecycle changes;
-- a real constraint becomes binding;
-- research is accepted into project knowledge;
-- a deliverable becomes an actual tracked deliverable or is completed.
+- decisions;
+- task creation/start/completion/block;
+- validated plan phase changes;
+- lifecycle changes;
+- binding constraints;
+- accepted research;
+- tracked/completed deliverables.
 
-Do not turn an AI suggestion into a canonical decision without user acceptance.
+Never turn an AI recommendation into a canonical decision without user acceptance.
 
-## 9. Transaction-only writes
+## 9. Transaction-only canonical writes
 
-ChatGPT never directly modifies machine-managed canonical project files.
+Never directly modify machine-managed canonical project state.
 
-It must never submit generic operations such as:
+Never use generic canonical mutations such as:
 
-- `edit_file`
-- `replace_file`
-- `delete_file`
-- arbitrary path writes
-- shell commands
+- `edit_file`;
+- `replace_file`;
+- `delete_file`;
+- arbitrary canonical path writes;
+- shell-based state mutation.
 
-Durable changes are expressed only through the supported typed transaction operations.
+Durable changes use supported typed Project OS transactions only.
 
 ## 10. Transaction procedure
 
-When a durable change occurs:
+For every durable change:
 
-1. refresh the project's current canonical revision;
-2. construct exactly one or more minimal typed transactions representing only validated changes;
-3. generate a fresh unique `transaction_id` for each independent mutation;
-4. set `base_revision` to the latest canonical revision relevant to that mutation;
-5. write each transaction JSON file to the Dropbox Project OS incoming queue using the exact filename `<transaction_id>.json`;
-6. check the corresponding receipt;
-7. consider the mutation persisted only if the receipt status is `committed`.
+1. refresh the current canonical revision;
+2. construct the minimal typed transaction(s);
+3. generate a fresh unique `transaction_id`;
+4. set `base_revision` correctly;
+5. write `<transaction_id>.json` to the current incoming queue;
+6. check the receipt;
+7. consider persistence successful only when `receipt.status = committed`.
 
-Do all of this without asking the user to type synchronization commands.
+Incoming queue by layout mode:
 
-Platform security confirmation dialogs may still require user approval. These are authorization controls, not workflow steps.
+```text
+legacy/shadow: TRANSACTIONS/incoming/
+v2:            .project-os/transactions/incoming/
+```
+
+Platform authorization dialogs may still require user confirmation. They are security controls, not workflow commands.
 
 ## 11. Receipt gate
 
-A ChatGPT statement such as "saved", "recorded", "updated" or "committed" is permitted only when a receipt exists with:
+Never say a durable change is saved/recorded/updated/committed unless a committed receipt exists.
 
-```json
-{
-  "status": "committed"
-}
-```
+If rejected, explain the validation issue.
 
-If no receipt is available yet:
+If conflict, preserve both realities and ask only when a genuine business-direction choice is required.
 
-- do not pretend persistence succeeded;
-- recheck the receipt during the same turn when practical;
-- otherwise mark persistence as unconfirmed internally and recheck automatically before relying on it later.
+## 12. Concurrency
 
-If the receipt is `rejected`, explain the relevant validation issue.
+Project Guard is authoritative for compatibility.
 
-If the receipt is `conflict`, preserve both realities and ask the user only when a genuine business-direction choice is required.
+Never semantically auto-merge competing direction-changing changes simply because one appears preferable.
 
-## 12. Revision/concurrency behavior
+Additive independent changes may be accepted only according to deterministic Guard rules.
 
-Never perform semantic conflict resolution for competing direction-changing changes merely because one seems more reasonable.
+## 13. Decisions
 
-Examples:
+Durable decisions must be explicit and user-accepted. Accepted decisions are historical records. Later direction changes supersede; they never erase history.
 
-- additive independent research may be accepted by deterministic Guard rules;
-- independent task transitions may be accepted if their current state still permits the transition;
-- stale accepted decisions, plan direction changes or lifecycle changes must conflict rather than silently overwrite newer state.
+## 14. Plans
 
-The Project Guard is authoritative about whether a transaction is compatible.
+A new idea does not automatically modify the validated plan. Use typed plan operations only after the user validates the direction.
 
-## 13. Decision discipline
+## 15. Lifecycle
 
-A durable decision must be explicit and user-accepted.
-
-Accepted decisions become immutable historical records. Later direction changes supersede earlier decisions; they do not erase them.
-
-Never rewrite history to make the current decision appear to have always been true.
-
-## 14. Plan discipline
-
-A new idea does not automatically change the validated plan.
-
-Change plan state only when:
-
-- the user validates the new direction; and
-- the correct typed plan operation exists.
-
-Do not use research, brainstorming or narrative edits as a hidden way to alter the plan.
-
-## 15. Project lifecycle discipline
-
-V1 lifecycle:
+V1 lifecycle remains:
 
 ```text
 active → paused → active
@@ -214,69 +204,208 @@ active/paused → completed → archived
 active/paused → archived
 ```
 
-Archive is terminal in V1.
-
-There is no destructive project delete operation.
+Archive is terminal. There is no destructive project delete operation.
 
 ## 16. Portfolio behavior
 
-For portfolio questions:
+For portfolio work:
 
 1. read the registry;
-2. retrieve `STATE.md`/`HANDOFF.md` only for projects necessary to answer;
-3. state comparisons using each project's canonical state;
-4. do not mutate individual projects unless the user accepts a concrete project-specific change;
-5. when a portfolio decision affects several projects, emit separate project transactions so each project retains its own history/revision.
+2. load only needed project handoff/state;
+3. keep project states separate;
+4. emit separate typed transactions per project when several projects change;
+5. represent intentional cross-project knowledge under `WORKSPACE/PORTFOLIO/` rather than creating implicit links between project notes.
 
-## 17. Human/Obsidian edits
+## 17. Human workspace architecture
 
-Files marked `MACHINE-MANAGED` are materialized views and may be regenerated.
+After V2 cutover, the Obsidian Vault is **only**:
 
-Do not treat manual edits inside generated sections as authoritative unless they have been converted into an accepted typed Project OS mutation.
+```text
+PROJECT_OS/WORKSPACE
+```
 
-Human notes can live outside machine-managed sections/files, but durable project facts should enter canonical state through transactions.
+The human-facing tree is:
 
-## 18. Context contamination protection
+```text
+WORKSPACE/
+├── PORTFOLIO/
+│   ├── DASHBOARD.md
+│   ├── RELATIONSHIPS/
+│   └── REVIEWS/
+└── PROJECTS/
+    └── PRJ-xxxx-slug/
+        ├── PROJECT.md
+        ├── STATE.md
+        ├── PLAN.md
+        ├── HANDOFF.md
+        ├── DECISIONS/
+        ├── CONSTRAINTS/
+        ├── TASKS/
+        ├── RESEARCH/
+        ├── REFERENCES/
+        ├── DELIVERABLES/
+        ├── SPECS/
+        ├── MEETINGS/
+        ├── NOTES/
+        ├── INBOX/
+        └── ASSETS/
+```
 
-Because many conversations exist inside one ChatGPT Project, information from another chat may appear in model context.
+Folders are lazy: create them only when used.
 
-Before using such information as a fact about the currently bound project, confirm it against the bound project's canonical files.
+Generated canonical notes are machine-managed materialized views. Human-managed areas such as `NOTES/` and `INBOX/` may contain non-canonical working content; durable facts still require typed transactions.
 
-A fact belonging to another project must never be copied into the current project merely because it is present in ChatGPT memory/context.
+## 18. Machine layer
 
-## 19. Failure behavior
+After V2 cutover, machine state lives outside the Obsidian Vault:
+
+```text
+.project-os/
+├── registry/
+├── transactions/
+├── receipts/
+└── projects/
+    └── PRJ-xxxx/
+        ├── state.json
+        ├── manifest.json
+        └── events/
+```
+
+Never expose machine files as ordinary project notes.
+
+Never write human generated Markdown below `.project-os/`.
+
+Never write events, receipts, transaction queues or structured machine state below `WORKSPACE/`.
+
+## 19. Generated-note metadata
+
+Every generated project Markdown note should carry stable project-scoped frontmatter:
+
+```yaml
+---
+project_id: PRJ-0002
+project_slug: project-os
+project_name: Project OS
+note_id: RES-CODE0001
+note_type: research
+canonical: true
+revision: 19
+---
+```
+
+Use stable canonical IDs for entity filenames. Titles may change without changing note identity/path.
+
+## 20. Obsidian graph isolation
+
+A single Vault is retained, but individual project work uses a project-scoped graph filter.
+
+Example:
+
+```text
+path:"PROJECTS/PRJ-0002-project-os"
+```
+
+The unfiltered Vault graph is Portfolio-only.
+
+Generated entity links must be folder-qualified where ambiguity is possible, for example:
+
+```text
+[[DECISIONS/DEC-ARCH0001|Canonical architecture]]
+```
+
+Do not create automatic cross-project links because of matching titles, names, technologies, clients or aliases.
+
+Intentional cross-project links belong under:
+
+```text
+PORTFOLIO/RELATIONSHIPS/
+```
+
+## 21. Workspace migration rules
+
+Runtime layout modes are:
+
+```text
+legacy → shadow → v2
+```
+
+`legacy` remains the default until explicitly changed.
+
+In `shadow`:
+
+- V1 remains canonical;
+- V2 machine state/human views are produced for verification;
+- any required shadow persistence failure prevents a committed legacy receipt from being published.
+
+Existing-project materialization is non-mutating business infrastructure work:
+
+- no DomainEvent;
+- no fake typed transaction;
+- no revision increment;
+- no receipt;
+- immutable V1 events are mirrored by exact-content/idempotent-add semantics;
+- V1 sources remain untouched.
+
+The authenticated migration endpoint is:
+
+```text
+POST /v1/admin/workspace-v2/materialize
+Authorization: Bearer <INGRESS_TOKEN>
+```
+
+Do not invoke a production cutover merely because code/tests pass. `shadow` verification must happen first.
+
+## 22. Rollback and cleanup
+
+Until explicit legacy cleanup approval, rollback is always available by restoring a known-good Worker if needed and returning to:
+
+```text
+PROJECT_OS_LAYOUT_MODE=legacy
+```
+
+Do not delete legacy `SYSTEM/`, `PROJECTS/`, `TRANSACTIONS/`, `RECEIPTS/` or per-project `.system/` during initial migration.
+
+Legacy cleanup is a separate destructive operation requiring explicit approval.
+
+## 23. Context contamination protection
+
+Information from another chat/project may appear in model context. Never treat it as a fact about the bound project without confirming it against canonical state.
+
+## 24. Failure behavior
 
 If Dropbox or Project Guard is unavailable:
 
-- continue non-durable reasoning if useful;
-- do not fabricate canonical updates;
-- keep intended mutations clearly separated from committed state;
-- re-read canonical state before retrying later.
+- continue non-durable reasoning when useful;
+- never fabricate persistence;
+- keep intended changes separate from committed state;
+- refresh canonical state before retrying.
 
-If generated Markdown is inconsistent with structured state/events, structured state/events win and the materialized Markdown should be regenerated.
+If materialized Markdown is stale/inconsistent, regenerate it from structured state rather than treating the Markdown discrepancy as a new canonical fact.
 
-## 20. User experience principle
+## 25. User experience principle
 
-The normal user experience should remain:
+Normal operation remains:
 
 ```text
 User speaks naturally
       ↓
-ChatGPT identifies project and loads fresh context
+resolve/bind project
       ↓
-Work / reasoning / creation
+load fresh canonical context
       ↓
-Durable change detected only when genuinely accepted
+reason/create/work
       ↓
-Typed transaction
+detect genuinely durable accepted change
       ↓
-Project Guard validation / serialization / persistence
+typed transaction
       ↓
-Committed receipt
+Project Guard validation + serialization
       ↓
-Dropbox sync
+committed receipt
       ↓
-Obsidian updated
+Dropbox persistent state/materialization
+      ↓
+Obsidian human workspace updated
 ```
 
-The mechanics should be largely invisible. Reliability must come from deterministic guards, not from expecting the LLM to remember every procedural rule perfectly.
+The mechanics should remain mostly invisible. Reliability comes from deterministic guards, not from model memory.

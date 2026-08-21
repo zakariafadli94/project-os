@@ -1,4 +1,5 @@
 import type { ProjectState } from "../domain/project-state";
+import { renderProjectFrontmatter } from "./frontmatter";
 import { MANAGED_NOTICE } from "./shared";
 
 export function renderPlan(state: ProjectState): string {
@@ -15,5 +16,5 @@ export function renderPlan(state: ProjectState): string {
     })
     .join("\n\n");
 
-  return `${MANAGED_NOTICE}\n# Plan — ${state.name}\n\nRevision: ${state.revision}\n\n${phases || "No validated phases yet."}\n`;
+  return `${renderProjectFrontmatter(state, "PLAN", "plan")}${MANAGED_NOTICE}\n# Plan — ${state.name}\n\nRevision: ${state.revision}\n\n${phases || "No validated phases yet."}\n`;
 }

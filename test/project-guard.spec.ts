@@ -31,6 +31,17 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   return response.json<Receipt>();
 }
 
+async function materialize(projectId: string): Promise<{ project_id: string; revision: number; materialized: boolean }> {
+  const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+  const response = await stub.fetch("https://project-guard.internal/materialize", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ target: "workspace-v2" })
+  });
+  expect(response.status).toBe(200);
+  return response.json();
+}
+
 describe("ProjectGuard", () => {
   let dropbox: ReturnType<typeof installDropboxMock>;
 
@@ -54,6 +65,26 @@ describe("ProjectGuard", () => {
     await submit(projectId, tx);
 
     expect(dropbox.files.has(`/PROJECT_OS/RECEIPTS/${tx.transaction_id}.json`)).toBe(false);
+  });
+
+  it("materializes workspace views without mutating business revision", async () => {
+    const projectId = "PRJ-1098";
+    await submit(projectId, createTx(projectId, "TXN-PROJECT-1098-0001"));
+
+    const result = await materialize(projectId);
+    expect(result).toEqual({ project_id: projectId, revision: 1, materialized: true });
+    expect(dropbox.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-1098-project-1098/STATE.md")).toBe(true);
+
+    const task = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-PROJECT-1098-0002",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "task.create",
+      created_at: at,
+      payload: { task_id: "TASK-1098", title: "Still revision one before this" }
+    });
+    expect(task.new_revision).toBe(2);
   });
 
   it("increments revisions monotonically across valid task mutations", async () => {

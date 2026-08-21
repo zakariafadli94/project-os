@@ -4,6 +4,7 @@ const PROJECT_ID_RE = /^PRJ-[0-9]{4,}$/;
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const EVENT_ID_RE = /^EVT-[0-9]{6,}$/;
 const DECISION_ID_RE = /^DEC-[A-Z0-9]{4,}$/;
+const STABLE_ID_RE = /^[A-Z]+-[A-Z0-9]{4,}$/;
 const TRANSACTION_ID_RE = /^TXN-[A-Z0-9-]{10,}$/;
 
 export function assertSafeProjectId(value: string): string {
@@ -21,6 +22,18 @@ function assertMatch(value: string, pattern: RegExp, label: string): string {
   return value;
 }
 
+export function assertSafeEventId(value: string): string {
+  return assertMatch(value, EVENT_ID_RE, "event id");
+}
+
+export function assertSafeStableId(value: string): string {
+  return assertMatch(value, STABLE_ID_RE, "stable id");
+}
+
+export function assertSafeTransactionId(value: string): string {
+  return assertMatch(value, TRANSACTION_ID_RE, "transaction id");
+}
+
 export function projectRoot(projectId: string, slug: string): string {
   return `${PROJECT_OS_ROOT}/PROJECTS/${assertSafeProjectId(projectId)}-${assertSafeSlug(slug)}`;
 }
@@ -34,7 +47,7 @@ export function manifestPath(projectId: string, slug: string): string {
 }
 
 export function eventPath(projectId: string, slug: string, eventId: string): string {
-  return `${projectRoot(projectId, slug)}/.system/events/${assertMatch(eventId, EVENT_ID_RE, "event id")}.json`;
+  return `${projectRoot(projectId, slug)}/.system/events/${assertSafeEventId(eventId)}.json`;
 }
 
 export function decisionPath(projectId: string, slug: string, decisionId: string): string {
@@ -42,12 +55,12 @@ export function decisionPath(projectId: string, slug: string, decisionId: string
 }
 
 export function transactionPath(status: "committed" | "rejected" | "conflicts", transactionId: string): string {
-  const id = assertMatch(transactionId, TRANSACTION_ID_RE, "transaction id");
+  const id = assertSafeTransactionId(transactionId);
   return `${PROJECT_OS_ROOT}/TRANSACTIONS/${status}/${id}.json`;
 }
 
 export function receiptPath(transactionId: string): string {
-  const id = assertMatch(transactionId, TRANSACTION_ID_RE, "transaction id");
+  const id = assertSafeTransactionId(transactionId);
   return `${PROJECT_OS_ROOT}/RECEIPTS/${id}.json`;
 }
 

@@ -5,6 +5,7 @@ import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
 import { DropboxClient } from "../dropbox/client";
+import { parseLayoutMode } from "../dropbox/layout";
 import { ProjectRepository } from "../dropbox/repository";
 
 interface TransactionRow {
@@ -38,11 +39,37 @@ export class ProjectGuard extends DurableObject<Env> {
       appKey: env.DROPBOX_APP_KEY,
       appSecret: env.DROPBOX_APP_SECRET,
       refreshToken: env.DROPBOX_REFRESH_TOKEN
-    }));
+    }), parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
   }
 
   async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST" || new URL(request.url).pathname !== "/transaction") {
+    const pathname = new URL(request.url).pathname;
+
+    if (request.method === "POST" && pathname === "/materialize") {
+      return this.serialize(async () => {
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return Response.json({ error: "invalid_materialize_request" }, { status: 400 });
+        }
+        if (!body || typeof body !== "object" || (body as { target?: unknown }).target !== "workspace-v2") {
+          return Response.json({ error: "invalid_materialize_target" }, { status: 400 });
+        }
+
+        const state = this.loadState();
+        if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+
+        await this.repository.materializeV2(state);
+        return Response.json({
+          project_id: state.project_id,
+          revision: state.revision,
+          materialized: true
+        });
+      });
+    }
+
+    if (request.method !== "POST" || pathname !== "/transaction") {
       return Response.json({ error: "not_found" }, { status: 404 });
     }
 

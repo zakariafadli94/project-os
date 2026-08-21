@@ -3,6 +3,9 @@
   "name": "project-os-guard",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-20",
+  "vars": {
+    "PROJECT_OS_LAYOUT_MODE": "legacy"
+  },
   "triggers": {
     "crons": ["*/5 * * * *"]
   },

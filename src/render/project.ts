@@ -1,4 +1,5 @@
 import type { ProjectState } from "../domain/project-state";
+import { renderProjectFrontmatter } from "./frontmatter";
 import { MANAGED_NOTICE } from "./shared";
 
 export function renderProject(state: ProjectState): string {
@@ -8,5 +9,5 @@ export function renderProject(state: ProjectState): string {
     .map((item) => `- **${item.constraint_id} — ${item.title}:** ${item.description}`)
     .join("\n") || "- None";
 
-  return `${MANAGED_NOTICE}\n# ${state.name}\n\nProject ID: ${state.project_id}\nStatus: ${state.status}\nRevision: ${state.revision}\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Aliases\n\n${aliases}\n\n## Durable constraints\n\n${constraints}\n`;
+  return `${renderProjectFrontmatter(state, "PROJECT", "project")}${MANAGED_NOTICE}\n# ${state.name}\n\nProject ID: ${state.project_id}\nStatus: ${state.status}\nRevision: ${state.revision}\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Aliases\n\n${aliases}\n\n## Durable constraints\n\n${constraints}\n`;
 }

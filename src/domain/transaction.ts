@@ -15,6 +15,7 @@ export const operationValues = [
   "project.resume",
   "project.complete",
   "project.archive",
+  "project.framing.update",
   "decision.accept",
   "decision.supersede",
   "task.create",
@@ -26,6 +27,14 @@ export const operationValues = [
   "plan.phase.complete",
   "constraint.add",
   "research.add",
+  "discovery.synthesis.update",
+  "deliverable.create",
+  "deliverable.start",
+  "deliverable.revise",
+  "deliverable.submit_review",
+  "deliverable.accept",
+  "deliverable.supersede",
+  "deliverable.abandon",
   "deliverable.add",
   "deliverable.complete"
 ] as const;
@@ -54,6 +63,21 @@ const projectPause = z.strictObject({ ...common, operation: z.literal("project.p
 const projectResume = z.strictObject({ ...common, operation: z.literal("project.resume"), payload: z.strictObject({ reason: nonEmpty.optional() }) });
 const projectComplete = z.strictObject({ ...common, operation: z.literal("project.complete"), payload: z.strictObject({ summary: nonEmpty.optional() }) });
 const projectArchive = z.strictObject({ ...common, operation: z.literal("project.archive"), payload: z.strictObject({ reason: nonEmpty }) });
+const projectFramingUpdate = z.strictObject({
+  ...common,
+  operation: z.literal("project.framing.update"),
+  payload: z.strictObject({
+    objective: nonEmpty.optional(),
+    scope: z.array(nonEmpty).optional(),
+    out_of_scope: z.array(nonEmpty).optional(),
+    success_criteria: z.array(nonEmpty).optional(),
+    stakeholders: z.array(nonEmpty).optional(),
+    open_questions: z.array(nonEmpty).optional()
+  }).refine(
+    (value) => Object.values(value).some((item) => item !== undefined),
+    { message: "project.framing.update requires at least one change" }
+  )
+});
 
 const decisionAccept = z.strictObject({
   ...common,
@@ -100,6 +124,80 @@ const researchAdd = z.strictObject({
   operation: z.literal("research.add"),
   payload: z.strictObject({ research_id: stableId("RES"), title: nonEmpty, body: nonEmpty, source: nonEmpty.optional() })
 });
+
+const discoveryFinding = z.strictObject({
+  summary: nonEmpty,
+  research_ids: z.array(stableId("RES")).default([])
+});
+const discoverySynthesisUpdate = z.strictObject({
+  ...common,
+  operation: z.literal("discovery.synthesis.update"),
+  payload: z.strictObject({
+    confirmed_findings: z.array(discoveryFinding).optional(),
+    provisional_findings: z.array(discoveryFinding).optional(),
+    unresolved_questions: z.array(nonEmpty).optional(),
+    next_exploration: z.array(nonEmpty).optional()
+  }).refine(
+    (value) => Object.values(value).some((item) => item !== undefined),
+    { message: "discovery.synthesis.update requires at least one change" }
+  )
+});
+
+const deliverableCreate = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.create"),
+  payload: z.strictObject({
+    deliverable_id: stableId("DEL"),
+    title: nonEmpty,
+    version: nonEmpty,
+    description: nonEmpty.optional(),
+    reference: nonEmpty.optional(),
+    owner: nonEmpty.optional(),
+    phase_id: stableId("PHASE").optional(),
+    decision_ids: z.array(stableId("DEC")).optional()
+  })
+});
+const deliverableStart = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.start"),
+  payload: z.strictObject({ deliverable_id: stableId("DEL") })
+});
+const deliverableRevise = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.revise"),
+  payload: z.strictObject({
+    deliverable_id: stableId("DEL"),
+    version: nonEmpty,
+    description: nonEmpty.optional(),
+    reference: nonEmpty.optional()
+  })
+});
+const deliverableSubmitReview = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.submit_review"),
+  payload: z.strictObject({ deliverable_id: stableId("DEL") })
+});
+const deliverableAccept = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.accept"),
+  payload: z.strictObject({ deliverable_id: stableId("DEL"), acceptance_note: nonEmpty })
+});
+const deliverableSupersede = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.supersede"),
+  payload: z.strictObject({
+    deliverable_id: stableId("DEL"),
+    replacement_deliverable_id: stableId("DEL"),
+    reason: nonEmpty
+  })
+});
+const deliverableAbandon = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.abandon"),
+  payload: z.strictObject({ deliverable_id: stableId("DEL"), reason: nonEmpty })
+});
+
+// Deprecated compatibility operations. New SOP-driven flows use the lifecycle above.
 const deliverableAdd = z.strictObject({
   ...common,
   operation: z.literal("deliverable.add"),
@@ -117,6 +215,7 @@ export const transactionSchema = z.discriminatedUnion("operation", [
   projectResume,
   projectComplete,
   projectArchive,
+  projectFramingUpdate,
   decisionAccept,
   decisionSupersede,
   taskCreate,
@@ -128,6 +227,14 @@ export const transactionSchema = z.discriminatedUnion("operation", [
   phaseComplete,
   constraintAdd,
   researchAdd,
+  discoverySynthesisUpdate,
+  deliverableCreate,
+  deliverableStart,
+  deliverableRevise,
+  deliverableSubmitReview,
+  deliverableAccept,
+  deliverableSupersede,
+  deliverableAbandon,
   deliverableAdd,
   deliverableComplete
 ]);

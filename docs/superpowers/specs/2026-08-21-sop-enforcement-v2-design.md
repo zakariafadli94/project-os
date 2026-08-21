@@ -1,51 +1,48 @@
 # SOP Enforcement V2 — Architecture Design
 
-Status: design approved in principle by the user; implementation not started
+Status: design approved in principle; implementation not started
 Date: 2026-08-21
-Canonical decision: `DEC-SOPENF002` (pending receipt at time this spec was first written)
+Canonical decision: `DEC-SOPENF002` — committed in PRJ-0002 revision 31 / event `EVT-000031`
 Related SOP decision: `DEC-SOPS001`
 
 ## 1. Purpose
 
-Project OS already materializes human-readable `BRIEF.md`, `DISCOVERY.md`, and `ROADMAP.md` views and now renders Roadmap using the adopted `Current / Next / Later` model. The second stress test demonstrated that the remaining Brief, Discovery, and Deliverable mismatches cannot be corrected safely in renderers alone because the current canonical `ProjectState` does not contain the concepts required by the adopted SOPs.
+Project OS already materializes human-readable `BRIEF.md`, `DISCOVERY.md`, and `ROADMAP.md` views. The second stress test proved that Roadmap can now be enforced mechanically with `Current / Next / Later`, but the remaining Brief, Discovery, and Deliverable mismatches cannot be solved safely inside renderers because the canonical `ProjectState` does not contain the concepts required by the adopted SOPs.
 
-SOP Enforcement V2 extends the canonical model so the SOP can be represented directly and mechanically. The goal is not to make Project OS more complicated for the user. The goal is to make the machine layer precise enough that the simple human Markdown layer is truthful.
+SOP Enforcement V2 extends the canonical model so the SOP can be represented directly and mechanically. The goal is not a more complicated user experience. The goal is a precise machine layer that can generate simple, truthful Markdown.
 
-The central rule is:
+Core rule:
 
 > Renderers may summarize canonical concepts, but they must not invent one canonical concept by deriving it from a different concept.
 
-Examples of derivations that this design removes:
+Invalid substitutions this design removes:
 
 - active phase ≠ project scope;
 - deliverables ≠ success criteria;
 - blocked tasks ≠ unresolved discovery questions;
 - phase next actions ≠ discovery exploration;
-- completed deliverable ≠ user-accepted deliverable.
+- completed deliverable ≠ explicitly accepted deliverable.
 
-## 2. Stress-test findings that drive this design
-
-The current implementation exposes three confirmed semantic defects.
+## 2. Confirmed stress-test defects
 
 ### 2.1 Brief conflates framing with execution
 
-Current `renderBrief()` sets `Current scope` from `current_phase_id` and sets `Success signals` from tracked deliverables. This violates SOP 01 because the Brief is supposed to contain current accepted framing, not the active execution phase or output inventory.
+Current `renderBrief()` derives `Current scope` from `current_phase_id` and `Success signals` from deliverables. The Brief is supposed to contain current accepted framing, not active execution state or output inventory.
 
 ### 2.2 Discovery is derived from unrelated operational state
 
-Current `renderDiscovery()` uses:
+Current `renderDiscovery()` derives:
 
-- project objective as `Current understanding`;
-- all research records as `Research and learnings`;
-- accepted decisions as `Decisions shaping direction`;
-- blocked tasks as `Unresolved issues`;
-- phase `next_actions` or pending tasks as `Explore next`.
+- current understanding from project objective;
+- research and learnings from the complete research list;
+- unresolved issues from blocked tasks;
+- next exploration from phase actions or pending tasks.
 
-These are useful neighboring signals but they are not a discovery synthesis. The SOP requires a concise layer that distinguishes confirmed findings, provisional findings, unresolved questions, and next exploration while keeping evidence in `RESEARCH/`.
+These are neighboring signals, not discovery synthesis. The SOP requires explicit confirmed findings, provisional findings, unresolved knowledge questions, and next exploration while keeping detailed evidence in `RESEARCH/`.
 
-### 2.3 Deliverables cannot represent the adopted lifecycle
+### 2.3 Deliverables cannot represent the SOP lifecycle
 
-The current model supports only `pending` and `completed`. It has no explicit review state, acceptance event, version, supersession, abandonment, or acceptance evidence. Therefore the software cannot enforce the SOP rule that acceptance must never be inferred from silence or file creation.
+The current model supports only `pending` and `completed`. It cannot represent production, review, explicit acceptance, versioning, supersession, abandonment, or acceptance evidence.
 
 ## 3. Goals
 
@@ -55,34 +52,32 @@ SOP Enforcement V2 MUST:
 2. represent discovery synthesis explicitly and separately from research evidence;
 3. represent the normative deliverable lifecycle explicitly;
 4. retain explicit user acceptance as the gate for accepted deliverables;
-5. preserve old projects, old decisions, old events, and existing project IDs/revisions;
-6. avoid a destructive migration or historical rewrite;
-7. keep Project Guard serialization, receipt gating, idempotency, and conflict rules intact;
-8. keep the Markdown-first portability model intact;
-9. keep current `BRIEF → DISCOVERY → ROADMAP` human navigation simple;
-10. remain deterministic when the same canonical state is re-materialized.
+5. preserve existing project IDs, revisions, decisions, research, tasks, events, and receipts;
+6. avoid destructive migration and historical rewriting;
+7. preserve Project Guard serialization, idempotency, conflict behavior, and receipt gating;
+8. keep the Markdown-first portability model;
+9. keep `BRIEF → DISCOVERY → ROADMAP` as the primary human reading path;
+10. remain deterministic under re-materialization.
 
 ## 4. Non-goals
 
 This change does NOT:
 
-- redesign tasks or phases beyond what is necessary to reference them;
-- change project lifecycle rules;
-- change decision history semantics;
-- introduce free-form canonical file editing;
-- move canonical authority from Project Guard to Markdown;
-- infer user acceptance automatically;
-- delete or rewrite old events;
-- require old projects to be manually migrated before they remain usable;
-- create a new database service;
+- redesign project lifecycle;
+- redesign decisions or tasks beyond necessary references;
+- introduce direct canonical Markdown editing;
+- infer acceptance automatically;
+- delete legacy data;
 - change Dropbox layout mode or Durable Object bindings;
-- make chat history authoritative.
+- require manual migration before existing projects can load;
+- change chat/history authority rules;
+- introduce a new database.
 
 ## 5. Canonical model extensions
 
 ### 5.1 Project framing
 
-Add an explicit `framing` object to `ProjectState`:
+Add:
 
 ```ts
 interface ProjectFraming {
@@ -94,20 +89,23 @@ interface ProjectFraming {
 }
 ```
 
-`objective` remains a first-class project field because it already exists and is widely consumed. The framing transaction may update the objective as well as the `framing` object.
+`objective` remains a first-class field and may be updated by the framing transaction.
 
-Why arrays rather than one free-form Markdown body:
+Semantics:
 
-- renderers can remain deterministic;
-- LLMs can distinguish concepts mechanically;
-- empty/unknown sections remain explicit;
-- later views can reuse individual fields without parsing prose.
+- `scope`: what is included in the accepted project framing;
+- `out_of_scope`: explicit exclusions;
+- `success_criteria`: conditions that define success, not outputs merely produced;
+- `stakeholders`: parties materially relevant to project framing;
+- `open_questions`: framing/business unknowns that affect scope, objectives, constraints, or success.
 
-Unknown values remain empty arrays. Project OS MUST NOT invent values merely to fill a section.
+`open_questions` is intentionally distinct from Discovery `unresolved_questions`: Brief questions concern project framing; Discovery questions concern knowledge still being investigated.
+
+Unknown values remain empty arrays. The system MUST NOT invent values to make a document look complete.
 
 ### 5.2 Discovery synthesis
 
-Add an explicit `discovery` object:
+Add:
 
 ```ts
 interface DiscoveryFinding {
@@ -123,13 +121,13 @@ interface DiscoverySynthesis {
 }
 ```
 
-`research_ids` are optional at the transaction level and normalize to `[]`. A synthesis finding may exist without a research link when it is derived from accepted internal project facts, but the LLM should attach research IDs whenever evidence exists in `RESEARCH/`.
+`research_ids` normalize to `[]` when omitted. When a finding is supported by a canonical research record, the synthesis should link it. Discovery remains current synthesis; detailed evidence stays in `RESEARCH/`.
 
-Discovery is intentionally current synthesis, not historical evidence. Updating the synthesis may replace previous synthesis entries. Historical evidence remains in immutable research records and the Project OS event ledger records the synthesis update transaction itself.
+Replacing a synthesis entry does not erase evidence history because research records remain durable and the event ledger preserves each synthesis-update transaction.
 
 ### 5.3 Deliverable lifecycle
 
-The normative new lifecycle is:
+Normative lifecycle:
 
 ```text
 planned → in_progress → review → accepted
@@ -142,15 +140,15 @@ superseded
 abandoned
 ```
 
-For safe migration, add one internal compatibility status:
+Migration-only compatibility status:
 
 ```text
 legacy_completed
 ```
 
-`legacy_completed` is NOT a normal new-project state. It exists only to preserve old `completed` records without falsely claiming that the user explicitly accepted them.
+`legacy_completed` exists only so old `completed` records do not silently become `accepted`.
 
-New deliverable model:
+New record shape:
 
 ```ts
 type DeliverableStatus =
@@ -175,7 +173,6 @@ interface DeliverableRecord {
   status: DeliverableStatus;
   acceptance_note?: string;
   accepted_at?: string;
-  supersedes?: string;
   superseded_by?: string;
   superseded_reason?: string;
   abandoned_reason?: string;
@@ -184,19 +181,13 @@ interface DeliverableRecord {
 }
 ```
 
-For newly created V2 deliverables, `version` is required by the new creation transaction. It remains optional in the TypeScript record only to load historical records safely.
+`version` is required for new V2 deliverables but optional in the record type so legacy records can load without invented values.
 
 ## 6. Typed transaction design
 
-Transaction schema version remains `1.0` in this phase. The operation set is extended with new discriminants. This is a backwards-compatible protocol extension; changing transaction envelope version is a separate migration and is not required to solve the semantic defects.
+The transaction envelope remains schema version `1.0`. This phase extends the operation discriminants without coupling the work to a separate protocol-version migration.
 
-### 6.1 Project framing
-
-Add:
-
-```text
-project.framing.update
-```
+### 6.1 `project.framing.update`
 
 Payload:
 
@@ -211,19 +202,13 @@ Payload:
 }
 ```
 
-At least one field is required. Array fields use replacement semantics, not append semantics. Replacement is deliberate because this layer represents current framing rather than history. The event ledger preserves historical changes.
+At least one field is required. Arrays use replacement semantics because framing represents current accepted truth. The event ledger preserves prior framing changes.
 
-This operation requires the exact current project revision because it can change project direction and binding framing.
+This is an exact-revision operation.
 
-### 6.2 Discovery synthesis
+### 6.2 `discovery.synthesis.update`
 
-Add:
-
-```text
-discovery.synthesis.update
-```
-
-Payload fields are optional full replacements:
+Payload:
 
 ```ts
 {
@@ -234,13 +219,13 @@ Payload fields are optional full replacements:
 }
 ```
 
-At least one field is required. Referenced research IDs MUST exist in the current project state. This operation requires the exact current revision because two competing syntheses should not silently overwrite each other.
+At least one field is required. Referenced research IDs MUST exist. This is an exact-revision operation so competing syntheses cannot silently overwrite each other.
 
-### 6.3 Deliverable creation and lifecycle
+### 6.3 Normative deliverable operations
 
-Retain legacy `deliverable.add` and `deliverable.complete` parsing for backwards compatibility, but mark them deprecated in code comments/docs and do not use them in new SOP-driven flows.
+Retain legacy `deliverable.add` and `deliverable.complete` parsing for compatibility, but mark them deprecated and exclude them from new SOP-driven flows.
 
-Add normative operations:
+Add:
 
 ```text
 deliverable.create
@@ -252,7 +237,7 @@ deliverable.supersede
 deliverable.abandon
 ```
 
-`deliverable.create` payload:
+#### `deliverable.create`
 
 ```ts
 {
@@ -264,75 +249,88 @@ deliverable.abandon
   owner?: string;
   phase_id?: string;
   decision_ids?: string[];
-  supersedes?: string;
 }
 ```
 
-Creation produces `planned`. Referenced phase/decisions/replacement IDs must exist.
+Creates `planned`. Referenced phase and decisions must exist.
 
-`deliverable.start` moves `planned → in_progress`.
+A new deliverable does NOT declare that it supersedes another deliverable at creation time. Supersession is established only through the dedicated `deliverable.supersede` transaction after both records are accepted. This prevents premature historical relationships.
 
-`deliverable.revise` is allowed from `in_progress` or `review`, requires a new non-empty `version`, may update `description` and `reference`, and ends in `in_progress`. It gives review feedback a deterministic way to return to active production without inventing a new deliverable ID.
+#### `deliverable.start`
 
-`deliverable.submit_review` moves `in_progress → review`.
+`planned → in_progress`.
 
-`deliverable.accept` moves `review → accepted`. It requires a non-empty `acceptance_note`. Project OS cannot cryptographically prove that the user personally approved the deliverable, but requiring a dedicated accept transaction plus acceptance note prevents acceptance from being inferred from file creation or task completion. The assistant SOP remains responsible for emitting this transaction only after explicit user acceptance.
+#### `deliverable.revise`
 
-`deliverable.supersede` requires both original and replacement deliverables to exist and be `accepted`. It moves the original `accepted → superseded`, sets reciprocal linkage, preserves both records, and stores a non-empty reason.
+Allowed from `in_progress` or `review`. Requires a new version value different from the current one, may update `description` and `reference`, and ends in `in_progress`. No semantic-version ordering is inferred; the guard only requires a non-empty changed version string.
 
-`deliverable.abandon` is allowed from `planned`, `in_progress`, `review`, or `legacy_completed`; it requires a non-empty reason. Accepted deliverables cannot be abandoned; they must be superseded to preserve the accepted historical record.
+#### `deliverable.submit_review`
 
-All deliverable lifecycle transitions require the exact current project revision. `deliverable.create` may remain compatible with current additive stale-write rules if its ID is unique and all referenced entities still exist; however the implementation plan should prefer exact-revision handling if that simplifies deterministic cross-reference validation.
+`in_progress → review`.
 
-### 6.4 Legacy deliverable operations
+#### `deliverable.accept`
 
-Compatibility behavior:
+Allowed from:
 
-- historical record status `pending` normalizes to `planned`;
-- historical record status `completed` normalizes to `legacy_completed`;
-- deprecated `deliverable.add` creates a `planned` record with no invented version;
-- deprecated `deliverable.complete` moves a non-terminal legacy/new record to `legacy_completed`, never to `accepted`.
+```text
+review → accepted
+legacy_completed → accepted
+```
 
-This preserves old API/event behavior without violating the new rule that acceptance is explicit.
+Both paths require a non-empty `acceptance_note` and exact current revision.
+
+The `legacy_completed → accepted` path is the only safe way to retroactively accept a historical completed deliverable. It requires an explicit new acceptance transaction; deployment or normalization alone can never perform this conversion.
+
+#### `deliverable.supersede`
+
+Requires original and replacement records to both exist and both be `accepted`. It moves the original `accepted → superseded`, writes `superseded_by` and `superseded_reason` on the original, and preserves the replacement as accepted current output. No accepted record is deleted.
+
+#### `deliverable.abandon`
+
+Allowed from `planned`, `in_progress`, `review`, or `legacy_completed`. Requires a reason. Accepted deliverables cannot be abandoned; they must be superseded to preserve accepted history.
+
+All lifecycle transitions are exact-revision operations. `deliverable.create` may be additive, but the implementation should prefer exact revision if that materially simplifies deterministic cross-reference validation.
+
+### 6.4 Legacy operation behavior
+
+Compatibility rules:
+
+- historical `pending` normalizes to `planned`;
+- historical `completed` normalizes to `legacy_completed`;
+- deprecated `deliverable.add` creates `planned` with no invented version;
+- deprecated `deliverable.complete` moves a non-terminal record to `legacy_completed`, never to `accepted`.
 
 ## 7. State normalization and migration safety
 
-Current `ProjectGuard.loadState()` performs a raw `JSON.parse(... as ProjectState)`. Existing Durable Object rows therefore lack the new fields and may contain old deliverable statuses.
-
-Introduce a pure deterministic function:
+Current `ProjectGuard.loadState()` performs a raw JSON parse/cast. Introduce a pure deterministic normalizer:
 
 ```ts
 normalizeProjectState(input: unknown): ProjectState
 ```
 
-and call it from `ProjectGuard.loadState()` after parsing stored JSON.
+and call it from `ProjectGuard.loadState()`.
 
 Normalization rules:
 
-1. missing `framing` becomes all-empty arrays;
-2. missing `discovery` becomes all-empty arrays;
-3. missing `decision_ids` on deliverables becomes `[]`;
-4. old `pending` deliverables become `planned` in memory;
-5. old `completed` deliverables become `legacy_completed` in memory;
-6. optional new deliverable metadata remains undefined when absent;
-7. no project revision is changed by normalization;
-8. no domain event is emitted by normalization;
-9. no accepted state is inferred;
-10. normalization is idempotent.
+1. missing `framing` → empty framing arrays;
+2. missing `discovery` → empty discovery arrays;
+3. missing deliverable `decision_ids` → `[]`;
+4. old `pending` → `planned` in memory;
+5. old `completed` → `legacy_completed` in memory;
+6. new optional metadata remains undefined if absent;
+7. project revision is unchanged;
+8. no domain event is created;
+9. acceptance is never inferred;
+10. normalization is idempotent;
+11. malformed state outside explicitly supported legacy/current shapes is rejected rather than silently coerced.
 
-The normalizer should accept only the known legacy/current shape needed for Project OS. It must not become a permissive arbitrary-object cast.
+The state envelope stays `schema_version: "1.0"` during this rollout to avoid coupling semantic enforcement to a separate envelope migration. A future explicit state-schema migration may bump it after this model is proven.
 
-The current state `schema_version` remains `1.0` for this implementation to avoid coupling semantic enforcement to a separate state-envelope migration. A future explicit schema-version migration may bump it after the new model is proven in production.
-
-### Persistence behavior
-
-Normalization is in-memory on read. A subsequent legitimate committed transaction persists the normalized state through the existing `persistCommit()` path. Pure materialization may render normalized views without incrementing business revision.
-
-This is acceptable because normalization changes representation, not project business facts. The compatibility status `legacy_completed` explicitly prevents representation normalization from inventing acceptance.
+Normalization is in-memory on load. A later legitimate committed transaction persists the normalized state via the existing commit path. Pure materialization may render normalized views without changing business revision.
 
 ## 8. Transition and concurrency rules
 
-Add to exact-revision operations:
+Add exact-revision requirements for:
 
 ```text
 project.framing.update
@@ -345,19 +343,15 @@ deliverable.supersede
 deliverable.abandon
 ```
 
-Reason: these operations alter a current synthesis or transition a singleton entity lifecycle. Stale competing writes should conflict rather than silently win.
+Reason: each operation changes current synthesis, framing, or a singleton lifecycle state. Stale competing writes should conflict.
 
-Existing Project Guard serialization, idempotency by transaction ID, receipt publication order, and conflict semantics remain unchanged.
-
-No new semantic auto-merge is introduced.
+Existing Project Guard serialization, transaction-ID idempotency, terminal receipts, and receipt-last persistence remain unchanged.
 
 ## 9. Renderer contract
 
-### 9.1 BRIEF.md
+### 9.1 `BRIEF.md`
 
-`BRIEF.md` MUST render project framing, never execution state as a substitute.
-
-Target sections:
+Target structure:
 
 ```text
 # Brief — <project>
@@ -384,22 +378,22 @@ Target sections:
 <framing.open_questions>
 ```
 
-The active phase and deliverables do not belong in these sections.
+Active phase and deliverables MUST NOT be substituted into these sections.
 
-Sparse project behavior remains explicit: `Not yet defined` / equivalent messages, never invented content.
+Sparse project output remains explicit: undefined sections say they are not yet defined rather than inventing facts.
 
-### 9.2 DISCOVERY.md
+### 9.2 `DISCOVERY.md`
 
-Target sections:
+Target structure:
 
 ```text
 # Discovery — <project>
 
 ## Confirmed findings
-<confirmed_findings + research links>
+<confirmed findings + research links>
 
 ## Provisional findings
-<provisional_findings + research links>
+<provisional findings + research links>
 
 ## Unresolved questions
 <discovery.unresolved_questions>
@@ -411,13 +405,11 @@ Target sections:
 <accepted decision links>
 ```
 
-Research records are linked from synthesized findings. The renderer should not dump every research record merely because it exists.
+The renderer does not dump all research records merely because they exist. Blocked tasks belong to State/Roadmap unless an explicit discovery question records the underlying knowledge uncertainty.
 
-Blocked tasks belong to State/Roadmap, not Discovery unless a real unresolved discovery question is explicitly recorded.
+### 9.3 `ROADMAP.md`
 
-### 9.3 ROADMAP.md
-
-Keep the already validated structure:
+Keep the validated model:
 
 ```text
 Current
@@ -429,11 +421,11 @@ Completed
 Deliverables
 ```
 
-No semantic change is required in this phase except adapting deliverable status labels to the richer lifecycle.
+Only deliverable status labels need adaptation to the richer lifecycle.
 
 ### 9.4 Deliverable notes
 
-Each deliverable note MUST expose at minimum:
+Expose at minimum:
 
 ```text
 Deliverable ID
@@ -444,7 +436,7 @@ Phase (when present)
 Related decisions
 Created
 Updated
-Acceptance note / accepted_at when accepted
+Acceptance note and accepted_at when accepted
 Supersession linkage/reason when superseded
 Abandonment reason when abandoned
 Reference
@@ -452,7 +444,7 @@ Description
 Outcome
 ```
 
-For `legacy_completed`, render a clear compatibility warning such as:
+For historical completed records:
 
 ```text
 Status: legacy_completed
@@ -461,148 +453,142 @@ Acceptance: not inferred; explicit acceptance was not recorded in the legacy mod
 
 ## 10. Human/LLM behavior
 
-The SOP suite remains the method source of truth. The code supplies deterministic guardrails, not replacement judgment.
+The SOP remains the method source of truth. Code supplies deterministic guardrails, not replacement judgment.
 
-The assistant MUST continue to distinguish:
+Project framing updates are directional. A speculative recommendation must not be written into framing before user acceptance when it materially changes direction.
 
-```text
-fact → research finding → recommendation → explicit acceptance → decision
-```
+Discovery synthesis can be refreshed autonomously when it faithfully summarizes already canonical facts/research and does not create a new business-direction decision.
 
-Similarly, a deliverable reaches `accepted` only after explicit user acceptance and an explicit `deliverable.accept` transaction.
-
-Project framing updates are directional. The assistant should not persist a speculative recommendation into framing before acceptance.
-
-Discovery synthesis may be updated autonomously when it is a faithful synthesis of already accepted/recorded facts and research, but material interpretation changes that alter direction still follow the knowledge/decision SOP.
+Deliverable acceptance remains explicit: the assistant emits `deliverable.accept` only after user acceptance. A file, completed task, or legacy `completed` status is not acceptance evidence.
 
 ## 11. Backward compatibility
 
-Existing projects MUST continue to load with no manual migration.
+Existing projects MUST load without manual migration.
 
-Compatibility acceptance criteria:
+Acceptance criteria:
 
 - PRJ-0001 through PRJ-0004 load successfully;
-- their current revisions do not change merely because new code is deployed;
-- old decisions/tasks/research/events remain readable;
-- old `pending` deliverables render as planned-compatible state;
-- old `completed` deliverables do not silently render as accepted;
-- a pure `/materialize` call does not create a business event;
+- deployment/normalization alone does not increment revisions;
+- old events, decisions, tasks, and research remain intact;
+- pending deliverables become planned-compatible in memory;
+- completed deliverables become `legacy_completed`, not accepted;
+- `legacy_completed` may become accepted only through explicit `deliverable.accept`;
+- pure `/materialize` creates no business event;
 - old transaction IDs remain idempotent;
-- legacy transaction operation parsing remains available where required for replay/in-flight compatibility.
+- legacy operations remain parseable for replay/in-flight compatibility.
 
-## 12. Test strategy
+## 12. TDD strategy
 
-Implementation MUST use TDD.
+Implementation MUST use failing tests first.
 
-### 12.1 Normalization tests
+### 12.1 Normalization
 
-Start with failing tests for:
+Test:
 
 - missing framing/discovery defaults;
 - pending → planned;
 - completed → legacy_completed;
 - idempotent normalization;
-- preservation of revision/event IDs;
-- rejection of malformed state where current code previously relied on unsafe casting.
+- preservation of revision/event ID;
+- malformed-state rejection.
 
-### 12.2 Transaction schema tests
+### 12.2 Transaction schema
 
-Failing tests for each new operation and strict payload shape, including research/phase/decision references and required acceptance/reason fields.
+Test strict payloads for every new operation, including required acceptance/reason fields and reference validation expectations.
 
-### 12.3 Transition tests
+### 12.3 Transitions
 
-Cover:
+Test:
 
 - framing replacement semantics;
 - discovery replacement semantics;
 - exact-revision conflicts;
-- full deliverable happy path;
+- full planned → in_progress → review → accepted path;
+- legacy_completed → accepted with explicit acceptance note;
 - revise from review;
-- invalid lifecycle transitions;
-- acceptance only from review;
-- supersession preserving both deliverables;
+- invalid transitions;
+- supersession preserving both records;
 - abandonment terminal behavior;
 - legacy operation compatibility.
 
-### 12.4 Renderer tests
+### 12.4 Renderers
 
-Explicitly prove that:
+Prove explicitly:
 
 - Brief scope does not equal current phase;
 - Brief success criteria do not equal deliverables;
-- Discovery questions do not equal blockers;
-- Discovery exploration does not equal phase actions unless explicitly recorded in discovery;
-- Roadmap retains Current / Next / Later;
-- accepted/legacy/superseded deliverable metadata is unambiguous.
+- Brief framing questions and discovery questions are distinct;
+- Discovery unresolved questions do not equal blockers;
+- Discovery exploration does not equal phase actions unless explicitly recorded;
+- Roadmap remains Current / Next / Later;
+- legacy/accepted/superseded deliverable states render unambiguously.
 
-### 12.5 Integration tests
+### 12.5 Project Guard integration
 
-Verify Project Guard:
+Verify:
 
-- normalizes stored legacy state on load;
-- persists normalized state only through legitimate commit flow;
-- preserves idempotency;
-- preserves receipt-last behavior;
-- materializes deterministic Markdown;
-- does not increment revision for pure materialization.
+- legacy state normalization on load;
+- normalized state persists only through legitimate commit flow;
+- idempotency remains intact;
+- receipt-last behavior remains intact;
+- pure materialization does not increment revision;
+- generated Markdown is deterministic.
 
 ## 13. Rollout
 
-Rollout sequence:
-
-1. implement on isolated feature branch using TDD;
+1. implement on an isolated feature branch with TDD;
 2. run full `npm run check`;
 3. run `npx wrangler deploy --dry-run`;
-4. review PR diff against this spec and `DEC-SOPENF002`;
+4. review diff against this spec and `DEC-SOPENF002`;
 5. merge only when CI is green;
-6. rely on the existing Cloudflare Workers Builds Git integration as the production deployment path;
-7. confirm Cloudflare deployment success from the GitHub bot/status;
-8. verify `/health` when accessible;
-9. pure-materialize existing test projects where appropriate;
-10. replay dedicated PRJ-0004 stress-test scenarios with explicit framing/discovery/deliverable data;
+6. use the existing Cloudflare Workers Builds Git integration as production deployment path;
+7. confirm Cloudflare deployment success via its GitHub status/comment;
+8. verify Worker health when accessible;
+9. materialize existing test projects where appropriate;
+10. replay PRJ-0004 with explicit framing, discovery, and deliverable lifecycle data;
 11. run Markdown-only clean-room resume;
-12. only then consider the SOP enforcement layer validated for final adoption.
+12. only then consider SOP Enforcement V2 validated.
 
-The redundant GitHub Actions `deploy.yml` introduced during troubleshooting is not part of the production deployment architecture because it lacks Cloudflare credentials and the existing Workers Builds integration already owns deployment. Removing or disabling that redundant workflow should be handled as a small cleanup change alongside implementation or immediately before merge, provided Cloudflare Workers Builds remains verified.
+The troubleshooting-only `.github/workflows/deploy.yml` is not part of the production deployment architecture because it lacks Cloudflare credentials and Workers Builds already owns deployment. Remove or disable it as a bounded cleanup during implementation so routine pushes do not create misleading deployment failures.
 
-## 14. Failure and rollback behavior
+## 14. Failure and rollback
 
-If new code fails before commit, existing Project Guard state remains untouched.
+If new code fails before commit, canonical Project Guard state is untouched.
 
-If production rendering is wrong but canonical transitions are correct, rollback the Worker to the previous known-good code while preserving state.
+If production rendering is wrong while canonical state remains valid, rollback Worker code to the prior known-good revision; do not rewrite state to match a renderer bug.
 
-If normalization reveals an unexpected legacy shape, reject/diagnose it rather than silently fabricating defaults beyond the explicitly supported compatibility rules.
+If normalization encounters an unsupported legacy shape, diagnose/reject it rather than inventing values.
 
-Never delete legacy Dropbox history as part of this rollout.
+Never delete legacy Dropbox history during this rollout.
 
-## 15. Acceptance criteria
+## 15. Completion criteria
 
-SOP Enforcement V2 is complete only when all of the following are demonstrated:
+SOP Enforcement V2 is complete only when:
 
-1. Brief renders true framing and never substitutes phase/deliverables for scope/success criteria.
-2. Discovery renders explicit synthesis and never substitutes objective/blockers/tasks for discovery concepts.
-3. New deliverables follow planned → in_progress → review → accepted.
-4. Acceptance is represented only by explicit `deliverable.accept`.
-5. Superseded and abandoned deliverables preserve history.
-6. Legacy completed deliverables do not become accepted implicitly.
-7. Existing projects load without manual migration or revision increments.
-8. New transactions remain receipt-gated and idempotent.
-9. Roadmap remains Current / Next / Later.
-10. PRJ-0004 passes the second stress test.
-11. A fresh LLM can reconstruct objective, framing, current learning, current direction, accepted decisions, deliverables, blockers, and next meaningful action from Markdown/SOP artifacts without prior chat.
+1. Brief renders true framing and never substitutes phase/deliverables for scope/success;
+2. Discovery renders explicit synthesis and never substitutes objective/blockers/tasks;
+3. new deliverables follow planned → in_progress → review → accepted;
+4. acceptance exists only through explicit `deliverable.accept`;
+5. historical completed deliverables remain non-accepted until explicitly accepted;
+6. superseded/abandoned deliverables preserve history;
+7. existing projects load without manual migration or revision increment;
+8. new transactions remain receipt-gated and idempotent;
+9. Roadmap remains Current / Next / Later;
+10. PRJ-0004 passes the second stress test;
+11. a fresh LLM can reconstruct objective, framing, current learning, current direction, decisions, deliverables, blockers, and next meaningful action from Markdown/SOP artifacts without prior chat;
 12. Project OS remains reconstructable without hidden scripts or proprietary-only knowledge.
 
-## 16. Design decision summary
+## 16. Architecture summary
 
-The implementation should extend canonical concepts first and renderers second.
+The correct ordering is canonical concepts first, renderers second.
 
-Do not solve these defects by writing smarter prose in `brief.ts` or `discovery.ts`. Without explicit canonical fields, such prose would still be inference presented as fact.
+Do not solve these defects by making `brief.ts` or `discovery.ts` write smarter inferred prose. Without explicit guarded fields, inferred prose would still present inference as fact.
 
-The intended architecture is therefore:
+Target flow:
 
 ```text
 Accepted project framing ─┐
-Research + synthesis ─────┼─> ProjectState ─> deterministic Markdown views
+Research + synthesis ─────┼─> ProjectState ─> deterministic Markdown
 Accepted decisions ───────┤
 Roadmap/tasks ─────────────┤
 Deliverable lifecycle ─────┘
@@ -616,4 +602,6 @@ Project Guard validation + serialization
 immutable event + state + receipt
 ```
 
-That preserves the core Project OS invariant: **simple human views are generated from explicit guarded state, not from hidden model inference.**
+The resulting invariant is:
+
+> Simple human views are generated from explicit guarded state, not hidden model inference.

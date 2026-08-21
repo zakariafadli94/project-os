@@ -9,5 +9,5 @@ export function renderProject(state: ProjectState): string {
     .map((item) => `- **${item.constraint_id} — ${item.title}:** ${item.description}`)
     .join("\n") || "- None";
 
-  return `${renderProjectFrontmatter(state, "PROJECT", "project")}${MANAGED_NOTICE}\n# ${state.name}\n\nProject ID: ${state.project_id}\nStatus: ${state.status}\nRevision: ${state.revision}\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Aliases\n\n${aliases}\n\n## Durable constraints\n\n${constraints}\n`;
+  return `${renderProjectFrontmatter(state, "PROJECT", "project")}${MANAGED_NOTICE}\n# ${state.name}\n\nProject ID: ${state.project_id}\nStatus: ${state.status}\nRevision: ${state.revision}\n\n## Start here\n\n- [[BRIEF|Brief]] — what this project is and what success means.\n- [[DISCOVERY|Discovery]] — what we know, learned and still need to explore.\n- [[ROADMAP|Roadmap]] — what is happening now and what comes next.\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Aliases\n\n${aliases}\n\n## Durable constraints\n\n${constraints}\n`;
 }

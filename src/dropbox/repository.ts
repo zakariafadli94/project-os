@@ -17,8 +17,12 @@ import {
   machineEventPath,
   machineManifestPath,
   machineReceiptPath,
+  machineRegistryJsonPath,
+  machineRegistryMarkdownPath,
   machineStatePath,
+  machineTransactionPath,
   workspaceEntityPath,
+  workspacePortfolioDashboardPath,
   workspaceProjectFile
 } from "./layout";
 import {
@@ -126,13 +130,23 @@ export class ProjectRepository {
 
   async writeTerminalTransaction(transaction: Transaction, receipt: Receipt): Promise<void> {
     const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
-    await this.safeAdd(transactionPath(statusFolder, transaction.transaction_id), pretty({ transaction, receipt }));
+    const path = this.mode === "v2"
+      ? machineTransactionPath(statusFolder, transaction.transaction_id)
+      : transactionPath(statusFolder, transaction.transaction_id);
+    await this.safeAdd(path, pretty({ transaction, receipt }));
     await this.writeReceipt(receipt);
   }
 
   async writeRegistry(registry: unknown, markdown: string): Promise<void> {
-    await this.transport.upload(registryJsonPath(), pretty(registry), "overwrite");
-    await this.transport.upload(registryMarkdownPath(), markdown, "overwrite");
+    if (this.mode === "legacy" || this.mode === "shadow") {
+      await this.transport.upload(registryJsonPath(), pretty(registry), "overwrite");
+      await this.transport.upload(registryMarkdownPath(), markdown, "overwrite");
+    }
+    if (this.mode === "shadow" || this.mode === "v2") {
+      await this.transport.upload(machineRegistryJsonPath(), pretty(registry), "overwrite");
+      await this.transport.upload(machineRegistryMarkdownPath(), markdown, "overwrite");
+      await this.transport.upload(workspacePortfolioDashboardPath(), markdown, "overwrite");
+    }
   }
 
   private async writeLegacyArtifacts(state: ProjectState, event: DomainEvent): Promise<void> {

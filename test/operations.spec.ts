@@ -67,13 +67,15 @@ describe("complete V1 operation surface", () => {
     expect(applyTransaction(state, tx(state.project_id, 4, "plan.phase.update", { phase_id: "PHASE-2001", title: "Changed" })).kind).toBe("rejected");
   });
 
-  it("rejects duplicate constraints and deliverables and terminal re-completion", () => {
+  it("keeps deprecated deliverable operations compatible without inferring acceptance", () => {
     let state = emptyProjectState("PRJ-2004", "Outputs", "outputs");
     state = commit(state, tx(state.project_id, 0, "constraint.add", { constraint_id: "CON-2001", title: "Budget", description: "Low" }));
     expect(applyTransaction(state, tx(state.project_id, 1, "constraint.add", { constraint_id: "CON-2001", title: "Budget", description: "Again" })).kind).toBe("rejected");
     state = commit(state, tx(state.project_id, 1, "deliverable.add", { deliverable_id: "DEL-2001", title: "Report" }));
+    expect(state.deliverables["DEL-2001"].status).toBe("planned");
     state = commit(state, tx(state.project_id, 2, "deliverable.complete", { deliverable_id: "DEL-2001", outcome: "Delivered" }));
-    expect(state.deliverables["DEL-2001"].status).toBe("completed");
+    expect(state.deliverables["DEL-2001"].status).toBe("legacy_completed");
+    expect(state.deliverables["DEL-2001"].acceptance_note).toBeUndefined();
     expect(applyTransaction(state, tx(state.project_id, 3, "deliverable.complete", { deliverable_id: "DEL-2001" })).kind).toBe("rejected");
   });
 });
@@ -153,5 +155,121 @@ describe("SOP V2 framing and discovery operations", () => {
       operation: "discovery.synthesis.update",
       payload: {}
     })).toThrow();
+  });
+});
+
+describe("SOP V2 deliverable lifecycle", () => {
+  it("moves a versioned deliverable through planned, work, review, revision and explicit acceptance", () => {
+    let state = emptyProjectState("PRJ-2201", "Deliverables", "deliverables");
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-2201", title: "Delivery"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "decision.accept", {
+      decision_id: "DEC-2201", title: "Format", decision: "Use report", reason: "Validated", impacts: []
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-2201",
+      title: "Strategy report",
+      version: "v1",
+      phase_id: "PHASE-2201",
+      decision_ids: ["DEC-2201"]
+    }));
+    expect(state.deliverables["DEL-2201"].status).toBe("planned");
+    expect(state.deliverables["DEL-2201"].version).toBe("v1");
+    expect(state.deliverables["DEL-2201"].decision_ids).toEqual(["DEC-2201"]);
+
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.start", { deliverable_id: "DEL-2201" }));
+    expect(state.deliverables["DEL-2201"].status).toBe("in_progress");
+
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.submit_review", { deliverable_id: "DEL-2201" }));
+    expect(state.deliverables["DEL-2201"].status).toBe("review");
+
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.revise", {
+      deliverable_id: "DEL-2201", version: "v2", description: "Revised after review"
+    }));
+    expect(state.deliverables["DEL-2201"].status).toBe("in_progress");
+    expect(state.deliverables["DEL-2201"].version).toBe("v2");
+
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.submit_review", { deliverable_id: "DEL-2201" }));
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.accept", {
+      deliverable_id: "DEL-2201", acceptance_note: "Explicitly approved by user"
+    }));
+    expect(state.deliverables["DEL-2201"].status).toBe("accepted");
+    expect(state.deliverables["DEL-2201"].acceptance_note).toBe("Explicitly approved by user");
+    expect(state.deliverables["DEL-2201"].accepted_at).toBe(at);
+  });
+
+  it("rejects invalid references, stale lifecycle writes and unchanged revisions", () => {
+    let state = emptyProjectState("PRJ-2202", "Validation", "validation");
+
+    const missingPhase = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-2202", title: "Bad", version: "v1", phase_id: "PHASE-9999"
+    }));
+    expect(missingPhase.kind).toBe("rejected");
+
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-2202", title: "Good", version: "v1"
+    }));
+    const stale = applyTransaction(state, tx(state.project_id, 0, "deliverable.start", { deliverable_id: "DEL-2202" }));
+    expect(stale.kind).toBe("conflict");
+
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.start", { deliverable_id: "DEL-2202" }));
+    const sameVersion = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.revise", {
+      deliverable_id: "DEL-2202", version: "v1"
+    }));
+    expect(sameVersion.kind).toBe("rejected");
+  });
+
+  it("preserves accepted deliverable history through explicit supersession", () => {
+    let state = emptyProjectState("PRJ-2203", "Supersession", "supersession");
+
+    for (const [id, title] of [["DEL-2203", "Report v1"], ["DEL-2204", "Report v2"]] as const) {
+      state = commit(state, tx(state.project_id, state.revision, "deliverable.create", {
+        deliverable_id: id, title, version: "v1"
+      }));
+      state = commit(state, tx(state.project_id, state.revision, "deliverable.start", { deliverable_id: id }));
+      state = commit(state, tx(state.project_id, state.revision, "deliverable.submit_review", { deliverable_id: id }));
+      state = commit(state, tx(state.project_id, state.revision, "deliverable.accept", {
+        deliverable_id: id, acceptance_note: `Approved ${id}`
+      }));
+    }
+
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.supersede", {
+      deliverable_id: "DEL-2203", replacement_deliverable_id: "DEL-2204", reason: "New accepted version"
+    }));
+
+    expect(state.deliverables["DEL-2203"].status).toBe("superseded");
+    expect(state.deliverables["DEL-2203"].superseded_by).toBe("DEL-2204");
+    expect(state.deliverables["DEL-2203"].superseded_reason).toBe("New accepted version");
+    expect(state.deliverables["DEL-2204"].status).toBe("accepted");
+  });
+
+  it("abandons only non-accepted work and can explicitly accept legacy completed output", () => {
+    let state = emptyProjectState("PRJ-2204", "Terminal states", "terminal-states");
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-2205", title: "Discarded", version: "v1"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.abandon", {
+      deliverable_id: "DEL-2205", reason: "No longer needed"
+    }));
+    expect(state.deliverables["DEL-2205"].status).toBe("abandoned");
+    expect(state.deliverables["DEL-2205"].abandoned_reason).toBe("No longer needed");
+
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.add", {
+      deliverable_id: "DEL-2206", title: "Legacy final"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.complete", {
+      deliverable_id: "DEL-2206", outcome: "Delivered before V2"
+    }));
+    expect(state.deliverables["DEL-2206"].status).toBe("legacy_completed");
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.accept", {
+      deliverable_id: "DEL-2206", acceptance_note: "User explicitly accepts historical output"
+    }));
+    expect(state.deliverables["DEL-2206"].status).toBe("accepted");
+
+    const acceptedAbandon = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.abandon", {
+      deliverable_id: "DEL-2206", reason: "Should fail"
+    }));
+    expect(acceptedAbandon.kind).toBe("rejected");
   });
 });

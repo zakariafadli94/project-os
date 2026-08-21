@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker from "../src/index";
+import worker, { inboxPath } from "../src/index";
 import type { Env } from "../src/env";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
@@ -22,6 +22,12 @@ async function hmac(body: string): Promise<string> {
 describe("Worker routing", () => {
   beforeEach(() => installDropboxMock());
   afterEach(() => vi.restoreAllMocks());
+
+  it("selects inbox path from layout mode", () => {
+    expect(inboxPath("legacy")).toBe("/PROJECT_OS/TRANSACTIONS/incoming");
+    expect(inboxPath("shadow")).toBe("/PROJECT_OS/TRANSACTIONS/incoming");
+    expect(inboxPath("v2")).toBe("/PROJECT_OS/.project-os/transactions/incoming");
+  });
 
   it("returns health status", async () => {
     const ctx = createExecutionContext();

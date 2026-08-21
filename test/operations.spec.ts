@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
-import type { Transaction } from "../src/domain/transaction";
+import { parseTransaction, type Transaction } from "../src/domain/transaction";
 
 const at = "2026-08-20T18:00:00.000Z";
 let serial = 0;
@@ -75,5 +75,83 @@ describe("complete V1 operation surface", () => {
     state = commit(state, tx(state.project_id, 2, "deliverable.complete", { deliverable_id: "DEL-2001", outcome: "Delivered" }));
     expect(state.deliverables["DEL-2001"].status).toBe("completed");
     expect(applyTransaction(state, tx(state.project_id, 3, "deliverable.complete", { deliverable_id: "DEL-2001" })).kind).toBe("rejected");
+  });
+});
+
+describe("SOP V2 framing and discovery operations", () => {
+  it("updates project framing with replacement semantics and exact revision safety", () => {
+    let state = emptyProjectState("PRJ-2101", "Framing", "framing", "Initial objective");
+    state = commit(state, tx(state.project_id, state.revision, "project.framing.update", {
+      objective: "Validated objective",
+      scope: ["Agency offer design"],
+      success_criteria: ["Offer explicitly validated"],
+      stakeholders: ["Owner"]
+    }));
+
+    expect(state.objective).toBe("Validated objective");
+    expect(state.framing.scope).toEqual(["Agency offer design"]);
+    expect(state.framing.success_criteria).toEqual(["Offer explicitly validated"]);
+    expect(state.framing.stakeholders).toEqual(["Owner"]);
+
+    const stale = applyTransaction(state, tx(state.project_id, 0, "project.framing.update", { scope: ["Stale"] }));
+    expect(stale.kind).toBe("conflict");
+
+    state = commit(state, tx(state.project_id, state.revision, "project.framing.update", { scope: [] }));
+    expect(state.framing.scope).toEqual([]);
+  });
+
+  it("stores discovery synthesis only when referenced research exists", () => {
+    let state = emptyProjectState("PRJ-2102", "Discovery", "discovery");
+    state.research["RES-2101"] = {
+      research_id: "RES-2101",
+      title: "Interviews",
+      body: "Evidence",
+      created_at: at
+    };
+
+    state = commit(state, tx(state.project_id, state.revision, "discovery.synthesis.update", {
+      confirmed_findings: [{ summary: "SMBs value speed", research_ids: ["RES-2101"] }],
+      provisional_findings: [{ summary: "A niche offer may convert better", research_ids: [] }],
+      unresolved_questions: ["Preferred pricing model?"],
+      next_exploration: ["Test pricing interviews"]
+    }));
+
+    expect(state.discovery.confirmed_findings).toEqual([
+      { summary: "SMBs value speed", research_ids: ["RES-2101"] }
+    ]);
+    expect(state.discovery.unresolved_questions).toEqual(["Preferred pricing model?"]);
+
+    const missing = applyTransaction(state, tx(state.project_id, state.revision, "discovery.synthesis.update", {
+      confirmed_findings: [{ summary: "Unsupported finding", research_ids: ["RES-9999"] }]
+    }));
+    expect(missing.kind).toBe("rejected");
+
+    const stale = applyTransaction(state, tx(state.project_id, 0, "discovery.synthesis.update", {
+      unresolved_questions: []
+    }));
+    expect(stale.kind).toBe("conflict");
+  });
+
+  it("rejects empty framing and discovery update payloads", () => {
+    const base = {
+      schema_version: "1.0" as const,
+      project_id: "PRJ-2103",
+      base_revision: 0,
+      created_at: at
+    };
+
+    expect(() => parseTransaction({
+      ...base,
+      transaction_id: "TXN-EMPTY-FRAMING-0001",
+      operation: "project.framing.update",
+      payload: {}
+    })).toThrow();
+
+    expect(() => parseTransaction({
+      ...base,
+      transaction_id: "TXN-EMPTY-DISCOVERY-001",
+      operation: "discovery.synthesis.update",
+      payload: {}
+    })).toThrow();
   });
 });

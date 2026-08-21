@@ -4,7 +4,7 @@ import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/tr
 import { DropboxClient, DropboxConflictError } from "./dropbox/client";
 import { type LayoutMode, machineTransactionPath, parseLayoutMode } from "./dropbox/layout";
 import { assertSafeProjectId, PROJECT_OS_ROOT, transactionPath } from "./dropbox/paths";
-import { mirrorLegacyEvents } from "./migration/workspace-v2";
+import { mirrorLegacyEvents, mirrorLegacyLedger } from "./migration/workspace-v2";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
 export { ProjectGuard } from "./durable/project-guard";
@@ -53,6 +53,18 @@ const worker = {
     if (request.method === "POST" && url.pathname === "/v1/admin/workspace-v2/materialize") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
       return materializeExistingProjects(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/admin/workspace-v2/migrate-ledger") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      try {
+        return Response.json(await migrateLegacyLedger(env));
+      } catch (error) {
+        return Response.json({
+          error: "ledger_migration_failed",
+          message: error instanceof Error ? error.message : String(error)
+        }, { status: 502 });
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/v1/admin/process-inbox") {
@@ -177,6 +189,15 @@ async function materializeExistingProjects(request: Request, env: Env): Promise<
   }
 
   return Response.json({ results });
+}
+
+async function migrateLegacyLedger(env: Env): Promise<{ transactions: number; receipts: number }> {
+  const client = new DropboxClient({
+    appKey: env.DROPBOX_APP_KEY,
+    appSecret: env.DROPBOX_APP_SECRET,
+    refreshToken: env.DROPBOX_REFRESH_TOKEN
+  });
+  return mirrorLegacyLedger(client);
 }
 
 async function routeTransaction(env: Env, transaction: Transaction): Promise<Receipt> {

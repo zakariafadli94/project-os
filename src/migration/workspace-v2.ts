@@ -3,8 +3,8 @@ import {
   type DropboxEntry,
   type DropboxTransport
 } from "../dropbox/client";
-import { machineEventPath } from "../dropbox/layout";
-import { assertSafeProjectId, assertSafeSlug, projectRoot } from "../dropbox/paths";
+import { machineEventPath, machineReceiptPath, machineTransactionPath } from "../dropbox/layout";
+import { assertSafeProjectId, assertSafeSlug, PROJECT_OS_ROOT, projectRoot } from "../dropbox/paths";
 
 export interface MigrationTransport extends DropboxTransport {
   listFolder(path: string): Promise<DropboxEntry[]>;
@@ -51,4 +51,44 @@ export async function mirrorLegacyEvents(
   }
 
   return { mirrored };
+}
+
+export async function mirrorLegacyLedger(
+  transport: MigrationTransport
+): Promise<{ transactions: number; receipts: number }> {
+  let transactions = 0;
+  let receipts = 0;
+
+  for (const status of ["committed", "rejected", "conflicts"] as const) {
+    const legacyRoot = `${PROJECT_OS_ROOT}/TRANSACTIONS/${status}`;
+    const entries = await transport.listFolder(legacyRoot);
+
+    for (const entry of entries
+      .filter((item) => item.tag === "file" && /^TXN-[A-Z0-9-]{10,}(?:\.source)?\.json$/.test(item.name))
+      .sort((a, b) => a.name.localeCompare(b.name))) {
+      const sourcePath = entry.path_display;
+      if (!sourcePath) continue;
+      const isSourceArtifact = entry.name.endsWith(".source.json");
+      const transactionId = entry.name.replace(/(?:\.source)?\.json$/, "");
+      const terminalPath = machineTransactionPath(status, transactionId);
+      const destinationPath = isSourceArtifact
+        ? terminalPath.replace(/\.json$/, ".source.json")
+        : terminalPath;
+      await mirrorImmutableFile(transport, sourcePath, destinationPath);
+      if (!isSourceArtifact) transactions += 1;
+    }
+  }
+
+  const receiptEntries = await transport.listFolder(`${PROJECT_OS_ROOT}/RECEIPTS`);
+  for (const entry of receiptEntries
+    .filter((item) => item.tag === "file" && /^TXN-[A-Z0-9-]{10,}\.json$/.test(item.name))
+    .sort((a, b) => a.name.localeCompare(b.name))) {
+    const sourcePath = entry.path_display;
+    if (!sourcePath) continue;
+    const transactionId = entry.name.replace(/\.json$/, "");
+    await mirrorImmutableFile(transport, sourcePath, machineReceiptPath(transactionId));
+    receipts += 1;
+  }
+
+  return { transactions, receipts };
 }

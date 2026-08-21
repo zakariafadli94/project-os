@@ -96,7 +96,12 @@ export class ProjectGuard extends DurableObject<Env> {
       if (existing) {
         if (existing.status === "committed" && PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
           const currentState = this.loadState();
-          if (currentState) await this.syncRegistryStatus(currentState);
+          if (currentState) {
+            if (tx.operation === "project.archive") {
+              await this.repository.archiveHumanWorkspace(currentState);
+            }
+            await this.syncRegistryStatus(currentState);
+          }
         }
         return Response.json(existing);
       }

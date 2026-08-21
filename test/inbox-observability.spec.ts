@@ -26,8 +26,8 @@ describe("inbox recovery observability", () => {
       "Project OS scheduled inbox scan started",
       expect.objectContaining({
         cron: "*/5 * * * *",
-        mode: "shadow",
-        inbox: "/PROJECT_OS/TRANSACTIONS/incoming"
+        mode: "v2",
+        inbox: "/PROJECT_OS/.project-os/transactions/incoming"
       })
     );
     expect(info).toHaveBeenCalledWith(

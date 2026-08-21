@@ -65,7 +65,7 @@ describe("Worker routing", () => {
       created_at: "2026-08-20T18:00:00.000Z",
       payload: { name: "Webhook Project", slug: "webhook-project", aliases: [], objective: "Verify ingress" }
     };
-    mock.files.set(`/PROJECT_OS/TRANSACTIONS/incoming/${transaction.transaction_id}.json`, JSON.stringify(transaction));
+    mock.files.set(`/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`, JSON.stringify(transaction));
     const body = '{"list_folder":{"accounts":["dbid:test"]}}';
     const ctx = createExecutionContext();
     const response = await worker.fetch(new Request("https://example.com/dropbox/webhook", {
@@ -75,8 +75,8 @@ describe("Worker routing", () => {
     }), testEnv, ctx);
     expect(response.status).toBe(200);
     await waitOnExecutionContext(ctx);
-    expect(mock.files.has(`/PROJECT_OS/TRANSACTIONS/committed/${transaction.transaction_id}.json`)).toBe(true);
-    expect(mock.files.has(`/PROJECT_OS/TRANSACTIONS/incoming/${transaction.transaction_id}.json`)).toBe(false);
+    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${transaction.transaction_id}.json`)).toBe(true);
+    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`)).toBe(false);
   });
 
   it("recovers an unprocessed incoming transaction from the scheduled handler", async () => {
@@ -90,14 +90,14 @@ describe("Worker routing", () => {
       created_at: "2026-08-20T18:00:00.000Z",
       payload: { name: "Cron Project", slug: "cron-project", aliases: [], objective: "Recover missed webhook" }
     };
-    mock.files.set(`/PROJECT_OS/TRANSACTIONS/incoming/${transaction.transaction_id}.json`, JSON.stringify(transaction));
+    mock.files.set(`/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`, JSON.stringify(transaction));
 
     const ctx = createExecutionContext();
     await worker.scheduled?.({ cron: "*/5 * * * *", scheduledTime: Date.now(), noRetry: () => undefined } as ScheduledController, testEnv, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(mock.files.has(`/PROJECT_OS/TRANSACTIONS/committed/${transaction.transaction_id}.json`)).toBe(true);
-    expect(mock.files.has(`/PROJECT_OS/TRANSACTIONS/incoming/${transaction.transaction_id}.json`)).toBe(false);
+    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${transaction.transaction_id}.json`)).toBe(true);
+    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`)).toBe(false);
   });
 
   it("requires authentication and strict schema on direct transaction ingress", async () => {

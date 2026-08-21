@@ -64,6 +64,10 @@ export function workspacePortfolioRoot(): string {
   return `${WORKSPACE_ROOT}/PORTFOLIO`;
 }
 
+export function workspacePortfolioDashboardPath(): string {
+  return `${workspacePortfolioRoot()}/DASHBOARD.md`;
+}
+
 export function machineProjectRoot(projectId: string): string {
   return `${MACHINE_ROOT}/projects/${assertSafeProjectId(projectId)}`;
 }
@@ -113,6 +117,7 @@ export const v2Paths = {
   workspaceProjectFile,
   workspaceEntityPath,
   workspacePortfolioRoot,
+  workspacePortfolioDashboardPath,
   machineProjectRoot,
   machineStatePath,
   machineManifestPath,

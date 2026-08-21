@@ -24,6 +24,19 @@ export function emptyProjectState(
     slug,
     aliases: [...aliases],
     objective,
+    framing: {
+      scope: [],
+      out_of_scope: [],
+      success_criteria: [],
+      stakeholders: [],
+      open_questions: []
+    },
+    discovery: {
+      confirmed_findings: [],
+      provisional_findings: [],
+      unresolved_questions: [],
+      next_exploration: []
+    },
     status: "active",
     revision: 0,
     current_phase_id: null,

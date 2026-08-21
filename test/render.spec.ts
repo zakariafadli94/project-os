@@ -104,7 +104,11 @@ describe("Markdown renderers", () => {
 
   it("renders stable project, plan and handoff documents", () => {
     const state = sampleState();
-    expect(renderProject(state)).toContain("Launch the agency");
+    const project = renderProject(state);
+    expect(project).toContain("Launch the agency");
+    expect(project).toContain("[[BRIEF|Brief]]");
+    expect(project).toContain("[[DISCOVERY|Discovery]]");
+    expect(project).toContain("[[ROADMAP|Roadmap]]");
     expect(renderPlan(state)).toContain("PHASE-0001");
     expect(renderHandoff(state)).toContain("PRJ-0001");
   });

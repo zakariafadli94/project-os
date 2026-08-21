@@ -38,14 +38,14 @@ export class ProjectRepository {
       const decisionId = String(event.payload.decision_id);
       const decision = state.decisions[decisionId];
       if (!decision) throw new Error(`Committed decision ${decisionId} missing from state`);
-      await this.safeAdd(decisionPath(state.project_id, state.slug, decisionId), renderDecision(decision));
+      await this.safeAdd(decisionPath(state.project_id, state.slug, decisionId), renderDecision(state, decision));
     }
 
     if (event.type === "decision.supersede") {
       const decisionId = String(event.payload.decision_id);
       const decision = state.decisions[decisionId];
       if (!decision) throw new Error(`Superseded decision ${decisionId} missing from state`);
-      await this.transport.upload(decisionPath(state.project_id, state.slug, decisionId), renderDecision(decision), "overwrite");
+      await this.transport.upload(decisionPath(state.project_id, state.slug, decisionId), renderDecision(state, decision), "overwrite");
     }
 
     await this.transport.upload(projectFile(state.project_id, state.slug, "PROJECT.md"), renderProject(state), "overwrite");

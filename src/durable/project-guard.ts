@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
+import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
@@ -135,7 +136,7 @@ export class ProjectGuard extends DurableObject<Env> {
     const row = this.ctx.storage.sql.exec<StateRow>(
       "SELECT state_json FROM project_state WHERE singleton = 1"
     ).toArray()[0];
-    return row ? JSON.parse(row.state_json) as ProjectState : null;
+    return row ? normalizeProjectState(JSON.parse(row.state_json)) : null;
   }
 
   private findReceipt(transactionId: string): Receipt | null {

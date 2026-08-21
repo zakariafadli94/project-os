@@ -16,7 +16,7 @@ export function renderRegistry(entries: RegistryEntry[]): string {
     const items = entries
       .filter((entry) => entry.status === status)
       .sort((a, b) => a.project_id.localeCompare(b.project_id))
-      .map((entry) => `- **${entry.project_id}** — [[${entry.project_id}-${entry.slug}/PROJECT|${entry.name}]]`)
+      .map((entry) => `- **${entry.project_id}** — [[PROJECTS/${entry.project_id}-${entry.slug}/PROJECT|${entry.name}]]`)
       .join("\n") || "- None";
     return `## ${status[0].toUpperCase()}${status.slice(1)}\n\n${items}`;
   }).join("\n\n");

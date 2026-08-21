@@ -53,8 +53,8 @@ describe("RegistryGuard", () => {
     const receipt = await createProject(tx);
 
     expect(receipt.status).toBe("committed");
-    expect(dropbox.files.has("/PROJECT_OS/SYSTEM/PROJECT_REGISTRY.json")).toBe(true);
-    expect(dropbox.files.has(`/PROJECT_OS/RECEIPTS/${tx.transaction_id}.json`)).toBe(true);
+    expect(dropbox.files.has("/PROJECT_OS/.project-os/registry/PROJECT_REGISTRY.json")).toBe(true);
+    expect(dropbox.files.has(`/PROJECT_OS/.project-os/receipts/${tx.transaction_id}.json`)).toBe(true);
   });
 
   it("replays project.create idempotently with the original allocated project ID", async () => {

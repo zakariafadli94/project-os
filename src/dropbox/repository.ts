@@ -113,11 +113,20 @@ export class ProjectRepository {
 
   async writeMachineState(state: ProjectState, event: DomainEvent): Promise<void> {
     await this.safeAdd(machineEventPath(state.project_id, event.event_id), pretty(event));
+    await this.writeMachineSnapshot(state);
+  }
+
+  async writeMachineSnapshot(state: ProjectState): Promise<void> {
     await this.transport.upload(machineStatePath(state.project_id), pretty(state), "overwrite");
     await this.transport.upload(machineManifestPath(state.project_id), pretty(manifestFor(state)), "overwrite");
   }
 
   async materializeWorkspace(state: ProjectState): Promise<void> {
+    await this.writeHumanViews(state);
+  }
+
+  async materializeV2(state: ProjectState): Promise<void> {
+    await this.writeMachineSnapshot(state);
     await this.writeHumanViews(state);
   }
 

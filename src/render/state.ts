@@ -1,4 +1,5 @@
 import type { ProjectState } from "../domain/project-state";
+import { renderProjectFrontmatter } from "./frontmatter";
 import { MANAGED_NOTICE } from "./shared";
 
 export function renderState(state: ProjectState): string {
@@ -23,5 +24,5 @@ export function renderState(state: ProjectState): string {
         .slice(0, 5)
         .map((task) => `- ${task.title}`);
 
-  return `${MANAGED_NOTICE}\n# Current State — ${state.name}\n\nProject ID: ${state.project_id}\nStatus: ${state.status}\nRevision: ${state.revision}\nUpdated: ${state.updated_at}\n\n## Current phase\n\n${currentPhase ? `${currentPhase.phase_id} — ${currentPhase.title}` : "None"}\n\n## Active work\n\n${active.join("\n") || "- None"}\n\n## Blockers\n\n${blocked.join("\n") || "- None"}\n\n## Completed\n\n${completed.join("\n") || "- None"}\n\n## Next actions\n\n${nextActions.join("\n") || "- None"}\n`;
+  return `${renderProjectFrontmatter(state, "STATE", "state")}${MANAGED_NOTICE}\n# Current State — ${state.name}\n\nProject ID: ${state.project_id}\nStatus: ${state.status}\nRevision: ${state.revision}\nUpdated: ${state.updated_at}\n\n## Current phase\n\n${currentPhase ? `${currentPhase.phase_id} — ${currentPhase.title}` : "None"}\n\n## Active work\n\n${active.join("\n") || "- None"}\n\n## Blockers\n\n${blocked.join("\n") || "- None"}\n\n## Completed\n\n${completed.join("\n") || "- None"}\n\n## Next actions\n\n${nextActions.join("\n") || "- None"}\n`;
 }

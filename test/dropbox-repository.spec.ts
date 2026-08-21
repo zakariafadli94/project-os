@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DropboxConflictError, type DropboxTransport } from "../src/dropbox/client";
+import { machineReceiptPath } from "../src/dropbox/layout";
 import { ProjectRepository } from "../src/dropbox/repository";
 import type { DomainEvent } from "../src/domain/event";
 import type { Receipt } from "../src/domain/receipt";
@@ -88,5 +89,39 @@ describe("ProjectRepository", () => {
     const eventWrites = transport.uploads.filter((write) => write.path.endsWith(`/${event.event_id}.json`));
     expect(eventWrites).toHaveLength(1);
     expect(transport.files.has(`/PROJECT_OS/RECEIPTS/${receipt.transaction_id}.json`)).toBe(true);
+  });
+
+  it("shadow mode keeps legacy canonical writes and also materializes V2 workspace", async () => {
+    const transport = new FakeTransport();
+    const repository = new ProjectRepository(transport, "shadow");
+    const { state, event, receipt } = fixture();
+    state.research["RES-CODE0001"] = {
+      research_id: "RES-CODE0001",
+      title: "Code map",
+      body: "Responsibilities",
+      created_at: state.updated_at
+    };
+
+    await repository.writeCommit(state, event, receipt);
+
+    expect(transport.files.has("/PROJECT_OS/PROJECTS/PRJ-0001-agency/STATE.md")).toBe(true);
+    expect(transport.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0001-agency/STATE.md")).toBe(true);
+    expect(transport.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0001-agency/RESEARCH/RES-CODE0001.md")).toBe(true);
+    expect(transport.files.has("/PROJECT_OS/.project-os/projects/PRJ-0001/state.json")).toBe(true);
+    expect(transport.files.has(`/PROJECT_OS/RECEIPTS/${receipt.transaction_id}.json`)).toBe(true);
+    expect(transport.uploads.at(-1)?.path).toBe(`/PROJECT_OS/RECEIPTS/${receipt.transaction_id}.json`);
+  });
+
+  it("v2 writes its receipt last and never publishes it after an earlier view failure", async () => {
+    const transport = new FakeTransport();
+    const repository = new ProjectRepository(transport, "v2");
+    const { state, event, receipt } = fixture();
+    transport.failOnceOn = "/STATE.md";
+
+    await expect(repository.writeCommit(state, event, receipt)).rejects.toThrow("transient write failure");
+    expect(transport.files.has(machineReceiptPath(receipt.transaction_id))).toBe(false);
+
+    await repository.writeCommit(state, event, receipt);
+    expect(transport.uploads.at(-1)?.path).toBe(machineReceiptPath(receipt.transaction_id));
   });
 });

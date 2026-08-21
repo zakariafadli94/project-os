@@ -87,6 +87,20 @@ describe("workspace v2 migration", () => {
     expect(transport.files.get(machineReceiptPath(txId))).toBe(receiptContent);
   });
 
+  it("preserves rejected transaction source artifacts", async () => {
+    const transport = new FakeTransport();
+    const txId = "TXN-LEDGER-00000005";
+    const terminal = '{"status":"rejected"}\n';
+    const source = '{"transaction_id":"TXN-LEDGER-00000005","bad":true}\n';
+    transport.files.set(`/PROJECT_OS/TRANSACTIONS/rejected/${txId}.json`, terminal);
+    transport.files.set(`/PROJECT_OS/TRANSACTIONS/rejected/${txId}.source.json`, source);
+
+    await mirrorLegacyLedger(transport);
+
+    expect(transport.files.get(machineTransactionPath("rejected", txId))).toBe(terminal);
+    expect(transport.files.get(machineTransactionPath("rejected", txId).replace(/\.json$/, ".source.json"))).toBe(source);
+  });
+
   it("resumes ledger migration after interruption without losing immutable history", async () => {
     const transport = new FakeTransport();
     const firstId = "TXN-LEDGER-00000002";

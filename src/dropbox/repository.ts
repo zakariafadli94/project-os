@@ -2,13 +2,16 @@ import type { DomainEvent } from "../domain/event";
 import type { ProjectState } from "../domain/project-state";
 import type { Receipt } from "../domain/receipt";
 import type { Transaction } from "../domain/transaction";
+import { renderBrief } from "../render/brief";
 import { renderConstraint } from "../render/constraint";
 import { renderDecision } from "../render/decision";
 import { renderDeliverable } from "../render/deliverable";
+import { renderDiscovery } from "../render/discovery";
 import { renderHandoff } from "../render/handoff";
 import { renderPlan } from "../render/plan";
 import { renderProject } from "../render/project";
 import { renderResearch } from "../render/research";
+import { renderRoadmap } from "../render/roadmap";
 import { renderState } from "../render/state";
 import { renderTask } from "../render/task";
 import { DropboxConflictError, type DropboxTransport } from "./client";
@@ -105,6 +108,9 @@ export class ProjectRepository {
       );
     }
 
+    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "BRIEF.md"), renderBrief(state), "overwrite");
+    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "DISCOVERY.md"), renderDiscovery(state), "overwrite");
+    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "ROADMAP.md"), renderRoadmap(state), "overwrite");
     await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "PROJECT.md"), renderProject(state), "overwrite");
     await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "STATE.md"), renderState(state), "overwrite");
     await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "PLAN.md"), renderPlan(state), "overwrite");

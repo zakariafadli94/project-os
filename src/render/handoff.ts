@@ -1,4 +1,5 @@
 import type { ProjectState } from "../domain/project-state";
+import { renderProjectFrontmatter } from "./frontmatter";
 import { MANAGED_NOTICE } from "./shared";
 
 export function renderHandoff(state: ProjectState): string {
@@ -18,11 +19,11 @@ export function renderHandoff(state: ProjectState): string {
     .filter((decision) => decision.status === "accepted")
     .sort((a, b) => b.decision_id.localeCompare(a.decision_id))
     .slice(0, 8)
-    .map((decision) => `- [[${decision.decision_id}]] — ${decision.title}`)
+    .map((decision) => `- [[DECISIONS/${decision.decision_id}|${decision.title}]]`)
     .join("\n") || "- None";
   const next = currentPhase?.next_actions?.length
     ? currentPhase.next_actions.map((action) => `- ${action}`).join("\n")
     : activeTasks;
 
-  return `${MANAGED_NOTICE}\n# Handoff — ${state.name}\n\nProject ID: ${state.project_id}\nRevision: ${state.revision}\nStatus: ${state.status}\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Current phase\n\n${currentPhase ? `${currentPhase.phase_id} — ${currentPhase.title}` : "None"}\n\n## Current work\n\n${activeTasks}\n\n## Blockers\n\n${blockers}\n\n## Important accepted decisions\n\n${decisions}\n\n## Next work\n\n${next || "- None"}\n\n## Read deeper when needed\n\n- [[PROJECT]]\n- [[STATE]]\n- [[PLAN]]\n- DECISIONS/\n- RESEARCH/\n`;
+  return `${renderProjectFrontmatter(state, "HANDOFF", "handoff")}${MANAGED_NOTICE}\n# Handoff — ${state.name}\n\nProject ID: ${state.project_id}\nRevision: ${state.revision}\nStatus: ${state.status}\n\n## Objective\n\n${state.objective || "Not defined"}\n\n## Current phase\n\n${currentPhase ? `${currentPhase.phase_id} — ${currentPhase.title}` : "None"}\n\n## Current work\n\n${activeTasks}\n\n## Blockers\n\n${blockers}\n\n## Important accepted decisions\n\n${decisions}\n\n## Next work\n\n${next || "- None"}\n\n## Read deeper when needed\n\n- [[PROJECT|Project overview]]\n- [[STATE|Current state]]\n- [[PLAN|Plan]]\n- DECISIONS/\n- RESEARCH/\n`;
 }

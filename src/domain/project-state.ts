@@ -2,7 +2,39 @@ export type ProjectStatus = "active" | "paused" | "completed" | "archived";
 export type TaskStatus = "pending" | "active" | "blocked" | "completed";
 export type PhaseStatus = "pending" | "active" | "completed";
 export type DecisionStatus = "accepted" | "superseded";
-export type DeliverableStatus = "pending" | "completed";
+
+// Legacy statuses remain accepted in-memory during the incremental rollout.
+// normalizeProjectState maps them to the normative V2 compatibility states.
+export type DeliverableStatus =
+  | "pending"
+  | "completed"
+  | "planned"
+  | "in_progress"
+  | "review"
+  | "accepted"
+  | "superseded"
+  | "abandoned"
+  | "legacy_completed";
+
+export interface ProjectFraming {
+  scope: string[];
+  out_of_scope: string[];
+  success_criteria: string[];
+  stakeholders: string[];
+  open_questions: string[];
+}
+
+export interface DiscoveryFinding {
+  summary: string;
+  research_ids: string[];
+}
+
+export interface DiscoverySynthesis {
+  confirmed_findings: DiscoveryFinding[];
+  provisional_findings: DiscoveryFinding[];
+  unresolved_questions: string[];
+  next_exploration: string[];
+}
 
 export interface ConstraintRecord {
   constraint_id: string;
@@ -60,7 +92,17 @@ export interface DeliverableRecord {
   description?: string;
   reference?: string;
   outcome?: string;
+  owner?: string;
+  version?: string;
+  phase_id?: string;
+  decision_ids?: string[];
   status: DeliverableStatus;
+  acceptance_note?: string;
+  accepted_at?: string;
+  supersedes?: string;
+  superseded_by?: string;
+  superseded_reason?: string;
+  abandoned_reason?: string;
   created_at: string;
   updated_at: string;
 }
@@ -72,6 +114,8 @@ export interface ProjectState {
   slug: string;
   aliases: string[];
   objective: string;
+  framing: ProjectFraming;
+  discovery: DiscoverySynthesis;
   status: ProjectStatus;
   revision: number;
   current_phase_id: string | null;

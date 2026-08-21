@@ -28,6 +28,13 @@ export const operationValues = [
   "constraint.add",
   "research.add",
   "discovery.synthesis.update",
+  "deliverable.create",
+  "deliverable.start",
+  "deliverable.revise",
+  "deliverable.submit_review",
+  "deliverable.accept",
+  "deliverable.supersede",
+  "deliverable.abandon",
   "deliverable.add",
   "deliverable.complete"
 ] as const;
@@ -136,6 +143,61 @@ const discoverySynthesisUpdate = z.strictObject({
   )
 });
 
+const deliverableCreate = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.create"),
+  payload: z.strictObject({
+    deliverable_id: stableId("DEL"),
+    title: nonEmpty,
+    version: nonEmpty,
+    description: nonEmpty.optional(),
+    reference: nonEmpty.optional(),
+    owner: nonEmpty.optional(),
+    phase_id: stableId("PHASE").optional(),
+    decision_ids: z.array(stableId("DEC")).optional()
+  })
+});
+const deliverableStart = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.start"),
+  payload: z.strictObject({ deliverable_id: stableId("DEL") })
+});
+const deliverableRevise = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.revise"),
+  payload: z.strictObject({
+    deliverable_id: stableId("DEL"),
+    version: nonEmpty,
+    description: nonEmpty.optional(),
+    reference: nonEmpty.optional()
+  })
+});
+const deliverableSubmitReview = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.submit_review"),
+  payload: z.strictObject({ deliverable_id: stableId("DEL") })
+});
+const deliverableAccept = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.accept"),
+  payload: z.strictObject({ deliverable_id: stableId("DEL"), acceptance_note: nonEmpty })
+});
+const deliverableSupersede = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.supersede"),
+  payload: z.strictObject({
+    deliverable_id: stableId("DEL"),
+    replacement_deliverable_id: stableId("DEL"),
+    reason: nonEmpty
+  })
+});
+const deliverableAbandon = z.strictObject({
+  ...common,
+  operation: z.literal("deliverable.abandon"),
+  payload: z.strictObject({ deliverable_id: stableId("DEL"), reason: nonEmpty })
+});
+
+// Deprecated compatibility operations. New SOP-driven flows use the lifecycle above.
 const deliverableAdd = z.strictObject({
   ...common,
   operation: z.literal("deliverable.add"),
@@ -166,6 +228,13 @@ export const transactionSchema = z.discriminatedUnion("operation", [
   constraintAdd,
   researchAdd,
   discoverySynthesisUpdate,
+  deliverableCreate,
+  deliverableStart,
+  deliverableRevise,
+  deliverableSubmitReview,
+  deliverableAccept,
+  deliverableSupersede,
+  deliverableAbandon,
   deliverableAdd,
   deliverableComplete
 ]);

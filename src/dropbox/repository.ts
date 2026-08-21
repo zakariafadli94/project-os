@@ -16,6 +16,7 @@ import { renderState } from "../render/state";
 import { renderTask } from "../render/task";
 import { DropboxConflictError, type DropboxTransport } from "./client";
 import {
+  archiveProjectRoot,
   type LayoutMode,
   machineEventPath,
   machineManifestPath,
@@ -26,7 +27,8 @@ import {
   machineTransactionPath,
   workspaceEntityPath,
   workspacePortfolioDashboardPath,
-  workspaceProjectFile
+  workspaceProjectFile,
+  workspaceProjectRoot
 } from "./layout";
 import {
   decisionPath,
@@ -64,6 +66,10 @@ export class ProjectRepository {
     } else {
       await this.writeMachineState(state, event);
       await this.writeHumanViews(state);
+    }
+
+    if (state.status === "archived") {
+      await this.archiveHumanWorkspace(state);
     }
 
     if (options.publishReceipt !== false) {
@@ -117,6 +123,25 @@ export class ProjectRepository {
     await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "HANDOFF.md"), renderHandoff(state), "overwrite");
   }
 
+  async archiveHumanWorkspace(state: ProjectState): Promise<void> {
+    if (this.mode === "legacy") return;
+
+    const from = workspaceProjectRoot(state.project_id, state.slug);
+    const to = archiveProjectRoot(state.project_id, state.slug);
+    try {
+      await this.transport.move(from, to);
+      return;
+    } catch (error) {
+      if (!(error instanceof DropboxConflictError)) throw error;
+    }
+
+    const archivedProject = await this.transport.download(`${to}/PROJECT.md`);
+    const workspaceProject = await this.transport.download(`${from}/PROJECT.md`);
+    if (archivedProject !== null && workspaceProject === null) return;
+    if (archivedProject === null && workspaceProject === null) return;
+    throw new Error(`Archived workspace move is inconsistent: ${from} -> ${to}`);
+  }
+
   async writeMachineState(state: ProjectState, event: DomainEvent): Promise<void> {
     await this.safeAdd(machineEventPath(state.project_id, event.event_id), pretty(event));
     await this.writeMachineSnapshot(state);
@@ -128,11 +153,19 @@ export class ProjectRepository {
   }
 
   async materializeWorkspace(state: ProjectState): Promise<void> {
+    if (state.status === "archived") {
+      await this.archiveHumanWorkspace(state);
+      return;
+    }
     await this.writeHumanViews(state);
   }
 
   async materializeV2(state: ProjectState): Promise<void> {
     await this.writeMachineSnapshot(state);
+    if (state.status === "archived") {
+      await this.archiveHumanWorkspace(state);
+      return;
+    }
     await this.writeHumanViews(state);
   }
 

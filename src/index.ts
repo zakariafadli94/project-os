@@ -55,6 +55,22 @@ const worker = {
       return materializeExistingProjects(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/admin/process-inbox") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const mode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
+      try {
+        const summary = await processInbox(env);
+        return Response.json({ mode, inbox: inboxPath(mode), ...summary });
+      } catch (error) {
+        return Response.json({
+          error: "inbox_processing_failed",
+          mode,
+          inbox: inboxPath(mode),
+          message: error instanceof Error ? error.message : String(error)
+        }, { status: 502 });
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/transactions") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 

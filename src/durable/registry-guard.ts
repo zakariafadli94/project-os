@@ -3,6 +3,7 @@ import type { Env } from "../env";
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { DropboxClient } from "../dropbox/client";
+import { parseLayoutMode } from "../dropbox/layout";
 import { ProjectRepository } from "../dropbox/repository";
 import { renderRegistry, type RegistryEntry } from "../render/registry";
 
@@ -63,7 +64,7 @@ export class RegistryGuard extends DurableObject<Env> {
       appKey: env.DROPBOX_APP_KEY,
       appSecret: env.DROPBOX_APP_SECRET,
       refreshToken: env.DROPBOX_REFRESH_TOKEN
-    }));
+    }), parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
   }
 
   async fetch(request: Request): Promise<Response> {

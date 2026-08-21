@@ -60,7 +60,7 @@ export class ProjectGuard extends DurableObject<Env> {
         const state = this.loadState();
         if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
 
-        await this.repository.materializeWorkspace(state);
+        await this.repository.materializeV2(state);
         return Response.json({
           project_id: state.project_id,
           revision: state.revision,

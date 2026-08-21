@@ -112,4 +112,44 @@ describe("Worker routing", () => {
     }), testEnv, ctx);
     expect(malformed.status).toBe(400);
   });
+
+  it("requires auth and materializes existing projects without changing their revision", async () => {
+    const mock = installDropboxMock();
+    const ctx = createExecutionContext();
+
+    const create = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: "1.0",
+        transaction_id: "TXN-ADMIN-MATERIALIZE-0001",
+        project_id: "PRJ-AUTO",
+        base_revision: 0,
+        operation: "project.create",
+        created_at: "2026-08-20T18:00:00.000Z",
+        payload: { name: "Admin Project", slug: "admin-project", aliases: [], objective: "Test migration" }
+      })
+    }), testEnv, ctx);
+    expect(create.status).toBe(200);
+    const receipt = await create.json<{ project_id: string; new_revision: number }>();
+    expect(receipt.new_revision).toBe(1);
+
+    const unauthorized = await worker.fetch(new Request("https://example.com/v1/admin/workspace-v2/materialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_ids: [receipt.project_id] })
+    }), testEnv, ctx);
+    expect(unauthorized.status).toBe(401);
+
+    const response = await worker.fetch(new Request("https://example.com/v1/admin/workspace-v2/materialize", {
+      method: "POST",
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ project_ids: [receipt.project_id] })
+    }), testEnv, ctx);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      results: [{ project_id: receipt.project_id, status: "materialized", revision: 1 }]
+    });
+    expect(mock.files.has(`/PROJECT_OS/WORKSPACE/PROJECTS/${receipt.project_id}-admin-project/PROJECT.md`)).toBe(true);
+  });
 });

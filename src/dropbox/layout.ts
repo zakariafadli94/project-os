@@ -39,6 +39,7 @@ export type WorkspaceEntityFolder =
   | "MEETINGS";
 
 export type MachineTransactionStatus = "incoming" | "committed" | "rejected" | "conflicts";
+export type MachineArtifactStatus = "incoming" | "committed" | "rejected" | "conflicts";
 
 export function workspaceProjectRoot(projectId: string, slug: string): string {
   return `${WORKSPACE_ROOT}/PROJECTS/${assertSafeProjectId(projectId)}-${assertSafeSlug(slug)}`;
@@ -109,6 +110,14 @@ export function machineReceiptPath(transactionId: string): string {
   return `${MACHINE_ROOT}/receipts/${assertSafeTransactionId(transactionId)}.json`;
 }
 
+export function machineArtifactRequestPath(status: MachineArtifactStatus, requestId: string): string {
+  return `${MACHINE_ROOT}/artifacts/${status}/${assertSafeArtifactRequestId(requestId)}.json`;
+}
+
+export function machineArtifactReceiptPath(requestId: string): string {
+  return `${MACHINE_ROOT}/artifacts/receipts/${assertSafeArtifactRequestId(requestId)}.json`;
+}
+
 export function machineRegistryJsonPath(): string {
   return `${MACHINE_ROOT}/registry/PROJECT_REGISTRY.json`;
 }
@@ -143,6 +152,8 @@ export const v2Paths = {
   machineEventPath,
   machineTransactionPath,
   machineReceiptPath,
+  machineArtifactRequestPath,
+  machineArtifactReceiptPath,
   machineRegistryJsonPath,
   machineRegistryMarkdownPath
 } as const;
@@ -157,6 +168,13 @@ function assertSafeArtifactRelativePath(value: string): string {
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) {
     throw new Error(`Unsafe artifact relative path: ${value}`);
+  }
+  return value;
+}
+
+function assertSafeArtifactRequestId(value: string): string {
+  if (!/^ART-[A-Z0-9-]{10,}$/.test(value)) {
+    throw new Error(`Unsafe artifact request id: ${value}`);
   }
   return value;
 }

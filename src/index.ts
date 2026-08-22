@@ -329,8 +329,8 @@ async function processTransactionInbox(env: Env, client: DropboxClient, mode: La
         throw new Error("Transaction filename must exactly match transaction_id");
       }
     } catch (error) {
-      const syntheticId = filenameTransactionId ?? await syntheticId("TXN-INVALID", entry.name, raw);
-      const rejectedPath = terminalTransactionPath(mode, "rejected", syntheticId);
+      const fallbackId = filenameTransactionId ?? await syntheticInboxId("TXN-INVALID", entry.name, raw);
+      const rejectedPath = terminalTransactionPath(mode, "rejected", fallbackId);
       await safeAdd(client, rejectedPath, `${JSON.stringify({
         status: "rejected",
         code: "INVALID_TRANSACTION_FILE",
@@ -396,8 +396,8 @@ async function processArtifactInbox(env: Env, client: DropboxClient, mode: Layou
         throw new Error("Artifact filename must exactly match request_id");
       }
     } catch (error) {
-      const syntheticId = filenameRequestId ?? await syntheticId("ART-INVALID", entry.name, raw);
-      const rejectedPath = terminalArtifactRequestPath(mode, "rejected", syntheticId);
+      const fallbackId = filenameRequestId ?? await syntheticInboxId("ART-INVALID", entry.name, raw);
+      const rejectedPath = terminalArtifactRequestPath(mode, "rejected", fallbackId);
       await safeAdd(client, rejectedPath, `${JSON.stringify({
         status: "rejected",
         code: "INVALID_ARTIFACT_FILE",
@@ -442,7 +442,7 @@ function artifactRequestIdFromFilename(filename: string): string | null {
   return match?.[1] ?? null;
 }
 
-async function syntheticId(prefix: "TXN-INVALID" | "ART-INVALID", filename: string, content: string): Promise<string> {
+async function syntheticInboxId(prefix: "TXN-INVALID" | "ART-INVALID", filename: string, content: string): Promise<string> {
   const bytes = new TextEncoder().encode(`${filename}\0${content}`);
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   const hex = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();

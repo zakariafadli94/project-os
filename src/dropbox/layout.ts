@@ -48,6 +48,11 @@ export function archiveProjectRoot(projectId: string, slug: string): string {
   return `${ARCHIVE_ROOT}/PROJECTS/${assertSafeProjectId(projectId)}-${assertSafeSlug(slug)}`;
 }
 
+export function workspaceArtifactPath(projectId: string, slug: string, relativePath: string): string {
+  const normalized = assertSafeArtifactRelativePath(relativePath);
+  return `${workspaceProjectRoot(projectId, slug)}/ARTIFACTS/${normalized}`;
+}
+
 export function workspaceProjectFile(
   projectId: string,
   slug: string,
@@ -127,6 +132,7 @@ export const legacyPaths = {
 export const v2Paths = {
   workspaceProjectRoot,
   archiveProjectRoot,
+  workspaceArtifactPath,
   workspaceProjectFile,
   workspaceEntityPath,
   workspacePortfolioRoot,
@@ -140,3 +146,17 @@ export const v2Paths = {
   machineRegistryJsonPath,
   machineRegistryMarkdownPath
 } as const;
+
+function assertSafeArtifactRelativePath(value: string): string {
+  if (!value || value.startsWith("/") || value.includes("//")) {
+    throw new Error(`Unsafe artifact relative path: ${value}`);
+  }
+  const segments = value.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error(`Unsafe artifact relative path: ${value}`);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) {
+    throw new Error(`Unsafe artifact relative path: ${value}`);
+  }
+  return value;
+}

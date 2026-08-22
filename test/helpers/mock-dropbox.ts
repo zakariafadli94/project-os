@@ -29,7 +29,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
 
       const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string; mode?: "add" | "overwrite" };
       if (!arg.path) return new Response("missing path", { status: 400 });
-      const content = await request.text();
+      const content = new TextDecoder().decode(await request.arrayBuffer());
       if (arg.mode === "add" && files.has(arg.path)) {
         return new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
           status: 409,

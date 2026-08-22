@@ -1,4 +1,4 @@
-import type { ArtifactWriteRequest } from "../domain/artifact-write";
+import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
 import type { DomainEvent } from "../domain/event";
 import type { ProjectState } from "../domain/project-state";
 import type { Receipt } from "../domain/receipt";
@@ -19,6 +19,7 @@ import { DropboxConflictError, type DropboxTransport } from "./client";
 import {
   archiveProjectRoot,
   type LayoutMode,
+  machineArtifactReceiptPath,
   machineEventPath,
   machineManifestPath,
   machineReceiptPath,
@@ -104,8 +105,22 @@ export class ProjectRepository {
       throw new ArtifactContentConflictError(path);
     }
 
-    await this.transport.upload(path, request.content, existing === null ? "add" : "overwrite");
-    return "written";
+    try {
+      await this.transport.upload(path, request.content, existing === null ? "add" : "overwrite");
+      return "written";
+    } catch (error) {
+      if (!(error instanceof DropboxConflictError)) throw error;
+      const current = await this.transport.download(path);
+      if (current === request.content) return "idempotent";
+      if (request.mode === "create") throw new ArtifactContentConflictError(path);
+      await this.transport.upload(path, request.content, "overwrite");
+      return "written";
+    }
+  }
+
+  async writeArtifactReceipt(receipt: ArtifactWriteReceipt): Promise<void> {
+    if (this.mode === "legacy") throw new Error("Artifact receipts require workspace layout mode");
+    await this.safeAdd(machineArtifactReceiptPath(receipt.request_id), pretty(receipt));
   }
 
   async writeHumanViews(state: ProjectState): Promise<void> {

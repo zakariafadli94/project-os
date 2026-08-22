@@ -70,9 +70,9 @@ ProjectGuard stores artifact receipts in Durable Object SQL keyed by `request_id
 
 The agent must not create a second request id merely because a first attempt is slow. It replays the exact same request when transport delivery is uncertain.
 
-### 3. Dropbox client absorbs transient infrastructure failures
+### 3. Dropbox transport absorbs transient infrastructure failures
 
-Add a reusable retry policy around write operations (`upload`, `move`, and folder creation where appropriate).
+A reusable resilient transport wraps internal Dropbox writes used by ProjectGuard, RegistryGuard and inbox archival operations.
 
 Retry only when evidence marks the failure transient:
 - HTTP 429;
@@ -84,15 +84,42 @@ Do not retry semantic conflicts such as path already exists with different conte
 
 Backoff policy: bounded exponential backoff with jitter, maximum five attempts. Tests use an injectable sleeper/random source so the suite remains deterministic.
 
-### 4. Receipt gate remains the business barrier
+### 4. Artifact inbox bridges the actual ChatGPT workflow to ProjectGuard
 
-Canonical transactions remain receipt-gated. Dependent business actions use the committed receipt and refreshed state before constructing a new transaction. This design does not add arbitrary settling sleeps after receipts: correctness comes from serialized mutation plus idempotent retry, not timing guesses.
+The normal Project OS workflow cannot assume ChatGPT can call an internal Durable Object endpoint directly. Therefore the supported ChatGPT mutation path is an immutable artifact request message in Dropbox:
 
-### 5. Observability
+```text
+/PROJECT_OS/.project-os/artifacts/incoming/<request_id>.json
+```
 
-For each internal Dropbox write attempt, emit structured logs containing:
-- `project_id` when available;
-- `request_id` or `transaction_id` when available;
+The webhook or scheduled inbox scanner processes canonical transaction messages first, then artifact request messages. Each artifact request is parsed and validated, then routed to the matching ProjectGuard `/artifact` endpoint. ProjectGuard remains the only writer of the final business artifact.
+
+Terminal request-message locations are:
+
+```text
+/PROJECT_OS/.project-os/artifacts/committed/<request_id>.json
+/PROJECT_OS/.project-os/artifacts/rejected/<request_id>.json
+/PROJECT_OS/.project-os/artifacts/conflicts/<request_id>.json
+```
+
+The ProjectGuard publication receipt is written at:
+
+```text
+/PROJECT_OS/.project-os/artifacts/receipts/<request_id>.json
+```
+
+An authenticated `POST /v1/artifacts` route is also available for clients that can call the Worker directly. Both ingress methods route into the same per-project ProjectGuard serialization boundary.
+
+### 5. Receipt gate remains the business barrier
+
+Canonical transactions remain receipt-gated. Artifact publication is also receipt-gated: ProjectGuard writes the artifact receipt before durably acknowledging the request id. If the final artifact file was written but receipt publication failed, replaying the exact request is content-idempotent and retries receipt publication without creating a duplicate file.
+
+Dependent business actions use the committed receipt and refreshed state before constructing a new canonical transaction. This design does not add arbitrary settling sleeps after receipts: correctness comes from serialized mutation plus idempotent retry, not timing guesses.
+
+### 6. Observability
+
+For each internal Dropbox retry, emit structured logs containing:
+- `project_id` when derivable;
 - operation type;
 - path;
 - attempt number;
@@ -100,19 +127,20 @@ For each internal Dropbox write attempt, emit structured logs containing:
 - Dropbox request id/error classification;
 - retry delay when a retry occurs.
 
-No secret values or artifact contents are logged.
+Inbox processing logs failed request ids and preserves failed messages for later retry. No secret values or artifact contents are logged.
 
 ## Agent operating rule
 
-Once `/artifact` is available, ChatGPT must not directly mutate files inside `WORKSPACE/PROJECTS/<project>/ARTIFACTS`. It submits artifact writes through ProjectGuard. Direct Dropbox reads remain allowed. Canonical writes continue to use typed Project OS transactions.
+Once this baseline is deployed, ChatGPT must not directly mutate final business files inside `WORKSPACE/PROJECTS/<project>/ARTIFACTS`. In normal Dropbox-backed operation it writes an artifact request message to `.project-os/artifacts/incoming/` and waits for the corresponding artifact receipt. Direct Dropbox reads remain allowed. Canonical writes continue to use typed Project OS transactions.
 
 ## Failure semantics
 
-- Transient infrastructure error exhausted after five attempts: return terminal infrastructure failure to the caller; do not create another business transaction automatically.
+- Transient infrastructure error exhausted after five attempts: leave the ingress message recoverable and do not create another business request automatically.
 - Same artifact request replay: idempotent success.
 - Same request id, different request: rejected.
 - `create` to existing different content: explicit conflict.
 - Canonical `base_revision` conflict: unchanged and still visible.
+- A real content or business conflict is never converted into an infrastructure retry success.
 
 ## Acceptance tests
 
@@ -124,5 +152,7 @@ Once `/artifact` is available, ChatGPT must not directly mutate files inside `WO
 6. Same request id with different hash/path is rejected.
 7. A canonical transaction followed immediately by artifact publication for the same project completes without write overlap inside ProjectGuard.
 8. Fifty sequential mixed transaction/artifact mutations complete without manual intervention in the deterministic stress harness.
-9. Existing transaction/reducer tests remain green.
-10. `npm run check` and `npx wrangler deploy --dry-run` pass.
+9. Artifact inbox processing routes a Dropbox request message to ProjectGuard, writes the final artifact and receipt, and archives the source request.
+10. Direct artifact ingress requires authentication and uses the same ProjectGuard path.
+11. Existing transaction/reducer tests remain green.
+12. `npm run check` and `npx wrangler deploy --dry-run` pass.

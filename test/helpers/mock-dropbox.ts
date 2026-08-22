@@ -1,8 +1,13 @@
 import { vi } from "vitest";
 
-export function installDropboxMock() {
+export interface DropboxMockOptions {
+  transientUploadFailures?: number;
+}
+
+export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
   const calls: string[] = [];
+  let transientUploadFailures = options.transientUploadFailures ?? 0;
 
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init);
@@ -14,6 +19,14 @@ export function installDropboxMock() {
     }
 
     if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/upload") {
+      if (transientUploadFailures > 0) {
+        transientUploadFailures -= 1;
+        return new Response(JSON.stringify({ error_summary: "too_many_write_operations/..." }), {
+          status: 409,
+          headers: { "x-dropbox-request-id": `req-transient-${transientUploadFailures}` }
+        });
+      }
+
       const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string; mode?: "add" | "overwrite" };
       if (!arg.path) return new Response("missing path", { status: 400 });
       const content = await request.text();

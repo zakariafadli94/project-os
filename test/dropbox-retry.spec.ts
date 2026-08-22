@@ -12,7 +12,7 @@ describe("Dropbox transient retry policy", () => {
   });
 
   it("retries transient failures and returns the first success", async () => {
-    const sleep = vi.fn(async () => undefined);
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
     const operation = vi.fn()
       .mockResolvedValueOnce({ ok: false, status: 409, body: "too_many_write_operations" })
       .mockResolvedValueOnce({ ok: false, status: 503, body: "busy" })
@@ -32,7 +32,7 @@ describe("Dropbox transient retry policy", () => {
   });
 
   it("does not retry semantic conflicts", async () => {
-    const sleep = vi.fn(async () => undefined);
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
     const operation = vi.fn().mockResolvedValue({ ok: false, status: 409, body: "path/conflict/file" });
 
     const result = await retryDropboxWrite(operation, {
@@ -48,7 +48,7 @@ describe("Dropbox transient retry policy", () => {
   });
 
   it("stops after the configured maximum attempts", async () => {
-    const sleep = vi.fn(async () => undefined);
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
     const operation = vi.fn().mockResolvedValue({ ok: false, status: 429, body: "rate_limit" });
 
     const result = await retryDropboxWrite(operation, {

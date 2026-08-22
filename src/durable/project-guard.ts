@@ -195,37 +195,45 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (this.ctx.id.name && this.ctx.id.name !== artifact.project_id) {
-      const receipt = this.artifactReceipt(artifact, "rejected", "PROJECT_BINDING_MISMATCH", "Durable Object binding does not match artifact project_id");
-      this.persistArtifact(artifact, receipt);
-      return Response.json(receipt);
+      return this.finalizeArtifact(
+        artifact,
+        this.artifactReceipt(artifact, "rejected", "PROJECT_BINDING_MISMATCH", "Durable Object binding does not match artifact project_id")
+      );
     }
 
     const state = this.loadState();
     if (!state) {
-      const receipt = this.artifactReceipt(artifact, "rejected", "PROJECT_NOT_INITIALIZED", "Project state is not initialized");
-      this.persistArtifact(artifact, receipt);
-      return Response.json(receipt);
+      return this.finalizeArtifact(
+        artifact,
+        this.artifactReceipt(artifact, "rejected", "PROJECT_NOT_INITIALIZED", "Project state is not initialized")
+      );
     }
 
     if (await sha256Hex(artifact.content) !== artifact.content_sha256) {
-      const receipt = this.artifactReceipt(artifact, "rejected", "CONTENT_HASH_MISMATCH", "content_sha256 does not match artifact content");
-      this.persistArtifact(artifact, receipt);
-      return Response.json(receipt);
+      return this.finalizeArtifact(
+        artifact,
+        this.artifactReceipt(artifact, "rejected", "CONTENT_HASH_MISMATCH", "content_sha256 does not match artifact content")
+      );
     }
 
     try {
       await this.repository.writeArtifact(state, artifact);
     } catch (error) {
       if (error instanceof ArtifactContentConflictError) {
-        const receipt = this.artifactReceipt(artifact, "conflict", "ARTIFACT_CONTENT_CONFLICT", error.message);
-        this.persistArtifact(artifact, receipt);
-        return Response.json(receipt);
+        return this.finalizeArtifact(
+          artifact,
+          this.artifactReceipt(artifact, "conflict", "ARTIFACT_CONTENT_CONFLICT", error.message)
+        );
       }
       throw error;
     }
 
-    const receipt = this.artifactReceipt(artifact, "committed");
-    this.persistArtifact(artifact, receipt);
+    return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "committed"));
+  }
+
+  private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
+    await this.repository.writeArtifactReceipt(receipt);
+    this.persistArtifact(request, receipt);
     return Response.json(receipt);
   }
 

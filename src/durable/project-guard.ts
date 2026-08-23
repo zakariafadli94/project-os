@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { parseArtifactWriteRequest, type ArtifactWriteReceipt, type ArtifactWriteRequest } from "../domain/artifact-write";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
@@ -7,10 +8,16 @@ import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/t
 import { applyTransaction } from "../domain/transitions";
 import { DropboxClient } from "../dropbox/client";
 import { parseLayoutMode } from "../dropbox/layout";
-import { ProjectRepository } from "../dropbox/repository";
+import { ArtifactContentConflictError, ProjectRepository } from "../dropbox/repository";
 
 interface TransactionRow {
   [key: string]: SqlStorageValue;
+  receipt_json: string;
+}
+
+interface ArtifactRow {
+  [key: string]: SqlStorageValue;
+  request_json: string;
   receipt_json: string;
 }
 
@@ -38,6 +45,11 @@ export class ProjectGuard extends DurableObject<Env> {
         status TEXT NOT NULL,
         receipt_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS artifact_requests (
+        request_id TEXT PRIMARY KEY,
+        request_json TEXT NOT NULL,
+        receipt_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS project_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         state_json TEXT NOT NULL
@@ -52,6 +64,10 @@ export class ProjectGuard extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const pathname = new URL(request.url).pathname;
+
+    if (request.method === "POST" && pathname === "/artifact") {
+      return this.serialize(() => this.handleArtifact(request));
+    }
 
     if (request.method === "POST" && pathname === "/materialize") {
       return this.serialize(async () => {
@@ -153,6 +169,74 @@ export class ProjectGuard extends DurableObject<Env> {
     });
   }
 
+  private async handleArtifact(request: Request): Promise<Response> {
+    let artifact: ArtifactWriteRequest;
+    try {
+      artifact = parseArtifactWriteRequest(await request.json());
+    } catch (error) {
+      return Response.json({
+        error: "invalid_artifact_request",
+        message: error instanceof Error ? error.message : "Invalid artifact request"
+      }, { status: 400 });
+    }
+
+    const serialized = JSON.stringify(artifact);
+    const existing = this.findArtifact(artifact.request_id);
+    if (existing) {
+      if (existing.request_json !== serialized) {
+        return Response.json(this.artifactReceipt(
+          artifact,
+          "rejected",
+          "IDEMPOTENCY_PAYLOAD_MISMATCH",
+          "The same request_id was reused with different artifact content or path"
+        ));
+      }
+      return Response.json(JSON.parse(existing.receipt_json) as ArtifactWriteReceipt);
+    }
+
+    if (this.ctx.id.name && this.ctx.id.name !== artifact.project_id) {
+      return this.finalizeArtifact(
+        artifact,
+        this.artifactReceipt(artifact, "rejected", "PROJECT_BINDING_MISMATCH", "Durable Object binding does not match artifact project_id")
+      );
+    }
+
+    const state = this.loadState();
+    if (!state) {
+      return this.finalizeArtifact(
+        artifact,
+        this.artifactReceipt(artifact, "rejected", "PROJECT_NOT_INITIALIZED", "Project state is not initialized")
+      );
+    }
+
+    if (await sha256Hex(artifact.content) !== artifact.content_sha256) {
+      return this.finalizeArtifact(
+        artifact,
+        this.artifactReceipt(artifact, "rejected", "CONTENT_HASH_MISMATCH", "content_sha256 does not match artifact content")
+      );
+    }
+
+    try {
+      await this.repository.writeArtifact(state, artifact);
+    } catch (error) {
+      if (error instanceof ArtifactContentConflictError) {
+        return this.finalizeArtifact(
+          artifact,
+          this.artifactReceipt(artifact, "conflict", "ARTIFACT_CONTENT_CONFLICT", error.message)
+        );
+      }
+      throw error;
+    }
+
+    return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "committed"));
+  }
+
+  private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
+    await this.repository.writeArtifactReceipt(receipt);
+    this.persistArtifact(request, receipt);
+    return Response.json(receipt);
+  }
+
   private loadState(): ProjectState | null {
     const row = this.ctx.storage.sql.exec<StateRow>(
       "SELECT state_json FROM project_state WHERE singleton = 1"
@@ -166,6 +250,13 @@ export class ProjectGuard extends DurableObject<Env> {
       transactionId
     ).toArray()[0];
     return row ? JSON.parse(row.receipt_json) as Receipt : null;
+  }
+
+  private findArtifact(requestId: string): ArtifactRow | null {
+    return this.ctx.storage.sql.exec<ArtifactRow>(
+      "SELECT request_json, receipt_json FROM artifact_requests WHERE request_id = ?",
+      requestId
+    ).toArray()[0] ?? null;
   }
 
   private async syncRegistryStatus(state: ProjectState): Promise<void> {
@@ -191,6 +282,32 @@ export class ProjectGuard extends DurableObject<Env> {
       receipt.status,
       JSON.stringify(receipt)
     );
+  }
+
+  private persistArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO artifact_requests (request_id, request_json, receipt_json) VALUES (?, ?, ?)",
+      request.request_id,
+      JSON.stringify(request),
+      JSON.stringify(receipt)
+    );
+  }
+
+  private artifactReceipt(
+    request: ArtifactWriteRequest,
+    status: ArtifactWriteReceipt["status"],
+    code?: string,
+    message?: string
+  ): ArtifactWriteReceipt {
+    return {
+      request_id: request.request_id,
+      project_id: request.project_id,
+      relative_path: request.relative_path,
+      content_sha256: request.content_sha256,
+      status,
+      ...(code ? { code } : {}),
+      ...(message ? { message } : {})
+    };
   }
 
   private persistCommit(state: ProjectState, receipt: Receipt): void {
@@ -238,4 +355,9 @@ export class ProjectGuard extends DurableObject<Env> {
       release();
     }
   }
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }

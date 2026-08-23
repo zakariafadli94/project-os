@@ -39,6 +39,7 @@ export type WorkspaceEntityFolder =
   | "MEETINGS";
 
 export type MachineTransactionStatus = "incoming" | "committed" | "rejected" | "conflicts";
+export type MachineArtifactStatus = "incoming" | "committed" | "rejected" | "conflicts";
 
 export function workspaceProjectRoot(projectId: string, slug: string): string {
   return `${WORKSPACE_ROOT}/PROJECTS/${assertSafeProjectId(projectId)}-${assertSafeSlug(slug)}`;
@@ -46,6 +47,11 @@ export function workspaceProjectRoot(projectId: string, slug: string): string {
 
 export function archiveProjectRoot(projectId: string, slug: string): string {
   return `${ARCHIVE_ROOT}/PROJECTS/${assertSafeProjectId(projectId)}-${assertSafeSlug(slug)}`;
+}
+
+export function workspaceArtifactPath(projectId: string, slug: string, relativePath: string): string {
+  const normalized = assertSafeArtifactRelativePath(relativePath);
+  return `${workspaceProjectRoot(projectId, slug)}/ARTIFACTS/${normalized}`;
 }
 
 export function workspaceProjectFile(
@@ -104,6 +110,14 @@ export function machineReceiptPath(transactionId: string): string {
   return `${MACHINE_ROOT}/receipts/${assertSafeTransactionId(transactionId)}.json`;
 }
 
+export function machineArtifactRequestPath(status: MachineArtifactStatus, requestId: string): string {
+  return `${MACHINE_ROOT}/artifacts/${status}/${assertSafeArtifactRequestId(requestId)}.json`;
+}
+
+export function machineArtifactReceiptPath(requestId: string): string {
+  return `${MACHINE_ROOT}/artifacts/receipts/${assertSafeArtifactRequestId(requestId)}.json`;
+}
+
 export function machineRegistryJsonPath(): string {
   return `${MACHINE_ROOT}/registry/PROJECT_REGISTRY.json`;
 }
@@ -127,6 +141,7 @@ export const legacyPaths = {
 export const v2Paths = {
   workspaceProjectRoot,
   archiveProjectRoot,
+  workspaceArtifactPath,
   workspaceProjectFile,
   workspaceEntityPath,
   workspacePortfolioRoot,
@@ -137,6 +152,29 @@ export const v2Paths = {
   machineEventPath,
   machineTransactionPath,
   machineReceiptPath,
+  machineArtifactRequestPath,
+  machineArtifactReceiptPath,
   machineRegistryJsonPath,
   machineRegistryMarkdownPath
 } as const;
+
+function assertSafeArtifactRelativePath(value: string): string {
+  if (!value || value.startsWith("/") || value.includes("//")) {
+    throw new Error(`Unsafe artifact relative path: ${value}`);
+  }
+  const segments = value.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error(`Unsafe artifact relative path: ${value}`);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) {
+    throw new Error(`Unsafe artifact relative path: ${value}`);
+  }
+  return value;
+}
+
+function assertSafeArtifactRequestId(value: string): string {
+  if (!/^ART-[A-Z0-9-]{10,}$/.test(value)) {
+    throw new Error(`Unsafe artifact request id: ${value}`);
+  }
+  return value;
+}

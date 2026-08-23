@@ -1,3 +1,4 @@
+import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
 import type { DomainEvent } from "../domain/event";
 import type { ProjectState } from "../domain/project-state";
 import type { Receipt } from "../domain/receipt";
@@ -18,6 +19,7 @@ import { DropboxConflictError, type DropboxTransport } from "./client";
 import {
   archiveProjectRoot,
   type LayoutMode,
+  machineArtifactReceiptPath,
   machineEventPath,
   machineManifestPath,
   machineReceiptPath,
@@ -25,6 +27,7 @@ import {
   machineRegistryMarkdownPath,
   machineStatePath,
   machineTransactionPath,
+  workspaceArtifactPath,
   workspaceEntityPath,
   workspacePortfolioDashboardPath,
   workspaceProjectFile,
@@ -40,16 +43,28 @@ import {
   registryMarkdownPath,
   transactionPath
 } from "./paths";
+import { ResilientDropboxTransport } from "./resilient-transport";
 
 export interface CommitWriteOptions {
   publishReceipt?: boolean;
 }
 
+export class ArtifactContentConflictError extends Error {
+  constructor(public readonly path: string) {
+    super(`Artifact already exists with different content: ${path}`);
+    this.name = "ArtifactContentConflictError";
+  }
+}
+
 export class ProjectRepository {
+  private readonly transport: DropboxTransport;
+
   constructor(
-    private readonly transport: DropboxTransport,
+    transport: DropboxTransport,
     private readonly mode: LayoutMode = "legacy"
-  ) {}
+  ) {
+    this.transport = new ResilientDropboxTransport(transport);
+  }
 
   async writeCommit(
     state: ProjectState,
@@ -75,6 +90,37 @@ export class ProjectRepository {
     if (options.publishReceipt !== false) {
       await this.writeReceipt(receipt);
     }
+  }
+
+  async writeArtifact(state: ProjectState, request: ArtifactWriteRequest): Promise<"written" | "idempotent"> {
+    if (this.mode === "legacy") throw new Error("Artifact writes require workspace layout mode");
+    if (request.project_id !== state.project_id) throw new Error("Artifact request project_id does not match project state");
+    if (state.status === "archived") throw new Error("Archived projects do not accept artifact writes");
+
+    const path = workspaceArtifactPath(state.project_id, state.slug, request.relative_path);
+    const existing = await this.transport.download(path);
+    if (existing === request.content) return "idempotent";
+
+    if (request.mode === "create" && existing !== null) {
+      throw new ArtifactContentConflictError(path);
+    }
+
+    try {
+      await this.transport.upload(path, request.content, existing === null ? "add" : "overwrite");
+      return "written";
+    } catch (error) {
+      if (!(error instanceof DropboxConflictError)) throw error;
+      const current = await this.transport.download(path);
+      if (current === request.content) return "idempotent";
+      if (request.mode === "create") throw new ArtifactContentConflictError(path);
+      await this.transport.upload(path, request.content, "overwrite");
+      return "written";
+    }
+  }
+
+  async writeArtifactReceipt(receipt: ArtifactWriteReceipt): Promise<void> {
+    if (this.mode === "legacy") throw new Error("Artifact receipts require workspace layout mode");
+    await this.safeAdd(machineArtifactReceiptPath(receipt.request_id), pretty(receipt));
   }
 
   async writeHumanViews(state: ProjectState): Promise<void> {

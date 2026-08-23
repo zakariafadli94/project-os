@@ -400,7 +400,7 @@ function secureStringEqual(left: string, right: string): boolean {
   const length = Math.max(a.length, b.length);
   let difference = a.length ^ b.length;
   for (let index = 0; index < length; index += 1) {
-    difference |= (a[index] ?? 0) ^ (b[index] ?? 0;
+    difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
   }
   return difference === 0;
 }

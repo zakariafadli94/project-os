@@ -5,6 +5,19 @@ import worker from "../src/index";
 import type { Env } from "../src/env";
 
 const testEnv = env as unknown as Env;
+const authorization = { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` };
+
+const completeProofs = {
+  user_workflow_unchanged: true,
+  zero_downtime: true,
+  project_isolation_proven: true,
+  canonical_compatibility_proven: true,
+  old_new_chat_compatibility_proven: true,
+  stable_path_retained: true,
+  rollback_proven: true,
+  history_preserved: true,
+  production_proof_complete: true
+};
 
 describe("continuity control plane", () => {
   it("exposes authenticated stable-by-default continuity status without changing user workflow", async () => {
@@ -12,7 +25,7 @@ describe("continuity control plane", () => {
     expect(unauthorized.status).toBe(401);
 
     const response = await worker.fetch(new Request("https://example.com/v1/admin/continuity", {
-      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+      headers: authorization
     }), testEnv, createExecutionContext());
 
     expect(response.status).toBe(200);
@@ -24,6 +37,48 @@ describe("continuity control plane", () => {
       ready_for_candidate: false,
       blockers: ["CANDIDATE_NOT_AVAILABLE"],
       user_workflow_change_required: false
+    });
+  });
+
+  it("selects a candidate automatically only when every continuity proof is present", async () => {
+    const response = await worker.fetch(new Request("https://example.com/v1/admin/continuity/evaluate", {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json" },
+      body: JSON.stringify({
+        mode: "automatic",
+        candidate_available: true,
+        proofs: completeProofs
+      })
+    }), testEnv, createExecutionContext());
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      contract_version: "1.0",
+      mode: "automatic",
+      effective_path: "candidate",
+      candidate_available: true,
+      ready_for_candidate: true,
+      blockers: [],
+      user_workflow_change_required: false
+    });
+  });
+
+  it("fails closed to the stable path when rollback proof is missing", async () => {
+    const response = await worker.fetch(new Request("https://example.com/v1/admin/continuity/evaluate", {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json" },
+      body: JSON.stringify({
+        mode: "automatic",
+        candidate_available: true,
+        proofs: { ...completeProofs, rollback_proven: false }
+      })
+    }), testEnv, createExecutionContext());
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      effective_path: "stable",
+      ready_for_candidate: false,
+      blockers: ["ROLLBACK_NOT_PROVEN"]
     });
   });
 });

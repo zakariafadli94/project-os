@@ -6,6 +6,14 @@ const stableId = (prefix: string) => z.string().regex(new RegExp(`^${prefix}-[A-
 const slug = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 const nonEmpty = z.string().trim().min(1);
 const timestamp = z.string().datetime({ offset: true });
+const safeRelativePrefix = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/).refine(
+  (value) => !value.startsWith("/") && !value.endsWith("/") && !value.includes("//") && !value.split("/").some((segment) => segment === "." || segment === ".."),
+  { message: "unsafe relative prefix" }
+);
+const governedTargetPrefix = safeRelativePrefix.refine(
+  (value) => ["DELIVERABLES", "ARCHIVES", "RESEARCH", "REFERENCES", "SPECS", "MEETINGS", "ARTIFACTS"].includes(value.split("/")[0] ?? ""),
+  { message: "target_prefix must use an allowed human workspace root" }
+);
 
 export const AUTO_PROJECT_ID = "PRJ-AUTO" as const;
 
@@ -16,6 +24,7 @@ export const operationValues = [
   "project.complete",
   "project.archive",
   "project.framing.update",
+  "artifact.route.configure",
   "decision.accept",
   "decision.supersede",
   "task.create",
@@ -77,6 +86,19 @@ const projectFramingUpdate = z.strictObject({
     (value) => Object.values(value).some((item) => item !== undefined),
     { message: "project.framing.update requires at least one change" }
   )
+});
+
+const artifactRouteConfigure = z.strictObject({
+  ...common,
+  operation: z.literal("artifact.route.configure"),
+  payload: z.strictObject({
+    route_id: stableId("ROUTE"),
+    source_prefix: safeRelativePrefix,
+    target_prefix: governedTargetPrefix,
+    archive_prefix: governedTargetPrefix.optional(),
+    exclusive: z.boolean().default(false),
+    decision_ids: z.array(stableId("DEC")).min(1)
+  })
 });
 
 const decisionAccept = z.strictObject({
@@ -157,57 +179,27 @@ const deliverableCreate = z.strictObject({
     decision_ids: z.array(stableId("DEC")).optional()
   })
 });
-const deliverableStart = z.strictObject({
-  ...common,
-  operation: z.literal("deliverable.start"),
-  payload: z.strictObject({ deliverable_id: stableId("DEL") })
-});
+const deliverableStart = z.strictObject({ ...common, operation: z.literal("deliverable.start"), payload: z.strictObject({ deliverable_id: stableId("DEL") }) });
 const deliverableRevise = z.strictObject({
   ...common,
   operation: z.literal("deliverable.revise"),
-  payload: z.strictObject({
-    deliverable_id: stableId("DEL"),
-    version: nonEmpty,
-    description: nonEmpty.optional(),
-    reference: nonEmpty.optional()
-  })
+  payload: z.strictObject({ deliverable_id: stableId("DEL"), version: nonEmpty, description: nonEmpty.optional(), reference: nonEmpty.optional() })
 });
-const deliverableSubmitReview = z.strictObject({
-  ...common,
-  operation: z.literal("deliverable.submit_review"),
-  payload: z.strictObject({ deliverable_id: stableId("DEL") })
-});
-const deliverableAccept = z.strictObject({
-  ...common,
-  operation: z.literal("deliverable.accept"),
-  payload: z.strictObject({ deliverable_id: stableId("DEL"), acceptance_note: nonEmpty })
-});
+const deliverableSubmitReview = z.strictObject({ ...common, operation: z.literal("deliverable.submit_review"), payload: z.strictObject({ deliverable_id: stableId("DEL") }) });
+const deliverableAccept = z.strictObject({ ...common, operation: z.literal("deliverable.accept"), payload: z.strictObject({ deliverable_id: stableId("DEL"), acceptance_note: nonEmpty }) });
 const deliverableSupersede = z.strictObject({
   ...common,
   operation: z.literal("deliverable.supersede"),
-  payload: z.strictObject({
-    deliverable_id: stableId("DEL"),
-    replacement_deliverable_id: stableId("DEL"),
-    reason: nonEmpty
-  })
+  payload: z.strictObject({ deliverable_id: stableId("DEL"), replacement_deliverable_id: stableId("DEL"), reason: nonEmpty })
 });
-const deliverableAbandon = z.strictObject({
-  ...common,
-  operation: z.literal("deliverable.abandon"),
-  payload: z.strictObject({ deliverable_id: stableId("DEL"), reason: nonEmpty })
-});
+const deliverableAbandon = z.strictObject({ ...common, operation: z.literal("deliverable.abandon"), payload: z.strictObject({ deliverable_id: stableId("DEL"), reason: nonEmpty }) });
 
-// Deprecated compatibility operations. New SOP-driven flows use the lifecycle above.
 const deliverableAdd = z.strictObject({
   ...common,
   operation: z.literal("deliverable.add"),
   payload: z.strictObject({ deliverable_id: stableId("DEL"), title: nonEmpty, description: nonEmpty.optional(), reference: nonEmpty.optional() })
 });
-const deliverableComplete = z.strictObject({
-  ...common,
-  operation: z.literal("deliverable.complete"),
-  payload: z.strictObject({ deliverable_id: stableId("DEL"), outcome: nonEmpty.optional() })
-});
+const deliverableComplete = z.strictObject({ ...common, operation: z.literal("deliverable.complete"), payload: z.strictObject({ deliverable_id: stableId("DEL"), outcome: nonEmpty.optional() }) });
 
 export const transactionSchema = z.discriminatedUnion("operation", [
   projectCreate,
@@ -216,6 +208,7 @@ export const transactionSchema = z.discriminatedUnion("operation", [
   projectComplete,
   projectArchive,
   projectFramingUpdate,
+  artifactRouteConfigure,
   decisionAccept,
   decisionSupersede,
   taskCreate,

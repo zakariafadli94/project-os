@@ -37,7 +37,11 @@ Cloudflare Worker
 - ChatGPT never submits arbitrary canonical file paths or file patches.
 - Only operations in the closed transaction schema are accepted for canonical state changes.
 - Business artifacts under a project workspace are published by ProjectGuard, never by a competing direct write to their final path.
-- Artifact paths are restricted to `WORKSPACE/PROJECTS/<project>/ARTIFACTS/` and validated as safe relative paths.
+- Artifact requests use safe logical relative paths. Their physical workspace root is resolved from canonical project `artifact_routes` when a governed route matches; otherwise the compatibility default remains `ARTIFACTS/`.
+- A governed artifact route must reference accepted canonical decisions. If a governing decision is later superseded, publication through that route is blocked until governance is updated.
+- Exclusive routes reject physical-path bypasses that would create a second active tree.
+- Changing an existing route root requires a newly accepted governing decision; a platform convention cannot silently move a business tree.
+- A configured `archive_prefix` keeps replaced content outside the active tree before overwrite.
 - Artifact request IDs are idempotency keys; exact replay is safe, while request-ID reuse with different content is rejected.
 - Artifact `create` never overwrites different existing content; a real content conflict remains visible.
 - Transient Dropbox infrastructure failures are retried with bounded exponential backoff and jitter; semantic conflicts are not retried into overwrites.
@@ -68,14 +72,27 @@ Example request:
 {
   "request_id": "ART-GROWTH-000001",
   "project_id": "PRJ-0003",
-  "relative_path": "playbooks/06-acquisition-multicanale.md",
-  "content": "# Acquisition",
+  "relative_path": "REVENUE-OS/04-playbooks-sectoriels/example.md",
+  "content": "# Example",
   "content_sha256": "<64 lowercase hex chars>",
   "mode": "create"
 }
 ```
 
-The Worker processes canonical transactions first, then artifact requests, and routes the artifact request to the matching ProjectGuard. ProjectGuard recomputes the SHA-256 hash, serializes the final artifact write with canonical writes for the same project, writes the artifact receipt, and only then acknowledges the request as durable.
+`relative_path` is a **logical artifact path**, not an instruction to write under a physical `ARTIFACTS/` folder. ProjectGuard resolves it against canonical project routing before publication.
+
+For example, a project may canonically configure:
+
+```text
+REVENUE-OS
+  → DELIVERABLES/REVENUE-OS
+  archive → ARCHIVES/REVENUE-OS
+  exclusive = true
+```
+
+The route is configured through the typed `artifact.route.configure` transaction and must reference one or more accepted decision IDs. A project with no matching route keeps the generic compatibility destination `ARTIFACTS/<relative_path>`.
+
+The Worker processes canonical transactions first, then artifact requests, and routes the artifact request to the matching ProjectGuard. ProjectGuard recomputes the SHA-256 hash, resolves the governed destination, serializes the final write with canonical writes for the same project, writes the artifact receipt, and only then acknowledges the request as durable.
 
 Receipt path:
 
@@ -91,7 +108,7 @@ The source request is then moved to one of:
 /PROJECT_OS/.project-os/artifacts/conflicts/<request_id>.json
 ```
 
-Authenticated clients may instead call `POST /v1/artifacts`; it routes into the same ProjectGuard path. Direct Dropbox reads remain allowed. Direct final writes under a project's `ARTIFACTS/` subtree are not part of the supported operating contract.
+Authenticated clients may instead call `POST /v1/artifacts`; it routes into the same ProjectGuard path. Direct Dropbox reads remain allowed. Direct final writes into governed business trees are not part of the supported operating contract.
 
 ## Dropbox-backed mutation barrier
 

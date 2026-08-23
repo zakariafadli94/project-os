@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { evaluateContinuity } from "../src/continuity/policy";
+import { continuityStatus, evaluateContinuity } from "../src/continuity/policy";
 import worker from "../src/index";
 import type { Env } from "../src/env";
 
@@ -37,6 +37,15 @@ describe("continuity control plane", () => {
       candidate_available: false,
       ready_for_candidate: false,
       blockers: ["CANDIDATE_NOT_AVAILABLE"],
+      user_workflow_change_required: false
+    });
+  });
+
+  it("fails closed to stable for an unknown configured mode", () => {
+    expect(continuityStatus("unexpected-mode")).toMatchObject({
+      mode: "stable",
+      effective_path: "stable",
+      ready_for_candidate: false,
       user_workflow_change_required: false
     });
   });

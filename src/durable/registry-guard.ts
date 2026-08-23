@@ -31,6 +31,11 @@ interface MetaRow {
   value: string;
 }
 
+interface CountRow {
+  [key: string]: SqlStorageValue;
+  count: number;
+}
+
 export class RegistryGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
   private queue: Promise<void> = Promise.resolve();
@@ -73,7 +78,10 @@ export class RegistryGuard extends DurableObject<Env> {
       return this.serialize(() => this.handleCreate(request));
     }
     if (request.method === "GET" && path === "/registry") {
-      return Response.json({ schema_version: "1.0", projects: this.registryEntries() });
+      return this.serialize(async () => {
+        await this.ensureRegistryRecovered();
+        return Response.json({ schema_version: "1.0", projects: this.registryEntries() });
+      });
     }
     if (request.method === "POST" && path === "/sync-status") {
       return this.serialize(() => this.handleStatusSync(request));
@@ -201,6 +209,42 @@ export class RegistryGuard extends DurableObject<Env> {
     return Response.json({ status: "ok" });
   }
 
+  private async ensureRegistryRecovered(): Promise<void> {
+    const projectCount = this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS count FROM projects").one().count;
+    if (projectCount > 0) return;
+
+    const pendingCount = this.ctx.storage.sql.exec<CountRow>(
+      "SELECT COUNT(*) AS count FROM requests WHERE status IN ('allocated', 'guard_committed')"
+    ).one().count;
+    if (pendingCount > 0) return;
+
+    const canonical = parseCanonicalRegistry(await this.repository.readRegistry());
+    if (!canonical) return;
+
+    this.ctx.storage.transactionSync(() => {
+      for (const project of canonical) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO projects (project_id, name, slug, aliases_json, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(project_id) DO UPDATE SET
+             name = excluded.name,
+             slug = excluded.slug,
+             aliases_json = excluded.aliases_json,
+             status = excluded.status,
+             created_at = excluded.created_at,
+             updated_at = excluded.updated_at`,
+          project.project_id,
+          project.name,
+          project.slug,
+          JSON.stringify(project.aliases),
+          project.status,
+          project.created_at,
+          project.updated_at
+        );
+      }
+    });
+  }
+
   private requestRow(transactionId: string): RequestRow | null {
     return this.ctx.storage.sql.exec<RequestRow>(
       "SELECT transaction_json, project_id, status, receipt_json FROM requests WHERE transaction_id = ?",
@@ -295,6 +339,40 @@ export class RegistryGuard extends DurableObject<Env> {
       release();
     }
   }
+}
+
+function parseCanonicalRegistry(value: unknown): RegistryEntry[] | null {
+  if (value === null) return null;
+  if (!value || typeof value !== "object") throw new Error("Canonical registry must be an object");
+  const registry = value as { schema_version?: unknown; projects?: unknown };
+  if (registry.schema_version !== "1.0" || !Array.isArray(registry.projects)) {
+    throw new Error("Canonical registry has an unsupported shape");
+  }
+
+  return registry.projects.map((raw) => {
+    if (!raw || typeof raw !== "object") throw new Error("Canonical registry project must be an object");
+    const project = raw as Record<string, unknown>;
+    if (
+      typeof project.project_id !== "string" || !/^PRJ-\d{4,}$/.test(project.project_id)
+      || typeof project.name !== "string"
+      || typeof project.slug !== "string"
+      || !Array.isArray(project.aliases) || project.aliases.some((alias) => typeof alias !== "string")
+      || typeof project.status !== "string" || !["active", "paused", "completed", "archived"].includes(project.status)
+      || typeof project.created_at !== "string"
+      || typeof project.updated_at !== "string"
+    ) {
+      throw new Error(`Invalid canonical registry project: ${JSON.stringify(raw)}`);
+    }
+    return {
+      project_id: project.project_id,
+      name: project.name,
+      slug: project.slug,
+      aliases: project.aliases as string[],
+      status: project.status as RegistryEntry["status"],
+      created_at: project.created_at,
+      updated_at: project.updated_at
+    };
+  });
 }
 
 function normalizeIdentity(value: string): string {

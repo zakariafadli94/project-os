@@ -2,6 +2,7 @@ export interface DropboxTransport {
   upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void>;
   download(path: string): Promise<string | null>;
   move(from: string, to: string): Promise<void>;
+  delete?(path: string): Promise<void>;
 }
 
 export interface DropboxEntry {
@@ -118,6 +119,25 @@ export class DropboxClient implements DropboxTransport {
       throw new DropboxConflictError(`Dropbox move conflict ${from} -> ${to}`, response.headers.get("x-dropbox-request-id"), text);
     }
     throw this.errorFromResponse(`Dropbox move failed ${from} -> ${to}`, response, text);
+  }
+
+  async delete(path: string): Promise<void> {
+    const token = await this.accessToken();
+    const response = await fetch("https://api.dropboxapi.com/2/files/delete_v2", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ path })
+    });
+    if (response.ok) return;
+    const text = await response.text();
+    if (response.status === 409 && text.includes("not_found")) return;
+    if (response.status === 409) {
+      throw new DropboxConflictError(`Dropbox delete conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
+    }
+    throw this.errorFromResponse(`Dropbox delete failed for ${path}`, response, text);
   }
 
   async listFolder(path: string): Promise<DropboxEntry[]> {

@@ -14,6 +14,7 @@ async function sha256(value: string): Promise<string> {
 }
 
 async function createProject(transactionId: string): Promise<Receipt> {
+  const suffix = transactionId.slice(-4).toLowerCase();
   const stub = testEnv.REGISTRY_GUARD.getByName("global");
   const response = await stub.fetch("https://registry-guard.internal/create", {
     method: "POST",
@@ -25,10 +26,14 @@ async function createProject(transactionId: string): Promise<Receipt> {
       base_revision: 0,
       operation: "project.create",
       created_at: at,
-      payload: { name: "Artifact Project", slug: `artifact-${transactionId.slice(-4).toLowerCase()}`, aliases: [], objective: "Test artifacts" }
+      payload: { name: `Artifact Project ${suffix}`, slug: `artifact-${suffix}`, aliases: [], objective: "Test artifacts" }
     })
   });
-  return response.json<Receipt>();
+  expect(response.status).toBe(200);
+  const receipt = await response.json<Receipt>();
+  expect(receipt.status).toBe("committed");
+  expect(receipt.project_id).toMatch(/^PRJ-[0-9]{4,}$/);
+  return receipt;
 }
 
 function artifactBody(projectId: string, requestId: string, content: string, hash: string) {

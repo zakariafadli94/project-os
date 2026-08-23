@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { evaluateContinuity } from "../src/continuity/policy";
 import worker from "../src/index";
 import type { Env } from "../src/env";
 
@@ -40,19 +41,12 @@ describe("continuity control plane", () => {
     });
   });
 
-  it("selects a candidate automatically only when every continuity proof is present", async () => {
-    const response = await worker.fetch(new Request("https://example.com/v1/admin/continuity/evaluate", {
-      method: "POST",
-      headers: { ...authorization, "content-type": "application/json" },
-      body: JSON.stringify({
-        mode: "automatic",
-        candidate_available: true,
-        proofs: completeProofs
-      })
-    }), testEnv, createExecutionContext());
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({
+  it("selects a candidate automatically only when every continuity proof is present", () => {
+    expect(evaluateContinuity({
+      mode: "automatic",
+      candidate_available: true,
+      proofs: completeProofs
+    })).toEqual({
       contract_version: "1.0",
       mode: "automatic",
       effective_path: "candidate",
@@ -63,22 +57,27 @@ describe("continuity control plane", () => {
     });
   });
 
-  it("fails closed to the stable path when rollback proof is missing", async () => {
-    const response = await worker.fetch(new Request("https://example.com/v1/admin/continuity/evaluate", {
-      method: "POST",
-      headers: { ...authorization, "content-type": "application/json" },
-      body: JSON.stringify({
-        mode: "automatic",
-        candidate_available: true,
-        proofs: { ...completeProofs, rollback_proven: false }
-      })
-    }), testEnv, createExecutionContext());
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
+  it("fails closed to the stable path when rollback proof is missing", () => {
+    expect(evaluateContinuity({
+      mode: "automatic",
+      candidate_available: true,
+      proofs: { ...completeProofs, rollback_proven: false }
+    })).toMatchObject({
       effective_path: "stable",
       ready_for_candidate: false,
       blockers: ["ROLLBACK_NOT_PROVEN"]
+    });
+  });
+
+  it("forces the stable path in rollback mode even with complete candidate proofs", () => {
+    expect(evaluateContinuity({
+      mode: "rollback",
+      candidate_available: true,
+      proofs: completeProofs
+    })).toMatchObject({
+      effective_path: "stable",
+      ready_for_candidate: true,
+      blockers: []
     });
   });
 });

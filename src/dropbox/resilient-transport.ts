@@ -1,4 +1,4 @@
-import { DropboxApiError, type DropboxTransport } from "./client";
+import { DropboxApiError, DropboxConflictError, type DropboxTransport } from "./client";
 import { isTransientDropboxFailure } from "./retry";
 
 export interface ResilientDropboxTransportOptions {
@@ -36,7 +36,30 @@ export class ResilientDropboxTransport implements DropboxTransport {
   }
 
   move(from: string, to: string): Promise<void> {
-    return this.retry("move", `${from} -> ${to}`, () => this.inner.move(from, to));
+    return this.retry("move", `${from} -> ${to}`, async () => {
+      try {
+        await this.inner.move(from, to);
+      } catch (error) {
+        if (!(error instanceof DropboxConflictError) || !this.inner.delete) throw error;
+
+        try {
+          const source = await this.inner.download(from);
+          if (source === null) return;
+          const destination = await this.inner.download(to);
+          if (destination !== source) throw error;
+          await this.delete(from);
+          return;
+        } catch (verificationError) {
+          if (verificationError === error) throw error;
+          throw error;
+        }
+      }
+    });
+  }
+
+  delete(path: string): Promise<void> {
+    if (!this.inner.delete) throw new Error("Dropbox transport does not support delete");
+    return this.retry("delete", path, () => this.inner.delete!(path));
   }
 
   private async retry(operation: string, path: string, fn: () => Promise<void>): Promise<void> {

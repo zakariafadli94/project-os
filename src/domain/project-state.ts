@@ -32,6 +32,17 @@ export interface DiscoverySynthesis {
   next_exploration: string[];
 }
 
+export interface ArtifactRouteRecord {
+  route_id: string;
+  source_prefix: string;
+  target_prefix: string;
+  archive_prefix?: string;
+  exclusive: boolean;
+  decision_ids: string[];
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ConstraintRecord {
   constraint_id: string;
   title: string;
@@ -114,6 +125,7 @@ export interface ProjectState {
   status: ProjectStatus;
   revision: number;
   current_phase_id: string | null;
+  artifact_routes: Record<string, ArtifactRouteRecord>;
   constraints: Record<string, ConstraintRecord>;
   tasks: Record<string, TaskRecord>;
   plan_phases: Record<string, PlanPhaseRecord>;

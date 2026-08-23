@@ -1,18 +1,75 @@
 import { vi } from "vitest";
 
+export interface DropboxMockFault {
+  endpoint: string;
+  occurrence: number;
+  status: number;
+  error_summary: string;
+  method?: string;
+  path?: string;
+}
+
 export interface DropboxMockOptions {
   transientUploadFailures?: number;
+  faults?: DropboxMockFault[];
 }
 
 export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
   const calls: string[] = [];
+  const matchedFaultOccurrences = new Map<number, number>();
+  const consumedFaults = new Set<number>();
   let transientUploadFailures = options.transientUploadFailures ?? 0;
 
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init);
     const url = new URL(request.url);
     calls.push(`${request.method} ${url.pathname}`);
+
+    const requestPaths = new Set<string>();
+    const apiArg = request.headers.get("Dropbox-API-Arg");
+    if (apiArg) {
+      try {
+        const parsed = JSON.parse(apiArg) as { path?: unknown };
+        if (typeof parsed.path === "string") requestPaths.add(parsed.path);
+      } catch {
+        // Ignore malformed test-only metadata; the normal endpoint handler will surface it.
+      }
+    }
+
+    if (!apiArg && request.method !== "GET" && request.method !== "HEAD") {
+      try {
+        const rawBody = await request.clone().text();
+        if (rawBody) {
+          const parsed = JSON.parse(rawBody) as { path?: unknown; from_path?: unknown; to_path?: unknown };
+          for (const value of [parsed.path, parsed.from_path, parsed.to_path]) {
+            if (typeof value === "string") requestPaths.add(value);
+          }
+        }
+      } catch {
+        // Non-JSON payloads are valid for Dropbox content endpoints and are ignored here.
+      }
+    }
+
+    const faults = options.faults ?? [];
+    for (let index = 0; index < faults.length; index += 1) {
+      if (consumedFaults.has(index)) continue;
+      const fault = faults[index];
+      const matches = fault.endpoint === url.pathname
+        && (fault.method === undefined || fault.method === request.method)
+        && (fault.path === undefined || requestPaths.has(fault.path));
+      if (!matches) continue;
+
+      const occurrence = (matchedFaultOccurrences.get(index) ?? 0) + 1;
+      matchedFaultOccurrences.set(index, occurrence);
+      if (occurrence !== fault.occurrence) continue;
+
+      consumedFaults.add(index);
+      return new Response(JSON.stringify({ error_summary: fault.error_summary }), {
+        status: fault.status,
+        headers: { "x-dropbox-request-id": `req-fault-${index}` }
+      });
+    }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/oauth2/token") {
       return Response.json({ access_token: "test-access-token", expires_in: 14400 });

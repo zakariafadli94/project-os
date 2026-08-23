@@ -4,7 +4,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-20",
   "vars": {
-    "PROJECT_OS_LAYOUT_MODE": "v2"
+    "PROJECT_OS_LAYOUT_MODE": "v2",
+    "PROJECT_OS_CONTINUITY_MODE": "stable"
   },
   "triggers": {
     "crons": ["*/5 * * * *"]

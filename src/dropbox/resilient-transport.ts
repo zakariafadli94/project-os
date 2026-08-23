@@ -42,17 +42,18 @@ export class ResilientDropboxTransport implements DropboxTransport {
       } catch (error) {
         if (!(error instanceof DropboxConflictError) || !this.inner.delete) throw error;
 
+        let source: string | null;
+        let destination: string | null;
         try {
-          const source = await this.inner.download(from);
+          source = await this.inner.download(from);
           if (source === null) return;
-          const destination = await this.inner.download(to);
-          if (destination !== source) throw error;
-          await this.delete(from);
-          return;
-        } catch (verificationError) {
-          if (verificationError === error) throw error;
+          destination = await this.inner.download(to);
+        } catch {
           throw error;
         }
+
+        if (destination !== source) throw error;
+        await this.delete(from);
       }
     });
   }

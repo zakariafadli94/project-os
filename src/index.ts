@@ -1,6 +1,6 @@
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "./domain/artifact-write";
 import { parseArtifactWriteRequest } from "./domain/artifact-write";
-import { continuityStatus } from "./continuity/policy";
+import { continuityStatus, evaluateContinuity, type ContinuityEvaluationInput } from "./continuity/policy";
 import type { Env } from "./env";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
@@ -54,6 +54,19 @@ const worker = {
     if (request.method === "GET" && url.pathname === "/v1/admin/continuity") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
       return Response.json(continuityStatus(env.PROJECT_OS_CONTINUITY_MODE));
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/admin/continuity/evaluate") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      try {
+        const input = await request.json() as ContinuityEvaluationInput;
+        return Response.json(evaluateContinuity(input));
+      } catch (error) {
+        return Response.json({
+          error: "invalid_continuity_evaluation",
+          message: error instanceof Error ? error.message : "Invalid continuity evaluation"
+        }, { status: 400 });
+      }
     }
 
     if (request.method === "GET" && url.pathname === "/dropbox/webhook") {

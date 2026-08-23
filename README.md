@@ -49,6 +49,8 @@ Cloudflare Worker
 - Transaction IDs are idempotency keys.
 - Stale direction-changing operations conflict instead of being semantically merged.
 - Canonical transaction receipts and artifact receipts are persistence gates.
+- A dependent Dropbox inbox mutation is physically settled only after the prior receipt is committed **and** the prior source message has drained from its `incoming` queue.
+- Connector-level `WRITE_CONFLICT` is treated as transient infrastructure only after target-state verification: retry the exact same path, ID and content when absent; accept an identical existing target idempotently; surface different content as a real conflict.
 - Generated Markdown is rebuildable from structured state.
 - Project deletion is intentionally absent from V1; archive is terminal.
 
@@ -90,6 +92,32 @@ The source request is then moved to one of:
 ```
 
 Authenticated clients may instead call `POST /v1/artifacts`; it routes into the same ProjectGuard path. Direct Dropbox reads remain allowed. Direct final writes under a project's `ARTIFACTS/` subtree are not part of the supported operating contract.
+
+## Dropbox-backed mutation barrier
+
+For a sequence of dependent mutations submitted through Dropbox, use this order:
+
+```text
+write immutable incoming message
+        ↓
+receipt status = committed
+        ↓
+confirm that exact source message is no longer in incoming
+        ↓
+start the next dependent Dropbox mutation
+```
+
+A committed receipt is the business-persistence proof. Source drain is the additional physical Dropbox settlement barrier that prevents the next connector write from racing the scanner's terminal archival.
+
+If the connector reports `WRITE_CONFLICT` while creating an incoming message:
+
+1. Check whether the exact target path already exists.
+2. If it exists with the exact intended content, treat the write as idempotently present and continue with the same ID.
+3. If it does not exist, retry the exact same path, ID and content after the transient contention clears.
+4. If it exists with different content, stop and surface a real conflict.
+5. Never generate a replacement transaction/request ID merely because the first write was slow or conflicted at the infrastructure layer.
+
+The Worker-side inbox scanner follows the same principle for terminal archival: exact terminal replays clean the duplicate source, and a file move conflict with an absent destination falls back to idempotent publish plus retryable source deletion. Different terminal content remains a semantic conflict.
 
 ## Current write-coordination design
 

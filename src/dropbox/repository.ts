@@ -93,6 +93,12 @@ export class ProjectRepository {
     return receipt;
   }
 
+  async readRegistry(): Promise<unknown | null> {
+    const path = this.mode === "v2" ? machineRegistryJsonPath() : registryJsonPath();
+    const raw = await this.transport.download(path);
+    return raw === null ? null : JSON.parse(raw);
+  }
+
   async writeCommit(
     state: ProjectState,
     event: DomainEvent,

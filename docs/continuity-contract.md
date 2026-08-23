@@ -47,16 +47,23 @@ A candidate is not eligible until all of these are proven:
 
 A missing proof creates an explicit blocker and keeps the effective path on `stable`.
 
+## Control-plane surfaces
+
+`GET /v1/admin/continuity` is authenticated and read-only. It reports the configured continuity mode and the effective fail-closed path.
+
+`POST /v1/admin/continuity/evaluate` is authenticated and non-mutating. It evaluates a proposed proof set and reports the path the policy would select. It does not activate a candidate, change configuration, migrate data, or switch production traffic.
+
 ## Current implementation boundary
 
-`IMP-CONTINUITY001` establishes the fail-closed policy and authenticated read-only continuity status surface. It intentionally does not pretend that generic rollback of partially completed business writes is safe: crash-consistent commit/recovery and storage rollback are implemented by the dependent roadmap packages (`IMP-RECOVERY001`, `IMP-COMMIT001`, `IMP-ROLLBACK001`).
+`IMP-CONTINUITY001` establishes the fail-closed policy and continuity control-plane contract. It intentionally does not pretend that generic rollback of partially completed business writes is safe: crash-consistent commit/recovery and storage rollback are implemented by the dependent roadmap packages (`IMP-RECOVERY001`, `IMP-COMMIT001`, `IMP-ROLLBACK001`).
 
-Future candidate features must use this continuity policy as their activation gate. They must not add a second user-facing workflow.
+Future candidate features must use this continuity policy as their activation gate and obtain real proof evidence internally before using candidate behavior. They must not add a second user-facing workflow.
 
 ## Completion criteria for this foundation
 
 - the default deployed behavior remains stable;
 - continuity status is authenticated and read-only;
+- continuity evaluation is authenticated and non-mutating;
 - automatic candidate eligibility requires the complete proof set;
 - rollback mode always resolves to stable;
 - missing/invalid configuration fails closed;

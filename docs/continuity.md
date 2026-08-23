@@ -70,3 +70,5 @@ The improvement is ready for production validation only when:
 - existing user-facing mutation and inbox behavior is unchanged;
 - the authenticated continuity status reports the stable path after deployment;
 - no canonical Project OS state is changed merely by installing the control plane.
+
+This document is the source-controlled continuity contract for the implementation. The durable Project OS decision record is written only after production validation through the canonical transaction path.

@@ -41,4 +41,22 @@ describe("ResilientDropboxTransport", () => {
     expect(upload).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
   });
+
+  it("retries transient cleanup deletes", async () => {
+    const remove = vi.fn<NonNullable<DropboxTransport["delete"]>>()
+      .mockRejectedValueOnce(new DropboxApiError("busy", 409, "req-delete", "too_many_write_operations"))
+      .mockResolvedValueOnce(undefined);
+    const sleep = vi.fn(async () => undefined);
+    const base = fakeTransport(async () => undefined);
+    const transport = new ResilientDropboxTransport({ ...base, delete: remove }, {
+      sleep,
+      random: () => 0,
+      baseDelayMs: 100
+    });
+
+    await transport.delete("/PROJECT_OS/.project-os/artifacts/incoming/ART-TEST-000001.json");
+
+    expect(remove).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(100);
+  });
 });

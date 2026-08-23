@@ -78,6 +78,19 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       return Response.json({ metadata: { path_display: body.to_path } });
     }
 
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/delete_v2") {
+      const body = JSON.parse(await request.text()) as { path: string };
+      const directContent = files.get(body.path);
+      const prefix = `${body.path}/`;
+      const descendants = [...files.keys()].filter((path) => path.startsWith(prefix));
+      if (directContent === undefined && descendants.length === 0) {
+        return new Response(JSON.stringify({ error_summary: "path_lookup/not_found/" }), { status: 409 });
+      }
+      files.delete(body.path);
+      for (const path of descendants) files.delete(path);
+      return Response.json({ metadata: { path_display: body.path } });
+    }
+
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder") {
       const body = JSON.parse(await request.text()) as { path: string };
       const prefix = `${body.path}/`;

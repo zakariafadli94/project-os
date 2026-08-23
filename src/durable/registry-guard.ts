@@ -31,6 +31,11 @@ interface MetaRow {
   value: string;
 }
 
+interface CountRow {
+  [key: string]: SqlStorageValue;
+  count: number;
+}
+
 export class RegistryGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
   private queue: Promise<void> = Promise.resolve();
@@ -73,7 +78,10 @@ export class RegistryGuard extends DurableObject<Env> {
       return this.serialize(() => this.handleCreate(request));
     }
     if (request.method === "GET" && path === "/registry") {
-      return Response.json({ schema_version: "1.0", projects: this.registryEntries() });
+      return this.serialize(async () => {
+        await this.ensureRegistryRecovered();
+        return Response.json({ schema_version: "1.0", projects: this.registryEntries() });
+      });
     }
     if (request.method === "POST" && path === "/sync-status") {
       return this.serialize(() => this.handleStatusSync(request));
@@ -92,6 +100,8 @@ export class RegistryGuard extends DurableObject<Env> {
     if (tx.operation !== "project.create") {
       return Response.json({ error: "invalid_operation" }, { status: 400 });
     }
+
+    await this.ensureRegistryRecovered();
 
     const existing = this.requestRow(tx.transaction_id);
     if (existing) {
@@ -184,6 +194,9 @@ export class RegistryGuard extends DurableObject<Env> {
     if (!body.project_id || !body.status || !body.updated_at || !["active", "paused", "completed", "archived"].includes(body.status)) {
       return Response.json({ error: "invalid_status_sync" }, { status: 400 });
     }
+
+    await this.ensureRegistryRecovered();
+
     const existing = this.ctx.storage.sql.exec<ProjectRow>(
       "SELECT * FROM projects WHERE project_id = ?",
       body.project_id
@@ -199,6 +212,62 @@ export class RegistryGuard extends DurableObject<Env> {
     const entries = this.registryEntries();
     await this.repository.writeRegistry({ schema_version: "1.0", projects: entries }, renderRegistry(entries));
     return Response.json({ status: "ok" });
+  }
+
+  private async ensureRegistryRecovered(): Promise<void> {
+    const projectCount = this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS count FROM projects").one().count;
+    if (projectCount > 0) return;
+
+    const pendingCount = this.ctx.storage.sql.exec<CountRow>(
+      "SELECT COUNT(*) AS count FROM requests WHERE status IN ('allocated', 'guard_committed')"
+    ).one().count;
+    if (pendingCount > 0) return;
+
+    const canonical = parseCanonicalRegistry(await this.repository.readRegistry());
+    if (!canonical) return;
+
+    this.ctx.storage.transactionSync(() => {
+      for (const project of canonical) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO projects (project_id, name, slug, aliases_json, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(project_id) DO UPDATE SET
+             name = excluded.name,
+             slug = excluded.slug,
+             aliases_json = excluded.aliases_json,
+             status = excluded.status,
+             created_at = excluded.created_at,
+             updated_at = excluded.updated_at`,
+          project.project_id,
+          project.name,
+          project.slug,
+          JSON.stringify(project.aliases),
+          project.status,
+          project.created_at,
+          project.updated_at
+        );
+      }
+
+      if (canonical.length > 0) {
+        const highestProjectNumber = canonical.reduce(
+          (highest, project) => Math.max(highest, Number.parseInt(project.project_id.slice(4), 10)),
+          0
+        );
+        const allocator = this.ctx.storage.sql.exec<MetaRow>(
+          "SELECT value FROM meta WHERE key = 'next_project_number'"
+        ).one();
+        const currentNext = Number.parseInt(allocator.value, 10);
+        if (!Number.isSafeInteger(currentNext) || currentNext < 1) {
+          throw new Error("Invalid project allocator state");
+        }
+        if (currentNext <= highestProjectNumber) {
+          this.ctx.storage.sql.exec(
+            "UPDATE meta SET value = ? WHERE key = 'next_project_number'",
+            String(highestProjectNumber + 1)
+          );
+        }
+      }
+    });
   }
 
   private requestRow(transactionId: string): RequestRow | null {
@@ -295,6 +364,40 @@ export class RegistryGuard extends DurableObject<Env> {
       release();
     }
   }
+}
+
+function parseCanonicalRegistry(value: unknown): RegistryEntry[] | null {
+  if (value === null) return null;
+  if (!value || typeof value !== "object") throw new Error("Canonical registry must be an object");
+  const registry = value as { schema_version?: unknown; projects?: unknown };
+  if (registry.schema_version !== "1.0" || !Array.isArray(registry.projects)) {
+    throw new Error("Canonical registry has an unsupported shape");
+  }
+
+  return registry.projects.map((raw) => {
+    if (!raw || typeof raw !== "object") throw new Error("Canonical registry project must be an object");
+    const project = raw as Record<string, unknown>;
+    if (
+      typeof project.project_id !== "string" || !/^PRJ-\d{4,}$/.test(project.project_id)
+      || typeof project.name !== "string"
+      || typeof project.slug !== "string"
+      || !Array.isArray(project.aliases) || project.aliases.some((alias) => typeof alias !== "string")
+      || typeof project.status !== "string" || !["active", "paused", "completed", "archived"].includes(project.status)
+      || typeof project.created_at !== "string"
+      || typeof project.updated_at !== "string"
+    ) {
+      throw new Error(`Invalid canonical registry project: ${JSON.stringify(raw)}`);
+    }
+    return {
+      project_id: project.project_id,
+      name: project.name,
+      slug: project.slug,
+      aliases: project.aliases as string[],
+      status: project.status as RegistryEntry["status"],
+      created_at: project.created_at,
+      updated_at: project.updated_at
+    };
+  });
 }
 
 function normalizeIdentity(value: string): string {

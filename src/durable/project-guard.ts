@@ -81,7 +81,7 @@ export class ProjectGuard extends DurableObject<Env> {
           return Response.json({ error: "invalid_materialize_target" }, { status: 400 });
         }
 
-        const state = this.loadState();
+        const state = await this.loadOrRecoverState();
         if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
 
         await this.repository.materializeV2(state);
@@ -110,16 +110,18 @@ export class ProjectGuard extends DurableObject<Env> {
 
       const existing = this.findReceipt(tx.transaction_id);
       if (existing) {
-        if (existing.status === "committed" && PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
-          const currentState = this.loadState();
-          if (currentState) {
-            if (tx.operation === "project.archive") {
-              await this.repository.archiveHumanWorkspace(currentState);
-            }
-            await this.syncRegistryStatus(currentState);
-          }
-        }
+        await this.replayStatusSideEffects(tx, existing);
         return Response.json(existing);
+      }
+
+      const canonicalReceipt = await this.repository.readReceipt(tx.transaction_id);
+      if (canonicalReceipt) {
+        if (canonicalReceipt.project_id !== tx.project_id) {
+          throw new Error(`Canonical receipt project binding mismatch for ${tx.transaction_id}`);
+        }
+        this.persistReceipt(canonicalReceipt);
+        await this.replayStatusSideEffects(tx, canonicalReceipt);
+        return Response.json(canonicalReceipt);
       }
 
       if (tx.project_id === AUTO_PROJECT_ID) {
@@ -136,7 +138,7 @@ export class ProjectGuard extends DurableObject<Env> {
         return Response.json(receipt);
       }
 
-      const state = this.loadState();
+      const state = await this.loadOrRecoverState();
       const result = applyTransaction(state, tx);
 
       if (result.kind === "rejected" || result.kind === "conflict") {
@@ -201,7 +203,7 @@ export class ProjectGuard extends DurableObject<Env> {
       );
     }
 
-    const state = this.loadState();
+    const state = await this.loadOrRecoverState();
     if (!state) {
       return this.finalizeArtifact(
         artifact,
@@ -244,6 +246,22 @@ export class ProjectGuard extends DurableObject<Env> {
     return row ? normalizeProjectState(JSON.parse(row.state_json)) : null;
   }
 
+  private async loadOrRecoverState(): Promise<ProjectState | null> {
+    const local = this.loadState();
+    if (local) return local;
+
+    const projectId = this.ctx.id.name;
+    if (!projectId) return null;
+    const recovered = await this.repository.readProjectState(projectId);
+    if (!recovered) return null;
+
+    this.ctx.storage.sql.exec(
+      "INSERT INTO project_state (singleton, state_json) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
+      JSON.stringify(recovered)
+    );
+    return recovered;
+  }
+
   private findReceipt(transactionId: string): Receipt | null {
     const row = this.ctx.storage.sql.exec<TransactionRow>(
       "SELECT receipt_json FROM transactions WHERE transaction_id = ?",
@@ -257,6 +275,16 @@ export class ProjectGuard extends DurableObject<Env> {
       "SELECT request_json, receipt_json FROM artifact_requests WHERE request_id = ?",
       requestId
     ).toArray()[0] ?? null;
+  }
+
+  private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<void> {
+    if (receipt.status !== "committed" || !PROJECT_STATUS_OPERATIONS.has(tx.operation)) return;
+    const currentState = await this.loadOrRecoverState();
+    if (!currentState) return;
+    if (tx.operation === "project.archive") {
+      await this.repository.archiveHumanWorkspace(currentState);
+    }
+    await this.syncRegistryStatus(currentState);
   }
 
   private async syncRegistryStatus(state: ProjectState): Promise<void> {

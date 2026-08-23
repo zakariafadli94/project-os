@@ -1,6 +1,7 @@
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
 import type { DomainEvent } from "../domain/event";
 import type { ProjectState } from "../domain/project-state";
+import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
 import type { Transaction } from "../domain/transaction";
 import { renderBrief } from "../render/brief";
@@ -66,6 +67,36 @@ export class ProjectRepository {
     private readonly mode: LayoutMode = "legacy"
   ) {
     this.transport = new ResilientDropboxTransport(transport);
+  }
+
+  async readProjectState(projectId: string): Promise<ProjectState | null> {
+    if (this.mode === "legacy") return null;
+    const raw = await this.transport.download(machineStatePath(projectId));
+    if (raw === null) return null;
+    const state = normalizeProjectState(JSON.parse(raw));
+    if (state.project_id !== projectId) {
+      throw new Error(`Canonical project state binding mismatch: expected ${projectId}, got ${state.project_id}`);
+    }
+    return state;
+  }
+
+  async readReceipt(transactionId: string): Promise<Receipt | null> {
+    const path = this.mode === "v2"
+      ? machineReceiptPath(transactionId)
+      : receiptPath(transactionId);
+    const raw = await this.transport.download(path);
+    if (raw === null) return null;
+    const receipt = JSON.parse(raw) as Receipt;
+    if (receipt.transaction_id !== transactionId) {
+      throw new Error(`Canonical receipt binding mismatch: expected ${transactionId}, got ${receipt.transaction_id}`);
+    }
+    return receipt;
+  }
+
+  async readRegistry(): Promise<unknown | null> {
+    const path = this.mode === "v2" ? machineRegistryJsonPath() : registryJsonPath();
+    const raw = await this.transport.download(path);
+    return raw === null ? null : JSON.parse(raw);
   }
 
   async writeCommit(

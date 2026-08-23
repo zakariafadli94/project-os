@@ -184,6 +184,20 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
         }
       }
       const existing = next.artifact_routes[p.route_id];
+      if (existing && (
+        existing.source_prefix !== p.source_prefix ||
+        existing.target_prefix !== p.target_prefix ||
+        existing.archive_prefix !== p.archive_prefix ||
+        existing.exclusive !== p.exclusive
+      )) {
+        const hasNewDecision = p.decision_ids.some((decisionId) => !existing.decision_ids.includes(decisionId));
+        if (!hasNewDecision) {
+          return rejected(
+            "ARTIFACT_ROUTE_CHANGE_REQUIRES_NEW_DECISION",
+            `Changing artifact route ${p.route_id} requires a newly accepted governing decision`
+          );
+        }
+      }
       next.artifact_routes[p.route_id] = {
         route_id: p.route_id,
         source_prefix: p.source_prefix,

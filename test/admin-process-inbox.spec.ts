@@ -25,6 +25,7 @@ describe("admin inbox processing", () => {
     await expect(response.json()).resolves.toEqual({
       mode: "v2",
       inbox: "/PROJECT_OS/.project-os/transactions/incoming",
+      artifact_inbox: "/PROJECT_OS/.project-os/artifacts/incoming",
       scanned: 0,
       processed: 0,
       failed: 0

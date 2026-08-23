@@ -23,7 +23,7 @@ const artifact: ArtifactWriteRequest = {
 };
 
 function configuredState() {
-  const state = emptyProjectState("PRJ-0003", "Growth", "growth", "Build growth agency") as any;
+  const state = emptyProjectState("PRJ-0003", "Growth", "growth", "Build growth agency");
   state.decisions["DEC-REVENUESINGLETREE001"] = {
     decision_id: "DEC-REVENUESINGLETREE001", title: "single tree", decision: "single tree", reason: "governance", impacts: [], status: "accepted", created_at: "2026-08-22T10:00:00Z", updated_at: "2026-08-22T10:00:00Z"
   };
@@ -71,13 +71,36 @@ describe("project artifact routing", () => {
     })).rejects.toBeInstanceOf(ArtifactGovernanceConflictError);
   });
 
+  it("blocks writes when a governing decision is no longer accepted", async () => {
+    const state = configuredState();
+    state.decisions["DEC-REVENUESINGLETREE001"].status = "superseded";
+    const repository = new ProjectRepository(new FakeTransport(), "v2");
+    await expect(repository.writeArtifact(state, artifact)).rejects.toBeInstanceOf(ArtifactGovernanceConflictError);
+  });
+
+  it("archives the replaced active content under ARCHIVES without polluting DELIVERABLES", async () => {
+    const transport = new FakeTransport();
+    const repository = new ProjectRepository(transport, "v2");
+    const activePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/DELIVERABLES/REVENUE-OS/04-playbooks-sectoriels/foo.md";
+    transport.files.set(activePath, "# old");
+
+    await repository.writeArtifact(configuredState(), { ...artifact, content: "# new", mode: "replace" });
+
+    expect(transport.files.get(activePath)).toBe("# new");
+    const archivePath = transport.uploads.find((path) => path.includes("/ARCHIVES/REVENUE-OS/") && path.includes("foo.previous-"));
+    expect(archivePath).toBeDefined();
+    expect(archivePath?.endsWith(".md")).toBe(true);
+    expect(transport.files.get(archivePath!)).toBe("# old");
+    expect(transport.uploads.filter((path) => path.includes("/DELIVERABLES/REVENUE-OS/") && path.includes("previous-"))).toHaveLength(0);
+  });
+
   it("requires accepted decisions before a route can be configured", () => {
     const state = emptyProjectState("PRJ-0003", "Growth", "growth", "Build growth agency");
     const tx = parseTransaction({
       schema_version: "1.0", transaction_id: "TXN-ARTROUTE-000001", project_id: "PRJ-0003", base_revision: 0,
       created_at: "2026-08-23T12:00:00Z", operation: "artifact.route.configure",
       payload: { route_id: "ROUTE-REVENUE001", source_prefix: "REVENUE-OS", target_prefix: "DELIVERABLES/REVENUE-OS", archive_prefix: "ARCHIVES/REVENUE-OS", exclusive: true, decision_ids: ["DEC-REVENUESINGLETREE001"] }
-    } as any);
+    });
     expect(applyTransaction(state, tx)).toMatchObject({ kind: "rejected", code: "ARTIFACT_ROUTE_DECISION_NOT_ACCEPTED" });
   });
 
@@ -87,7 +110,7 @@ describe("project artifact routing", () => {
       schema_version: "1.0", transaction_id: "TXN-ARTROUTE-000002", project_id: "PRJ-0003", base_revision: 0,
       created_at: "2026-08-23T12:00:00Z", operation: "artifact.route.configure",
       payload: { route_id: "ROUTE-REVENUE001", source_prefix: "REVENUE-OS", target_prefix: "DELIVERABLES/REVENUE-OS", archive_prefix: "ARCHIVES/REVENUE-OS", exclusive: true, decision_ids: ["DEC-REVENUESINGLETREE001", "DEC-REVENUEARCHIVE001"] }
-    } as any);
+    });
     const result = applyTransaction(state, tx);
     expect(result.kind).toBe("commit");
     if (result.kind === "commit") expect(result.state.artifact_routes["ROUTE-REVENUE001"].target_prefix).toBe("DELIVERABLES/REVENUE-OS");
@@ -99,7 +122,7 @@ describe("project artifact routing", () => {
       schema_version: "1.0", transaction_id: "TXN-ARTROUTE-000003", project_id: "PRJ-0003", base_revision: 0,
       created_at: "2026-08-23T12:05:00Z", operation: "artifact.route.configure",
       payload: { route_id: "ROUTE-REVENUE001", source_prefix: "REVENUE-OS", target_prefix: "ARTIFACTS/REVENUE-OS", archive_prefix: "ARCHIVES/REVENUE-OS", exclusive: true, decision_ids: ["DEC-REVENUESINGLETREE001", "DEC-REVENUEARCHIVE001"] }
-    } as any);
+    });
     expect(applyTransaction(state, tx)).toMatchObject({ kind: "rejected", code: "ARTIFACT_ROUTE_CHANGE_REQUIRES_NEW_DECISION" });
   });
 });

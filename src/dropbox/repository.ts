@@ -80,6 +80,19 @@ export class ProjectRepository {
     return state;
   }
 
+  async readReceipt(transactionId: string): Promise<Receipt | null> {
+    const path = this.mode === "v2"
+      ? machineReceiptPath(transactionId)
+      : receiptPath(transactionId);
+    const raw = await this.transport.download(path);
+    if (raw === null) return null;
+    const receipt = JSON.parse(raw) as Receipt;
+    if (receipt.transaction_id !== transactionId) {
+      throw new Error(`Canonical receipt binding mismatch: expected ${transactionId}, got ${receipt.transaction_id}`);
+    }
+    return receipt;
+  }
+
   async writeCommit(
     state: ProjectState,
     event: DomainEvent,

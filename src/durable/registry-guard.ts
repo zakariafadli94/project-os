@@ -194,6 +194,9 @@ export class RegistryGuard extends DurableObject<Env> {
     if (!body.project_id || !body.status || !body.updated_at || !["active", "paused", "completed", "archived"].includes(body.status)) {
       return Response.json({ error: "invalid_status_sync" }, { status: 400 });
     }
+
+    await this.ensureRegistryRecovered();
+
     const existing = this.ctx.storage.sql.exec<ProjectRow>(
       "SELECT * FROM projects WHERE project_id = ?",
       body.project_id

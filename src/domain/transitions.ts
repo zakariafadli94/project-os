@@ -40,6 +40,7 @@ export function emptyProjectState(
     status: "active",
     revision: 0,
     current_phase_id: null,
+    artifact_routes: {},
     constraints: {},
     tasks: {},
     plan_phases: {},
@@ -88,6 +89,7 @@ const exactRevisionOperations = new Set<Transaction["operation"]>([
   "project.complete",
   "project.archive",
   "project.framing.update",
+  "artifact.route.configure",
   "decision.accept",
   "decision.supersede",
   "plan.phase.create",
@@ -165,6 +167,33 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
       if (p.success_criteria !== undefined) next.framing.success_criteria = [...p.success_criteria];
       if (p.stakeholders !== undefined) next.framing.stakeholders = [...p.stakeholders];
       if (p.open_questions !== undefined) next.framing.open_questions = [...p.open_questions];
+      return commit(next, tx);
+    }
+
+    case "artifact.route.configure": {
+      const p = tx.payload;
+      for (const decisionId of p.decision_ids) {
+        const decision = next.decisions[decisionId];
+        if (!decision || decision.status !== "accepted") {
+          return rejected("ARTIFACT_ROUTE_DECISION_NOT_ACCEPTED", `Artifact route requires accepted decision ${decisionId}`);
+        }
+      }
+      for (const route of Object.values(next.artifact_routes)) {
+        if (route.route_id !== p.route_id && route.source_prefix === p.source_prefix) {
+          return rejected("ARTIFACT_ROUTE_PREFIX_EXISTS", `Artifact route already exists for ${p.source_prefix}`);
+        }
+      }
+      const existing = next.artifact_routes[p.route_id];
+      next.artifact_routes[p.route_id] = {
+        route_id: p.route_id,
+        source_prefix: p.source_prefix,
+        target_prefix: p.target_prefix,
+        archive_prefix: p.archive_prefix,
+        exclusive: p.exclusive,
+        decision_ids: [...p.decision_ids],
+        created_at: existing?.created_at ?? tx.created_at,
+        updated_at: tx.created_at
+      };
       return commit(next, tx);
     }
 

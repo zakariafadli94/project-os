@@ -83,4 +83,26 @@ describe("RegistryGuard canonical recovery", () => {
     expect(third.status).toBe("committed");
     expect(third.project_id).toBe("PRJ-1402");
   });
+
+  it("recovers automatically before allocating a new project after local loss", async () => {
+    const stub = testEnv.REGISTRY_GUARD.getByName("global");
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM requests");
+      state.storage.sql.exec("DELETE FROM projects");
+      state.storage.sql.exec("UPDATE meta SET value = '1500' WHERE key = 'next_project_number'");
+    });
+
+    await createProject("TXN-REGREC-1500-A", "Registry Automatic A", "registry-automatic-a");
+    await createProject("TXN-REGREC-1500-B", "Registry Automatic B", "registry-automatic-b");
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM requests");
+      state.storage.sql.exec("DELETE FROM projects");
+      state.storage.sql.exec("UPDATE meta SET value = '1499' WHERE key = 'next_project_number'");
+    });
+
+    const third = await createProject("TXN-REGREC-1500-C", "Registry Automatic C", "registry-automatic-c");
+    expect(third.status).toBe("committed");
+    expect(third.project_id).toBe("PRJ-1502");
+  });
 });

@@ -105,4 +105,36 @@ describe("RegistryGuard canonical recovery", () => {
     expect(third.status).toBe("committed");
     expect(third.project_id).toBe("PRJ-1502");
   });
+
+  it("recovers automatically before a project status sync after local loss", async () => {
+    const stub = testEnv.REGISTRY_GUARD.getByName("global");
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM requests");
+      state.storage.sql.exec("DELETE FROM projects");
+      state.storage.sql.exec("UPDATE meta SET value = '1600' WHERE key = 'next_project_number'");
+    });
+
+    const created = await createProject("TXN-REGREC-1600-A", "Registry Status A", "registry-status-a");
+    expect(created.status).toBe("committed");
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM requests");
+      state.storage.sql.exec("DELETE FROM projects");
+      state.storage.sql.exec("UPDATE meta SET value = '1' WHERE key = 'next_project_number'");
+    });
+
+    const synced = await stub.fetch("https://registry-guard.internal/sync-status", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: created.project_id, status: "paused", updated_at: "2026-08-23T22:05:00.000Z" })
+    });
+    expect(synced.status).toBe(200);
+
+    const registryResponse = await stub.fetch("https://registry-guard.internal/registry");
+    const registry = await registryResponse.json<{ projects: Array<{ project_id: string; status: string }> }>();
+    expect(registry.projects).toContainEqual(expect.objectContaining({
+      project_id: created.project_id,
+      status: "paused"
+    }));
+  });
 });

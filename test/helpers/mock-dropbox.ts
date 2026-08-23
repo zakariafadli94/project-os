@@ -2,12 +2,14 @@ import { vi } from "vitest";
 
 export interface DropboxMockOptions {
   transientUploadFailures?: number;
+  moveConflicts?: number;
 }
 
 export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
   const calls: string[] = [];
   let transientUploadFailures = options.transientUploadFailures ?? 0;
+  let moveConflicts = options.moveConflicts ?? 0;
 
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init);
@@ -50,6 +52,13 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/move_v2") {
       const body = JSON.parse(await request.text()) as { from_path: string; to_path: string };
+      if (moveConflicts > 0) {
+        moveConflicts -= 1;
+        return new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), {
+          status: 409,
+          headers: { "x-dropbox-request-id": `req-move-conflict-${moveConflicts}` }
+        });
+      }
       const directContent = files.get(body.from_path);
       const sourcePrefix = `${body.from_path}/`;
       const descendants = [...files.entries()].filter(([path]) => path.startsWith(sourcePrefix));

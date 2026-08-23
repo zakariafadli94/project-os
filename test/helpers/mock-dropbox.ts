@@ -1,18 +1,47 @@
 import { vi } from "vitest";
 
+export interface DropboxMockFault {
+  endpoint: string;
+  occurrence: number;
+  status: number;
+  error_summary: string;
+  method?: string;
+}
+
 export interface DropboxMockOptions {
   transientUploadFailures?: number;
+  faults?: DropboxMockFault[];
 }
 
 export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
   const calls: string[] = [];
+  const endpointOccurrences = new Map<string, number>();
+  const consumedFaults = new Set<number>();
   let transientUploadFailures = options.transientUploadFailures ?? 0;
 
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init);
     const url = new URL(request.url);
     calls.push(`${request.method} ${url.pathname}`);
+
+    const faultKey = `${request.method} ${url.pathname}`;
+    const occurrence = (endpointOccurrences.get(faultKey) ?? 0) + 1;
+    endpointOccurrences.set(faultKey, occurrence);
+    const faultIndex = (options.faults ?? []).findIndex((fault, index) =>
+      !consumedFaults.has(index)
+      && fault.endpoint === url.pathname
+      && (fault.method === undefined || fault.method === request.method)
+      && fault.occurrence === occurrence
+    );
+    if (faultIndex >= 0) {
+      consumedFaults.add(faultIndex);
+      const fault = options.faults![faultIndex];
+      return new Response(JSON.stringify({ error_summary: fault.error_summary }), {
+        status: fault.status,
+        headers: { "x-dropbox-request-id": `req-fault-${faultIndex}` }
+      });
+    }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/oauth2/token") {
       return Response.json({ access_token: "test-access-token", expires_in: 14400 });

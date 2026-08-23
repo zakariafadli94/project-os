@@ -58,4 +58,40 @@ describe("ProjectGuard canonical recovery", () => {
     expect(recovered.previous_revision).toBe(1);
     expect(recovered.new_revision).toBe(2);
   });
+
+  it("replays the canonical committed receipt after local receipt and state caches are lost", async () => {
+    const projectId = "PRJ-1202";
+    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+
+    await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-RECOVERY-1202-CREATE",
+      project_id: projectId,
+      base_revision: 0,
+      operation: "project.create",
+      created_at: at,
+      payload: { name: "Recovery 1202", slug: "recovery-1202", aliases: [], objective: "Recover committed receipt" }
+    });
+
+    const transaction = {
+      schema_version: "1.0",
+      transaction_id: "TXN-RECOVERY-1202-TASK",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "task.create",
+      created_at: at,
+      payload: { task_id: "TASK-RECOVERY1202", title: "Commit exactly once" }
+    };
+    const committed = await submit(projectId, transaction);
+    expect(committed.status).toBe("committed");
+    expect(committed.new_revision).toBe(2);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM transactions");
+      state.storage.sql.exec("DELETE FROM project_state");
+    });
+
+    const replay = await submit(projectId, transaction);
+    expect(replay).toEqual(committed);
+  });
 });

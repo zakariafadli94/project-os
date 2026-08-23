@@ -242,6 +242,26 @@ export class RegistryGuard extends DurableObject<Env> {
           project.updated_at
         );
       }
+
+      if (canonical.length > 0) {
+        const highestProjectNumber = canonical.reduce(
+          (highest, project) => Math.max(highest, Number.parseInt(project.project_id.slice(4), 10)),
+          0
+        );
+        const allocator = this.ctx.storage.sql.exec<MetaRow>(
+          "SELECT value FROM meta WHERE key = 'next_project_number'"
+        ).one();
+        const currentNext = Number.parseInt(allocator.value, 10);
+        if (!Number.isSafeInteger(currentNext) || currentNext < 1) {
+          throw new Error("Invalid project allocator state");
+        }
+        if (currentNext <= highestProjectNumber) {
+          this.ctx.storage.sql.exec(
+            "UPDATE meta SET value = ? WHERE key = 'next_project_number'",
+            String(highestProjectNumber + 1)
+          );
+        }
+      }
     });
   }
 

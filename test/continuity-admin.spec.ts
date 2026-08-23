@@ -78,6 +78,18 @@ describe("continuity control plane", () => {
     });
   });
 
+  it("blocks any candidate that requires a user workflow change", () => {
+    expect(evaluateContinuity({
+      mode: "automatic",
+      candidate_available: true,
+      proofs: { ...completeProofs, user_workflow_unchanged: false }
+    })).toMatchObject({
+      effective_path: "stable",
+      ready_for_candidate: false,
+      blockers: ["USER_WORKFLOW_CHANGE_REQUIRED"]
+    });
+  });
+
   it("forces the stable path in rollback mode even with complete candidate proofs", () => {
     expect(evaluateContinuity({
       mode: "rollback",

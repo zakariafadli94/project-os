@@ -1,6 +1,7 @@
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
 import type { DomainEvent } from "../domain/event";
 import type { ProjectState } from "../domain/project-state";
+import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
 import type { Transaction } from "../domain/transaction";
 import { renderBrief } from "../render/brief";
@@ -66,6 +67,17 @@ export class ProjectRepository {
     private readonly mode: LayoutMode = "legacy"
   ) {
     this.transport = new ResilientDropboxTransport(transport);
+  }
+
+  async readProjectState(projectId: string): Promise<ProjectState | null> {
+    if (this.mode === "legacy") return null;
+    const raw = await this.transport.download(machineStatePath(projectId));
+    if (raw === null) return null;
+    const state = normalizeProjectState(JSON.parse(raw));
+    if (state.project_id !== projectId) {
+      throw new Error(`Canonical project state binding mismatch: expected ${projectId}, got ${state.project_id}`);
+    }
+    return state;
   }
 
   async writeCommit(

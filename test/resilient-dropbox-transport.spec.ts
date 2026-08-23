@@ -59,4 +59,36 @@ describe("ResilientDropboxTransport", () => {
     expect(remove).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledWith(100);
   });
+
+  it("publishes and removes a file source when move conflicts before the destination exists", async () => {
+    const from = "/PROJECT_OS/.project-os/transactions/incoming/TXN-FALLBACK-000001.json";
+    const to = "/PROJECT_OS/.project-os/transactions/committed/TXN-FALLBACK-000001.json";
+    const content = "{\"transaction_id\":\"TXN-FALLBACK-000001\"}";
+    const move = vi.fn<DropboxTransport["move"]>()
+      .mockRejectedValue(new DropboxConflictError("move conflict", "req-move", "to/conflict/file"));
+    const upload = vi.fn<DropboxTransport["upload"]>().mockResolvedValue(undefined);
+    const remove = vi.fn<NonNullable<DropboxTransport["delete"]>>().mockResolvedValue(undefined);
+    const download = vi.fn<DropboxTransport["download"]>(async (path) => path === from ? content : null);
+    const transport = new ResilientDropboxTransport({ upload, download, move, delete: remove }, { random: () => 0 });
+
+    await transport.move(from, to);
+
+    expect(upload).toHaveBeenCalledWith(to, content, "add");
+    expect(remove).toHaveBeenCalledWith(from);
+  });
+
+  it("keeps a move conflict terminal when the destination contains different content", async () => {
+    const from = "/PROJECT_OS/.project-os/transactions/incoming/TXN-FALLBACK-000002.json";
+    const to = "/PROJECT_OS/.project-os/transactions/committed/TXN-FALLBACK-000002.json";
+    const conflict = new DropboxConflictError("move conflict", "req-move", "to/conflict/file");
+    const move = vi.fn<DropboxTransport["move"]>().mockRejectedValue(conflict);
+    const upload = vi.fn<DropboxTransport["upload"]>().mockResolvedValue(undefined);
+    const remove = vi.fn<NonNullable<DropboxTransport["delete"]>>().mockResolvedValue(undefined);
+    const download = vi.fn<DropboxTransport["download"]>(async (path) => path === from ? "source" : "different");
+    const transport = new ResilientDropboxTransport({ upload, download, move, delete: remove }, { random: () => 0 });
+
+    await expect(transport.move(from, to)).rejects.toBe(conflict);
+    expect(upload).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+  });
 });

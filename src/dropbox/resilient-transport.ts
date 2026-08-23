@@ -39,6 +39,7 @@ export class ResilientDropboxTransport implements DropboxTransport {
     return this.retry("move", `${from} -> ${to}`, async () => {
       try {
         await this.inner.move(from, to);
+        return;
       } catch (error) {
         if (!(error instanceof DropboxConflictError) || !this.inner.delete) throw error;
 
@@ -52,7 +53,19 @@ export class ResilientDropboxTransport implements DropboxTransport {
           throw error;
         }
 
-        if (destination !== source) throw error;
+        if (destination === source) {
+          await this.delete(from);
+          return;
+        }
+        if (destination !== null) throw error;
+
+        try {
+          await this.upload(to, source, "add");
+        } catch (publishError) {
+          if (!(publishError instanceof DropboxConflictError)) throw publishError;
+          const published = await this.inner.download(to);
+          if (published !== source) throw error;
+        }
         await this.delete(from);
       }
     });

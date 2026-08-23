@@ -22,7 +22,7 @@ describe("deterministic Dropbox fault injection", () => {
         status: 503,
         error_summary: "injected/write_failure"
       }]
-    } as never);
+    });
 
     expect((await upload("/a.txt", "a")).status).toBe(200);
 
@@ -34,5 +34,24 @@ describe("deterministic Dropbox fault injection", () => {
     expect(mock.files.get("/a.txt")).toBe("a");
     expect(mock.files.has("/b.txt")).toBe(false);
     expect(mock.files.get("/c.txt")).toBe("c");
+  });
+
+  it("can scope a failpoint to one Dropbox path without disturbing earlier writes", async () => {
+    const mock = installDropboxMock({
+      faults: [{
+        endpoint: "/2/files/upload",
+        path: "/target.txt",
+        occurrence: 1,
+        status: 500,
+        error_summary: "injected/target_failure"
+      }]
+    } as never);
+
+    expect((await upload("/other.txt", "other")).status).toBe(200);
+
+    const failed = await upload("/target.txt", "target");
+    expect(failed.status).toBe(500);
+    expect(mock.files.get("/other.txt")).toBe("other");
+    expect(mock.files.has("/target.txt")).toBe(false);
   });
 });

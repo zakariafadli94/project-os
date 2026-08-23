@@ -51,7 +51,7 @@ describe("ProjectGuard canonical recovery", () => {
       base_revision: 1,
       operation: "task.create",
       created_at: at,
-      payload: { task_id: "TASK-RECOVERY-1201", title: "Continue after local loss" }
+      payload: { task_id: "TASK-RECOVERY1201", title: "Continue after local loss" }
     });
 
     expect(recovered.status).toBe("committed");

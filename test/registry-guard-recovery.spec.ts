@@ -58,4 +58,29 @@ describe("RegistryGuard canonical recovery", () => {
       second.project_id
     ]);
   });
+
+  it("recovers the allocator above the highest canonical project ID", async () => {
+    const stub = testEnv.REGISTRY_GUARD.getByName("global");
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM requests");
+      state.storage.sql.exec("DELETE FROM projects");
+      state.storage.sql.exec("UPDATE meta SET value = '1400' WHERE key = 'next_project_number'");
+    });
+
+    await createProject("TXN-REGREC-1400-A", "Registry Allocator A", "registry-allocator-a");
+    await createProject("TXN-REGREC-1400-B", "Registry Allocator B", "registry-allocator-b");
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM requests");
+      state.storage.sql.exec("DELETE FROM projects");
+      state.storage.sql.exec("UPDATE meta SET value = '1399' WHERE key = 'next_project_number'");
+    });
+
+    const recoveredRegistry = await stub.fetch("https://registry-guard.internal/registry");
+    expect(recoveredRegistry.status).toBe(200);
+
+    const third = await createProject("TXN-REGREC-1400-C", "Registry Allocator C", "registry-allocator-c");
+    expect(third.status).toBe("committed");
+    expect(third.project_id).toBe("PRJ-1402");
+  });
 });

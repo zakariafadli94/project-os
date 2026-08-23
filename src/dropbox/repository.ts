@@ -15,6 +15,7 @@ import { renderResearch } from "../render/research";
 import { renderRoadmap } from "../render/roadmap";
 import { renderState } from "../render/state";
 import { renderTask } from "../render/task";
+import { ArtifactGovernanceConflictError, resolveArtifactDestination } from "./artifact-routing";
 import { DropboxConflictError, type DropboxTransport } from "./client";
 import {
   archiveProjectRoot,
@@ -27,7 +28,6 @@ import {
   machineRegistryMarkdownPath,
   machineStatePath,
   machineTransactionPath,
-  workspaceArtifactPath,
   workspaceEntityPath,
   workspacePortfolioDashboardPath,
   workspaceProjectFile,
@@ -44,6 +44,8 @@ import {
   transactionPath
 } from "./paths";
 import { ResilientDropboxTransport } from "./resilient-transport";
+
+export { ArtifactGovernanceConflictError } from "./artifact-routing";
 
 export interface CommitWriteOptions {
   publishReceipt?: boolean;
@@ -97,12 +99,17 @@ export class ProjectRepository {
     if (request.project_id !== state.project_id) throw new Error("Artifact request project_id does not match project state");
     if (state.status === "archived") throw new Error("Archived projects do not accept artifact writes");
 
-    const path = workspaceArtifactPath(state.project_id, state.slug, request.relative_path);
+    const destination = resolveArtifactDestination(state, request.relative_path);
+    const path = destination.path;
     const existing = await this.transport.download(path);
     if (existing === request.content) return "idempotent";
 
     if (request.mode === "create" && existing !== null) {
       throw new ArtifactContentConflictError(path);
+    }
+
+    if (request.mode === "replace" && existing !== null && destination.archive_path) {
+      await this.archiveExisting(destination.archive_path, existing);
     }
 
     try {
@@ -113,6 +120,7 @@ export class ProjectRepository {
       const current = await this.transport.download(path);
       if (current === request.content) return "idempotent";
       if (request.mode === "create") throw new ArtifactContentConflictError(path);
+      if (current !== null && destination.archive_path) await this.archiveExisting(destination.archive_path, current);
       await this.transport.upload(path, request.content, "overwrite");
       return "written";
     }
@@ -267,6 +275,17 @@ export class ProjectRepository {
     await this.transport.upload(manifestPath(state.project_id, state.slug), pretty(manifestFor(state)), "overwrite");
   }
 
+  private async archiveExisting(basePath: string, content: string): Promise<void> {
+    const hash = await sha256(content);
+    const slash = basePath.lastIndexOf("/");
+    const dot = basePath.lastIndexOf(".");
+    const hasExtension = dot > slash;
+    const archivePath = hasExtension
+      ? `${basePath.slice(0, dot)}.previous-${hash.slice(0, 12)}${basePath.slice(dot)}`
+      : `${basePath}.previous-${hash.slice(0, 12)}`;
+    await this.safeAdd(archivePath, content);
+  }
+
   private async safeAdd(path: string, content: string): Promise<void> {
     try {
       await this.transport.upload(path, content, "add");
@@ -290,6 +309,11 @@ function manifestFor(state: ProjectState): object {
     last_event_id: state.last_event_id,
     updated_at: state.updated_at
   };
+}
+
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function pretty(value: unknown): string {

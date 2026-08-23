@@ -3,7 +3,7 @@ import type { ArtifactWriteRequest } from "../src/domain/artifact-write";
 import { parseTransaction } from "../src/domain/transaction";
 import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
 import type { DropboxTransport } from "../src/dropbox/client";
-import { ProjectRepository } from "../src/dropbox/repository";
+import { ArtifactGovernanceConflictError, ProjectRepository } from "../src/dropbox/repository";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -63,49 +63,43 @@ describe("project artifact routing", () => {
     expect(transport.uploads[0]).toBe("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/OTHER/foo.md");
   });
 
+  it("blocks a physical ARTIFACTS bypass for an exclusive governed domain", async () => {
+    const repository = new ProjectRepository(new FakeTransport(), "v2");
+    await expect(repository.writeArtifact(configuredState(), {
+      ...artifact,
+      relative_path: "ARTIFACTS/REVENUE-OS/04-playbooks-sectoriels/foo.md"
+    })).rejects.toBeInstanceOf(ArtifactGovernanceConflictError);
+  });
+
   it("requires accepted decisions before a route can be configured", () => {
     const state = emptyProjectState("PRJ-0003", "Growth", "growth", "Build growth agency");
     const tx = parseTransaction({
-      schema_version: "1.0",
-      transaction_id: "TXN-ARTROUTE-000001",
-      project_id: "PRJ-0003",
-      base_revision: 0,
-      created_at: "2026-08-23T12:00:00Z",
-      operation: "artifact.route.configure",
-      payload: {
-        route_id: "ROUTE-REVENUE001",
-        source_prefix: "REVENUE-OS",
-        target_prefix: "DELIVERABLES/REVENUE-OS",
-        archive_prefix: "ARCHIVES/REVENUE-OS",
-        exclusive: true,
-        decision_ids: ["DEC-REVENUESINGLETREE001"]
-      }
+      schema_version: "1.0", transaction_id: "TXN-ARTROUTE-000001", project_id: "PRJ-0003", base_revision: 0,
+      created_at: "2026-08-23T12:00:00Z", operation: "artifact.route.configure",
+      payload: { route_id: "ROUTE-REVENUE001", source_prefix: "REVENUE-OS", target_prefix: "DELIVERABLES/REVENUE-OS", archive_prefix: "ARCHIVES/REVENUE-OS", exclusive: true, decision_ids: ["DEC-REVENUESINGLETREE001"] }
     } as any);
-    const result = applyTransaction(state, tx);
-    expect(result).toMatchObject({ kind: "rejected", code: "ARTIFACT_ROUTE_DECISION_NOT_ACCEPTED" });
+    expect(applyTransaction(state, tx)).toMatchObject({ kind: "rejected", code: "ARTIFACT_ROUTE_DECISION_NOT_ACCEPTED" });
   });
 
   it("commits a route only when every governing decision is accepted", () => {
-    const state = configuredState();
-    state.artifact_routes = {};
+    const state = configuredState(); state.artifact_routes = {};
     const tx = parseTransaction({
-      schema_version: "1.0",
-      transaction_id: "TXN-ARTROUTE-000002",
-      project_id: "PRJ-0003",
-      base_revision: 0,
-      created_at: "2026-08-23T12:00:00Z",
-      operation: "artifact.route.configure",
-      payload: {
-        route_id: "ROUTE-REVENUE001",
-        source_prefix: "REVENUE-OS",
-        target_prefix: "DELIVERABLES/REVENUE-OS",
-        archive_prefix: "ARCHIVES/REVENUE-OS",
-        exclusive: true,
-        decision_ids: ["DEC-REVENUESINGLETREE001", "DEC-REVENUEARCHIVE001"]
-      }
+      schema_version: "1.0", transaction_id: "TXN-ARTROUTE-000002", project_id: "PRJ-0003", base_revision: 0,
+      created_at: "2026-08-23T12:00:00Z", operation: "artifact.route.configure",
+      payload: { route_id: "ROUTE-REVENUE001", source_prefix: "REVENUE-OS", target_prefix: "DELIVERABLES/REVENUE-OS", archive_prefix: "ARCHIVES/REVENUE-OS", exclusive: true, decision_ids: ["DEC-REVENUESINGLETREE001", "DEC-REVENUEARCHIVE001"] }
     } as any);
     const result = applyTransaction(state, tx);
     expect(result.kind).toBe("commit");
-    if (result.kind === "commit") expect((result.state as any).artifact_routes["ROUTE-REVENUE001"].target_prefix).toBe("DELIVERABLES/REVENUE-OS");
+    if (result.kind === "commit") expect(result.state.artifact_routes["ROUTE-REVENUE001"].target_prefix).toBe("DELIVERABLES/REVENUE-OS");
+  });
+
+  it("requires a newly accepted decision to change an existing route target", () => {
+    const state = configuredState();
+    const tx = parseTransaction({
+      schema_version: "1.0", transaction_id: "TXN-ARTROUTE-000003", project_id: "PRJ-0003", base_revision: 0,
+      created_at: "2026-08-23T12:05:00Z", operation: "artifact.route.configure",
+      payload: { route_id: "ROUTE-REVENUE001", source_prefix: "REVENUE-OS", target_prefix: "ARTIFACTS/REVENUE-OS", archive_prefix: "ARCHIVES/REVENUE-OS", exclusive: true, decision_ids: ["DEC-REVENUESINGLETREE001", "DEC-REVENUEARCHIVE001"] }
+    } as any);
+    expect(applyTransaction(state, tx)).toMatchObject({ kind: "rejected", code: "ARTIFACT_ROUTE_CHANGE_REQUIRES_NEW_DECISION" });
   });
 });

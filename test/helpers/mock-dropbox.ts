@@ -6,6 +6,7 @@ export interface DropboxMockFault {
   status: number;
   error_summary: string;
   method?: string;
+  path?: string;
 }
 
 export interface DropboxMockOptions {
@@ -16,7 +17,7 @@ export interface DropboxMockOptions {
 export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
   const calls: string[] = [];
-  const endpointOccurrences = new Map<string, number>();
+  const matchedFaultOccurrences = new Map<number, number>();
   const consumedFaults = new Set<number>();
   let transientUploadFailures = options.transientUploadFailures ?? 0;
 
@@ -25,21 +26,33 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     const url = new URL(request.url);
     calls.push(`${request.method} ${url.pathname}`);
 
-    const faultKey = `${request.method} ${url.pathname}`;
-    const occurrence = (endpointOccurrences.get(faultKey) ?? 0) + 1;
-    endpointOccurrences.set(faultKey, occurrence);
-    const faultIndex = (options.faults ?? []).findIndex((fault, index) =>
-      !consumedFaults.has(index)
-      && fault.endpoint === url.pathname
-      && (fault.method === undefined || fault.method === request.method)
-      && fault.occurrence === occurrence
-    );
-    if (faultIndex >= 0) {
-      consumedFaults.add(faultIndex);
-      const fault = options.faults![faultIndex];
+    const apiArg = request.headers.get("Dropbox-API-Arg");
+    let requestPath: string | undefined;
+    if (apiArg) {
+      try {
+        requestPath = (JSON.parse(apiArg) as { path?: string }).path;
+      } catch {
+        requestPath = undefined;
+      }
+    }
+
+    const faults = options.faults ?? [];
+    for (let index = 0; index < faults.length; index += 1) {
+      if (consumedFaults.has(index)) continue;
+      const fault = faults[index];
+      const matches = fault.endpoint === url.pathname
+        && (fault.method === undefined || fault.method === request.method)
+        && (fault.path === undefined || fault.path === requestPath);
+      if (!matches) continue;
+
+      const occurrence = (matchedFaultOccurrences.get(index) ?? 0) + 1;
+      matchedFaultOccurrences.set(index, occurrence);
+      if (occurrence !== fault.occurrence) continue;
+
+      consumedFaults.add(index);
       return new Response(JSON.stringify({ error_summary: fault.error_summary }), {
         status: fault.status,
-        headers: { "x-dropbox-request-id": `req-fault-${faultIndex}` }
+        headers: { "x-dropbox-request-id": `req-fault-${index}` }
       });
     }
 

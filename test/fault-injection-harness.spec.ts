@@ -45,7 +45,7 @@ describe("deterministic Dropbox fault injection", () => {
         status: 500,
         error_summary: "injected/target_failure"
       }]
-    } as never);
+    });
 
     expect((await upload("/other.txt", "other")).status).toBe(200);
 

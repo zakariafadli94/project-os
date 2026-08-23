@@ -1,4 +1,5 @@
 import type {
+  ArtifactRouteRecord,
   ConstraintRecord,
   DecisionRecord,
   DeliverableRecord,
@@ -28,6 +29,11 @@ function requireString(value: unknown, name: string): string {
 
 function optionalString(value: unknown, name: string): string | undefined {
   return value === undefined ? undefined : requireString(value, name);
+}
+
+function requireBoolean(value: unknown, name: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
+  return value;
 }
 
 function requireNullableString(value: unknown, name: string): string | null {
@@ -91,6 +97,23 @@ function normalizeDiscovery(value: unknown): DiscoverySynthesis {
     provisional_findings: normalizeFindingArray(input.provisional_findings, "discovery.provisional_findings"),
     unresolved_questions: optionalStringArray(input.unresolved_questions, "discovery.unresolved_questions"),
     next_exploration: optionalStringArray(input.next_exploration, "discovery.next_exploration")
+  };
+}
+
+function normalizeArtifactRoute(value: unknown, key: string): ArtifactRouteRecord {
+  const name = `artifact_routes.${key}`;
+  const input = requireRecord(value, name);
+  const routeId = requireString(input.route_id, `${name}.route_id`);
+  if (routeId !== key) throw new Error(`${name}.route_id must match its record key`);
+  return {
+    route_id: routeId,
+    source_prefix: requireString(input.source_prefix, `${name}.source_prefix`),
+    target_prefix: requireString(input.target_prefix, `${name}.target_prefix`),
+    archive_prefix: optionalString(input.archive_prefix, `${name}.archive_prefix`),
+    exclusive: requireBoolean(input.exclusive, `${name}.exclusive`),
+    decision_ids: requireStringArray(input.decision_ids, `${name}.decision_ids`),
+    created_at: requireString(input.created_at, `${name}.created_at`),
+    updated_at: requireString(input.updated_at, `${name}.updated_at`)
   };
 }
 
@@ -219,6 +242,15 @@ function normalizeRecordMap<T>(
   return Object.fromEntries(Object.entries(input).map(([key, item]) => [key, normalizer(item, key)]));
 }
 
+function normalizeOptionalRecordMap<T>(
+  value: unknown,
+  name: string,
+  normalizer: (item: unknown, key: string) => T
+): Record<string, T> {
+  if (value === undefined) return {};
+  return normalizeRecordMap(value, name, normalizer);
+}
+
 export function normalizeProjectState(input: unknown): ProjectState {
   const raw = requireRecord(input, "project state");
   if (raw.schema_version !== "1.0") throw new Error("Unsupported project state schema_version");
@@ -247,6 +279,7 @@ export function normalizeProjectState(input: unknown): ProjectState {
     status,
     revision: raw.revision as number,
     current_phase_id: currentPhaseId,
+    artifact_routes: normalizeOptionalRecordMap(raw.artifact_routes, "artifact_routes", normalizeArtifactRoute),
     constraints: normalizeRecordMap(raw.constraints, "constraints", normalizeConstraint),
     tasks: normalizeRecordMap(raw.tasks, "tasks", normalizeTask),
     plan_phases: planPhases,

@@ -101,6 +101,8 @@ export class RegistryGuard extends DurableObject<Env> {
       return Response.json({ error: "invalid_operation" }, { status: 400 });
     }
 
+    await this.ensureRegistryRecovered();
+
     const existing = this.requestRow(tx.transaction_id);
     if (existing) {
       if (existing.transaction_json !== JSON.stringify(tx)) {

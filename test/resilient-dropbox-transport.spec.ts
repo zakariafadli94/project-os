@@ -31,6 +31,34 @@ describe("ResilientDropboxTransport", () => {
     expect(logs[0]).toMatchObject({ project_id: "PRJ-0003", attempt: 1, dropbox_request_id: "req-1" });
   });
 
+  it("retries transient downloads and returns the successful read", async () => {
+    const download = vi.fn<DropboxTransport["download"]>()
+      .mockRejectedValueOnce(new DropboxApiError("temporarily unavailable", 503, "req-read", "internal_error"))
+      .mockResolvedValueOnce("canonical-state");
+    const sleep = vi.fn(async () => undefined);
+    const logs: Record<string, unknown>[] = [];
+    const base = fakeTransport(async () => undefined);
+    const transport = new ResilientDropboxTransport({ ...base, download }, {
+      sleep,
+      random: () => 0,
+      baseDelayMs: 100,
+      log: (entry) => logs.push(entry)
+    });
+
+    await expect(transport.download("/PROJECT_OS/.project-os/projects/PRJ-0002/state.json"))
+      .resolves.toBe("canonical-state");
+
+    expect(download).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(100);
+    expect(logs[0]).toMatchObject({
+      operation: "download",
+      project_id: "PRJ-0002",
+      attempt: 1,
+      dropbox_status: 503,
+      dropbox_request_id: "req-read"
+    });
+  });
+
   it("does not retry semantic conflicts", async () => {
     const upload = vi.fn<DropboxTransport["upload"]>()
       .mockRejectedValue(new DropboxConflictError("conflict", "req-2", "path/conflict/file"));

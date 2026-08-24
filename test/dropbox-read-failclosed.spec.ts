@@ -45,7 +45,7 @@ describe("Dropbox resilient reads fail closed", () => {
     const repository = new ProjectRepository(baseTransport(download), "v2");
 
     await expect(repository.readProjectState(expectedProjectId))
-      .rejects.toThrow(`Project state binding mismatch for ${expectedProjectId}`);
+      .rejects.toThrow(`Canonical project state binding mismatch: expected ${expectedProjectId}, got PRJ-9999`);
     expect(download).toHaveBeenCalledTimes(1);
   });
 });

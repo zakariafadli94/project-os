@@ -117,4 +117,30 @@ describe("reference reconciliation", () => {
     expect(fingerprint?.document_id).toBe(originalDocumentId);
     expect(await ledger.readHead(state.project_id, duplicateDocumentId)).toBeNull();
   });
+
+  it("does not deduplicate against an old historical fingerprint after the managed reference changed", async () => {
+    const dropbox = new ReferenceDropbox();
+    const state = project();
+    const originalInput = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "market/report.pdf");
+    const first = await dropbox.externalAdd(originalInput, "old-report-bytes");
+    const reconciler = new ManagedDocumentReconciler(dropbox);
+    await reconciler.reconcileChanges(state, [change(first)]);
+
+    const referencePath = workspaceManagedDocumentPath(state.project_id, state.slug, "references", "UNCLASSIFIED/market/report.pdf");
+    const edited = await dropbox.externalWrite(referencePath, "new-current-report-bytes");
+    await reconciler.reconcileChanges(state, [change(edited)]);
+
+    const newInputPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "historical/old-report.pdf");
+    const historicalCopy = await dropbox.externalAdd(newInputPath, "old-report-bytes");
+    const result = await reconciler.reconcileChanges(state, [change(historicalCopy)]);
+
+    const secondDocumentId = await documentIdForProviderFile(state.project_id, historicalCopy.id);
+    const ledger = new DocumentLedgerRepository(dropbox);
+    expect(result).toMatchObject({ ingested: 1, duplicates: 0 });
+    expect(await ledger.readHead(state.project_id, secondDocumentId)).toMatchObject({
+      kind: "reference",
+      logical_path: "historical/old-report.pdf",
+      collection_path: "UNCLASSIFIED"
+    });
+  });
 });

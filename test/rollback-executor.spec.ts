@@ -42,6 +42,39 @@ describe("continuity rollback executor", () => {
     expect(candidate).not.toHaveBeenCalled();
   });
 
+  it("accepts the allocated project ID returned by a stable project.create execution", async () => {
+    const createTx: Transaction = {
+      schema_version: "1.0",
+      transaction_id: "TXN-ROLLBACK-EXECUTOR-CREATE-0001",
+      project_id: "PRJ-AUTO",
+      base_revision: 0,
+      operation: "project.create",
+      created_at: "2026-08-24T02:01:00+01:00",
+      payload: {
+        name: "Allocated rollback project",
+        slug: "allocated-rollback-project",
+        aliases: [],
+        objective: "Prove PRJ-AUTO receipt binding"
+      }
+    };
+    const allocated: Receipt = {
+      schema_version: "1.0",
+      transaction_id: createTx.transaction_id,
+      project_id: "PRJ-2077",
+      status: "committed",
+      previous_revision: 0,
+      new_revision: 1,
+      event_id: "EVT-000001",
+      committed_at: createTx.created_at
+    };
+    const stable = vi.fn(async (_transaction: Transaction) => allocated);
+
+    const execution = await executeWithRollback({ selectedPath: "stable", transaction: createTx, stable });
+
+    expect(execution.receipt).toEqual(allocated);
+    expect(execution.fallback_occurred).toBe(false);
+  });
+
   for (const status of ["committed", "rejected", "conflict"] as const) {
     it(`returns candidate ${status} business result without stable fallback`, async () => {
       const stable = vi.fn(async (_transaction: Transaction) => receipt("committed"));

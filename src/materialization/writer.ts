@@ -5,6 +5,8 @@ import { MANAGED_NOTICE } from "../render/shared";
 import { sha256Text } from "./hash";
 import type { PlannedProjectionOutput, ProjectionPlan } from "./planner";
 
+export type ProjectionWriteOutcome = "uploaded" | "content_hash" | "attempt_reuse";
+
 export class MaterializationOutputConflictError extends Error {
   constructor(
     public readonly key: string,
@@ -29,6 +31,7 @@ export interface WorkspaceProjectionWriterOptions {
   workspaceRoot: string;
   alreadyVerified?: ReadonlyMap<string, ProjectionOutputEvidence>;
   onOutputVerified?: (key: string, evidence: ProjectionOutputEvidence) => void | Promise<void>;
+  onOutputOutcome?: (key: string, outcome: ProjectionWriteOutcome) => void | Promise<void>;
 }
 
 export class WorkspaceProjectionWriter {
@@ -54,14 +57,15 @@ export class WorkspaceProjectionWriter {
       const priorAttempt = options.alreadyVerified?.get(output.key);
       if (priorAttempt && sameEvidence(priorAttempt, output)) {
         verified.set(output.key, priorAttempt);
+        await options.onOutputOutcome?.(output.key, "attempt_reuse");
         await options.onOutputVerified?.(output.key, priorAttempt);
         continue;
       }
       (output.critical ? critical : nonCritical).push(output);
     }
 
-    await this.runStage(nonCritical, root, verified, options.onOutputVerified);
-    await this.runStage(critical, root, verified, options.onOutputVerified);
+    await this.runStage(nonCritical, root, verified, options);
+    await this.runStage(critical, root, verified, options);
     return verified;
   }
 
@@ -85,7 +89,7 @@ export class WorkspaceProjectionWriter {
     outputs: PlannedProjectionOutput[],
     root: string,
     verified: Map<string, ProjectionOutputEvidence>,
-    callback?: (key: string, evidence: ProjectionOutputEvidence) => void | Promise<void>
+    options: WorkspaceProjectionWriterOptions
   ): Promise<void> {
     if (outputs.length === 0) return;
     let cursor = 0;
@@ -99,9 +103,10 @@ export class WorkspaceProjectionWriter {
         if (index >= outputs.length) return;
         try {
           const output = outputs[index];
-          const evidence = await this.materializeOne(output, root);
-          verified.set(output.key, evidence);
-          await callback?.(output.key, evidence);
+          const result = await this.materializeOne(output, root);
+          verified.set(output.key, result.evidence);
+          await options.onOutputOutcome?.(output.key, result.outcome);
+          await options.onOutputVerified?.(output.key, result.evidence);
         } catch (error) {
           errors.push(error);
           return;
@@ -116,13 +121,13 @@ export class WorkspaceProjectionWriter {
   private async materializeOne(
     output: PlannedProjectionOutput,
     root: string
-  ): Promise<ProjectionOutputEvidence> {
+  ): Promise<{ evidence: ProjectionOutputEvidence; outcome: ProjectionWriteOutcome }> {
     const path = joinWorkspacePath(root, output.relative_path);
     const current = await this.transport.download(path);
     const currentHash = current === null ? null : await sha256Text(current);
     const desired = evidenceFor(output);
 
-    if (currentHash === output.content_hash) return desired;
+    if (currentHash === output.content_hash) return { evidence: desired, outcome: "content_hash" };
 
     const baseline = output.baseline?.relative_path === output.relative_path
       ? output.baseline
@@ -157,7 +162,7 @@ export class WorkspaceProjectionWriter {
       }
     }
 
-    return desired;
+    return { evidence: desired, outcome: "uploaded" };
   }
 }
 

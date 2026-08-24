@@ -1,4 +1,5 @@
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
+import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../domain/commit-record";
 import type { DomainEvent } from "../domain/event";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
@@ -22,6 +23,7 @@ import {
   archiveProjectRoot,
   type LayoutMode,
   machineArtifactReceiptPath,
+  machineCommitRecordPath,
   machineEventPath,
   machineManifestPath,
   machineReceiptPath,
@@ -80,6 +82,17 @@ export class ProjectRepository {
     return state;
   }
 
+  async readCommitRecord(projectId: string, revision: number): Promise<CanonicalCommitRecord | null> {
+    if (this.mode !== "v2") return null;
+    const raw = await this.transport.download(machineCommitRecordPath(projectId, revision));
+    if (raw === null) return null;
+    const record = parseCanonicalCommitRecord(JSON.parse(raw));
+    if (record.project_id !== projectId || record.new_revision !== revision) {
+      throw new Error(`Canonical commit record binding mismatch for ${projectId} revision ${revision}`);
+    }
+    return record;
+  }
+
   async readReceipt(transactionId: string): Promise<Receipt | null> {
     const path = this.mode === "v2"
       ? machineReceiptPath(transactionId)
@@ -97,6 +110,34 @@ export class ProjectRepository {
     const path = this.mode === "v2" ? machineRegistryJsonPath() : registryJsonPath();
     const raw = await this.transport.download(path);
     return raw === null ? null : JSON.parse(raw);
+  }
+
+  async writeCommitRecord(record: CanonicalCommitRecord): Promise<void> {
+    if (this.mode !== "v2") throw new Error("Canonical commit records require V2 layout mode");
+    const validated = parseCanonicalCommitRecord(record);
+    await this.safeAdd(
+      machineCommitRecordPath(validated.project_id, validated.new_revision),
+      pretty(validated)
+    );
+  }
+
+  async materializeCommit(
+    record: CanonicalCommitRecord,
+    options: CommitWriteOptions = {}
+  ): Promise<void> {
+    if (this.mode !== "v2") throw new Error("Canonical commit materialization requires V2 layout mode");
+    const validated = parseCanonicalCommitRecord(record);
+    await this.writeMachineState(validated.state, validated.event);
+
+    if (validated.state.status === "archived") {
+      await this.materializeArchivedWorkspace(validated.state);
+    } else {
+      await this.writeHumanViews(validated.state);
+    }
+
+    if (options.publishReceipt !== false) {
+      await this.writeReceipt(validated.receipt);
+    }
   }
 
   async writeCommit(
@@ -280,6 +321,23 @@ export class ProjectRepository {
       await this.transport.upload(machineRegistryMarkdownPath(), markdown, "overwrite");
       await this.transport.upload(workspacePortfolioDashboardPath(), markdown, "overwrite");
     }
+  }
+
+  private async materializeArchivedWorkspace(state: ProjectState): Promise<void> {
+    const archivedProjectPath = `${archiveProjectRoot(state.project_id, state.slug)}/PROJECT.md`;
+    const workspaceProjectPath = `${workspaceProjectRoot(state.project_id, state.slug)}/PROJECT.md`;
+    const archivedProject = await this.transport.download(archivedProjectPath);
+    const workspaceProject = await this.transport.download(workspaceProjectPath);
+
+    if (archivedProject !== null) {
+      if (workspaceProject !== null) {
+        throw new Error(`Archived workspace already exists while active workspace is still present: ${state.project_id}`);
+      }
+      return;
+    }
+
+    await this.writeHumanViews(state);
+    await this.archiveHumanWorkspace(state);
   }
 
   private async writeLegacyArtifacts(state: ProjectState, event: DomainEvent): Promise<void> {

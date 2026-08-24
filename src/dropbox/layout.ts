@@ -102,6 +102,13 @@ export function machineEventPath(projectId: string, eventId: string): string {
   return `${machineProjectRoot(projectId)}/events/${assertSafeEventId(eventId)}.json`;
 }
 
+export function machineCommitRecordPath(projectId: string, revision: number): string {
+  if (!Number.isSafeInteger(revision) || revision < 1) {
+    throw new Error(`Invalid commit record revision: ${revision}`);
+  }
+  return `${machineProjectRoot(projectId)}/commits/REV-${revision.toString().padStart(6, "0")}.json`;
+}
+
 export function machineTransactionPath(status: MachineTransactionStatus, transactionId: string): string {
   return `${MACHINE_ROOT}/transactions/${status}/${assertSafeTransactionId(transactionId)}.json`;
 }
@@ -150,6 +157,7 @@ export const v2Paths = {
   machineStatePath,
   machineManifestPath,
   machineEventPath,
+  machineCommitRecordPath,
   machineTransactionPath,
   machineReceiptPath,
   machineArtifactRequestPath,

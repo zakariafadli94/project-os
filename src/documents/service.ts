@@ -3,7 +3,7 @@ import type {
   ManagedDocumentHead,
   ManagedProviderObservation
 } from "../domain/managed-document";
-import { assertManagedRelativePath, documentIdFor } from "../domain/managed-document";
+import { assertManagedRelativePath, assertReferenceCollectionPath, documentIdFor } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
 import { DropboxConflictError, type DropboxFileMetadata, type DropboxTransport } from "../dropbox/client";
 import { workspaceManagedDocumentPath } from "../dropbox/layout";
@@ -39,12 +39,16 @@ export interface ManagedLifecycleRequest {
   created_at: string;
 }
 
+export interface ManagedReferenceClassificationRequest extends ManagedLifecycleRequest {
+  collection_path: string;
+}
+
 export interface ManagedDocumentReceipt {
   request_id: string;
   project_id: string;
   document_id: string;
   version_id: string;
-  stage: "working" | "review" | "published";
+  stage: "reference" | "working" | "review" | "published";
   logical_path: string;
   status: "committed";
   provider_rev?: string;
@@ -367,6 +371,80 @@ export class ManagedDocumentService {
     return receiptFor(request.request_id, record);
   }
 
+  async classifyReference(request: ManagedReferenceClassificationRequest, state: ProjectState): Promise<ManagedDocumentReceipt> {
+    this.assertMutableProject(request.project_id, state);
+    const collectionPath = assertReferenceCollectionPath(request.collection_path);
+    const versionId = await requestVersionIdFor(request.request_id, "reference");
+    const replay = await this.ledger.readVersion(request.project_id, request.document_id, versionId);
+    if (replay) return receiptFor(request.request_id, replay);
+
+    const head = await this.ledger.readHead(request.project_id, request.document_id);
+    if (!head) {
+      throw new ManagedDocumentConflictError("DOCUMENT_NOT_FOUND", `Managed reference not found: ${request.document_id}`, request.document_id);
+    }
+    if (head.kind !== "reference" || !head.reference_version_id) {
+      throw new ManagedDocumentConflictError("DOCUMENT_KIND_CONFLICT", "Document is not a managed reference", request.document_id);
+    }
+    this.assertExpectedVersion(request.expected_version_id, head.reference_version_id, request.document_id);
+    const parent = await this.requireVersion(request.project_id, request.document_id, head.reference_version_id);
+    const from = head.provider?.reference?.path
+      ?? workspaceManagedDocumentPath(
+        state.project_id,
+        state.slug,
+        "references",
+        `${head.collection_path ?? "UNCLASSIFIED"}/${head.logical_path}`
+      );
+    const to = workspaceManagedDocumentPath(
+      state.project_id,
+      state.slug,
+      "references",
+      `${collectionPath}/${head.logical_path}`
+    );
+    await this.assertProviderStillMatches(from, parent, head.provider?.reference, request.document_id);
+    if (from !== to) {
+      try {
+        await this.transport.move(from, to);
+      } catch (error) {
+        if (!(error instanceof DropboxConflictError)) throw error;
+        throw new ManagedDocumentConflictError(
+          "REFERENCE_TARGET_CONFLICT",
+          `Reference classification destination already exists: ${to}`,
+          request.document_id
+        );
+      }
+    }
+    const metadata = await this.requireMetadata(to);
+    const record = versionFromParent(parent, {
+      version_id: versionId,
+      parent_version_id: parent.version_id,
+      stage: "reference",
+      source: "project_os",
+      created_at: request.created_at,
+      provider_content_hash: metadata.content_hash,
+      provider_file_id: metadata.id,
+      provider_rev: metadata.rev,
+      provider_path: to,
+      size: metadata.size,
+      request_id: request.request_id
+    });
+    await this.ledger.writeVersion(record);
+    await this.ledger.writeHead({
+      ...head,
+      collection_path: collectionPath,
+      reference_version_id: versionId,
+      provider: { reference: providerObservation(metadata, to) },
+      reconciliation_status: "clean"
+    });
+    await this.ledger.writeReferenceFingerprint({
+      schema_version: "1.0",
+      project_id: request.project_id,
+      provider_content_hash: metadata.content_hash,
+      document_id: request.document_id,
+      version_id: versionId
+    });
+    return receiptFor(request.request_id, record);
+  }
+
   private assertMutableProject(projectId: string, state: ProjectState): void {
     if (projectId !== state.project_id) throw new Error("Managed document request project_id does not match project state");
     if (state.status === "archived") {
@@ -476,7 +554,7 @@ export class ManagedDocumentService {
   }
 }
 
-async function requestVersionIdFor(requestId: string, stage: "working" | "review" | "published"): Promise<string> {
+async function requestVersionIdFor(requestId: string, stage: "reference" | "working" | "review" | "published"): Promise<string> {
   if (!/^[A-Z][A-Z0-9-]{7,}$/.test(requestId)) throw new Error(`Invalid managed document request id: ${requestId}`);
   const digest = await sha256Text(`${requestId}\n${stage}`);
   return `VER-REQ-${digest.slice(0, 24).toUpperCase()}`;
@@ -511,7 +589,7 @@ function compactProviderState<T extends Record<string, ManagedProviderObservatio
 }
 
 function receiptFor(requestId: string, record: DocumentVersionRecord): ManagedDocumentReceipt {
-  if (record.stage !== "working" && record.stage !== "review" && record.stage !== "published") {
+  if (record.stage !== "reference" && record.stage !== "working" && record.stage !== "review" && record.stage !== "published") {
     throw new Error(`Cannot build managed document receipt for stage ${record.stage}`);
   }
   return {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const CURRENT_PROJECTION_VERSION = 1 as const;
+export const CURRENT_PROJECTION_VERSION: number = 1;
 export const MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH = 127 as const;
 
 const projectId = z.string().regex(/^PRJ-[0-9]{4,}$/);

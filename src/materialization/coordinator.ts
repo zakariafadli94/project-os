@@ -8,7 +8,7 @@ import {
   type ProjectionOutputEvidence
 } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
-import { machineMaterializationRecordPath, workspaceProjectRoot } from "../dropbox/layout";
+import { archiveProjectRoot, machineMaterializationRecordPath, workspaceProjectRoot } from "../dropbox/layout";
 import { projectionIndexRootHash } from "./hash";
 import {
   planProjection,
@@ -16,6 +16,7 @@ import {
   type ProjectionPlan
 } from "./planner";
 import type { MaterializationLedgerStatus, MaterializationTarget } from "./ledger";
+import { MaterializationOutputConflictError } from "./writer";
 
 export interface MaterializationRepositoryPort {
   readCommitRecord(projectId: string, revision: number): Promise<CanonicalCommitRecord | null>;
@@ -32,6 +33,7 @@ export interface MaterializationRepositoryPort {
     record: CanonicalCommitRecord,
     options?: { publishReceipt?: boolean }
   ): Promise<void>;
+  archiveHumanWorkspace?(state: ProjectState): Promise<void>;
 }
 
 export interface MaterializationLedgerPort {
@@ -60,6 +62,7 @@ export interface ProjectionWriterPort {
     alreadyVerified?: ReadonlyMap<string, ProjectionOutputEvidence>;
     onOutputVerified?: (key: string, evidence: ProjectionOutputEvidence) => void | Promise<void>;
   }): Promise<Map<string, ProjectionOutputEvidence>>;
+  verifyCritical?(plan: ProjectionPlan, workspaceRoot: string): Promise<void>;
 }
 
 export interface ProjectionBaseline {
@@ -220,11 +223,39 @@ export class MaterializationCoordinator {
         : null;
       const plan = await planProjection(record, plannerBaseline, target.projection_version);
       const attempts = this.ledger.attemptOutputs();
+      const archived = record.state.status === "archived";
+      const activeRoot = this.workspaceRootFor(record.state);
+      const archiveRoot = archiveProjectRoot(record.state.project_id, record.state.slug);
+      let workspaceRoot = activeRoot;
+      let workspaceLocation: "active" | "archive" = "active";
+      let moveAfterWrite = false;
+
+      if (archived) {
+        workspaceLocation = "archive";
+        const baselineAlreadyArchived = baseline?.head.workspace_location === "archive";
+        if (baselineAlreadyArchived) {
+          workspaceRoot = archiveRoot;
+        } else if (attempts.size > 0) {
+          await this.archiveWorkspaceOrConflict(record.state, activeRoot);
+          workspaceRoot = archiveRoot;
+        } else {
+          moveAfterWrite = true;
+        }
+      }
+
       const verified = await this.writer.materialize(plan, {
-        workspaceRoot: this.workspaceRootFor(record.state),
+        workspaceRoot,
         alreadyVerified: attempts,
         onOutputVerified: (key, evidence) => this.ledger.recordVerifiedOutput(key, evidence)
       });
+
+      if (archived) {
+        if (moveAfterWrite) await this.archiveWorkspaceOrConflict(record.state, activeRoot);
+        if (!this.writer.verifyCritical) {
+          throw new Error("Archive materialization requires final critical-output verification");
+        }
+        await this.writer.verifyCritical(plan, archiveRoot);
+      }
 
       const fullOutputs = applyPlanToBaseline(baseline?.outputs ?? new Map(), plan, verified);
       const resultRootHash = await projectionIndexRootHash(fullOutputs);
@@ -248,7 +279,7 @@ export class MaterializationCoordinator {
               projection_version: baseline.head.projection_version
             },
         chain_depth: snapshot || baseline === null ? 0 : baseline.chain_depth + 1,
-        workspace_location: "active",
+        workspace_location: workspaceLocation,
         outputs: Object.fromEntries([...changedEvidence.entries()].sort(([a], [b]) => a.localeCompare(b))),
         removed_outputs: snapshot ? [] : [...plan.removed_outputs].sort(),
         total_output_count: fullOutputs.size,
@@ -335,6 +366,24 @@ export class MaterializationCoordinator {
       baseline.outputs
     );
     return needsRepair;
+  }
+
+  private async archiveWorkspaceOrConflict(state: ProjectState, activeRoot: string): Promise<void> {
+    if (!this.repository.archiveHumanWorkspace) {
+      throw new Error("Archive materialization requires repository archive support");
+    }
+    try {
+      await this.repository.archiveHumanWorkspace(state);
+    } catch (error) {
+      if (error instanceof Error && /Archived workspace move is inconsistent/.test(error.message)) {
+        throw new MaterializationOutputConflictError(
+          "workspace:archive",
+          activeRoot,
+          error.message
+        );
+      }
+      throw error;
+    }
   }
 
   private hasMoreWork(): boolean {

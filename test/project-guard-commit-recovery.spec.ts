@@ -1,0 +1,148 @@
+import { env } from "cloudflare:workers";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Env } from "../src/env";
+import type { Receipt } from "../src/domain/receipt";
+import { machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
+import { installDropboxMock } from "./helpers/mock-dropbox";
+
+const testEnv = env as unknown as Env;
+const at = "2026-08-24T00:10:00.000Z";
+
+async function submit(projectId: string, transaction: unknown): Promise<Receipt> {
+  const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/transaction", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(transaction)
+  });
+  expect(response.status).toBe(200);
+  return response.json<Receipt>();
+}
+
+async function submitMustFail(projectId: string, transaction: unknown): Promise<void> {
+  let failed = false;
+  try {
+    const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/transaction", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(transaction)
+    });
+    failed = !response.ok;
+  } catch {
+    failed = true;
+  }
+  expect(failed).toBe(true);
+}
+
+function createTransaction(projectId: string) {
+  return {
+    schema_version: "1.0",
+    transaction_id: `TXN-COMMIT-${projectId.slice(4)}-CREATE`,
+    project_id: projectId,
+    base_revision: 0,
+    operation: "project.create",
+    created_at: at,
+    payload: {
+      name: `Commit ${projectId.slice(4)}`,
+      slug: `commit-${projectId.slice(4)}`,
+      aliases: [],
+      objective: "Recover interrupted canonical commits"
+    }
+  };
+}
+
+describe("ProjectGuard crash-safe canonical commits", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("replays an immutable committed record after materialization fails before local persistence", async () => {
+    const projectId = "PRJ-1701";
+    const eventPath = `/PROJECT_OS/.project-os/projects/${projectId}/events/EVT-000002.json`;
+    const mock = installDropboxMock({
+      faults: [{
+        endpoint: "/2/files/upload",
+        path: eventPath,
+        occurrence: 1,
+        status: 400,
+        error_summary: "injected/post_commit_materialization_failure"
+      }]
+    });
+
+    const created = await submit(projectId, createTransaction(projectId));
+    expect(created.new_revision).toBe(1);
+
+    const transaction = {
+      schema_version: "1.0",
+      transaction_id: "TXN-COMMIT-1701-TASK-A",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "task.create",
+      created_at: at,
+      payload: { task_id: "TASK-COMMIT1701A", title: "Commit once across a crash" }
+    };
+
+    await submitMustFail(projectId, transaction);
+
+    const recordPath = machineCommitRecordPath(projectId, 2);
+    expect(mock.files.has(recordPath)).toBe(true);
+    expect(mock.files.has(machineReceiptPath(transaction.transaction_id))).toBe(false);
+    expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(1);
+
+    const replay = await submit(projectId, transaction);
+    expect(replay).toMatchObject({
+      status: "committed",
+      previous_revision: 1,
+      new_revision: 2,
+      event_id: "EVT-000002"
+    });
+    expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(2);
+    expect(mock.files.has(machineReceiptPath(transaction.transaction_id))).toBe(true);
+  });
+
+  it("reconciles the committed record before accepting different subsequent work", async () => {
+    const projectId = "PRJ-1702";
+    const eventPath = `/PROJECT_OS/.project-os/projects/${projectId}/events/EVT-000002.json`;
+    const mock = installDropboxMock({
+      faults: [{
+        endpoint: "/2/files/upload",
+        path: eventPath,
+        occurrence: 1,
+        status: 400,
+        error_summary: "injected/post_commit_materialization_failure"
+      }]
+    });
+
+    await submit(projectId, createTransaction(projectId));
+
+    await submitMustFail(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-COMMIT-1702-TASK-A",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "task.create",
+      created_at: at,
+      payload: { task_id: "TASK-COMMIT1702A", title: "Interrupted committed task" }
+    });
+    expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(true);
+
+    const next = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-COMMIT-1702-TASK-B",
+      project_id: projectId,
+      base_revision: 2,
+      operation: "task.create",
+      created_at: at,
+      payload: { task_id: "TASK-COMMIT1702B", title: "Continue after reconciliation" }
+    });
+
+    expect(next).toMatchObject({
+      status: "committed",
+      previous_revision: 2,
+      new_revision: 3,
+      event_id: "EVT-000003"
+    });
+    expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(true);
+    const state = JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}");
+    expect(state.revision).toBe(3);
+    expect(state.tasks).toHaveProperty("TASK-COMMIT1702A");
+    expect(state.tasks).toHaveProperty("TASK-COMMIT1702B");
+  });
+});

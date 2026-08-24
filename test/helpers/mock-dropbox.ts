@@ -16,6 +16,8 @@ export interface DropboxMockOptions {
 
 export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
+  const fileIds = new Map<string, string>();
+  const revisions = new Map<string, number>();
   const calls: string[] = [];
   const uploadCalls: string[] = [];
   const downloadCalls: string[] = [];
@@ -24,6 +26,40 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
   let transientUploadFailures = options.transientUploadFailures ?? 0;
   let concurrentUploads = 0;
   let maxConcurrentUploadCount = 0;
+  let nextFileId = 1;
+
+  const ensureIdentity = (path: string): string => {
+    const existing = fileIds.get(path);
+    if (existing) return existing;
+    const id = `id:mock-${String(nextFileId++).padStart(6, "0")}`;
+    fileIds.set(path, id);
+    return id;
+  };
+
+  const bumpRevision = (path: string): number => {
+    const revision = (revisions.get(path) ?? 0) + 1;
+    revisions.set(path, revision);
+    return revision;
+  };
+
+  const metadataFor = async (path: string) => {
+    const content = files.get(path);
+    if (content === undefined) return null;
+    const bytes = new TextEncoder().encode(content);
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    const contentHash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    return {
+      ".tag": "file",
+      id: ensureIdentity(path),
+      name: path.split("/").at(-1) ?? path,
+      path_display: path,
+      path_lower: path.toLowerCase(),
+      rev: `mock-rev-${revisions.get(path) ?? 1}`,
+      content_hash: contentHash,
+      size: bytes.byteLength,
+      server_modified: "2026-08-24T22:00:00Z"
+    };
+  };
 
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init);
@@ -102,7 +138,10 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
           });
         }
 
-        const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string; mode?: "add" | "overwrite" };
+        const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as {
+          path?: string;
+          mode?: "add" | "overwrite" | { ".tag": "update"; update: string };
+        };
         if (!arg.path) return new Response("missing path", { status: 400 });
         const content = new TextDecoder().decode(await request.arrayBuffer());
         if (arg.mode === "add" && files.has(arg.path)) {
@@ -111,8 +150,19 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
             headers: { "x-dropbox-request-id": "req-conflict" }
           });
         }
+        if (typeof arg.mode === "object" && arg.mode?.[".tag"] === "update") {
+          const current = await metadataFor(arg.path);
+          if (!current || current.rev !== arg.mode.update) {
+            return new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
+              status: 409,
+              headers: { "x-dropbox-request-id": "req-update-conflict" }
+            });
+          }
+        }
+        ensureIdentity(arg.path);
         files.set(arg.path, content);
-        return Response.json({ name: arg.path.split("/").at(-1), path_display: arg.path });
+        bumpRevision(arg.path);
+        return Response.json(await metadataFor(arg.path));
       } finally {
         concurrentUploads -= 1;
       }
@@ -124,6 +174,14 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
         return new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 });
       }
       return new Response(files.get(arg.path), { status: 200 });
+    }
+
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/get_metadata") {
+      const body = JSON.parse(await request.text()) as { path?: string };
+      if (!body.path || !files.has(body.path)) {
+        return new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 });
+      }
+      return Response.json(await metadataFor(body.path));
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/move_v2") {
@@ -140,20 +198,48 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
         if (files.has(body.to_path)) {
           return new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 });
         }
+        const id = ensureIdentity(body.from_path);
+        const rev = revisions.get(body.from_path) ?? 1;
         files.delete(body.from_path);
+        fileIds.delete(body.from_path);
+        revisions.delete(body.from_path);
         files.set(body.to_path, directContent);
+        fileIds.set(body.to_path, id);
+        revisions.set(body.to_path, rev);
       } else {
         const destinationPrefix = `${body.to_path}/`;
         if ([...files.keys()].some((path) => path === body.to_path || path.startsWith(destinationPrefix))) {
           return new Response(JSON.stringify({ error_summary: "to/conflict/folder/" }), { status: 409 });
         }
         for (const [path, content] of descendants) {
+          const destination = `${body.to_path}${path.slice(body.from_path.length)}`;
+          const id = ensureIdentity(path);
+          const rev = revisions.get(path) ?? 1;
           files.delete(path);
-          files.set(`${body.to_path}${path.slice(body.from_path.length)}`, content);
+          fileIds.delete(path);
+          revisions.delete(path);
+          files.set(destination, content);
+          fileIds.set(destination, id);
+          revisions.set(destination, rev);
         }
       }
 
-      return Response.json({ metadata: { path_display: body.to_path } });
+      return Response.json({ metadata: await metadataFor(body.to_path) ?? { path_display: body.to_path } });
+    }
+
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/copy_v2") {
+      const body = JSON.parse(await request.text()) as { from_path: string; to_path: string };
+      const content = files.get(body.from_path);
+      if (content === undefined) {
+        return new Response(JSON.stringify({ error_summary: "from_lookup/not_found/" }), { status: 409 });
+      }
+      if (files.has(body.to_path)) {
+        return new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 });
+      }
+      files.set(body.to_path, content);
+      ensureIdentity(body.to_path);
+      bumpRevision(body.to_path);
+      return Response.json({ metadata: await metadataFor(body.to_path) });
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/delete_v2") {
@@ -165,17 +251,24 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
         return new Response(JSON.stringify({ error_summary: "path_lookup/not_found/" }), { status: 409 });
       }
       files.delete(body.path);
-      for (const path of descendants) files.delete(path);
+      fileIds.delete(body.path);
+      revisions.delete(body.path);
+      for (const path of descendants) {
+        files.delete(path);
+        fileIds.delete(path);
+        revisions.delete(path);
+      }
       return Response.json({ metadata: { path_display: body.path } });
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder") {
-      const body = JSON.parse(await request.text()) as { path: string };
+      const body = JSON.parse(await request.text()) as { path: string; recursive?: boolean };
       const prefix = `${body.path}/`;
-      const entries = [...files.keys()]
-        .filter((path) => path.startsWith(prefix) && !path.slice(prefix.length).includes("/"))
+      const entries = (await Promise.all([...files.keys()]
+        .filter((path) => path.startsWith(prefix) && (body.recursive || !path.slice(prefix.length).includes("/")))
         .sort()
-        .map((path) => ({ ".tag": "file", name: path.slice(prefix.length), path_display: path, path_lower: path.toLowerCase() }));
+        .map((path) => metadataFor(path))))
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
       return Response.json({ entries, cursor: "done", has_more: false });
     }
 

@@ -71,6 +71,7 @@ export interface DocumentVersionRecord {
   provider_content_hash?: string;
   provider_file_id?: string;
   provider_rev?: string;
+  provider_path?: string;
   size?: number;
   media_type?: string;
   request_id?: string;
@@ -168,6 +169,7 @@ const versionRecordSchema = z.strictObject({
   provider_content_hash: hashSchema.optional(),
   provider_file_id: providerFileIdSchema.optional(),
   provider_rev: z.string().min(1).max(256).optional(),
+  provider_path: z.string().min(1).optional(),
   size: z.number().int().nonnegative().safe().optional(),
   media_type: z.string().min(1).max(255).optional(),
   request_id: z.string().regex(/^[A-Z][A-Z0-9-]{7,}$/).optional()
@@ -187,6 +189,10 @@ const versionRecordSchema = z.strictObject({
     });
   }
 
+  if (value.provider_path && (!value.provider_path.startsWith("/") || hasUnsafeSegments(value.provider_path))) {
+    ctx.addIssue({ code: "custom", path: ["provider_path"], message: "provider_path must be an absolute safe Dropbox path" });
+  }
+
   if (value.kind === "reference" && value.stage !== "reference" && value.stage !== "recovered_external") {
     ctx.addIssue({ code: "custom", path: ["stage"], message: "Reference documents cannot use work-product stages" });
   }
@@ -195,10 +201,7 @@ const versionRecordSchema = z.strictObject({
   }
 
   if (!value.content_sha256 && !value.provider_content_hash) {
-    ctx.addIssue({
-      code: "custom",
-      message: "A document version must carry canonical SHA-256 or provider content evidence"
-    });
+    ctx.addIssue({ code: "custom", message: "A document version must carry canonical SHA-256 or provider content evidence" });
   }
 });
 

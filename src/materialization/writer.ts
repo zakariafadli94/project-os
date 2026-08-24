@@ -65,6 +65,22 @@ export class WorkspaceProjectionWriter {
     return verified;
   }
 
+  async verifyCritical(plan: ProjectionPlan, workspaceRoot: string): Promise<void> {
+    const root = normalizeWorkspaceRoot(workspaceRoot);
+    for (const output of plan.changed_outputs.values()) {
+      if (!output.critical) continue;
+      const path = joinWorkspacePath(root, output.relative_path);
+      const persisted = await this.transport.download(path);
+      if (persisted === null || await sha256Text(persisted) !== output.content_hash) {
+        throw new MaterializationOutputConflictError(
+          output.key,
+          path,
+          `Critical materialization verification failed at final workspace location: ${path}`
+        );
+      }
+    }
+  }
+
   private async runStage(
     outputs: PlannedProjectionOutput[],
     root: string,

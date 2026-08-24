@@ -1,4 +1,8 @@
-import type { DocumentVersionRecord, ManagedDocumentHead } from "../domain/managed-document";
+import type {
+  DocumentVersionRecord,
+  ManagedDocumentHead,
+  ManagedProviderObservation
+} from "../domain/managed-document";
 import { assertManagedRelativePath, documentIdFor } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
 import { DropboxConflictError, type DropboxFileMetadata, type DropboxTransport } from "../dropbox/client";
@@ -92,7 +96,13 @@ export class ManagedDocumentService {
     const parent = currentVersionId ? await this.requireVersion(request.project_id, documentId, currentVersionId) : null;
     const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);
     const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "working", logicalPath);
-    const metadata = await this.writeTextAtStage(visiblePath, request.content, head?.working_version_id ? parent : null, documentId);
+    const metadata = await this.writeTextAtStage(
+      visiblePath,
+      request.content,
+      head?.working_version_id ? parent : null,
+      head?.provider?.working,
+      documentId
+    );
 
     const record: DocumentVersionRecord = {
       schema_version: "1.0",
@@ -110,6 +120,7 @@ export class ManagedDocumentService {
       provider_content_hash: metadata.content_hash,
       provider_file_id: metadata.id,
       provider_rev: metadata.rev,
+      provider_path: visiblePath,
       size: metadata.size,
       request_id: request.request_id
     };
@@ -122,6 +133,10 @@ export class ManagedDocumentService {
       logical_path: logicalPath,
       working_version_id: versionId,
       ...(head?.published_version_id ? { published_version_id: head.published_version_id } : {}),
+      provider: compactProviderState({
+        ...head?.provider,
+        working: providerObservation(metadata, visiblePath)
+      }),
       reconciliation_status: "clean"
     });
     return receiptFor(request.request_id, record);
@@ -143,7 +158,13 @@ export class ManagedDocumentService {
     const parent = await this.requireVersion(request.project_id, request.document_id, currentVersionId);
     const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);
     const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);
-    const metadata = await this.writeTextAtStage(visiblePath, request.content, parent, request.document_id);
+    const metadata = await this.writeTextAtStage(
+      visiblePath,
+      request.content,
+      parent,
+      head.provider?.review,
+      request.document_id
+    );
 
     const record = versionFromParent(parent, {
       version_id: versionId,
@@ -156,11 +177,20 @@ export class ManagedDocumentService {
       provider_content_hash: metadata.content_hash,
       provider_file_id: metadata.id,
       provider_rev: metadata.rev,
+      provider_path: visiblePath,
       size: metadata.size,
       request_id: request.request_id
     });
     await this.ledger.writeVersion(record);
-    await this.ledger.writeHead({ ...head, review_version_id: versionId, reconciliation_status: "clean" });
+    await this.ledger.writeHead({
+      ...head,
+      review_version_id: versionId,
+      provider: compactProviderState({
+        ...head.provider,
+        review: providerObservation(metadata, visiblePath)
+      }),
+      reconciliation_status: "clean"
+    });
     return receiptFor(request.request_id, record);
   }
 
@@ -181,7 +211,7 @@ export class ManagedDocumentService {
     const parent = await this.requireVersion(request.project_id, request.document_id, head.working_version_id);
     const from = workspaceManagedDocumentPath(state.project_id, state.slug, "working", head.logical_path);
     const to = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);
-    await this.assertProviderStillMatches(from, parent, request.document_id);
+    await this.assertProviderStillMatches(from, parent, head.provider?.working, request.document_id);
     await this.transport.move(from, to);
     const metadata = await this.requireMetadata(to);
 
@@ -194,6 +224,7 @@ export class ManagedDocumentService {
       provider_content_hash: metadata.content_hash,
       provider_file_id: metadata.id,
       provider_rev: metadata.rev,
+      provider_path: to,
       size: metadata.size,
       request_id: request.request_id
     });
@@ -202,6 +233,11 @@ export class ManagedDocumentService {
       ...head,
       working_version_id: undefined,
       review_version_id: versionId,
+      provider: compactProviderState({
+        ...head.provider,
+        working: undefined,
+        review: providerObservation(metadata, to)
+      }),
       reconciliation_status: "clean"
     });
     return receiptFor(request.request_id, record);
@@ -221,19 +257,32 @@ export class ManagedDocumentService {
     const review = await this.requireVersion(request.project_id, request.document_id, head.review_version_id);
     const reviewPath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);
     const publishedPath = workspaceManagedDocumentPath(state.project_id, state.slug, "deliverables", head.logical_path);
-    await this.assertProviderStillMatches(reviewPath, review, request.document_id);
+    await this.assertProviderStillMatches(reviewPath, review, head.provider?.review, request.document_id);
 
     let metadata: DropboxFileMetadata;
     if (head.published_version_id) {
       const priorPublished = await this.requireVersion(request.project_id, request.document_id, head.published_version_id);
-      const currentPublished = await this.requireMetadata(publishedPath);
-      if (!priorPublished.provider_rev || currentPublished.rev !== priorPublished.provider_rev) {
-        throw new ManagedDocumentConflictError("PUBLISHED_PROVIDER_CHANGED", "Published deliverable changed outside Project OS", request.document_id);
-      }
+      const currentPublished = await this.assertProviderStillMatches(
+        publishedPath,
+        priorPublished,
+        head.provider?.published,
+        request.document_id
+      );
       const reviewContent = await this.transport.download(reviewPath);
-      if (reviewContent === null) throw new ManagedDocumentConflictError("REVIEW_CONTENT_MISSING", "Review candidate content is missing", request.document_id);
+      if (reviewContent === null) {
+        throw new ManagedDocumentConflictError("REVIEW_CONTENT_MISSING", "Review candidate content is missing", request.document_id);
+      }
       if (!this.transport.uploadConditional) throw new Error("Dropbox transport does not support conditional managed-document writes");
-      metadata = await this.transport.uploadConditional(publishedPath, reviewContent, currentPublished.rev);
+      try {
+        metadata = await this.transport.uploadConditional(publishedPath, reviewContent, currentPublished.rev);
+      } catch (error) {
+        if (!(error instanceof DropboxConflictError)) throw error;
+        throw new ManagedDocumentConflictError(
+          "PROVIDER_CAS_CONFLICT",
+          `Published deliverable changed concurrently during publication: ${publishedPath}`,
+          request.document_id
+        );
+      }
       if (!this.transport.delete) throw new Error("Dropbox transport does not support managed-document cleanup");
       await this.transport.delete(reviewPath);
     } else {
@@ -250,6 +299,7 @@ export class ManagedDocumentService {
       provider_content_hash: metadata.content_hash,
       provider_file_id: metadata.id,
       provider_rev: metadata.rev,
+      provider_path: publishedPath,
       size: metadata.size,
       request_id: request.request_id
     });
@@ -259,6 +309,12 @@ export class ManagedDocumentService {
       working_version_id: undefined,
       review_version_id: undefined,
       published_version_id: versionId,
+      provider: compactProviderState({
+        ...head.provider,
+        working: undefined,
+        review: undefined,
+        published: providerObservation(metadata, publishedPath)
+      }),
       reconciliation_status: "clean"
     });
     return receiptFor(request.request_id, record);
@@ -281,7 +337,7 @@ export class ManagedDocumentService {
     const published = await this.requireVersion(request.project_id, request.document_id, head.published_version_id);
     const from = workspaceManagedDocumentPath(state.project_id, state.slug, "deliverables", head.logical_path);
     const to = workspaceManagedDocumentPath(state.project_id, state.slug, "working", head.logical_path);
-    await this.assertProviderStillMatches(from, published, request.document_id);
+    await this.assertProviderStillMatches(from, published, head.provider?.published, request.document_id);
     if (!this.transport.copy) throw new Error("Dropbox transport does not support managed-document copy");
     const metadata = await this.transport.copy(from, to);
 
@@ -294,6 +350,7 @@ export class ManagedDocumentService {
       provider_content_hash: metadata.content_hash,
       provider_file_id: metadata.id,
       provider_rev: metadata.rev,
+      provider_path: to,
       size: metadata.size,
       request_id: request.request_id
     });
@@ -301,6 +358,10 @@ export class ManagedDocumentService {
     await this.ledger.writeHead({
       ...head,
       working_version_id: versionId,
+      provider: compactProviderState({
+        ...head.provider,
+        working: providerObservation(metadata, to)
+      }),
       reconciliation_status: "clean"
     });
     return receiptFor(request.request_id, record);
@@ -315,7 +376,9 @@ export class ManagedDocumentService {
 
   private async assertContentHash(content: string, expected: string): Promise<void> {
     const actual = await sha256Text(content);
-    if (actual !== expected) throw new Error(`Managed document content SHA-256 mismatch: expected ${expected}, got ${actual}`);
+    if (actual !== expected) {
+      throw new Error(`Managed document content SHA-256 mismatch: expected ${expected}, got ${actual}`);
+    }
   }
 
   private assertExpectedVersion(expected: string | undefined, current: string | undefined, documentId: string): void {
@@ -331,7 +394,9 @@ export class ManagedDocumentService {
   private async requireWorkProductHead(projectId: string, documentId: string): Promise<ManagedDocumentHead> {
     const head = await this.ledger.readHead(projectId, documentId);
     if (!head) throw new ManagedDocumentConflictError("DOCUMENT_NOT_FOUND", `Managed document not found: ${documentId}`, documentId);
-    if (head.kind !== "work_product") throw new ManagedDocumentConflictError("DOCUMENT_KIND_CONFLICT", "Document is not a work product", documentId);
+    if (head.kind !== "work_product") {
+      throw new ManagedDocumentConflictError("DOCUMENT_KIND_CONFLICT", "Document is not a work product", documentId);
+    }
     return head;
   }
 
@@ -344,14 +409,26 @@ export class ManagedDocumentService {
   private async requireMetadata(path: string): Promise<DropboxFileMetadata> {
     if (!this.transport.getMetadata) throw new Error("Dropbox transport does not support managed-document metadata");
     const metadata = await this.transport.getMetadata(path);
-    if (!metadata) throw new ManagedDocumentConflictError("PROVIDER_FILE_MISSING", `Managed document visible file is missing: ${path}`);
+    if (!metadata) {
+      throw new ManagedDocumentConflictError("PROVIDER_FILE_MISSING", `Managed document visible file is missing: ${path}`);
+    }
     return metadata;
   }
 
-  private async assertProviderStillMatches(path: string, version: DocumentVersionRecord, documentId: string): Promise<DropboxFileMetadata> {
+  private async assertProviderStillMatches(
+    path: string,
+    version: DocumentVersionRecord,
+    currentObservation: ManagedProviderObservation | undefined,
+    documentId: string
+  ): Promise<DropboxFileMetadata> {
     const metadata = await this.requireMetadata(path);
-    if (!version.provider_rev || metadata.rev !== version.provider_rev) {
-      throw new ManagedDocumentConflictError("PROVIDER_VERSION_CHANGED", `Managed document visible file changed outside Project OS: ${path}`, documentId);
+    const expectedRev = currentObservation?.rev ?? version.provider_rev;
+    if (!expectedRev || metadata.rev !== expectedRev) {
+      throw new ManagedDocumentConflictError(
+        "PROVIDER_VERSION_CHANGED",
+        `Managed document visible file changed outside Project OS: ${path}`,
+        documentId
+      );
     }
     return metadata;
   }
@@ -360,6 +437,7 @@ export class ManagedDocumentService {
     path: string,
     content: string,
     currentStageVersion: DocumentVersionRecord | null,
+    currentObservation: ManagedProviderObservation | undefined,
     documentId: string
   ): Promise<DropboxFileMetadata> {
     if (!this.transport.getMetadata) throw new Error("Dropbox transport does not support managed-document metadata");
@@ -384,7 +462,8 @@ export class ManagedDocumentService {
     }
 
     const current = await this.requireMetadata(path);
-    if (!currentStageVersion.provider_rev || current.rev !== currentStageVersion.provider_rev) {
+    const expectedRev = currentObservation?.rev ?? currentStageVersion.provider_rev;
+    if (!expectedRev || current.rev !== expectedRev) {
       throw new ManagedDocumentConflictError("PROVIDER_VERSION_CHANGED", `Managed document changed outside Project OS: ${path}`, documentId);
     }
     if (!this.transport.uploadConditional) throw new Error("Dropbox transport does not support conditional managed-document writes");
@@ -415,6 +494,20 @@ function versionFromParent(
     kind: parent.kind,
     logical_path: parent.logical_path
   };
+}
+
+function providerObservation(metadata: DropboxFileMetadata, path: string): ManagedProviderObservation {
+  return {
+    path,
+    file_id: metadata.id,
+    rev: metadata.rev,
+    content_hash: metadata.content_hash,
+    size: metadata.size
+  };
+}
+
+function compactProviderState<T extends Record<string, ManagedProviderObservation | undefined>>(state: T): T {
+  return Object.fromEntries(Object.entries(state).filter(([, value]) => value !== undefined)) as T;
 }
 
 function receiptFor(requestId: string, record: DocumentVersionRecord): ManagedDocumentReceipt {

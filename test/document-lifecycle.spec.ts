@@ -101,7 +101,7 @@ async function write(service: ManagedDocumentService, requestId: string, content
 }
 
 describe("ManagedDocumentService work-product lifecycle", () => {
-  it("builds one visible working file over multiple immutable versions", async () => {
+  it("builds one visible working file over multiple immutable versions and tracks its current provider rev", async () => {
     const transport = new FakeTransport();
     const service = new ManagedDocumentService(transport);
 
@@ -112,6 +112,12 @@ describe("ManagedDocumentService work-product lifecycle", () => {
     expect(v1.version_id).not.toBe(v2.version_id);
     expect(transport.files.get(workingPath)?.content).toContain("Mid-market");
     expect([...transport.files.keys()].filter((path) => path === workingPath)).toHaveLength(1);
+    const status = await service.status("PRJ-0002", v2.document_id);
+    expect(status?.provider?.working).toEqual(expect.objectContaining({
+      path: workingPath,
+      rev: transport.files.get(workingPath)?.metadata.rev,
+      content_hash: transport.files.get(workingPath)?.metadata.content_hash
+    }));
   });
 
   it("rejects an AI write based on a stale logical version without touching the newer working file", async () => {
@@ -141,6 +147,9 @@ describe("ManagedDocumentService work-product lifecycle", () => {
     expect(transport.files.has(workingPath)).toBe(false);
     expect(transport.files.get(reviewPath)?.content).toBe("draft");
     expect(transport.files.has(publishedPath)).toBe(false);
+    let status = await service.status("PRJ-0002", working.document_id);
+    expect(status?.provider?.working).toBeUndefined();
+    expect(status?.provider?.review?.rev).toBe(transport.files.get(reviewPath)?.metadata.rev);
 
     const reviewEdit = await service.writeReview({
       request_id: "DOCREQ-REVIEW-000002",
@@ -163,12 +172,14 @@ describe("ManagedDocumentService work-product lifecycle", () => {
 
     expect(transport.files.has(reviewPath)).toBe(false);
     expect(transport.files.get(publishedPath)?.content).toBe("final candidate");
-    const status = await service.status("PRJ-0002", working.document_id);
+    status = await service.status("PRJ-0002", working.document_id);
     expect(status?.published_version_id).toBe(published.version_id);
     expect(status?.review_version_id).toBeUndefined();
+    expect(status?.provider?.review).toBeUndefined();
+    expect(status?.provider?.published?.rev).toBe(transport.files.get(publishedPath)?.metadata.rev);
   });
 
-  it("reopens a published deliverable into working while keeping the published version frozen", async () => {
+  it("reopens a published deliverable into working while keeping the published version frozen and provider observations independent", async () => {
     const transport = new FakeTransport();
     const service = new ManagedDocumentService(transport);
     const working = await write(service, "DOCREQ-WORK-000007", "published content");
@@ -180,6 +191,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
       request_id: "DOCREQ-PUBLISH-000002", project_id: "PRJ-0002", document_id: working.document_id,
       expected_version_id: review.version_id, created_at: "2026-08-24T19:02:00+01:00"
     }, state());
+    const publishedRev = transport.files.get(publishedPath)!.metadata.rev;
 
     const reopened = await service.reopenPublished({
       request_id: "DOCREQ-REOPEN-000001", project_id: "PRJ-0002", document_id: working.document_id,
@@ -191,6 +203,8 @@ describe("ManagedDocumentService work-product lifecycle", () => {
     const status = await service.status("PRJ-0002", working.document_id);
     expect(status?.published_version_id).toBe(published.version_id);
     expect(status?.working_version_id).toBe(reopened.version_id);
+    expect(status?.provider?.published?.rev).toBe(publishedRev);
+    expect(status?.provider?.working?.rev).toBe(transport.files.get(workingPath)?.metadata.rev);
   });
 
   it("writes immutable publish evidence before advancing the mutable document head", async () => {

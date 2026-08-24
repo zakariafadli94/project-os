@@ -1,5 +1,5 @@
 import type { Receipt } from "../domain/receipt";
-import type { Transaction } from "../domain/transaction";
+import { AUTO_PROJECT_ID, type Transaction } from "../domain/transaction";
 import type { ContinuityPath } from "./policy";
 
 export type TransactionExecutor = (transaction: Transaction) => Promise<unknown>;
@@ -66,11 +66,19 @@ function businessReceiptOrNull(value: unknown, transaction: Transaction): Receip
   if (!isRecord(value)) return null;
   if (value.schema_version !== "1.0") return null;
   if (value.transaction_id !== transaction.transaction_id) return null;
-  if (value.project_id !== transaction.project_id) return null;
+  if (!receiptProjectMatchesTransaction(value.project_id, transaction)) return null;
   if (value.status !== "committed" && value.status !== "rejected" && value.status !== "conflict") return null;
   if (!isNonNegativeInteger(value.previous_revision) || !isNonNegativeInteger(value.new_revision)) return null;
 
   return value as unknown as Receipt;
+}
+
+function receiptProjectMatchesTransaction(projectId: unknown, transaction: Transaction): boolean {
+  if (typeof projectId !== "string") return false;
+  if (projectId === transaction.project_id) return true;
+  return transaction.operation === "project.create"
+    && transaction.project_id === AUTO_PROJECT_ID
+    && /^PRJ-[0-9]{4,}$/.test(projectId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

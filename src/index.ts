@@ -5,7 +5,7 @@ import { executeWithRollback, type TransactionExecutor } from "./continuity/roll
 import type { Env } from "./env";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
-import { DropboxClient, DropboxConflictError } from "./dropbox/client";
+import { DropboxClient, DropboxConflictError, type DropboxEntry } from "./dropbox/client";
 import {
   type LayoutMode,
   machineArtifactRequestPath,
@@ -188,6 +188,13 @@ interface InboxProcessSummary {
   failed: number;
 }
 
+interface PreparedTransactionInboxEntry {
+  entry: DropboxEntry;
+  raw?: string | null;
+  transaction?: Transaction;
+  loadError?: unknown;
+}
+
 async function materializeExistingProjects(request: Request, env: Env): Promise<Response> {
   let projectIds: string[];
   try {
@@ -320,68 +327,138 @@ async function processInbox(env: Env): Promise<InboxProcessSummary> {
   };
 }
 
+async function prepareTransactionInboxEntries(
+  transport: ResilientDropboxTransport,
+  entries: DropboxEntry[]
+): Promise<PreparedTransactionInboxEntry[]> {
+  const prepared: PreparedTransactionInboxEntry[] = [];
+
+  for (const entry of entries) {
+    const sourcePath = entry.path_display;
+    if (!sourcePath) {
+      prepared.push({ entry });
+      continue;
+    }
+
+    let raw: string | null;
+    try {
+      raw = await transport.download(sourcePath);
+    } catch (error) {
+      prepared.push({ entry, loadError: error });
+      continue;
+    }
+
+    let transaction: Transaction | undefined;
+    if (raw !== null) {
+      try {
+        const parsed = parseTransaction(JSON.parse(raw));
+        if (transactionIdFromFilename(entry.name) === parsed.transaction_id) transaction = parsed;
+      } catch {
+        // Invalid entries remain eligible for rejection/cleanup after valid work is ordered.
+      }
+    }
+    prepared.push({ entry, raw, transaction });
+  }
+
+  return prepared.sort(comparePreparedTransactionEntries);
+}
+
+function comparePreparedTransactionEntries(a: PreparedTransactionInboxEntry, b: PreparedTransactionInboxEntry): number {
+  if (a.transaction && b.transaction) {
+    if (a.transaction.project_id === b.transaction.project_id) {
+      const revisionOrder = a.transaction.base_revision - b.transaction.base_revision;
+      if (revisionOrder !== 0) return revisionOrder;
+    }
+    const createdOrder = a.transaction.created_at.localeCompare(b.transaction.created_at);
+    if (createdOrder !== 0) return createdOrder;
+    return a.entry.name.localeCompare(b.entry.name);
+  }
+  if (a.transaction) return -1;
+  if (b.transaction) return 1;
+  return a.entry.name.localeCompare(b.entry.name);
+}
+
 async function processTransactionInbox(env: Env, transport: ResilientDropboxTransport, mode: LayoutMode): Promise<InboxProcessSummary> {
-  const entries = await transport.listFolder(inboxPath(mode));
-  const transactionEntries = entries
+  const listedEntries = await transport.listFolder(inboxPath(mode));
+  const transactionEntries = listedEntries
     .filter((item) => item.tag === "file" && item.name.endsWith(".json"))
     .sort((a, b) => a.name.localeCompare(b.name));
+  const preparedEntries = await prepareTransactionInboxEntries(transport, transactionEntries);
   const summary: InboxProcessSummary = {
     scanned: transactionEntries.length,
     processed: 0,
     failed: 0
   };
 
-  for (const entry of transactionEntries) {
-    const sourcePath = entry.path_display;
-    if (!sourcePath) {
-      summary.failed += 1;
-      console.error("Project OS inbox entry missing path_display", { name: entry.name });
-      continue;
-    }
-    const raw = await transport.download(sourcePath);
-    if (raw === null) {
-      summary.failed += 1;
-      console.error("Project OS inbox entry disappeared before processing", { name: entry.name, sourcePath });
-      continue;
-    }
-
-    const filenameTransactionId = transactionIdFromFilename(entry.name);
-    let transaction: Transaction;
+  for (const prepared of preparedEntries) {
+    const entry = prepared.entry;
     try {
-      transaction = parseTransaction(JSON.parse(raw));
-      if (!filenameTransactionId || filenameTransactionId !== transaction.transaction_id) {
-        throw new Error("Transaction filename must exactly match transaction_id");
+      const sourcePath = entry.path_display;
+      if (!sourcePath) {
+        summary.failed += 1;
+        console.error("Project OS inbox entry missing path_display", { name: entry.name });
+        continue;
       }
-    } catch (error) {
-      const fallbackId = filenameTransactionId ?? await syntheticInboxId("TXN-INVALID", entry.name, raw);
-      const rejectedPath = terminalTransactionPath(mode, "rejected", fallbackId);
-      await safeAdd(transport, rejectedPath, `${JSON.stringify({
-        status: "rejected",
-        code: "INVALID_TRANSACTION_FILE",
-        message: error instanceof Error ? error.message : "Invalid transaction file",
-        source_name: entry.name
-      }, null, 2)}\n`);
-      await archiveSource(transport, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
-      summary.processed += 1;
-      continue;
-    }
+      if (prepared.loadError) {
+        summary.failed += 1;
+        console.error("Project OS inbox entry could not be loaded", {
+          name: entry.name,
+          sourcePath,
+          message: prepared.loadError instanceof Error ? prepared.loadError.message : String(prepared.loadError)
+        });
+        continue;
+      }
+      const raw = prepared.raw;
+      if (raw === null || raw === undefined) {
+        summary.failed += 1;
+        console.error("Project OS inbox entry disappeared before processing", { name: entry.name, sourcePath });
+        continue;
+      }
 
-    let receipt: Receipt;
-    try {
-      receipt = await executeTransactionWithContinuity(env, transaction);
+      const filenameTransactionId = transactionIdFromFilename(entry.name);
+      let transaction: Transaction;
+      try {
+        transaction = prepared.transaction ?? parseTransaction(JSON.parse(raw));
+        if (!filenameTransactionId || filenameTransactionId !== transaction.transaction_id) {
+          throw new Error("Transaction filename must exactly match transaction_id");
+        }
+      } catch (error) {
+        const fallbackId = filenameTransactionId ?? await syntheticInboxId("TXN-INVALID", entry.name, raw);
+        const rejectedPath = terminalTransactionPath(mode, "rejected", fallbackId);
+        await safeAdd(transport, rejectedPath, `${JSON.stringify({
+          status: "rejected",
+          code: "INVALID_TRANSACTION_FILE",
+          message: error instanceof Error ? error.message : "Invalid transaction file",
+          source_name: entry.name
+        }, null, 2)}\n`);
+        await archiveSource(transport, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
+        summary.processed += 1;
+        continue;
+      }
+
+      let receipt: Receipt;
+      try {
+        receipt = await executeTransactionWithContinuity(env, transaction);
+      } catch (error) {
+        summary.failed += 1;
+        console.error("Project OS transaction processing failed", transaction.transaction_id, error);
+        continue;
+      }
+
+      const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
+      const canonicalTerminalPath = terminalTransactionPath(mode, statusFolder, transaction.transaction_id);
+      const archivePath = receipt.status === "committed"
+        ? canonicalTerminalPath
+        : canonicalTerminalPath.replace(/\.json$/, ".source.json");
+      await archiveSource(transport, sourcePath, archivePath);
+      summary.processed += 1;
     } catch (error) {
       summary.failed += 1;
-      console.error("Project OS transaction processing failed", transaction.transaction_id, error);
-      continue;
+      console.error("Project OS transaction inbox entry failed", {
+        name: entry.name,
+        message: error instanceof Error ? error.message : String(error)
+      });
     }
-
-    const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
-    const canonicalTerminalPath = terminalTransactionPath(mode, statusFolder, transaction.transaction_id);
-    const archivePath = receipt.status === "committed"
-      ? canonicalTerminalPath
-      : canonicalTerminalPath.replace(/\.json$/, ".source.json");
-    await archiveSource(transport, sourcePath, archivePath);
-    summary.processed += 1;
   }
 
   return summary;
@@ -399,53 +476,61 @@ async function processArtifactInbox(env: Env, transport: ResilientDropboxTranspo
   };
 
   for (const entry of artifactEntries) {
-    const sourcePath = entry.path_display;
-    if (!sourcePath) {
-      summary.failed += 1;
-      console.error("Project OS artifact inbox entry missing path_display", { name: entry.name });
-      continue;
-    }
-    const raw = await transport.download(sourcePath);
-    if (raw === null) {
-      summary.failed += 1;
-      console.error("Project OS artifact inbox entry disappeared before processing", { name: entry.name, sourcePath });
-      continue;
-    }
-
-    const filenameRequestId = artifactRequestIdFromFilename(entry.name);
-    let artifact: ArtifactWriteRequest;
     try {
-      artifact = parseArtifactWriteRequest(JSON.parse(raw));
-      if (!filenameRequestId || filenameRequestId !== artifact.request_id) {
-        throw new Error("Artifact filename must exactly match request_id");
+      const sourcePath = entry.path_display;
+      if (!sourcePath) {
+        summary.failed += 1;
+        console.error("Project OS artifact inbox entry missing path_display", { name: entry.name });
+        continue;
       }
-    } catch (error) {
-      const fallbackId = filenameRequestId ?? await syntheticInboxId("ART-INVALID", entry.name, raw);
-      const rejectedPath = terminalArtifactRequestPath(mode, "rejected", fallbackId);
-      await safeAdd(transport, rejectedPath, `${JSON.stringify({
-        status: "rejected",
-        code: "INVALID_ARTIFACT_FILE",
-        message: error instanceof Error ? error.message : "Invalid artifact file",
-        source_name: entry.name
-      }, null, 2)}\n`);
-      await archiveSource(transport, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
-      summary.processed += 1;
-      continue;
-    }
+      const raw = await transport.download(sourcePath);
+      if (raw === null) {
+        summary.failed += 1;
+        console.error("Project OS artifact inbox entry disappeared before processing", { name: entry.name, sourcePath });
+        continue;
+      }
 
-    let receipt: ArtifactWriteReceipt;
-    try {
-      receipt = await routeArtifact(env, artifact);
+      const filenameRequestId = artifactRequestIdFromFilename(entry.name);
+      let artifact: ArtifactWriteRequest;
+      try {
+        artifact = parseArtifactWriteRequest(JSON.parse(raw));
+        if (!filenameRequestId || filenameRequestId !== artifact.request_id) {
+          throw new Error("Artifact filename must exactly match request_id");
+        }
+      } catch (error) {
+        const fallbackId = filenameRequestId ?? await syntheticInboxId("ART-INVALID", entry.name, raw);
+        const rejectedPath = terminalArtifactRequestPath(mode, "rejected", fallbackId);
+        await safeAdd(transport, rejectedPath, `${JSON.stringify({
+          status: "rejected",
+          code: "INVALID_ARTIFACT_FILE",
+          message: error instanceof Error ? error.message : "Invalid artifact file",
+          source_name: entry.name
+        }, null, 2)}\n`);
+        await archiveSource(transport, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
+        summary.processed += 1;
+        continue;
+      }
+
+      let receipt: ArtifactWriteReceipt;
+      try {
+        receipt = await routeArtifact(env, artifact);
+      } catch (error) {
+        summary.failed += 1;
+        console.error("Project OS artifact processing failed", artifact.request_id, error);
+        continue;
+      }
+
+      const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
+      const terminalPath = terminalArtifactRequestPath(mode, statusFolder, artifact.request_id);
+      await archiveSource(transport, sourcePath, terminalPath);
+      summary.processed += 1;
     } catch (error) {
       summary.failed += 1;
-      console.error("Project OS artifact processing failed", artifact.request_id, error);
-      continue;
+      console.error("Project OS artifact inbox entry failed", {
+        name: entry.name,
+        message: error instanceof Error ? error.message : String(error)
+      });
     }
-
-    const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
-    const terminalPath = terminalArtifactRequestPath(mode, statusFolder, artifact.request_id);
-    await archiveSource(transport, sourcePath, terminalPath);
-    summary.processed += 1;
   }
 
   return summary;

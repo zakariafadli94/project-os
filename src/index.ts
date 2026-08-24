@@ -5,7 +5,7 @@ import { executeWithRollback, type TransactionExecutor } from "./continuity/roll
 import type { Env } from "./env";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
-import { DropboxClient, DropboxConflictError } from "./dropbox/client";
+import { DropboxClient, DropboxConflictError, type DropboxEntry } from "./dropbox/client";
 import {
   type LayoutMode,
   machineArtifactRequestPath,
@@ -188,6 +188,13 @@ interface InboxProcessSummary {
   failed: number;
 }
 
+interface PreparedTransactionInboxEntry {
+  entry: DropboxEntry;
+  raw?: string | null;
+  transaction?: Transaction;
+  loadError?: unknown;
+}
+
 async function materializeExistingProjects(request: Request, env: Env): Promise<Response> {
   let projectIds: string[];
   try {
@@ -320,18 +327,71 @@ async function processInbox(env: Env): Promise<InboxProcessSummary> {
   };
 }
 
+async function prepareTransactionInboxEntries(
+  transport: ResilientDropboxTransport,
+  entries: DropboxEntry[]
+): Promise<PreparedTransactionInboxEntry[]> {
+  const prepared: PreparedTransactionInboxEntry[] = [];
+
+  for (const entry of entries) {
+    const sourcePath = entry.path_display;
+    if (!sourcePath) {
+      prepared.push({ entry });
+      continue;
+    }
+
+    let raw: string | null;
+    try {
+      raw = await transport.download(sourcePath);
+    } catch (error) {
+      prepared.push({ entry, loadError: error });
+      continue;
+    }
+
+    let transaction: Transaction | undefined;
+    if (raw !== null) {
+      try {
+        const parsed = parseTransaction(JSON.parse(raw));
+        if (transactionIdFromFilename(entry.name) === parsed.transaction_id) transaction = parsed;
+      } catch {
+        // Invalid entries remain eligible for rejection/cleanup after valid work is ordered.
+      }
+    }
+    prepared.push({ entry, raw, transaction });
+  }
+
+  return prepared.sort(comparePreparedTransactionEntries);
+}
+
+function comparePreparedTransactionEntries(a: PreparedTransactionInboxEntry, b: PreparedTransactionInboxEntry): number {
+  if (a.transaction && b.transaction) {
+    if (a.transaction.project_id === b.transaction.project_id) {
+      const revisionOrder = a.transaction.base_revision - b.transaction.base_revision;
+      if (revisionOrder !== 0) return revisionOrder;
+    }
+    const createdOrder = a.transaction.created_at.localeCompare(b.transaction.created_at);
+    if (createdOrder !== 0) return createdOrder;
+    return a.entry.name.localeCompare(b.entry.name);
+  }
+  if (a.transaction) return -1;
+  if (b.transaction) return 1;
+  return a.entry.name.localeCompare(b.entry.name);
+}
+
 async function processTransactionInbox(env: Env, transport: ResilientDropboxTransport, mode: LayoutMode): Promise<InboxProcessSummary> {
-  const entries = await transport.listFolder(inboxPath(mode));
-  const transactionEntries = entries
+  const listedEntries = await transport.listFolder(inboxPath(mode));
+  const transactionEntries = listedEntries
     .filter((item) => item.tag === "file" && item.name.endsWith(".json"))
     .sort((a, b) => a.name.localeCompare(b.name));
+  const preparedEntries = await prepareTransactionInboxEntries(transport, transactionEntries);
   const summary: InboxProcessSummary = {
     scanned: transactionEntries.length,
     processed: 0,
     failed: 0
   };
 
-  for (const entry of transactionEntries) {
+  for (const prepared of preparedEntries) {
+    const entry = prepared.entry;
     try {
       const sourcePath = entry.path_display;
       if (!sourcePath) {
@@ -339,8 +399,17 @@ async function processTransactionInbox(env: Env, transport: ResilientDropboxTran
         console.error("Project OS inbox entry missing path_display", { name: entry.name });
         continue;
       }
-      const raw = await transport.download(sourcePath);
-      if (raw === null) {
+      if (prepared.loadError) {
+        summary.failed += 1;
+        console.error("Project OS inbox entry could not be loaded", {
+          name: entry.name,
+          sourcePath,
+          message: prepared.loadError instanceof Error ? prepared.loadError.message : String(prepared.loadError)
+        });
+        continue;
+      }
+      const raw = prepared.raw;
+      if (raw === null || raw === undefined) {
         summary.failed += 1;
         console.error("Project OS inbox entry disappeared before processing", { name: entry.name, sourcePath });
         continue;
@@ -349,7 +418,7 @@ async function processTransactionInbox(env: Env, transport: ResilientDropboxTran
       const filenameTransactionId = transactionIdFromFilename(entry.name);
       let transaction: Transaction;
       try {
-        transaction = parseTransaction(JSON.parse(raw));
+        transaction = prepared.transaction ?? parseTransaction(JSON.parse(raw));
         if (!filenameTransactionId || filenameTransactionId !== transaction.transaction_id) {
           throw new Error("Transaction filename must exactly match transaction_id");
         }

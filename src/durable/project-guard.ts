@@ -279,6 +279,7 @@ export class ProjectGuard extends DurableObject<Env> {
           await this.ctx.storage.setAlarm(Date.now() + 300_000);
           return;
         }
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
         throw error;
       }
     });

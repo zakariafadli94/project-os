@@ -16,7 +16,7 @@ import {
   type ProjectionPlan
 } from "./planner";
 import type { MaterializationLedgerStatus, MaterializationTarget } from "./ledger";
-import { MaterializationOutputConflictError } from "./writer";
+import { MaterializationOutputConflictError, type ProjectionWriteOutcome } from "./writer";
 
 export interface MaterializationRepositoryPort {
   readCommitRecord(projectId: string, revision: number): Promise<CanonicalCommitRecord | null>;
@@ -61,6 +61,7 @@ export interface ProjectionWriterPort {
     workspaceRoot: string;
     alreadyVerified?: ReadonlyMap<string, ProjectionOutputEvidence>;
     onOutputVerified?: (key: string, evidence: ProjectionOutputEvidence) => void | Promise<void>;
+    onOutputOutcome?: (key: string, outcome: ProjectionWriteOutcome) => void | Promise<void>;
   }): Promise<Map<string, ProjectionOutputEvidence>>;
   verifyCritical?(plan: ProjectionPlan, workspaceRoot: string): Promise<void>;
 }
@@ -88,6 +89,12 @@ export interface MaterializationRunResult {
   completed: boolean;
   repaired_head: boolean;
   more_work: boolean;
+}
+
+interface MaterializationAttemptMetrics {
+  uploaded: number;
+  contentHash: number;
+  attemptReuse: number;
 }
 
 export class MaterializationCoordinator {
@@ -158,7 +165,7 @@ export class MaterializationCoordinator {
     return this.ledger.status();
   }
 
-  async runNext(): Promise<MaterializationRunResult> {
+  async runNext(retryCount = 0): Promise<MaterializationRunResult> {
     const target = this.ledger.beginNextTarget();
     if (!target) {
       return {
@@ -195,6 +202,11 @@ export class MaterializationCoordinator {
       throw new Error(message);
     }
 
+    const startedAt = Date.now();
+    let plan: ProjectionPlan | null = null;
+    let verifiedCount = 0;
+    const metrics: MaterializationAttemptMetrics = { uploaded: 0, contentHash: 0, attemptReuse: 0 };
+
     try {
       await this.repository.materializeCanonicalDerivatives(
         record,
@@ -221,7 +233,7 @@ export class MaterializationCoordinator {
       const plannerBaseline: PlannerBaseline | null = baseline
         ? { projection_version: baseline.head.projection_version, outputs: baseline.outputs }
         : null;
-      const plan = await planProjection(record, plannerBaseline, target.projection_version);
+      plan = await planProjection(record, plannerBaseline, target.projection_version);
       const attempts = this.ledger.attemptOutputs();
       const archived = record.state.status === "archived";
       const activeRoot = this.workspaceRootFor(record.state);
@@ -246,8 +258,10 @@ export class MaterializationCoordinator {
       const verified = await this.writer.materialize(plan, {
         workspaceRoot,
         alreadyVerified: attempts,
+        onOutputOutcome: (_key, outcome) => countOutcome(metrics, outcome),
         onOutputVerified: (key, evidence) => this.ledger.recordVerifiedOutput(key, evidence)
       });
+      verifiedCount = verified.size;
 
       if (archived) {
         if (moveAfterWrite) await this.archiveWorkspaceOrConflict(record.state, activeRoot);
@@ -299,6 +313,7 @@ export class MaterializationCoordinator {
         removed_outputs: plan.removed_outputs
       });
 
+      logMaterializationAttempt("info", record, target, plan, metrics, verifiedCount, retryCount, startedAt, "complete");
       return {
         project_id: this.projectId,
         target_revision: target.revision,
@@ -309,6 +324,7 @@ export class MaterializationCoordinator {
       };
     } catch (error) {
       this.ledger.failActive(error instanceof Error ? error.message : String(error));
+      logMaterializationAttempt("error", record, target, plan, metrics, verifiedCount, retryCount, startedAt, "failed");
       throw error;
     }
   }
@@ -514,6 +530,49 @@ function sameEvidence(a: ProjectionOutputEvidence, b: ProjectionOutputEvidence):
     && a.input_hash === b.input_hash
     && a.content_hash === b.content_hash
     && a.source_revision === b.source_revision;
+}
+
+function countOutcome(metrics: MaterializationAttemptMetrics, outcome: ProjectionWriteOutcome): void {
+  if (outcome === "uploaded") metrics.uploaded += 1;
+  else if (outcome === "content_hash") metrics.contentHash += 1;
+  else metrics.attemptReuse += 1;
+}
+
+function logMaterializationAttempt(
+  level: "info" | "error",
+  record: CanonicalCommitRecord,
+  target: MaterializationTarget,
+  plan: ProjectionPlan | null,
+  metrics: MaterializationAttemptMetrics,
+  verifiedCount: number,
+  retryCount: number,
+  startedAt: number,
+  finalState: "complete" | "failed"
+): void {
+  const payload = {
+    project_id: record.project_id,
+    target_revision: target.revision,
+    projection_version: target.projection_version,
+    generation_id: generationId(record.project_id, target.revision, target.projection_version),
+    source_transaction_id: record.transaction.transaction_id,
+    source_event_id: record.event.event_id,
+    outputs_planned: plan?.expected_output_keys.length ?? 0,
+    outputs_carried_forward: plan?.carried_forward.size ?? 0,
+    outputs_rendered: plan?.changed_outputs.size ?? 0,
+    outputs_skipped_content_hash: metrics.contentHash,
+    outputs_uploaded: metrics.uploaded,
+    outputs_verified: verifiedCount,
+    retry_count: retryCount,
+    coalesced_revisions: [...target.coalesced_revisions],
+    duration_ms: Math.max(0, Date.now() - startedAt),
+    final_state: finalState
+  };
+  if (level === "info") console.info("Project OS materialization attempt", payload);
+  else console.error("Project OS materialization attempt", payload);
+}
+
+function generationId(projectId: string, revision: number, projectionVersion: number): string {
+  return `${projectId}:REV-${revision.toString().padStart(6, "0")}:PV-${projectionVersion.toString().padStart(4, "0")}`;
 }
 
 function headFor(record: CompletedMaterializationRecord): MaterializationHead {

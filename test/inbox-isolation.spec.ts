@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, runDurableObjectAlarm, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/env";
@@ -134,6 +134,8 @@ describe("inbox entry isolation", () => {
 
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${createTask.transaction_id}.json`)).toBe(true);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${startTask.transaction_id}.json`)).toBe(true);
+
+    expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);
     expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`)).toContain("Status: active");
   });
 });

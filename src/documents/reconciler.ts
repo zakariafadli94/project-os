@@ -143,7 +143,9 @@ export class ManagedDocumentReconciler {
     visiblePath: string,
     metadata: DropboxFileMetadata
   ): Promise<boolean> {
-    const documentId = await documentIdForProviderFile(state.project_id, metadata.id);
+    const binding = await this.ledger.readProviderFileBinding(state.project_id, metadata.id);
+    const directDocumentId = await documentIdForProviderFile(state.project_id, metadata.id);
+    const documentId = binding?.document_id ?? directDocumentId;
     const head = await this.ledger.readHead(state.project_id, documentId);
     if (!head || head.kind !== "reference" || !head.reference_version_id) return false;
     if (sameObservation(head.provider?.reference, metadata)) return false;
@@ -169,6 +171,12 @@ export class ManagedDocumentReconciler {
       reference_version_id: versionId,
       provider: { reference: observation(visiblePath, metadata) },
       reconciliation_status: "clean"
+    });
+    await this.ledger.writeProviderFileBinding({
+      schema_version: "1.0",
+      project_id: state.project_id,
+      provider_file_id: metadata.id,
+      document_id: documentId
     });
     await this.ledger.writeReferenceFingerprint({
       schema_version: "1.0",
@@ -247,6 +255,12 @@ export class ManagedDocumentReconciler {
       provider: { reference: observation(targetPath, targetMetadata) },
       reconciliation_status: "clean"
     });
+    await this.ledger.writeProviderFileBinding({
+      schema_version: "1.0",
+      project_id: state.project_id,
+      provider_file_id: targetMetadata.id,
+      document_id: documentId
+    });
     await this.ledger.writeReferenceFingerprint({
       schema_version: "1.0",
       project_id: state.project_id,
@@ -263,9 +277,13 @@ export class ManagedDocumentReconciler {
     fingerprint: ReferenceFingerprintRecord
   ): Promise<boolean> {
     const head = await this.ledger.readHead(projectId, fingerprint.document_id);
-    if (!head || head.kind !== "reference" || head.reference_version_id !== fingerprint.version_id) return false;
-    const version = await this.ledger.readVersion(projectId, fingerprint.document_id, fingerprint.version_id);
-    return !!version && version.kind === "reference" && version.provider_content_hash === contentHash;
+    if (!head || head.kind !== "reference" || !head.reference_version_id || !head.provider?.reference) return false;
+    const currentVersion = await this.ledger.readVersion(projectId, fingerprint.document_id, head.reference_version_id);
+    if (!currentVersion || currentVersion.kind !== "reference" || currentVersion.provider_content_hash !== contentHash) return false;
+    const currentMetadata = await this.metadataMaybe(head.provider.reference.path);
+    return !!currentMetadata
+      && currentMetadata.content_hash === contentHash
+      && sameObservation(head.provider.reference, currentMetadata);
   }
 
   private async reconcilePublishedEdit(

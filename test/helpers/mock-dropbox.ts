@@ -17,9 +17,13 @@ export interface DropboxMockOptions {
 export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
   const calls: string[] = [];
+  const uploadCalls: string[] = [];
+  const downloadCalls: string[] = [];
   const matchedFaultOccurrences = new Map<number, number>();
   const consumedFaults = new Set<number>();
   let transientUploadFailures = options.transientUploadFailures ?? 0;
+  let concurrentUploads = 0;
+  let maxConcurrentUploadCount = 0;
 
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init);
@@ -27,11 +31,15 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     calls.push(`${request.method} ${url.pathname}`);
 
     const requestPaths = new Set<string>();
+    let apiPath: string | undefined;
     const apiArg = request.headers.get("Dropbox-API-Arg");
     if (apiArg) {
       try {
         const parsed = JSON.parse(apiArg) as { path?: unknown };
-        if (typeof parsed.path === "string") requestPaths.add(parsed.path);
+        if (typeof parsed.path === "string") {
+          apiPath = parsed.path;
+          requestPaths.add(parsed.path);
+        }
       } catch {
         // Ignore malformed test-only metadata; the normal endpoint handler will surface it.
       }
@@ -49,6 +57,13 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       } catch {
         // Non-JSON payloads are valid for Dropbox content endpoints and are ignored here.
       }
+    }
+
+    if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/upload" && apiPath) {
+      uploadCalls.push(apiPath);
+    }
+    if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/download" && apiPath) {
+      downloadCalls.push(apiPath);
     }
 
     const faults = options.faults ?? [];
@@ -76,25 +91,31 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     }
 
     if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/upload") {
-      if (transientUploadFailures > 0) {
-        transientUploadFailures -= 1;
-        return new Response(JSON.stringify({ error_summary: "too_many_write_operations/..." }), {
-          status: 409,
-          headers: { "x-dropbox-request-id": `req-transient-${transientUploadFailures}` }
-        });
-      }
+      concurrentUploads += 1;
+      maxConcurrentUploadCount = Math.max(maxConcurrentUploadCount, concurrentUploads);
+      try {
+        if (transientUploadFailures > 0) {
+          transientUploadFailures -= 1;
+          return new Response(JSON.stringify({ error_summary: "too_many_write_operations/..." }), {
+            status: 409,
+            headers: { "x-dropbox-request-id": `req-transient-${transientUploadFailures}` }
+          });
+        }
 
-      const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string; mode?: "add" | "overwrite" };
-      if (!arg.path) return new Response("missing path", { status: 400 });
-      const content = new TextDecoder().decode(await request.arrayBuffer());
-      if (arg.mode === "add" && files.has(arg.path)) {
-        return new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
-          status: 409,
-          headers: { "x-dropbox-request-id": "req-conflict" }
-        });
+        const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string; mode?: "add" | "overwrite" };
+        if (!arg.path) return new Response("missing path", { status: 400 });
+        const content = new TextDecoder().decode(await request.arrayBuffer());
+        if (arg.mode === "add" && files.has(arg.path)) {
+          return new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
+            status: 409,
+            headers: { "x-dropbox-request-id": "req-conflict" }
+          });
+        }
+        files.set(arg.path, content);
+        return Response.json({ name: arg.path.split("/").at(-1), path_display: arg.path });
+      } finally {
+        concurrentUploads -= 1;
       }
-      files.set(arg.path, content);
-      return Response.json({ name: arg.path.split("/").at(-1), path_display: arg.path });
     }
 
     if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/download") {
@@ -169,5 +190,12 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     throw new Error(`Unhandled outbound request in Dropbox mock: ${request.method} ${request.url}`);
   });
 
-  return { files, calls, spy };
+  return {
+    files,
+    calls,
+    spy,
+    uploadCalls,
+    downloadCalls,
+    maxConcurrentUploads: () => maxConcurrentUploadCount
+  };
 }

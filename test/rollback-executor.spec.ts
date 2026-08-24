@@ -27,8 +27,8 @@ function receipt(status: Receipt["status"]): Receipt {
 
 describe("continuity rollback executor", () => {
   it("runs stable directly when stable is selected", async () => {
-    const stable = vi.fn(async () => receipt("committed"));
-    const candidate = vi.fn(async () => receipt("committed"));
+    const stable = vi.fn(async (_transaction: Transaction) => receipt("committed"));
+    const candidate = vi.fn(async (_transaction: Transaction) => receipt("committed"));
 
     const execution = await executeWithRollback({ selectedPath: "stable", transaction: tx, stable, candidate });
 
@@ -44,8 +44,8 @@ describe("continuity rollback executor", () => {
 
   for (const status of ["committed", "rejected", "conflict"] as const) {
     it(`returns candidate ${status} business result without stable fallback`, async () => {
-      const stable = vi.fn(async () => receipt("committed"));
-      const candidate = vi.fn(async () => receipt(status));
+      const stable = vi.fn(async (_transaction: Transaction) => receipt("committed"));
+      const candidate = vi.fn(async (_transaction: Transaction) => receipt(status));
 
       const execution = await executeWithRollback({ selectedPath: "candidate", transaction: tx, stable, candidate });
 
@@ -61,8 +61,14 @@ describe("continuity rollback executor", () => {
   }
 
   it("falls back once to stable on candidate technical failure with the exact transaction object", async () => {
-    const stable = vi.fn(async () => receipt("committed"));
-    const candidate = vi.fn(async () => {
+    let stableTransaction: Transaction | undefined;
+    let candidateTransaction: Transaction | undefined;
+    const stable = vi.fn(async (transaction: Transaction) => {
+      stableTransaction = transaction;
+      return receipt("committed");
+    });
+    const candidate = vi.fn(async (transaction: Transaction) => {
+      candidateTransaction = transaction;
       throw new Error("candidate unavailable");
     });
 
@@ -77,13 +83,13 @@ describe("continuity rollback executor", () => {
     });
     expect(candidate).toHaveBeenCalledTimes(1);
     expect(stable).toHaveBeenCalledTimes(1);
-    expect(candidate.mock.calls[0]?.[0]).toBe(tx);
-    expect(stable.mock.calls[0]?.[0]).toBe(tx);
+    expect(candidateTransaction).toBe(tx);
+    expect(stableTransaction).toBe(tx);
   });
 
   it("treats a malformed candidate response as technical rollback input", async () => {
-    const stable = vi.fn(async () => receipt("committed"));
-    const candidate = vi.fn(async () => ({ status: "committed" }));
+    const stable = vi.fn(async (_transaction: Transaction) => receipt("committed"));
+    const candidate = vi.fn(async (_transaction: Transaction) => ({ status: "committed" }));
 
     const execution = await executeWithRollback({ selectedPath: "candidate", transaction: tx, stable, candidate });
 
@@ -96,10 +102,10 @@ describe("continuity rollback executor", () => {
   });
 
   it("surfaces stable technical failure and never recurses through candidate", async () => {
-    const stable = vi.fn(async () => {
+    const stable = vi.fn(async (_transaction: Transaction) => {
       throw new Error("stable transport failure");
     });
-    const candidate = vi.fn(async () => receipt("committed"));
+    const candidate = vi.fn(async (_transaction: Transaction) => receipt("committed"));
 
     await expect(executeWithRollback({ selectedPath: "stable", transaction: tx, stable, candidate }))
       .rejects.toThrow("stable transport failure");

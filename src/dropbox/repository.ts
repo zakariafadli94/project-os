@@ -128,10 +128,13 @@ export class ProjectRepository {
     if (this.mode !== "v2") throw new Error("Canonical commit materialization requires V2 layout mode");
     const validated = parseCanonicalCommitRecord(record);
     await this.writeMachineState(validated.state, validated.event);
-    await this.writeHumanViews(validated.state);
+
     if (validated.state.status === "archived") {
-      await this.archiveHumanWorkspace(validated.state);
+      await this.materializeArchivedWorkspace(validated.state);
+    } else {
+      await this.writeHumanViews(validated.state);
     }
+
     if (options.publishReceipt !== false) {
       await this.writeReceipt(validated.receipt);
     }
@@ -318,6 +321,23 @@ export class ProjectRepository {
       await this.transport.upload(machineRegistryMarkdownPath(), markdown, "overwrite");
       await this.transport.upload(workspacePortfolioDashboardPath(), markdown, "overwrite");
     }
+  }
+
+  private async materializeArchivedWorkspace(state: ProjectState): Promise<void> {
+    const archivedProjectPath = `${archiveProjectRoot(state.project_id, state.slug)}/PROJECT.md`;
+    const workspaceProjectPath = `${workspaceProjectRoot(state.project_id, state.slug)}/PROJECT.md`;
+    const archivedProject = await this.transport.download(archivedProjectPath);
+    const workspaceProject = await this.transport.download(workspaceProjectPath);
+
+    if (archivedProject !== null) {
+      if (workspaceProject !== null) {
+        throw new Error(`Archived workspace already exists while active workspace is still present: ${state.project_id}`);
+      }
+      return;
+    }
+
+    await this.writeHumanViews(state);
+    await this.archiveHumanWorkspace(state);
   }
 
   private async writeLegacyArtifacts(state: ProjectState, event: DomainEvent): Promise<void> {

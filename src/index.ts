@@ -1,6 +1,7 @@
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "./domain/artifact-write";
 import { parseArtifactWriteRequest } from "./domain/artifact-write";
 import { continuityStatus } from "./continuity/policy";
+import { executeWithRollback, type TransactionExecutor } from "./continuity/rollback";
 import type { Env } from "./env";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
@@ -128,7 +129,7 @@ const worker = {
         }, { status: 400 });
       }
 
-      return Response.json(await routeTransaction(env, transaction));
+      return Response.json(await executeTransactionWithContinuity(env, transaction));
     }
 
     if (request.method === "POST" && url.pathname === "/v1/artifacts") {
@@ -249,7 +250,22 @@ async function migrateLegacyLedger(env: Env): Promise<{ transactions: number; re
   return mirrorLegacyLedger(client);
 }
 
-async function routeTransaction(env: Env, transaction: Transaction): Promise<Receipt> {
+export async function executeTransactionWithContinuity(
+  env: Env,
+  transaction: Transaction,
+  candidate?: TransactionExecutor
+): Promise<Receipt> {
+  const status = continuityStatus(env.PROJECT_OS_CONTINUITY_MODE);
+  const execution = await executeWithRollback({
+    selectedPath: status.effective_path,
+    transaction,
+    stable: (tx) => routeStableTransaction(env, tx),
+    candidate
+  });
+  return execution.receipt;
+}
+
+async function routeStableTransaction(env: Env, transaction: Transaction): Promise<Receipt> {
   if (transaction.operation === "project.create") {
     const stub = env.REGISTRY_GUARD.getByName("global");
     const response = await stub.fetch("https://registry-guard.internal/create", {
@@ -350,7 +366,7 @@ async function processTransactionInbox(env: Env, client: DropboxClient, mode: La
 
     let receipt: Receipt;
     try {
-      receipt = await routeTransaction(env, transaction);
+      receipt = await executeTransactionWithContinuity(env, transaction);
     } catch (error) {
       summary.failed += 1;
       console.error("Project OS transaction processing failed", transaction.transaction_id, error);

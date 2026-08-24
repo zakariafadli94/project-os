@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { parseArtifactWriteRequest, type ArtifactWriteReceipt, type ArtifactWriteRequest } from "../domain/artifact-write";
+import type { CanonicalCommitRecord } from "../domain/commit-record";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
@@ -7,7 +8,7 @@ import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
 import { DropboxClient } from "../dropbox/client";
-import { parseLayoutMode } from "../dropbox/layout";
+import { parseLayoutMode, type LayoutMode } from "../dropbox/layout";
 import { ArtifactContentConflictError, ProjectRepository } from "../dropbox/repository";
 
 interface TransactionRow {
@@ -35,6 +36,7 @@ const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
 
 export class ProjectGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
+  private readonly layoutMode: LayoutMode;
   private queue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -55,11 +57,12 @@ export class ProjectGuard extends DurableObject<Env> {
         state_json TEXT NOT NULL
       );
     `);
+    this.layoutMode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
     this.repository = new ProjectRepository(new DropboxClient({
       appKey: env.DROPBOX_APP_KEY,
       appSecret: env.DROPBOX_APP_SECRET,
       refreshToken: env.DROPBOX_REFRESH_TOKEN
-    }), parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
+    }), this.layoutMode);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -114,16 +117,6 @@ export class ProjectGuard extends DurableObject<Env> {
         return Response.json(existing);
       }
 
-      const canonicalReceipt = await this.repository.readReceipt(tx.transaction_id);
-      if (canonicalReceipt) {
-        if (canonicalReceipt.project_id !== tx.project_id) {
-          throw new Error(`Canonical receipt project binding mismatch for ${tx.transaction_id}`);
-        }
-        this.persistReceipt(canonicalReceipt);
-        await this.replayStatusSideEffects(tx, canonicalReceipt);
-        return Response.json(canonicalReceipt);
-      }
-
       if (tx.project_id === AUTO_PROJECT_ID) {
         const receipt = this.terminalReceipt(tx, "rejected", "UNALLOCATED_PROJECT_ID", "project.create must be allocated by RegistryGuard");
         await this.repository.writeTerminalTransaction(tx, receipt);
@@ -138,6 +131,25 @@ export class ProjectGuard extends DurableObject<Env> {
         return Response.json(receipt);
       }
 
+      if (this.layoutMode === "v2") {
+        await this.reconcileCanonicalCommits();
+        const reconciled = this.findReceipt(tx.transaction_id);
+        if (reconciled) {
+          await this.replayStatusSideEffects(tx, reconciled);
+          return Response.json(reconciled);
+        }
+      }
+
+      const canonicalReceipt = await this.repository.readReceipt(tx.transaction_id);
+      if (canonicalReceipt) {
+        if (canonicalReceipt.project_id !== tx.project_id) {
+          throw new Error(`Canonical receipt project binding mismatch for ${tx.transaction_id}`);
+        }
+        this.persistReceipt(canonicalReceipt);
+        await this.replayStatusSideEffects(tx, canonicalReceipt);
+        return Response.json(canonicalReceipt);
+      }
+
       const state = await this.loadOrRecoverState();
       const result = applyTransaction(state, tx);
 
@@ -149,7 +161,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
 
       const previousRevision = state?.revision ?? 0;
-      const receipt: Receipt = {
+      const receipt: CanonicalCommitRecord["receipt"] = {
         schema_version: "1.0",
         transaction_id: tx.transaction_id,
         status: "committed",
@@ -160,9 +172,27 @@ export class ProjectGuard extends DurableObject<Env> {
         committed_at: tx.created_at
       };
 
-      await this.repository.writeCommit(result.state, result.event, receipt, {
-        publishReceipt: tx.operation !== "project.create"
-      });
+      if (this.layoutMode === "v2") {
+        const record: CanonicalCommitRecord = {
+          schema_version: "1.0",
+          project_id: tx.project_id,
+          previous_revision: previousRevision,
+          new_revision: result.state.revision,
+          transaction: tx,
+          state: result.state,
+          event: result.event,
+          receipt
+        };
+        await this.repository.writeCommitRecord(record);
+        await this.repository.materializeCommit(record, {
+          publishReceipt: tx.operation !== "project.create"
+        });
+      } else {
+        await this.repository.writeCommit(result.state, result.event, receipt, {
+          publishReceipt: tx.operation !== "project.create"
+        });
+      }
+
       this.persistCommit(result.state, receipt);
       if (PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
         await this.syncRegistryStatus(result.state);
@@ -247,6 +277,10 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async loadOrRecoverState(): Promise<ProjectState | null> {
+    if (this.layoutMode === "v2") {
+      return this.reconcileCanonicalCommits();
+    }
+
     const local = this.loadState();
     if (local) return local;
 
@@ -255,11 +289,64 @@ export class ProjectGuard extends DurableObject<Env> {
     const recovered = await this.repository.readProjectState(projectId);
     if (!recovered) return null;
 
+    this.persistState(recovered);
+    return recovered;
+  }
+
+  private async reconcileCanonicalCommits(): Promise<ProjectState | null> {
+    const projectId = this.ctx.id.name;
+    if (!projectId) return this.loadState();
+
+    let state = this.loadState();
+    if (!state) {
+      const snapshot = await this.repository.readProjectState(projectId);
+      if (snapshot) {
+        const sameRevisionRecord = snapshot.revision > 0
+          ? await this.repository.readCommitRecord(projectId, snapshot.revision)
+          : null;
+        if (sameRevisionRecord) {
+          await this.materializeRecoveredRecord(sameRevisionRecord);
+          state = sameRevisionRecord.state;
+        } else {
+          this.persistState(snapshot);
+          state = snapshot;
+        }
+      } else {
+        const firstRecord = await this.repository.readCommitRecord(projectId, 1);
+        if (!firstRecord) return null;
+        if (firstRecord.previous_revision !== 0) {
+          throw new Error(`First canonical commit record for ${projectId} is not revision-contiguous`);
+        }
+        await this.materializeRecoveredRecord(firstRecord);
+        state = firstRecord.state;
+      }
+    }
+
+    while (state) {
+      const nextRecord = await this.repository.readCommitRecord(projectId, state.revision + 1);
+      if (!nextRecord) return state;
+      if (nextRecord.previous_revision !== state.revision) {
+        throw new Error(`Canonical commit record gap for ${projectId}: expected previous revision ${state.revision}`);
+      }
+      await this.materializeRecoveredRecord(nextRecord);
+      state = nextRecord.state;
+    }
+
+    return state;
+  }
+
+  private async materializeRecoveredRecord(record: CanonicalCommitRecord): Promise<void> {
+    await this.repository.materializeCommit(record, {
+      publishReceipt: record.transaction.operation !== "project.create"
+    });
+    this.persistCommit(record.state, record.receipt);
+  }
+
+  private persistState(state: ProjectState): void {
     this.ctx.storage.sql.exec(
       "INSERT INTO project_state (singleton, state_json) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
-      JSON.stringify(recovered)
+      JSON.stringify(state)
     );
-    return recovered;
   }
 
   private findReceipt(transactionId: string): Receipt | null {
@@ -345,7 +432,8 @@ export class ProjectGuard extends DurableObject<Env> {
         JSON.stringify(state)
       );
       this.ctx.storage.sql.exec(
-        "INSERT INTO transactions (transaction_id, status, receipt_json) VALUES (?, ?, ?)",
+        `INSERT INTO transactions (transaction_id, status, receipt_json) VALUES (?, ?, ?)
+         ON CONFLICT(transaction_id) DO UPDATE SET status = excluded.status, receipt_json = excluded.receipt_json`,
         receipt.transaction_id,
         receipt.status,
         JSON.stringify(receipt)

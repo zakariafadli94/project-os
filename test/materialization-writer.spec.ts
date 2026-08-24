@@ -116,6 +116,35 @@ describe("WorkspaceProjectionWriter", () => {
     expect(transport.uploads).toHaveLength(0);
   });
 
+  it("offers unexpected human bytes to a recovery hook before failing closed", async () => {
+    const transport = new InstrumentedTransport();
+    const baselineContent = `${MANAGED_NOTICE}\nbaseline`;
+    const baseline: ProjectionOutputEvidence = {
+      relative_path: "STATE.md",
+      input_hash: await sha256Text("baseline-state"),
+      content_hash: await sha256Text(baselineContent),
+      source_revision: 3
+    };
+    const humanEdit = `${MANAGED_NOTICE}\nhuman changed this in Obsidian`;
+    transport.files.set("/workspace/STATE.md", humanEdit);
+    const writer = new WorkspaceProjectionWriter(transport, 1);
+    const item = await output("global:STATE", "STATE.md", `${MANAGED_NOTICE}\ncanonical state`, { baseline, critical: true });
+    const preserved: Array<{ key: string; path: string; currentContent: string; currentHash: string }> = [];
+
+    await expect(writer.materialize(plan([item]), {
+      workspaceRoot: "/workspace",
+      onUnexpectedContent: (entry) => { preserved.push(entry); }
+    })).rejects.toBeInstanceOf(MaterializationOutputConflictError);
+
+    expect(preserved).toEqual([{
+      key: "global:STATE",
+      path: "/workspace/STATE.md",
+      currentContent: humanEdit,
+      currentHash: await sha256Text(humanEdit)
+    }]);
+    expect(transport.uploads).toHaveLength(0);
+  });
+
   it("bootstrap may overwrite a known machine-managed note but refuses an untracked human file", async () => {
     const managedTransport = new InstrumentedTransport();
     managedTransport.files.set("/workspace/BRIEF.md", `${MANAGED_NOTICE}\nold generated`);

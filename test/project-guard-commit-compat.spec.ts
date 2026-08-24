@@ -1,4 +1,5 @@
 import { env } from "cloudflare:workers";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -17,21 +18,6 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   });
   expect(response.status).toBe(200);
   return response.json<Receipt>();
-}
-
-async function submitMustFail(projectId: string, transaction: unknown): Promise<void> {
-  let failed = false;
-  try {
-    const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/transaction", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(transaction)
-    });
-    failed = !response.ok;
-  } catch {
-    failed = true;
-  }
-  expect(failed).toBe(true);
 }
 
 describe("ProjectGuard commit-record compatibility", () => {
@@ -64,16 +50,8 @@ describe("ProjectGuard commit-record compatibility", () => {
 
   it("recovers a brand-new project from revision-1 commit record when no snapshot was materialized", async () => {
     const projectId = "PRJ-1802";
-    const eventPath = `/PROJECT_OS/.project-os/projects/${projectId}/events/EVT-000001.json`;
-    const mock = installDropboxMock({
-      faults: [{
-        endpoint: "/2/files/upload",
-        path: eventPath,
-        occurrence: 1,
-        status: 400,
-        error_summary: "injected/first_commit_materialization_failure"
-      }]
-    });
+    const mock = installDropboxMock();
+    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
     const transaction = {
       schema_version: "1.0",
       transaction_id: "TXN-COMMIT-1802-CREATE",
@@ -89,12 +67,23 @@ describe("ProjectGuard commit-record compatibility", () => {
       }
     };
 
-    await submitMustFail(projectId, transaction);
+    const committed = await submit(projectId, transaction);
+    expect(committed).toMatchObject({ status: "committed", previous_revision: 0, new_revision: 1, event_id: "EVT-000001" });
     expect(mock.files.has(machineCommitRecordPath(projectId, 1))).toBe(true);
     expect(mock.files.has(machineStatePath(projectId))).toBe(false);
 
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM project_state");
+      state.storage.sql.exec("DELETE FROM transactions");
+    });
+    await evictDurableObject(stub);
+
     const replay = await submit(projectId, transaction);
-    expect(replay).toMatchObject({ status: "committed", previous_revision: 0, new_revision: 1, event_id: "EVT-000001" });
+    expect(replay).toEqual(committed);
+    expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(false);
+    expect(mock.files.has(machineStatePath(projectId))).toBe(false);
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
     expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(1);
   });
 });

@@ -214,13 +214,14 @@ async function materializeExistingProjects(request: Request, env: Env): Promise<
     appSecret: env.DROPBOX_APP_SECRET,
     refreshToken: env.DROPBOX_REFRESH_TOKEN
   });
+  const transport = new ResilientDropboxTransport(client);
   const results: Array<{ project_id: string; status: "materialized"; revision: number }> = [];
 
   for (const projectId of projectIds) {
     const project = byId.get(projectId);
     if (!project) return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
 
-    await mirrorLegacyEvents(client, projectId, project.slug);
+    await mirrorLegacyEvents(transport, projectId, project.slug);
 
     const guard = env.PROJECT_GUARD.getByName(projectId);
     const response = await guard.fetch("https://project-guard.internal/materialize", {
@@ -247,7 +248,7 @@ async function migrateLegacyLedger(env: Env): Promise<{ transactions: number; re
     appSecret: env.DROPBOX_APP_SECRET,
     refreshToken: env.DROPBOX_REFRESH_TOKEN
   });
-  return mirrorLegacyLedger(client);
+  return mirrorLegacyLedger(new ResilientDropboxTransport(client));
 }
 
 export async function executeTransactionWithContinuity(
@@ -309,8 +310,9 @@ async function processInbox(env: Env): Promise<InboxProcessSummary> {
     appSecret: env.DROPBOX_APP_SECRET,
     refreshToken: env.DROPBOX_REFRESH_TOKEN
   });
-  const transactionSummary = await processTransactionInbox(env, client, mode);
-  const artifactSummary = await processArtifactInbox(env, client, mode);
+  const transport = new ResilientDropboxTransport(client);
+  const transactionSummary = await processTransactionInbox(env, transport, mode);
+  const artifactSummary = await processArtifactInbox(env, transport, mode);
   return {
     scanned: transactionSummary.scanned + artifactSummary.scanned,
     processed: transactionSummary.processed + artifactSummary.processed,
@@ -318,8 +320,8 @@ async function processInbox(env: Env): Promise<InboxProcessSummary> {
   };
 }
 
-async function processTransactionInbox(env: Env, client: DropboxClient, mode: LayoutMode): Promise<InboxProcessSummary> {
-  const entries = await client.listFolder(inboxPath(mode));
+async function processTransactionInbox(env: Env, transport: ResilientDropboxTransport, mode: LayoutMode): Promise<InboxProcessSummary> {
+  const entries = await transport.listFolder(inboxPath(mode));
   const transactionEntries = entries
     .filter((item) => item.tag === "file" && item.name.endsWith(".json"))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -336,7 +338,7 @@ async function processTransactionInbox(env: Env, client: DropboxClient, mode: La
       console.error("Project OS inbox entry missing path_display", { name: entry.name });
       continue;
     }
-    const raw = await client.download(sourcePath);
+    const raw = await transport.download(sourcePath);
     if (raw === null) {
       summary.failed += 1;
       console.error("Project OS inbox entry disappeared before processing", { name: entry.name, sourcePath });
@@ -353,13 +355,13 @@ async function processTransactionInbox(env: Env, client: DropboxClient, mode: La
     } catch (error) {
       const fallbackId = filenameTransactionId ?? await syntheticInboxId("TXN-INVALID", entry.name, raw);
       const rejectedPath = terminalTransactionPath(mode, "rejected", fallbackId);
-      await safeAdd(client, rejectedPath, `${JSON.stringify({
+      await safeAdd(transport, rejectedPath, `${JSON.stringify({
         status: "rejected",
         code: "INVALID_TRANSACTION_FILE",
         message: error instanceof Error ? error.message : "Invalid transaction file",
         source_name: entry.name
       }, null, 2)}\n`);
-      await archiveSource(client, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
+      await archiveSource(transport, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
       summary.processed += 1;
       continue;
     }
@@ -378,15 +380,15 @@ async function processTransactionInbox(env: Env, client: DropboxClient, mode: La
     const archivePath = receipt.status === "committed"
       ? canonicalTerminalPath
       : canonicalTerminalPath.replace(/\.json$/, ".source.json");
-    await archiveSource(client, sourcePath, archivePath);
+    await archiveSource(transport, sourcePath, archivePath);
     summary.processed += 1;
   }
 
   return summary;
 }
 
-async function processArtifactInbox(env: Env, client: DropboxClient, mode: LayoutMode): Promise<InboxProcessSummary> {
-  const entries = await client.listFolder(artifactInboxPath(mode));
+async function processArtifactInbox(env: Env, transport: ResilientDropboxTransport, mode: LayoutMode): Promise<InboxProcessSummary> {
+  const entries = await transport.listFolder(artifactInboxPath(mode));
   const artifactEntries = entries
     .filter((item) => item.tag === "file" && item.name.endsWith(".json"))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -403,7 +405,7 @@ async function processArtifactInbox(env: Env, client: DropboxClient, mode: Layou
       console.error("Project OS artifact inbox entry missing path_display", { name: entry.name });
       continue;
     }
-    const raw = await client.download(sourcePath);
+    const raw = await transport.download(sourcePath);
     if (raw === null) {
       summary.failed += 1;
       console.error("Project OS artifact inbox entry disappeared before processing", { name: entry.name, sourcePath });
@@ -420,13 +422,13 @@ async function processArtifactInbox(env: Env, client: DropboxClient, mode: Layou
     } catch (error) {
       const fallbackId = filenameRequestId ?? await syntheticInboxId("ART-INVALID", entry.name, raw);
       const rejectedPath = terminalArtifactRequestPath(mode, "rejected", fallbackId);
-      await safeAdd(client, rejectedPath, `${JSON.stringify({
+      await safeAdd(transport, rejectedPath, `${JSON.stringify({
         status: "rejected",
         code: "INVALID_ARTIFACT_FILE",
         message: error instanceof Error ? error.message : "Invalid artifact file",
         source_name: entry.name
       }, null, 2)}\n`);
-      await archiveSource(client, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
+      await archiveSource(transport, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
       summary.processed += 1;
       continue;
     }
@@ -442,7 +444,7 @@ async function processArtifactInbox(env: Env, client: DropboxClient, mode: Layou
 
     const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
     const terminalPath = terminalArtifactRequestPath(mode, statusFolder, artifact.request_id);
-    await archiveSource(client, sourcePath, terminalPath);
+    await archiveSource(transport, sourcePath, terminalPath);
     summary.processed += 1;
   }
 
@@ -471,26 +473,24 @@ async function syntheticInboxId(prefix: "TXN-INVALID" | "ART-INVALID", filename:
   return `${prefix}-${hex.slice(0, 24)}`;
 }
 
-async function safeAdd(client: DropboxClient, path: string, content: string): Promise<void> {
-  const writer = new ResilientDropboxTransport(client);
+async function safeAdd(transport: ResilientDropboxTransport, path: string, content: string): Promise<void> {
   try {
-    await writer.upload(path, content, "add");
+    await transport.upload(path, content, "add");
   } catch (error) {
     if (!(error instanceof DropboxConflictError)) throw error;
-    const existing = await client.download(path);
+    const existing = await transport.download(path);
     if (existing !== content) throw new Error(`Conflicting terminal inbox artifact at ${path}`);
   }
 }
 
-async function archiveSource(client: DropboxClient, source: string, destination: string): Promise<void> {
-  const writer = new ResilientDropboxTransport(client);
+async function archiveSource(transport: ResilientDropboxTransport, source: string, destination: string): Promise<void> {
   try {
-    await writer.move(source, destination);
+    await transport.move(source, destination);
   } catch (error) {
     if (!(error instanceof DropboxConflictError)) throw error;
-    const sourceStillExists = await client.download(source);
+    const sourceStillExists = await transport.download(source);
     if (sourceStillExists === null) return;
-    const destinationExists = await client.download(destination);
+    const destinationExists = await transport.download(destination);
     if (destinationExists === sourceStillExists) return;
     throw error;
   }

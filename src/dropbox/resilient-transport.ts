@@ -1,4 +1,4 @@
-import { DropboxApiError, DropboxConflictError, type DropboxTransport } from "./client";
+import { DropboxApiError, DropboxConflictError, type DropboxEntry, type DropboxTransport } from "./client";
 import { isTransientDropboxFailure } from "./retry";
 
 export interface ResilientDropboxTransportOptions {
@@ -33,6 +33,11 @@ export class ResilientDropboxTransport implements DropboxTransport {
 
   download(path: string): Promise<string | null> {
     return this.retry("download", path, () => this.inner.download(path));
+  }
+
+  listFolder(path: string): Promise<DropboxEntry[]> {
+    if (!this.inner.listFolder) throw new Error("Dropbox transport does not support listFolder");
+    return this.retry("list_folder", path, () => this.inner.listFolder!(path));
   }
 
   move(from: string, to: string): Promise<void> {

@@ -1,6 +1,13 @@
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
 import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../domain/commit-record";
 import type { DomainEvent } from "../domain/event";
+import {
+  parseCompletedMaterializationRecord,
+  parseMaterializationHead,
+  type CompletedMaterializationRecord,
+  type MaterializationGenerationRef,
+  type MaterializationHead
+} from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
@@ -26,6 +33,9 @@ import {
   machineCommitRecordPath,
   machineEventPath,
   machineManifestPath,
+  machineMaterializationHeadPath,
+  machineMaterializationRecordPath,
+  machineMaterializationRoot,
   machineReceiptPath,
   machineRegistryJsonPath,
   machineRegistryMarkdownPath,
@@ -93,6 +103,59 @@ export class ProjectRepository {
     return record;
   }
 
+  async readMaterializationHead(projectId: string): Promise<MaterializationHead | null> {
+    if (this.mode !== "v2") return null;
+    const raw = await this.transport.download(machineMaterializationHeadPath(projectId));
+    if (raw === null) return null;
+    const head = parseMaterializationHead(JSON.parse(raw));
+    if (head.project_id !== projectId) {
+      throw new Error(`Materialization head binding mismatch for ${projectId}`);
+    }
+    const expectedPath = machineMaterializationRecordPath(projectId, head.target_revision, head.projection_version);
+    if (head.record_path !== expectedPath) {
+      throw new Error(`Materialization head record binding mismatch for ${projectId}`);
+    }
+    return head;
+  }
+
+  async readMaterializationRecord(
+    projectId: string,
+    revision: number,
+    projectionVersion: number
+  ): Promise<CompletedMaterializationRecord | null> {
+    if (this.mode !== "v2") return null;
+    const raw = await this.transport.download(machineMaterializationRecordPath(projectId, revision, projectionVersion));
+    if (raw === null) return null;
+    const record = parseCompletedMaterializationRecord(JSON.parse(raw));
+    if (
+      record.project_id !== projectId
+      || record.target_revision !== revision
+      || record.projection_version !== projectionVersion
+    ) {
+      throw new Error(`Materialization record binding mismatch for ${projectId} revision ${revision} projection ${projectionVersion}`);
+    }
+    return record;
+  }
+
+  async listMaterializationRecordRefs(projectId: string): Promise<MaterializationGenerationRef[]> {
+    if (this.mode !== "v2") return [];
+    if (!this.transport.listFolder) throw new Error("Dropbox transport does not support materialization record listing");
+    const entries = await this.transport.listFolder(machineMaterializationRoot(projectId));
+    const refs: MaterializationGenerationRef[] = [];
+    for (const entry of entries) {
+      if (entry.tag !== "file") continue;
+      const match = /^REV-(\d{6,})-PV-(\d{4,})\.json$/.exec(entry.name);
+      if (!match) continue;
+      const target_revision = Number.parseInt(match[1], 10);
+      const projection_version = Number.parseInt(match[2], 10);
+      if (!Number.isSafeInteger(target_revision) || !Number.isSafeInteger(projection_version) || projection_version < 1) continue;
+      refs.push({ target_revision, projection_version });
+    }
+    return refs.sort((a, b) =>
+      a.projection_version - b.projection_version || a.target_revision - b.target_revision
+    );
+  }
+
   async readReceipt(transactionId: string): Promise<Receipt | null> {
     const path = this.mode === "v2"
       ? machineReceiptPath(transactionId)
@@ -121,6 +184,52 @@ export class ProjectRepository {
     );
   }
 
+  async writeCompletedMaterializationRecord(record: CompletedMaterializationRecord): Promise<void> {
+    if (this.mode !== "v2") throw new Error("Completed materialization records require V2 layout mode");
+    const validated = parseCompletedMaterializationRecord(record);
+    await this.safeAdd(
+      machineMaterializationRecordPath(
+        validated.project_id,
+        validated.target_revision,
+        validated.projection_version
+      ),
+      pretty(validated)
+    );
+  }
+
+  async writeMaterializationHead(head: MaterializationHead): Promise<void> {
+    if (this.mode !== "v2") throw new Error("Materialization head requires V2 layout mode");
+    const validated = parseMaterializationHead(head);
+    const expectedPath = machineMaterializationRecordPath(
+      validated.project_id,
+      validated.target_revision,
+      validated.projection_version
+    );
+    if (validated.record_path !== expectedPath) {
+      throw new Error("Materialization head does not reference its canonical generation record path");
+    }
+    const record = await this.readMaterializationRecord(
+      validated.project_id,
+      validated.target_revision,
+      validated.projection_version
+    );
+    if (
+      !record
+      || record.project_id !== validated.project_id
+      || record.target_revision !== validated.target_revision
+      || record.projection_version !== validated.projection_version
+      || record.result_root_hash !== validated.result_root_hash
+      || record.workspace_location !== validated.workspace_location
+    ) {
+      throw new Error("Materialization head does not match its immutable completed record");
+    }
+    await this.transport.upload(
+      machineMaterializationHeadPath(validated.project_id),
+      pretty(validated),
+      "overwrite"
+    );
+  }
+
   async materializeCommit(
     record: CanonicalCommitRecord,
     options: CommitWriteOptions = {}
@@ -135,6 +244,18 @@ export class ProjectRepository {
       await this.writeHumanViews(validated.state);
     }
 
+    if (options.publishReceipt !== false) {
+      await this.writeReceipt(validated.receipt);
+    }
+  }
+
+  async materializeCanonicalDerivatives(
+    record: CanonicalCommitRecord,
+    options: CommitWriteOptions = {}
+  ): Promise<void> {
+    if (this.mode !== "v2") throw new Error("Canonical derivative materialization requires V2 layout mode");
+    const validated = parseCanonicalCommitRecord(record);
+    await this.writeMachineState(validated.state, validated.event);
     if (options.publishReceipt !== false) {
       await this.writeReceipt(validated.receipt);
     }

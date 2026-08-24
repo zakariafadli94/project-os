@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { parseArtifactWriteRequest, type ArtifactWriteReceipt, type ArtifactWriteRequest } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
+import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
@@ -10,6 +11,13 @@ import { applyTransaction } from "../domain/transitions";
 import { DropboxClient } from "../dropbox/client";
 import { parseLayoutMode, type LayoutMode } from "../dropbox/layout";
 import { ArtifactContentConflictError, ProjectRepository } from "../dropbox/repository";
+import { MaterializationCoordinator } from "../materialization/coordinator";
+import { initializeMaterializationSchema, MaterializationLedger } from "../materialization/ledger";
+import {
+  MaterializationOutputConflictError,
+  parseProjectionConcurrency,
+  WorkspaceProjectionWriter
+} from "../materialization/writer";
 
 interface TransactionRow {
   [key: string]: SqlStorageValue;
@@ -33,10 +41,13 @@ const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
   "project.complete",
   "project.archive"
 ]);
+const MATERIALIZATION_ALARM_DELAY_MS = 1_000;
 
 export class ProjectGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
   private readonly layoutMode: LayoutMode;
+  private readonly materializationLedger: MaterializationLedger | null;
+  private readonly materializationCoordinator: MaterializationCoordinator | null;
   private queue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -58,11 +69,31 @@ export class ProjectGuard extends DurableObject<Env> {
       );
     `);
     this.layoutMode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
-    this.repository = new ProjectRepository(new DropboxClient({
+    const rawDropbox = new DropboxClient({
       appKey: env.DROPBOX_APP_KEY,
       appSecret: env.DROPBOX_APP_SECRET,
       refreshToken: env.DROPBOX_REFRESH_TOKEN
-    }), this.layoutMode);
+    });
+    this.repository = new ProjectRepository(rawDropbox, this.layoutMode);
+
+    const projectId = this.ctx.id.name;
+    if (this.layoutMode === "v2" && projectId) {
+      initializeMaterializationSchema(this.ctx.storage);
+      this.materializationLedger = new MaterializationLedger(this.ctx.storage);
+      this.materializationCoordinator = new MaterializationCoordinator({
+        projectId,
+        repository: this.repository,
+        ledger: this.materializationLedger,
+        writer: new WorkspaceProjectionWriter(
+          rawDropbox,
+          parseProjectionConcurrency(env.PROJECT_OS_PROJECTION_CONCURRENCY)
+        ),
+        projectionVersion: CURRENT_PROJECTION_VERSION
+      });
+    } else {
+      this.materializationLedger = null;
+      this.materializationCoordinator = null;
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -70,6 +101,23 @@ export class ProjectGuard extends DurableObject<Env> {
 
     if (request.method === "POST" && pathname === "/artifact") {
       return this.serialize(() => this.handleArtifact(request));
+    }
+
+    if (request.method === "GET" && pathname === "/materialization-status") {
+      return this.serialize(async () => {
+        const state = await this.loadOrRecoverState();
+        if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+        return Response.json(this.materializationStatus(state));
+      });
+    }
+
+    if (request.method === "POST" && pathname === "/reconcile-materialization") {
+      return this.serialize(async () => {
+        const state = await this.loadOrRecoverState();
+        if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+        await this.reconcileMaterializationForState(state);
+        return Response.json(this.materializationStatus(state));
+      });
     }
 
     if (request.method === "POST" && pathname === "/materialize") {
@@ -87,7 +135,22 @@ export class ProjectGuard extends DurableObject<Env> {
         const state = await this.loadOrRecoverState();
         if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
 
-        await this.repository.materializeV2(state);
+        if (this.layoutMode === "v2" && this.materializationCoordinator) {
+          const record = state.revision > 0
+            ? await this.repository.readCommitRecord(state.project_id, state.revision)
+            : null;
+          if (record) {
+            await this.materializationCoordinator.reconcile(state.revision);
+            this.materializationCoordinator.requestTarget(state.revision, CURRENT_PROJECTION_VERSION);
+            await this.materializationCoordinator.runUntilIdle();
+            await this.ctx.storage.deleteAlarm();
+          } else {
+            // Compatibility for historical V2 snapshots that predate immutable commit records.
+            await this.repository.materializeV2(state);
+          }
+        } else {
+          await this.repository.materializeV2(state);
+        }
         return Response.json({
           project_id: state.project_id,
           revision: state.revision,
@@ -184,20 +247,41 @@ export class ProjectGuard extends DurableObject<Env> {
           receipt
         };
         await this.repository.writeCommitRecord(record);
-        await this.repository.materializeCommit(record, {
-          publishReceipt: tx.operation !== "project.create"
-        });
+        this.persistCommit(result.state, receipt);
+        await this.requestMaterializationSafely(result.state.revision);
       } else {
         await this.repository.writeCommit(result.state, result.event, receipt, {
           publishReceipt: tx.operation !== "project.create"
         });
+        this.persistCommit(result.state, receipt);
       }
 
-      this.persistCommit(result.state, receipt);
       if (PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
         await this.syncRegistryStatus(result.state);
       }
       return Response.json(receipt);
+    });
+  }
+
+  async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
+    if (this.layoutMode !== "v2" || !this.materializationCoordinator) return;
+    return this.serialize(async () => {
+      try {
+        const result = await this.materializationCoordinator!.runNext();
+        if (result.more_work) await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+      } catch (error) {
+        if (error instanceof MaterializationOutputConflictError) {
+          console.error("Project OS materialization blocked", structuredMaterializationError(this.ctx.id.name, error));
+          return;
+        }
+        if ((alarmInfo?.retryCount ?? 0) >= 5) {
+          console.error("Project OS materialization deferred after alarm retries", structuredMaterializationError(this.ctx.id.name, error));
+          await this.ctx.storage.setAlarm(Date.now() + 300_000);
+          return;
+        }
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+        throw error;
+      }
     });
   }
 
@@ -305,7 +389,7 @@ export class ProjectGuard extends DurableObject<Env> {
           ? await this.repository.readCommitRecord(projectId, snapshot.revision)
           : null;
         if (sameRevisionRecord) {
-          await this.materializeRecoveredRecord(sameRevisionRecord);
+          await this.recoverCommittedRecord(sameRevisionRecord);
           state = sameRevisionRecord.state;
         } else {
           this.persistState(snapshot);
@@ -317,7 +401,7 @@ export class ProjectGuard extends DurableObject<Env> {
         if (firstRecord.previous_revision !== 0) {
           throw new Error(`First canonical commit record for ${projectId} is not revision-contiguous`);
         }
-        await this.materializeRecoveredRecord(firstRecord);
+        await this.recoverCommittedRecord(firstRecord);
         state = firstRecord.state;
       }
     }
@@ -328,18 +412,66 @@ export class ProjectGuard extends DurableObject<Env> {
       if (nextRecord.previous_revision !== state.revision) {
         throw new Error(`Canonical commit record gap for ${projectId}: expected previous revision ${state.revision}`);
       }
-      await this.materializeRecoveredRecord(nextRecord);
+      await this.recoverCommittedRecord(nextRecord);
       state = nextRecord.state;
     }
 
     return state;
   }
 
-  private async materializeRecoveredRecord(record: CanonicalCommitRecord): Promise<void> {
-    await this.repository.materializeCommit(record, {
-      publishReceipt: record.transaction.operation !== "project.create"
-    });
+  private async recoverCommittedRecord(record: CanonicalCommitRecord): Promise<void> {
     this.persistCommit(record.state, record.receipt);
+    await this.requestMaterializationSafely(record.new_revision);
+  }
+
+  private async requestMaterializationSafely(revision: number): Promise<void> {
+    if (!this.materializationCoordinator) return;
+    try {
+      this.materializationCoordinator.requestTarget(revision, CURRENT_PROJECTION_VERSION);
+      await this.ensureMaterializationAlarm();
+    } catch (error) {
+      console.error("Project OS materialization scheduling failed after canonical commit", {
+        project_id: this.ctx.id.name ?? null,
+        target_revision: revision,
+        projection_version: CURRENT_PROJECTION_VERSION,
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  private async reconcileMaterializationForState(state: ProjectState): Promise<void> {
+    if (!this.materializationCoordinator) return;
+    const currentRecord = state.revision > 0
+      ? await this.repository.readCommitRecord(state.project_id, state.revision)
+      : null;
+    if (!currentRecord) return;
+    await this.materializationCoordinator.reconcile(state.revision);
+    await this.ensureMaterializationAlarm();
+  }
+
+  private async ensureMaterializationAlarm(): Promise<void> {
+    if (!this.materializationCoordinator) return;
+    const status = this.materializationCoordinator.status();
+    if (!status.active && !status.requested) return;
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing === null) await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+  }
+
+  private materializationStatus(state: ProjectState) {
+    const status = this.materializationCoordinator?.status();
+    return {
+      project_id: state.project_id,
+      canonical_revision: state.revision,
+      projection_version: CURRENT_PROJECTION_VERSION,
+      materialized_head: status?.head ?? null,
+      requested: status?.requested ?? null,
+      active: status?.active
+        ? { revision: status.active.revision, projection_version: status.active.projection_version }
+        : null,
+      blocked_error: status?.last_error ?? null,
+      output_count: status?.output_count ?? 0,
+      attempt_output_count: status?.attempt_output_count ?? 0
+    };
   }
 
   private persistState(state: ProjectState): void {
@@ -368,9 +500,6 @@ export class ProjectGuard extends DurableObject<Env> {
     if (receipt.status !== "committed" || !PROJECT_STATUS_OPERATIONS.has(tx.operation)) return;
     const currentState = await this.loadOrRecoverState();
     if (!currentState) return;
-    if (tx.operation === "project.archive") {
-      await this.repository.archiveHumanWorkspace(currentState);
-    }
     await this.syncRegistryStatus(currentState);
   }
 
@@ -471,6 +600,18 @@ export class ProjectGuard extends DurableObject<Env> {
       release();
     }
   }
+}
+
+function structuredMaterializationError(projectId: string | undefined, error: unknown) {
+  return {
+    project_id: projectId ?? null,
+    projection_version: CURRENT_PROJECTION_VERSION,
+    error_name: error instanceof Error ? error.name : "UnknownError",
+    message: error instanceof Error ? error.message : String(error),
+    ...(error instanceof MaterializationOutputConflictError
+      ? { output_key: error.key, path: error.path }
+      : {})
+  };
 }
 
 async function sha256Hex(value: string): Promise<string> {

@@ -1,9 +1,10 @@
 import { env } from "cloudflare:workers";
+import { runDurableObjectAlarm } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import { archiveProjectRoot, machineCommitRecordPath, machineReceiptPath, workspaceProjectRoot } from "../src/dropbox/layout";
-import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
+import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-24T00:25:00.000Z";
@@ -16,21 +17,6 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   });
   expect(response.status).toBe(200);
   return response.json<Receipt>();
-}
-
-async function submitMustFail(projectId: string, transaction: unknown): Promise<void> {
-  let failed = false;
-  try {
-    const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/transaction", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(transaction)
-    });
-    failed = !response.ok;
-  } catch {
-    failed = true;
-  }
-  expect(failed).toBe(true);
 }
 
 async function createRegisteredProject(slug: string): Promise<Receipt> {
@@ -48,7 +34,7 @@ async function createRegisteredProject(slug: string): Promise<Receipt> {
         name: "Archive Commit 1901",
         slug,
         aliases: [],
-        objective: "Prove archive replay is idempotent"
+        objective: "Prove archive commit remains replay-safe before projection"
       }
     })
   });
@@ -59,24 +45,20 @@ async function createRegisteredProject(slug: string): Promise<Receipt> {
 describe("ProjectGuard crash-safe archive commits", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("replays an archive whose workspace move succeeded before the standalone receipt failed", async () => {
+  it("commits archive exactly once while deferring the physical workspace move to projection", async () => {
     const slug = "archive-commit-1901";
     const archiveTransactionId = "TXN-COMMIT-1901-ARCHIVE";
-    const faults: DropboxMockFault[] = [];
-    const mock = installDropboxMock({ faults });
+    const mock = installDropboxMock();
 
     const created = await createRegisteredProject(slug);
     expect(created.status).toBe("committed");
     expect(created.new_revision).toBe(1);
     const projectId = created.project_id;
+    const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
 
-    faults.push({
-      endpoint: "/2/files/upload",
-      path: machineReceiptPath(archiveTransactionId),
-      occurrence: 1,
-      status: 400,
-      error_summary: "injected/post_archive_receipt_failure"
-    });
+    expect(await runDurableObjectAlarm(projectStub)).toBe(true);
+    expect(mock.files.has(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(true);
+    expect(mock.files.has(`${archiveProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(false);
 
     const archiveTransaction = {
       schema_version: "1.0",
@@ -88,22 +70,23 @@ describe("ProjectGuard crash-safe archive commits", () => {
       payload: { reason: "Archive crash test" }
     };
 
-    await submitMustFail(projectId, archiveTransaction);
-
-    expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(true);
-    expect(mock.files.has(machineReceiptPath(archiveTransactionId))).toBe(false);
-    expect(mock.files.has(`${archiveProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(true);
-    expect(mock.files.has(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(false);
-
-    const replay = await submit(projectId, archiveTransaction);
-    expect(replay).toMatchObject({
+    const committed = await submit(projectId, archiveTransaction);
+    expect(committed).toMatchObject({
       status: "committed",
       previous_revision: 1,
       new_revision: 2,
       event_id: "EVT-000002"
     });
-    expect(mock.files.has(machineReceiptPath(archiveTransactionId))).toBe(true);
-    expect(mock.files.has(`${archiveProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(true);
-    expect(mock.files.has(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(false);
+
+    expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(true);
+    expect(mock.files.has(machineReceiptPath(archiveTransactionId))).toBe(false);
+    expect(mock.files.has(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(true);
+    expect(mock.files.has(`${archiveProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(false);
+
+    const replay = await submit(projectId, archiveTransaction);
+    expect(replay).toEqual(committed);
+    expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
+    expect(mock.files.has(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(true);
+    expect(mock.files.has(`${archiveProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(false);
   });
 });

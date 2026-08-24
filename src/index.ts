@@ -153,19 +153,22 @@ const worker = {
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const mode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
-    console.info("Project OS scheduled inbox scan started", {
+    console.info("Project OS scheduled maintenance started", {
       cron: controller.cron,
       mode,
       inbox: inboxPath(mode),
       artifact_inbox: artifactInboxPath(mode)
     });
     ctx.waitUntil(
-      processInbox(env)
-        .then((summary) => {
-          console.info("Project OS inbox scan completed", summary);
+      Promise.all([
+        processInbox(env),
+        reconcileMaterializations(env)
+      ])
+        .then(([inbox, materialization]) => {
+          console.info("Project OS scheduled maintenance completed", { inbox, materialization });
         })
         .catch((error) => {
-          console.error("Project OS scheduled inbox scan failed", {
+          console.error("Project OS scheduled maintenance failed", {
             message: error instanceof Error ? error.message : String(error),
             stack: error instanceof Error ? error.stack : undefined
           });
@@ -180,6 +183,23 @@ export default worker;
 interface RegistryProject {
   project_id: string;
   slug: string;
+}
+
+export interface MaterializationReconcileSummary {
+  scanned: number;
+  scheduled: number;
+  current: number;
+  failed: number;
+}
+
+interface MaterializationStatusResponse {
+  project_id: string;
+  canonical_revision: number;
+  projection_version: number;
+  materialized_head: { revision: number; projection_version: number } | null;
+  requested: { revision: number; projection_version: number } | null;
+  active: { revision: number; projection_version: number } | null;
+  blocked_error: string | null;
 }
 
 interface InboxProcessSummary {
@@ -325,6 +345,53 @@ async function processInbox(env: Env): Promise<InboxProcessSummary> {
     processed: transactionSummary.processed + artifactSummary.processed,
     failed: transactionSummary.failed + artifactSummary.failed
   };
+}
+
+export async function reconcileMaterializations(env: Env): Promise<MaterializationReconcileSummary> {
+  const registryStub = env.REGISTRY_GUARD.getByName("global");
+  const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+  if (!registryResponse.ok) throw new Error(`RegistryGuard materialization reconcile returned ${registryResponse.status}`);
+  const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const summary: MaterializationReconcileSummary = {
+    scanned: registry.projects.length,
+    scheduled: 0,
+    current: 0,
+    failed: 0
+  };
+
+  let cursor = 0;
+  const workerCount = Math.min(4, registry.projects.length);
+  const worker = async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= registry.projects.length) return;
+      const project = registry.projects[index];
+      try {
+        const stub = env.PROJECT_GUARD.getByName(project.project_id);
+        const response = await stub.fetch("https://project-guard.internal/reconcile-materialization", {
+          method: "POST"
+        });
+        if (!response.ok) throw new Error(`ProjectGuard returned ${response.status}`);
+        const status = await response.json<MaterializationStatusResponse>();
+        const headCurrent = status.materialized_head !== null
+          && status.materialized_head.revision === status.canonical_revision
+          && status.materialized_head.projection_version === status.projection_version;
+        const workPending = status.requested !== null || status.active !== null || !headCurrent;
+        if (workPending) summary.scheduled += 1;
+        else summary.current += 1;
+      } catch (error) {
+        summary.failed += 1;
+        console.error("Project OS materialization reconcile failed", {
+          project_id: project.project_id,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return summary;
 }
 
 async function prepareTransactionInboxEntries(

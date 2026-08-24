@@ -1,29 +1,42 @@
-# Project OS Deployment and Workspace V2 Rollout
+# Project OS Deployment and V2 Operations
 
-Project OS keeps credentials out of GitHub, generated Markdown, Obsidian, and ChatGPT conversation text. The production system is a Cloudflare Worker backed by SQLite Durable Objects, using a Dropbox App Folder for persistence and Obsidian as a human reading/navigation layer.
+Project OS keeps credentials out of GitHub, generated Markdown, Obsidian and ChatGPT conversation text. Production is a Cloudflare Worker backed by SQLite Durable Objects, with Dropbox as the current durable external persistence provider and Obsidian as an optional human reading/navigation layer.
 
-## 1. Cloudflare Worker
+## 1. Runtime
 
-Repository and runtime:
+Repository and Worker:
 
 - Repository: `zakariafadli94/project-os`
-- Worker: `project-os-guard`
 - Production branch: `main`
-- Build command: `npm install && npm run check`
-- Deploy command: `npm run deploy`
+- Worker: `project-os-guard`
+- Verification: `npm install && npm run check`
+- Deploy: `npm run deploy`
+- Dry-run: `npx wrangler deploy --dry-run`
 
-`wrangler.jsonc` declares two SQLite-backed Durable Objects:
+`wrangler.jsonc` declares SQLite-backed:
 
 - `ProjectGuard` → `PROJECT_GUARD`
 - `RegistryGuard` → `REGISTRY_GUARD`
 
-It also declares the five-minute scheduled recovery trigger used to retry transactions that remain in the Dropbox incoming queue.
+Production layout is V2 and continuity remains:
 
-The deployment was provisioned with declarative Durable Object `exports`. Do not replace this with Wrangler `migrations`.
+```text
+PROJECT_OS_LAYOUT_MODE=v2
+PROJECT_OS_CONTINUITY_MODE=stable
+```
+
+Do not change continuity mode merely because a feature PR is merged. Transparent candidate rollout/cutover remains owned by the later deployment package.
+
+The scheduled trigger runs every five minutes. It now performs two independent recovery jobs:
+
+- transaction/artifact inbox processing;
+- fleet materialization reconciliation.
+
+Materialization reconciliation uses bounded project concurrency and isolates one blocked project from the rest.
 
 ## 2. Required secrets
 
-Production requires these Cloudflare secrets:
+Production requires Cloudflare secrets:
 
 ```text
 DROPBOX_APP_KEY
@@ -32,15 +45,13 @@ DROPBOX_REFRESH_TOKEN
 INGRESS_TOKEN
 ```
 
-Never commit or copy their values into Markdown. Documentation may contain the secret names and regeneration procedures only.
+Never commit or paste their values into Markdown or chat. Documentation may contain secret names and regeneration procedures only.
 
-`INGRESS_TOKEN` protects both normal direct transaction ingress and the workspace migration administration endpoint.
+`INGRESS_TOKEN` protects direct transaction ingress and authenticated administrative endpoints.
 
 ## 3. Dropbox application
 
-Use a dedicated scoped Dropbox application with App Folder access.
-
-Required scopes:
+Use a dedicated Dropbox App Folder application with at least:
 
 ```text
 files.content.read
@@ -48,76 +59,38 @@ files.content.write
 files.metadata.read
 ```
 
-Authorize it with offline OAuth access (`token_access_type=offline`) and store the resulting refresh token only as the Cloudflare `DROPBOX_REFRESH_TOKEN` secret.
+Use offline OAuth and store the refresh token only as Cloudflare `DROPBOX_REFRESH_TOKEN`.
 
-The Dropbox API root for Project OS is:
+The API root used by Project OS is:
 
 ```text
 /PROJECT_OS
 ```
 
-The user-visible physical location is under the Dropbox application folder, for example on a French-localized account:
+A user-visible synced location may appear as:
 
 ```text
 Dropbox/Applications/project-os/PROJECT_OS
 ```
 
-or the locale-equivalent `Dropbox/Apps/...` path.
+or the locale-equivalent Dropbox App Folder.
 
-## 4. Storage layout modes
+Dropbox Desktop is optional. Project OS does not depend on a user computer, direct filesystem access, a desktop daemon or a local bridge for correctness.
 
-Project OS V2 introduces one non-secret runtime switch:
+## 4. V2 storage layout
 
-```text
-PROJECT_OS_LAYOUT_MODE=legacy|shadow|v2
-```
-
-When the variable is absent, the application must behave as `legacy`.
-
-### legacy
-
-The existing V1 layout remains authoritative:
-
-```text
-PROJECT_OS/
-├── SYSTEM/
-├── PROJECTS/
-├── TRANSACTIONS/
-└── RECEIPTS/
-```
-
-This is the safe rollback mode and remains the default until the migration is verified.
-
-### shadow
-
-V1 remains canonical for transaction queue, terminal transaction artifacts, registry, and receipts, while V2 is materialized in parallel:
-
-```text
-PROJECT_OS/
-├── WORKSPACE/                 # new human-only layer
-├── .project-os/               # new machine mirror
-├── SYSTEM/                    # legacy canonical during shadow
-├── PROJECTS/                  # legacy canonical during shadow
-├── TRANSACTIONS/              # legacy canonical during shadow
-└── RECEIPTS/                  # legacy canonical during shadow
-```
-
-A shadow write failure must fail before the legacy committed receipt is published. A receipt must never claim success when required shadow materialization failed.
-
-### v2
-
-After explicit verification and cutover, machine persistence is under `.project-os/` and human Markdown is under `WORKSPACE/`:
+Machine persistence is below `.project-os/`; human Markdown is below `WORKSPACE/`.
 
 ```text
 PROJECT_OS/
 ├── WORKSPACE/
 │   ├── PORTFOLIO/
-│   │   ├── DASHBOARD.md
-│   │   ├── RELATIONSHIPS/
-│   │   └── REVIEWS/
 │   └── PROJECTS/
 │       └── PRJ-xxxx-slug/
 │           ├── PROJECT.md
+│           ├── BRIEF.md
+│           ├── DISCOVERY.md
+│           ├── ROADMAP.md
 │           ├── STATE.md
 │           ├── PLAN.md
 │           ├── HANDOFF.md
@@ -125,13 +98,7 @@ PROJECT_OS/
 │           ├── CONSTRAINTS/
 │           ├── TASKS/
 │           ├── RESEARCH/
-│           ├── REFERENCES/
-│           ├── DELIVERABLES/
-│           ├── SPECS/
-│           ├── MEETINGS/
-│           ├── NOTES/
-│           ├── INBOX/
-│           └── ASSETS/
+│           └── DELIVERABLES/
 └── .project-os/
     ├── registry/
     ├── transactions/
@@ -140,58 +107,71 @@ PROJECT_OS/
         └── PRJ-xxxx/
             ├── state.json
             ├── manifest.json
-            └── events/
+            ├── events/
+            ├── commits/
+            ├── materializations/
+            └── materialization-head.json
 ```
 
-Folders are created lazily. Empty project subdirectories are not required.
+Folders are lazy. Empty project subdirectories are not required.
 
-## 5. Dropbox webhook and scheduled recovery
-
-Webhook URL:
+The Obsidian Vault may point only at:
 
 ```text
-https://<worker-host>/dropbox/webhook
+PROJECT_OS/WORKSPACE
 ```
 
-Dropbox GET verification must echo `challenge` exactly. POST requests must pass Dropbox HMAC-SHA256 verification using `DROPBOX_APP_SECRET`.
+Machine files must remain outside the Vault.
 
-The webhook is a wake-up signal only. The Worker processes the incoming transaction folder chosen by the layout mode:
+## 5. Canonical commit and projection deployment model
+
+After `IMP-MATERIAL001`, a successful transaction does not wait for all human Markdown to be uploaded.
+
+The production flow is:
 
 ```text
-legacy/shadow: /PROJECT_OS/TRANSACTIONS/incoming/
-v2:            /PROJECT_OS/.project-os/transactions/incoming/
+immutable canonical commit
+  -> committed business result
+  -> async projection target
+  -> human/machine derivatives
+  -> immutable completed-generation evidence
+  -> materialization head
 ```
 
-The scheduled trigger executes the same processor every five minutes. Transiently failed source transactions remain in `incoming` and are retried idempotently.
+The canonical commit record remains the business truth.
+
+It is valid for a short interval to observe:
+
+```text
+canonical_revision > materialized_head.revision
+```
+
+That state must automatically converge through ProjectGuard alarms or scheduled fleet reconciliation.
+
+Do not classify projection lag as a business rollback. Do not create a new transaction merely to repair projection work.
+
+Full materialization semantics are in `docs/materialization.md`.
 
 ## 6. Transaction ingress and receipt gate
 
-Normal durable changes still use typed Project OS transactions. A new project uses:
+Durable changes use typed Project OS transactions.
 
-```json
-{
-  "project_id": "PRJ-AUTO",
-  "base_revision": 0,
-  "operation": "project.create"
-}
-```
-
-`RegistryGuard` allocates the canonical `PRJ-xxxx` ID.
-
-The final committed receipt is always the proof of persistence. For `project.create`, the final receipt appears only after both per-project creation and registry persistence succeed.
-
-The public direct ingress endpoint remains:
+Public ingress remains:
 
 ```text
 POST /v1/transactions
 Authorization: Bearer <INGRESS_TOKEN>
 ```
 
-## 7. Existing-project workspace materialization
+External project creation uses `PRJ-AUTO`; RegistryGuard allocates `PRJ-xxxx`.
 
-Workspace V2 migration does not create fake business events and does not increment project revisions.
+The committed receipt remains the business persistence proof. For `project.create`, RegistryGuard owns publication of the final standalone committed receipt after registry finalization.
 
-Authenticated migration endpoint:
+Normal users never need a materialization/sync command.
+
+## 7. Administrative existing-project materialization
+
+The existing authenticated route remains for migration/recovery compatibility:
 
 ```text
 POST /v1/admin/workspace-v2/materialize
@@ -199,7 +179,7 @@ Authorization: Bearer <INGRESS_TOKEN>
 Content-Type: application/json
 ```
 
-Example body:
+Example:
 
 ```json
 {
@@ -207,92 +187,72 @@ Example body:
 }
 ```
 
-For each existing project, the migration:
+This operation does not create a domain event or increment business revision. In current V2 projects with commit records it runs the projection coordinator synchronously until the current target is complete. Older historical snapshots without commit records retain the compatibility materialization path.
 
-1. resolves its canonical slug from RegistryGuard;
-2. reads immutable V1 events from `PROJECTS/<PRJ>-<slug>/.system/events/`;
-3. mirrors each event to `.project-os/projects/<PRJ>/events/` using add-if-absent semantics;
-4. on destination conflict, requires byte-for-byte content equality;
-5. calls the ProjectGuard non-mutating `/materialize` endpoint;
-6. regenerates human views into `WORKSPACE/PROJECTS/<PRJ>-<slug>/`;
-7. reports the existing business revision unchanged.
+This endpoint is an administrative recovery/migration mechanism, not a normal user workflow command.
 
-The operation is safe to rerun. It never deletes or moves V1 source material.
+## 8. Materialization evidence
 
-## 8. Obsidian Vault — V2 target
-
-**Do not use the entire `PROJECT_OS/` root as the long-term Obsidian Vault after V2 shadow verification.**
-
-The Vault root becomes only:
+For a project:
 
 ```text
-Dropbox/Applications/project-os/PROJECT_OS/WORKSPACE
+/PROJECT_OS/.project-os/projects/<PRJ>/materializations/REV-000072-PV-0001.json
+/PROJECT_OS/.project-os/projects/<PRJ>/materialization-head.json
 ```
 
-or the locale-equivalent Dropbox App Folder path.
+Completed generation records are immutable. The head is a small repairable pointer and must reference an existing validated record/root hash.
 
-This deliberately keeps these machine artifacts outside Obsidian indexing:
+A generation can be `snapshot` or `delta`. Reconstruction is bounded to at most 128 generation records before a fresh snapshot is required.
+
+`STATE.md` and `HANDOFF.md` are critical and must both be verified before the completed-generation record is published.
+
+## 9. Projection concurrency and retries
+
+Optional environment setting:
 
 ```text
-.project-os/
-SYSTEM/
-TRANSACTIONS/
-RECEIPTS/
-legacy per-project .system/
+PROJECT_OS_PROJECTION_CONCURRENCY=<1..4>
 ```
 
-The user should normally see only:
+Default: `4`.
 
-```text
-PORTFOLIO/
-PROJECTS/
-```
+Do not configure above `4` in this package.
 
-inside the Vault.
+Dropbox operations use the existing resilient transport. Do not add an independent second retry layer in deployment scripts.
 
-## 9. Obsidian graph isolation
+ProjectGuard alarms handle prompt retry. A technical failure keeps the canonical business result intact; after repeated alarm failures the object schedules a deferred retry. Permanent destination conflicts fail closed and leave the last materialization head unchanged.
 
-A single Vault is retained, but each project is treated as a separate logical graph.
+## 10. Archive behavior
 
-Every generated project note contains stable frontmatter including:
+Archive business state can commit before human workspace movement.
 
-```yaml
----
-project_id: PRJ-0002
-project_slug: project-os
-project_name: Project OS
-note_id: RES-CODE0001
-note_type: research
-canonical: true
-revision: 19
----
-```
+The projection engine then:
 
-For the Project OS project, use this graph filter:
+- renders required archived-state views;
+- moves active workspace to `ARCHIVE` when required;
+- verifies critical files at archive destination;
+- writes completed generation with `workspace_location=archive`;
+- advances head.
+
+If both active and archive roots are conflicting realities, do not delete or merge them automatically. Projection remains blocked for diagnosis while the canonical archived business state stays valid.
+
+## 11. Obsidian and graph isolation
+
+A single human Vault can be retained at `PROJECT_OS/WORKSPACE`.
+
+For Project OS itself, a project-scoped graph filter is:
 
 ```text
 path:"PROJECTS/PRJ-0002-project-os"
 ```
 
-For another project, substitute its exact project directory.
+Entity links remain folder-qualified where needed. Matching titles/names across projects do not create implicit cross-project relationships.
 
-The unfiltered Vault graph is intentionally the Portfolio graph. It is not the working graph for an individual project.
+Under incremental projection, a non-critical note can legitimately retain an older `revision` frontmatter when its semantic content was carried forward unchanged. Do not use arbitrary note frontmatter as the authoritative current project revision. Use canonical state and materialization head.
 
-Generated links between project entities are path-qualified, for example:
+## 12. Pre-merge verification
 
-```text
-[[DECISIONS/DEC-ARCH0001|Canonical architecture]]
-```
-
-Project OS must not generate cross-project links merely because two projects contain the same title, technology, client name, or alias. Intentional cross-project relationships belong under:
-
-```text
-WORKSPACE/PORTFOLIO/RELATIONSHIPS/
-```
-
-## 10. Shadow rollout procedure
-
-Before changing production from legacy to shadow:
+Before a production merge:
 
 ```bash
 npm install
@@ -300,94 +260,92 @@ npm run check
 npx wrangler deploy --dry-run
 ```
 
-Then:
+Requirements:
 
-1. merge the reviewed feature branch to `main`;
-2. deploy production with `PROJECT_OS_LAYOUT_MODE=legacy` first;
-3. verify `GET /health`;
-4. verify an ordinary transaction still follows the legacy path and receipt gate;
-5. change only `PROJECT_OS_LAYOUT_MODE` to `shadow`;
-6. redeploy;
-7. verify health again;
-8. run `/v1/admin/workspace-v2/materialize` for `PRJ-0001` and `PRJ-0002`;
-9. compare V1 and V2 project IDs/revisions;
-10. confirm V2 research, deliverables, tasks, constraints and decisions are readable Markdown;
-11. inspect `WORKSPACE/` locally through Dropbox sync;
-12. open `WORKSPACE/` as a temporary/new Obsidian Vault and validate project graph filters;
-13. create one disposable/test project through the normal transaction flow in shadow mode;
-14. verify both legacy canonical output and V2 shadow output;
-15. run a clean-room recovery from a new chat/platform.
+- complete suite green on exact final PR head;
+- dry-run green on exact final PR head;
+- no production secret/config drift;
+- continuity still `stable`;
+- no user-facing command/version-selection change;
+- no direct PC/filesystem dependency introduced.
 
-Do not cut over to `v2` if any discrepancy exists.
+## 13. Exact-commit production deployment validation
 
-## 11. V2 cutover procedure
+After merge, record the exact merge commit SHA.
 
-Only after the shadow checklist is clean:
+The deployment workflow on `main` must succeed for that exact SHA with all of these steps green:
 
-1. ensure legacy data remains intact;
-2. set `PROJECT_OS_LAYOUT_MODE=v2`;
-3. deploy;
-4. confirm health;
-5. submit a controlled test transaction;
-6. verify the incoming source and terminal transaction artifact are under `.project-os/transactions/`;
-7. verify its receipt is under `.project-os/receipts/`;
-8. verify human Markdown is updated only under `WORKSPACE/`;
-9. verify the registry is under `.project-os/registry/`;
-10. point the normal Obsidian Vault at `PROJECT_OS/WORKSPACE`;
-11. verify project-specific graph isolation;
-12. run the clean-room portability test again.
+- checkout;
+- required credentials check;
+- Node setup;
+- dependency install;
+- `npm run check`;
+- Worker deploy;
+- production health check;
+- deployment-status publication.
 
-V1 directories remain untouched during this stage.
+Do not declare the package production-complete from PR CI alone.
 
-## 12. Rollback
+## 14. `IMP-MATERIAL001` production-safe proof
 
-Until explicit legacy cleanup approval, the rollback path is:
+Production validation for the projection engine must prove all of the following without direct edits to machine-managed state:
 
-```text
-v2 → deploy previous known-good Worker/code if needed → PROJECT_OS_LAYOUT_MODE=legacy
-```
+### A. Canonical revision can lead materialization head
 
-For a shadow issue, simply return to:
+Submit a normal controlled typed transaction and verify its committed business revision exists before/independently of completed human projection.
 
-```text
-PROJECT_OS_LAYOUT_MODE=legacy
-```
+Observe briefly that canonical revision may be newer than materialization head, then verify the alarm/reconciliation path converges automatically to the same target revision.
 
-because V1 remained authoritative throughout shadow mode.
+### B. Carry-forward avoids an upload
 
-Do not delete V1 `SYSTEM`, `PROJECTS`, `TRANSACTIONS`, `RECEIPTS`, or per-project `.system` history as part of initial rollout.
+Use a transaction whose semantic scope does not affect at least one non-critical global view (for example a task-only change that leaves `BRIEF.md` input unchanged).
 
-Legacy cleanup is a separate destructive operation and requires explicit user approval after successful clean-room validation.
+Inspect the resulting completed delta record. The unchanged view must remain part of the logical output set while being absent from the changed delta evidence, proving it was carried forward rather than uploaded by the changed-output writer.
 
-## 13. Validation requirements
+Deterministic CI additionally asserts exact Dropbox upload paths.
 
-The following must remain true throughout migration:
+### C. `STATE.md` and `HANDOFF.md` are one completed generation
 
-- `PRJ-0001` and `PRJ-0002` IDs do not change;
-- pure materialization does not increment business revision;
-- immutable events are never silently overwritten with different content;
-- receipts are written last;
-- no machine event, receipt, transaction, registry JSON or state JSON is stored under `WORKSPACE/`;
-- no human generated project Markdown is stored under `.project-os/`;
-- no secret value appears in source or Markdown;
-- duplicate transaction replay remains idempotent;
-- project allocation remains globally unique;
-- stale direction-changing mutations still conflict;
-- scheduled recovery still retries unprocessed incoming transactions;
-- Durable Object declarative `exports` remain configured.
+Verify both generated files show the target canonical revision and the materialization head references a completed record for that same revision/projection version.
 
-## 14. Production cleanup
+### D. Exact replay is idempotent
 
-There is intentionally no automatic cleanup in the V2 feature.
+Replay the same controlled transaction ID. The business revision must not increment and the original committed receipt must be returned.
 
-Only after all of these are true:
+### E. Continuity remains stable
 
-- V2 has operated successfully in production;
-- clean-room recovery succeeds from another session/platform;
-- Obsidian navigation and project graph isolation are validated;
-- canonical project state and event history have been compared;
-- rollback is no longer required;
+Verify production continuity status/config still resolves to `stable`.
 
-may a separate cleanup plan be proposed.
+## 15. Recovery validation
 
-That cleanup must receive explicit approval before any legacy Dropbox directory is deleted or archived.
+Recovery scenarios to keep tested/documented:
+
+- local ProjectGuard SQLite lost → recover from canonical snapshots/commit records;
+- materialization SQLite lost → rebuild projection baseline from external completed-generation evidence;
+- output upload interrupted → resume missing/uncertain output only;
+- completed-generation record exists but head update failed → repair head with zero workspace rewrite;
+- four fast canonical revisions → coalesce human projection safely while preserving every commit record;
+- archived projection retry → never resurrect active workspace.
+
+## 16. Legacy/shadow notes
+
+Historical `legacy` and `shadow` modes remain documented compatibility concepts. Production currently runs V2.
+
+Do not perform legacy directory cleanup as part of `IMP-MATERIAL001`. Deleting or archiving legacy Dropbox history is a separate destructive operation requiring explicit approval.
+
+Likewise, alternate persistence providers are not introduced here. Dropbox remains the production provider until the later persistence-provider package is separately designed and approved.
+
+## 17. Production completion gate
+
+`IMP-MATERIAL001` is complete only after:
+
+- exact final PR head CI succeeds;
+- exact final PR head Wrangler dry-run succeeds;
+- exact merge commit deploy succeeds;
+- production health succeeds;
+- continuity remains `stable`;
+- canonical/head convergence is proven;
+- carry-forward is proven;
+- critical STATE/HANDOFF coherence is proven;
+- replay idempotency is proven;
+- canonical PRJ-0002 research evidence and task closure are recorded through normal receipt-gated transactions.

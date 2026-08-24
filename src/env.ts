@@ -5,4 +5,5 @@ export type Env = Omit<Cloudflare.Env, "PROJECT_OS_LAYOUT_MODE" | "PROJECT_OS_CO
   INGRESS_TOKEN: string;
   PROJECT_OS_LAYOUT_MODE?: "legacy" | "shadow" | "v2";
   PROJECT_OS_CONTINUITY_MODE?: "stable" | "automatic" | "rollback";
+  PROJECT_OS_PROJECTION_CONCURRENCY?: string;
 };

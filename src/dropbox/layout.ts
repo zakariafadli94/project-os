@@ -109,6 +109,28 @@ export function machineCommitRecordPath(projectId: string, revision: number): st
   return `${machineProjectRoot(projectId)}/commits/REV-${revision.toString().padStart(6, "0")}.json`;
 }
 
+export function machineMaterializationRoot(projectId: string): string {
+  return `${machineProjectRoot(projectId)}/materializations`;
+}
+
+export function machineMaterializationRecordPath(
+  projectId: string,
+  targetRevision: number,
+  projectionVersion: number
+): string {
+  if (!Number.isSafeInteger(targetRevision) || targetRevision < 0) {
+    throw new Error(`Invalid materialization revision: ${targetRevision}`);
+  }
+  if (!Number.isSafeInteger(projectionVersion) || projectionVersion < 1) {
+    throw new Error(`Invalid projection version: ${projectionVersion}`);
+  }
+  return `${machineMaterializationRoot(projectId)}/REV-${targetRevision.toString().padStart(6, "0")}-PV-${projectionVersion.toString().padStart(4, "0")}.json`;
+}
+
+export function machineMaterializationHeadPath(projectId: string): string {
+  return `${machineProjectRoot(projectId)}/materialization-head.json`;
+}
+
 export function machineTransactionPath(status: MachineTransactionStatus, transactionId: string): string {
   return `${MACHINE_ROOT}/transactions/${status}/${assertSafeTransactionId(transactionId)}.json`;
 }
@@ -158,6 +180,9 @@ export const v2Paths = {
   machineManifestPath,
   machineEventPath,
   machineCommitRecordPath,
+  machineMaterializationRoot,
+  machineMaterializationRecordPath,
+  machineMaterializationHeadPath,
   machineTransactionPath,
   machineReceiptPath,
   machineArtifactRequestPath,

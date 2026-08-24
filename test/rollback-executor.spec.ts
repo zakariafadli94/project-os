@@ -1,0 +1,148 @@
+import { describe, expect, it, vi } from "vitest";
+import type { Receipt } from "../src/domain/receipt";
+import type { Transaction } from "../src/domain/transaction";
+import { executeWithRollback } from "../src/continuity/rollback";
+
+const tx: Transaction = {
+  schema_version: "1.0",
+  transaction_id: "TXN-ROLLBACK-EXECUTOR-0001",
+  project_id: "PRJ-2001",
+  base_revision: 1,
+  operation: "task.create",
+  created_at: "2026-08-24T02:00:00+01:00",
+  payload: { task_id: "TASK-ROLLBACK2001", title: "Rollback executor proof" }
+};
+
+function receipt(status: Receipt["status"]): Receipt {
+  return {
+    schema_version: "1.0",
+    transaction_id: tx.transaction_id,
+    project_id: tx.project_id,
+    status,
+    previous_revision: 1,
+    new_revision: status === "committed" ? 2 : 1,
+    ...(status === "committed" ? { event_id: "EVT-000002", committed_at: tx.created_at } : {})
+  };
+}
+
+describe("continuity rollback executor", () => {
+  it("runs stable directly when stable is selected", async () => {
+    const stable = vi.fn(async (_transaction: Transaction) => receipt("committed"));
+    const candidate = vi.fn(async (_transaction: Transaction) => receipt("committed"));
+
+    const execution = await executeWithRollback({ selectedPath: "stable", transaction: tx, stable, candidate });
+
+    expect(execution).toMatchObject({
+      receipt: receipt("committed"),
+      selected_path: "stable",
+      final_path: "stable",
+      fallback_occurred: false
+    });
+    expect(stable).toHaveBeenCalledTimes(1);
+    expect(candidate).not.toHaveBeenCalled();
+  });
+
+  it("accepts the allocated project ID returned by a stable project.create execution", async () => {
+    const createTx: Transaction = {
+      schema_version: "1.0",
+      transaction_id: "TXN-ROLLBACK-EXECUTOR-CREATE-0001",
+      project_id: "PRJ-AUTO",
+      base_revision: 0,
+      operation: "project.create",
+      created_at: "2026-08-24T02:01:00+01:00",
+      payload: {
+        name: "Allocated rollback project",
+        slug: "allocated-rollback-project",
+        aliases: [],
+        objective: "Prove PRJ-AUTO receipt binding"
+      }
+    };
+    const allocated: Receipt = {
+      schema_version: "1.0",
+      transaction_id: createTx.transaction_id,
+      project_id: "PRJ-2077",
+      status: "committed",
+      previous_revision: 0,
+      new_revision: 1,
+      event_id: "EVT-000001",
+      committed_at: createTx.created_at
+    };
+    const stable = vi.fn(async (_transaction: Transaction) => allocated);
+
+    const execution = await executeWithRollback({ selectedPath: "stable", transaction: createTx, stable });
+
+    expect(execution.receipt).toEqual(allocated);
+    expect(execution.fallback_occurred).toBe(false);
+  });
+
+  for (const status of ["committed", "rejected", "conflict"] as const) {
+    it(`returns candidate ${status} business result without stable fallback`, async () => {
+      const stable = vi.fn(async (_transaction: Transaction) => receipt("committed"));
+      const candidate = vi.fn(async (_transaction: Transaction) => receipt(status));
+
+      const execution = await executeWithRollback({ selectedPath: "candidate", transaction: tx, stable, candidate });
+
+      expect(execution).toMatchObject({
+        receipt: receipt(status),
+        selected_path: "candidate",
+        final_path: "candidate",
+        fallback_occurred: false
+      });
+      expect(candidate).toHaveBeenCalledTimes(1);
+      expect(stable).not.toHaveBeenCalled();
+    });
+  }
+
+  it("falls back once to stable on candidate technical failure with the exact transaction object", async () => {
+    let stableTransaction: Transaction | undefined;
+    let candidateTransaction: Transaction | undefined;
+    const stable = vi.fn(async (transaction: Transaction) => {
+      stableTransaction = transaction;
+      return receipt("committed");
+    });
+    const candidate = vi.fn(async (transaction: Transaction) => {
+      candidateTransaction = transaction;
+      throw new Error("candidate unavailable");
+    });
+
+    const execution = await executeWithRollback({ selectedPath: "candidate", transaction: tx, stable, candidate });
+
+    expect(execution).toMatchObject({
+      receipt: receipt("committed"),
+      selected_path: "candidate",
+      final_path: "stable",
+      fallback_occurred: true,
+      candidate_failure: "technical"
+    });
+    expect(candidate).toHaveBeenCalledTimes(1);
+    expect(stable).toHaveBeenCalledTimes(1);
+    expect(candidateTransaction).toBe(tx);
+    expect(stableTransaction).toBe(tx);
+  });
+
+  it("treats a malformed candidate response as technical rollback input", async () => {
+    const stable = vi.fn(async (_transaction: Transaction) => receipt("committed"));
+    const candidate = vi.fn(async (_transaction: Transaction) => ({ status: "committed" }));
+
+    const execution = await executeWithRollback({ selectedPath: "candidate", transaction: tx, stable, candidate });
+
+    expect(execution).toMatchObject({
+      final_path: "stable",
+      fallback_occurred: true,
+      candidate_failure: "malformed_result"
+    });
+    expect(stable).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces stable technical failure and never recurses through candidate", async () => {
+    const stable = vi.fn(async (_transaction: Transaction) => {
+      throw new Error("stable transport failure");
+    });
+    const candidate = vi.fn(async (_transaction: Transaction) => receipt("committed"));
+
+    await expect(executeWithRollback({ selectedPath: "stable", transaction: tx, stable, candidate }))
+      .rejects.toThrow("stable transport failure");
+    expect(stable).toHaveBeenCalledTimes(1);
+    expect(candidate).not.toHaveBeenCalled();
+  });
+});

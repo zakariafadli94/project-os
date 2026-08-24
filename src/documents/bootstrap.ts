@@ -4,6 +4,7 @@ import {
   externalVersionIdFor,
   type DocumentVersionRecord,
   type ManagedDocumentHead,
+  type ManagedDocumentKind,
   type ManagedProviderObservation
 } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
@@ -40,18 +41,20 @@ export class ManagedDocumentBootstrapper {
     }
 
     const parsed = parseVisiblePath(state, visiblePath, inferredStage);
+    const kind: ManagedDocumentKind = inferredStage === "reference" ? "reference" : "work_product";
     const documentId = inferredStage === "reference"
       ? await documentIdForProviderFile(state.project_id, metadata.id)
       : await documentIdFor(state.project_id, parsed.logicalPath);
     const existingHead = await this.ledger.readHead(state.project_id, documentId);
+
     if (existingHead) {
-      const versionId = pointerFor(existingHead, inferredStage);
-      if (!versionId) {
-        throw new Error(`Existing managed document head does not match bootstrap stage ${inferredStage}: ${documentId}`);
+      assertCompatibleHead(existingHead, kind, parsed.logicalPath);
+      const existingVersionId = pointerFor(existingHead, inferredStage);
+      if (existingVersionId) {
+        const version = await this.ledger.readVersion(state.project_id, documentId, existingVersionId);
+        if (!version) throw new Error(`Existing managed document head points to missing version: ${documentId}/${existingVersionId}`);
+        return { adopted: false, head: existingHead, version };
       }
-      const version = await this.ledger.readVersion(state.project_id, documentId, versionId);
-      if (!version) throw new Error(`Existing managed document head points to missing version: ${documentId}/${versionId}`);
-      return { adopted: false, head: existingHead, version };
     }
 
     const versionId = await externalVersionIdFor(metadata.rev);
@@ -64,12 +67,13 @@ export class ManagedDocumentBootstrapper {
       metadata
     );
 
-    const kind = inferredStage === "reference" ? "reference" : "work_product";
+    const parentVersionId = parentForBootstrap(existingHead, inferredStage);
     const version: DocumentVersionRecord = {
       schema_version: "1.0",
       project_id: state.project_id,
       document_id: documentId,
       version_id: versionId,
+      ...(parentVersionId ? { parent_version_id: parentVersionId } : {}),
       kind,
       stage: inferredStage,
       logical_path: parsed.logicalPath,
@@ -85,29 +89,16 @@ export class ManagedDocumentBootstrapper {
     await this.ledger.writeVersion(version);
 
     const provider = observation(visiblePath, metadata);
-    const head: ManagedDocumentHead = inferredStage === "reference"
-      ? {
-          schema_version: "1.0",
-          project_id: state.project_id,
-          document_id: documentId,
-          kind: "reference",
-          logical_path: parsed.logicalPath,
-          collection_path: parsed.collectionPath ?? "UNCLASSIFIED",
-          reference_version_id: versionId,
-          provider: { reference: provider },
-          reconciliation_status: "clean"
-        }
-      : {
-          schema_version: "1.0",
-          project_id: state.project_id,
-          document_id: documentId,
-          kind: "work_product",
-          logical_path: parsed.logicalPath,
-          ...(inferredStage === "working" ? { working_version_id: versionId, provider: { working: provider } } : {}),
-          ...(inferredStage === "review" ? { review_version_id: versionId, provider: { review: provider } } : {}),
-          ...(inferredStage === "published" ? { published_version_id: versionId, provider: { published: provider } } : {}),
-          reconciliation_status: "clean"
-        };
+    const head = mergeHead(existingHead, {
+      projectId: state.project_id,
+      documentId,
+      kind,
+      logicalPath: parsed.logicalPath,
+      collectionPath: parsed.collectionPath,
+      stage: inferredStage,
+      versionId,
+      provider
+    });
     await this.ledger.writeHead(head);
 
     if (inferredStage === "reference") {
@@ -127,6 +118,75 @@ export class ManagedDocumentBootstrapper {
     }
 
     return { adopted: true, head, version };
+  }
+}
+
+function mergeHead(
+  existing: ManagedDocumentHead | null,
+  input: {
+    projectId: string;
+    documentId: string;
+    kind: ManagedDocumentKind;
+    logicalPath: string;
+    collectionPath?: string;
+    stage: BootstrapManagedStage;
+    versionId: string;
+    provider: ManagedProviderObservation;
+  }
+): ManagedDocumentHead {
+  if (input.kind === "reference") {
+    return {
+      ...(existing ?? {
+        schema_version: "1.0" as const,
+        project_id: input.projectId,
+        document_id: input.documentId,
+        kind: "reference" as const,
+        logical_path: input.logicalPath,
+        reconciliation_status: "clean" as const
+      }),
+      collection_path: input.collectionPath ?? existing?.collection_path ?? "UNCLASSIFIED",
+      reference_version_id: input.versionId,
+      provider: { ...(existing?.provider ?? {}), reference: input.provider },
+      reconciliation_status: "clean"
+    };
+  }
+
+  const base: ManagedDocumentHead = existing ?? {
+    schema_version: "1.0",
+    project_id: input.projectId,
+    document_id: input.documentId,
+    kind: "work_product",
+    logical_path: input.logicalPath,
+    reconciliation_status: "clean"
+  };
+  const provider = { ...(base.provider ?? {}) };
+  if (input.stage === "working") provider.working = input.provider;
+  if (input.stage === "review") provider.review = input.provider;
+  if (input.stage === "published") provider.published = input.provider;
+
+  return {
+    ...base,
+    ...(input.stage === "working" ? { working_version_id: input.versionId } : {}),
+    ...(input.stage === "review" ? { review_version_id: input.versionId } : {}),
+    ...(input.stage === "published" ? { published_version_id: input.versionId } : {}),
+    provider,
+    reconciliation_status: "clean"
+  };
+}
+
+function parentForBootstrap(head: ManagedDocumentHead | null, stage: BootstrapManagedStage): string | undefined {
+  if (!head || stage === "reference") return undefined;
+  if (stage === "working") return head.published_version_id;
+  if (stage === "review") return head.working_version_id ?? head.published_version_id;
+  return head.review_version_id ?? head.working_version_id;
+}
+
+function assertCompatibleHead(head: ManagedDocumentHead, kind: ManagedDocumentKind, logicalPath: string): void {
+  if (head.kind !== kind) {
+    throw new Error(`Managed document bootstrap kind mismatch for ${head.document_id}: ${head.kind} != ${kind}`);
+  }
+  if (head.logical_path !== logicalPath) {
+    throw new Error(`Managed document bootstrap logical path mismatch for ${head.document_id}`);
   }
 }
 

@@ -14,7 +14,7 @@ import {
   workspaceProjectRoot
 } from "../dropbox/layout";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
-import { DocumentLedgerRepository } from "./repository";
+import { DocumentLedgerRepository, type ReferenceFingerprintRecord } from "./repository";
 
 export interface ManagedDocumentReconcileSummary {
   scanned: number;
@@ -192,7 +192,7 @@ export class ManagedDocumentReconciler {
     if (existing) return "ignored";
 
     const fingerprint = await this.ledger.readReferenceFingerprint(state.project_id, metadata.content_hash);
-    if (fingerprint) {
+    if (fingerprint && await this.isCurrentReferenceFingerprint(state.project_id, metadata.content_hash, fingerprint)) {
       if (!this.transport.delete) throw new Error("Dropbox transport does not support duplicate input cleanup");
       await this.transport.delete(inputPath);
       return "duplicate";
@@ -255,6 +255,17 @@ export class ManagedDocumentReconciler {
       version_id: versionId
     });
     return "ingested";
+  }
+
+  private async isCurrentReferenceFingerprint(
+    projectId: string,
+    contentHash: string,
+    fingerprint: ReferenceFingerprintRecord
+  ): Promise<boolean> {
+    const head = await this.ledger.readHead(projectId, fingerprint.document_id);
+    if (!head || head.kind !== "reference" || head.reference_version_id !== fingerprint.version_id) return false;
+    const version = await this.ledger.readVersion(projectId, fingerprint.document_id, fingerprint.version_id);
+    return !!version && version.kind === "reference" && version.provider_content_hash === contentHash;
   }
 
   private async reconcilePublishedEdit(

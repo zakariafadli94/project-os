@@ -41,6 +41,7 @@ const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
   "project.complete",
   "project.archive"
 ]);
+const MATERIALIZATION_ALARM_DELAY_MS = 1_000;
 
 export class ProjectGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
@@ -267,7 +268,7 @@ export class ProjectGuard extends DurableObject<Env> {
     return this.serialize(async () => {
       try {
         const result = await this.materializationCoordinator!.runNext();
-        if (result.more_work) await this.ctx.storage.setAlarm(Date.now());
+        if (result.more_work) await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
       } catch (error) {
         if (error instanceof MaterializationOutputConflictError) {
           console.error("Project OS materialization blocked", structuredMaterializationError(this.ctx.id.name, error));
@@ -452,7 +453,7 @@ export class ProjectGuard extends DurableObject<Env> {
     const status = this.materializationCoordinator.status();
     if (!status.active && !status.requested) return;
     const existing = await this.ctx.storage.getAlarm();
-    if (existing === null) await this.ctx.storage.setAlarm(Date.now());
+    if (existing === null) await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
   }
 
   private materializationStatus(state: ProjectState) {

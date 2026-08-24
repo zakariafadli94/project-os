@@ -1,3 +1,4 @@
+import { assertManagedRelativePath, type ManagedDocumentZone } from "../domain/managed-document";
 import {
   PROJECT_OS_ROOT,
   assertSafeEventId,
@@ -41,6 +42,14 @@ export type WorkspaceEntityFolder =
 export type MachineTransactionStatus = "incoming" | "committed" | "rejected" | "conflicts";
 export type MachineArtifactStatus = "incoming" | "committed" | "rejected" | "conflicts";
 
+const MANAGED_ZONE_FOLDERS: Record<ManagedDocumentZone, string> = {
+  inputs: "INPUTS",
+  references: "REFERENCES",
+  working: "WORKING",
+  review: "REVIEW",
+  deliverables: "DELIVERABLES"
+};
+
 export function workspaceProjectRoot(projectId: string, slug: string): string {
   return `${WORKSPACE_ROOT}/PROJECTS/${assertSafeProjectId(projectId)}-${assertSafeSlug(slug)}`;
 }
@@ -52,6 +61,21 @@ export function archiveProjectRoot(projectId: string, slug: string): string {
 export function workspaceArtifactPath(projectId: string, slug: string, relativePath: string): string {
   const normalized = assertSafeArtifactRelativePath(relativePath);
   return `${workspaceProjectRoot(projectId, slug)}/ARTIFACTS/${normalized}`;
+}
+
+export function workspaceManagedZoneRoot(projectId: string, slug: string, zone: ManagedDocumentZone): string {
+  const folder = MANAGED_ZONE_FOLDERS[zone];
+  if (!folder) throw new Error(`Unsupported managed document zone: ${String(zone)}`);
+  return `${workspaceProjectRoot(projectId, slug)}/${folder}`;
+}
+
+export function workspaceManagedDocumentPath(
+  projectId: string,
+  slug: string,
+  zone: ManagedDocumentZone,
+  relativePath: string
+): string {
+  return `${workspaceManagedZoneRoot(projectId, slug, zone)}/${assertManagedRelativePath(relativePath)}`;
 }
 
 export function workspaceProjectFile(
@@ -131,6 +155,26 @@ export function machineMaterializationHeadPath(projectId: string): string {
   return `${machineProjectRoot(projectId)}/materialization-head.json`;
 }
 
+export function machineDocumentRoot(projectId: string): string {
+  return `${machineProjectRoot(projectId)}/documents`;
+}
+
+export function machineDocumentHeadPath(projectId: string, documentId: string): string {
+  return `${machineDocumentRoot(projectId)}/heads/${assertSafeDocumentId(documentId)}.json`;
+}
+
+export function machineDocumentVersionPath(projectId: string, documentId: string, versionId: string): string {
+  return `${machineDocumentRoot(projectId)}/versions/${assertSafeDocumentId(documentId)}/${assertSafeDocumentVersionId(versionId)}.json`;
+}
+
+export function machineDocumentTextPayloadPath(projectId: string, sha256: string): string {
+  return `${machineDocumentRoot(projectId)}/payloads/sha256/${assertSafeSha256(sha256)}`;
+}
+
+export function machineDocumentProviderPayloadPath(projectId: string, documentId: string, versionId: string): string {
+  return `${machineDocumentRoot(projectId)}/payloads/provider/${assertSafeDocumentId(documentId)}/${assertSafeDocumentVersionId(versionId)}/payload`;
+}
+
 export function machineTransactionPath(status: MachineTransactionStatus, transactionId: string): string {
   return `${MACHINE_ROOT}/transactions/${status}/${assertSafeTransactionId(transactionId)}.json`;
 }
@@ -171,6 +215,8 @@ export const v2Paths = {
   workspaceProjectRoot,
   archiveProjectRoot,
   workspaceArtifactPath,
+  workspaceManagedZoneRoot,
+  workspaceManagedDocumentPath,
   workspaceProjectFile,
   workspaceEntityPath,
   workspacePortfolioRoot,
@@ -183,6 +229,11 @@ export const v2Paths = {
   machineMaterializationRoot,
   machineMaterializationRecordPath,
   machineMaterializationHeadPath,
+  machineDocumentRoot,
+  machineDocumentHeadPath,
+  machineDocumentVersionPath,
+  machineDocumentTextPayloadPath,
+  machineDocumentProviderPayloadPath,
   machineTransactionPath,
   machineReceiptPath,
   machineArtifactRequestPath,
@@ -209,5 +260,20 @@ function assertSafeArtifactRequestId(value: string): string {
   if (!/^ART-[A-Z0-9-]{10,}$/.test(value)) {
     throw new Error(`Unsafe artifact request id: ${value}`);
   }
+  return value;
+}
+
+function assertSafeDocumentId(value: string): string {
+  if (!/^DOC-[A-F0-9]{24}$/.test(value)) throw new Error(`Unsafe document id: ${value}`);
+  return value;
+}
+
+function assertSafeDocumentVersionId(value: string): string {
+  if (!/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/.test(value)) throw new Error(`Unsafe document version id: ${value}`);
+  return value;
+}
+
+function assertSafeSha256(value: string): string {
+  if (!/^[a-f0-9]{64}$/.test(value)) throw new Error(`Unsafe SHA-256: ${value}`);
   return value;
 }

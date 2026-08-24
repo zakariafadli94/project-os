@@ -41,6 +41,37 @@ describe("managed document domain", () => {
     expect(head.working_version_id).not.toBe(head.published_version_id);
   });
 
+  it("keeps repairable provider observations separate from immutable version pointers", () => {
+    const head = parseManagedDocumentHead({
+      schema_version: "1.0",
+      project_id: "PRJ-0002",
+      document_id: "DOC-0123456789ABCDEF01234567",
+      kind: "work_product",
+      logical_path: "strategy/commercial.md",
+      working_version_id: "VER-EXT-111111111111111111111111",
+      published_version_id: "VER-REQ-222222222222222222222222",
+      provider: {
+        working: {
+          path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/WORKING/strategy/commercial.md",
+          file_id: "id:working",
+          rev: "rev-working",
+          content_hash: "a".repeat(64),
+          size: 100
+        },
+        published: {
+          path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/strategy/commercial.md",
+          file_id: "id:published",
+          rev: "rev-restored-new",
+          content_hash: "b".repeat(64),
+          size: 90
+        }
+      },
+      reconciliation_status: "clean"
+    });
+
+    expect(head.provider?.published?.rev).toBe("rev-restored-new");
+  });
+
   it("accepts immutable binary-friendly version metadata without requiring text content", () => {
     const record = parseDocumentVersionRecord({
       schema_version: "1.0",

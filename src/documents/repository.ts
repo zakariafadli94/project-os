@@ -1,4 +1,5 @@
 import {
+  documentIdForProviderFile,
   parseDocumentVersionRecord,
   parseManagedDocumentHead,
   type DocumentVersionRecord,
@@ -25,6 +26,13 @@ export interface ReferenceFingerprintRecord {
   provider_content_hash: string;
   document_id: string;
   version_id: string;
+}
+
+export interface ProviderFileBindingRecord {
+  schema_version: "1.0";
+  project_id: string;
+  provider_file_id: string;
+  document_id: string;
 }
 
 export class DocumentLedgerRepository {
@@ -94,6 +102,46 @@ export class DocumentLedgerRepository {
       pretty(validated),
       "overwrite"
     );
+  }
+
+  async readProviderFileBinding(projectId: string, providerFileId: string): Promise<ProviderFileBindingRecord | null> {
+    const path = await providerFileBindingPath(projectId, providerFileId);
+    const raw = await this.transport.download(path);
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as Partial<ProviderFileBindingRecord>;
+    if (
+      parsed.schema_version !== "1.0"
+      || parsed.project_id !== projectId
+      || parsed.provider_file_id !== providerFileId
+      || typeof parsed.document_id !== "string"
+      || !/^DOC-[A-F0-9]{24}$/.test(parsed.document_id)
+    ) {
+      throw new Error(`Invalid provider-file document binding for ${projectId}/${providerFileId}`);
+    }
+    return parsed as ProviderFileBindingRecord;
+  }
+
+  async writeProviderFileBinding(record: ProviderFileBindingRecord): Promise<void> {
+    if (
+      record.schema_version !== "1.0"
+      || !record.provider_file_id
+      || !/^DOC-[A-F0-9]{24}$/.test(record.document_id)
+    ) {
+      throw new Error("Invalid provider-file document binding");
+    }
+    const head = await this.readHead(record.project_id, record.document_id);
+    if (!head) throw new Error(`Provider-file binding references missing managed document head: ${record.document_id}`);
+    const path = await providerFileBindingPath(record.project_id, record.provider_file_id);
+    const content = pretty(record);
+    try {
+      await this.transport.upload(path, content, "add");
+    } catch (error) {
+      if (!(error instanceof DropboxConflictError)) throw error;
+      const existing = await this.transport.download(path);
+      if (existing !== content) {
+        throw new Error(`Provider file id is already bound to a different managed document: ${record.provider_file_id}`);
+      }
+    }
   }
 
   async readReferenceFingerprint(projectId: string, providerContentHash: string): Promise<ReferenceFingerprintRecord | null> {
@@ -245,6 +293,11 @@ export class DocumentLedgerRepository {
 
 function referenceFingerprintPath(projectId: string, providerContentHash: string): string {
   return `${machineDocumentRoot(projectId)}/reference-fingerprints/${assertProviderContentHash(providerContentHash)}.json`;
+}
+
+async function providerFileBindingPath(projectId: string, providerFileId: string): Promise<string> {
+  const key = await documentIdForProviderFile(projectId, providerFileId);
+  return `${machineDocumentRoot(projectId)}/provider-file-bindings/${key}.json`;
 }
 
 function assertProviderContentHash(value: string): string {

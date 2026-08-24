@@ -19,6 +19,14 @@ import {
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
 import { sha256Text } from "./hash";
 
+export interface ReferenceFingerprintRecord {
+  schema_version: "1.0";
+  project_id: string;
+  provider_content_hash: string;
+  document_id: string;
+  version_id: string;
+}
+
 export class DocumentLedgerRepository {
   private readonly transport: DropboxTransport;
 
@@ -86,6 +94,53 @@ export class DocumentLedgerRepository {
       pretty(validated),
       "overwrite"
     );
+  }
+
+  async readReferenceFingerprint(projectId: string, providerContentHash: string): Promise<ReferenceFingerprintRecord | null> {
+    const hash = assertProviderContentHash(providerContentHash);
+    const raw = await this.transport.download(referenceFingerprintPath(projectId, hash));
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as Partial<ReferenceFingerprintRecord>;
+    if (
+      parsed.schema_version !== "1.0"
+      || parsed.project_id !== projectId
+      || parsed.provider_content_hash !== hash
+      || typeof parsed.document_id !== "string"
+      || !/^DOC-[A-F0-9]{24}$/.test(parsed.document_id)
+      || typeof parsed.version_id !== "string"
+      || !/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/.test(parsed.version_id)
+    ) {
+      throw new Error(`Invalid reference fingerprint record for ${projectId}/${hash}`);
+    }
+    return parsed as ReferenceFingerprintRecord;
+  }
+
+  async writeReferenceFingerprint(record: ReferenceFingerprintRecord): Promise<ReferenceFingerprintRecord> {
+    const hash = assertProviderContentHash(record.provider_content_hash);
+    if (record.schema_version !== "1.0" || !/^DOC-[A-F0-9]{24}$/.test(record.document_id) || !/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/.test(record.version_id)) {
+      throw new Error("Invalid reference fingerprint record");
+    }
+    const version = await this.readVersion(record.project_id, record.document_id, record.version_id);
+    if (!version || version.kind !== "reference" || version.stage !== "reference" || version.provider_content_hash !== hash) {
+      throw new Error(`Reference fingerprint does not match a durable reference version: ${record.document_id}/${record.version_id}`);
+    }
+    const validated: ReferenceFingerprintRecord = {
+      schema_version: "1.0",
+      project_id: record.project_id,
+      provider_content_hash: hash,
+      document_id: record.document_id,
+      version_id: record.version_id
+    };
+    const path = referenceFingerprintPath(record.project_id, hash);
+    try {
+      await this.transport.upload(path, pretty(validated), "add");
+      return validated;
+    } catch (error) {
+      if (!(error instanceof DropboxConflictError)) throw error;
+      const existing = await this.readReferenceFingerprint(record.project_id, hash);
+      if (!existing) throw error;
+      return existing;
+    }
   }
 
   async storeTextPayload(projectId: string, expectedSha256: string, content: string): Promise<string> {
@@ -186,6 +241,15 @@ export class DocumentLedgerRepository {
     await this.writeHead(validated);
     return validated;
   }
+}
+
+function referenceFingerprintPath(projectId: string, providerContentHash: string): string {
+  return `${machineDocumentRoot(projectId)}/reference-fingerprints/${assertProviderContentHash(providerContentHash)}.json`;
+}
+
+function assertProviderContentHash(value: string): string {
+  if (!/^[a-f0-9]{64}$/.test(value)) throw new Error(`Unsafe provider content hash: ${value}`);
+  return value;
 }
 
 function pointerAcceptsStage(field: keyof ManagedDocumentHead, stage: DocumentVersionRecord["stage"]): boolean {

@@ -7,11 +7,11 @@ import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 
-describe("inbox recovery observability", () => {
+describe("scheduled maintenance observability", () => {
   beforeEach(() => installDropboxMock());
   afterEach(() => vi.restoreAllMocks());
 
-  it("logs scheduled inbox scan lifecycle with a structured summary", async () => {
+  it("logs inbox and materialization maintenance lifecycle with structured summaries", async () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const ctx = createExecutionContext();
 
@@ -23,7 +23,7 @@ describe("inbox recovery observability", () => {
     await waitOnExecutionContext(ctx);
 
     expect(info).toHaveBeenCalledWith(
-      "Project OS scheduled inbox scan started",
+      "Project OS scheduled maintenance started",
       expect.objectContaining({
         cron: "*/5 * * * *",
         mode: "v2",
@@ -31,8 +31,11 @@ describe("inbox recovery observability", () => {
       })
     );
     expect(info).toHaveBeenCalledWith(
-      "Project OS inbox scan completed",
-      expect.objectContaining({ scanned: 0, processed: 0, failed: 0 })
+      "Project OS scheduled maintenance completed",
+      expect.objectContaining({
+        inbox: expect.objectContaining({ scanned: 0, processed: 0, failed: 0 }),
+        materialization: expect.objectContaining({ scanned: 0, scheduled: 0, current: 0, failed: 0 })
+      })
     );
   });
 });

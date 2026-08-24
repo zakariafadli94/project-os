@@ -1,4 +1,11 @@
-import { DropboxApiError, DropboxConflictError, type DropboxEntry, type DropboxTransport } from "./client";
+import {
+  DropboxApiError,
+  DropboxConflictError,
+  type DropboxChangePage,
+  type DropboxEntry,
+  type DropboxFileMetadata,
+  type DropboxTransport
+} from "./client";
 import { isTransientDropboxFailure } from "./retry";
 
 export interface ResilientDropboxTransportOptions {
@@ -31,13 +38,34 @@ export class ResilientDropboxTransport implements DropboxTransport {
     return this.retry("upload", path, () => this.inner.upload(path, content, mode));
   }
 
+  uploadConditional(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata> {
+    if (!this.inner.uploadConditional) throw new Error("Dropbox transport does not support uploadConditional");
+    return this.retry("upload_conditional", path, () => this.inner.uploadConditional!(path, content, expectedRev));
+  }
+
   download(path: string): Promise<string | null> {
     return this.retry("download", path, () => this.inner.download(path));
+  }
+
+  getMetadata(path: string): Promise<DropboxFileMetadata | null> {
+    if (!this.inner.getMetadata) throw new Error("Dropbox transport does not support getMetadata");
+    return this.retry("get_metadata", path, () => this.inner.getMetadata!(path));
   }
 
   listFolder(path: string): Promise<DropboxEntry[]> {
     if (!this.inner.listFolder) throw new Error("Dropbox transport does not support listFolder");
     return this.retry("list_folder", path, () => this.inner.listFolder!(path));
+  }
+
+  listFolderChanges(root?: string, cursor?: string): Promise<DropboxChangePage> {
+    if (!this.inner.listFolderChanges) throw new Error("Dropbox transport does not support listFolderChanges");
+    const identity = root ?? `cursor:${cursor ?? "missing"}`;
+    return this.retry("list_folder_changes", identity, () => this.inner.listFolderChanges!(root, cursor));
+  }
+
+  copy(from: string, to: string): Promise<DropboxFileMetadata> {
+    if (!this.inner.copy) throw new Error("Dropbox transport does not support copy");
+    return this.retry("copy", `${from} -> ${to}`, () => this.inner.copy!(from, to));
   }
 
   move(from: string, to: string): Promise<void> {

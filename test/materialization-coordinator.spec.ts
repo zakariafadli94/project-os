@@ -295,7 +295,18 @@ describe("MaterializationCoordinator", () => {
   });
 
   it("starts a fresh snapshot when the previous chain depth reached 127", async () => {
-    const target = createFixture();
+    seq = 127;
+    const targetState = emptyProjectState("PRJ-3501", "Coordinator Fixture", "coordinator-fixture", "Test coordinator");
+    targetState.revision = 127;
+    targetState.last_event_id = "EVT-000127";
+    targetState.created_at = at;
+    targetState.updated_at = at;
+    const target = committed(targetState, "task.create", {
+      task_id: "TASK-SNAPSHOT3501",
+      title: "Force snapshot rollover"
+    });
+    expect(target.new_revision).toBe(128);
+
     const repo = new FakeRepository();
     repo.commits.set(target.new_revision, target);
     const seed: ProjectionOutputEvidence = {

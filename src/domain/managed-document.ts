@@ -25,6 +25,21 @@ const RESERVED_WORKSPACE_ROOTS = new Set([
   "WORKING"
 ]);
 
+export interface ManagedProviderObservation {
+  path: string;
+  file_id: string;
+  rev: string;
+  content_hash: string;
+  size: number;
+}
+
+export interface ManagedDocumentProviderState {
+  reference?: ManagedProviderObservation;
+  working?: ManagedProviderObservation;
+  review?: ManagedProviderObservation;
+  published?: ManagedProviderObservation;
+}
+
 export interface ManagedDocumentHead {
   schema_version: "1.0";
   project_id: string;
@@ -36,6 +51,7 @@ export interface ManagedDocumentHead {
   working_version_id?: string;
   review_version_id?: string;
   published_version_id?: string;
+  provider?: ManagedDocumentProviderState;
   reconciliation_status: "clean" | "conflict";
 }
 
@@ -60,6 +76,25 @@ export interface DocumentVersionRecord {
   request_id?: string;
 }
 
+const providerObservationSchema = z.strictObject({
+  path: z.string().min(1),
+  file_id: providerFileIdSchema,
+  rev: z.string().min(1).max(256),
+  content_hash: hashSchema,
+  size: z.number().int().nonnegative().safe()
+}).superRefine((value, ctx) => {
+  if (!value.path.startsWith("/") || hasUnsafeSegments(value.path)) {
+    ctx.addIssue({ code: "custom", path: ["path"], message: "provider path must be an absolute safe Dropbox path" });
+  }
+});
+
+const providerStateSchema = z.strictObject({
+  reference: providerObservationSchema.optional(),
+  working: providerObservationSchema.optional(),
+  review: providerObservationSchema.optional(),
+  published: providerObservationSchema.optional()
+});
+
 const headSchema = z.strictObject({
   schema_version: z.literal("1.0"),
   project_id: projectIdSchema,
@@ -71,6 +106,7 @@ const headSchema = z.strictObject({
   working_version_id: versionIdSchema.optional(),
   review_version_id: versionIdSchema.optional(),
   published_version_id: versionIdSchema.optional(),
+  provider: providerStateSchema.optional(),
   reconciliation_status: z.enum(["clean", "conflict"])
 }).superRefine((value, ctx) => {
   try {
@@ -91,8 +127,28 @@ const headSchema = z.strictObject({
     if (value.working_version_id || value.review_version_id || value.published_version_id) {
       ctx.addIssue({ code: "custom", message: "Reference document heads cannot carry work-product lifecycle pointers" });
     }
-  } else if (value.reference_version_id || value.collection_path) {
-    ctx.addIssue({ code: "custom", message: "Work-product document heads cannot carry reference-only fields" });
+    if (value.provider?.working || value.provider?.review || value.provider?.published) {
+      ctx.addIssue({ code: "custom", path: ["provider"], message: "Reference heads cannot carry work-product provider observations" });
+    }
+  } else {
+    if (value.reference_version_id || value.collection_path) {
+      ctx.addIssue({ code: "custom", message: "Work-product document heads cannot carry reference-only fields" });
+    }
+    if (value.provider?.reference) {
+      ctx.addIssue({ code: "custom", path: ["provider", "reference"], message: "Work-product heads cannot carry reference provider observations" });
+    }
+  }
+
+  const pointerProviderPairs = [
+    [value.reference_version_id, value.provider?.reference, "reference"],
+    [value.working_version_id, value.provider?.working, "working"],
+    [value.review_version_id, value.provider?.review, "review"],
+    [value.published_version_id, value.provider?.published, "published"]
+  ] as const;
+  for (const [pointer, observation, stage] of pointerProviderPairs) {
+    if (!pointer && observation) {
+      ctx.addIssue({ code: "custom", path: ["provider", stage], message: `Provider observation ${stage} requires its version pointer` });
+    }
   }
 });
 
@@ -158,6 +214,12 @@ export async function documentIdFor(projectId: string, logicalPath: string): Pro
   projectIdSchema.parse(projectId);
   const path = assertManagedRelativePath(logicalPath);
   return `DOC-${(await sha256Hex(`${projectId}\n${path}`)).slice(0, 24).toUpperCase()}`;
+}
+
+export async function documentIdForProviderFile(projectId: string, providerFileId: string): Promise<string> {
+  projectIdSchema.parse(projectId);
+  providerFileIdSchema.parse(providerFileId);
+  return `DOC-${(await sha256Hex(`${projectId}\n${providerFileId}`)).slice(0, 24).toUpperCase()}`;
 }
 
 export async function externalVersionIdFor(providerRev: string): Promise<string> {

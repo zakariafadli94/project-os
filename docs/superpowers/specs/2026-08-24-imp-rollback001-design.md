@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved design for implementation. Production continuity mode remains `stable` until the package is fully proven and production-validated.
+Design approved in chat; written specification awaiting final review before implementation planning. Production continuity mode remains `stable` until the package is fully proven and production-validated.
 
 ## Goal
 

@@ -32,7 +32,7 @@ export class ResilientDropboxTransport implements DropboxTransport {
   }
 
   download(path: string): Promise<string | null> {
-    return this.inner.download(path);
+    return this.retry("download", path, () => this.inner.download(path));
   }
 
   move(from: string, to: string): Promise<void> {
@@ -46,9 +46,9 @@ export class ResilientDropboxTransport implements DropboxTransport {
         let source: string | null;
         let destination: string | null;
         try {
-          source = await this.inner.download(from);
+          source = await this.download(from);
           if (source === null) return;
-          destination = await this.inner.download(to);
+          destination = await this.download(to);
         } catch {
           throw error;
         }
@@ -63,7 +63,7 @@ export class ResilientDropboxTransport implements DropboxTransport {
           await this.upload(to, source, "add");
         } catch (publishError) {
           if (!(publishError instanceof DropboxConflictError)) throw publishError;
-          const published = await this.inner.download(to);
+          const published = await this.download(to);
           if (published !== source) throw error;
         }
         await this.delete(from);
@@ -76,12 +76,11 @@ export class ResilientDropboxTransport implements DropboxTransport {
     return this.retry("delete", path, () => this.inner.delete!(path));
   }
 
-  private async retry(operation: string, path: string, fn: () => Promise<void>): Promise<void> {
+  private async retry<T>(operation: string, path: string, fn: () => Promise<T>): Promise<T> {
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       const startedAt = Date.now();
       try {
-        await fn();
-        return;
+        return await fn();
       } catch (error) {
         const durationMs = Date.now() - startedAt;
         if (!(error instanceof DropboxApiError)) throw error;
@@ -103,6 +102,7 @@ export class ResilientDropboxTransport implements DropboxTransport {
         await this.sleep(retryAfterMs);
       }
     }
+    throw new Error("Dropbox retry loop exhausted unexpectedly");
   }
 }
 

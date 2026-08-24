@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { DropboxApiError, DropboxConflictError, type DropboxTransport } from "../src/dropbox/client";
+import { DropboxApiError, DropboxConflictError, type DropboxEntry, type DropboxTransport } from "../src/dropbox/client";
 import { ResilientDropboxTransport } from "../src/dropbox/resilient-transport";
 
 function fakeTransport(upload: DropboxTransport["upload"]): DropboxTransport {
@@ -56,6 +56,34 @@ describe("ResilientDropboxTransport", () => {
       attempt: 1,
       dropbox_status: 503,
       dropbox_request_id: "req-read"
+    });
+  });
+
+  it("retries transient folder listings and returns the successful listing", async () => {
+    const entries: DropboxEntry[] = [{ tag: "file", name: "TXN-TEST.json", path_display: "/PROJECT_OS/incoming/TXN-TEST.json" }];
+    const listFolder = vi.fn<(path: string) => Promise<DropboxEntry[]>>()
+      .mockRejectedValueOnce(new DropboxApiError("rate limited", 429, "req-list", "too_many_requests"))
+      .mockResolvedValueOnce(entries);
+    const sleep = vi.fn(async () => undefined);
+    const logs: Record<string, unknown>[] = [];
+    const base = fakeTransport(async () => undefined);
+    const transport = new ResilientDropboxTransport({ ...base, listFolder }, {
+      sleep,
+      random: () => 0,
+      baseDelayMs: 100,
+      log: (entry) => logs.push(entry)
+    });
+
+    await expect(transport.listFolder("/PROJECT_OS/.project-os/transactions/incoming"))
+      .resolves.toEqual(entries);
+
+    expect(listFolder).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(100);
+    expect(logs[0]).toMatchObject({
+      operation: "list_folder",
+      attempt: 1,
+      dropbox_status: 429,
+      dropbox_request_id: "req-list"
     });
   });
 

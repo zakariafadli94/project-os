@@ -98,7 +98,7 @@ describe("WorkspaceProjectionWriter", () => {
     expect(transport.uploads).toHaveLength(0);
   });
 
-  it("fails closed when current bytes match neither baseline nor desired", async () => {
+  it("fails closed and durably quarantines current bytes when they match neither baseline nor desired", async () => {
     const transport = new InstrumentedTransport();
     const baselineContent = `${MANAGED_NOTICE}\nbaseline`;
     const baseline: ProjectionOutputEvidence = {
@@ -107,16 +107,23 @@ describe("WorkspaceProjectionWriter", () => {
       content_hash: await sha256Text(baselineContent),
       source_revision: 3
     };
-    transport.files.set("/workspace/BRIEF.md", `${MANAGED_NOTICE}\nunexpected edit`);
+    const humanEdit = `${MANAGED_NOTICE}\nunexpected edit`;
+    transport.files.set("/workspace/BRIEF.md", humanEdit);
     const writer = new WorkspaceProjectionWriter(transport, 1);
     const item = await output("global:BRIEF", "BRIEF.md", `${MANAGED_NOTICE}\ndesired`, { baseline });
 
     await expect(writer.materialize(plan([item]), { workspaceRoot: "/workspace" }))
       .rejects.toBeInstanceOf(MaterializationOutputConflictError);
-    expect(transport.uploads).toHaveLength(0);
+    expect(transport.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
+    const hash = await sha256Text(humanEdit);
+    expect(transport.files.get(`/PROJECT_OS/.project-os/projects/PRJ-3301/recovery/projections/payloads/sha256/${hash}.md`))
+      .toBe(humanEdit);
+    expect([...transport.files.keys()].some((path) =>
+      path.startsWith("/PROJECT_OS/.project-os/projects/PRJ-3301/recovery/projections/records/")
+    )).toBe(true);
   });
 
-  it("offers unexpected human bytes to a recovery hook before failing closed", async () => {
+  it("offers already-preserved unexpected human bytes to a recovery hook before failing closed", async () => {
     const transport = new InstrumentedTransport();
     const baselineContent = `${MANAGED_NOTICE}\nbaseline`;
     const baseline: ProjectionOutputEvidence = {
@@ -142,10 +149,10 @@ describe("WorkspaceProjectionWriter", () => {
       currentContent: humanEdit,
       currentHash: await sha256Text(humanEdit)
     }]);
-    expect(transport.uploads).toHaveLength(0);
+    expect(transport.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
   });
 
-  it("bootstrap may overwrite a known machine-managed note but refuses an untracked human file", async () => {
+  it("bootstrap may overwrite a known machine-managed note but quarantines and refuses an untracked human file", async () => {
     const managedTransport = new InstrumentedTransport();
     managedTransport.files.set("/workspace/BRIEF.md", `${MANAGED_NOTICE}\nold generated`);
     const managedWriter = new WorkspaceProjectionWriter(managedTransport, 1);
@@ -159,7 +166,10 @@ describe("WorkspaceProjectionWriter", () => {
     const humanWriter = new WorkspaceProjectionWriter(humanTransport, 1);
     await expect(humanWriter.materialize(plan([desired]), { workspaceRoot: "/workspace" }))
       .rejects.toBeInstanceOf(MaterializationOutputConflictError);
-    expect(humanTransport.uploads).toHaveLength(0);
+    expect(humanTransport.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
+    expect([...humanTransport.files.keys()].some((path) =>
+      path.startsWith("/PROJECT_OS/.project-os/projects/PRJ-3301/recovery/projections/payloads/")
+    )).toBe(true);
   });
 
   it("does not read back non-critical success but verifies critical output after upload", async () => {

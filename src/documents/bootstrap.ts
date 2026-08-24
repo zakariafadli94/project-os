@@ -135,7 +135,7 @@ function parseVisiblePath(
   visiblePath: string,
   stage: BootstrapManagedStage
 ): { logicalPath: string; collectionPath?: string } {
-  const zone = stage === "published" ? "deliverables" : stage;
+  const zone = stage === "published" ? "deliverables" : stage === "reference" ? "references" : stage;
   const root = workspaceManagedZoneRoot(state.project_id, state.slug, zone);
   const prefix = `${root}/`;
   if (!visiblePath.startsWith(prefix)) {

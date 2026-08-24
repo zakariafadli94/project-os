@@ -9,6 +9,7 @@ import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
+import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinator";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
 import { DropboxClient } from "../dropbox/client";
 import { parseLayoutMode, type LayoutMode } from "../dropbox/layout";
@@ -65,6 +66,7 @@ const MATERIALIZATION_ALARM_DELAY_MS = 1_000;
 export class ProjectGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
   private readonly managedDocumentService: ManagedDocumentService;
+  private readonly managedDocumentChanges: ManagedDocumentChangeCoordinator;
   private readonly layoutMode: LayoutMode;
   private readonly materializationLedger: MaterializationLedger | null;
   private readonly materializationCoordinator: MaterializationCoordinator | null;
@@ -101,6 +103,7 @@ export class ProjectGuard extends DurableObject<Env> {
     });
     this.repository = new ProjectRepository(rawDropbox, this.layoutMode);
     this.managedDocumentService = new ManagedDocumentService(rawDropbox);
+    this.managedDocumentChanges = new ManagedDocumentChangeCoordinator(rawDropbox, this.ctx.storage);
 
     const projectId = this.ctx.id.name;
     if (this.layoutMode === "v2" && projectId) {
@@ -136,6 +139,14 @@ export class ProjectGuard extends DurableObject<Env> {
 
     if (request.method === "GET" && pathname === "/document-status") {
       return this.serialize(() => this.handleManagedDocumentStatus(url));
+    }
+
+    if (request.method === "POST" && pathname === "/reconcile-documents") {
+      return this.serialize(async () => {
+        const state = await this.loadOrRecoverState();
+        if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+        return Response.json(await this.managedDocumentChanges.reconcile(state));
+      });
     }
 
     if (request.method === "GET" && pathname === "/materialization-status") {

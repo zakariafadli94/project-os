@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
+import { documentIdFor } from "../src/domain/managed-document";
 import type { Receipt } from "../src/domain/receipt";
 import { sha256Text } from "../src/documents/hash";
 import { installDropboxMock } from "./helpers/mock-dropbox";
@@ -50,6 +51,34 @@ async function createWorking(projectId: string) {
 describe("ProjectGuard managed document change reconciliation", () => {
   beforeEach(() => installDropboxMock());
   afterEach(() => vi.restoreAllMocks());
+
+  it("lazily adopts a pre-ledger WORKING file on the first recursive baseline without rewriting it", async () => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-DOCCHANGE-PROJECT-0000", "doc-change-zero");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const logicalPath = "strategy/legacy.md";
+    const visiblePath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-doc-change-zero/WORKING/${logicalPath}`;
+    const content = "# Legacy strategy\n\nHuman bytes before managed-document rollout";
+    await mock.writeExternal(visiblePath, content);
+
+    const baseline = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(baseline.status).toBe(200);
+    expect(await baseline.json()).toMatchObject({ baseline: true, bootstrapped: 1, captured: 0, conflicts: 0 });
+    expect(mock.files.get(visiblePath)).toBe(content);
+    expect(mock.uploadCalls.filter((path) => path === visiblePath)).toHaveLength(0);
+
+    const documentId = await documentIdFor(created.project_id, logicalPath);
+    const status = await guard.fetch(
+      `https://project-guard.internal/document-status?document_id=${encodeURIComponent(documentId)}`,
+      { method: "GET" }
+    );
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({
+      document_id: documentId,
+      logical_path: logicalPath,
+      reconciliation_status: "clean"
+    });
+  });
 
   it("captures only a new WORKING provider revision after the durable baseline cursor", async () => {
     const mock = installDropboxMock();

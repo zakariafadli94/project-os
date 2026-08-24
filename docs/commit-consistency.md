@@ -35,11 +35,15 @@ Before a recovered record is accepted, ProjectGuard validates that project bindi
 
 If Dropbox fails after the immutable commit record is created but before derived files or the standalone receipt are fully materialized, the current request may fail. The next request or exact replay must detect the committed record, re-run materialization idempotently, persist local SQLite, and return the original committed receipt. The business effect is never applied twice.
 
-The deterministic Dropbox fault-injection harness from `IMP-FAULTTEST001` must prove this window by failing a write after the commit record has been published and verifying that retry/recovery converges to one committed revision and one receipt without user intervention.
+The deterministic Dropbox fault-injection harness from `IMP-FAULTTEST001` proves this window by failing a derived write after the commit record has been published. Tests verify both exact replay and different subsequent work converge from the committed record without a duplicate revision or business effect.
+
+Archived workspaces have an additional invariant: once the final archived workspace already exists and the active workspace is absent, replay must not recreate an active copy merely to regenerate the archived views. If the archive does not yet exist, the final archived-state views are materialized in the active workspace and then moved once. If both active and archived copies already exist before materialization, recovery fails closed rather than deleting or merging potentially divergent content automatically.
 
 ## Backward compatibility
 
-Projects created before `IMP-COMMIT001` have no historical commit records. Their existing V2 `state.json` remains the baseline. The first post-upgrade transaction creates the first commit record at the next revision. Recovery must not require retroactive journal backfill.
+Projects created before `IMP-COMMIT001` have no historical commit records. Their existing V2 `state.json` remains the baseline. The first post-upgrade transaction creates the first commit record at the next revision. Recovery does not require retroactive journal backfill.
+
+A new project whose revision-1 commit record was published but whose first snapshot failed to materialize can recover directly from `REV-000001.json`; no pre-existing `state.json` is required for that case.
 
 Legacy and shadow layout behavior are not migrated by this improvement. Production currently runs V2; V2 receives the new commit boundary while existing legacy/shadow semantics remain unchanged until a separately governed migration requires otherwise.
 
@@ -56,8 +60,10 @@ This package closes the ProjectGuard transaction crash window between canonical 
 - deterministic RED/GREEN tests reproduce and close the post-record/pre-local crash window;
 - exact replay after interrupted materialization returns the original receipt and does not increment revision again;
 - a different subsequent transaction first reconciles the committed record and continues from the canonical revision;
+- an interrupted archive replay preserves the archive without resurrecting an active workspace;
 - loss of local ProjectGuard SQLite still recovers from existing snapshots plus contiguous commit records;
 - pre-upgrade projects without commit records continue normally;
+- a revision-1 record can recover a new project when the first snapshot was never written;
 - the entire existing test suite passes;
 - Wrangler deploy dry-run passes;
 - production deploy and health verification pass while continuity mode remains `stable`.

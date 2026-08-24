@@ -61,14 +61,43 @@ function committed(state: ProjectState, operation: Transaction["operation"], pay
 }
 
 function createFixture(projectId = "PRJ-3501"): CanonicalCommitRecord {
-  seq = 0;
-  const state = emptyProjectState(projectId, "Coordinator Fixture", "coordinator-fixture", "Test coordinator");
-  return committed(state, "project.create", {
-    name: "Coordinator Fixture",
-    slug: "coordinator-fixture",
-    aliases: [],
-    objective: "Test coordinator"
+  seq = 1;
+  const tx = parseTransaction({
+    schema_version: "1.0",
+    transaction_id: "TXN-COORD-000001",
+    project_id: projectId,
+    base_revision: 0,
+    operation: "project.create",
+    created_at: at,
+    payload: {
+      name: "Coordinator Fixture",
+      slug: "coordinator-fixture",
+      aliases: [],
+      objective: "Test coordinator"
+    }
   });
+  const result = applyTransaction(null, tx);
+  if (result.kind !== "commit") throw new Error(`fixture failed: ${result.kind}`);
+  const receipt: Receipt & { status: "committed"; event_id: string } = {
+    schema_version: "1.0",
+    transaction_id: tx.transaction_id,
+    status: "committed",
+    project_id: projectId,
+    previous_revision: 0,
+    new_revision: result.state.revision,
+    event_id: result.event.event_id,
+    committed_at: at
+  };
+  return {
+    schema_version: "1.0",
+    project_id: projectId,
+    previous_revision: 0,
+    new_revision: result.state.revision,
+    transaction: tx,
+    state: result.state,
+    event: result.event,
+    receipt
+  };
 }
 
 class FakeRepository implements MaterializationRepositoryPort {

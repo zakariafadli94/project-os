@@ -21,6 +21,7 @@ export interface ManagedDocumentReconcileSummary {
   ignored: number;
   captured: number;
   ingested: number;
+  duplicates: number;
   restored: number;
   conflicts: number;
 }
@@ -40,6 +41,7 @@ export class ManagedDocumentReconciler {
       ignored: 0,
       captured: 0,
       ingested: 0,
+      duplicates: 0,
       restored: 0,
       conflicts: 0
     };
@@ -71,6 +73,7 @@ export class ManagedDocumentReconciler {
       if (classified.zone === "inputs") {
         const result = await this.ingestInput(state, classified.relativePath, change.path, metadata);
         summary.ingested += result === "ingested" ? 1 : 0;
+        summary.duplicates += result === "duplicate" ? 1 : 0;
         summary.ignored += result === "ignored" ? 1 : 0;
         continue;
       }
@@ -167,6 +170,13 @@ export class ManagedDocumentReconciler {
       provider: { reference: observation(visiblePath, metadata) },
       reconciliation_status: "clean"
     });
+    await this.ledger.writeReferenceFingerprint({
+      schema_version: "1.0",
+      project_id: state.project_id,
+      provider_content_hash: metadata.content_hash,
+      document_id: documentId,
+      version_id: versionId
+    });
     return true;
   }
 
@@ -175,11 +185,18 @@ export class ManagedDocumentReconciler {
     logicalPath: string,
     inputPath: string,
     metadata: DropboxFileMetadata
-  ): Promise<"ingested" | "ignored"> {
+  ): Promise<"ingested" | "duplicate" | "ignored"> {
     const documentId = await documentIdForProviderFile(state.project_id, metadata.id);
     const versionId = await externalVersionIdFor(metadata.rev);
     const existing = await this.ledger.readVersion(state.project_id, documentId, versionId);
     if (existing) return "ignored";
+
+    const fingerprint = await this.ledger.readReferenceFingerprint(state.project_id, metadata.content_hash);
+    if (fingerprint) {
+      if (!this.transport.delete) throw new Error("Dropbox transport does not support duplicate input cleanup");
+      await this.transport.delete(inputPath);
+      return "duplicate";
+    }
 
     await this.ledger.snapshotProviderFile(state.project_id, documentId, versionId, inputPath, metadata);
     const targetPath = workspaceManagedDocumentPath(
@@ -229,6 +246,13 @@ export class ManagedDocumentReconciler {
       reference_version_id: versionId,
       provider: { reference: observation(targetPath, targetMetadata) },
       reconciliation_status: "clean"
+    });
+    await this.ledger.writeReferenceFingerprint({
+      schema_version: "1.0",
+      project_id: state.project_id,
+      provider_content_hash: targetMetadata.content_hash,
+      document_id: documentId,
+      version_id: versionId
     });
     return "ingested";
   }

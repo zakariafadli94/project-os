@@ -3,6 +3,7 @@ import { parseArtifactWriteRequest } from "./domain/artifact-write";
 import { continuityStatus } from "./continuity/policy";
 import { executeWithRollback, type TransactionExecutor } from "./continuity/rollback";
 import type { Env } from "./env";
+import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "./domain/managed-document-request";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
 import { DropboxClient, DropboxConflictError, type DropboxEntry } from "./dropbox/client";
@@ -73,7 +74,7 @@ const worker = {
       const rawBody = await request.text();
       const valid = await verifyDropboxSignature(env.DROPBOX_APP_SECRET, rawBody, request.headers.get("x-dropbox-signature"));
       if (!valid) return new Response("invalid signature", { status: 401 });
-      ctx.waitUntil(processInbox(env));
+      ctx.waitUntil(Promise.all([processInbox(env), reconcileManagedDocuments(env)]).then(() => undefined));
       return new Response("", { status: 200 });
     }
 
@@ -148,6 +149,22 @@ const worker = {
       return Response.json(await routeArtifact(env, artifact));
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/documents") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+      let document: ManagedDocumentRequest;
+      try {
+        document = parseManagedDocumentRequest(await request.json());
+      } catch (error) {
+        return Response.json({
+          error: "invalid_document_request",
+          message: error instanceof Error ? error.message : "Invalid managed document request"
+        }, { status: 400 });
+      }
+
+      return Response.json(await routeManagedDocument(env, document));
+    }
+
     return Response.json({ error: "not_found" }, { status: 404 });
   },
 
@@ -162,10 +179,11 @@ const worker = {
     ctx.waitUntil(
       Promise.all([
         processInbox(env),
-        reconcileMaterializations(env)
+        reconcileMaterializations(env),
+        reconcileManagedDocuments(env)
       ])
-        .then(([inbox, materialization]) => {
-          console.info("Project OS scheduled maintenance completed", { inbox, materialization });
+        .then(([inbox, materialization, documents]) => {
+          console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents });
         })
         .catch((error) => {
           console.error("Project OS scheduled maintenance failed", {
@@ -190,6 +208,28 @@ export interface MaterializationReconcileSummary {
   scheduled: number;
   current: number;
   failed: number;
+}
+
+export interface ManagedDocumentReconcileAllSummary {
+  projects_scanned: number;
+  projects_failed: number;
+  provider_entries_scanned: number;
+  captured: number;
+  ingested: number;
+  duplicates: number;
+  restored: number;
+  conflicts: number;
+  cursor_resets: number;
+}
+
+interface ManagedDocumentProjectSummary {
+  scanned: number;
+  captured: number;
+  ingested: number;
+  duplicates: number;
+  restored: number;
+  conflicts: number;
+  cursor_reset: boolean;
 }
 
 interface MaterializationStatusResponse {
@@ -330,6 +370,17 @@ async function routeArtifact(env: Env, artifact: ArtifactWriteRequest): Promise<
   return response.json<ArtifactWriteReceipt>();
 }
 
+async function routeManagedDocument(env: Env, document: ManagedDocumentRequest): Promise<unknown> {
+  const stub = env.PROJECT_GUARD.getByName(document.project_id);
+  const response = await stub.fetch("https://project-guard.internal/document", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(document)
+  });
+  if (!response.ok) throw new Error(`ProjectGuard document route returned ${response.status}`);
+  return response.json();
+}
+
 async function processInbox(env: Env): Promise<InboxProcessSummary> {
   const mode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
   const client = new DropboxClient({
@@ -383,6 +434,57 @@ export async function reconcileMaterializations(env: Env): Promise<Materializati
       } catch (error) {
         summary.failed += 1;
         console.error("Project OS materialization reconcile failed", {
+          project_id: project.project_id,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return summary;
+}
+
+export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocumentReconcileAllSummary> {
+  const registryStub = env.REGISTRY_GUARD.getByName("global");
+  const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+  if (!registryResponse.ok) throw new Error(`RegistryGuard document reconcile returned ${registryResponse.status}`);
+  const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const summary: ManagedDocumentReconcileAllSummary = {
+    projects_scanned: registry.projects.length,
+    projects_failed: 0,
+    provider_entries_scanned: 0,
+    captured: 0,
+    ingested: 0,
+    duplicates: 0,
+    restored: 0,
+    conflicts: 0,
+    cursor_resets: 0
+  };
+
+  let cursor = 0;
+  const workerCount = Math.min(4, registry.projects.length);
+  const worker = async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= registry.projects.length) return;
+      const project = registry.projects[index];
+      try {
+        const stub = env.PROJECT_GUARD.getByName(project.project_id);
+        const response = await stub.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+        if (!response.ok) throw new Error(`ProjectGuard returned ${response.status}`);
+        const projectSummary = await response.json<ManagedDocumentProjectSummary>();
+        summary.provider_entries_scanned += projectSummary.scanned;
+        summary.captured += projectSummary.captured;
+        summary.ingested += projectSummary.ingested;
+        summary.duplicates += projectSummary.duplicates;
+        summary.restored += projectSummary.restored;
+        summary.conflicts += projectSummary.conflicts;
+        summary.cursor_resets += projectSummary.cursor_reset ? 1 : 0;
+      } catch (error) {
+        summary.projects_failed += 1;
+        console.error("Project OS managed document reconcile failed", {
           project_id: project.project_id,
           message: error instanceof Error ? error.message : String(error)
         });

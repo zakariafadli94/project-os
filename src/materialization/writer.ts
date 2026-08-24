@@ -7,6 +7,13 @@ import type { PlannedProjectionOutput, ProjectionPlan } from "./planner";
 
 export type ProjectionWriteOutcome = "uploaded" | "content_hash" | "attempt_reuse";
 
+export interface UnexpectedProjectionContent {
+  key: string;
+  path: string;
+  currentContent: string;
+  currentHash: string;
+}
+
 export class MaterializationOutputConflictError extends Error {
   constructor(
     public readonly key: string,
@@ -32,6 +39,7 @@ export interface WorkspaceProjectionWriterOptions {
   alreadyVerified?: ReadonlyMap<string, ProjectionOutputEvidence>;
   onOutputVerified?: (key: string, evidence: ProjectionOutputEvidence) => void | Promise<void>;
   onOutputOutcome?: (key: string, outcome: ProjectionWriteOutcome) => void | Promise<void>;
+  onUnexpectedContent?: (entry: UnexpectedProjectionContent) => void | Promise<void>;
 }
 
 export class WorkspaceProjectionWriter {
@@ -103,7 +111,7 @@ export class WorkspaceProjectionWriter {
         if (index >= outputs.length) return;
         try {
           const output = outputs[index];
-          const result = await this.materializeOne(output, root);
+          const result = await this.materializeOne(output, root, options);
           verified.set(output.key, result.evidence);
           await options.onOutputOutcome?.(output.key, result.outcome);
           await options.onOutputVerified?.(output.key, result.evidence);
@@ -120,7 +128,8 @@ export class WorkspaceProjectionWriter {
 
   private async materializeOne(
     output: PlannedProjectionOutput,
-    root: string
+    root: string,
+    options: WorkspaceProjectionWriterOptions
   ): Promise<{ evidence: ProjectionOutputEvidence; outcome: ProjectionWriteOutcome }> {
     const path = joinWorkspacePath(root, output.relative_path);
     const current = await this.transport.download(path);
@@ -134,6 +143,12 @@ export class WorkspaceProjectionWriter {
       : undefined;
 
     if (baseline && current !== null && currentHash !== baseline.content_hash) {
+      await options.onUnexpectedContent?.({
+        key: output.key,
+        path,
+        currentContent: current,
+        currentHash: currentHash!
+      });
       throw new MaterializationOutputConflictError(
         output.key,
         path,
@@ -142,6 +157,12 @@ export class WorkspaceProjectionWriter {
     }
 
     if (!baseline && current !== null && !current.includes(MANAGED_NOTICE)) {
+      await options.onUnexpectedContent?.({
+        key: output.key,
+        path,
+        currentContent: current,
+        currentHash: currentHash!
+      });
       throw new MaterializationOutputConflictError(
         output.key,
         path,

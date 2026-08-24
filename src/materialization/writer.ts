@@ -1,5 +1,6 @@
 import type { ProjectionOutputEvidence } from "../domain/materialization";
-import type { DropboxTransport } from "../dropbox/client";
+import { DropboxConflictError, type DropboxTransport } from "../dropbox/client";
+import { machineProjectRoot } from "../dropbox/layout";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
 import { MANAGED_NOTICE } from "../render/shared";
 import { sha256Text } from "./hash";
@@ -72,8 +73,8 @@ export class WorkspaceProjectionWriter {
       (output.critical ? critical : nonCritical).push(output);
     }
 
-    await this.runStage(nonCritical, root, verified, options);
-    await this.runStage(critical, root, verified, options);
+    await this.runStage(plan.project_id, nonCritical, root, verified, options);
+    await this.runStage(plan.project_id, critical, root, verified, options);
     return verified;
   }
 
@@ -94,6 +95,7 @@ export class WorkspaceProjectionWriter {
   }
 
   private async runStage(
+    projectId: string,
     outputs: PlannedProjectionOutput[],
     root: string,
     verified: Map<string, ProjectionOutputEvidence>,
@@ -111,7 +113,7 @@ export class WorkspaceProjectionWriter {
         if (index >= outputs.length) return;
         try {
           const output = outputs[index];
-          const result = await this.materializeOne(output, root, options);
+          const result = await this.materializeOne(projectId, output, root, options);
           verified.set(output.key, result.evidence);
           await options.onOutputOutcome?.(output.key, result.outcome);
           await options.onOutputVerified?.(output.key, result.evidence);
@@ -127,6 +129,7 @@ export class WorkspaceProjectionWriter {
   }
 
   private async materializeOne(
+    projectId: string,
     output: PlannedProjectionOutput,
     root: string,
     options: WorkspaceProjectionWriterOptions
@@ -143,12 +146,12 @@ export class WorkspaceProjectionWriter {
       : undefined;
 
     if (baseline && current !== null && currentHash !== baseline.content_hash) {
-      await options.onUnexpectedContent?.({
+      await this.preserveUnexpectedContent(projectId, {
         key: output.key,
         path,
         currentContent: current,
         currentHash: currentHash!
-      });
+      }, options.onUnexpectedContent);
       throw new MaterializationOutputConflictError(
         output.key,
         path,
@@ -157,12 +160,12 @@ export class WorkspaceProjectionWriter {
     }
 
     if (!baseline && current !== null && !current.includes(MANAGED_NOTICE)) {
-      await options.onUnexpectedContent?.({
+      await this.preserveUnexpectedContent(projectId, {
         key: output.key,
         path,
         currentContent: current,
         currentHash: currentHash!
-      });
+      }, options.onUnexpectedContent);
       throw new MaterializationOutputConflictError(
         output.key,
         path,
@@ -184,6 +187,41 @@ export class WorkspaceProjectionWriter {
     }
 
     return { evidence: desired, outcome: "uploaded" };
+  }
+
+  private async preserveUnexpectedContent(
+    projectId: string,
+    entry: UnexpectedProjectionContent,
+    callback?: (entry: UnexpectedProjectionContent) => void | Promise<void>
+  ): Promise<void> {
+    const recoveryRoot = `${machineProjectRoot(projectId)}/recovery/projections`;
+    const payloadPath = `${recoveryRoot}/payloads/sha256/${entry.currentHash}.md`;
+    const outputKeyHash = await sha256Text(entry.key);
+    const recordPath = `${recoveryRoot}/records/${outputKeyHash}-${entry.currentHash}.json`;
+    const record = `${JSON.stringify({
+      schema_version: "1.0",
+      project_id: projectId,
+      output_key: entry.key,
+      source_path: entry.path,
+      content_hash: entry.currentHash,
+      payload_path: payloadPath
+    }, null, 2)}\n`;
+
+    await this.safeAdd(payloadPath, entry.currentContent);
+    await this.safeAdd(recordPath, record);
+    await callback?.(entry);
+  }
+
+  private async safeAdd(path: string, content: string): Promise<void> {
+    try {
+      await this.transport.upload(path, content, "add");
+    } catch (error) {
+      if (!(error instanceof DropboxConflictError)) throw error;
+      const existing = await this.transport.download(path);
+      if (existing !== content) {
+        throw new Error(`Projection recovery evidence conflict with different content: ${path}`);
+      }
+    }
   }
 }
 

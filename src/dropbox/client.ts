@@ -3,6 +3,7 @@ export interface DropboxTransport {
   download(path: string): Promise<string | null>;
   move(from: string, to: string): Promise<void>;
   delete?(path: string): Promise<void>;
+  listFolder?(path: string): Promise<DropboxEntry[]>;
 }
 
 export interface DropboxEntry {

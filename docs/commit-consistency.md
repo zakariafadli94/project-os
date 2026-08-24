@@ -1,69 +1,130 @@
 # Project OS Crash-Safe Commit Contract
 
-Status: implementation spec for `IMP-COMMIT001`.
+Status: operational commit contract after `IMP-COMMIT001` + `IMP-MATERIAL001`.
 
 ## Goal
 
-A Project OS transaction must never leave canonical Dropbox state and ProjectGuard local SQLite as two competing realities after a crash or partial write. The user and every chat continue normal work without recovery commands or version selection.
+A Project OS transaction must never leave two competing business realities after a crash or partial write. The user and every chat continue normal work without recovery commands or version selection.
 
 ## Canonical commit boundary
 
-For new V2 commits, the atomic business commit boundary is one immutable canonical commit record stored under the project machine root at a deterministic revision path. The record contains the transaction, resulting project state, domain event, and committed receipt together.
+For V2 commits, the atomic business commit boundary is one immutable canonical commit record stored under the project machine root at a deterministic revision path. The record contains the transaction, resulting project state, domain event and committed receipt together.
 
-A commit record is written before any derived snapshot, Markdown view, standalone receipt, or local SQLite cache is advanced. If the record does not exist, the transaction is not committed. If the record exists, the transaction is committed and any missing derived state is repairable from that record.
+A commit record is written before derived snapshots, Markdown views, standalone receipt copies, materialization evidence, or local caches can become authoritative. If the record does not exist, the transaction is not committed. If it exists and validates, the transaction is committed and derived state is repairable from it.
 
-## Commit sequence
+The immutable commit record remains the single business source of truth introduced by `IMP-COMMIT001`.
 
-1. Reconcile any previously committed record that local SQLite has not absorbed yet.
-2. Validate and apply the new transaction against the reconciled state.
-3. Publish exactly one immutable commit record for the resulting revision.
-4. Materialize the event, machine snapshot, human workspace, standalone receipt, and archive side effects idempotently from that record.
-5. Persist the resulting state and receipt in local SQLite only after materialization succeeds.
-6. Perform registry status side effects after local persistence; existing replay behavior repairs these if they fail.
+## Commit sequence after `IMP-MATERIAL001`
 
-The immutable record is the only new source of commit truth. Machine `state.json`, `manifest.json`, Markdown views, event files, standalone receipts, and local SQLite remain materialized/indexed representations and may be repaired from the record.
+The V2 critical path is now:
 
-## Deterministic recovery
+1. reconcile any canonical commit record that local ProjectGuard state has not absorbed;
+2. validate and apply the new transaction against reconciled canonical state;
+3. publish exactly one immutable canonical commit record for the resulting revision;
+4. persist the resulting state/receipt in ProjectGuard SQLite so immediate replay is idempotent;
+5. request asynchronous materialization for the new canonical revision;
+6. return the committed business result;
+7. separately materialize machine derivatives and human workspace, verify a complete projection generation, publish immutable materialization evidence, then advance materialization head.
 
-Commit records are addressed by project revision rather than by a mutable head pointer. Starting from the best known local or snapshot revision, ProjectGuard probes the next deterministic commit-record path (`revision + 1`) and absorbs records sequentially until the next path is absent.
+Registry/status side effects retain their existing ownership. For `project.create`, RegistryGuard still publishes the standalone committed receipt only after its registry finalization succeeds.
 
-This avoids a second crash window around a mutable head file. A brand-new or locally damaged ProjectGuard can use the existing canonical snapshot as its baseline, absorb the commit record for that same revision when present to recover its receipt, then absorb every later contiguous record.
+## Expected projection lag
 
-Before a recovered record is accepted, ProjectGuard validates that project binding, previous/new revision, event revision, state revision, event ID, transaction ID, and committed receipt all agree. A malformed or non-contiguous record fails closed instead of being guessed or skipped.
+After `IMP-MATERIAL001`, these values are allowed to differ temporarily:
 
-## Interrupted materialization
+```text
+canonical commit revision = 72
+machine snapshot revision = 71
+materialization head = 71
+human STATE/HANDOFF = completed generation 71
+```
 
-If Dropbox fails after the immutable commit record is created but before derived files or the standalone receipt are fully materialized, the current request may fail. The next request or exact replay must detect the committed record, re-run materialization idempotently, persist local SQLite, and return the original committed receipt. The business effect is never applied twice.
+This is expected asynchronous lag, not a failed business commit and not a rollback condition.
 
-The deterministic Dropbox fault-injection harness from `IMP-FAULTTEST001` proves this window by failing a derived write after the commit record has been published. Tests verify both exact replay and different subsequent work converge from the committed record without a duplicate revision or business effect.
+The canonical commit record is authoritative. Machine `state.json`, `manifest.json`, standalone receipts, events and Markdown views are derived/reconstructible materializations. The latest human generation proven coherent is identified by `materialization-head.json` plus its immutable completed-generation record.
 
-Archived workspaces have an additional invariant: once the final archived workspace already exists and the active workspace is absent, replay must not recreate an active copy merely to regenerate the archived views. If the archive does not yet exist, the final archived-state views are materialized in the active workspace and then moved once. If both active and archived copies already exist before materialization, recovery fails closed rather than deleting or merging potentially divergent content automatically.
+The projection engine must converge toward the canonical revision automatically through ProjectGuard alarms and scheduled reconciliation.
+
+## Deterministic canonical recovery
+
+Commit records are addressed by project revision rather than a mutable business head pointer. Starting from the best known local/snapshot revision, ProjectGuard probes the next deterministic commit-record path (`revision + 1`) and absorbs records sequentially until the next path is absent.
+
+A brand-new or locally damaged ProjectGuard can use an existing canonical snapshot as a baseline, absorb the commit record for that same revision when present to recover its receipt, then absorb every later contiguous record. If the snapshot itself is absent, a valid revision-1 commit record can bootstrap recovery.
+
+Before a recovered record is accepted, ProjectGuard validates project binding, previous/new revision, event revision, state revision, event ID, transaction ID and committed receipt. A malformed or non-contiguous record fails closed instead of being guessed or skipped.
+
+Recovered commits are persisted locally and projection work is requested. Recovery does not require human Markdown to be current before the canonical state is usable.
+
+## Materialization recovery
+
+Projection recovery is separate from canonical business recovery.
+
+`IMP-MATERIAL001` adds:
+
+- immutable completed-generation records;
+- a repairable materialization head;
+- a reconstructible SQLite progress ledger;
+- deterministic semantic/content hashes;
+- per-output resume;
+- revision coalescing for current-state human views.
+
+If a projection crashes mid-generation, the business revision does not change. Verified per-output work is reused when possible.
+
+If all outputs were verified and the immutable completed-generation record was written but advancing `materialization-head.json` failed, reconciliation validates the completed record and repairs the head without rewriting the workspace.
+
+See `docs/materialization.md` for the full projection contract.
+
+## Exact replay
+
+Exact transaction replay is keyed by the original `transaction_id`.
+
+If the canonical commit exists, replay converges to the original business receipt and never creates another revision merely because materialization is incomplete or failed.
+
+A projection retry is not a new transaction and never applies the domain operation again.
+
+## Archived workspaces
+
+Archive business state commits before workspace movement.
+
+The projection engine owns human workspace archive completion:
+
+- render/verify the archived target;
+- move the active workspace when necessary;
+- verify critical `STATE.md`/`HANDOFF.md` at archive destination;
+- publish completed generation with `workspace_location: archive`;
+- advance materialization head only after those checks.
+
+If archive already exists and active workspace is absent, replay is idempotent. If both represent conflicting realities, projection fails closed rather than deleting/merging content automatically.
 
 ## Backward compatibility
 
-Projects created before `IMP-COMMIT001` have no historical commit records. Their existing V2 `state.json` remains the baseline. The first post-upgrade transaction creates the first commit record at the next revision. Recovery does not require retroactive journal backfill.
+Projects created before `IMP-COMMIT001` have no historical commit records. Their existing V2 `state.json` can remain a recovery baseline; the first later transaction creates a commit record at the next revision.
 
-A new project whose revision-1 commit record was published but whose first snapshot failed to materialize can recover directly from `REV-000001.json`; no pre-existing `state.json` is required for that case.
+Historical V2 snapshots that predate materialization generation records remain supported. The authenticated administrative materialize route can regenerate the workspace without creating a business revision.
 
-Legacy and shadow layout behavior are not migrated by this improvement. Production currently runs V2; V2 receives the new commit boundary while existing legacy/shadow semantics remain unchanged until a separately governed migration requires otherwise.
+Legacy/shadow layout semantics are not silently redefined by `IMP-MATERIAL001`. Production remains V2.
 
 ## Scope boundary
 
-This package closes the ProjectGuard transaction crash window between canonical Dropbox publication and local SQLite persistence. It does not claim to provide full version rollback, multi-file human-view atomicity, schema migration, or generalized Dropbox read retry; those remain owned by later roadmap packages (`IMP-ROLLBACK001`, `IMP-MATERIAL001`, `IMP-SCHEMA001`, `IMP-DROPRES001`).
+This contract covers:
 
-`project.create` still has RegistryGuard-level orchestration after ProjectGuard commits the project state. The ProjectGuard half of that creation uses the same commit record, but RegistryGuard's own registry publication lifecycle is not silently redefined here.
+- canonical transaction commit truth;
+- deterministic canonical recovery;
+- separation of business commits from derived projection work;
+- idempotent replay across partial projection failures.
 
-## Completion gate
+It does not define schema migrations, alternate persistence providers, final performance SLOs, multi-tenant isolation or automatic software rollout. Those belong to later roadmap packages.
 
-`IMP-COMMIT001` is complete only when:
+## Completion invariants
 
-- deterministic RED/GREEN tests reproduce and close the post-record/pre-local crash window;
-- exact replay after interrupted materialization returns the original receipt and does not increment revision again;
-- a different subsequent transaction first reconciles the committed record and continues from the canonical revision;
-- an interrupted archive replay preserves the archive without resurrecting an active workspace;
-- loss of local ProjectGuard SQLite still recovers from existing snapshots plus contiguous commit records;
-- pre-upgrade projects without commit records continue normally;
-- a revision-1 record can recover a new project when the first snapshot was never written;
-- the entire existing test suite passes;
-- Wrangler deploy dry-run passes;
-- production deploy and health verification pass while continuity mode remains `stable`.
+The combined commit/materialization system must maintain all of these:
+
+- one logical transaction produces at most one canonical business revision;
+- commit record existence/validation determines business truth;
+- projection failure never rewinds a committed revision;
+- canonical revision may be ahead of materialization head and converges automatically;
+- exact replay returns the original receipt;
+- loss of hot ProjectGuard/materialization SQLite can recover from durable external evidence;
+- `STATE.md` and `HANDOFF.md` only advance as a completed pair for one target revision/projection version;
+- unexpected destination edits fail closed;
+- production continuity remains `stable` until the separate automatic rollout package is implemented and proven.

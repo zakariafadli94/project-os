@@ -4,6 +4,10 @@ export interface DropboxTransport {
   move(from: string, to: string): Promise<void>;
   delete?(path: string): Promise<void>;
   listFolder?(path: string): Promise<DropboxEntry[]>;
+  getMetadata?(path: string): Promise<DropboxFileMetadata | null>;
+  uploadConditional?(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata>;
+  copy?(from: string, to: string): Promise<DropboxFileMetadata>;
+  listFolderChanges?(root?: string, cursor?: string): Promise<DropboxChangePage>;
 }
 
 export interface DropboxEntry {
@@ -11,6 +15,31 @@ export interface DropboxEntry {
   name: string;
   path_lower?: string;
   path_display?: string;
+}
+
+export interface DropboxFileMetadata {
+  id: string;
+  path: string;
+  rev: string;
+  content_hash: string;
+  size: number;
+  server_modified?: string;
+}
+
+export interface DropboxChangeEntry {
+  tag: "file" | "folder" | "deleted";
+  name: string;
+  path: string;
+  id?: string;
+  rev?: string;
+  content_hash?: string;
+  size?: number;
+  server_modified?: string;
+}
+
+export interface DropboxChangePage {
+  entries: DropboxChangeEntry[];
+  cursor: string;
 }
 
 export class DropboxApiError extends Error {
@@ -32,10 +61,31 @@ export class DropboxConflictError extends DropboxApiError {
   }
 }
 
+export class DropboxCursorResetError extends DropboxApiError {
+  constructor(message: string, requestId: string | null, responseBody = "") {
+    super(message, 409, requestId, responseBody);
+    this.name = "DropboxCursorResetError";
+  }
+}
+
 export interface DropboxCredentials {
   appKey: string;
   appSecret: string;
   refreshToken: string;
+}
+
+type DropboxUploadMode = "add" | "overwrite" | { ".tag": "update"; update: string };
+
+interface RawDropboxMetadata {
+  ".tag"?: string;
+  id?: string;
+  name?: string;
+  path_lower?: string;
+  path_display?: string;
+  rev?: string;
+  content_hash?: string;
+  size?: number;
+  server_modified?: string;
 }
 
 export class DropboxClient implements DropboxTransport {
@@ -71,13 +121,13 @@ export class DropboxClient implements DropboxTransport {
 
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
     const token = await this.accessToken();
-    let response = await this.uploadRequest(token, path, content, mode);
+    let response = await this.uploadRequest(token, path, content, mode, mode === "add");
     if (response.ok) return;
 
     let text = await response.text();
     if (response.status === 409 && text.includes("not_found")) {
       await this.ensureParentFolders(token, path);
-      response = await this.uploadRequest(token, path, content, mode);
+      response = await this.uploadRequest(token, path, content, mode, mode === "add");
       if (response.ok) return;
       text = await response.text();
     }
@@ -86,6 +136,24 @@ export class DropboxClient implements DropboxTransport {
       throw new DropboxConflictError(`Dropbox upload conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
     }
     throw this.errorFromResponse(`Dropbox upload failed for ${path}`, response, text);
+  }
+
+  async uploadConditional(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata> {
+    if (!expectedRev) throw new Error("Dropbox conditional upload requires expectedRev");
+    const token = await this.accessToken();
+    const response = await this.uploadRequest(
+      token,
+      path,
+      content,
+      { ".tag": "update", update: expectedRev },
+      true
+    );
+    const text = await response.text();
+    if (response.ok) return parseFileMetadata(JSON.parse(text) as RawDropboxMetadata, path);
+    if (response.status === 409) {
+      throw new DropboxConflictError(`Dropbox conditional upload conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
+    }
+    throw this.errorFromResponse(`Dropbox conditional upload failed for ${path}`, response, text);
   }
 
   async download(path: string): Promise<string | null> {
@@ -101,6 +169,22 @@ export class DropboxClient implements DropboxTransport {
     const text = await response.text();
     if (response.status === 409 && text.includes("not_found")) return null;
     throw this.errorFromResponse(`Dropbox download failed for ${path}`, response, text);
+  }
+
+  async getMetadata(path: string): Promise<DropboxFileMetadata | null> {
+    const token = await this.accessToken();
+    const response = await fetch("https://api.dropboxapi.com/2/files/get_metadata", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ path })
+    });
+    const text = await response.text();
+    if (response.ok) return parseFileMetadata(JSON.parse(text) as RawDropboxMetadata, path);
+    if (response.status === 409 && text.includes("not_found")) return null;
+    throw this.errorFromResponse(`Dropbox metadata lookup failed for ${path}`, response, text);
   }
 
   async move(from: string, to: string): Promise<void> {
@@ -120,6 +204,27 @@ export class DropboxClient implements DropboxTransport {
       throw new DropboxConflictError(`Dropbox move conflict ${from} -> ${to}`, response.headers.get("x-dropbox-request-id"), text);
     }
     throw this.errorFromResponse(`Dropbox move failed ${from} -> ${to}`, response, text);
+  }
+
+  async copy(from: string, to: string): Promise<DropboxFileMetadata> {
+    const token = await this.accessToken();
+    let response = await this.copyRequest(token, from, to);
+    let text = await response.text();
+
+    if (response.status === 409 && text.includes("to/not_found")) {
+      await this.ensureParentFolders(token, to);
+      response = await this.copyRequest(token, from, to);
+      text = await response.text();
+    }
+
+    if (response.ok) {
+      const parsed = JSON.parse(text) as { metadata?: RawDropboxMetadata };
+      return parseFileMetadata(parsed.metadata ?? {}, to);
+    }
+    if (response.status === 409) {
+      throw new DropboxConflictError(`Dropbox copy conflict ${from} -> ${to}`, response.headers.get("x-dropbox-request-id"), text);
+    }
+    throw this.errorFromResponse(`Dropbox copy failed ${from} -> ${to}`, response, text);
   }
 
   async delete(path: string): Promise<void> {
@@ -179,7 +284,52 @@ export class DropboxClient implements DropboxTransport {
     }
   }
 
-  private async uploadRequest(token: string, path: string, content: string, mode: "add" | "overwrite"): Promise<Response> {
+  async listFolderChanges(root?: string, cursor?: string): Promise<DropboxChangePage> {
+    if ((root && cursor) || (!root && !cursor)) {
+      throw new Error("Dropbox change listing requires exactly one of root or cursor");
+    }
+    const token = await this.accessToken();
+    const entries: DropboxChangeEntry[] = [];
+    let response = cursor
+      ? await this.listFolderContinueRequest(token, cursor)
+      : await this.listFolderChangeRequest(token, root!);
+    let currentCursor = cursor ?? "";
+
+    for (;;) {
+      const text = await response.text();
+      if (!response.ok) {
+        if (response.status === 409 && text.includes("reset")) {
+          throw new DropboxCursorResetError(
+            "Dropbox change cursor must be rebuilt",
+            response.headers.get("x-dropbox-request-id"),
+            text
+          );
+        }
+        if (response.status === 409 && text.includes("not_found") && root) {
+          return { entries: [], cursor: currentCursor };
+        }
+        throw this.errorFromResponse("Dropbox change listing failed", response, text);
+      }
+
+      const parsed = JSON.parse(text) as {
+        entries: RawDropboxMetadata[];
+        cursor: string;
+        has_more: boolean;
+      };
+      currentCursor = parsed.cursor;
+      entries.push(...parsed.entries.map(parseChangeEntry));
+      if (!parsed.has_more) return { entries, cursor: currentCursor };
+      response = await this.listFolderContinueRequest(token, currentCursor);
+    }
+  }
+
+  private async uploadRequest(
+    token: string,
+    path: string,
+    content: string,
+    mode: DropboxUploadMode,
+    strictConflict: boolean
+  ): Promise<Response> {
     return fetch("https://content.dropboxapi.com/2/files/upload", {
       method: "POST",
       headers: {
@@ -190,7 +340,7 @@ export class DropboxClient implements DropboxTransport {
           mode,
           autorename: false,
           mute: true,
-          strict_conflict: mode === "add"
+          strict_conflict: strictConflict
         })
       },
       body: content
@@ -205,6 +355,45 @@ export class DropboxClient implements DropboxTransport {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ from_path: from, to_path: to, autorename: false, allow_ownership_transfer: false })
+    });
+  }
+
+  private async copyRequest(token: string, from: string, to: string): Promise<Response> {
+    return fetch("https://api.dropboxapi.com/2/files/copy_v2", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from_path: from,
+        to_path: to,
+        autorename: false,
+        allow_shared_folder: false,
+        allow_ownership_transfer: false
+      })
+    });
+  }
+
+  private async listFolderChangeRequest(token: string, root: string): Promise<Response> {
+    return fetch("https://api.dropboxapi.com/2/files/list_folder", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ path: root, recursive: true, include_deleted: true })
+    });
+  }
+
+  private async listFolderContinueRequest(token: string, cursor: string): Promise<Response> {
+    return fetch("https://api.dropboxapi.com/2/files/list_folder/continue", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ cursor })
     });
   }
 
@@ -235,4 +424,46 @@ export class DropboxClient implements DropboxTransport {
   private errorFromResponse(message: string, response: Response, responseBody: string): DropboxApiError {
     return new DropboxApiError(message, response.status, response.headers.get("x-dropbox-request-id"), responseBody);
   }
+}
+
+function parseFileMetadata(raw: RawDropboxMetadata, fallbackPath: string): DropboxFileMetadata {
+  if (
+    !raw.id
+    || !raw.rev
+    || !raw.content_hash
+    || typeof raw.size !== "number"
+  ) {
+    throw new Error(`Dropbox file metadata incomplete for ${fallbackPath}`);
+  }
+  return {
+    id: raw.id,
+    path: raw.path_display ?? raw.path_lower ?? fallbackPath,
+    rev: raw.rev,
+    content_hash: raw.content_hash,
+    size: raw.size,
+    ...(raw.server_modified ? { server_modified: raw.server_modified } : {})
+  };
+}
+
+function parseChangeEntry(raw: RawDropboxMetadata): DropboxChangeEntry {
+  const tag = raw[".tag"];
+  if (tag !== "file" && tag !== "folder" && tag !== "deleted") {
+    throw new Error(`Unsupported Dropbox change entry tag: ${String(tag)}`);
+  }
+  const path = raw.path_display ?? raw.path_lower;
+  if (!raw.name || !path) throw new Error("Dropbox change entry is missing name/path");
+  if (tag !== "file") return { tag, name: raw.name, path };
+  if (!raw.id || !raw.rev || !raw.content_hash || typeof raw.size !== "number") {
+    throw new Error(`Dropbox changed file metadata incomplete for ${path}`);
+  }
+  return {
+    tag,
+    name: raw.name,
+    path,
+    id: raw.id,
+    rev: raw.rev,
+    content_hash: raw.content_hash,
+    size: raw.size,
+    ...(raw.server_modified ? { server_modified: raw.server_modified } : {})
+  };
 }

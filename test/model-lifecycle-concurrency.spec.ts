@@ -213,4 +213,48 @@ describe("MODEL001 phase lifecycle", () => {
     }));
     expect(deliverable).toMatchObject({ kind: "rejected", code: "PHASE_COMPLETED" });
   });
+
+  it("promotes the lexicographically lowest pending phase and clears current when none remain", () => {
+    let state = emptyProjectState("PRJ-4204", "Phases", "phases");
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4210", title: "Current"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4212", title: "Third"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4211", title: "Second"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4210"
+    }));
+    expect(state.current_phase_id).toBe("PHASE-4211");
+    expect(state.plan_phases["PHASE-4211"].status).toBe("active");
+
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4211"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4212"
+    }));
+    expect(state.current_phase_id).toBeNull();
+  });
+
+  it("does not fabricate child completion when the current phase completes", () => {
+    let state = emptyProjectState("PRJ-4205", "Phases", "phases");
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4220", title: "Current"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4220", title: "Still pending", phase_id: "PHASE-4220"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-4220", title: "Still planned", version: "v1", phase_id: "PHASE-4220"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4220"
+    }));
+    expect(state.tasks["TASK-4220"].status).toBe("pending");
+    expect(state.deliverables["DEL-4220"].status).toBe("planned");
+  });
 });

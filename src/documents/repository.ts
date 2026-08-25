@@ -274,7 +274,7 @@ export class DocumentLedgerRepository {
       if (tip.stage !== "reference") {
         throw new Error(`Managed reference history has non-reference active tip ${tip.version_id}`);
       }
-      const provider = providerObservationFromVersion(tip);
+      const provider = await providerObservationForVersion(this.transport, tip);
       head = {
         schema_version: "1.0",
         project_id: projectId,
@@ -294,9 +294,11 @@ export class DocumentLedgerRepository {
         ? tip
         : nearestAncestorAtStage(tip, records, "published");
       const provider: Record<string, ManagedProviderObservation> = {};
-      const publishedProvider = publishedAncestor ? providerObservationFromVersion(publishedAncestor) : undefined;
+      const publishedProvider = publishedAncestor
+        ? await providerObservationForVersion(this.transport, publishedAncestor)
+        : undefined;
       if (publishedProvider) provider.published = publishedProvider;
-      const tipProvider = providerObservationFromVersion(tip);
+      const tipProvider = await providerObservationForVersion(this.transport, tip);
       if (tipProvider && tip.stage === "working") provider.working = tipProvider;
       if (tipProvider && tip.stage === "review") provider.review = tipProvider;
       if (tipProvider && tip.stage === "published") provider.published = tipProvider;
@@ -372,6 +374,29 @@ function nearestAncestorAtStage(
     if (current?.stage === stage) return current;
   }
   return undefined;
+}
+
+async function providerObservationForVersion(
+  transport: DropboxTransport,
+  record: DocumentVersionRecord
+): Promise<ManagedProviderObservation | undefined> {
+  const stored = providerObservationFromVersion(record);
+  if (!stored || !transport.getMetadata) return stored;
+  const current = await transport.getMetadata(stored.path);
+  if (
+    current
+    && current.content_hash === stored.content_hash
+    && current.size === stored.size
+  ) {
+    return {
+      path: stored.path,
+      file_id: current.id,
+      rev: current.rev,
+      content_hash: current.content_hash,
+      size: current.size
+    };
+  }
+  return stored;
 }
 
 function providerObservationFromVersion(record: DocumentVersionRecord): ManagedProviderObservation | undefined {

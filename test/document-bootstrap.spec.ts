@@ -4,6 +4,7 @@ import { DropboxConflictError, type DropboxFileMetadata, type DropboxTransport }
 import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { ManagedDocumentBootstrapper } from "../src/documents/bootstrap";
 import { sha256Text } from "../src/documents/hash";
+import { DocumentLedgerRepository } from "../src/documents/repository";
 import { ManagedDocumentService } from "../src/documents/service";
 
 class FakeTransport implements DropboxTransport {
@@ -156,5 +157,28 @@ describe("ManagedDocumentBootstrapper", () => {
     expect(result.head.provider?.reference?.file_id).toBe("id:reference-existing");
     expect(transport.files.get(referencePath)?.content).toBe("%PDF CRM market report");
     expect(transport.visibleUploads).toEqual([]);
+  });
+
+  it("uses a durable provider-file binding during baseline rebuild instead of duplicating an ingested reference", async () => {
+    const transport = new FakeTransport();
+    const referencePath = workspaceManagedDocumentPath("PRJ-0002", "project-os", "references", "UNCLASSIFIED/report.pdf");
+    const bootstrap = new ManagedDocumentBootstrapper(transport);
+    const originalMetadata = transport.seed(referencePath, "%PDF durable source", "id:reference-original");
+    const original = await bootstrap.bootstrapExistingManagedPath(state(), referencePath, originalMetadata, "reference");
+
+    const copiedMetadata = transport.seed(referencePath, "%PDF durable source", "id:reference-after-copy");
+    const ledger = new DocumentLedgerRepository(transport);
+    await ledger.writeProviderFileBinding({
+      schema_version: "1.0",
+      project_id: "PRJ-0002",
+      provider_file_id: copiedMetadata.id,
+      document_id: original.head.document_id
+    });
+
+    const rebuilt = await bootstrap.bootstrapExistingManagedPath(state(), referencePath, copiedMetadata, "reference");
+
+    expect(rebuilt.adopted).toBe(false);
+    expect(rebuilt.head.document_id).toBe(original.head.document_id);
+    expect(rebuilt.version.version_id).toBe(original.version.version_id);
   });
 });

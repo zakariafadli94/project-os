@@ -1,16 +1,24 @@
 import { DropboxConflictError, type DropboxTransport } from "../dropbox/client";
 import { machineDocumentRoot } from "../dropbox/layout";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+import { sha256Text } from "./hash";
 
 export interface ManagedDocumentRequestIntentRecord {
   schema_version: "1.0";
   project_id: string;
   request_id: string;
-  request_json: string;
+  request_sha256: string;
 }
 
 export interface ManagedDocumentRequestReceiptRecord extends ManagedDocumentRequestIntentRecord {
   receipt_json: string;
+}
+
+export class ManagedDocumentRequestIntentConflictError extends Error {
+  constructor(public readonly requestId: string) {
+    super(`Managed document request intent conflict: ${requestId}`);
+    this.name = "ManagedDocumentRequestIntentConflictError";
+  }
 }
 
 export class ManagedDocumentRequestLedger {
@@ -29,7 +37,8 @@ export class ManagedDocumentRequestLedger {
       parsed.schema_version !== "1.0"
       || parsed.project_id !== projectId
       || parsed.request_id !== requestId
-      || typeof parsed.request_json !== "string"
+      || typeof parsed.request_sha256 !== "string"
+      || !/^[a-f0-9]{64}$/.test(parsed.request_sha256)
     ) {
       throw new Error(`Invalid durable managed-document request intent: ${projectId}/${requestId}`);
     }
@@ -38,11 +47,12 @@ export class ManagedDocumentRequestLedger {
 
   async ensureIntent(projectId: string, requestId: string, requestJson: string): Promise<ManagedDocumentRequestIntentRecord> {
     assertRequestId(requestId);
+    const requestSha256 = await sha256Text(requestJson);
     const record: ManagedDocumentRequestIntentRecord = {
       schema_version: "1.0",
       project_id: projectId,
       request_id: requestId,
-      request_json: requestJson
+      request_sha256: requestSha256
     };
     const content = pretty(record);
     try {
@@ -52,8 +62,8 @@ export class ManagedDocumentRequestLedger {
       if (!(error instanceof DropboxConflictError)) throw error;
       const existing = await this.readIntent(projectId, requestId);
       if (!existing) throw error;
-      if (existing.request_json !== requestJson) {
-        throw new Error(`Managed document request intent conflict: ${requestId}`);
+      if (existing.request_sha256 !== requestSha256) {
+        throw new ManagedDocumentRequestIntentConflictError(requestId);
       }
       return existing;
     }
@@ -68,7 +78,8 @@ export class ManagedDocumentRequestLedger {
       parsed.schema_version !== "1.0"
       || parsed.project_id !== projectId
       || parsed.request_id !== requestId
-      || typeof parsed.request_json !== "string"
+      || typeof parsed.request_sha256 !== "string"
+      || !/^[a-f0-9]{64}$/.test(parsed.request_sha256)
       || typeof parsed.receipt_json !== "string"
     ) {
       throw new Error(`Invalid durable managed-document request receipt: ${projectId}/${requestId}`);
@@ -82,8 +93,9 @@ export class ManagedDocumentRequestLedger {
     requestJson: string,
     receiptJson: string
   ): Promise<ManagedDocumentRequestReceiptRecord> {
+    const requestSha256 = await sha256Text(requestJson);
     const intent = await this.readIntent(projectId, requestId);
-    if (!intent || intent.request_json !== requestJson) {
+    if (!intent || intent.request_sha256 !== requestSha256) {
       throw new Error(`Managed document receipt has no matching durable intent: ${requestId}`);
     }
     const record: ManagedDocumentRequestReceiptRecord = {
@@ -98,7 +110,7 @@ export class ManagedDocumentRequestLedger {
       if (!(error instanceof DropboxConflictError)) throw error;
       const existing = await this.readReceipt(projectId, requestId);
       if (!existing) throw error;
-      if (existing.request_json !== requestJson || existing.receipt_json !== receiptJson) {
+      if (existing.request_sha256 !== requestSha256 || existing.receipt_json !== receiptJson) {
         throw new Error(`Immutable managed-document request receipt conflict: ${requestId}`);
       }
       return existing;

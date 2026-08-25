@@ -134,7 +134,10 @@ describe("project artifact routing", () => {
     const repository = new ProjectRepository(transport, "v2");
     const state = emptyProjectState("PRJ-0003", "Growth", "growth", "Build growth agency");
     await repository.writeArtifact(state, await artifactRequest({ relative_path: "OTHER/foo.md" }));
-    expect(transport.uploads[0]).toBe("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/OTHER/foo.md");
+    const visiblePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/OTHER/foo.md";
+    expect(transport.uploads).toContain(visiblePath);
+    expect(transport.uploads.findIndex((path) => path.includes("/mutation-gate/intents/artifacts/")))
+      .toBeLessThan(transport.uploads.indexOf(visiblePath));
   });
 
   it("blocks a physical ARTIFACTS bypass for an exclusive governed domain", async () => {

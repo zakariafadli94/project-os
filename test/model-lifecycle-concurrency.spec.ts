@@ -258,3 +258,28 @@ describe("MODEL001 phase lifecycle", () => {
     expect(state.deliverables["DEL-4220"].status).toBe("planned");
   });
 });
+
+describe("MODEL001 governing references", () => {
+  it("rejects a superseded decision and accepts the current replacement for new deliverables", () => {
+    let state = emptyProjectState("PRJ-4301", "Governance", "governance");
+    state = commit(state, tx(state.project_id, state.revision, "decision.accept", {
+      decision_id: "DEC-4301", title: "Old", decision: "Old rule", reason: "Initial", impacts: []
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "decision.accept", {
+      decision_id: "DEC-4302", title: "New", decision: "New rule", reason: "Replacement", impacts: []
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "decision.supersede", {
+      decision_id: "DEC-4301", replacement_decision_id: "DEC-4302", reason: "Replaced"
+    }));
+
+    const oldDecision = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-4301", title: "Old governance", version: "v1", decision_ids: ["DEC-4301"]
+    }));
+    expect(oldDecision).toMatchObject({ kind: "rejected", code: "DELIVERABLE_DECISION_NOT_ACCEPTED" });
+
+    const currentDecision = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-4302", title: "Current governance", version: "v1", decision_ids: ["DEC-4302"]
+    }));
+    expect(currentDecision.kind).toBe("commit");
+  });
+});

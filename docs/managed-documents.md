@@ -67,9 +67,13 @@ Published/approved versions only.
 
 A published version is frozen logically. A new iteration starts by reopening it into `WORKING` while retaining the published pointer.
 
-If a human edits a managed `DELIVERABLES` file directly, Project OS never treats that edit as an implicit publication. It preserves the human bytes, restores the last published bytes, and routes the human change to a safe working/conflict path without overwriting an existing draft.
+If a human edits an **already managed** `DELIVERABLES` file directly, Project OS never treats that edit as an implicit publication. It preserves the human bytes, restores the last published bytes, and routes the human change to a safe working/conflict path without overwriting an existing draft.
 
 If a published file is deleted externally, the frozen published version is restored from immutable payload evidence and its logical published pointer does not advance.
+
+A previously unknown file appearing in `DELIVERABLES/**` is different: it is a strict final-zone mutation. Project OS requires durable governed provenance before a published bootstrap is allowed. Without that provenance, MutationGate preserves the bytes as an external mutation candidate and creates **no** published pointer.
+
+Detailed final-zone/operator contract: `docs/mutation-gate.md`.
 
 ## Generated projections are different
 
@@ -184,10 +188,13 @@ Each `ProjectGuard` keeps only a hot Dropbox change cursor. Durable document tru
 
 Processing rules:
 
+- MutationGate classifies strict final-zone files **before** bootstrap/reconciliation and before cursor advancement;
 - cursor is advanced only after every observed change is reconciled;
 - a crash replays the same page safely;
 - an expired/reset cursor triggers a bounded fresh baseline scan;
-- baseline adoption records existing managed files without classifying them as new human edits;
+- baseline adoption may record collaborative legacy files without classifying them as new human edits;
+- baseline/reset may bootstrap final published content only when durable governed provenance proves it;
+- unknown `DELIVERABLES/**` files become external mutation candidates and are never implicitly published;
 - durable provider-file bindings are honored during baseline rebuild so copied references do not become duplicate logical documents;
 - archived projects do not reconcile into active workspaces.
 
@@ -197,13 +204,15 @@ Existing projects are not bulk-rewritten.
 
 When a pre-ledger file is first encountered:
 
-- existing `DELIVERABLES` adopts as the initial published version;
-- existing `WORKING` adopts as working;
-- existing `REVIEW` adopts as review;
-- existing `REFERENCES` adopts as reference;
-- adoption preserves visible bytes and records provider metadata as baseline evidence.
+- existing `WORKING` may adopt as working;
+- existing `REVIEW` may adopt as review;
+- existing `REFERENCES` may adopt as reference;
+- existing `DELIVERABLES` does **not** adopt as published from path presence alone;
+- a final `DELIVERABLES` file may bootstrap as published only when accepted legacy artifact/document evidence or another governed recovery proof explains the exact provider content;
+- otherwise the final file is preserved as a MutationGate external candidate for explicit resolution;
+- permitted adoption preserves visible bytes and records provider metadata as baseline evidence.
 
-The legacy artifact API remains supported. Its governed writes gain managed-document evidence without forcing existing callers to understand the new lifecycle.
+The legacy artifact API remains supported. Its governed writes gain managed-document evidence without forcing existing callers to understand the new lifecycle. A real pre-effect governed artifact intent can explain an interrupted legacy artifact write; an unknown baseline file cannot impersonate that intent.
 
 ## Internal API surface
 
@@ -224,14 +233,17 @@ Authorization: Bearer <INGRESS_TOKEN>
 
 `/document-status` returns compact logical state and intentionally omits file contents and provider-internal metadata.
 
+Mutation candidate list/status/resolution routes are documented in `docs/mutation-gate.md`.
+
 ## Operational invariants
 
 - No direct PC/filesystem access is part of correctness.
 - Dropbox Desktop/Obsidian are optional human interfaces over Dropbox files.
-- `DELIVERABLES` edits never auto-publish.
+- An already governed `DELIVERABLES` edit never auto-publishes a new version.
+- An unknown `DELIVERABLES` file never becomes an initial published version from path presence alone.
 - Generated projection edits never auto-become canonical facts.
-- Human bytes are preserved before repair/restoration.
+- Human/external bytes are preserved before repair/restoration or candidate resolution.
 - Managed document history and request identity are isolated per project.
-- Legacy files are adopted lazily, not bulk rewritten.
+- Collaborative legacy files may be adopted lazily; strict final files require governed provenance.
 - Durable history/intent/receipt evidence survives loss of hot SQLite rows.
-- Continuity mode remains `stable`; this package does not perform transparent deployment cutover.
+- Continuity mode remains `stable`; managed-document/MutationGate work does not perform transparent deployment cutover.

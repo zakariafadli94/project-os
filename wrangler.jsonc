@@ -1,11 +1,12 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "project-os-guard",
-  "main": "src/index.ts",
+  "main": "src/index-mutation-gate.ts",
   "compatibility_date": "2026-08-20",
   "vars": {
     "PROJECT_OS_LAYOUT_MODE": "v2",
-    "PROJECT_OS_CONTINUITY_MODE": "stable"
+    "PROJECT_OS_CONTINUITY_MODE": "stable",
+    "PROJECT_OS_MUTATION_GATE_MODE": "observe"
   },
   "triggers": {
     "crons": ["*/5 * * * *"]

@@ -175,6 +175,30 @@ export function machineDocumentProviderPayloadPath(projectId: string, documentId
   return `${machineDocumentRoot(projectId)}/payloads/provider/${assertSafeDocumentId(documentId)}/${assertSafeDocumentVersionId(versionId)}/payload`;
 }
 
+export function machineMutationGateRoot(projectId: string): string {
+  return `${machineProjectRoot(projectId)}/mutation-gate`;
+}
+
+export function machineMutationIntentPath(projectId: string, requestId: string): string {
+  return `${machineMutationGateRoot(projectId)}/intents/artifacts/${assertSafeArtifactRequestId(requestId)}.json`;
+}
+
+export function machineMutationIntentDestinationBindingRoot(projectId: string, pathHash: string): string {
+  return `${machineMutationGateRoot(projectId)}/intent-bindings/destination/${assertSafeSha256(pathHash)}`;
+}
+
+export function machineMutationCandidatePath(projectId: string, candidateId: string): string {
+  return `${machineMutationGateRoot(projectId)}/candidates/${assertSafeMutationCandidateId(candidateId)}.json`;
+}
+
+export function machineMutationCandidatePayloadPath(projectId: string, candidateId: string): string {
+  return `${machineMutationGateRoot(projectId)}/payloads/candidates/${assertSafeMutationCandidateId(candidateId)}/payload`;
+}
+
+export function machineMutationResolutionPath(projectId: string, candidateId: string, resolutionId: string): string {
+  return `${machineMutationGateRoot(projectId)}/resolutions/${assertSafeMutationCandidateId(candidateId)}/${assertSafeMutationResolutionId(resolutionId)}.json`;
+}
+
 export function machineTransactionPath(status: MachineTransactionStatus, transactionId: string): string {
   return `${MACHINE_ROOT}/transactions/${status}/${assertSafeTransactionId(transactionId)}.json`;
 }
@@ -234,6 +258,12 @@ export const v2Paths = {
   machineDocumentVersionPath,
   machineDocumentTextPayloadPath,
   machineDocumentProviderPayloadPath,
+  machineMutationGateRoot,
+  machineMutationIntentPath,
+  machineMutationIntentDestinationBindingRoot,
+  machineMutationCandidatePath,
+  machineMutationCandidatePayloadPath,
+  machineMutationResolutionPath,
   machineTransactionPath,
   machineReceiptPath,
   machineArtifactRequestPath,
@@ -270,6 +300,16 @@ function assertSafeDocumentId(value: string): string {
 
 function assertSafeDocumentVersionId(value: string): string {
   if (!/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/.test(value)) throw new Error(`Unsafe document version id: ${value}`);
+  return value;
+}
+
+function assertSafeMutationCandidateId(value: string): string {
+  if (!/^MUTCAND-[A-F0-9]{24}$/.test(value)) throw new Error(`Unsafe mutation candidate id: ${value}`);
+  return value;
+}
+
+function assertSafeMutationResolutionId(value: string): string {
+  if (!/^MUTRES-[A-F0-9]{24}$/.test(value)) throw new Error(`Unsafe mutation resolution id: ${value}`);
   return value;
 }
 

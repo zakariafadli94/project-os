@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { documentIdFor } from "../src/domain/managed-document";
 import { emptyProjectState } from "../src/domain/transitions";
 import { DropboxConflictError, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
@@ -84,17 +85,36 @@ const workingPath = workspaceManagedDocumentPath("PRJ-0002", "project-os", "work
 const publishedPath = workspaceManagedDocumentPath("PRJ-0002", "project-os", "deliverables", logicalPath);
 
 describe("ManagedDocumentBootstrapper", () => {
-  it("adopts a pre-ledger DELIVERABLE as published evidence without rewriting visible bytes", async () => {
+  it("refuses to infer publication from an unknown DELIVERABLE provider file", async () => {
+    const transport = new FakeTransport();
+    const content = "# Strategy\n\nUnknown provider file";
+    const metadata = transport.seed(publishedPath, content, "id:published-unknown");
+    const bootstrap = new ManagedDocumentBootstrapper(transport);
+
+    await expect(bootstrap.bootstrapExistingManagedPath(state(), publishedPath, metadata, "published"))
+      .rejects.toThrow(/published provenance/i);
+
+    const documentId = await documentIdFor("PRJ-0002", logicalPath);
+    expect(await new DocumentLedgerRepository(transport).readHead("PRJ-0002", documentId)).toBeNull();
+    expect(transport.files.get(publishedPath)?.content).toBe(content);
+    expect(transport.visibleUploads).toEqual([]);
+    expect(transport.copies).toHaveLength(0);
+  });
+
+  it("adopts a DELIVERABLE only when explicit legacy artifact provenance is supplied", async () => {
     const transport = new FakeTransport();
     const content = "# Strategy\n\nPublished legacy version";
     const metadata = transport.seed(publishedPath, content, "id:published-legacy");
     const bootstrap = new ManagedDocumentBootstrapper(transport);
 
-    const result = await bootstrap.bootstrapExistingManagedPath(state(), publishedPath, metadata, "published");
+    const result = await bootstrap.bootstrapExistingManagedPath(
+      state(), publishedPath, metadata, "published", { publishedProvenance: "legacy_artifact" }
+    );
 
     expect(result.adopted).toBe(true);
     expect(result.head.published_version_id).toBe(result.version.version_id);
     expect(result.version.stage).toBe("published");
+    expect(result.version.source).toBe("legacy_artifact_api");
     expect(transport.files.get(publishedPath)?.content).toBe(content);
     expect(transport.visibleUploads).toEqual([]);
     expect(transport.copies).toHaveLength(1);
@@ -125,11 +145,13 @@ describe("ManagedDocumentBootstrapper", () => {
     expect(transport.visibleUploads).toEqual([workingPath]);
   });
 
-  it("merges a published baseline and a later WORKING baseline into one logical document head", async () => {
+  it("merges an explicitly governed published baseline and a later WORKING baseline", async () => {
     const transport = new FakeTransport();
     const published = transport.seed(publishedPath, "# Strategy\n\nPublished V10", "id:pub-same-doc");
     const bootstrap = new ManagedDocumentBootstrapper(transport);
-    const publishedAdoption = await bootstrap.bootstrapExistingManagedPath(state(), publishedPath, published, "published");
+    const publishedAdoption = await bootstrap.bootstrapExistingManagedPath(
+      state(), publishedPath, published, "published", { publishedProvenance: "legacy_artifact" }
+    );
     const working = transport.seed(workingPath, "# Strategy\n\nPublished V10\n\nNew iteration", "id:work-same-doc");
 
     const workingAdoption = await bootstrap.bootstrapExistingManagedPath(state(), workingPath, working, "working");

@@ -4,6 +4,12 @@ import {
   machineDocumentProviderPayloadPath,
   machineDocumentTextPayloadPath,
   machineDocumentVersionPath,
+  machineMutationCandidatePath,
+  machineMutationCandidatePayloadPath,
+  machineMutationGateRoot,
+  machineMutationIntentDestinationBindingRoot,
+  machineMutationIntentPath,
+  machineMutationResolutionPath,
   workspaceManagedDocumentPath,
   workspaceManagedZoneRoot
 } from "../src/dropbox/layout";
@@ -47,9 +53,41 @@ it("builds project-isolated hidden document ledger paths", () => {
     .toBe(`/PROJECT_OS/.project-os/projects/PRJ-0002/documents/payloads/provider/${documentId}/${versionId}/payload`);
 });
 
+it("builds project-isolated mutation-gate paths", () => {
+  const requestId = "ART-MUTATION-000001";
+  const candidateId = "MUTCAND-111111111111111111111111";
+  const resolutionId = "MUTRES-222222222222222222222222";
+  const hash = "a".repeat(64);
+
+  expect(machineMutationGateRoot("PRJ-0002"))
+    .toBe("/PROJECT_OS/.project-os/projects/PRJ-0002/mutation-gate");
+  expect(machineMutationIntentPath("PRJ-0002", requestId))
+    .toBe(`/PROJECT_OS/.project-os/projects/PRJ-0002/mutation-gate/intents/artifacts/${requestId}.json`);
+  expect(machineMutationIntentDestinationBindingRoot("PRJ-0002", hash))
+    .toBe(`/PROJECT_OS/.project-os/projects/PRJ-0002/mutation-gate/intent-bindings/destination/${hash}`);
+  expect(machineMutationCandidatePath("PRJ-0002", candidateId))
+    .toBe(`/PROJECT_OS/.project-os/projects/PRJ-0002/mutation-gate/candidates/${candidateId}.json`);
+  expect(machineMutationCandidatePayloadPath("PRJ-0002", candidateId))
+    .toBe(`/PROJECT_OS/.project-os/projects/PRJ-0002/mutation-gate/payloads/candidates/${candidateId}/payload`);
+  expect(machineMutationResolutionPath("PRJ-0002", candidateId, resolutionId))
+    .toBe(`/PROJECT_OS/.project-os/projects/PRJ-0002/mutation-gate/resolutions/${candidateId}/${resolutionId}.json`);
+});
+
 it("rejects unsafe managed document path components", () => {
   expect(() => workspaceManagedDocumentPath("PRJ-0003", "growth", "working", "../STATE.md")).toThrow();
   expect(() => machineDocumentHeadPath("PRJ-0002", "DOC-bad")).toThrow();
   expect(() => machineDocumentVersionPath("PRJ-0002", "DOC-0123456789ABCDEF01234567", "VER-bad")).toThrow();
   expect(() => machineDocumentTextPayloadPath("PRJ-0002", "abc")).toThrow();
+});
+
+it("rejects unsafe mutation-gate path components", () => {
+  expect(() => machineMutationIntentPath("PRJ-0002", "ART-bad")).toThrow();
+  expect(() => machineMutationIntentDestinationBindingRoot("PRJ-0002", "abc")).toThrow();
+  expect(() => machineMutationCandidatePath("PRJ-0002", "MUTCAND-bad")).toThrow();
+  expect(() => machineMutationCandidatePayloadPath("PRJ-0002", "../candidate")).toThrow();
+  expect(() => machineMutationResolutionPath(
+    "PRJ-0002",
+    "MUTCAND-111111111111111111111111",
+    "MUTRES-bad"
+  )).toThrow();
 });

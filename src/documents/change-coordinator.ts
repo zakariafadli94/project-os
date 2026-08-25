@@ -8,6 +8,8 @@ import {
 } from "../dropbox/client";
 import { workspaceProjectRoot } from "../dropbox/layout";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+import { MutationGateClassifier } from "../mutation-gate/classifier";
+import { MutationGateService, type MutationGateMode, type MutationGateProcessSummary } from "../mutation-gate/service";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
 import {
   ManagedDocumentReconciler,
@@ -22,7 +24,7 @@ export interface ManagedDocumentCursorStore {
   delete(key: string): Promise<boolean>;
 }
 
-export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSummary {
+export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSummary, MutationGateProcessSummary {
   bootstrapped: number;
   cursor_reset: boolean;
   baseline: boolean;
@@ -40,19 +42,24 @@ export class ManagedDocumentChangeCoordinator {
   private readonly transport: ResilientDropboxTransport;
   private readonly reconciler: ManagedDocumentReconciler;
   private readonly bootstrapper: ManagedDocumentBootstrapper;
+  private readonly mutationClassifier: MutationGateClassifier;
+  private readonly mutationGate: MutationGateService;
 
   constructor(
     transport: DropboxTransport,
-    private readonly cursorStore: ManagedDocumentCursorStore
+    private readonly cursorStore: ManagedDocumentCursorStore,
+    private readonly gateMode: MutationGateMode = "observe"
   ) {
     this.transport = new ResilientDropboxTransport(transport);
     this.reconciler = new ManagedDocumentReconciler(transport);
     this.bootstrapper = new ManagedDocumentBootstrapper(transport);
+    this.mutationClassifier = new MutationGateClassifier(transport);
+    this.mutationGate = new MutationGateService(transport, gateMode);
   }
 
   async reconcile(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
     if (state.status === "archived") {
-      return emptySummary({ archived: true });
+      return emptySummary({ archived: true }, this.mutationGateMode());
     }
     if (!this.transport.listFolderChanges) {
       throw new Error("Dropbox transport does not support managed-document change cursors");
@@ -76,20 +83,23 @@ export class ManagedDocumentChangeCoordinator {
       page = await this.transport.listFolderChanges(root);
     }
 
+    const detectionSource = cursorReset ? "cursor_reset" : baseline ? "baseline" : "incremental";
+    // MutationGate runs before any bootstrap/reconciliation and before cursor
+    // advancement so an unknown final-zone file cannot disappear behind a cursor.
+    const gateSummary = await this.mutationGate.processChanges(state, page.entries, detectionSource);
+
     let bootstrapped = 0;
     if (baseline) {
       bootstrapped = await this.bootstrapBaseline(state, page.entries);
     }
 
-    // Never advance the cursor until every observed change has been reconciled.
-    // A crash/failure therefore replays the same provider page, which is safe because
-    // version records are immutable and provider observations make replay idempotent.
     const summary = await this.reconciler.reconcileChanges(state, page.entries);
     const cursorAdvanced = page.cursor.length > 0 && page.cursor !== existingCursor;
     if (page.cursor.length > 0) await this.cursorStore.put(CURSOR_KEY, page.cursor);
 
     return {
       ...summary,
+      ...gateSummary,
       bootstrapped,
       cursor_reset: cursorReset,
       baseline,
@@ -108,6 +118,12 @@ export class ManagedDocumentChangeCoordinator {
     for (const candidate of candidates) {
       const metadata = await this.metadataFor(candidate.change);
       if (!metadata) continue;
+
+      if (candidate.stage === "published") {
+        const classification = await this.mutationClassifier.classify(state, candidate.change.path, metadata);
+        if (classification.kind !== "not_final_zone") continue;
+      }
+
       const result = await this.bootstrapper.bootstrapExistingManagedPath(
         state,
         candidate.change.path,
@@ -153,8 +169,11 @@ export class ManagedDocumentChangeCoordinator {
         ...(change.server_modified ? { server_modified: change.server_modified } : {})
       };
     }
-    if (!this.transport.getMetadata) return null;
     return this.transport.getMetadata(change.path);
+  }
+
+  private mutationGateMode(): MutationGateMode {
+    return this.gateMode;
   }
 }
 
@@ -163,7 +182,7 @@ function isProjectedDeliverableMetadata(state: ProjectState, relativePath: strin
   return Object.prototype.hasOwnProperty.call(state.deliverables, relativePath.slice(0, -3));
 }
 
-function emptySummary(flags: { archived: boolean }): ManagedDocumentChangeSummary {
+function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): ManagedDocumentChangeSummary {
   return {
     scanned: 0,
     ignored: 0,
@@ -172,6 +191,9 @@ function emptySummary(flags: { archived: boolean }): ManagedDocumentChangeSummar
     duplicates: 0,
     restored: 0,
     conflicts: 0,
+    candidates: 0,
+    mutation_gate_mode: mode,
+    policy_violations: 0,
     bootstrapped: 0,
     cursor_reset: false,
     baseline: false,

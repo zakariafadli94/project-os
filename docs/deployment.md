@@ -18,19 +18,23 @@ Repository and Worker:
 - `ProjectGuard` → `PROJECT_GUARD`
 - `RegistryGuard` → `REGISTRY_GUARD`
 
-Production layout is V2 and continuity remains:
+Production layout is V2, continuity remains stable, and the initial MutationGate rollout mode is observe:
 
 ```text
 PROJECT_OS_LAYOUT_MODE=v2
 PROJECT_OS_CONTINUITY_MODE=stable
+PROJECT_OS_MUTATION_GATE_MODE=observe
 ```
 
 Do not change continuity mode merely because a feature PR is merged. Transparent candidate rollout/cutover remains owned by the later deployment package.
 
-The scheduled trigger runs every five minutes. It now performs two independent recovery jobs:
+Do not enable `PROJECT_OS_MUTATION_GATE_MODE=enforce` in the first MutationGate production deployment. `enforce` is a separate rollout gate after observe-mode inventory and production proof.
+
+The scheduled trigger runs every five minutes. It performs independent recovery/reconciliation jobs for:
 
 - transaction/artifact inbox processing;
-- fleet materialization reconciliation.
+- fleet materialization reconciliation;
+- managed-document/MutationGate provider change reconciliation.
 
 Materialization reconciliation uses bounded project concurrency and isolates one blocked project from the rest.
 
@@ -47,7 +51,7 @@ INGRESS_TOKEN
 
 Never commit or paste their values into Markdown or chat. Documentation may contain secret names and regeneration procedures only.
 
-`INGRESS_TOKEN` protects direct transaction ingress and authenticated administrative endpoints.
+`INGRESS_TOKEN` protects direct transaction/artifact/document/candidate-resolution ingress and authenticated administrative endpoints.
 
 ## 3. Dropbox application
 
@@ -77,6 +81,8 @@ or the locale-equivalent Dropbox App Folder.
 
 Dropbox Desktop is optional. Project OS does not depend on a user computer, direct filesystem access, a desktop daemon or a local bridge for correctness.
 
+MutationGate does not yet change Dropbox credential scope or cryptographically prove which actor performed a provider write. Those trust-boundary hardening concerns remain for `IMP-SECURITY001`.
+
 ## 4. V2 storage layout
 
 Machine persistence is below `.project-os/`; human Markdown is below `WORKSPACE/`.
@@ -98,11 +104,16 @@ PROJECT_OS/
 │           ├── CONSTRAINTS/
 │           ├── TASKS/
 │           ├── RESEARCH/
+│           ├── INPUTS/
+│           ├── REFERENCES/
+│           ├── WORKING/
+│           ├── REVIEW/
 │           └── DELIVERABLES/
 └── .project-os/
     ├── registry/
     ├── transactions/
     ├── receipts/
+    ├── artifacts/
     └── projects/
         └── PRJ-xxxx/
             ├── state.json
@@ -110,7 +121,13 @@ PROJECT_OS/
             ├── events/
             ├── commits/
             ├── materializations/
-            └── materialization-head.json
+            ├── materialization-head.json
+            ├── documents/
+            └── mutation-gate/
+                ├── intents/
+                ├── candidates/
+                ├── payloads/
+                └── resolutions/
 ```
 
 Folders are lazy. Empty project subdirectories are not required.
@@ -154,7 +171,7 @@ Full materialization semantics are in `docs/materialization.md`.
 
 ## 6. Transaction ingress and receipt gate
 
-Durable changes use typed Project OS transactions.
+Durable canonical changes use typed Project OS transactions.
 
 Public ingress remains:
 
@@ -168,6 +185,31 @@ External project creation uses `PRJ-AUTO`; RegistryGuard allocates `PRJ-xxxx`.
 The committed receipt remains the business persistence proof. For `project.create`, RegistryGuard owns publication of the final standalone committed receipt after registry finalization.
 
 Normal users never need a materialization/sync command.
+
+## 6A. Governed artifact/document/candidate ingress
+
+Final business outputs must use governed ingress rather than raw Dropbox writes.
+
+Public authenticated mutation routes include:
+
+```text
+POST /v1/artifacts
+POST /v1/documents
+POST /v1/mutation-candidates/resolve
+Authorization: Bearer <INGRESS_TOKEN>
+```
+
+MutationGate distinguishes:
+
+```text
+SUBMITTED -> COMMITTED -> CANONICAL VERIFIED -> ACCEPTED
+```
+
+For an artifact, durable intent alone is `SUBMITTED`. A committed artifact receipt is `COMMITTED`; final provider bytes must also match the durable intent before the artifact is reported `CANONICAL VERIFIED`. Acceptance remains object-specific and is never inferred from provider file presence.
+
+Unknown strict final-zone files are preserved as external candidates. Candidate list/status responses are compact and do not expose payload content; resolution reuses normal governed artifact/document flows.
+
+Full contract: `docs/mutation-gate.md`.
 
 ## 7. Administrative existing-project materialization
 
@@ -266,8 +308,11 @@ Requirements:
 - dry-run green on exact final PR head;
 - no production secret/config drift;
 - continuity still `stable`;
+- MutationGate default/config remains `observe` until its separate enforcement gate;
 - no user-facing command/version-selection change;
 - no direct PC/filesystem dependency introduced.
+
+For MutationGate, pre-merge CI must include PRJ-0003-shaped bypasses, baseline/reset, governed crash recovery, candidate resolution crash recovery, multi-project isolation, service recreation and status-vocabulary tests.
 
 ## 13. Exact-commit production deployment validation
 
@@ -316,6 +361,37 @@ Replay the same controlled transaction ID. The business revision must not increm
 
 Verify production continuity status/config still resolves to `stable`.
 
+## 14A. `IMP-MUTATIONGATE001` observe-first production proof
+
+First production rollout must keep:
+
+```text
+PROJECT_OS_CONTINUITY_MODE=stable
+PROJECT_OS_MUTATION_GATE_MODE=observe
+```
+
+Do **not** repair historical PRJ-0003 deviations as part of initial deployment. Do **not** enable `enforce` in the same change.
+
+Observe-mode validation must prove:
+
+1. existing governed published/artifact outputs are classified as governed rather than candidates;
+2. an isolated controlled unknown strict-zone file is preserved byte-for-byte and recorded as one candidate with no project revision/publication/acceptance effect;
+3. baseline and cursor-reset paths do not bootstrap unknown `DELIVERABLES` as published;
+4. a governed artifact intent survives provider-write/crash recovery without becoming a candidate or being rerouted after route drift;
+5. candidate resolution exact replay is idempotent and a changed payload cannot reuse terminal resolution identity;
+6. `SUBMITTED`, `COMMITTED`, `CANONICAL VERIFIED` and `ACCEPTED` are reported/used distinctly;
+7. candidate evidence remains reconstructible from Dropbox after hot service/SQLite loss;
+8. project isolation holds for candidate/intents/resolutions;
+9. no candidate payload or secret value appears in logs/status responses.
+
+Only after observe inventory is reviewed and production proof is accepted may `PROJECT_OS_MUTATION_GATE_MODE=enforce` be separately enabled.
+
+Rollback from enforcement is configuration-only back to `observe`. Do not delete append-only intent/candidate/resolution evidence during rollback.
+
+After MutationGate itself is production-validated, historical PRJ-0003 direct-write files are audited separately and adopted/rejected through governed flows. Do not resubmit an already accepted canonical decision such as `DEC-EXECUTABILITY001` merely because related files need governance repair.
+
+After that repair, revalidate the accepted SCHEMA rollout design against MutationGate record families before resuming SCHEMA runtime implementation.
+
 ## 15. Recovery validation
 
 Recovery scenarios to keep tested/documented:
@@ -325,17 +401,22 @@ Recovery scenarios to keep tested/documented:
 - output upload interrupted → resume missing/uncertain output only;
 - completed-generation record exists but head update failed → repair head with zero workspace rewrite;
 - four fast canonical revisions → coalesce human projection safely while preserving every commit record;
-- archived projection retry → never resurrect active workspace.
+- archived projection retry → never resurrect active workspace;
+- MutationGate artifact intent written + provider bytes landed + receipt missing → governed in-flight replay, no candidate;
+- MutationGate candidate terminal marker written + resolution detail missing → repair detail without rerunning downstream;
+- MutationGate service/hot cache lost → rebuild candidate identity/payload/resolution from Dropbox durable evidence.
 
 ## 16. Legacy/shadow notes
 
 Historical `legacy` and `shadow` modes remain documented compatibility concepts. Production currently runs V2.
 
-Do not perform legacy directory cleanup as part of `IMP-MATERIAL001`. Deleting or archiving legacy Dropbox history is a separate destructive operation requiring explicit approval.
+Do not perform legacy directory cleanup as part of `IMP-MATERIAL001` or `IMP-MUTATIONGATE001`. Deleting or archiving legacy Dropbox history is a separate destructive operation requiring explicit approval.
+
+Legacy managed-document compatibility does not mean unknown final files may be auto-published. `WORKING`, `REVIEW` and `REFERENCES` keep bounded lazy adoption; unknown `DELIVERABLES` require governed provenance or become MutationGate candidates.
 
 Likewise, alternate persistence providers are not introduced here. Dropbox remains the production provider until the later persistence-provider package is separately designed and approved.
 
-## 17. Production completion gate
+## 17. Production completion gates
 
 `IMP-MATERIAL001` is complete only after:
 
@@ -349,3 +430,5 @@ Likewise, alternate persistence providers are not introduced here. Dropbox remai
 - critical STATE/HANDOFF coherence is proven;
 - replay idempotency is proven;
 - canonical PRJ-0002 research evidence and task closure are recorded through normal receipt-gated transactions.
+
+`IMP-MUTATIONGATE001` is production-complete only after its own exact final PR head/merge deployment proof, observe-mode production validation, accepted decision on enforcement rollout, any separately approved enforcement activation, and canonical PRJ-0002 evidence. PR CI alone does not authorize merge, deployment, `enforce`, PRJ-0003 repair or SCHEMA resumption.

@@ -164,7 +164,7 @@ Working/review document versions may still be durably versioned without being ca
 
 Never turn an AI recommendation into a canonical decision without user acceptance.
 
-## 9. Transaction-only canonical writes
+## 9. Transaction-only canonical writes and governed mutation routes
 
 Never directly modify machine-managed canonical project state.
 
@@ -179,6 +179,12 @@ Never bypass Project Guard with generic edits such as:
 Durable business changes use supported typed Project OS transactions only.
 
 Managed-document lifecycle operations are a separate typed interface and must not be used to bypass canonical transactions.
+
+Agent/operator writes to final business outputs must also use governed artifact/document ingress. A raw Dropbox create/update/move into `DELIVERABLES/**`, governed artifact destinations or business `ARTIFACTS/**` is not a parallel publication route.
+
+When a typed route exists, ChatGPT/operator must use it. If a raw provider write happens anyway, treat it as external/unverified until ProjectGuard evidence proves otherwise. Never fabricate a receipt, document head, mutation intent or hidden ledger record to make a bypass look governed.
+
+Detailed final-zone contract: `docs/mutation-gate.md`.
 
 ## 10. Transaction procedure
 
@@ -200,7 +206,7 @@ V2 Dropbox incoming queue:
 
 Platform authorization confirmations are security controls, not workflow commands.
 
-## 11. Receipt / canonical commit gate
+## 11. Receipt / verification gates
 
 Never claim a durable business change was recorded unless the committed result is proven.
 
@@ -209,6 +215,35 @@ A committed canonical business result is not invalidated because Markdown projec
 If a transaction is rejected, explain the validation issue. If it conflicts, preserve both realities and ask only when a genuine business-direction choice is required.
 
 Managed-document receipts prove document lifecycle/version operations; they do not substitute for canonical business commit receipts.
+
+### Mutation status vocabulary
+
+Do not collapse these terms:
+
+```text
+SUBMITTED -> COMMITTED -> CANONICAL VERIFIED -> ACCEPTED
+```
+
+- **SUBMITTED**: governed ingress/pre-effect durable intent exists; no successful final effect is claimed.
+- **COMMITTED**: the semantic operation has its required terminal committed receipt/evidence.
+- **CANONICAL VERIFIED**: family-specific authoritative evidence has been checked against the resulting durable/provider representation.
+- **ACCEPTED**: only an explicit object-specific human/business lifecycle rule can create acceptance.
+
+For artifacts, a committed receipt alone is `COMMITTED`. `CANONICAL VERIFIED` additionally requires the final provider bytes to match the durable intent. File presence, upload success, candidate capture or technical resolution never imply `ACCEPTED`.
+
+### MutationGate candidate rule
+
+Unknown strict final-zone files are preserved as external mutation candidates before bootstrap/reconciliation and before Dropbox cursor advancement.
+
+Candidate capture:
+
+- snapshots provider bytes into immutable hidden evidence;
+- creates no published document pointer;
+- creates no artifact committed receipt;
+- creates no canonical project revision;
+- creates no acceptance.
+
+Resolution is explicit and typed: `candidate.reject`, `candidate.adopt_artifact`, or `candidate.adopt_working`. Adoption must pass through the normal governed artifact/document service and a successful adoption resolution is written only after its downstream operation commits.
 
 ## 12. Asynchronous materialization
 
@@ -249,6 +284,8 @@ Managed-document concurrency has two protections:
 - persistence-provider compare-and-swap using the exact observed provider revision for replacements.
 
 A provider CAS conflict is not a transient overwrite opportunity. Preserve the newer external reality and reconcile it.
+
+Candidate resolution is same-project serialized through ProjectGuard. Its internal unresolved-path capability is bound to the exact candidate and destination and must never be exposed as a public `skipGuard` option.
 
 ## 14. Decisions and plans
 
@@ -340,9 +377,11 @@ Generated canonical notes and managed collaborative documents are different clas
 `DELIVERABLES/`
 : explicitly published/approved versions. A new iteration reopens from the frozen published version into WORKING.
 
-Direct human edits to a managed published deliverable never auto-publish. Preserve the edited bytes first, retain/restore the approved published version, and keep any existing different WORKING draft untouched.
+Direct human edits to an already managed published deliverable never auto-publish. Preserve the edited bytes first, retain/restore the approved published version, and keep any existing different WORKING draft untouched.
 
-Detailed runtime contract: `docs/managed-documents.md`.
+An unknown `DELIVERABLES/**` file is not an initial publication. Published bootstrap requires durable governed provenance; otherwise MutationGate preserves it as an external candidate for explicit resolution.
+
+Detailed runtime contracts: `docs/managed-documents.md` and `docs/mutation-gate.md`.
 
 ## 18. Machine layer
 
@@ -362,6 +401,11 @@ V2 machine state is outside the Obsidian Vault:
         ├── commits/
         ├── materializations/
         ├── materialization-head.json
+        ├── mutation-gate/
+        │   ├── intents/
+        │   ├── candidates/
+        │   ├── payloads/
+        │   └── resolutions/
         └── documents/
             ├── heads/
             ├── versions/
@@ -375,7 +419,7 @@ Never expose these machine files as ordinary project notes.
 Never write human generated Markdown below `.project-os/`.
 Never write events, receipts, transaction queues, commits or structured machine state below `WORKSPACE/`.
 
-Managed document version records are immutable evidence. Mutable heads/indexes are reconstructible and may advance only after referenced immutable evidence exists.
+Managed document version records and MutationGate intents/candidates/resolutions are durable evidence. Mutable heads/indexes are reconstructible and may advance only after referenced immutable evidence exists.
 
 ## 19. Generated-note metadata
 
@@ -434,7 +478,7 @@ For modern V2 projects it can synchronously drive the projection coordinator to 
 
 Never ask a normal user to invoke it.
 
-Managed documents use lazy adoption rather than bulk workspace rewrite. Pre-ledger `DELIVERABLES`, `WORKING`, `REVIEW`, and `REFERENCES` files are adopted only when encountered/needed, preserving their visible bytes.
+Managed documents use bounded lazy adoption rather than bulk workspace rewrite. Pre-ledger `WORKING`, `REVIEW`, and `REFERENCES` files may be adopted when encountered/needed, preserving their visible bytes. Pre-ledger `DELIVERABLES` files require durable governed provenance before published bootstrap; unknown final files become MutationGate candidates instead.
 
 ## 22. Projection version and completed evidence
 
@@ -458,11 +502,15 @@ Managed-document provider actions may span several Dropbox operations and theref
 
 If a visible managed file changed but ledger/head/receipt completion was interrupted, recover only after verifying visible provider evidence against the expected immutable version. Otherwise fail closed.
 
-The Dropbox change cursor advances only after the observed page is reconciled. Cursor reset triggers a bounded fresh baseline/adoption pass rather than treating every known file as a new human edit.
+Artifact recovery follows the same rule: a durable pre-effect mutation intent may explain an interrupted provider write and freezes its resolved destination. Provider bytes that predate any matching governed intent remain external candidates and cannot be retroactively sanitized by creating a new request.
+
+The Dropbox change cursor advances only after MutationGate classification and document reconciliation of the observed page. Cursor reset triggers a bounded fresh baseline pass. Unknown strict final files discovered by a baseline/reset remain candidates; they are never promoted merely because the cursor was rebuilt.
 
 Do not delete legacy or canonical history as part of normal recovery/materialization.
 
 Any destructive legacy cleanup remains a separately approved operation.
+
+MutationGate `enforce` rollback is configuration-only back to `observe`; append-only intent/candidate/resolution evidence is preserved.
 
 ## 24. Context contamination protection
 
@@ -490,6 +538,8 @@ If a business commit is already canonical but materialization is delayed:
 If generated Markdown is inconsistent, preserve unexpected external bytes where applicable and repair/rebuild it from canonical truth rather than treating the Markdown discrepancy as a new business fact.
 
 If a managed document conflicts, preserve both realities and fail closed rather than blind-overwrite. Human/external bytes must survive conflict handling.
+
+If MutationGate finds an unknown final-zone file, preserve it as external candidate evidence and use explicit typed resolution. Do not describe the file as published/accepted, do not overwrite it with an ordinary artifact write, and do not manufacture hidden evidence to bypass the conflict.
 
 ## 26. User experience principle
 
@@ -534,5 +584,7 @@ DELIVERABLES frozen version
       ↓
 optional reopen for the next iteration
 ```
+
+When an unexpected final-zone provider write occurs, the normal user experience remains natural-language: Project OS identifies it as an unresolved external candidate and the user may choose to adopt it through the appropriate governed flow or reject it. Users should not need to manipulate candidate IDs, hidden records or provider files manually.
 
 The reliability mechanics remain mostly invisible. No version selection, materialization command or workstation dependency is part of normal operation.

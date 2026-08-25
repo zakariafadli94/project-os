@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ArtifactWriteReceipt } from "../src/domain/artifact-write";
 import type { Receipt } from "../src/domain/receipt";
 import type { Env } from "../src/env";
-import { parseMutationGateMode } from "../src/mutation-gate/service";
+import { DropboxClient } from "../src/dropbox/client";
+import { MutationGateRepository } from "../src/mutation-gate/repository";
+import { MutationGateService, parseMutationGateMode } from "../src/mutation-gate/service";
 import { sha256Text } from "../src/documents/hash";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
@@ -78,6 +80,60 @@ describe("MutationGate candidates", () => {
     expect((await listReplay.json<{ candidates: unknown[] }>()).candidates).toHaveLength(1);
   });
 
+  it("reconstructs candidate identity and payload from Dropbox evidence after service recreation", async () => {
+    const created = await createProject("TXN-MUTCAND-PROJECT-0003", "mutcand-recreate");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+
+    const path = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-mutcand-recreate/ARTIFACTS/recovered.md`;
+    const content = "# durable candidate identity";
+    await mock.writeExternal(path, content);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+
+    const firstList = await guard.fetch("https://project-guard.internal/mutation-candidates", { method: "GET" });
+    const first = (await firstList.json<{ candidates: Array<{ candidate_id: string }> }>()).candidates;
+    expect(first).toHaveLength(1);
+    const candidateId = first[0]!.candidate_id;
+    const candidateFilesBefore = [...mock.files.keys()].filter((candidate) =>
+      candidate.includes(`/.project-os/projects/${created.project_id}/mutation-gate/candidates/`)
+      || candidate.includes(`/.project-os/projects/${created.project_id}/mutation-gate/payloads/candidates/`)
+    ).sort();
+
+    const client = new DropboxClient({
+      appKey: testEnv.DROPBOX_APP_KEY,
+      appSecret: testEnv.DROPBOX_APP_SECRET,
+      refreshToken: testEnv.DROPBOX_REFRESH_TOKEN
+    });
+    const freshService = new MutationGateService(client, "observe");
+    const freshRepository = new MutationGateRepository(client);
+    const rebuilt = await freshService.list(created.project_id);
+
+    expect(rebuilt).toEqual([
+      expect.objectContaining({ candidate_id: candidateId, provider_path: path, resolution_state: "unresolved" })
+    ]);
+    expect(await freshRepository.readCandidatePayload(created.project_id, candidateId)).toBe(content);
+
+    const metadata = await client.getMetadata(path);
+    expect(metadata).not.toBeNull();
+    await freshService.processChanges(createdState(created.project_id, "mutcand-recreate"), [{
+      tag: "file",
+      name: "recovered.md",
+      path,
+      id: metadata!.id,
+      rev: metadata!.rev,
+      content_hash: metadata!.content_hash,
+      size: metadata!.size,
+      ...(metadata!.server_modified ? { server_modified: metadata!.server_modified } : {})
+    }], "incremental");
+
+    const candidateFilesAfter = [...mock.files.keys()].filter((candidate) =>
+      candidate.includes(`/.project-os/projects/${created.project_id}/mutation-gate/candidates/`)
+      || candidate.includes(`/.project-os/projects/${created.project_id}/mutation-gate/payloads/candidates/`)
+    ).sort();
+    expect(candidateFilesAfter).toEqual(candidateFilesBefore);
+    expect((await freshService.list(created.project_id))[0]?.candidate_id).toBe(candidateId);
+  });
+
   it("blocks a new artifact request from retroactively sanitizing a pre-existing raw file", async () => {
     const created = await createProject("TXN-MUTCAND-PROJECT-0002", "mutcand-two");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
@@ -108,3 +164,26 @@ describe("MutationGate candidates", () => {
     ]);
   });
 });
+
+function createdState(projectId: string, slug: string) {
+  return {
+    schema_version: "1.0" as const,
+    project_id: projectId,
+    name: slug,
+    slug,
+    aliases: [],
+    objective: "Mutation gate candidate test",
+    status: "active" as const,
+    revision: 1,
+    phases: {},
+    tasks: {},
+    decisions: {},
+    research: {},
+    deliverables: {},
+    constraints: {},
+    risks: {},
+    artifact_routes: {},
+    created_at: at,
+    updated_at: at
+  };
+}

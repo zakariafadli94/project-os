@@ -8,6 +8,22 @@ import { MutationGateRepository } from "./repository";
 
 export type MutationGateMode = "observe" | "enforce";
 
+const CANDIDATE_RESOLUTION_CAPABILITY = Symbol("ProjectOSCandidateResolution");
+
+export interface CandidateResolutionContext {
+  readonly candidateId: string;
+  readonly destinationPath: string;
+  readonly [CANDIDATE_RESOLUTION_CAPABILITY]: true;
+}
+
+export function createCandidateResolutionContext(candidateId: string, destinationPath: string): CandidateResolutionContext {
+  return {
+    candidateId,
+    destinationPath,
+    [CANDIDATE_RESOLUTION_CAPABILITY]: true
+  };
+}
+
 export interface MutationGateProcessSummary {
   candidates: number;
   mutation_gate_mode: MutationGateMode;
@@ -98,7 +114,15 @@ export class MutationGateService {
     });
   }
 
-  async assertDestinationClear(state: ProjectState, destinationPath: string): Promise<void> {
+  async assertDestinationClear(
+    state: ProjectState,
+    destinationPath: string,
+    resolutionContext?: CandidateResolutionContext
+  ): Promise<void> {
+    if (resolutionContext && resolutionContext.destinationPath !== destinationPath) {
+      throw new Error("Candidate resolution capability does not match artifact destination");
+    }
+
     const metadata = await this.transport.getMetadata(destinationPath);
     if (metadata) {
       const classification = await this.classifier.classify(state, destinationPath, metadata);
@@ -108,6 +132,19 @@ export class MutationGateService {
     }
 
     const unresolved = await this.listUnresolved(state.project_id, { destinationPath });
+    if (resolutionContext) {
+      const authorized = unresolved.some((item) => item.candidate_id === resolutionContext.candidateId);
+      if (!authorized) {
+        throw new Error("Candidate resolution capability does not reference the unresolved destination candidate");
+      }
+      const remaining = unresolved.filter((item) => item.candidate_id !== resolutionContext.candidateId);
+      if (remaining.length === 0) return;
+      throw new UnresolvedExternalMutationCandidateError(
+        destinationPath,
+        remaining.map((item) => item.candidate_id)
+      );
+    }
+
     if (unresolved.length > 0) {
       throw new UnresolvedExternalMutationCandidateError(
         destinationPath,

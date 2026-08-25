@@ -110,4 +110,94 @@ describe("Project OS write coordination stress", () => {
     expect(await responseA.json()).toMatchObject({ status: "committed" });
     expect(await responseB.json()).toMatchObject({ status: "committed" });
   });
+
+  it("runs fifty managed-document writes across two projects without cross-project heads or duplicate replay versions", async () => {
+    const [a, b] = await Promise.all([
+      createProject("TXN-WRITE-STRESS-PROJECT-0004", "doc-stress-a"),
+      createProject("TXN-WRITE-STRESS-PROJECT-0005", "doc-stress-b")
+    ]);
+    expect(a.status).toBe("committed");
+    expect(b.status).toBe("committed");
+    const guardA = testEnv.PROJECT_GUARD.getByName(a.project_id);
+    const guardB = testEnv.PROJECT_GUARD.getByName(b.project_id);
+    let firstA: any;
+    let firstB: any;
+    let firstBodyA: Record<string, unknown> | undefined;
+    let firstBodyB: Record<string, unknown> | undefined;
+
+    for (let index = 1; index <= 25; index += 1) {
+      const suffix = String(index).padStart(4, "0");
+      const contentA = `# Project A document ${index}`;
+      const contentB = `# Project B document ${index}`;
+      const bodyA = {
+        operation: "working.write",
+        request_id: `DOCREQ-STRESS-A-${suffix}`,
+        project_id: a.project_id,
+        logical_path: `stress/doc-${suffix}.md`,
+        content: contentA,
+        content_sha256: await sha256(contentA),
+        created_at: at
+      };
+      const bodyB = {
+        operation: "working.write",
+        request_id: `DOCREQ-STRESS-B-${suffix}`,
+        project_id: b.project_id,
+        logical_path: `stress/doc-${suffix}.md`,
+        content: contentB,
+        content_sha256: await sha256(contentB),
+        created_at: at
+      };
+      const [responseA, responseB] = await Promise.all([
+        guardA.fetch("https://project-guard.internal/document", {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(bodyA)
+        }),
+        guardB.fetch("https://project-guard.internal/document", {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(bodyB)
+        })
+      ]);
+      const receiptA = await responseA.json<any>();
+      const receiptB = await responseB.json<any>();
+      expect(receiptA).toMatchObject({ status: "committed", project_id: a.project_id, stage: "working" });
+      expect(receiptB).toMatchObject({ status: "committed", project_id: b.project_id, stage: "working" });
+      if (index === 1) {
+        firstA = receiptA;
+        firstB = receiptB;
+        firstBodyA = bodyA;
+        firstBodyB = bodyB;
+      }
+    }
+
+    const [replayA, replayB] = await Promise.all([
+      guardA.fetch("https://project-guard.internal/document", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(firstBodyA)
+      }),
+      guardB.fetch("https://project-guard.internal/document", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(firstBodyB)
+      })
+    ]);
+    expect(await replayA.json()).toMatchObject({ status: "committed", version_id: firstA.version_id });
+    expect(await replayB.json()).toMatchObject({ status: "committed", version_id: firstB.version_id });
+
+    const ownA = await guardA.fetch(
+      `https://project-guard.internal/document-status?document_id=${encodeURIComponent(firstA.document_id)}`,
+      { method: "GET" }
+    );
+    const ownB = await guardB.fetch(
+      `https://project-guard.internal/document-status?document_id=${encodeURIComponent(firstB.document_id)}`,
+      { method: "GET" }
+    );
+    expect(ownA.status).toBe(200);
+    expect(ownB.status).toBe(200);
+
+    const crossA = await guardB.fetch(
+      `https://project-guard.internal/document-status?document_id=${encodeURIComponent(firstA.document_id)}`,
+      { method: "GET" }
+    );
+    const crossB = await guardA.fetch(
+      `https://project-guard.internal/document-status?document_id=${encodeURIComponent(firstB.document_id)}`,
+      { method: "GET" }
+    );
+    expect(crossA.status).toBe(404);
+    expect(crossB.status).toBe(404);
+  });
 });

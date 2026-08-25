@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { parseArtifactWriteRequest, type ArtifactWriteReceipt, type ArtifactWriteRequest } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
+import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
 import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
@@ -8,6 +9,9 @@ import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
+import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinator";
+import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
+import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
 import { DropboxClient } from "../dropbox/client";
 import { parseLayoutMode, type LayoutMode } from "../dropbox/layout";
 import { ArtifactContentConflictError, ProjectRepository } from "../dropbox/repository";
@@ -30,10 +34,27 @@ interface ArtifactRow {
   receipt_json: string;
 }
 
+interface DocumentRequestRow {
+  [key: string]: SqlStorageValue;
+  request_json: string;
+  receipt_json: string;
+}
+
 interface StateRow {
   [key: string]: SqlStorageValue;
   state_json: string;
 }
+
+interface ManagedDocumentTerminalReceipt {
+  request_id: string;
+  project_id: string;
+  status: "rejected" | "conflict";
+  code: string;
+  message: string;
+  document_id?: string;
+}
+
+type ManagedDocumentOperationReceipt = ManagedDocumentReceipt | ManagedDocumentTerminalReceipt;
 
 const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
   "project.pause",
@@ -45,6 +66,9 @@ const MATERIALIZATION_ALARM_DELAY_MS = 1_000;
 
 export class ProjectGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
+  private readonly managedDocumentService: ManagedDocumentService;
+  private readonly managedDocumentChanges: ManagedDocumentChangeCoordinator;
+  private readonly managedDocumentRequests: ManagedDocumentRequestLedger;
   private readonly layoutMode: LayoutMode;
   private readonly materializationLedger: MaterializationLedger | null;
   private readonly materializationCoordinator: MaterializationCoordinator | null;
@@ -63,6 +87,11 @@ export class ProjectGuard extends DurableObject<Env> {
         request_json TEXT NOT NULL,
         receipt_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS document_requests (
+        request_id TEXT PRIMARY KEY,
+        request_json TEXT NOT NULL,
+        receipt_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS project_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         state_json TEXT NOT NULL
@@ -75,6 +104,9 @@ export class ProjectGuard extends DurableObject<Env> {
       refreshToken: env.DROPBOX_REFRESH_TOKEN
     });
     this.repository = new ProjectRepository(rawDropbox, this.layoutMode);
+    this.managedDocumentService = new ManagedDocumentService(rawDropbox);
+    this.managedDocumentChanges = new ManagedDocumentChangeCoordinator(rawDropbox, this.ctx.storage);
+    this.managedDocumentRequests = new ManagedDocumentRequestLedger(rawDropbox);
 
     const projectId = this.ctx.id.name;
     if (this.layoutMode === "v2" && projectId) {
@@ -97,10 +129,27 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const pathname = new URL(request.url).pathname;
+    const url = new URL(request.url);
+    const pathname = url.pathname;
 
     if (request.method === "POST" && pathname === "/artifact") {
       return this.serialize(() => this.handleArtifact(request));
+    }
+
+    if (request.method === "POST" && pathname === "/document") {
+      return this.serialize(() => this.handleManagedDocument(request));
+    }
+
+    if (request.method === "GET" && pathname === "/document-status") {
+      return this.serialize(() => this.handleManagedDocumentStatus(url));
+    }
+
+    if (request.method === "POST" && pathname === "/reconcile-documents") {
+      return this.serialize(async () => {
+        const state = await this.loadOrRecoverState();
+        if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+        return Response.json(await this.managedDocumentChanges.reconcile(state));
+      });
     }
 
     if (request.method === "GET" && pathname === "/materialization-status") {
@@ -347,9 +396,143 @@ export class ProjectGuard extends DurableObject<Env> {
     return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "committed"));
   }
 
+  private async handleManagedDocument(request: Request): Promise<Response> {
+    let operation: ManagedDocumentRequest;
+    try {
+      operation = parseManagedDocumentRequest(await request.json());
+    } catch (error) {
+      return Response.json({
+        error: "invalid_document_request",
+        message: error instanceof Error ? error.message : "Invalid managed document request"
+      }, { status: 400 });
+    }
+
+    const serialized = JSON.stringify(operation);
+    const existing = this.findDocumentRequest(operation.request_id);
+    if (existing) {
+      if (existing.request_json !== serialized) {
+        return Response.json(this.documentTerminalReceipt(
+          operation,
+          "rejected",
+          "IDEMPOTENCY_PAYLOAD_MISMATCH",
+          "The same request_id was reused with a different managed-document payload"
+        ));
+      }
+      return Response.json(JSON.parse(existing.receipt_json) as ManagedDocumentOperationReceipt);
+    }
+
+    if (this.ctx.id.name && this.ctx.id.name !== operation.project_id) {
+      return Response.json(this.documentTerminalReceipt(
+        operation,
+        "rejected",
+        "PROJECT_BINDING_MISMATCH",
+        "Durable Object binding does not match managed document project_id"
+      ));
+    }
+
+    const state = await this.loadOrRecoverState();
+    if (!state) {
+      return Response.json(this.documentTerminalReceipt(
+        operation,
+        "rejected",
+        "PROJECT_NOT_INITIALIZED",
+        "Project state is not initialized"
+      ));
+    }
+
+    try {
+      await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
+    } catch (error) {
+      if (error instanceof ManagedDocumentRequestIntentConflictError) {
+        return Response.json(this.documentTerminalReceipt(
+          operation,
+          "rejected",
+          "IDEMPOTENCY_PAYLOAD_MISMATCH",
+          "The same request_id was reused with a different managed-document payload"
+        ));
+      }
+      throw error;
+    }
+
+    const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
+    if (durableReceipt) {
+      const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
+      this.persistDocumentRequest(operation, receipt);
+      return Response.json(receipt);
+    }
+
+    try {
+      const receipt = await this.executeManagedDocument(operation, state);
+      return this.finalizeDocument(operation, receipt);
+    } catch (error) {
+      if (error instanceof ManagedDocumentConflictError) {
+        return this.finalizeDocument(
+          operation,
+          this.documentTerminalReceipt(operation, "conflict", error.code, error.message, error.documentId)
+        );
+      }
+      if (error instanceof Error && error.message.startsWith("Managed document content SHA-256 mismatch:")) {
+        return this.finalizeDocument(
+          operation,
+          this.documentTerminalReceipt(operation, "rejected", "CONTENT_HASH_MISMATCH", error.message)
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async handleManagedDocumentStatus(url: URL): Promise<Response> {
+    const documentId = url.searchParams.get("document_id");
+    if (!documentId || !/^DOC-[A-F0-9]{24}$/.test(documentId)) {
+      return Response.json({ error: "invalid_document_id" }, { status: 400 });
+    }
+    const state = await this.loadOrRecoverState();
+    if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+    const head = await this.managedDocumentService.status(state.project_id, documentId);
+    if (!head) return Response.json({ error: "document_not_found" }, { status: 404 });
+    const { provider: _provider, ...logical } = head;
+    return Response.json(logical);
+  }
+
+  private async executeManagedDocument(
+    request: ManagedDocumentRequest,
+    state: ProjectState
+  ): Promise<ManagedDocumentReceipt> {
+    switch (request.operation) {
+      case "working.write":
+        return this.managedDocumentService.writeWorking(request, state);
+      case "review.write":
+        return this.managedDocumentService.writeReview(request, state);
+      case "review.promote":
+        return this.managedDocumentService.promoteToReview(request, state);
+      case "publish":
+        return this.managedDocumentService.publish(request, state);
+      case "reopen":
+        return this.managedDocumentService.reopenPublished(request, state);
+      case "reference.classify":
+        return this.managedDocumentService.classifyReference(request, state);
+    }
+  }
+
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
     await this.repository.writeArtifactReceipt(receipt);
     this.persistArtifact(request, receipt);
+    return Response.json(receipt);
+  }
+
+  private async finalizeDocument(
+    request: ManagedDocumentRequest,
+    receipt: ManagedDocumentOperationReceipt
+  ): Promise<Response> {
+    const requestJson = JSON.stringify(request);
+    const receiptJson = JSON.stringify(receipt);
+    await this.managedDocumentRequests.writeReceipt(
+      request.project_id,
+      request.request_id,
+      requestJson,
+      receiptJson
+    );
+    this.persistDocumentRequest(request, receipt);
     return Response.json(receipt);
   }
 
@@ -496,6 +679,13 @@ export class ProjectGuard extends DurableObject<Env> {
     ).toArray()[0] ?? null;
   }
 
+  private findDocumentRequest(requestId: string): DocumentRequestRow | null {
+    return this.ctx.storage.sql.exec<DocumentRequestRow>(
+      "SELECT request_json, receipt_json FROM document_requests WHERE request_id = ?",
+      requestId
+    ).toArray()[0] ?? null;
+  }
+
   private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<void> {
     if (receipt.status !== "committed" || !PROJECT_STATUS_OPERATIONS.has(tx.operation)) return;
     const currentState = await this.loadOrRecoverState();
@@ -537,6 +727,18 @@ export class ProjectGuard extends DurableObject<Env> {
     );
   }
 
+  private persistDocumentRequest(
+    request: ManagedDocumentRequest,
+    receipt: ManagedDocumentOperationReceipt
+  ): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO document_requests (request_id, request_json, receipt_json) VALUES (?, ?, ?)",
+      request.request_id,
+      JSON.stringify(request),
+      JSON.stringify(receipt)
+    );
+  }
+
   private artifactReceipt(
     request: ArtifactWriteRequest,
     status: ArtifactWriteReceipt["status"],
@@ -551,6 +753,23 @@ export class ProjectGuard extends DurableObject<Env> {
       status,
       ...(code ? { code } : {}),
       ...(message ? { message } : {})
+    };
+  }
+
+  private documentTerminalReceipt(
+    request: ManagedDocumentRequest,
+    status: ManagedDocumentTerminalReceipt["status"],
+    code: string,
+    message: string,
+    documentId?: string
+  ): ManagedDocumentTerminalReceipt {
+    return {
+      request_id: request.request_id,
+      project_id: request.project_id,
+      status,
+      code,
+      message,
+      ...(documentId ? { document_id: documentId } : {})
     };
   }
 

@@ -4,6 +4,7 @@ import type { ArtifactWriteRequest } from "../domain/artifact-write";
 import type { ProjectState } from "../domain/project-state";
 import { ArtifactMutationIntentService } from "../mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../mutation-gate/repository";
+import { MutationGateService, type MutationGateMode } from "../mutation-gate/service";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
 import type { DropboxTransport } from "./client";
 import type { LayoutMode } from "./layout";
@@ -11,13 +12,17 @@ import { ProjectRepository as CoreProjectRepository } from "./repository-core";
 
 export class ProjectRepository extends CoreProjectRepository {
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
+  private readonly mutationGate: MutationGateService;
 
   constructor(
     private readonly rawTransport: DropboxTransport,
-    private readonly repositoryMode: LayoutMode = "legacy"
+    private readonly repositoryMode: LayoutMode = "legacy",
+    mutationGateMode: MutationGateMode = "observe"
   ) {
     super(rawTransport, repositoryMode);
-    this.artifactMutationIntents = new ArtifactMutationIntentService(new MutationGateRepository(rawTransport));
+    const mutationRepository = new MutationGateRepository(rawTransport);
+    this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, rawTransport);
+    this.mutationGate = new MutationGateService(rawTransport, mutationGateMode);
   }
 
   override async writeArtifact(
@@ -32,6 +37,7 @@ export class ProjectRepository extends CoreProjectRepository {
       throw new Error(`Prepared artifact destination does not match durable mutation intent: ${request.request_id}`);
     }
     const replayState = stateForPreparedDestination(state, request, prepared.destination);
+    await this.mutationGate.assertDestinationClear(replayState, prepared.destination.path);
 
     const { LegacyArtifactDocumentWriter } = await import("../documents/legacy-artifact");
     const managed = await new LegacyArtifactDocumentWriter(this.rawTransport).writeIfManaged(replayState, request);
@@ -51,8 +57,6 @@ function stateForPreparedDestination(
       ? {
           [destination.route.route_id]: {
             ...destination.route,
-            // The durable intent proves the route was authorized when submitted.
-            // Replay reconstructs routing only; it does not re-decide current business governance.
             decision_ids: []
           }
         }

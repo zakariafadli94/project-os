@@ -178,6 +178,39 @@ describe("DocumentLedgerRepository", () => {
     expect(await repository.readHead(projectId, documentId)).toEqual(restored);
   });
 
+  it("uses a newer live provider rev during head recovery when bytes still match immutable evidence", async () => {
+    const transport = new FakeTransport();
+    const repository = new DocumentLedgerRepository(transport);
+    const publishedPath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/strategy/commercial.md";
+    const immutable = record({
+      version_id: v1,
+      stage: "published",
+      provider_content_hash: "3".repeat(64),
+      provider_file_id: "id:published-old",
+      provider_rev: "rev-old",
+      provider_path: publishedPath,
+      size: 140
+    });
+    await repository.writeVersion(immutable);
+    transport.metadata.set(publishedPath, {
+      id: "id:published-restored",
+      path: publishedPath,
+      rev: "rev-new-after-restore",
+      content_hash: "3".repeat(64),
+      size: 140
+    });
+
+    const restored = await repository.restoreHeadFromVersions(projectId, documentId);
+
+    expect(restored?.published_version_id).toBe(v1);
+    expect(restored?.provider?.published).toMatchObject({
+      file_id: "id:published-restored",
+      rev: "rev-new-after-restore",
+      content_hash: "3".repeat(64),
+      size: 140
+    });
+  });
+
   it("does not resurrect consumed working or review pointers after a completed publication", async () => {
     const transport = new FakeTransport();
     const repository = new DocumentLedgerRepository(transport);

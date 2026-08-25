@@ -32,11 +32,13 @@ interface MutationIntentDestinationBindingRecord {
   intent_id: string;
 }
 
-interface MutationResolutionTerminalRecord {
+export interface MutationResolutionTerminalEvidence {
   schema_version: "1.0";
   project_id: string;
   candidate_id: string;
   resolution_id: string;
+  resolution: ExternalMutationResolutionRecord;
+  resolution_request_sha256?: string;
 }
 
 export interface CaptureExternalMutationCandidateInput {
@@ -211,31 +213,41 @@ export class MutationGateRepository {
     return this.transport.download(candidate.immutable_payload_path);
   }
 
-  async writeResolution(record: ExternalMutationResolutionRecord): Promise<ExternalMutationResolutionRecord> {
+  async writeResolution(
+    record: ExternalMutationResolutionRecord,
+    resolutionRequestSha256?: string
+  ): Promise<ExternalMutationResolutionRecord> {
     const validated = parseExternalMutationResolutionRecord(record);
+    const requestHash = validateOptionalSha256(resolutionRequestSha256);
     const candidate = await this.readCandidate(validated.project_id, validated.candidate_id);
     if (!candidate) throw new Error(`Mutation candidate does not exist: ${validated.candidate_id}`);
 
-    const terminal = await this.readTerminalResolution(validated.project_id, validated.candidate_id);
-    if (terminal && terminal.resolution_id !== validated.resolution_id) {
-      throw new MutationResolutionConflictError(validated.candidate_id);
+    const terminal = await this.readTerminalResolutionRecord(validated.project_id, validated.candidate_id);
+    if (terminal) {
+      assertTerminalCompatible(terminal, validated, requestHash);
     }
 
-    const terminalRecord: MutationResolutionTerminalRecord = {
+    const terminalEvidence: MutationResolutionTerminalEvidence = {
       schema_version: "1.0",
       project_id: validated.project_id,
       candidate_id: validated.candidate_id,
-      resolution_id: validated.resolution_id
+      resolution_id: validated.resolution_id,
+      resolution: validated,
+      ...(requestHash ? { resolution_request_sha256: requestHash } : {})
     };
+
     if (!terminal) {
       try {
-        await this.transport.upload(terminalResolutionPath(validated.project_id, validated.candidate_id), pretty(terminalRecord), "add");
+        await this.transport.upload(
+          terminalResolutionPath(validated.project_id, validated.candidate_id),
+          pretty(terminalEvidence),
+          "add"
+        );
       } catch (error) {
         if (!(error instanceof DropboxConflictError)) throw error;
-        const raced = await this.readTerminalResolution(validated.project_id, validated.candidate_id);
-        if (!raced || raced.resolution_id !== validated.resolution_id) {
-          throw new MutationResolutionConflictError(validated.candidate_id);
-        }
+        const raced = await this.readTerminalResolutionRecord(validated.project_id, validated.candidate_id);
+        if (!raced) throw new MutationResolutionConflictError(validated.candidate_id);
+        assertTerminalCompatible(raced, validated, requestHash);
       }
     }
 
@@ -267,8 +279,44 @@ export class MutationGateRepository {
     return records.sort((left, right) => left.resolved_at.localeCompare(right.resolved_at) || left.resolution_id.localeCompare(right.resolution_id));
   }
 
+  async readTerminalResolutionRecord(
+    projectId: string,
+    candidateId: string
+  ): Promise<MutationResolutionTerminalEvidence | null> {
+    const raw = await this.transport.download(terminalResolutionPath(projectId, candidateId));
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as Partial<MutationResolutionTerminalEvidence>;
+    if (
+      parsed.schema_version !== "1.0"
+      || parsed.project_id !== projectId
+      || parsed.candidate_id !== candidateId
+      || typeof parsed.resolution_id !== "string"
+      || !/^MUTRES-[A-F0-9]{24}$/.test(parsed.resolution_id)
+      || parsed.resolution === undefined
+    ) {
+      throw new Error(`Invalid mutation resolution terminal binding for ${projectId}/${candidateId}`);
+    }
+    const resolution = parseExternalMutationResolutionRecord(parsed.resolution);
+    if (
+      resolution.project_id !== projectId
+      || resolution.candidate_id !== candidateId
+      || resolution.resolution_id !== parsed.resolution_id
+    ) {
+      throw new Error(`Mutation resolution terminal evidence mismatch for ${projectId}/${candidateId}`);
+    }
+    const requestHash = validateOptionalSha256(parsed.resolution_request_sha256);
+    return {
+      schema_version: "1.0",
+      project_id: projectId,
+      candidate_id: candidateId,
+      resolution_id: resolution.resolution_id,
+      resolution,
+      ...(requestHash ? { resolution_request_sha256: requestHash } : {})
+    };
+  }
+
   async hasTerminalResolution(projectId: string, candidateId: string): Promise<boolean> {
-    return (await this.readTerminalResolution(projectId, candidateId)) !== null;
+    return (await this.readTerminalResolutionRecord(projectId, candidateId)) !== null;
   }
 
   private async ensureDestinationBinding(intent: MutationIntentRecord): Promise<void> {
@@ -345,22 +393,6 @@ export class MutationGateRepository {
     }
     return record;
   }
-
-  private async readTerminalResolution(projectId: string, candidateId: string): Promise<MutationResolutionTerminalRecord | null> {
-    const raw = await this.transport.download(terminalResolutionPath(projectId, candidateId));
-    if (raw === null) return null;
-    const parsed = JSON.parse(raw) as Partial<MutationResolutionTerminalRecord>;
-    if (
-      parsed.schema_version !== "1.0"
-      || parsed.project_id !== projectId
-      || parsed.candidate_id !== candidateId
-      || typeof parsed.resolution_id !== "string"
-      || !/^MUTRES-[A-F0-9]{24}$/.test(parsed.resolution_id)
-    ) {
-      throw new Error(`Invalid mutation resolution terminal binding for ${projectId}/${candidateId}`);
-    }
-    return parsed as MutationResolutionTerminalRecord;
-  }
 }
 
 async function destinationBindingPath(projectId: string, destinationPath: string, requestId: string): Promise<string> {
@@ -405,6 +437,32 @@ function sameCandidateEvidence(left: ExternalMutationCandidateRecord, right: Ext
     && left.provider_content_hash === right.provider_content_hash
     && left.size === right.size
     && left.immutable_payload_path === right.immutable_payload_path;
+}
+
+function assertTerminalCompatible(
+  terminal: MutationResolutionTerminalEvidence,
+  resolution: ExternalMutationResolutionRecord,
+  resolutionRequestSha256?: string
+): void {
+  if (!sameJson(terminal.resolution, resolution)) {
+    throw new MutationResolutionConflictError(resolution.candidate_id);
+  }
+  if (
+    terminal.resolution_request_sha256 !== undefined
+    && resolutionRequestSha256 !== undefined
+    && terminal.resolution_request_sha256 !== resolutionRequestSha256
+  ) {
+    throw new MutationResolutionConflictError(resolution.candidate_id);
+  }
+  if (terminal.resolution_request_sha256 === undefined && resolutionRequestSha256 !== undefined) {
+    throw new MutationResolutionConflictError(resolution.candidate_id);
+  }
+}
+
+function validateOptionalSha256(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (!/^[a-f0-9]{64}$/.test(value)) throw new Error(`Invalid SHA-256: ${value}`);
+  return value;
 }
 
 function sameJson(left: unknown, right: unknown): boolean {

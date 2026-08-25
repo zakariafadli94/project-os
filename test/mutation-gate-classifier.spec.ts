@@ -67,6 +67,30 @@ function stateWithSpecsRoute() {
   return current;
 }
 
+function stateWithReferencesRoute() {
+  const current = state();
+  current.decisions["DEC-ROUTEREF001"] = {
+    decision_id: "DEC-ROUTEREF001",
+    title: "Route market references",
+    decision: "Route market inputs into the managed references collection",
+    reason: "Preserve collaborative reference semantics",
+    impacts: [],
+    status: "accepted",
+    created_at: "2026-08-25T16:00:00+01:00",
+    updated_at: "2026-08-25T16:00:00+01:00"
+  };
+  current.artifact_routes["ROUTE-REFS001"] = {
+    route_id: "ROUTE-REFS001",
+    source_prefix: "market-input",
+    target_prefix: "REFERENCES/MARKET",
+    exclusive: true,
+    decision_ids: ["DEC-ROUTEREF001"],
+    created_at: "2026-08-25T16:00:00+01:00",
+    updated_at: "2026-08-25T16:00:00+01:00"
+  };
+  return current;
+}
+
 describe("MutationGateClassifier", () => {
   it("leaves collaborative zones outside strict final-zone classification", async () => {
     const transport = new FakeClassifierDropbox();
@@ -93,6 +117,15 @@ describe("MutationGateClassifier", () => {
 
     await expect(new MutationGateClassifier(transport).classify(stateWithSpecsRoute(), path, metadata))
       .resolves.toEqual({ kind: "external_candidate" });
+  });
+
+  it("keeps an artifact-route target under REFERENCES collaborative", async () => {
+    const transport = new FakeClassifierDropbox();
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/REFERENCES/MARKET/human-edit.md";
+    const metadata = await transport.seed(path, "# human reference edit", "id:routed-reference");
+
+    await expect(new MutationGateClassifier(transport).classify(stateWithReferencesRoute(), path, metadata))
+      .resolves.toEqual({ kind: "not_final_zone" });
   });
 
   it("does not make an unrelated SPECS path strict merely because a different SPECS subtree is routed", async () => {

@@ -84,7 +84,10 @@ export class LegacyArtifactDocumentWriter {
     if (metadata && currentContent === null) throw new ArtifactContentConflictError(destination.path);
 
     if (metadata && currentContent === request.content) {
-      if (sameObservation(head?.provider?.published, metadata)) return "idempotent";
+      if (
+        sameObservation(head?.provider?.published, metadata)
+        && await this.activeVersionProvesLegacyContent(head, "published", request.content_sha256)
+      ) return "idempotent";
       await this.persistPublishedVersion(request, destination, payloadPath, documentId, versionId, head, metadata);
       return "idempotent";
     }
@@ -137,7 +140,10 @@ export class LegacyArtifactDocumentWriter {
     if (metadata && currentContent === null) throw new ArtifactContentConflictError(destination.path);
 
     if (metadata && currentContent === request.content) {
-      if (sameObservation(head?.provider?.reference, metadata)) return "idempotent";
+      if (
+        sameObservation(head?.provider?.reference, metadata)
+        && await this.activeVersionProvesLegacyContent(head, "reference", request.content_sha256)
+      ) return "idempotent";
       await this.persistReferenceVersion(
         request,
         destination,
@@ -333,6 +339,18 @@ export class LegacyArtifactDocumentWriter {
   private async readOrRestoreHead(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
     return await this.ledger.readHead(projectId, documentId)
       ?? await this.ledger.restoreHeadFromVersions(projectId, documentId);
+  }
+
+  private async activeVersionProvesLegacyContent(
+    head: ManagedDocumentHead | null,
+    stage: "reference" | "published",
+    contentSha256: string
+  ): Promise<boolean> {
+    if (!head) return false;
+    const activeVersionId = stage === "published" ? head.published_version_id : head.reference_version_id;
+    if (!activeVersionId) return false;
+    const active = await this.ledger.readVersion(head.project_id, head.document_id, activeVersionId);
+    return active?.source === "legacy_artifact_api" && active.content_sha256 === contentSha256;
   }
 
   private async assertPublishedBaseline(

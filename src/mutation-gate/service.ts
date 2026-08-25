@@ -5,6 +5,7 @@ import type { DropboxChangeEntry, DropboxFileMetadata, DropboxTransport } from "
 import { machineArtifactReceiptPath } from "../dropbox/layout";
 import { ArtifactContentConflictError } from "../dropbox/repository-core";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+import { sha256Text } from "../documents/hash";
 import { MutationGateClassifier } from "./classifier";
 import { MutationGateRepository } from "./repository";
 
@@ -59,7 +60,7 @@ export interface MutationArtifactStatus {
   intent_id: string;
   destination_path: string;
   gate_mode: MutationGateMode;
-  verification_state: "submitted" | "committed" | "conflict" | "rejected";
+  verification_state: "submitted" | "committed" | "canonical_verified" | "conflict" | "rejected";
   receipt_status?: ArtifactWriteReceipt["status"];
 }
 
@@ -190,14 +191,29 @@ export class MutationGateService {
     }
 
     const receipt = parseArtifactReceipt(rawReceipt, intent);
+    if (receipt.status !== "committed") {
+      return {
+        request_id: requestId,
+        project_id: projectId,
+        intent_id: intent.intent_id,
+        destination_path: intent.destination_path,
+        gate_mode: this.mode,
+        verification_state: receipt.status,
+        receipt_status: receipt.status
+      };
+    }
+
+    const visible = await this.transport.download(intent.destination_path);
+    const finalEffectVerified = visible !== null
+      && await sha256Text(visible) === intent.expected_content_sha256;
     return {
       request_id: requestId,
       project_id: projectId,
       intent_id: intent.intent_id,
       destination_path: intent.destination_path,
       gate_mode: this.mode,
-      verification_state: receipt.status,
-      receipt_status: receipt.status
+      verification_state: finalEffectVerified ? "canonical_verified" : "committed",
+      receipt_status: "committed"
     };
   }
 

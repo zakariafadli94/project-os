@@ -1,4 +1,4 @@
-import type { ArtifactWriteReceipt } from "../domain/artifact-write";
+import { parseArtifactWriteRequest, type ArtifactWriteReceipt } from "../domain/artifact-write";
 import type { MutationDetectionSource } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import type { DropboxChangeEntry, DropboxFileMetadata, DropboxTransport } from "../dropbox/client";
@@ -286,11 +286,15 @@ export class MutationGateService {
 function parseArtifactReceipt(raw: string, intent: Awaited<ReturnType<MutationGateRepository["readArtifactIntent"]>>): ArtifactWriteReceipt {
   if (!intent) throw new Error("Mutation artifact receipt parser requires a durable intent");
   const parsed = JSON.parse(raw) as Partial<ArtifactWriteReceipt>;
+  const frozenRequest = parseArtifactWriteRequest(JSON.parse(intent.request_json));
   if (
-    parsed.request_id !== intent.request_id
+    frozenRequest.request_id !== intent.request_id
+    || frozenRequest.project_id !== intent.project_id
+    || frozenRequest.content_sha256 !== intent.expected_content_sha256
+    || parsed.request_id !== intent.request_id
     || parsed.project_id !== intent.project_id
     || parsed.content_sha256 !== intent.expected_content_sha256
-    || typeof parsed.relative_path !== "string"
+    || parsed.relative_path !== frozenRequest.relative_path
     || (parsed.status !== "committed" && parsed.status !== "conflict" && parsed.status !== "rejected")
   ) {
     throw new Error(`Artifact receipt does not match durable mutation intent: ${intent.request_id}`);

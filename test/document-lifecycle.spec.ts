@@ -17,6 +17,7 @@ class FakeTransport implements DropboxTransport {
   uploads: Array<{ path: string; mode: string }> = [];
   moves: Array<{ from: string; to: string }> = [];
   copies: Array<{ from: string; to: string }> = [];
+  raceBeforeConditional?: { path: string; content: string };
   private revision = 0;
 
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
@@ -26,6 +27,12 @@ class FakeTransport implements DropboxTransport {
   }
 
   async uploadConditional(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata> {
+    const race = this.raceBeforeConditional;
+    const beforeRace = this.files.get(path);
+    if (race?.path === path && beforeRace) {
+      this.raceBeforeConditional = undefined;
+      this.set(path, race.content, beforeRace.metadata.id);
+    }
     const current = this.files.get(path);
     if (!current || current.metadata.rev !== expectedRev) {
       throw new DropboxConflictError("stale", "req-cas", "path/conflict/file");
@@ -227,5 +234,40 @@ describe("ManagedDocumentService work-product lifecycle", () => {
 
     expect(versionIndex).toBeGreaterThanOrEqual(0);
     expect(headIndex).toBeGreaterThan(versionIndex);
+  });
+
+  it("preserves a human deliverable edit that races between observation and publish CAS", async () => {
+    const transport = new FakeTransport();
+    const service = new ManagedDocumentService(transport);
+    const firstWorking = await write(service, "DOCREQ-WORK-000009", "published v1");
+    const firstReview = await service.promoteToReview({
+      request_id: "DOCREQ-REVIEW-000005", project_id: "PRJ-0002", document_id: firstWorking.document_id,
+      expected_version_id: firstWorking.version_id, created_at: "2026-08-24T19:05:00+01:00"
+    }, state());
+    const firstPublished = await service.publish({
+      request_id: "DOCREQ-PUBLISH-000004", project_id: "PRJ-0002", document_id: firstWorking.document_id,
+      expected_version_id: firstReview.version_id, created_at: "2026-08-24T19:06:00+01:00"
+    }, state());
+    const reopened = await service.reopenPublished({
+      request_id: "DOCREQ-REOPEN-000002", project_id: "PRJ-0002", document_id: firstWorking.document_id,
+      expected_version_id: firstPublished.version_id, created_at: "2026-08-24T19:07:00+01:00"
+    }, state());
+    const secondWorking = await write(service, "DOCREQ-WORK-000010", "candidate v2", reopened.version_id);
+    const secondReview = await service.promoteToReview({
+      request_id: "DOCREQ-REVIEW-000006", project_id: "PRJ-0002", document_id: firstWorking.document_id,
+      expected_version_id: secondWorking.version_id, created_at: "2026-08-24T19:08:00+01:00"
+    }, state());
+
+    transport.raceBeforeConditional = { path: publishedPath, content: "human edit during publish" };
+    await expect(service.publish({
+      request_id: "DOCREQ-PUBLISH-000005", project_id: "PRJ-0002", document_id: firstWorking.document_id,
+      expected_version_id: secondReview.version_id, created_at: "2026-08-24T19:09:00+01:00"
+    }, state())).rejects.toMatchObject({ code: "PROVIDER_CAS_CONFLICT" });
+
+    expect(transport.files.get(publishedPath)?.content).toBe("human edit during publish");
+    expect(transport.files.get(reviewPath)?.content).toBe("candidate v2");
+    const status = await service.status("PRJ-0002", firstWorking.document_id);
+    expect(status?.published_version_id).toBe(firstPublished.version_id);
+    expect(status?.review_version_id).toBe(secondReview.version_id);
   });
 });

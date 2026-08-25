@@ -10,7 +10,7 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.boundProjectId = ctx.id.name ?? "";
+    this.boundProjectId = this.ctx.id.name ?? "";
     this.gateMode = parseMutationGateMode(env.PROJECT_OS_MUTATION_GATE_MODE);
     const dropbox = new DropboxClient({
       appKey: env.DROPBOX_APP_KEY,

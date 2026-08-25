@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { DropboxConflictError, type DropboxEntry, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import { emptyProjectState } from "../src/domain/transitions";
 import { sha256Text } from "../src/documents/hash";
+import { machineMutationResolutionPath } from "../src/dropbox/layout";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { MutationCandidateResolutionService } from "../src/mutation-gate/resolution-service";
 
@@ -198,5 +199,59 @@ describe("MutationGate terminal resolution crash recovery", () => {
     });
 
     expect(artifact).toHaveBeenCalledTimes(1);
+  });
+
+  it("repairs exact marker-only replay without rerunning the governed downstream", async () => {
+    const transport = new CrashableMutationGateDropbox();
+    const service = new MutationCandidateResolutionService(transport);
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/exact.md";
+    const content = "# exact governed candidate";
+    const { repository, candidate } = await capturedCandidate(transport, path, content, "id:exact");
+    const artifact = vi.fn(async (request: { artifact_request: { request_id: string; content_sha256: string } }) => ({
+      request_id: request.artifact_request.request_id,
+      project_id: state.project_id,
+      relative_path: "exact.md",
+      content_sha256: request.artifact_request.content_sha256,
+      status: "committed" as const
+    }));
+    const request = {
+      operation: "candidate.adopt_artifact" as const,
+      resolution_id: "MUTRES-444444444444444444444444",
+      project_id: state.project_id,
+      candidate_id: candidate.candidate_id,
+      artifact_request: {
+        request_id: "ART-CANDIDATE-EXACT-0001",
+        project_id: state.project_id,
+        relative_path: "exact.md",
+        content,
+        content_sha256: await sha256Text(content),
+        mode: "create" as const
+      }
+    };
+
+    transport.failResolutionJsonOnce = true;
+    await expect(service.resolve(request, state, {
+      artifact,
+      working: vi.fn()
+    })).rejects.toThrow(/injected crash after terminal marker/i);
+    expect(artifact).toHaveBeenCalledTimes(1);
+    expect(await repository.readResolutions(state.project_id, candidate.candidate_id)).toEqual([]);
+
+    await expect(service.resolve(request, state, {
+      artifact,
+      working: vi.fn()
+    })).resolves.toMatchObject({
+      status: "committed",
+      action: "adopt_as_artifact",
+      downstream_request_id: request.artifact_request.request_id
+    });
+
+    expect(artifact).toHaveBeenCalledTimes(1);
+    expect(await repository.readResolutions(state.project_id, candidate.candidate_id)).toHaveLength(1);
+    expect(transport.files.has(machineMutationResolutionPath(
+      state.project_id,
+      candidate.candidate_id,
+      request.resolution_id
+    ))).toBe(true);
   });
 });

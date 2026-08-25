@@ -105,21 +105,28 @@ describe("MutationGate status vocabulary", () => {
   it("keeps SUBMITTED durable intent distinct from COMMITTED and ACCEPTED", async () => {
     const transport = new FakeStatusDropbox();
     const repository = new MutationGateRepository(transport);
+    const gate = new MutationGateService(transport, "observe");
     const request = await artifactRequest();
 
     const prepared = await new ArtifactMutationIntentService(repository, transport).prepare(state(), request);
     const intentPath = machineMutationIntentPath(request.project_id, request.request_id);
     const intentRaw = transport.files.get(intentPath);
+    const status = await gate.artifactStatus(request.project_id, request.request_id);
 
     expect(prepared.intent.request_id).toBe(request.request_id);
     expect(intentRaw).toBeDefined();
     expect(transport.files.has(prepared.destination.path)).toBe(false);
     expect(transport.files.has(machineArtifactReceiptPath(request.request_id))).toBe(false);
+    expect(status).toMatchObject({
+      project_id: request.project_id,
+      request_id: request.request_id,
+      verification_state: "submitted"
+    });
     expect(JSON.parse(intentRaw!)).not.toHaveProperty("status");
-    expect(intentRaw).not.toMatch(/accepted|published/i);
+    expect(JSON.stringify(status)).not.toMatch(/accepted|published/i);
   });
 
-  it("treats durable candidate evidence as verified without implying publication or acceptance", async () => {
+  it("reports unresolved provider presence as external_candidate, never published or accepted", async () => {
     const transport = new FakeStatusDropbox();
     const gate = new MutationGateService(transport, "observe");
     const repository = new MutationGateRepository(transport);
@@ -141,13 +148,13 @@ describe("MutationGate status vocabulary", () => {
     expect(status).toMatchObject({
       candidate_id: capture.record.candidate_id,
       gate_mode: "observe",
+      verification_state: "external_candidate",
       resolution_state: "unresolved"
     });
-    expect(status).not.toHaveProperty("accepted");
-    expect(status).not.toHaveProperty("published");
+    expect(JSON.stringify(status)).not.toMatch(/accepted|published/i);
   });
 
-  it("records a committed rejection resolution without creating ACCEPTED state or changing project revision", async () => {
+  it("reports durable candidate resolution as canonical_verified without creating ACCEPTED state", async () => {
     const transport = new FakeStatusDropbox();
     const gate = new MutationGateService(transport, "observe");
     const project = state();
@@ -165,14 +172,16 @@ describe("MutationGate status vocabulary", () => {
       artifact: async () => { throw new Error("artifact executor must not run for reject"); },
       working: async () => { throw new Error("working executor must not run for reject"); }
     });
+    const status = await gate.status(project.project_id, candidate.record.candidate_id);
 
     expect(receipt).toMatchObject({ status: "committed", action: "reject" });
     expect(project.revision).toBe(revisionBefore);
-    expect(await gate.status(project.project_id, candidate.record.candidate_id)).toMatchObject({
+    expect(status).toMatchObject({
+      verification_state: "canonical_verified",
       resolution_state: "resolved",
       resolution_action: "reject"
     });
-    expect(JSON.stringify(receipt)).not.toMatch(/accepted|published/i);
+    expect(JSON.stringify({ receipt, status })).not.toMatch(/accepted|published/i);
   });
 
   it("keeps production continuity stable while MutationGate defaults to observe", () => {

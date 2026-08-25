@@ -1,6 +1,7 @@
 import type { MutationDetectionSource } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import type { DropboxChangeEntry, DropboxFileMetadata, DropboxTransport } from "../dropbox/client";
+import { ArtifactContentConflictError } from "../dropbox/repository-core";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
 import { MutationGateClassifier } from "./classifier";
 import { MutationGateRepository } from "./repository";
@@ -26,15 +27,16 @@ export interface MutationCandidateStatus {
   resolution_id?: string;
 }
 
-export class UnresolvedExternalMutationCandidateError extends Error {
+export class UnresolvedExternalMutationCandidateError extends ArtifactContentConflictError {
   readonly code = "UNRESOLVED_EXTERNAL_CANDIDATE";
 
   constructor(
     public readonly destinationPath: string,
     public readonly candidateIds: string[]
   ) {
-    super(`Unresolved external mutation candidate blocks destination: ${destinationPath}`);
+    super(destinationPath);
     this.name = "UnresolvedExternalMutationCandidateError";
+    this.message = `Unresolved external mutation candidate blocks destination: ${destinationPath}`;
   }
 }
 

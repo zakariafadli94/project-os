@@ -32,7 +32,8 @@ MODEL001 does **not**:
 - change MutationGate from `observe` to `enforce`;
 - repair or reconcile historical PRJ-0003 mutation deviations;
 - alter the canonical commit boundary, materialization architecture or managed-document lifecycle;
-- introduce distributed locks or a second concurrency coordinator.
+- introduce distributed locks or a second concurrency coordinator;
+- infer new aggregate parent/child completion dependencies that the current model cannot represent safely.
 
 Any model capability requiring new persisted structure belongs behind `IMP-SCHEMA001` or a later explicitly approved package.
 
@@ -160,6 +161,8 @@ completed -> archived
 
 MODEL001 does not redefine `paused` as a universal hard freeze of every child entity. It remains the existing project lifecycle status; any future stronger pause policy would require a separate decision because it could change normal workflow semantics.
 
+Project completion remains an explicit project-level decision. MODEL001 does not infer project completion from child entities and does not newly require every task, phase or deliverable to be terminal before `project.complete`. The current model has no task cancellation/dependency semantics sufficient to make such an aggregate gate safe without changing established workflows.
+
 ## 7. Task lifecycle
 
 Persisted task statuses remain:
@@ -180,6 +183,7 @@ pending -> completed
 active  -> blocked
 active  -> completed
 blocked -> active
+blocked -> blocked   (explicit blocked-reason refresh)
 blocked -> completed
 ```
 
@@ -191,7 +195,7 @@ Rationale for direct `pending -> completed`: Project OS supports natural-languag
 
 `task.complete` clears `blocked_reason` and may store the optional result.
 
-`task.block` requires a non-completed task and stores the explicit reason.
+`task.block` requires a non-completed task and stores the explicit reason. When the task is already blocked, an exact-current `task.block` may replace the block reason while keeping the task blocked; this preserves the existing only-way-to-refresh-block-context behavior without treating it as a stale merge.
 
 All task lifecycle mutations require exact current project revision.
 
@@ -244,7 +248,7 @@ may be completed.
 
 Attempting to complete a pending/non-current phase is rejected.
 
-After completion, the next pending phase is promoted deterministically using the existing stable ordering rule unless a future explicitly approved ordering model supersedes it.
+After completion, the next pending phase is promoted deterministically using the current compatibility rule: lexicographically lowest `phase_id`. Introducing explicit phase ordering would require a separately approved model/schema capability.
 
 If there is no pending phase, `current_phase_id` becomes `null`.
 
@@ -255,6 +259,14 @@ If there is no pending phase, `current_phase_id` becomes `null`.
 They may attach to an existing active or pending phase.
 
 This prevents new operational work from being introduced into a phase whose lifecycle has already closed while preserving advance planning against pending phases.
+
+### 8.6 No inferred child-completion dependency in MODEL001
+
+Completing the current phase does not newly require every task or deliverable attached to that phase to be terminal.
+
+That stronger dependency rule is intentionally not introduced because the existing task model has no explicit cancelled/abandoned task state and no persisted dependency graph. Enforcing aggregate child closure now could strand legitimate workflows or force false `completed` records.
+
+MODEL001 formalizes phase identity/progression and concurrency only. Explicit dependency gates remain a later, separately designed capability.
 
 ## 9. Decision lifecycle
 
@@ -323,7 +335,7 @@ planned -> in_progress -> review -> accepted
 
 An accepted deliverable may be superseded only by another accepted deliverable.
 
-`legacy_completed` remains a compatibility state and does not imply acceptance. Existing explicit compatibility paths to accept or abandon a `legacy_completed` item remain unchanged unless tests reveal a contradiction with the accepted SOP baseline.
+`legacy_completed` remains a compatibility state and does not imply acceptance. Existing explicit compatibility paths remain exactly defined: `legacy_completed -> accepted` through `deliverable.accept` with an explicit acceptance note, or `legacy_completed -> abandoned` through `deliverable.abandon` with an explicit reason.
 
 ### 11.1 Reference invariants
 
@@ -423,7 +435,7 @@ Tests must cover:
 
 ### 16.2 Task lifecycle
 
-Tests must cover every allowed task transition and representative forbidden/terminal transitions.
+Tests must cover every allowed task transition, exact-current blocked-reason refresh, and representative forbidden/terminal transitions.
 
 ### 16.3 Phase invariants
 
@@ -433,11 +445,12 @@ Tests must cover:
 - later phase is pending;
 - pending phase cannot be completed directly;
 - only active/current phase completes;
-- deterministic promotion of the next pending phase;
+- deterministic lexicographic `phase_id` promotion of the next pending phase;
 - no remaining pending phase clears `current_phase_id`;
 - completed phase cannot be updated;
 - new task cannot attach to completed phase;
-- new normative deliverable cannot attach to completed phase.
+- new normative deliverable cannot attach to completed phase;
+- phase completion does not fabricate child completion or require unavailable task-cancellation semantics.
 
 ### 16.4 Decision/research/deliverable invariants
 
@@ -450,6 +463,7 @@ Tests must cover:
 - discovery references only existing research;
 - accepted/superseded/abandoned deliverable behavior remains compatible;
 - legacy completion does not imply acceptance;
+- explicit legacy acceptance and abandonment remain compatible;
 - deliverable supersession preserves historical output.
 
 ### 16.5 Compatibility/recovery
@@ -459,6 +473,7 @@ Tests must prove:
 - historical schema-1.0 snapshots that are structurally valid remain readable even when they contain a historical lifecycle combination that new mutations would no longer create;
 - loading history does not create a business revision;
 - canonical commit replay/recovery still produces the same final current state;
+- project/phase parent lifecycle does not retroactively rewrite child states;
 - no test requires MutationGate enforcement, PRJ-0003 repair or SCHEMA runtime behavior.
 
 ### 16.6 Regression
@@ -518,9 +533,10 @@ MODEL001 adopts a schema-1.0-compatible formal lifecycle/concurrency policy:
 - keep existing persistent entity shapes;
 - make lifecycle mutations exact-current;
 - allow only narrowly defined independent additions to rebase;
-- make task behavior deterministic;
+- make task behavior deterministic while preserving exact-current blocked-reason refresh;
 - enforce one current active phase for new mutations;
 - prevent new work from attaching to completed phases;
+- avoid inventing aggregate child-completion dependencies not supported by the current model;
 - require currently accepted governing decisions for new governed relationships;
 - preserve immutable history and historical snapshot readability;
 - defer all new persisted dependency/version structures to SCHEMA or later packages.

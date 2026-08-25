@@ -13,6 +13,10 @@ class FakeDropbox implements DropboxTransport {
   raceBeforeConditional?: { path: string; content: string };
   private revision = 0;
 
+  seed(path: string, content: string): DropboxFileMetadata {
+    return this.set(path, content);
+  }
+
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
     if (mode === "add" && this.files.has(path)) throw new DropboxConflictError("exists", "req-add", "path/conflict/file");
     this.set(path, content, this.metadata.get(path)?.id);
@@ -172,6 +176,36 @@ describe("legacy artifact managed-document compatibility", () => {
     const heads = [...dropbox.files.keys()].filter((path) => path.includes("/documents/heads/"));
     const head = JSON.parse(dropbox.files.get(heads[0])!);
     expect(head).toMatchObject({ kind: "reference", collection_path: "MARKET", logical_path: "strategy/commercial.md" });
+  });
+
+  it("repairs an interrupted first DELIVERABLES create by attaching the original artifact request provenance", async () => {
+    const dropbox = new FakeDropbox();
+    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const visible = `${workspaceProjectRoot("PRJ-0003", "growth")}/DELIVERABLES/REVENUE-OS/strategy/commercial.md`;
+    dropbox.seed(visible, "partial published");
+
+    const result = await writer.writeIfManaged(state(), await request("partial published", "create", "ART-LEGACY-000008"));
+    expect(result).toBe("idempotent");
+
+    const heads = [...dropbox.files.keys()].filter((path) => path.includes("/documents/heads/"));
+    const head = JSON.parse(dropbox.files.get(heads[0])!);
+    const version = await new DocumentLedgerRepository(dropbox).readVersion("PRJ-0003", head.document_id, head.published_version_id);
+    expect(version).toMatchObject({ source: "legacy_artifact_api", request_id: "ART-LEGACY-000008", stage: "published" });
+  });
+
+  it("repairs an interrupted first REFERENCES create by attaching the original artifact request provenance", async () => {
+    const dropbox = new FakeDropbox();
+    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const visible = `${workspaceProjectRoot("PRJ-0003", "growth")}/REFERENCES/MARKET/strategy/commercial.md`;
+    dropbox.seed(visible, "partial reference");
+
+    const result = await writer.writeIfManaged(state("REFERENCES/MARKET"), await request("partial reference", "create", "ART-LEGACY-000009"));
+    expect(result).toBe("idempotent");
+
+    const heads = [...dropbox.files.keys()].filter((path) => path.includes("/documents/heads/"));
+    const head = JSON.parse(dropbox.files.get(heads[0])!);
+    const version = await new DocumentLedgerRepository(dropbox).readVersion("PRJ-0003", head.document_id, head.reference_version_id);
+    expect(version).toMatchObject({ source: "legacy_artifact_api", request_id: "ART-LEGACY-000009", stage: "reference" });
   });
 
   it("returns null for historical artifact destinations that are not managed-document zones", async () => {

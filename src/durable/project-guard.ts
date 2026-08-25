@@ -10,7 +10,7 @@ import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
 import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinator";
-import { ManagedDocumentRequestLedger } from "../documents/request-ledger";
+import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
 import { DropboxClient } from "../dropbox/client";
 import { parseLayoutMode, type LayoutMode } from "../dropbox/layout";
@@ -440,9 +440,10 @@ export class ProjectGuard extends DurableObject<Env> {
       ));
     }
 
-    const durableIntent = await this.managedDocumentRequests.readIntent(operation.project_id, operation.request_id);
-    if (durableIntent) {
-      if (durableIntent.request_json !== serialized) {
+    try {
+      await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
+    } catch (error) {
+      if (error instanceof ManagedDocumentRequestIntentConflictError) {
         return Response.json(this.documentTerminalReceipt(
           operation,
           "rejected",
@@ -450,14 +451,14 @@ export class ProjectGuard extends DurableObject<Env> {
           "The same request_id was reused with a different managed-document payload"
         ));
       }
-      const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
-      if (durableReceipt) {
-        const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
-        this.persistDocumentRequest(operation, receipt);
-        return Response.json(receipt);
-      }
-    } else {
-      await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
+      throw error;
+    }
+
+    const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
+    if (durableReceipt) {
+      const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
+      this.persistDocumentRequest(operation, receipt);
+      return Response.json(receipt);
     }
 
     try {

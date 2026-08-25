@@ -101,14 +101,21 @@ describe("managed document domain", () => {
     "/absolute.md",
     "foo//bar.md",
     "foo/./bar.md",
+    "foo\\bar.md",
+    "foo/line\nbreak.md",
+    " foo.md",
+    "foo.md ",
     "",
     "INPUTS/file.md"
   ])("rejects unsafe or reserved managed relative path %s", (value) => {
     expect(() => assertManagedRelativePath(value)).toThrow();
   });
 
-  it("accepts safe nested managed relative paths", () => {
+  it("accepts safe nested and human-friendly managed relative paths", () => {
     expect(assertManagedRelativePath("strategy/commercial.md")).toBe("strategy/commercial.md");
+    expect(assertManagedRelativePath("Stratégie commerciale 2026.pdf")).toBe("Stratégie commerciale 2026.pdf");
+    expect(assertManagedRelativePath("Client A/Brief final (validé) — août 2026.docx"))
+      .toBe("Client A/Brief final (validé) — août 2026.docx");
   });
 
   it.each([
@@ -116,6 +123,9 @@ describe("managed document domain", () => {
     "/MARKET",
     "MARKET//Reports",
     "MARKET/./Reports",
+    "MARKET\\Reports",
+    " Market",
+    "Market ",
     "INPUTS",
     "WORKING/foo",
     "DELIVERABLES",
@@ -127,6 +137,7 @@ describe("managed document domain", () => {
   it("accepts bounded project-specific reference collections", () => {
     expect(assertReferenceCollectionPath("MARKET/Reports")).toBe("MARKET/Reports");
     expect(assertReferenceCollectionPath("COMPETITORS/HubSpot")).toBe("COMPETITORS/HubSpot");
+    expect(assertReferenceCollectionPath("Marché français/Études 2026")).toBe("Marché français/Études 2026");
     expect(assertReferenceCollectionPath("UNCLASSIFIED")).toBe("UNCLASSIFIED");
   });
 });

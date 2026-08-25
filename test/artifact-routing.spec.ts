@@ -154,11 +154,17 @@ describe("project artifact routing", () => {
     await expect(repository.writeArtifact(state, await artifactRequest())).rejects.toBeInstanceOf(ArtifactGovernanceConflictError);
   });
 
-  it("archives the replaced active content under ARCHIVES without polluting DELIVERABLES", async () => {
+  it("archives the replaced governed active content under ARCHIVES without polluting DELIVERABLES", async () => {
     const transport = new FakeTransport();
     const repository = new ProjectRepository(transport, "v2");
     const activePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/DELIVERABLES/REVENUE-OS/04-playbooks-sectoriels/foo.md";
-    transport.seed(activePath, "# old");
+
+    await repository.writeArtifact(configuredState(), await artifactRequest({
+      request_id: "ART-ROUTING-SEED-0001",
+      content: "# old",
+      mode: "create"
+    }));
+    expect(transport.files.get(activePath)).toBe("# old");
 
     await repository.writeArtifact(configuredState(), await artifactRequest({
       request_id: "ART-ROUTING-000002",

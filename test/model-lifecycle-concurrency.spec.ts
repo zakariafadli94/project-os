@@ -79,4 +79,24 @@ describe("MODEL001 concurrency", () => {
     }));
     expect(result).toMatchObject({ kind: "conflict", code: "STALE_REVISION" });
   });
+
+  it("rebases only the approved additive operations when current-state invariants still hold", () => {
+    const state = { ...emptyProjectState("PRJ-4005", "Model", "model"), revision: 5 };
+
+    expect(applyTransaction(state, tx(state.project_id, 2, "research.add", {
+      research_id: "RES-4001", title: "Research", body: "Evidence"
+    })).kind).toBe("commit");
+
+    expect(applyTransaction(state, tx(state.project_id, 2, "constraint.add", {
+      constraint_id: "CON-4001", title: "Constraint", description: "Rule"
+    })).kind).toBe("commit");
+
+    expect(applyTransaction(state, tx(state.project_id, 2, "task.create", {
+      task_id: "TASK-4005", title: "Independent task"
+    })).kind).toBe("commit");
+
+    expect(applyTransaction(state, tx(state.project_id, 2, "deliverable.add", {
+      deliverable_id: "DEL-4002", title: "Legacy additive"
+    })).kind).toBe("commit");
+  });
 });

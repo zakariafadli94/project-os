@@ -1,12 +1,21 @@
+import type { ArtifactWriteReceipt } from "../domain/artifact-write";
 import type { MutationDetectionSource } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import type { DropboxChangeEntry, DropboxFileMetadata, DropboxTransport } from "../dropbox/client";
+import { machineArtifactReceiptPath } from "../dropbox/layout";
 import { ArtifactContentConflictError } from "../dropbox/repository-core";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
 import { MutationGateClassifier } from "./classifier";
 import { MutationGateRepository } from "./repository";
 
 export type MutationGateMode = "observe" | "enforce";
+export type MutationVerificationState =
+  | "submitted"
+  | "committed"
+  | "canonical_verified"
+  | "external_candidate"
+  | "conflict"
+  | "rejected";
 
 const CANDIDATE_RESOLUTION_CAPABILITY = Symbol("ProjectOSCandidateResolution");
 
@@ -38,9 +47,20 @@ export interface MutationCandidateStatus {
   detection_source: MutationDetectionSource;
   detected_at: string;
   gate_mode: MutationGateMode;
+  verification_state: "external_candidate" | "canonical_verified";
   resolution_state: "unresolved" | "resolved";
   resolution_action?: "adopt_as_artifact" | "adopt_as_working" | "reject";
   resolution_id?: string;
+}
+
+export interface MutationArtifactStatus {
+  request_id: string;
+  project_id: string;
+  intent_id: string;
+  destination_path: string;
+  gate_mode: MutationGateMode;
+  verification_state: "submitted" | "committed" | "conflict" | "rejected";
+  receipt_status?: ArtifactWriteReceipt["status"];
 }
 
 export class UnresolvedExternalMutationCandidateError extends ArtifactContentConflictError {
@@ -153,6 +173,34 @@ export class MutationGateService {
     }
   }
 
+  async artifactStatus(projectId: string, requestId: string): Promise<MutationArtifactStatus | null> {
+    const intent = await this.repository.readArtifactIntent(projectId, requestId);
+    if (!intent) return null;
+
+    const rawReceipt = await this.transport.download(machineArtifactReceiptPath(requestId));
+    if (rawReceipt === null) {
+      return {
+        request_id: requestId,
+        project_id: projectId,
+        intent_id: intent.intent_id,
+        destination_path: intent.destination_path,
+        gate_mode: this.mode,
+        verification_state: "submitted"
+      };
+    }
+
+    const receipt = parseArtifactReceipt(rawReceipt, intent);
+    return {
+      request_id: requestId,
+      project_id: projectId,
+      intent_id: intent.intent_id,
+      destination_path: intent.destination_path,
+      gate_mode: this.mode,
+      verification_state: receipt.status,
+      receipt_status: receipt.status
+    };
+  }
+
   async listUnresolved(
     projectId: string,
     filter: { destinationPath?: string } = {}
@@ -161,8 +209,8 @@ export class MutationGateService {
     const result: MutationCandidateStatus[] = [];
     for (const candidate of candidates) {
       if (filter.destinationPath && candidate.provider_path !== filter.destinationPath) continue;
-      const resolutions = await this.repository.readResolutions(projectId, candidate.candidate_id);
-      if (resolutions.length > 0) continue;
+      const terminal = await this.repository.readTerminalResolutionRecord(projectId, candidate.candidate_id);
+      if (terminal) continue;
       result.push({
         candidate_id: candidate.candidate_id,
         project_id: candidate.project_id,
@@ -170,6 +218,7 @@ export class MutationGateService {
         detection_source: candidate.detection_source,
         detected_at: candidate.detected_at,
         gate_mode: this.mode,
+        verification_state: "external_candidate",
         resolution_state: "unresolved"
       });
     }
@@ -186,8 +235,7 @@ export class MutationGateService {
   async status(projectId: string, candidateId: string): Promise<MutationCandidateStatus | null> {
     const candidate = await this.repository.readCandidate(projectId, candidateId);
     if (!candidate) return null;
-    const resolutions = await this.repository.readResolutions(projectId, candidateId);
-    const terminal = resolutions.at(-1);
+    const terminal = await this.repository.readTerminalResolutionRecord(projectId, candidateId);
     return {
       candidate_id: candidate.candidate_id,
       project_id: candidate.project_id,
@@ -195,9 +243,10 @@ export class MutationGateService {
       detection_source: candidate.detection_source,
       detected_at: candidate.detected_at,
       gate_mode: this.mode,
+      verification_state: terminal ? "canonical_verified" : "external_candidate",
       resolution_state: terminal ? "resolved" : "unresolved",
       ...(terminal ? {
-        resolution_action: terminal.action,
+        resolution_action: terminal.resolution.action,
         resolution_id: terminal.resolution_id
       } : {})
     };
@@ -216,4 +265,19 @@ export class MutationGateService {
     }
     return this.transport.getMetadata(change.path);
   }
+}
+
+function parseArtifactReceipt(raw: string, intent: Awaited<ReturnType<MutationGateRepository["readArtifactIntent"]>>): ArtifactWriteReceipt {
+  if (!intent) throw new Error("Mutation artifact receipt parser requires a durable intent");
+  const parsed = JSON.parse(raw) as Partial<ArtifactWriteReceipt>;
+  if (
+    parsed.request_id !== intent.request_id
+    || parsed.project_id !== intent.project_id
+    || parsed.content_sha256 !== intent.expected_content_sha256
+    || typeof parsed.relative_path !== "string"
+    || (parsed.status !== "committed" && parsed.status !== "conflict" && parsed.status !== "rejected")
+  ) {
+    throw new Error(`Artifact receipt does not match durable mutation intent: ${intent.request_id}`);
+  }
+  return parsed as ArtifactWriteReceipt;
 }

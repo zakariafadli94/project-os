@@ -4,7 +4,11 @@ import type { ArtifactWriteRequest } from "../domain/artifact-write";
 import type { ProjectState } from "../domain/project-state";
 import { ArtifactMutationIntentService } from "../mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../mutation-gate/repository";
-import { MutationGateService, type MutationGateMode } from "../mutation-gate/service";
+import {
+  MutationGateService,
+  type CandidateResolutionContext,
+  type MutationGateMode
+} from "../mutation-gate/service";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
 import type { DropboxTransport } from "./client";
 import type { LayoutMode } from "./layout";
@@ -28,7 +32,8 @@ export class ProjectRepository extends CoreProjectRepository {
   override async writeArtifact(
     state: ProjectState,
     request: ArtifactWriteRequest,
-    preparedDestination?: ResolvedArtifactDestination
+    preparedDestination?: ResolvedArtifactDestination,
+    resolutionContext?: CandidateResolutionContext
   ): Promise<"written" | "idempotent"> {
     if (this.repositoryMode === "legacy") return super.writeArtifact(state, request);
 
@@ -37,7 +42,7 @@ export class ProjectRepository extends CoreProjectRepository {
       throw new Error(`Prepared artifact destination does not match durable mutation intent: ${request.request_id}`);
     }
     const replayState = stateForPreparedDestination(state, request, prepared.destination);
-    await this.mutationGate.assertDestinationClear(replayState, prepared.destination.path);
+    await this.mutationGate.assertDestinationClear(replayState, prepared.destination.path, resolutionContext);
 
     const { LegacyArtifactDocumentWriter } = await import("../documents/legacy-artifact");
     const managed = await new LegacyArtifactDocumentWriter(this.rawTransport).writeIfManaged(replayState, request);

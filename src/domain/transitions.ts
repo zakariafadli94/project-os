@@ -305,6 +305,15 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
       const phase = next.plan_phases[tx.payload.phase_id];
       if (!phase) return rejected("PHASE_NOT_FOUND", `Phase ${tx.payload.phase_id} does not exist`);
       if (phase.status === "completed") return rejected("PHASE_COMPLETED", `Phase ${phase.phase_id} is already completed`);
+      if (phase.status !== "active" || next.current_phase_id !== phase.phase_id) {
+        return rejected("PHASE_NOT_CURRENT", `Only the active current phase can be completed: ${phase.phase_id}`);
+      }
+      const otherActive = Object.values(next.plan_phases).find(
+        (candidate) => candidate.phase_id !== phase.phase_id && candidate.status === "active"
+      );
+      if (otherActive) {
+        return rejected("PHASE_STATE_INCONSISTENT", `Multiple active phases exist: ${phase.phase_id}, ${otherActive.phase_id}`);
+      }
       phase.status = "completed";
       phase.updated_at = tx.created_at;
       const nextPhase = Object.values(next.plan_phases)

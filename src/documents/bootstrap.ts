@@ -16,6 +16,11 @@ import {
 import { DocumentLedgerRepository } from "./repository";
 
 export type BootstrapManagedStage = "reference" | "working" | "review" | "published";
+export type PublishedBootstrapProvenance = "legacy_artifact" | "managed_recovery";
+
+export interface ManagedDocumentBootstrapOptions {
+  publishedProvenance?: PublishedBootstrapProvenance;
+}
 
 export interface ManagedDocumentBootstrapResult {
   adopted: boolean;
@@ -34,10 +39,14 @@ export class ManagedDocumentBootstrapper {
     state: ProjectState,
     visiblePath: string,
     metadata: DropboxFileMetadata,
-    inferredStage: BootstrapManagedStage
+    inferredStage: BootstrapManagedStage,
+    options: ManagedDocumentBootstrapOptions = {}
   ): Promise<ManagedDocumentBootstrapResult> {
     if (state.status === "archived") {
       throw new Error("Archived projects do not bootstrap active managed document paths");
+    }
+    if (inferredStage === "published" && !options.publishedProvenance) {
+      throw new Error("Published provenance is required before DELIVERABLES bootstrap");
     }
 
     const parsed = parseVisiblePath(state, visiblePath, inferredStage);
@@ -51,9 +60,6 @@ export class ManagedDocumentBootstrapper {
     const existingHead = await this.ledger.readHead(state.project_id, documentId);
 
     if (existingHead) {
-      // A durable provider-file binding is authoritative for reference identity. The
-      // visible collection may have changed since the head was written; reconciliation
-      // of the same baseline page will capture that change after bootstrap.
       assertCompatibleHead(
         existingHead,
         kind,
@@ -87,7 +93,7 @@ export class ManagedDocumentBootstrapper {
       kind,
       stage: inferredStage,
       logical_path: existingHead?.logical_path ?? parsed.logicalPath,
-      source: "external_human",
+      source: sourceForBootstrap(inferredStage, options),
       created_at: metadata.server_modified ?? "1970-01-01T00:00:00.000Z",
       immutable_payload_path: immutablePayloadPath,
       provider_content_hash: metadata.content_hash,
@@ -129,6 +135,16 @@ export class ManagedDocumentBootstrapper {
 
     return { adopted: true, head, version };
   }
+}
+
+function sourceForBootstrap(
+  stage: BootstrapManagedStage,
+  options: ManagedDocumentBootstrapOptions
+): DocumentVersionRecord["source"] {
+  if (stage !== "published") return "external_human";
+  if (options.publishedProvenance === "legacy_artifact") return "legacy_artifact_api";
+  if (options.publishedProvenance === "managed_recovery") return "project_os";
+  throw new Error("Published provenance is required before DELIVERABLES bootstrap");
 }
 
 function mergeHead(

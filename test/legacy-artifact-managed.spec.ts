@@ -34,6 +34,13 @@ class FakeDropbox implements DropboxTransport {
   async download(path: string): Promise<string | null> { return this.files.get(path) ?? null; }
   async getMetadata(path: string): Promise<DropboxFileMetadata | null> { return this.metadata.get(path) ?? null; }
 
+  async listFolder(path: string) {
+    const prefix = `${path}/`;
+    return [...this.files.keys()]
+      .filter((candidate) => candidate.startsWith(prefix) && !candidate.slice(prefix.length).includes("/"))
+      .map((candidate) => ({ tag: "file" as const, name: candidate.slice(prefix.length), path_display: candidate }));
+  }
+
   async copy(from: string, to: string): Promise<DropboxFileMetadata> {
     const content = this.files.get(from);
     if (content === undefined) throw new Error(`missing source ${from}`);

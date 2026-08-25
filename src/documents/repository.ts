@@ -3,7 +3,8 @@ import {
   parseDocumentVersionRecord,
   parseManagedDocumentHead,
   type DocumentVersionRecord,
-  type ManagedDocumentHead
+  type ManagedDocumentHead,
+  type ManagedProviderObservation
 } from "../domain/managed-document";
 import {
   DropboxConflictError,
@@ -254,36 +255,65 @@ export class DocumentLedgerRepository {
       throw new Error(`Managed document version history mixes document kinds for ${documentId}`);
     }
 
-    const newest = (stage: DocumentVersionRecord["stage"]) => causal
-      .filter((record) => record.stage === stage)
-      .sort(compareVersionRecords)
-      .at(-1);
-    const latestMeaningful = causal
-      .filter((record) => record.stage !== "recovered_external")
-      .sort(compareVersionRecords)
-      .at(-1) ?? causal.sort(compareVersionRecords).at(-1)!;
+    const meaningful = causal.filter((record) => record.stage !== "recovered_external");
+    if (meaningful.length === 0) return null;
+    const meaningfulIds = new Set(meaningful.map((record) => record.version_id));
+    const consumedParents = new Set(
+      meaningful
+        .map((record) => record.parent_version_id)
+        .filter((value): value is string => !!value && meaningfulIds.has(value))
+    );
+    const tips = meaningful.filter((record) => !consumedParents.has(record.version_id));
+    if (tips.length !== 1) {
+      throw new Error(`Managed document version history has ${tips.length} active causal tips for ${documentId}`);
+    }
+    const tip = tips[0];
 
-    const head: ManagedDocumentHead = kind === "reference"
-      ? {
-          schema_version: "1.0",
-          project_id: projectId,
-          document_id: documentId,
-          kind,
-          logical_path: latestMeaningful.logical_path,
-          reference_version_id: newest("reference")?.version_id,
-          reconciliation_status: "clean"
-        }
-      : {
-          schema_version: "1.0",
-          project_id: projectId,
-          document_id: documentId,
-          kind,
-          logical_path: latestMeaningful.logical_path,
-          working_version_id: newest("working")?.version_id,
-          review_version_id: newest("review")?.version_id,
-          published_version_id: newest("published")?.version_id,
-          reconciliation_status: "clean"
-        };
+    let head: ManagedDocumentHead;
+    if (kind === "reference") {
+      if (tip.stage !== "reference") {
+        throw new Error(`Managed reference history has non-reference active tip ${tip.version_id}`);
+      }
+      const provider = providerObservationFromVersion(tip);
+      head = {
+        schema_version: "1.0",
+        project_id: projectId,
+        document_id: documentId,
+        kind,
+        logical_path: tip.logical_path,
+        ...(referenceCollectionFromVersion(tip) ? { collection_path: referenceCollectionFromVersion(tip) } : {}),
+        reference_version_id: tip.version_id,
+        ...(provider ? { provider: { reference: provider } } : {}),
+        reconciliation_status: "clean"
+      };
+    } else {
+      if (tip.stage !== "working" && tip.stage !== "review" && tip.stage !== "published") {
+        throw new Error(`Managed work-product history has unsupported active tip ${tip.version_id}`);
+      }
+      const publishedAncestor = tip.stage === "published"
+        ? tip
+        : nearestAncestorAtStage(tip, records, "published");
+      const provider: Record<string, ManagedProviderObservation> = {};
+      const publishedProvider = publishedAncestor ? providerObservationFromVersion(publishedAncestor) : undefined;
+      if (publishedProvider) provider.published = publishedProvider;
+      const tipProvider = providerObservationFromVersion(tip);
+      if (tipProvider && tip.stage === "working") provider.working = tipProvider;
+      if (tipProvider && tip.stage === "review") provider.review = tipProvider;
+      if (tipProvider && tip.stage === "published") provider.published = tipProvider;
+
+      head = {
+        schema_version: "1.0",
+        project_id: projectId,
+        document_id: documentId,
+        kind,
+        logical_path: tip.logical_path,
+        ...(tip.stage === "working" ? { working_version_id: tip.version_id } : {}),
+        ...(tip.stage === "review" ? { review_version_id: tip.version_id } : {}),
+        ...(publishedAncestor ? { published_version_id: publishedAncestor.version_id } : {}),
+        ...(Object.keys(provider).length > 0 ? { provider } : {}),
+        reconciliation_status: "clean"
+      };
+    }
 
     const validated = parseManagedDocumentHead(head);
     await this.writeHead(validated);
@@ -328,9 +358,49 @@ function isCausallyComplete(
   return valid;
 }
 
-function compareVersionRecords(a: DocumentVersionRecord, b: DocumentVersionRecord): number {
-  const time = Date.parse(a.created_at) - Date.parse(b.created_at);
-  return time || a.version_id.localeCompare(b.version_id);
+function nearestAncestorAtStage(
+  record: DocumentVersionRecord,
+  records: ReadonlyMap<string, DocumentVersionRecord>,
+  stage: DocumentVersionRecord["stage"]
+): DocumentVersionRecord | undefined {
+  let current: DocumentVersionRecord | undefined = record;
+  const visited = new Set<string>();
+  while (current?.parent_version_id) {
+    if (visited.has(current.version_id)) return undefined;
+    visited.add(current.version_id);
+    current = records.get(current.parent_version_id);
+    if (current?.stage === stage) return current;
+  }
+  return undefined;
+}
+
+function providerObservationFromVersion(record: DocumentVersionRecord): ManagedProviderObservation | undefined {
+  if (
+    !record.provider_path
+    || !record.provider_file_id
+    || !record.provider_rev
+    || !record.provider_content_hash
+    || record.size === undefined
+  ) return undefined;
+  return {
+    path: record.provider_path,
+    file_id: record.provider_file_id,
+    rev: record.provider_rev,
+    content_hash: record.provider_content_hash,
+    size: record.size
+  };
+}
+
+function referenceCollectionFromVersion(record: DocumentVersionRecord): string | undefined {
+  if (!record.provider_path) return undefined;
+  const marker = "/REFERENCES/";
+  const index = record.provider_path.indexOf(marker);
+  if (index < 0) return undefined;
+  const relative = record.provider_path.slice(index + marker.length);
+  const suffix = `/${record.logical_path}`;
+  if (!relative.endsWith(suffix)) return relative === record.logical_path ? "UNCLASSIFIED" : undefined;
+  const collection = relative.slice(0, -suffix.length);
+  return collection || "UNCLASSIFIED";
 }
 
 function pretty(value: unknown): string {

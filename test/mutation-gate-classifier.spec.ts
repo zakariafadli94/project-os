@@ -27,7 +27,7 @@ class FakeClassifierDropbox implements DropboxTransport {
     return metadata;
   }
 
-  async upload(path: string, content: string): Promise<void> { this.files.set(path, content); }
+  async upload(path: string, content: string, _mode: "add" | "overwrite"): Promise<void> { this.files.set(path, content); }
   async download(path: string): Promise<string | null> { return this.files.get(path) ?? null; }
   async move(): Promise<void> { throw new Error("unused"); }
   async getMetadata(path: string): Promise<DropboxFileMetadata | null> { return this.metadata.get(path) ?? null; }

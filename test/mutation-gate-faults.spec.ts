@@ -75,22 +75,28 @@ class CrashableMutationGateDropbox implements DropboxTransport {
   }
 }
 
+const state = emptyProjectState("PRJ-0002", "Project OS", "project-os", "Mutation gate fault test");
+
+async function capturedCandidate(transport: CrashableMutationGateDropbox, path: string, content: string, id: string) {
+  const repository = new MutationGateRepository(transport);
+  const metadata = await transport.seed(path, content, id);
+  const candidate = (await repository.captureCandidate({
+    projectId: state.project_id,
+    detectionSource: "incremental",
+    visiblePath: path,
+    metadata,
+    detectedAt: "2026-08-25T18:10:00+01:00"
+  })).record;
+  return { repository, candidate };
+}
+
 describe("MutationGate terminal resolution crash recovery", () => {
   it("blocks a conflicting downstream after terminal marker survives but resolution JSON is missing", async () => {
     const transport = new CrashableMutationGateDropbox();
-    const repository = new MutationGateRepository(transport);
     const service = new MutationCandidateResolutionService(transport);
-    const state = emptyProjectState("PRJ-0002", "Project OS", "project-os", "Mutation gate fault test");
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/direct.md";
     const content = "# candidate";
-    const metadata = await transport.seed(path, content, "id:direct");
-    const candidate = (await repository.captureCandidate({
-      projectId: state.project_id,
-      detectionSource: "incremental",
-      visiblePath: path,
-      metadata,
-      detectedAt: "2026-08-25T18:10:00+01:00"
-    })).record;
+    const { repository, candidate } = await capturedCandidate(transport, path, content, "id:direct");
 
     transport.failResolutionJsonOnce = true;
     await expect(service.resolve({
@@ -136,5 +142,61 @@ describe("MutationGate terminal resolution crash recovery", () => {
     });
 
     expect(artifact).not.toHaveBeenCalled();
+  });
+
+  it("rejects a changed request that reuses the marker-only resolution id without rerunning downstream", async () => {
+    const transport = new CrashableMutationGateDropbox();
+    const service = new MutationCandidateResolutionService(transport);
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/replay.md";
+    const content = "# governed candidate";
+    const { repository, candidate } = await capturedCandidate(transport, path, content, "id:replay");
+    const artifact = vi.fn(async (request: { artifact_request: { request_id: string; content_sha256: string } }) => ({
+      request_id: request.artifact_request.request_id,
+      project_id: state.project_id,
+      relative_path: "replay.md",
+      content_sha256: request.artifact_request.content_sha256,
+      status: "committed" as const
+    }));
+    const original = {
+      operation: "candidate.adopt_artifact" as const,
+      resolution_id: "MUTRES-333333333333333333333333",
+      project_id: state.project_id,
+      candidate_id: candidate.candidate_id,
+      artifact_request: {
+        request_id: "ART-CANDIDATE-REPLAY-0001",
+        project_id: state.project_id,
+        relative_path: "replay.md",
+        content,
+        content_sha256: await sha256Text(content),
+        mode: "create" as const
+      }
+    };
+
+    transport.failResolutionJsonOnce = true;
+    await expect(service.resolve(original, state, {
+      artifact,
+      working: vi.fn()
+    })).rejects.toThrow(/injected crash after terminal marker/i);
+    expect(artifact).toHaveBeenCalledTimes(1);
+    expect(await repository.hasTerminalResolution(state.project_id, candidate.candidate_id)).toBe(true);
+    expect(await repository.readResolutions(state.project_id, candidate.candidate_id)).toEqual([]);
+
+    const changedContent = "# changed after crash";
+    await expect(service.resolve({
+      ...original,
+      artifact_request: {
+        ...original.artifact_request,
+        content: changedContent,
+        content_sha256: await sha256Text(changedContent)
+      }
+    }, state, {
+      artifact,
+      working: vi.fn()
+    })).resolves.toMatchObject({
+      status: "conflict",
+      code: "IDEMPOTENCY_PAYLOAD_MISMATCH"
+    });
+
+    expect(artifact).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,4 +1,5 @@
 import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -93,6 +94,49 @@ describe("ProjectGuard managed documents", () => {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(changed)
     });
     expect(await second.json()).toMatchObject({ status: "rejected", code: "IDEMPOTENCY_PAYLOAD_MISMATCH" });
+  });
+
+  it("keeps request-id binding durable when the local document request cache is lost", async () => {
+    const created = await createProject("TXN-DOCUMENT-PROJECT-0004");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const base = {
+      operation: "working.write",
+      request_id: "DOCREQ-WORK-36040001",
+      project_id: created.project_id,
+      logical_path: "strategy/original.md",
+      content: "durable original",
+      content_sha256: await sha256Text("durable original"),
+      created_at: at
+    };
+    const first = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(base)
+    });
+    const committed = await first.json<Record<string, unknown>>();
+    expect(committed).toMatchObject({ status: "committed", request_id: base.request_id });
+
+    await runInDurableObject(guard, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM document_requests");
+    });
+
+    const exactReplay = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(base)
+    });
+    expect(await exactReplay.json()).toEqual(committed);
+
+    await runInDurableObject(guard, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM document_requests");
+    });
+
+    const changed = {
+      ...base,
+      logical_path: "strategy/other.md",
+      content: "different effect",
+      content_sha256: await sha256Text("different effect")
+    };
+    const mismatch = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(changed)
+    });
+    expect(await mismatch.json()).toMatchObject({ status: "rejected", code: "IDEMPOTENCY_PAYLOAD_MISMATCH" });
   });
 
   it("fails closed when the Durable Object project binding differs", async () => {

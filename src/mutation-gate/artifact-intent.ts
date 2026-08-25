@@ -1,13 +1,16 @@
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
 import {
   mutationIntentIdFor,
-  type MutationIntentRecord
+  type MutationIntentRecord,
+  type MutationProviderPrecondition
 } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import {
   resolveArtifactDestination,
   type ResolvedArtifactDestination
 } from "../dropbox/artifact-routing";
+import type { DropboxTransport } from "../dropbox/client";
+import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
 import { sha256Text } from "../documents/hash";
 import { MutationGateRepository, MutationIntentConflictError } from "./repository";
 
@@ -17,7 +20,14 @@ export interface PreparedArtifactMutation {
 }
 
 export class ArtifactMutationIntentService {
-  constructor(private readonly repository: MutationGateRepository) {}
+  private readonly transport: ResilientDropboxTransport;
+
+  constructor(
+    private readonly repository: MutationGateRepository,
+    transport: DropboxTransport
+  ) {
+    this.transport = new ResilientDropboxTransport(transport);
+  }
 
   async prepare(state: ProjectState, request: ArtifactWriteRequest): Promise<PreparedArtifactMutation> {
     if (state.project_id !== request.project_id) {
@@ -39,6 +49,7 @@ export class ArtifactMutationIntentService {
     }
 
     const destination = resolveArtifactDestination(state, request.relative_path);
+    const providerPrecondition = await this.providerPrecondition(destination.path);
     const intent: MutationIntentRecord = {
       schema_version: "1.0",
       intent_id: await mutationIntentIdFor(request.project_id, request.request_id),
@@ -63,12 +74,25 @@ export class ArtifactMutationIntentService {
           updated_at: destination.route.updated_at
         }
       } : {}),
+      provider_precondition: providerPrecondition,
       expected_content_sha256: request.content_sha256,
       mode: request.mode,
       recorded_at: new Date().toISOString()
     };
     const persisted = await this.repository.ensureArtifactIntent(intent);
     return { intent: persisted, destination: destinationFromIntent(persisted) };
+  }
+
+  private async providerPrecondition(path: string): Promise<MutationProviderPrecondition> {
+    const metadata = await this.transport.getMetadata(path);
+    if (!metadata) return { kind: "absent" };
+    return {
+      kind: "existing",
+      file_id: metadata.id,
+      rev: metadata.rev,
+      content_hash: metadata.content_hash,
+      size: metadata.size
+    };
   }
 }
 

@@ -117,7 +117,7 @@ describe("mutation candidate resolution service", () => {
     expect(status).toMatchObject({ resolution_state: "resolved", resolution_action: "adopt_as_artifact" });
   });
 
-  it("adopt-as-working creates only a working pointer and never publishes", async () => {
+  it("adopt-as-working creates only a working pointer and replays with stable document identity", async () => {
     const project = await createProject("TXN-CANDRES-PROJECT-0002", "candidate-working");
     const guard = testEnv.PROJECT_GUARD.getByName(project.projectId);
     const content = "# candidate working";
@@ -132,20 +132,21 @@ describe("mutation candidate resolution service", () => {
       content_sha256: await sha256Text(content),
       created_at: at
     };
+    const resolution = {
+      operation: "candidate.adopt_working",
+      resolution_id: "MUTRES-BBBBBBBBBBBBBBBBBBBBBBBB",
+      project_id: project.projectId,
+      candidate_id: candidate.candidate_id,
+      document_request: documentRequest
+    };
 
-    const response = await guard.fetch("https://project-guard.internal/mutation-candidate-resolution", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        operation: "candidate.adopt_working",
-        resolution_id: "MUTRES-BBBBBBBBBBBBBBBBBBBBBBBB",
-        project_id: project.projectId,
-        candidate_id: candidate.candidate_id,
-        document_request: documentRequest
-      })
-    });
-    const receipt = await response.json<{ status: string; action: string; document_id: string }>();
+    const receipt = await postResolution(guard, resolution) as {
+      status: string;
+      action: string;
+      document_id: string;
+    };
     expect(receipt).toMatchObject({ status: "committed", action: "adopt_as_working" });
+    expect(await postResolution(guard, resolution)).toEqual(receipt);
 
     const documentStatus = await guard.fetch(
       `https://project-guard.internal/document-status?document_id=${encodeURIComponent(receipt.document_id)}`,

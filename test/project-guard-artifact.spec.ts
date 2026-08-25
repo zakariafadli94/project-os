@@ -73,6 +73,26 @@ describe("ProjectGuard artifact writes", () => {
     expect(dropbox.files.get(artifactPath)).toBe(content);
   });
 
+  it("persists durable mutation intent before the first visible artifact write", async () => {
+    const created = await createProject("TXN-ARTIFACT-PROJECT-0006");
+    const project = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# intent first";
+    const requestId = "ART-GROWTH-INTENT-0001";
+    const body = artifactBody(created.project_id, requestId, content, await sha256(content));
+
+    const response = await project.fetch("https://project-guard.internal/artifact", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body)
+    });
+    expect(await response.json()).toMatchObject({ status: "committed" });
+
+    const intentPath = `/PROJECT_OS/.project-os/projects/${created.project_id}/mutation-gate/intents/artifacts/${requestId}.json`;
+    const visiblePath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-artifact-0006/ARTIFACTS/playbooks/acquisition.md`;
+    const intentIndex = dropbox.uploadCalls.findIndex((path) => path === intentPath);
+    const visibleIndex = dropbox.uploadCalls.findIndex((path) => path === visiblePath);
+    expect(intentIndex).toBeGreaterThanOrEqual(0);
+    expect(visibleIndex).toBeGreaterThan(intentIndex);
+  });
+
   it("rejects request-id reuse with different content", async () => {
     const created = await createProject("TXN-ARTIFACT-PROJECT-0002");
     const project = testEnv.PROJECT_GUARD.getByName(created.project_id);

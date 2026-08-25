@@ -6,6 +6,7 @@ import { DropboxConflictError, type DropboxEntry, type DropboxTransport } from "
 import { ProjectRepository } from "../src/dropbox/repository";
 import { ArtifactMutationIntentService } from "../src/mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
+import { MutationGateService } from "../src/mutation-gate/service";
 
 class FakeArtifactIntentDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
@@ -101,6 +102,48 @@ describe("ArtifactMutationIntentService", () => {
     const repository = new ProjectRepository(transport, "v2");
     expect(await repository.writeArtifact(stateAfterRoute(), artifact, replay.destination)).toBe("idempotent");
     expect([...transport.files.keys()].some((path) => path.includes("/DELIVERABLES/REVENUE-OS/foo.md"))).toBe(false);
+  });
+
+  it("recovers a provider-written artifact from durable intent without creating a candidate", async () => {
+    const transport = new FakeArtifactIntentDropbox();
+    const mutationRepository = new MutationGateRepository(transport);
+    const intentService = new ArtifactMutationIntentService(mutationRepository, transport);
+    const artifact = await request();
+    const state = stateBeforeRoute();
+    const prepared = await intentService.prepare(state, artifact);
+
+    // Simulate the crash window: provider bytes landed after the durable intent,
+    // but ProjectGuard never got far enough to publish a terminal artifact receipt.
+    await transport.upload(prepared.destination.path, artifact.content, "add");
+    expect([...transport.files.keys()].some((path) => path.includes("/.project-os/artifacts/receipts/"))).toBe(false);
+
+    const summary = await new MutationGateService(transport, "observe").processChanges(state, [{
+      tag: "file",
+      name: "foo.md",
+      path: prepared.destination.path,
+      id: "id:artifact-crash-recovery",
+      rev: "rev-crash-1",
+      content_hash: "b".repeat(64),
+      size: new TextEncoder().encode(artifact.content).byteLength,
+      server_modified: "2026-08-25T18:40:00+01:00"
+    }], "incremental");
+
+    expect(summary).toMatchObject({ candidates: 0, policy_violations: 0 });
+    expect(await mutationRepository.listCandidates(artifact.project_id)).toHaveLength(0);
+
+    const repository = new ProjectRepository(transport, "v2");
+    expect(await repository.writeArtifact(state, artifact, prepared.destination)).toBe("idempotent");
+    expect(await mutationRepository.listCandidates(artifact.project_id)).toHaveLength(0);
+    expect([...transport.files.keys()].some((path) => path.includes("/.project-os/artifacts/receipts/"))).toBe(false);
+
+    await repository.writeArtifactReceipt({
+      request_id: artifact.request_id,
+      project_id: artifact.project_id,
+      relative_path: artifact.relative_path,
+      content_sha256: artifact.content_sha256,
+      status: "committed"
+    });
+    expect([...transport.files.keys()].some((path) => path.endsWith(`/artifacts/receipts/${artifact.request_id}.json`))).toBe(true);
   });
 
   it("rejects exact request-id replay when durable intent binds different request JSON", async () => {

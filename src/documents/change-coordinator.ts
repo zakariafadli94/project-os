@@ -8,6 +8,7 @@ import {
 } from "../dropbox/client";
 import { workspaceProjectRoot } from "../dropbox/layout";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+import { MutationGateClassifier } from "../mutation-gate/classifier";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
 import {
   ManagedDocumentReconciler,
@@ -40,6 +41,7 @@ export class ManagedDocumentChangeCoordinator {
   private readonly transport: ResilientDropboxTransport;
   private readonly reconciler: ManagedDocumentReconciler;
   private readonly bootstrapper: ManagedDocumentBootstrapper;
+  private readonly mutationClassifier: MutationGateClassifier;
 
   constructor(
     transport: DropboxTransport,
@@ -48,6 +50,7 @@ export class ManagedDocumentChangeCoordinator {
     this.transport = new ResilientDropboxTransport(transport);
     this.reconciler = new ManagedDocumentReconciler(transport);
     this.bootstrapper = new ManagedDocumentBootstrapper(transport);
+    this.mutationClassifier = new MutationGateClassifier(transport);
   }
 
   async reconcile(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
@@ -81,9 +84,6 @@ export class ManagedDocumentChangeCoordinator {
       bootstrapped = await this.bootstrapBaseline(state, page.entries);
     }
 
-    // Never advance the cursor until every observed change has been reconciled.
-    // A crash/failure therefore replays the same provider page, which is safe because
-    // version records are immutable and provider observations make replay idempotent.
     const summary = await this.reconciler.reconcileChanges(state, page.entries);
     const cursorAdvanced = page.cursor.length > 0 && page.cursor !== existingCursor;
     if (page.cursor.length > 0) await this.cursorStore.put(CURSOR_KEY, page.cursor);
@@ -108,6 +108,15 @@ export class ManagedDocumentChangeCoordinator {
     for (const candidate of candidates) {
       const metadata = await this.metadataFor(candidate.change);
       if (!metadata) continue;
+
+      if (candidate.stage === "published") {
+        const classification = await this.mutationClassifier.classify(state, candidate.change.path, metadata);
+        // Final-zone provider presence is never a bootstrap signal. Governed-current
+        // and governed-inflight files already have stronger evidence; unknown files
+        // are handled as candidates by the mutation gate before cursor advancement.
+        if (classification.kind !== "not_final_zone") continue;
+      }
+
       const result = await this.bootstrapper.bootstrapExistingManagedPath(
         state,
         candidate.change.path,

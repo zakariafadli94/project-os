@@ -1,4 +1,5 @@
 import { documentIdFor, type ManagedProviderObservation } from "../domain/managed-document";
+import type { MutationIntentRecord } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import type { DropboxFileMetadata, DropboxTransport } from "../dropbox/client";
 import { workspaceProjectRoot } from "../dropbox/layout";
@@ -59,13 +60,23 @@ export class MutationGateClassifier {
       const visible = await this.transport.download(path);
       if (visible !== null) {
         const contentSha256 = await sha256Text(visible);
-        const exact = intents.find((intent) => intent.expected_content_sha256 === contentSha256);
+        const exact = intents.find((intent) =>
+          intent.expected_content_sha256 === contentSha256 && intentExplainsProviderChange(intent, metadata)
+        );
         if (exact) return { kind: "governed_inflight", requestId: exact.request_id };
       }
     }
 
     return { kind: "external_candidate" };
   }
+}
+
+function intentExplainsProviderChange(intent: MutationIntentRecord, metadata: DropboxFileMetadata): boolean {
+  if (intent.provider_precondition.kind === "absent") return true;
+  return metadata.id !== intent.provider_precondition.file_id
+    || metadata.rev !== intent.provider_precondition.rev
+    || metadata.content_hash !== intent.provider_precondition.content_hash
+    || metadata.size !== intent.provider_precondition.size;
 }
 
 function strictZone(

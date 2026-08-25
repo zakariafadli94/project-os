@@ -48,13 +48,13 @@ export class ManagedDocumentChangeCoordinator {
   constructor(
     transport: DropboxTransport,
     private readonly cursorStore: ManagedDocumentCursorStore,
-    mode: MutationGateMode = "observe"
+    private readonly gateMode: MutationGateMode = "observe"
   ) {
     this.transport = new ResilientDropboxTransport(transport);
     this.reconciler = new ManagedDocumentReconciler(transport);
     this.bootstrapper = new ManagedDocumentBootstrapper(transport);
     this.mutationClassifier = new MutationGateClassifier(transport);
-    this.mutationGate = new MutationGateService(transport, mode);
+    this.mutationGate = new MutationGateService(transport, gateMode);
   }
 
   async reconcile(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
@@ -173,9 +173,7 @@ export class ManagedDocumentChangeCoordinator {
   }
 
   private mutationGateMode(): MutationGateMode {
-    // The service owns the mode; archived summaries need only preserve the
-    // externally visible contract. Archived reconciliation never mutates.
-    return "observe";
+    return this.gateMode;
   }
 }
 

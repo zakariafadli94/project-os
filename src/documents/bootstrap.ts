@@ -14,8 +14,6 @@ import {
   workspaceManagedZoneRoot
 } from "../dropbox/layout";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
-import { MutationGateRepository } from "../mutation-gate/repository";
-import { sha256Text } from "./hash";
 import { DocumentLedgerRepository } from "./repository";
 
 export type BootstrapManagedStage = "reference" | "working" | "review" | "published";
@@ -34,12 +32,10 @@ export interface ManagedDocumentBootstrapResult {
 export class ManagedDocumentBootstrapper {
   private readonly transport: ResilientDropboxTransport;
   private readonly ledger: DocumentLedgerRepository;
-  private readonly mutations: MutationGateRepository;
 
   constructor(transport: DropboxTransport) {
     this.transport = new ResilientDropboxTransport(transport);
     this.ledger = new DocumentLedgerRepository(transport);
-    this.mutations = new MutationGateRepository(transport);
   }
 
   async bootstrapExistingManagedPath(
@@ -53,10 +49,7 @@ export class ManagedDocumentBootstrapper {
       throw new Error("Archived projects do not bootstrap active managed document paths");
     }
 
-    const effectiveOptions = inferredStage === "published" && !options.publishedProvenance
-      ? { ...options, publishedProvenance: await this.publishedProvenanceFromIntent(state, visiblePath) }
-      : options;
-    if (inferredStage === "published" && !effectiveOptions.publishedProvenance) {
+    if (inferredStage === "published" && !options.publishedProvenance) {
       throw new Error("Published provenance is required before DELIVERABLES bootstrap");
     }
 
@@ -104,7 +97,7 @@ export class ManagedDocumentBootstrapper {
       kind,
       stage: inferredStage,
       logical_path: existingHead?.logical_path ?? parsed.logicalPath,
-      source: sourceForBootstrap(inferredStage, effectiveOptions),
+      source: sourceForBootstrap(inferredStage, options),
       created_at: metadata.server_modified ?? "1970-01-01T00:00:00.000Z",
       immutable_payload_path: immutablePayloadPath,
       provider_content_hash: metadata.content_hash,
@@ -145,20 +138,6 @@ export class ManagedDocumentBootstrapper {
     }
 
     return { adopted: true, head, version };
-  }
-
-  private async publishedProvenanceFromIntent(
-    state: ProjectState,
-    visiblePath: string
-  ): Promise<PublishedBootstrapProvenance | undefined> {
-    const intents = await this.mutations.listArtifactIntentsForDestination(state.project_id, visiblePath);
-    if (intents.length === 0) return undefined;
-    const visible = await this.transport.download(visiblePath);
-    if (visible === null) return undefined;
-    const contentSha256 = await sha256Text(visible);
-    return intents.some((intent) => intent.expected_content_sha256 === contentSha256)
-      ? "legacy_artifact"
-      : undefined;
   }
 }
 

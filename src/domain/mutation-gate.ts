@@ -16,6 +16,19 @@ export const mutationCandidateResolutionOperationSchema = z.enum([
 export type MutationDetectionSource = z.infer<typeof mutationDetectionSourceSchema>;
 export type MutationCandidateResolutionOperation = z.infer<typeof mutationCandidateResolutionOperationSchema>;
 
+export const mutationArtifactRouteSnapshotSchema = z.strictObject({
+  route_id: z.string().regex(/^ROUTE-[A-Z0-9-]{4,}$/),
+  source_prefix: z.string().min(1),
+  target_prefix: z.string().min(1),
+  archive_prefix: z.string().min(1).optional(),
+  exclusive: z.boolean(),
+  decision_ids: z.array(z.string().regex(/^DEC-[A-Z0-9]{4,}$/)),
+  created_at: z.string().min(1).max(128),
+  updated_at: z.string().min(1).max(128)
+});
+
+export type MutationArtifactRouteSnapshot = z.infer<typeof mutationArtifactRouteSnapshotSchema>;
+
 export const mutationIntentRecordSchema = z.strictObject({
   schema_version: z.literal("1.0"),
   intent_id: mutationIntentIdSchema,
@@ -27,7 +40,8 @@ export const mutationIntentRecordSchema = z.strictObject({
   base_project_revision: z.number().int().nonnegative().safe(),
   destination_path: z.string().min(1),
   archive_path: z.string().min(1).optional(),
-  route_id: z.string().min(1).optional(),
+  route_id: z.string().regex(/^ROUTE-[A-Z0-9-]{4,}$/).optional(),
+  route_snapshot: mutationArtifactRouteSnapshotSchema.optional(),
   expected_content_sha256: sha256Schema,
   mode: z.enum(["create", "replace"]),
   recorded_at: z.string().min(1).max(128)
@@ -44,6 +58,20 @@ export const mutationIntentRecordSchema = z.strictObject({
       code: "custom",
       path: ["archive_path"],
       message: "archive_path must stay inside the bound project workspace"
+    });
+  }
+  if (value.route_snapshot && value.route_id !== value.route_snapshot.route_id) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["route_snapshot"],
+      message: "route_snapshot must match route_id"
+    });
+  }
+  if (value.route_id && !value.route_snapshot) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["route_snapshot"],
+      message: "new routed mutation intents require an immutable route snapshot"
     });
   }
 });

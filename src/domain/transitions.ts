@@ -396,7 +396,14 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
         }
       }
       for (const decisionId of p.decision_ids ?? []) {
-        if (!next.decisions[decisionId]) return rejected("DECISION_NOT_FOUND", `Decision ${decisionId} does not exist`);
+        const decision = next.decisions[decisionId];
+        if (!decision) return rejected("DECISION_NOT_FOUND", `Decision ${decisionId} does not exist`);
+        if (decision.status !== "accepted") {
+          return rejected(
+            "DELIVERABLE_DECISION_NOT_ACCEPTED",
+            `Decision ${decisionId} must be currently accepted to govern a new deliverable`
+          );
+        }
       }
       next.deliverables[p.deliverable_id] = {
         deliverable_id: p.deliverable_id,

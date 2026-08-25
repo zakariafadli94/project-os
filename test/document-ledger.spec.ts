@@ -51,6 +51,7 @@ const projectId = "PRJ-0002";
 const documentId = "DOC-0123456789ABCDEF01234567";
 const v1 = "VER-REQ-111111111111111111111111";
 const v2 = "VER-REQ-222222222222222222222222";
+const v3 = "VER-REQ-333333333333333333333333";
 
 function record(overrides: Partial<DocumentVersionRecord> = {}): DocumentVersionRecord {
   return {
@@ -138,7 +139,12 @@ describe("DocumentLedgerRepository", () => {
     const published = record({
       version_id: v1,
       stage: "published",
-      created_at: "2026-08-24T18:00:00+01:00"
+      created_at: "2026-08-24T18:00:00+01:00",
+      provider_content_hash: "1".repeat(64),
+      provider_file_id: "id:published",
+      provider_rev: "rev-published",
+      provider_path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/strategy/commercial.md",
+      size: 100
     });
     const working = record({
       version_id: v2,
@@ -147,7 +153,12 @@ describe("DocumentLedgerRepository", () => {
       created_at: "2026-08-24T19:00:00+01:00",
       content_sha256: "b".repeat(64),
       immutable_payload_path: machineDocumentTextPayloadPath(projectId, "b".repeat(64)),
-      request_id: "DOCREQ-WORK-000002"
+      request_id: "DOCREQ-WORK-000002",
+      provider_content_hash: "2".repeat(64),
+      provider_file_id: "id:working",
+      provider_rev: "rev-working",
+      provider_path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/WORKING/strategy/commercial.md",
+      size: 120
     });
     await repository.writeVersion(published);
     await repository.writeVersion(working);
@@ -157,8 +168,81 @@ describe("DocumentLedgerRepository", () => {
     expect(restored).toMatchObject({
       published_version_id: v1,
       working_version_id: v2,
-      reconciliation_status: "clean"
+      reconciliation_status: "clean",
+      provider: {
+        published: { rev: "rev-published", file_id: "id:published" },
+        working: { rev: "rev-working", file_id: "id:working" }
+      }
     });
+    expect(restored?.review_version_id).toBeUndefined();
     expect(await repository.readHead(projectId, documentId)).toEqual(restored);
+  });
+
+  it("does not resurrect consumed working or review pointers after a completed publication", async () => {
+    const transport = new FakeTransport();
+    const repository = new DocumentLedgerRepository(transport);
+    await repository.writeVersion(record({
+      version_id: v1,
+      stage: "working",
+      created_at: "2026-08-24T18:00:00+01:00"
+    }));
+    await repository.writeVersion(record({
+      version_id: v2,
+      parent_version_id: v1,
+      stage: "review",
+      created_at: "2026-08-24T18:10:00+01:00",
+      content_sha256: "b".repeat(64),
+      immutable_payload_path: machineDocumentTextPayloadPath(projectId, "b".repeat(64)),
+      request_id: "DOCREQ-REVIEW-000001"
+    }));
+    await repository.writeVersion(record({
+      version_id: v3,
+      parent_version_id: v2,
+      stage: "published",
+      created_at: "2026-08-24T18:20:00+01:00",
+      content_sha256: "c".repeat(64),
+      immutable_payload_path: machineDocumentTextPayloadPath(projectId, "c".repeat(64)),
+      request_id: "DOCREQ-PUBLISH-000001"
+    }));
+
+    const restored = await repository.restoreHeadFromVersions(projectId, documentId);
+
+    expect(restored?.published_version_id).toBe(v3);
+    expect(restored?.working_version_id).toBeUndefined();
+    expect(restored?.review_version_id).toBeUndefined();
+  });
+
+  it("keeps the frozen published ancestor while restoring a newer active review candidate", async () => {
+    const transport = new FakeTransport();
+    const repository = new DocumentLedgerRepository(transport);
+    await repository.writeVersion(record({
+      version_id: v1,
+      stage: "published",
+      created_at: "2026-08-24T18:00:00+01:00"
+    }));
+    await repository.writeVersion(record({
+      version_id: v2,
+      parent_version_id: v1,
+      stage: "working",
+      created_at: "2026-08-24T18:10:00+01:00",
+      content_sha256: "b".repeat(64),
+      immutable_payload_path: machineDocumentTextPayloadPath(projectId, "b".repeat(64)),
+      request_id: "DOCREQ-WORK-000002"
+    }));
+    await repository.writeVersion(record({
+      version_id: v3,
+      parent_version_id: v2,
+      stage: "review",
+      created_at: "2026-08-24T18:20:00+01:00",
+      content_sha256: "c".repeat(64),
+      immutable_payload_path: machineDocumentTextPayloadPath(projectId, "c".repeat(64)),
+      request_id: "DOCREQ-REVIEW-000002"
+    }));
+
+    const restored = await repository.restoreHeadFromVersions(projectId, documentId);
+
+    expect(restored?.published_version_id).toBe(v1);
+    expect(restored?.review_version_id).toBe(v3);
+    expect(restored?.working_version_id).toBeUndefined();
   });
 });

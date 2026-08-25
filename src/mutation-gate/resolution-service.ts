@@ -65,23 +65,47 @@ export class MutationCandidateResolutionService {
       return terminal(request, "rejected", "CANDIDATE_NOT_FOUND", "Mutation candidate does not exist");
     }
 
-    const resolutions = await this.repository.readResolutions(request.project_id, request.candidate_id);
-    const existing = resolutions.at(-1);
-    if (existing) {
-      if (existing.resolution_id === request.resolution_id && existing.action === actionFor(request)) {
-        const replay = receiptFromRecord(existing);
-        if (request.operation === "candidate.adopt_working") {
-          if (request.document_request.operation !== "working.write") {
-            throw new Error("Parsed candidate working adoption violated working.write invariant");
-          }
-          return {
-            ...replay,
-            document_id: await documentIdFor(request.project_id, request.document_request.logical_path)
-          };
-        }
-        return replay;
+    const resolutionRequestSha256 = await sha256Text(JSON.stringify(request));
+    const terminalEvidence = await this.repository.readTerminalResolutionRecord(request.project_id, request.candidate_id);
+    if (terminalEvidence) {
+      if (
+        terminalEvidence.resolution_id !== request.resolution_id
+        || terminalEvidence.resolution.action !== actionFor(request)
+      ) {
+        return terminal(request, "conflict", "CANDIDATE_ALREADY_RESOLVED", "Mutation candidate already has a terminal resolution");
       }
-      return terminal(request, "conflict", "CANDIDATE_ALREADY_RESOLVED", "Mutation candidate already has a terminal resolution");
+      if (!terminalEvidence.resolution_request_sha256) {
+        return terminal(
+          request,
+          "conflict",
+          "CANDIDATE_TERMINAL_EVIDENCE_INCOMPLETE",
+          "Terminal mutation candidate evidence is missing its resolution request hash"
+        );
+      }
+      if (terminalEvidence.resolution_request_sha256 !== resolutionRequestSha256) {
+        return terminal(
+          request,
+          "conflict",
+          "IDEMPOTENCY_PAYLOAD_MISMATCH",
+          "The same resolution_id was reused with a different candidate resolution payload"
+        );
+      }
+
+      const repaired = await this.repository.writeResolution(
+        terminalEvidence.resolution,
+        terminalEvidence.resolution_request_sha256
+      );
+      return replayReceipt(request, repaired);
+    }
+
+    const resolutions = await this.repository.readResolutions(request.project_id, request.candidate_id);
+    if (resolutions.length > 0) {
+      return terminal(
+        request,
+        "conflict",
+        "CANDIDATE_TERMINAL_EVIDENCE_INCOMPLETE",
+        "Mutation candidate resolution exists without terminal evidence"
+      );
     }
 
     if (request.operation === "candidate.reject") {
@@ -92,7 +116,7 @@ export class MutationCandidateResolutionService {
         candidate_id: request.candidate_id,
         action: "reject",
         resolved_at: new Date().toISOString()
-      });
+      }, resolutionRequestSha256);
       return receiptFromRecord(record);
     }
 
@@ -156,7 +180,7 @@ export class MutationCandidateResolutionService {
       ...(downstreamId ? { downstream_request_id: downstreamId } : {}),
       downstream_receipt_status: "committed",
       resolved_at: new Date().toISOString()
-    });
+    }, resolutionRequestSha256);
 
     return {
       ...receiptFromRecord(record),
@@ -204,6 +228,21 @@ function receiptFromRecord(record: ExternalMutationResolutionRecord): MutationCa
     action: record.action,
     status: "committed",
     ...(record.downstream_request_id ? { downstream_request_id: record.downstream_request_id } : {})
+  };
+}
+
+async function replayReceipt(
+  request: MutationCandidateResolutionRequest,
+  record: ExternalMutationResolutionRecord
+): Promise<MutationCandidateResolutionReceipt> {
+  const receipt = receiptFromRecord(record);
+  if (request.operation !== "candidate.adopt_working") return receipt;
+  if (request.document_request.operation !== "working.write") {
+    throw new Error("Parsed candidate working adoption violated working.write invariant");
+  }
+  return {
+    ...receipt,
+    document_id: await documentIdFor(request.project_id, request.document_request.logical_path)
   };
 }
 

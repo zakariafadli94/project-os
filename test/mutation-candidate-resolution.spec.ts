@@ -80,7 +80,7 @@ describe("mutation candidate resolution service", () => {
     const guard = testEnv.PROJECT_GUARD.getByName(project.projectId);
     const content = "# candidate artifact";
     const path = workspacePath(project, "ARTIFACTS/playbooks/direct.md");
-    const candidate = await captureCandidate(guard, path, content);
+    const candidate = await captureCandidate(dropbox, guard, path, content);
     const artifactRequest = {
       request_id: "ART-CANDIDATE-ADOPT-1001",
       project_id: project.projectId,
@@ -122,7 +122,7 @@ describe("mutation candidate resolution service", () => {
     const guard = testEnv.PROJECT_GUARD.getByName(project.projectId);
     const content = "# candidate working";
     const path = workspacePath(project, "DELIVERABLES/direct.md");
-    const candidate = await captureCandidate(guard, path, content);
+    const candidate = await captureCandidate(dropbox, guard, path, content);
     const documentRequest = {
       operation: "working.write" as const,
       request_id: "DOCREQ-CANDIDATE-WORK-0002",
@@ -162,7 +162,7 @@ describe("mutation candidate resolution service", () => {
     const guard = testEnv.PROJECT_GUARD.getByName(project.projectId);
     const content = "# rejected";
     const path = workspacePath(project, "ARTIFACTS/reject.md");
-    const candidate = await captureCandidate(guard, path, content);
+    const candidate = await captureCandidate(dropbox, guard, path, content);
     const reject = {
       operation: "candidate.reject",
       resolution_id: "MUTRES-CCCCCCCCCCCCCCCCCCCCCCCC",
@@ -195,7 +195,7 @@ describe("mutation candidate resolution service", () => {
   it("exposes the resolution route only through authenticated public ingress", async () => {
     const project = await createProject("TXN-CANDRES-PROJECT-0004", "candidate-public");
     const guard = testEnv.PROJECT_GUARD.getByName(project.projectId);
-    const candidate = await captureCandidate(guard, workspacePath(project, "ARTIFACTS/public.md"), "public candidate");
+    const candidate = await captureCandidate(dropbox, guard, workspacePath(project, "ARTIFACTS/public.md"), "public candidate");
     const body = JSON.stringify({
       operation: "candidate.reject",
       resolution_id: "MUTRES-EEEEEEEEEEEEEEEEEEEEEEEE",
@@ -247,12 +247,12 @@ function workspacePath(project: CreatedProject, relative: string): string {
 }
 
 async function captureCandidate(
+  dropbox: ReturnType<typeof installDropboxMock>,
   guard: DurableObjectStub,
   path: string,
   content: string
 ): Promise<CandidateStatus> {
-  const mock = installDropboxMock();
-  await mock.writeExternal(path, content);
+  await dropbox.writeExternal(path, content);
   const reconcile = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
   expect(reconcile.status).toBe(200);
   const list = await guard.fetch("https://project-guard.internal/mutation-candidates", { method: "GET" });

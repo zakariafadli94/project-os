@@ -162,3 +162,35 @@ describe("MODEL001 task lifecycle", () => {
     })).kind).toBe("rejected");
   });
 });
+
+describe("MODEL001 phase lifecycle", () => {
+  it("rejects completion of a pending non-current phase", () => {
+    let state = emptyProjectState("PRJ-4201", "Phases", "phases");
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4201", title: "Current"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4202", title: "Later"
+    }));
+    const result = applyTransaction(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4202"
+    }));
+    expect(result).toMatchObject({ kind: "rejected", code: "PHASE_NOT_CURRENT" });
+  });
+
+  it("fails closed when a historical state contains another active phase", () => {
+    let state = emptyProjectState("PRJ-4202", "Phases", "phases");
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4203", title: "Current"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4204", title: "Later"
+    }));
+    state.plan_phases["PHASE-4204"].status = "active";
+
+    const result = applyTransaction(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4203"
+    }));
+    expect(result).toMatchObject({ kind: "rejected", code: "PHASE_STATE_INCONSISTENT" });
+  });
+});

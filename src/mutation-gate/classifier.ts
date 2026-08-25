@@ -92,7 +92,14 @@ function strictZone(
   if (relative.startsWith("ARTIFACTS/") && relative.length > "ARTIFACTS/".length) {
     return { kind: "artifacts" };
   }
+  if (Object.values(state.artifact_routes).some((route) => pathMatchesPrefix(relative, route.target_prefix))) {
+    return { kind: "artifacts" };
+  }
   return null;
+}
+
+function pathMatchesPrefix(path: string, prefix: string): boolean {
+  return path === prefix || path.startsWith(`${prefix}/`);
 }
 
 function sameObservation(value: ManagedProviderObservation | undefined, metadata: DropboxFileMetadata): boolean {

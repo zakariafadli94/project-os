@@ -22,6 +22,8 @@ Authority order for durable project state is:
 4. generated Markdown;
 5. chat/history as non-authoritative working context.
 
+Managed collaborative documents use their own immutable document-version ledger and logical head. They do not become canonical project facts merely because their bytes changed.
+
 When canonical state is available:
 
 - use it as source of truth;
@@ -83,8 +85,9 @@ Then load only what is needed:
 - `BRIEF.md` for framing;
 - `DISCOVERY.md` for synthesized research;
 - `ROADMAP.md` / `PLAN.md` for direction;
-- relevant `DECISIONS/`, `CONSTRAINTS/`, `TASKS/`, `RESEARCH/`, `DELIVERABLES/`;
-- relevant future `REFERENCES/`, `SPECS/`, `MEETINGS/` when present.
+- relevant `DECISIONS/`, `CONSTRAINTS/`, `TASKS/`, `RESEARCH/`;
+- relevant managed `REFERENCES/`, `WORKING/`, `REVIEW/`, `DELIVERABLES/` documents;
+- relevant `SPECS/`, `MEETINGS/` when present.
 
 Do not load an entire project indiscriminately.
 
@@ -96,14 +99,27 @@ A canonical commit can be newer than the latest completed human generation for a
 
 If materialization is behind, canonical state remains usable. Do not ask the user to run a sync command.
 
+### Managed-document freshness rule
+
+Before changing a collaborative document, use its current logical document head/version rather than an old chat copy. When available, carry `expected_version_id` so stale-context writes fail before touching visible bytes.
+
+Provider revision protection is separate: Project OS also verifies the current persistence-provider revision before replacement.
+
 ## 6. Old-chat safety
 
-Before any durable mutation:
+Before any durable canonical mutation:
 
 1. refresh canonical state/current revision;
 2. compare the intended change with that state;
 3. never use a revision remembered only from an earlier turn/chat;
 4. if canonical revision advanced, reevaluate the mutation against the new reality.
+
+Before any managed-document mutation:
+
+1. refresh the logical document head;
+2. use the current version as the editing base;
+3. preserve human/external changes rather than silently replacing them;
+4. never treat an old chat's document copy as current without verification.
 
 ## 7. New project bootstrap
 
@@ -125,7 +141,7 @@ Never invent canonical `PRJ-xxxx`; RegistryGuard allocates it. Use the allocated
 
 ## 8. Durable vs non-durable
 
-Do not automatically persist:
+Do not automatically persist as canonical facts:
 
 - brainstorming;
 - rejected ideas;
@@ -134,7 +150,7 @@ Do not automatically persist:
 - unaccepted recommendations;
 - unvalidated drafts.
 
-Persist when operationally real or explicitly accepted:
+Persist canonically when operationally real or explicitly accepted:
 
 - decisions;
 - task lifecycle changes;
@@ -142,7 +158,9 @@ Persist when operationally real or explicitly accepted:
 - project lifecycle changes;
 - binding constraints;
 - accepted research;
-- tracked deliverables.
+- tracked deliverable facts.
+
+Working/review document versions may still be durably versioned without being canonical project decisions. Versioning a draft is not equivalent to accepting its content as a canonical fact.
 
 Never turn an AI recommendation into a canonical decision without user acceptance.
 
@@ -160,9 +178,11 @@ Never bypass Project Guard with generic edits such as:
 
 Durable business changes use supported typed Project OS transactions only.
 
+Managed-document lifecycle operations are a separate typed interface and must not be used to bypass canonical transactions.
+
 ## 10. Transaction procedure
 
-For every durable change:
+For every durable canonical change:
 
 1. refresh current canonical revision;
 2. construct the minimal typed transaction(s);
@@ -188,6 +208,8 @@ A committed canonical business result is not invalidated because Markdown projec
 
 If a transaction is rejected, explain the validation issue. If it conflicts, preserve both realities and ask only when a genuine business-direction choice is required.
 
+Managed-document receipts prove document lifecycle/version operations; they do not substitute for canonical business commit receipts.
+
 ## 12. Asynchronous materialization
 
 After a canonical V2 commit, human/machine derivatives are projection work.
@@ -209,6 +231,8 @@ Do not tell the user to sync, refresh or retry the project manually. ProjectGuar
 
 If a permanent destination conflict blocks projection, preserve the committed business reality and surface the technical inconsistency separately.
 
+Unexpected external edits to generated projection files must be preserved as recovery evidence before fail/repair. They never become canonical truth implicitly.
+
 ## 13. Concurrency
 
 Project Guard is authoritative for compatibility.
@@ -218,6 +242,13 @@ Never semantically auto-merge competing direction-changing changes simply becaus
 Additive independent changes may be accepted only according to deterministic Guard rules.
 
 Projection concurrency is separate from business concurrency. Parallel Dropbox output writes are bounded and must not be interpreted as parallel domain mutation.
+
+Managed-document concurrency has two protections:
+
+- logical stale-version protection with `expected_version_id` when the editing base is known;
+- persistence-provider compare-and-swap using the exact observed provider revision for replacements.
+
+A provider CAS conflict is not a transient overwrite opportunity. Preserve the newer external reality and reconcile it.
 
 ## 14. Decisions and plans
 
@@ -238,6 +269,8 @@ active/paused -> archived
 Archive is terminal. There is no destructive project delete operation.
 
 Archive workspace movement is asynchronous projection work after the archived business state commits.
+
+Archived projects do not accept new managed working/reference mutations and managed-document reconciliation must not resurrect an active workspace.
 
 ## 16. Portfolio behavior
 
@@ -275,18 +308,41 @@ WORKSPACE/
         ├── CONSTRAINTS/
         ├── TASKS/
         ├── RESEARCH/
+        ├── INPUTS/
         ├── REFERENCES/
+        ├── WORKING/
+        ├── REVIEW/
         ├── DELIVERABLES/
         ├── SPECS/
         ├── MEETINGS/
         ├── NOTES/
-        ├── INBOX/
         └── ASSETS/
 ```
 
 Folders are lazy.
 
-Generated canonical notes are machine-managed derived views. Human-managed working areas may contain non-canonical content; durable facts still require typed transactions.
+Generated canonical notes and managed collaborative documents are different classes of content.
+
+### Managed document zones
+
+`INPUTS/`
+: temporary human drop zone. Project OS ingests documents for R&D and moves them to `REFERENCES/UNCLASSIFIED/` unless an explicit classification exists.
+
+`REFERENCES/`
+: durable source library. Reference collections are project-specific. Low-level ingestion must not guess taxonomy.
+
+`WORKING/`
+: collaborative human + AI authoring. Human Obsidian edits are legitimate new versions.
+
+`REVIEW/`
+: pre-publication candidate. Being in REVIEW is not final validation/publication.
+
+`DELIVERABLES/`
+: explicitly published/approved versions. A new iteration reopens from the frozen published version into WORKING.
+
+Direct human edits to a managed published deliverable never auto-publish. Preserve the edited bytes first, retain/restore the approved published version, and keep any existing different WORKING draft untouched.
+
+Detailed runtime contract: `docs/managed-documents.md`.
 
 ## 18. Machine layer
 
@@ -297,6 +353,7 @@ V2 machine state is outside the Obsidian Vault:
 ├── registry/
 ├── transactions/
 ├── receipts/
+├── artifacts/
 └── projects/
     └── PRJ-xxxx/
         ├── state.json
@@ -304,13 +361,21 @@ V2 machine state is outside the Obsidian Vault:
         ├── events/
         ├── commits/
         ├── materializations/
-        └── materialization-head.json
+        ├── materialization-head.json
+        └── documents/
+            ├── heads/
+            ├── versions/
+            ├── payloads/
+            ├── reference-fingerprints/
+            └── provider-file-bindings/
 ```
 
 Never expose these machine files as ordinary project notes.
 
 Never write human generated Markdown below `.project-os/`.
 Never write events, receipts, transaction queues, commits or structured machine state below `WORKSPACE/`.
+
+Managed document version records are immutable evidence. Mutable heads/indexes are reconstructible and may advance only after referenced immutable evidence exists.
 
 ## 19. Generated-note metadata
 
@@ -337,6 +402,8 @@ For those notes, `revision` is the source/content revision, not the current proj
 Do not use arbitrary entity-note frontmatter to determine current project revision. Canonical state is authoritative; completed generation coherence is represented by materialization evidence. `STATE.md` and `HANDOFF.md` are physically current for each completed generation.
 
 Use stable canonical IDs for entity filenames. Titles may change without changing identity/path.
+
+Managed collaborative documents are governed by document/version IDs rather than generated-note `revision` frontmatter.
 
 ## 20. Obsidian graph isolation
 
@@ -367,6 +434,8 @@ For modern V2 projects it can synchronously drive the projection coordinator to 
 
 Never ask a normal user to invoke it.
 
+Managed documents use lazy adoption rather than bulk workspace rewrite. Pre-ledger `DELIVERABLES`, `WORKING`, `REVIEW`, and `REFERENCES` files are adopted only when encountered/needed, preserving their visible bytes.
+
 ## 22. Projection version and completed evidence
 
 A completed generation is identified by canonical revision plus projection version.
@@ -377,11 +446,19 @@ Completed generation records are immutable. `materialization-head.json` is repai
 
 Snapshot/delta reconstruction is bounded. Missing parents/root mismatches fail closed.
 
-## 23. Rollback and cleanup
+Managed-document version history is independent of projection generations. Do not conflate a document version with a materialization generation.
+
+## 23. Rollback, recovery and cleanup
 
 Technical execution rollback changes an execution path; it never rewinds accepted canonical business history.
 
 Projection failure never rewinds the canonical commit.
+
+Managed-document provider actions may span several Dropbox operations and therefore use crash-reconcilable ordering. Never claim cross-file atomicity that the provider does not supply.
+
+If a visible managed file changed but ledger/head/receipt completion was interrupted, recover only after verifying visible provider evidence against the expected immutable version. Otherwise fail closed.
+
+The Dropbox change cursor advances only after the observed page is reconciled. Cursor reset triggers a bounded fresh baseline/adoption pass rather than treating every known file as a new human edit.
 
 Do not delete legacy or canonical history as part of normal recovery/materialization.
 
@@ -391,6 +468,8 @@ Any destructive legacy cleanup remains a separately approved operation.
 
 Information from another chat/project may appear in model context. Never treat it as a fact about the bound project without confirming it against canonical state.
 
+The same applies to managed documents: a document version seen in another/older chat may be stale. Refresh its current logical head before mutation.
+
 ## 25. Failure behavior
 
 If Dropbox/ProjectGuard is unavailable:
@@ -398,7 +477,8 @@ If Dropbox/ProjectGuard is unavailable:
 - continue non-durable reasoning when useful;
 - never fabricate persistence;
 - keep intended changes separate from committed state;
-- refresh canonical state before retrying a durable mutation.
+- refresh canonical state before retrying a durable canonical mutation;
+- refresh managed-document head/provider state before retrying a document mutation.
 
 If a business commit is already canonical but materialization is delayed:
 
@@ -407,11 +487,13 @@ If a business commit is already canonical but materialization is delayed:
 - let automatic projection recovery converge;
 - use canonical state for correctness until the human generation catches up.
 
-If generated Markdown is inconsistent, repair/rebuild it from canonical truth rather than treating the Markdown discrepancy as a new business fact.
+If generated Markdown is inconsistent, preserve unexpected external bytes where applicable and repair/rebuild it from canonical truth rather than treating the Markdown discrepancy as a new business fact.
+
+If a managed document conflicts, preserve both realities and fail closed rather than blind-overwrite. Human/external bytes must survive conflict handling.
 
 ## 26. User experience principle
 
-Normal operation remains:
+Normal canonical operation remains:
 
 ```text
 User speaks naturally
@@ -435,6 +517,22 @@ user can continue
 asynchronous internal projection
       ↓
 Dropbox human workspace / Obsidian converges
+```
+
+Normal collaborative-document work is similarly command-free:
+
+```text
+User/ChatGPT works in WORKING
+      ↓
+versioned human + AI edits
+      ↓
+REVIEW candidate
+      ↓
+explicit publication
+      ↓
+DELIVERABLES frozen version
+      ↓
+optional reopen for the next iteration
 ```
 
 The reliability mechanics remain mostly invisible. No version selection, materialization command or workstation dependency is part of normal operation.

@@ -88,6 +88,7 @@ function intent(overrides: Partial<MutationIntentRecord> = {}): MutationIntentRe
     request_json: JSON.stringify({ request_id: "ART-MUTATION-INTENT-0001", content: "# governed" }),
     base_project_revision: 85,
     destination_path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/REVENUE-OS/foo.md",
+    provider_precondition: { kind: "absent" },
     expected_content_sha256: "b".repeat(64),
     mode: "create",
     recorded_at: "2026-08-25T16:10:00+01:00",

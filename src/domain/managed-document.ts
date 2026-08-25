@@ -10,7 +10,7 @@ const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const providerFileIdSchema = z.string().regex(/^id:[A-Za-z0-9_-]+$/);
 
 const RESERVED_WORKSPACE_ROOTS = new Set([
-  ".project-os",
+  ".PROJECT-OS",
   "ARCHIVES",
   "CONSTRAINTS",
   "DECISIONS",
@@ -232,18 +232,18 @@ export async function externalVersionIdFor(providerRev: string): Promise<string>
 
 export function assertManagedRelativePath(value: string): string {
   const safe = assertSafeRelative(value, "managed document path", 16, 512);
-  const root = safe.split("/")[0];
+  const root = safe.split("/")[0].toUpperCase();
   if (RESERVED_WORKSPACE_ROOTS.has(root)) {
-    throw new Error(`managed document path must be relative to its managed zone, not start with reserved root ${root}`);
+    throw new Error(`managed document path must be relative to its managed zone, not start with reserved root ${safe.split("/")[0]}`);
   }
   return safe;
 }
 
 export function assertReferenceCollectionPath(value: string): string {
   const safe = assertSafeRelative(value, "reference collection path", 4, 256);
-  const root = safe.split("/")[0];
+  const root = safe.split("/")[0].toUpperCase();
   if (RESERVED_WORKSPACE_ROOTS.has(root)) {
-    throw new Error(`reference collection path cannot use reserved workspace root ${root}`);
+    throw new Error(`reference collection path cannot use reserved workspace root ${safe.split("/")[0]}`);
   }
   return safe;
 }
@@ -252,11 +252,14 @@ function assertSafeRelative(value: string, label: string, maxDepth: number, maxL
   if (!value || value.length > maxLength || value.startsWith("/") || value.endsWith("/") || value.includes("//")) {
     throw new Error(`Unsafe ${label}: ${value}`);
   }
-  const segments = value.split("/");
-  if (segments.length > maxDepth || segments.some((segment) => !segment || segment === "." || segment === "..")) {
+  if (/[\u0000-\u001F\u007F]/.test(value) || /[<>:"\\|?*]/.test(value)) {
     throw new Error(`Unsafe ${label}: ${value}`);
   }
-  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) {
+  const segments = value.split("/");
+  if (
+    segments.length > maxDepth
+    || segments.some((segment) => !segment || segment === "." || segment === ".." || segment.trim() !== segment)
+  ) {
     throw new Error(`Unsafe ${label}: ${value}`);
   }
   return value;

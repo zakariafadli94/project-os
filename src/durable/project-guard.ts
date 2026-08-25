@@ -10,6 +10,7 @@ import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
 import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinator";
+import { ManagedDocumentRequestLedger } from "../documents/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
 import { DropboxClient } from "../dropbox/client";
 import { parseLayoutMode, type LayoutMode } from "../dropbox/layout";
@@ -67,6 +68,7 @@ export class ProjectGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
   private readonly managedDocumentService: ManagedDocumentService;
   private readonly managedDocumentChanges: ManagedDocumentChangeCoordinator;
+  private readonly managedDocumentRequests: ManagedDocumentRequestLedger;
   private readonly layoutMode: LayoutMode;
   private readonly materializationLedger: MaterializationLedger | null;
   private readonly materializationCoordinator: MaterializationCoordinator | null;
@@ -104,6 +106,7 @@ export class ProjectGuard extends DurableObject<Env> {
     this.repository = new ProjectRepository(rawDropbox, this.layoutMode);
     this.managedDocumentService = new ManagedDocumentService(rawDropbox);
     this.managedDocumentChanges = new ManagedDocumentChangeCoordinator(rawDropbox, this.ctx.storage);
+    this.managedDocumentRequests = new ManagedDocumentRequestLedger(rawDropbox);
 
     const projectId = this.ctx.id.name;
     if (this.layoutMode === "v2" && projectId) {
@@ -419,28 +422,42 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (this.ctx.id.name && this.ctx.id.name !== operation.project_id) {
-      return this.finalizeDocument(
+      return Response.json(this.documentTerminalReceipt(
         operation,
-        this.documentTerminalReceipt(
-          operation,
-          "rejected",
-          "PROJECT_BINDING_MISMATCH",
-          "Durable Object binding does not match managed document project_id"
-        )
-      );
+        "rejected",
+        "PROJECT_BINDING_MISMATCH",
+        "Durable Object binding does not match managed document project_id"
+      ));
     }
 
     const state = await this.loadOrRecoverState();
     if (!state) {
-      return this.finalizeDocument(
+      return Response.json(this.documentTerminalReceipt(
         operation,
-        this.documentTerminalReceipt(
+        "rejected",
+        "PROJECT_NOT_INITIALIZED",
+        "Project state is not initialized"
+      ));
+    }
+
+    const durableIntent = await this.managedDocumentRequests.readIntent(operation.project_id, operation.request_id);
+    if (durableIntent) {
+      if (durableIntent.request_json !== serialized) {
+        return Response.json(this.documentTerminalReceipt(
           operation,
           "rejected",
-          "PROJECT_NOT_INITIALIZED",
-          "Project state is not initialized"
-        )
-      );
+          "IDEMPOTENCY_PAYLOAD_MISMATCH",
+          "The same request_id was reused with a different managed-document payload"
+        ));
+      }
+      const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
+      if (durableReceipt) {
+        const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
+        this.persistDocumentRequest(operation, receipt);
+        return Response.json(receipt);
+      }
+    } else {
+      await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
     }
 
     try {
@@ -502,10 +519,18 @@ export class ProjectGuard extends DurableObject<Env> {
     return Response.json(receipt);
   }
 
-  private finalizeDocument(
+  private async finalizeDocument(
     request: ManagedDocumentRequest,
     receipt: ManagedDocumentOperationReceipt
-  ): Response {
+  ): Promise<Response> {
+    const requestJson = JSON.stringify(request);
+    const receiptJson = JSON.stringify(receipt);
+    await this.managedDocumentRequests.writeReceipt(
+      request.project_id,
+      request.request_id,
+      requestJson,
+      receiptJson
+    );
     this.persistDocumentRequest(request, receipt);
     return Response.json(receipt);
   }

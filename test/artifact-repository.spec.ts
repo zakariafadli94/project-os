@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { ArtifactWriteRequest } from "../src/domain/artifact-write";
 import { emptyProjectState } from "../src/domain/transitions";
-import type { DropboxTransport } from "../src/dropbox/client";
+import { DropboxConflictError, type DropboxTransport } from "../src/dropbox/client";
 import { ArtifactContentConflictError, ProjectRepository } from "../src/dropbox/repository";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
   uploads: Array<{ path: string; mode: "add" | "overwrite" }> = [];
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
+    if (mode === "add" && this.files.has(path)) {
+      throw new DropboxConflictError(`exists ${path}`, "req-artifact", "path/conflict/file");
+    }
     this.files.set(path, content);
     this.uploads.push({ path, mode });
   }
@@ -29,14 +32,19 @@ function state() {
   return emptyProjectState("PRJ-0003", "Growth", "growth", "Build growth agency");
 }
 
+function visibleUploads(transport: FakeTransport) {
+  return transport.uploads.filter((entry) => entry.path.includes("/WORKSPACE/PROJECTS/"));
+}
+
 describe("ProjectRepository artifact writes", () => {
-  it("creates a new artifact", async () => {
+  it("creates a new artifact after durable mutation evidence", async () => {
     const transport = new FakeTransport();
     const repository = new ProjectRepository(transport, "v2");
 
     await expect(repository.writeArtifact(state(), request)).resolves.toBe("written");
-    expect(transport.uploads).toHaveLength(1);
-    expect(transport.uploads[0]?.mode).toBe("add");
+    expect(visibleUploads(transport)).toHaveLength(1);
+    expect(visibleUploads(transport)[0]?.mode).toBe("add");
+    expect(transport.uploads[0]?.path).toContain("/mutation-gate/intents/artifacts/");
   });
 
   it("treats same-content create replay as idempotent", async () => {
@@ -45,7 +53,7 @@ describe("ProjectRepository artifact writes", () => {
     await repository.writeArtifact(state(), request);
 
     await expect(repository.writeArtifact(state(), request)).resolves.toBe("idempotent");
-    expect(transport.uploads).toHaveLength(1);
+    expect(visibleUploads(transport)).toHaveLength(1);
   });
 
   it("returns a real conflict for create with different existing content", async () => {
@@ -55,7 +63,8 @@ describe("ProjectRepository artifact writes", () => {
     transport.files.set(path, "different");
 
     await expect(repository.writeArtifact(state(), request)).rejects.toBeInstanceOf(ArtifactContentConflictError);
-    expect(transport.uploads).toHaveLength(0);
+    expect(visibleUploads(transport)).toHaveLength(0);
+    expect(transport.uploads.some((entry) => entry.path.includes("/mutation-gate/intents/artifacts/"))).toBe(true);
   });
 
   it("replaces different content only in replace mode", async () => {
@@ -66,7 +75,7 @@ describe("ProjectRepository artifact writes", () => {
 
     await expect(repository.writeArtifact(state(), { ...request, mode: "replace" })).resolves.toBe("written");
     expect(transport.files.get(path)).toBe("# Acquisition");
-    expect(transport.uploads.at(-1)?.mode).toBe("overwrite");
+    expect(visibleUploads(transport).at(-1)?.mode).toBe("overwrite");
   });
 
   it("treats same-content replace as idempotent", async () => {
@@ -76,6 +85,7 @@ describe("ProjectRepository artifact writes", () => {
     transport.files.set(path, "# Acquisition");
 
     await expect(repository.writeArtifact(state(), { ...request, mode: "replace" })).resolves.toBe("idempotent");
-    expect(transport.uploads).toHaveLength(0);
+    expect(visibleUploads(transport)).toHaveLength(0);
+    expect(transport.uploads.some((entry) => entry.path.includes("/mutation-gate/intents/artifacts/"))).toBe(true);
   });
 });

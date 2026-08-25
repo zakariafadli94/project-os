@@ -75,7 +75,7 @@ export class ManagedDocumentService {
   }
 
   status(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
-    return this.ledger.readHead(projectId, documentId);
+    return this.readOrRestoreHead(projectId, documentId);
   }
 
   async writeWorking(request: ManagedTextWriteRequest, state: ProjectState): Promise<ManagedDocumentReceipt> {
@@ -87,7 +87,11 @@ export class ManagedDocumentService {
     const replay = await this.ledger.readVersion(request.project_id, documentId, versionId);
     if (replay) return receiptFor(request.request_id, replay);
 
-    const head = await this.ledger.readHead(request.project_id, documentId);
+    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "working", logicalPath);
+    let head = await this.ledger.readHead(request.project_id, documentId);
+    if (!head && this.transport.getMetadata && await this.transport.getMetadata(visiblePath)) {
+      head = await this.ledger.restoreHeadFromVersions(request.project_id, documentId);
+    }
     if (head && head.kind !== "work_product") {
       throw new ManagedDocumentConflictError("DOCUMENT_KIND_CONFLICT", "Logical document is already a reference", documentId);
     }
@@ -99,7 +103,6 @@ export class ManagedDocumentService {
     this.assertExpectedVersion(request.expected_version_id, currentVersionId, documentId);
     const parent = currentVersionId ? await this.requireVersion(request.project_id, documentId, currentVersionId) : null;
     const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);
-    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "working", logicalPath);
     const metadata = await this.writeTextAtStage(
       visiblePath,
       request.content,
@@ -410,7 +413,7 @@ export class ManagedDocumentService {
     const replay = await this.ledger.readVersion(request.project_id, request.document_id, versionId);
     if (replay) return receiptFor(request.request_id, replay);
 
-    const head = await this.ledger.readHead(request.project_id, request.document_id);
+    const head = await this.readOrRestoreHead(request.project_id, request.document_id);
     if (!head) {
       throw new ManagedDocumentConflictError("DOCUMENT_NOT_FOUND", `Managed reference not found: ${request.document_id}`, request.document_id);
     }
@@ -501,8 +504,13 @@ export class ManagedDocumentService {
     }
   }
 
+  private async readOrRestoreHead(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
+    const existing = await this.ledger.readHead(projectId, documentId);
+    return existing ?? this.ledger.restoreHeadFromVersions(projectId, documentId);
+  }
+
   private async requireWorkProductHead(projectId: string, documentId: string): Promise<ManagedDocumentHead> {
-    const head = await this.ledger.readHead(projectId, documentId);
+    const head = await this.readOrRestoreHead(projectId, documentId);
     if (!head) throw new ManagedDocumentConflictError("DOCUMENT_NOT_FOUND", `Managed document not found: ${documentId}`, documentId);
     if (head.kind !== "work_product") {
       throw new ManagedDocumentConflictError("DOCUMENT_KIND_CONFLICT", "Document is not a work product", documentId);

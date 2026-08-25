@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Status: proposed for user review. This document is not runtime implementation authorization until the user explicitly approves it and the corresponding Project OS implementation-authorization decision is committed.
+Status: proposed for user review. This document becomes runtime implementation authorization only after explicit user approval and a committed Project OS implementation-authorization decision.
 
 **Goal:** Implement the approved schema-1.0-compatible Project OS lifecycle and concurrency contract so stale lifecycle/direction mutations conflict deterministically, phase progression is coherent, new governed references are valid, and historical state remains readable without a schema migration.
 
-**Architecture:** Keep ProjectGuard as the existing per-project serialization boundary and keep persisted `ProjectState 1.0` unchanged. Move stale-rebase classification into one small fail-closed domain policy, enforce lifecycle/reference invariants in the pure transition layer, and prove behavior at both pure-domain and ProjectGuard receipt boundaries. Historical compatibility remains a reader concern: old structurally valid snapshots stay loadable, while stricter rules govern new mutations.
+**Architecture:** Keep ProjectGuard as the existing per-project serialization boundary and keep persisted `ProjectState 1.0` unchanged. Put stale-rebase classification in one small fail-closed domain policy, enforce lifecycle/reference invariants in the pure transition layer, and prove behavior at both pure-domain and ProjectGuard receipt boundaries. Historical compatibility remains a reader contract: old structurally valid snapshots stay loadable while stricter rules govern new mutations.
 
 **Tech Stack:** TypeScript 5.9, Vitest 4.1, Cloudflare Workers + SQLite Durable Objects, Zod 4.4, Wrangler 4.124, Dropbox persistence.
 
@@ -14,18 +14,18 @@ Status: proposed for user review. This document is not runtime implementation au
 
 ## Global Constraints
 
-- Implementation baseline is GitHub `main` commit `820030be0f775aa89689a4bdb56ac6495e21dfe1`; refresh `main` immediately before execution and stop for revalidation if it changed materially.
+- Execution baseline is GitHub `main` commit `820030be0f775aa89689a4bdb56ac6495e21dfe1`; refresh `main` immediately before execution and revalidate this plan if `main` changed materially.
 - Canonical design baseline is PRJ-0002 revision `89`, `RES-IMPMODELDESIGN001`, and accepted `DEC-IMPMODELDESIGN001`.
-- `ProjectState.schema_version` remains exactly `1.0`; do not add persisted fields, operations, payload members, upcasters, migrations, dependency graphs, per-entity revisions, or research statuses.
-- Do not modify `src/domain/project-state.ts` or `src/domain/transaction.ts` unless a failing test proves an implementation necessity that is still schema-compatible; if either persisted shape must change, stop and return to the SCHEMA gate instead of proceeding.
+- `ProjectState.schema_version` remains exactly `1.0`; do not add persisted fields, transaction operations, transaction payload members, upcasters, migrations, dependency graphs, per-entity revisions, or research statuses.
+- `src/domain/project-state.ts` and `src/domain/transaction.ts` are expected to remain unchanged. If a failing test demonstrates that either persisted shape must change, stop MODEL001 implementation and return that need to the SCHEMA gate.
 - `PROJECT_OS_CONTINUITY_MODE` remains `stable`.
 - `PROJECT_OS_MUTATION_GATE_MODE` remains `observe`; this plan never authorizes `enforce`.
 - Do not repair, adopt, reject, move, overwrite, or otherwise mutate historical PRJ-0003 deviations as part of MODEL001.
 - Do not implement IMP-SCHEMA001 runtime behavior.
-- No new distributed lock, queue, or persistence coordinator; ProjectGuard remains the per-project serialization boundary.
-- New lifecycle behavior must be introduced with strict RED -> GREEN -> REFACTOR TDD. Never write production behavior before watching its dedicated test fail for the expected reason.
-- Historical schema-1.0 snapshots that satisfy the existing normalizer remain readable even if their lifecycle combination would not be newly created after MODEL001.
-- Approval of this plan authorizes only an isolated implementation/test/documentation branch after the canonical implementation-authorization receipt commits. It does **not** authorize runtime PR merge or production deployment; those remain a later explicit gate after exact-head verification.
+- Do not add a second lock, queue, or persistence coordinator; ProjectGuard remains the per-project serialization boundary.
+- Every behavior change follows strict RED -> GREEN -> REFACTOR. Production code is written only after the dedicated test has been observed failing for the intended reason.
+- Historical schema-1.0 snapshots satisfying the existing normalizer remain readable even if their lifecycle combination would not be newly created after MODEL001.
+- Approval of this plan authorizes an isolated implementation/test/documentation branch after the canonical implementation-authorization receipt commits. Runtime PR merge and production deployment remain a later explicit gate after exact-head verification.
 
 ---
 
@@ -38,19 +38,19 @@ Status: proposed for user review. This document is not runtime implementation au
 
 **Interfaces:**
 - Consumes: approved spec, this approved plan, canonical PRJ-0002 current revision.
-- Produces: committed `DEC-IMPMODELIMPL001`, merged documentation checkpoint, isolated implementation branch/worktree based on the refreshed post-documentation `main`.
+- Produces: committed `DEC-IMPMODELIMPL001`, merged documentation checkpoint, isolated implementation branch/worktree based on refreshed `main`.
 
-- [ ] **Step 1: Re-read the execution-isolation skill before any source edit**
+- [ ] **Step 1: Read the execution-isolation skill before source edits**
 
-Read `superpowers:using-git-worktrees` at execution time and follow it before changing runtime code.
+At execution time read `superpowers:using-git-worktrees` and follow it before changing runtime code.
 
-- [ ] **Step 2: Refresh canonical PRJ-0002 and GitHub main**
+- [ ] **Step 2: Refresh PRJ-0002 and GitHub main**
 
-Verify `TASK-IMPMODEL001` is still active and `DEC-IMPMODELDESIGN001` is accepted. Verify PR #39 still contains documentation only and revalidate any new `main` commits against this plan.
+Verify `TASK-IMPMODEL001` remains active, `DEC-IMPMODELDESIGN001` remains accepted, PR #39 is documentation-only, and no new `main` change invalidates the approved model.
 
-- [ ] **Step 3: Commit the implementation-authorization decision through Project OS**
+- [ ] **Step 3: Commit implementation authorization through Project OS**
 
-Use a fresh typed `decision.accept` transaction with the then-current PRJ-0002 revision:
+Submit a fresh typed `decision.accept` against the then-current PRJ-0002 revision:
 
 ```json
 {
@@ -58,23 +58,23 @@ Use a fresh typed `decision.accept` transaction with the then-current PRJ-0002 r
   "payload": {
     "decision_id": "DEC-IMPMODELIMPL001",
     "title": "Authorize IMP-MODEL001 isolated TDD implementation",
-    "decision": "Authorize implementation of the approved IMP-MODEL001 specification and TDD plan on an isolated branch after the documentation checkpoint is merged. This authorization covers source changes, tests, documentation and creation of an implementation PR only. It does not authorize merging the runtime PR, production deployment, MutationGate enforce, PRJ-0003 repair, or IMP-SCHEMA001 runtime.",
-    "reason": "The written design and implementation plan were separately reviewed and approved before runtime changes.",
+    "decision": "Authorize implementation of the approved IMP-MODEL001 specification and TDD plan on an isolated branch after the documentation checkpoint is merged. This covers source changes, tests, documentation and creation of an implementation PR only. It does not authorize runtime PR merge, production deployment, MutationGate enforce, PRJ-0003 repair, or IMP-SCHEMA001 runtime.",
+    "reason": "The written design and executable implementation plan were separately reviewed and approved before runtime changes.",
     "impacts": [
       "Implement MODEL001 strictly with RED-GREEN-REFACTOR.",
       "Keep ProjectState and Transaction persisted schemas at 1.0.",
-      "Require a separate merge/deployment approval after exact-head verification.",
+      "Require a separate runtime merge/deployment approval after exact-head verification.",
       "Keep MutationGate observe and leave PRJ-0003 and SCHEMA runtime untouched."
     ]
   }
 }
 ```
 
-Do not continue until its receipt is `committed`.
+Continue only after the receipt is `committed`.
 
-- [ ] **Step 4: Merge the approved documentation checkpoint and create isolated implementation work**
+- [ ] **Step 4: Merge the approved documentation checkpoint and isolate runtime work**
 
-After explicit plan approval and the committed implementation-authorization decision, merge PR #39, refresh `main`, then create `imp/model001-lifecycle-concurrency` from that exact `main`. Do not place runtime changes into PR #39.
+After plan approval and the committed implementation-authorization decision, merge PR #39, refresh `main`, and create `imp/model001-lifecycle-concurrency` from that exact post-documentation `main`. Runtime changes never go into PR #39.
 
 ---
 
@@ -82,68 +82,116 @@ After explicit plan approval and the committed implementation-authorization deci
 
 **Files:**
 - Create: `src/domain/concurrency-policy.ts`
+- Create: `test/model-lifecycle-concurrency.spec.ts`
 - Modify: `src/domain/transitions.ts`
 - Modify: `test/transitions.spec.ts`
 
 **Interfaces:**
-- Consumes: `Transaction["operation"]` from `src/domain/transaction.ts`.
-- Produces: `mayRebaseStaleOperation(operation: Transaction["operation"]): boolean`, used by `applyTransaction` before cloning/mutating current state.
+- Consumes: `Transaction["operation"]`.
+- Produces: `mayRebaseStaleOperation(operation: Transaction["operation"]): boolean`, called by `applyTransaction` before state mutation.
 
-- [ ] **Step 1: Replace the existing stale-task expectation with failing exact-current tests**
+- [ ] **Step 1: Create the MODEL test file with deterministic helpers and stale lifecycle tests**
 
-In `test/transitions.spec.ts`, remove the test that currently expects stale task completion to commit. Add tests that construct a valid target state, advance only the project revision to simulate an unrelated intervening commit, and assert stale lifecycle writes conflict:
+Create `test/model-lifecycle-concurrency.spec.ts` with this preamble and first tests:
 
 ```ts
-it("returns conflict for stale task lifecycle mutations", () => {
-  let state = emptyProjectState("PRJ-0001", "Agency", "agency");
-  const created = applyTransaction(state, tx({
-    operation: "task.create",
-    payload: { task_id: "TASK-0001", title: "Launch" }
-  }));
-  if (created.kind !== "commit") throw new Error("setup failed");
+import { describe, expect, it } from "vitest";
+import type { ProjectState } from "../src/domain/project-state";
+import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
+import type { Transaction } from "../src/domain/transaction";
 
-  const concurrent = { ...created.state, revision: created.state.revision + 1 };
-  for (const operation of ["task.start", "task.block", "task.complete"] as const) {
-    const payload = operation === "task.block"
-      ? { task_id: "TASK-0001", reason: "Blocked" }
-      : { task_id: "TASK-0001" };
-    const result = applyTransaction(concurrent, tx({
-      base_revision: created.state.revision,
-      operation,
-      payload
-    } as never));
+const at = "2026-08-25T18:00:00.000Z";
+let serial = 0;
+
+function tx<T extends Transaction["operation"]>(
+  projectId: string,
+  baseRevision: number,
+  operation: T,
+  payload: Extract<Transaction, { operation: T }>["payload"]
+): Transaction {
+  serial += 1;
+  return {
+    schema_version: "1.0",
+    transaction_id: `TXN-MODEL-${serial.toString().padStart(10, "0")}`,
+    project_id: projectId,
+    base_revision: baseRevision,
+    operation,
+    created_at: at,
+    payload
+  } as Transaction;
+}
+
+function commit(state: ProjectState, transaction: Transaction): ProjectState {
+  const result = applyTransaction(state, transaction);
+  expect(result.kind).toBe("commit");
+  if (result.kind !== "commit") throw new Error(`Expected commit, got ${result.kind}`);
+  return result.state;
+}
+
+describe("MODEL001 concurrency", () => {
+  it("conflicts stale task start", () => {
+    let state = emptyProjectState("PRJ-4001", "Model", "model");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4001", title: "Target"
+    }));
+    const concurrent = { ...state, revision: state.revision + 1 };
+    const result = applyTransaction(concurrent, tx(state.project_id, state.revision, "task.start", {
+      task_id: "TASK-4001"
+    }));
     expect(result).toMatchObject({ kind: "conflict", code: "STALE_REVISION" });
-  }
-});
+  });
 
-it("returns conflict for stale legacy deliverable completion", () => {
-  let state = emptyProjectState("PRJ-0001", "Agency", "agency");
-  const created = applyTransaction(state, tx({
-    operation: "deliverable.add",
-    payload: { deliverable_id: "DEL-0001", title: "Legacy" }
-  }));
-  if (created.kind !== "commit") throw new Error("setup failed");
-  const concurrent = { ...created.state, revision: created.state.revision + 1 };
-  const result = applyTransaction(concurrent, tx({
-    base_revision: created.state.revision,
-    operation: "deliverable.complete",
-    payload: { deliverable_id: "DEL-0001", outcome: "Done" }
-  }));
-  expect(result).toMatchObject({ kind: "conflict", code: "STALE_REVISION" });
+  it("conflicts stale task block", () => {
+    let state = emptyProjectState("PRJ-4002", "Model", "model");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4002", title: "Target"
+    }));
+    const concurrent = { ...state, revision: state.revision + 1 };
+    const result = applyTransaction(concurrent, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4002", reason: "Blocked"
+    }));
+    expect(result).toMatchObject({ kind: "conflict", code: "STALE_REVISION" });
+  });
+
+  it("conflicts stale task completion", () => {
+    let state = emptyProjectState("PRJ-4003", "Model", "model");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4003", title: "Target"
+    }));
+    const concurrent = { ...state, revision: state.revision + 1 };
+    const result = applyTransaction(concurrent, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4003"
+    }));
+    expect(result).toMatchObject({ kind: "conflict", code: "STALE_REVISION" });
+  });
+
+  it("conflicts stale legacy deliverable completion", () => {
+    let state = emptyProjectState("PRJ-4004", "Model", "model");
+    state = commit(state, tx(state.project_id, state.revision, "deliverable.add", {
+      deliverable_id: "DEL-4001", title: "Legacy"
+    }));
+    const concurrent = { ...state, revision: state.revision + 1 };
+    const result = applyTransaction(concurrent, tx(state.project_id, state.revision, "deliverable.complete", {
+      deliverable_id: "DEL-4001", outcome: "Done"
+    }));
+    expect(result).toMatchObject({ kind: "conflict", code: "STALE_REVISION" });
+  });
 });
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [ ] **Step 2: Remove the obsolete permissive stale completion expectation**
 
-Run:
+Delete the existing `test/transitions.spec.ts` case named `allows a stale independent task completion only while the target transition is still valid`. Keep the stale `research.add` and stale `decision.accept` tests.
+
+- [ ] **Step 3: Run RED**
 
 ```bash
-npx vitest run test/transitions.spec.ts
+npx vitest run test/model-lifecycle-concurrency.spec.ts test/transitions.spec.ts
 ```
 
-Expected: the new stale task lifecycle and stale `deliverable.complete` assertions fail because current `applyTransaction` still permits those stale operations.
+Expected: stale task lifecycle and stale `deliverable.complete` tests fail because the current runtime permits them.
 
-- [ ] **Step 3: Add the fail-closed concurrency policy**
+- [ ] **Step 4: Add the fail-closed policy**
 
 Create `src/domain/concurrency-policy.ts`:
 
@@ -162,249 +210,328 @@ export function mayRebaseStaleOperation(operation: Transaction["operation"]): bo
 }
 ```
 
-This intentionally makes every existing or future operation exact-current unless it is explicitly added to the narrow additive allow-list.
+- [ ] **Step 5: Wire it into `applyTransaction`**
 
-- [ ] **Step 4: Wire the policy into `applyTransaction`**
-
-In `src/domain/transitions.ts`, import the helper, delete `exactRevisionOperations`, and replace:
+In `src/domain/transitions.ts`, import `mayRebaseStaleOperation`, delete `exactRevisionOperations`, and replace the stale check with:
 
 ```ts
-if (stale && exactRevisionOperations.has(tx.operation)) {
-```
-
-with:
-
-```ts
+const stale = tx.base_revision !== state.revision;
 if (stale && !mayRebaseStaleOperation(tx.operation)) {
   return conflict("STALE_REVISION", `${tx.operation} requires the current project revision`);
 }
 ```
 
-Keep `project.create`, `REVISION_AHEAD`, archived/completed project guards and transaction ordering unchanged.
+Keep the existing `project.create`, `REVISION_AHEAD`, archived-project and completed-project guards in their current order.
 
-- [ ] **Step 5: Verify GREEN and preserve additive stale behavior**
+- [ ] **Step 6: Add characterization for all four stale-rebasable operations**
 
-Run:
+Append to the concurrency describe block:
 
-```bash
-npx vitest run test/transitions.spec.ts
+```ts
+it("rebases only the approved additive operations when current-state invariants still hold", () => {
+  const state = { ...emptyProjectState("PRJ-4005", "Model", "model"), revision: 5 };
+
+  expect(applyTransaction(state, tx(state.project_id, 2, "research.add", {
+    research_id: "RES-4001", title: "Research", body: "Evidence"
+  })).kind).toBe("commit");
+
+  expect(applyTransaction(state, tx(state.project_id, 2, "constraint.add", {
+    constraint_id: "CON-4001", title: "Constraint", description: "Rule"
+  })).kind).toBe("commit");
+
+  expect(applyTransaction(state, tx(state.project_id, 2, "task.create", {
+    task_id: "TASK-4005", title: "Independent task"
+  })).kind).toBe("commit");
+
+  expect(applyTransaction(state, tx(state.project_id, 2, "deliverable.add", {
+    deliverable_id: "DEL-4002", title: "Legacy additive"
+  })).kind).toBe("commit");
+});
 ```
 
-Expected: all tests pass, including the existing stale `research.add` commit case and stale `decision.accept` conflict case.
-
-- [ ] **Step 6: Commit the task**
+- [ ] **Step 7: Run GREEN and commit**
 
 ```bash
-git add src/domain/concurrency-policy.ts src/domain/transitions.ts test/transitions.spec.ts
+npx vitest run test/model-lifecycle-concurrency.spec.ts test/transitions.spec.ts
+git add src/domain/concurrency-policy.ts src/domain/transitions.ts test/model-lifecycle-concurrency.spec.ts test/transitions.spec.ts
 git commit -m "feat: formalize MODEL001 concurrency policy"
 ```
 
 ---
 
-### Task 2: Lock the complete task lifecycle matrix
+### Task 2: Lock the approved task lifecycle matrix
 
 **Files:**
-- Modify: `test/operations.spec.ts`
+- Modify: `test/model-lifecycle-concurrency.spec.ts`
 
 **Interfaces:**
-- Consumes: existing task transition behavior in `applyTransaction` plus Task 1 exact-current policy.
-- Produces: executable characterization of every approved task transition, including blocked-reason refresh and terminal completion.
+- Consumes: existing task transition logic plus Task 1 exact-current policy.
+- Produces: executable coverage of direct completion, blocking/reason refresh, resume, active blocking, blocked completion and terminal completion.
 
-- [ ] **Step 1: Add the approved task transition matrix**
+- [ ] **Step 1: Add exact task lifecycle characterization**
 
-Add a dedicated `describe("MODEL001 task lifecycle", ...)` section with explicit cases:
+Append:
 
 ```ts
-it("supports the approved task lifecycle without a mandatory start", () => {
-  let state = emptyProjectState("PRJ-2301", "Tasks", "tasks");
-  state = commit(state, tx(state.project_id, state.revision, "task.create", {
-    task_id: "TASK-2301", title: "Direct completion"
-  }));
-  state = commit(state, tx(state.project_id, state.revision, "task.complete", {
-    task_id: "TASK-2301", result: "Done naturally"
-  }));
-  expect(state.tasks["TASK-2301"].status).toBe("completed");
-});
+describe("MODEL001 task lifecycle", () => {
+  it("allows pending to complete without mandatory start", () => {
+    let state = emptyProjectState("PRJ-4101", "Tasks", "tasks");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4101", title: "Direct completion"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4101", result: "Done naturally"
+    }));
+    expect(state.tasks["TASK-4101"]).toMatchObject({ status: "completed", result: "Done naturally" });
+  });
 
-it("supports pending to blocked, blocked reason refresh, blocked to active and active to completed", () => {
-  let state = emptyProjectState("PRJ-2302", "Tasks", "tasks");
-  state = commit(state, tx(state.project_id, state.revision, "task.create", {
-    task_id: "TASK-2302", title: "Recoverable task"
-  }));
-  state = commit(state, tx(state.project_id, state.revision, "task.block", {
-    task_id: "TASK-2302", reason: "First blocker"
-  }));
-  state = commit(state, tx(state.project_id, state.revision, "task.block", {
-    task_id: "TASK-2302", reason: "Updated blocker"
-  }));
-  expect(state.tasks["TASK-2302"].blocked_reason).toBe("Updated blocker");
-  state = commit(state, tx(state.project_id, state.revision, "task.start", {
-    task_id: "TASK-2302"
-  }));
-  expect(state.tasks["TASK-2302"].blocked_reason).toBeUndefined();
-  state = commit(state, tx(state.project_id, state.revision, "task.complete", {
-    task_id: "TASK-2302"
-  }));
-  expect(state.tasks["TASK-2302"].status).toBe("completed");
-});
+  it("supports blocked reason refresh, resume, active block and blocked completion", () => {
+    let state = emptyProjectState("PRJ-4102", "Tasks", "tasks");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4102", title: "Recoverable"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4102", reason: "First blocker"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4102", reason: "Updated blocker"
+    }));
+    expect(state.tasks["TASK-4102"].blocked_reason).toBe("Updated blocker");
 
-it("keeps completed tasks terminal", () => {
-  let state = emptyProjectState("PRJ-2303", "Tasks", "tasks");
-  state = commit(state, tx(state.project_id, state.revision, "task.create", {
-    task_id: "TASK-2303", title: "Terminal"
-  }));
-  state = commit(state, tx(state.project_id, state.revision, "task.complete", {
-    task_id: "TASK-2303"
-  }));
-  expect(applyTransaction(state, tx(state.project_id, state.revision, "task.start", {
-    task_id: "TASK-2303"
-  })).kind).toBe("rejected");
-  expect(applyTransaction(state, tx(state.project_id, state.revision, "task.block", {
-    task_id: "TASK-2303", reason: "No"
-  })).kind).toBe("rejected");
+    state = commit(state, tx(state.project_id, state.revision, "task.start", {
+      task_id: "TASK-4102"
+    }));
+    expect(state.tasks["TASK-4102"]).toMatchObject({ status: "active" });
+    expect(state.tasks["TASK-4102"].blocked_reason).toBeUndefined();
+
+    state = commit(state, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4102", reason: "Second blocker"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4102"
+    }));
+    expect(state.tasks["TASK-4102"].status).toBe("completed");
+    expect(state.tasks["TASK-4102"].blocked_reason).toBeUndefined();
+  });
+
+  it("keeps completed tasks terminal", () => {
+    let state = emptyProjectState("PRJ-4103", "Tasks", "tasks");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4103", title: "Terminal"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4103"
+    }));
+
+    expect(applyTransaction(state, tx(state.project_id, state.revision, "task.start", {
+      task_id: "TASK-4103"
+    })).kind).toBe("rejected");
+    expect(applyTransaction(state, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4103", reason: "No"
+    })).kind).toBe("rejected");
+    expect(applyTransaction(state, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4103"
+    })).kind).toBe("rejected");
+  });
 });
 ```
 
-- [ ] **Step 2: Run the focused characterization suite**
+- [ ] **Step 2: Run the characterization suite**
 
 ```bash
-npx vitest run test/operations.spec.ts
+npx vitest run test/model-lifecycle-concurrency.spec.ts
 ```
 
-Expected: PASS. These tests freeze approved existing behavior rather than adding a new persisted state.
+Expected: PASS. These cases freeze approved existing task semantics; no production change is expected in this task.
 
-- [ ] **Step 3: Commit the characterization tests**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add test/operations.spec.ts
-git commit -m "test: lock MODEL001 task lifecycle matrix"
+git add test/model-lifecycle-concurrency.spec.ts
+git commit -m "test: lock MODEL001 task lifecycle"
 ```
 
 ---
 
-### Task 3: Enforce coherent phase progression and phase attachment rules
+### Task 3: Enforce coherent phase progression and completed-phase attachment rules
 
 **Files:**
-- Create: `test/model-phase-lifecycle.spec.ts`
 - Modify: `src/domain/transitions.ts`
+- Modify: `test/model-lifecycle-concurrency.spec.ts`
 
 **Interfaces:**
-- Consumes: `ProjectState.plan_phases`, `current_phase_id`, `task.create`, `deliverable.create`, `plan.phase.complete`.
-- Produces: exact-current phase completion that only closes the single active/current phase, deterministic lexicographic promotion, and completed-phase attachment rejection.
+- Consumes: `plan_phases`, `current_phase_id`, `plan.phase.complete`, `task.create`, normative `deliverable.create`.
+- Produces: only the single active/current phase can complete, known multiple-active state fails closed, lexicographic promotion is preserved, and completed phases reject new work attachment.
 
-- [ ] **Step 1: Write failing pending/non-current completion tests**
+- [ ] **Step 1: Add failing phase tests**
 
-Create `test/model-phase-lifecycle.spec.ts` with the same deterministic transaction helper pattern as `test/operations.spec.ts`. Add:
+Append:
 
 ```ts
-it("rejects completion of a pending non-current phase", () => {
-  let state = emptyProjectState("PRJ-2401", "Phases", "phases");
-  state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
-    phase_id: "PHASE-2401", title: "Current"
-  }));
-  state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
-    phase_id: "PHASE-2402", title: "Later"
-  }));
-  const result = applyTransaction(state, tx(state.project_id, state.revision, "plan.phase.complete", {
-    phase_id: "PHASE-2402"
-  }));
-  expect(result).toMatchObject({ kind: "rejected", code: "PHASE_NOT_CURRENT" });
-  expect(state.current_phase_id).toBe("PHASE-2401");
-  expect(state.plan_phases["PHASE-2401"].status).toBe("active");
+describe("MODEL001 phase lifecycle", () => {
+  it("rejects completion of a pending non-current phase", () => {
+    let state = emptyProjectState("PRJ-4201", "Phases", "phases");
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4201", title: "Current"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4202", title: "Later"
+    }));
+    const result = applyTransaction(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4202"
+    }));
+    expect(result).toMatchObject({ kind: "rejected", code: "PHASE_NOT_CURRENT" });
+  });
+
+  it("fails closed when a historical state contains another active phase", () => {
+    let state = emptyProjectState("PRJ-4202", "Phases", "phases");
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4203", title: "Current"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4204", title: "Later"
+    }));
+    state.plan_phases["PHASE-4204"].status = "active";
+
+    const result = applyTransaction(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4203"
+    }));
+    expect(result).toMatchObject({ kind: "rejected", code: "PHASE_STATE_INCONSISTENT" });
+  });
 });
 ```
 
-Add a second failing case that injects a second historical `active` phase while `current_phase_id` points to the target and expects `PHASE_STATE_INCONSISTENT` rather than a transition that leaves multiple active phases.
-
-- [ ] **Step 2: Run the phase tests and verify RED**
+- [ ] **Step 2: Run RED**
 
 ```bash
-npx vitest run test/model-phase-lifecycle.spec.ts
+npx vitest run test/model-lifecycle-concurrency.spec.ts
 ```
 
-Expected: pending completion currently commits, so the first test fails for the expected reason.
+Expected: the pending phase currently completes and the multiple-active historical state is not rejected by the transition layer.
 
-- [ ] **Step 3: Implement active/current completion guards**
+- [ ] **Step 3: Guard active/current completion before mutating the phase**
 
-In `plan.phase.complete`, after locating the phase and before mutating it, add:
+In `plan.phase.complete`, after locating the target phase, add:
 
 ```ts
 if (phase.status !== "active" || next.current_phase_id !== phase.phase_id) {
-  return rejected("PHASE_NOT_CURRENT", `Only current active phase ${next.current_phase_id ?? "<none>"} can be completed`);
+  return rejected(
+    "PHASE_NOT_CURRENT",
+    `Only current active phase ${next.current_phase_id ?? "<none>"} can be completed`
+  );
 }
 const otherActive = Object.values(next.plan_phases).find(
   (candidate) => candidate.status === "active" && candidate.phase_id !== phase.phase_id
 );
 if (otherActive) {
-  return rejected("PHASE_STATE_INCONSISTENT", `Multiple active phases include ${phase.phase_id} and ${otherActive.phase_id}`);
+  return rejected(
+    "PHASE_STATE_INCONSISTENT",
+    `Multiple active phases include ${phase.phase_id} and ${otherActive.phase_id}`
+  );
 }
 ```
 
-Keep deterministic promotion, but make the compatibility rule explicit:
+Keep the existing lexicographic pending-phase promotion code after these guards.
+
+- [ ] **Step 4: Add failing completed-phase attachment tests**
+
+Append inside the phase describe block:
 
 ```ts
-const nextPhase = Object.values(next.plan_phases)
-  .filter((candidate) => candidate.status === "pending")
-  .sort((a, b) => a.phase_id.localeCompare(b.phase_id))[0];
+it("rejects new task and normative deliverable attachment to a completed phase", () => {
+  let state = emptyProjectState("PRJ-4203", "Phases", "phases");
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+    phase_id: "PHASE-4205", title: "Closed phase"
+  }));
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+    phase_id: "PHASE-4205"
+  }));
+
+  const task = applyTransaction(state, tx(state.project_id, state.revision, "task.create", {
+    task_id: "TASK-4201", title: "Too late", phase_id: "PHASE-4205"
+  }));
+  expect(task).toMatchObject({ kind: "rejected", code: "PHASE_COMPLETED" });
+
+  const deliverable = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
+    deliverable_id: "DEL-4201", title: "Too late", version: "v1", phase_id: "PHASE-4205"
+  }));
+  expect(deliverable).toMatchObject({ kind: "rejected", code: "PHASE_COMPLETED" });
+});
 ```
 
-- [ ] **Step 4: Add RED tests for completed-phase attachments**
+Run the focused file and verify this case fails because current create operations check phase existence but not completion.
 
-Add tests that first complete `PHASE-2401`, then attempt:
+- [ ] **Step 5: Implement completed-phase attachment rejection**
 
-```ts
-applyTransaction(state, tx(state.project_id, state.revision, "task.create", {
-  task_id: "TASK-2401", title: "Too late", phase_id: "PHASE-2401"
-}));
-```
-
-and:
-
-```ts
-applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
-  deliverable_id: "DEL-2401", title: "Too late", version: "v1", phase_id: "PHASE-2401"
-}));
-```
-
-Both must be `rejected` with `PHASE_COMPLETED`.
-
-Run the focused file and verify these new tests fail before production changes.
-
-- [ ] **Step 5: Reject new work attachment to completed phases**
-
-In `task.create`, replace the one-line phase existence check with:
+Replace the task phase check with:
 
 ```ts
 if (p.phase_id) {
   const phase = next.plan_phases[p.phase_id];
   if (!phase) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
-  if (phase.status === "completed") return rejected("PHASE_COMPLETED", `Completed phase ${p.phase_id} is terminal`);
+  if (phase.status === "completed") {
+    return rejected("PHASE_COMPLETED", `Completed phase ${p.phase_id} is terminal`);
+  }
 }
 ```
 
-Apply the same existence/completed check to normative `deliverable.create`.
+Use the same existence/completed logic in normative `deliverable.create` before decision validation.
 
-- [ ] **Step 6: Add deterministic progression and no-inferred-child-gate coverage**
+- [ ] **Step 6: Add progression and no-inferred-child-gate characterization**
 
-Add passing characterization cases that:
+Append:
 
-1. create active `PHASE-2403`, then pending `PHASE-2405`, then pending `PHASE-2404`;
-2. complete `PHASE-2403` and assert `PHASE-2404` is promoted first;
-3. complete the last active phase and assert `current_phase_id === null` when no pending phase remains;
-4. attach a still-pending task and planned deliverable to the current phase, complete the phase, and assert phase completion commits without fabricating child completion.
+```ts
+it("promotes the lexicographically lowest pending phase and clears current when none remain", () => {
+  let state = emptyProjectState("PRJ-4204", "Phases", "phases");
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+    phase_id: "PHASE-4210", title: "Current"
+  }));
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+    phase_id: "PHASE-4212", title: "Third"
+  }));
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+    phase_id: "PHASE-4211", title: "Second"
+  }));
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+    phase_id: "PHASE-4210"
+  }));
+  expect(state.current_phase_id).toBe("PHASE-4211");
+  expect(state.plan_phases["PHASE-4211"].status).toBe("active");
 
-- [ ] **Step 7: Verify GREEN**
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+    phase_id: "PHASE-4211"
+  }));
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+    phase_id: "PHASE-4212"
+  }));
+  expect(state.current_phase_id).toBeNull();
+});
 
-```bash
-npx vitest run test/model-phase-lifecycle.spec.ts test/operations.spec.ts
+it("does not fabricate child completion when the current phase completes", () => {
+  let state = emptyProjectState("PRJ-4205", "Phases", "phases");
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+    phase_id: "PHASE-4220", title: "Current"
+  }));
+  state = commit(state, tx(state.project_id, state.revision, "task.create", {
+    task_id: "TASK-4220", title: "Still pending", phase_id: "PHASE-4220"
+  }));
+  state = commit(state, tx(state.project_id, state.revision, "deliverable.create", {
+    deliverable_id: "DEL-4220", title: "Still planned", version: "v1", phase_id: "PHASE-4220"
+  }));
+  state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+    phase_id: "PHASE-4220"
+  }));
+  expect(state.tasks["TASK-4220"].status).toBe("pending");
+  expect(state.deliverables["DEL-4220"].status).toBe("planned");
+});
 ```
 
-Expected: PASS.
-
-- [ ] **Step 8: Commit the task**
+- [ ] **Step 7: Run GREEN and commit**
 
 ```bash
-git add src/domain/transitions.ts test/model-phase-lifecycle.spec.ts
+npx vitest run test/model-lifecycle-concurrency.spec.ts test/operations.spec.ts
+git add src/domain/transitions.ts test/model-lifecycle-concurrency.spec.ts
 git commit -m "feat: enforce MODEL001 phase invariants"
 ```
 
@@ -414,89 +541,93 @@ git commit -m "feat: enforce MODEL001 phase invariants"
 
 **Files:**
 - Modify: `src/domain/transitions.ts`
-- Modify: `test/operations.spec.ts`
+- Modify: `test/model-lifecycle-concurrency.spec.ts`
 
 **Interfaces:**
-- Consumes: `ProjectState.decisions[*].status` and `deliverable.create.payload.decision_ids`.
-- Produces: new normative deliverables can only claim governance from decisions currently in `accepted` state; superseded decisions remain historical but cannot newly govern.
+- Consumes: `decisions[decision_id].status` and `deliverable.create.payload.decision_ids`.
+- Produces: new normative deliverables reject superseded governing decisions while preserving historical decisions and existing deliverable relationships.
 
-- [ ] **Step 1: Write the failing superseded-decision reference test**
+- [ ] **Step 1: Add the failing governance reference test**
 
-Add to the deliverable lifecycle section:
+Append:
 
 ```ts
-it("rejects a superseded governing decision on new deliverables", () => {
-  let state = emptyProjectState("PRJ-2501", "Governance", "governance");
-  state = commit(state, tx(state.project_id, state.revision, "decision.accept", {
-    decision_id: "DEC-2501", title: "Old", decision: "Old rule", reason: "Initial", impacts: []
-  }));
-  state = commit(state, tx(state.project_id, state.revision, "decision.accept", {
-    decision_id: "DEC-2502", title: "New", decision: "New rule", reason: "Replacement", impacts: []
-  }));
-  state = commit(state, tx(state.project_id, state.revision, "decision.supersede", {
-    decision_id: "DEC-2501", replacement_decision_id: "DEC-2502", reason: "Replaced"
-  }));
+describe("MODEL001 governing references", () => {
+  it("rejects a superseded decision and accepts the current replacement for new deliverables", () => {
+    let state = emptyProjectState("PRJ-4301", "Governance", "governance");
+    state = commit(state, tx(state.project_id, state.revision, "decision.accept", {
+      decision_id: "DEC-4301", title: "Old", decision: "Old rule", reason: "Initial", impacts: []
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "decision.accept", {
+      decision_id: "DEC-4302", title: "New", decision: "New rule", reason: "Replacement", impacts: []
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "decision.supersede", {
+      decision_id: "DEC-4301", replacement_decision_id: "DEC-4302", reason: "Replaced"
+    }));
 
-  const rejected = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
-    deliverable_id: "DEL-2501", title: "Bad governance", version: "v1", decision_ids: ["DEC-2501"]
-  }));
-  expect(rejected).toMatchObject({ kind: "rejected", code: "DELIVERABLE_DECISION_NOT_ACCEPTED" });
+    const oldDecision = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-4301", title: "Old governance", version: "v1", decision_ids: ["DEC-4301"]
+    }));
+    expect(oldDecision).toMatchObject({ kind: "rejected", code: "DELIVERABLE_DECISION_NOT_ACCEPTED" });
 
-  const accepted = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
-    deliverable_id: "DEL-2502", title: "Current governance", version: "v1", decision_ids: ["DEC-2502"]
-  }));
-  expect(accepted.kind).toBe("commit");
+    const currentDecision = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-4302", title: "Current governance", version: "v1", decision_ids: ["DEC-4302"]
+    }));
+    expect(currentDecision.kind).toBe("commit");
+  });
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [ ] **Step 2: Run RED**
 
 ```bash
-npx vitest run test/operations.spec.ts
+npx vitest run test/model-lifecycle-concurrency.spec.ts
 ```
 
-Expected: the superseded-decision case currently commits because the runtime checks existence only.
+Expected: the superseded-decision deliverable currently commits because runtime checks existence only.
 
 - [ ] **Step 3: Implement accepted-status validation**
 
-In `deliverable.create`, replace the current decision loop with:
+In `deliverable.create`, use:
 
 ```ts
 for (const decisionId of p.decision_ids ?? []) {
   const decision = next.decisions[decisionId];
   if (!decision) return rejected("DECISION_NOT_FOUND", `Decision ${decisionId} does not exist`);
   if (decision.status !== "accepted") {
-    return rejected("DELIVERABLE_DECISION_NOT_ACCEPTED", `Deliverable requires accepted decision ${decisionId}`);
+    return rejected(
+      "DELIVERABLE_DECISION_NOT_ACCEPTED",
+      `Deliverable requires accepted decision ${decisionId}`
+    );
   }
 }
 ```
 
-Do not rewrite existing deliverables if a governing decision is superseded later.
+Do not rewrite any already-created deliverable if a governing decision is later superseded.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [ ] **Step 4: Run GREEN and commit**
 
 ```bash
-npx vitest run test/operations.spec.ts
-git add src/domain/transitions.ts test/operations.spec.ts
+npx vitest run test/model-lifecycle-concurrency.spec.ts test/operations.spec.ts
+git add src/domain/transitions.ts test/model-lifecycle-concurrency.spec.ts
 git commit -m "feat: require current governing decisions"
 ```
 
 ---
 
-### Task 5: Prove historical schema-1.0 compatibility remains reader-safe
+### Task 5: Prove historical schema-1.0 compatibility remains readable
 
 **Files:**
 - Modify: `test/project-state-normalizer.spec.ts`
-- Modify: `test/project-guard.spec.ts`
 - No production file expected.
 
 **Interfaces:**
-- Consumes: `normalizeProjectState`, ProjectGuard historical-state loading/materialization.
-- Produces: regression proof that MODEL001 does not turn historical lifecycle irregularities into reader failures or hidden migrations.
+- Consumes: `normalizeProjectState`.
+- Produces: regression proof that a structurally valid historical lifecycle combination remains readable without revision rewrite or hidden migration.
 
-- [ ] **Step 1: Add a normalizer compatibility case**
+- [ ] **Step 1: Add the compatibility case**
 
-Extend `test/project-state-normalizer.spec.ts` with a structurally valid historical state containing an archived project whose stored phase is still active/current:
+Append:
 
 ```ts
 it("keeps historical lifecycle combinations readable without rewriting revision", () => {
@@ -522,48 +653,38 @@ it("keeps historical lifecycle combinations readable without rewriting revision"
 });
 ```
 
-- [ ] **Step 2: Add a ProjectGuard materialization compatibility case**
-
-In `test/project-guard.spec.ts`, use `runInDurableObject` to store the same kind of schema-1.0 historical snapshot, call `materialize(projectId)`, and assert:
-
-```ts
-expect(result).toEqual({ project_id: projectId, revision: 7, materialized: true });
-```
-
-Then inspect generated `STATE.md` and assert it reflects revision 7 rather than creating a new business revision.
-
-- [ ] **Step 3: Run compatibility and recovery suites**
+- [ ] **Step 2: Run compatibility and existing recovery suites**
 
 ```bash
-npx vitest run test/project-state-normalizer.spec.ts test/project-guard.spec.ts test/project-guard-commit-recovery.spec.ts
+npx vitest run test/project-state-normalizer.spec.ts test/project-guard-commit-recovery.spec.ts
 ```
 
-Expected: PASS. If these tests require a production normalizer change, stop and re-evaluate against the no-hidden-migration design instead of strengthening the persisted-state parser casually.
+Expected: PASS without changing `src/domain/project-state-normalizer.ts`. If this step unexpectedly requires stricter parser changes, stop and re-evaluate against the approved no-hidden-migration contract.
 
-- [ ] **Step 4: Commit the compatibility tests**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add test/project-state-normalizer.spec.ts test/project-guard.spec.ts
+git add test/project-state-normalizer.spec.ts
 git commit -m "test: preserve MODEL001 historical compatibility"
 ```
 
 ---
 
-### Task 6: Verify concurrency semantics through ProjectGuard receipts
+### Task 6: Verify MODEL001 through ProjectGuard receipts
 
 **Files:**
 - Modify: `test/project-guard.spec.ts`
 
 **Interfaces:**
-- Consumes: Task 1 domain policy through the existing ProjectGuard transaction path.
-- Produces: receipt-level proof that stale lifecycle conflicts do not advance canonical revision, while stale additive creates still can.
+- Consumes: the domain policy through the existing ProjectGuard transaction route.
+- Produces: receipt-level proof that stale lifecycle conflicts do not advance revision and stale additive task creation still commits.
 
-- [ ] **Step 1: Add the ProjectGuard concurrency integration test**
+- [ ] **Step 1: Add the integration test**
 
-Add:
+Append inside `describe("ProjectGuard", ...)`:
 
 ```ts
-it("conflicts stale task lifecycle without advancing revision and still rebases additive work", async () => {
+it("conflicts stale task lifecycle without advancing revision and still rebases additive task creation", async () => {
   const projectId = "PRJ-1010";
   await submit(projectId, createTx(projectId, "TXN-PROJECT-1010-0001"));
 
@@ -578,7 +699,7 @@ it("conflicts stale task lifecycle without advancing revision and still rebases 
   });
   expect(task.new_revision).toBe(2);
 
-  const concurrent = await submit(projectId, {
+  const intervening = await submit(projectId, {
     schema_version: "1.0",
     transaction_id: "TXN-PROJECT-1010-0003",
     project_id: projectId,
@@ -587,7 +708,7 @@ it("conflicts stale task lifecycle without advancing revision and still rebases 
     created_at: at,
     payload: { research_id: "RES-1010", title: "Intervening", body: "Evidence" }
   });
-  expect(concurrent.new_revision).toBe(3);
+  expect(intervening.new_revision).toBe(3);
 
   const staleLifecycle = await submit(projectId, {
     schema_version: "1.0",
@@ -619,15 +740,15 @@ it("conflicts stale task lifecycle without advancing revision and still rebases 
 });
 ```
 
-- [ ] **Step 2: Run the integration test**
+- [ ] **Step 2: Run the ProjectGuard suite**
 
 ```bash
 npx vitest run test/project-guard.spec.ts
 ```
 
-Expected: PASS after Task 1. If it fails while pure transition tests pass, fix only the smallest ProjectGuard integration defect demonstrated by the failure; do not add a second concurrency coordinator.
+Expected: PASS. If pure transition tests pass but this integration fails, fix only the demonstrated ProjectGuard integration defect and do not introduce another concurrency coordinator.
 
-- [ ] **Step 3: Commit the integration proof**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add test/project-guard.spec.ts
@@ -636,7 +757,7 @@ git commit -m "test: prove MODEL001 receipt concurrency"
 
 ---
 
-### Task 7: Publish the formal domain contract in operational documentation
+### Task 7: Publish the formal domain contract
 
 **Files:**
 - Create: `docs/domain-model.md`
@@ -644,27 +765,27 @@ git commit -m "test: prove MODEL001 receipt concurrency"
 - Modify: `docs/deployment.md`
 
 **Interfaces:**
-- Consumes: implemented behavior from Tasks 1-6 and approved spec.
-- Produces: stable contract for operators and downstream PERSIST/INDEX packages.
+- Consumes: implemented behavior and approved spec.
+- Produces: stable operator/downstream contract for MODEL001, PERSIST001 and INDEX001.
 
-- [ ] **Step 1: Create `docs/domain-model.md` with the implemented rules**
+- [ ] **Step 1: Create `docs/domain-model.md`**
 
-The document must explicitly contain these sections and exact semantics:
+Use this complete core contract, expanding only with explanatory examples that do not change semantics:
 
 ```markdown
 # Project OS Domain Lifecycle and Concurrency Model
 
 ## Authority
-Canonical commit records are immutable history. `ProjectState` is the current aggregate reconstructed from that history. Markdown/materializations/indexes are derived and reconstructible.
+Canonical commit records are immutable history. `ProjectState` is the current aggregate reconstructed from that history. Markdown, materializations and indexes are derived and reconstructible.
 
 ## Concurrency
-A stale transaction may rebase only for `research.add`, `constraint.add`, `task.create`, and deprecated `deliverable.add`, after validation against current state. Every other operation requires the current project revision. Stale exact-current operations return `conflict` and create no business revision.
+A stale transaction may rebase only for `research.add`, `constraint.add`, `task.create`, and deprecated `deliverable.add`, after validation against current state. Every other operation requires the current project revision. A stale exact-current operation returns `conflict` and creates no business revision.
 
 ## Project lifecycle
 `active -> paused -> active`; `active|paused -> completed`; `active|paused|completed -> archived`; archived is terminal. Project completion does not infer child completion.
 
 ## Task lifecycle
-`pending -> active|blocked|completed`; `active -> blocked|completed`; `blocked -> active|blocked|completed`; completed is terminal. `blocked -> blocked` is an exact-current reason refresh.
+`pending -> active|blocked|completed`; `active -> blocked|completed`; `blocked -> active|blocked|completed`; completed is terminal. `blocked -> blocked` is an exact-current blocker-reason refresh.
 
 ## Phase lifecycle
 The first phase is active/current; later phases are pending. Only the single active `current_phase_id` may complete. The lexicographically lowest pending `phase_id` is promoted. New tasks and normative deliverables cannot attach to a completed phase. Phase completion does not fabricate child completion.
@@ -679,88 +800,68 @@ Normative lifecycle remains `planned -> in_progress -> review -> accepted`, with
 MODEL001 does not rewrite or reject structurally valid schema-1.0 historical snapshots merely because their stored lifecycle combination would no longer be newly created.
 
 ## Deferred schema capabilities
-Persisted dependency graphs, per-entity revisions, explicit phase ordering fields, research statuses, and other new durable relations remain deferred to IMP-SCHEMA001 or a separately approved package.
+Persisted dependency graphs, per-entity revisions, explicit phase-order fields, research statuses, and new durable relations remain deferred to IMP-SCHEMA001 or a separately approved package.
 ```
 
-- [ ] **Step 2: Update SOP concurrency/lifecycle sections**
+- [ ] **Step 2: Update SOP sections 13 and 15**
 
-In `docs/project-os-sop.md`, replace generic concurrency wording with the four-operation stale-rebase allow-list, exact-current rule, conflict semantics, one-current-phase invariant, and explicit task/deliverable attachment rules. Keep the existing project lifecycle table and add the no-inferred-child-completion clarification.
+In `docs/project-os-sop.md`, make the concurrency section enumerate the four stale-rebasable operations, state that all other operations are exact-current, distinguish conflict from business rejection, and add the one-current-phase/completed-phase-attachment rules. Keep the existing project lifecycle table and add that project/phase completion does not fabricate child completion.
 
-- [ ] **Step 3: Add MODEL001 production proof to deployment documentation**
+- [ ] **Step 3: Add MODEL001 production proof requirements to deployment docs**
 
-In `docs/deployment.md`, add a dedicated `IMP-MODEL001` production-proof subsection requiring:
+In `docs/deployment.md`, add a dedicated MODEL001 subsection requiring exact merge SHA, `npm run check`, `npx wrangler deploy --dry-run`, production health, continuity `stable`, MutationGate `observe`, current lifecycle success, stale lifecycle conflict with no revision increment, stale additive commit, existing-project read/recovery, and explicit absence of PRJ-0003 repair/SCHEMA runtime.
 
-- exact merge SHA deployment;
-- `npm run check` and `npx wrangler deploy --dry-run` on the exact implementation head;
-- health success;
-- continuity `stable`;
-- MutationGate `observe`;
-- controlled current lifecycle success;
-- stale lifecycle conflict with no revision increment;
-- stale additive commit after current-state revalidation;
-- existing project read/recovery check;
-- no PRJ-0003 repair and no SCHEMA runtime.
-
-- [ ] **Step 4: Run documentation-sensitive regression tests**
+- [ ] **Step 4: Run documentation-sensitive tests and commit**
 
 ```bash
 npx vitest run test/render.spec.ts test/rich-render.spec.ts test/v2-boundaries.spec.ts
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Commit documentation**
-
-```bash
 git add docs/domain-model.md docs/project-os-sop.md docs/deployment.md
 git commit -m "docs: formalize Project OS domain model"
 ```
 
 ---
 
-### Task 8: Run exact-head pre-merge verification and open the runtime PR
+### Task 8: Run exact-head pre-merge verification and open a separate runtime PR
 
 **Files:**
-- Verification only; no new behavior unless a failing gate requires a TDD fix.
+- Verification only unless a gate exposes a defect requiring a new RED/GREEN cycle.
 
 **Interfaces:**
-- Consumes: final implementation branch head from Tasks 1-7.
-- Produces: reproducible exact-head evidence and a runtime PR ready for human review.
+- Consumes: final implementation branch head.
+- Produces: fresh exact-head evidence and an implementation PR ready for human review.
 
-- [ ] **Step 1: Run the focused MODEL001 suites**
+- [ ] **Step 1: Run focused MODEL001 tests**
 
 ```bash
 npx vitest run \
+  test/model-lifecycle-concurrency.spec.ts \
   test/transitions.spec.ts \
   test/operations.spec.ts \
-  test/model-phase-lifecycle.spec.ts \
   test/project-state-normalizer.spec.ts \
   test/project-guard.spec.ts \
   test/project-guard-commit-recovery.spec.ts
 ```
 
-Expected: PASS with zero failures.
-
-- [ ] **Step 2: Run the complete repository gate**
+- [ ] **Step 2: Run the full repository gate**
 
 ```bash
 npm install
 npm run check
 ```
 
-Expected: `wrangler types`, TypeScript typecheck and the complete Vitest suite all exit 0.
+Require exit 0 for Wrangler types, TypeScript typecheck and the complete Vitest suite.
 
-- [ ] **Step 3: Run the exact-head Worker dry-run**
+- [ ] **Step 3: Run Worker dry-run**
 
 ```bash
 npx wrangler deploy --dry-run
 ```
 
-Expected: exit 0 with no production deployment.
+Require exit 0 and no production deployment.
 
-- [ ] **Step 4: Verify forbidden drift is absent**
+- [ ] **Step 4: Verify forbidden drift is absent on the exact head**
 
-Inspect the final diff and confirm:
+Confirm the diff has these properties:
 
 ```text
 src/domain/project-state.ts        unchanged
@@ -768,35 +869,25 @@ src/domain/transaction.ts          unchanged
 wrangler.jsonc                     unchanged
 PROJECT_OS_CONTINUITY_MODE         stable
 PROJECT_OS_MUTATION_GATE_MODE      observe
-no PRJ-0003 files                  touched
-no SCHEMA runtime                  added
+PRJ-0003 business/provider files   untouched
+IMP-SCHEMA001 runtime              absent
 ```
 
 - [ ] **Step 5: Apply verification-before-completion discipline**
 
-Re-run any gate whose evidence is stale after the last commit. Do not claim tests/build/dry-run pass from an earlier head.
+If any commit occurs after Steps 1-4, rerun the affected focused tests, `npm run check`, and dry-run on the new exact head before making a success claim or opening the PR.
 
-- [ ] **Step 6: Open a separate implementation PR**
+- [ ] **Step 6: Open the implementation PR**
 
-Open the runtime PR from `imp/model001-lifecycle-concurrency` to `main` with:
+Open `imp/model001-lifecycle-concurrency` -> `main` and include approved spec/plan paths, exact base/head SHAs, observed RED/GREEN evidence, focused/full test results, dry-run result, schema/MutationGate/PRJ-0003 boundaries, and rollback statement `code rollback only; canonical history is never rewritten`.
 
-- approved spec and plan links;
-- exact base/head SHAs;
-- RED/GREEN evidence summary;
-- focused and full test results;
-- dry-run result;
-- explicit schema/MutationGate/PRJ-0003 boundaries;
-- rollback statement: code rollback only, no history rewrite.
-
-Do **not** merge or deploy in this task.
+Do not merge or deploy in this task.
 
 ---
 
 ## Gate 1: Explicit runtime merge/deployment approval
 
-After Task 8, present the exact implementation PR head, changed files, test counts/results, dry-run result, and any review findings to the user.
-
-The next authorization must explicitly cover runtime PR merge and production deployment. Until that approval exists:
+Present the exact implementation PR head, changed files, fresh test results, dry-run result and review findings. The next authorization must explicitly cover runtime PR merge and production deployment. Until then:
 
 ```text
 NO runtime PR merge
@@ -811,147 +902,139 @@ NO SCHEMA runtime
 ### Task 9: Merge the exact reviewed runtime head and validate deployment
 
 **Files:**
-- No source edits expected after approval; if code changes are required, return to Task 8 verification on the new head.
+- No source edit is expected after approval. If the PR head changes, return to Task 8 verification before merge.
 
 **Interfaces:**
 - Consumes: explicitly approved runtime PR head.
-- Produces: exact merge SHA, successful main deployment evidence, production health evidence.
+- Produces: exact merge SHA, successful main deployment evidence and production health evidence.
 
-- [ ] **Step 1: Reconfirm the PR head did not change after approval**
+- [ ] **Step 1: Reconfirm approved PR head identity**
 
-Compare the approved head SHA to the current PR head. If different, stop and re-run Task 8 before merge.
+Compare the user-approved head SHA to the current PR head and stop if they differ.
 
-- [ ] **Step 2: Merge the runtime PR and record the exact merge SHA**
+- [ ] **Step 2: Merge and record exact merge SHA**
 
-Do not infer deployment from merge status alone.
+Merge only the reviewed head. Record the merge SHA; do not infer deployment from merge status.
 
-- [ ] **Step 3: Verify the deployment workflow for that exact SHA**
+- [ ] **Step 3: Verify deployment workflow for that SHA**
 
-Confirm checkout, credentials check, Node setup, install, `npm run check`, Worker deploy, health check and deployment-status publication all succeed for the exact merge commit.
+Confirm checkout, credentials check, Node setup, dependency install, `npm run check`, Worker deploy, production health check and deployment-status publication succeed for the exact merge commit.
 
-- [ ] **Step 4: Verify production health and configuration boundary**
+- [ ] **Step 4: Verify production boundary**
 
-Verify `/health` succeeds and production remains aligned with:
+Verify `/health` succeeds and deployed configuration remains consistent with:
 
 ```text
 PROJECT_OS_CONTINUITY_MODE=stable
 PROJECT_OS_MUTATION_GATE_MODE=observe
 ```
 
-No MODEL001 production gate may switch MutationGate to enforce.
-
 ---
 
-### Task 10: Run an isolated production behavior proof
+### Task 10: Run isolated production behavior proof
 
 **Files:**
-- No repository source edits.
-- Durable test evidence: one explicitly named isolated Project OS probe project, created only under the runtime deployment approval gate and archived at the end.
+- No repository source edit.
+- Durable test evidence: one isolated production probe project created under the explicit runtime deployment approval gate and archived at the end.
 
 **Interfaces:**
 - Consumes: deployed exact MODEL001 merge SHA.
-- Produces: receipts proving current lifecycle success, stale lifecycle conflict, stale additive commit, and terminal archival without touching PRJ-0003.
+- Produces: receipt evidence for current lifecycle success, stale lifecycle conflict, stale additive commit and final archival without touching PRJ-0003.
 
-- [ ] **Step 1: Create one isolated production probe project**
+- [ ] **Step 1: Create isolated project**
 
-Use normal typed `project.create` with `project_id: "PRJ-AUTO"`, name `MODEL001 production probe`, slug `model001-production-probe`, and objective `Validate MODEL001 lifecycle and concurrency semantics in production without using a business project.` Record the allocated PRJ ID and committed revision 1.
+Submit typed `project.create` with `project_id: "PRJ-AUTO"`, name `MODEL001 production probe`, slug `model001-production-probe`, aliases `[]`, objective `Validate MODEL001 lifecycle and concurrency semantics in production without using a business project.` Require committed revision 1 and record the allocated PRJ ID.
 
-- [ ] **Step 2: Create the lifecycle target at revision 1**
+- [ ] **Step 2: Create lifecycle target**
 
-Submit `task.create` for `TASK-MODELPROBE001` at base revision 1. Require a committed receipt to revision 2.
+At base revision 1, create `TASK-MODELPROBE001` titled `MODEL001 lifecycle target`. Require committed revision 2.
 
-- [ ] **Step 3: Create an intervening additive commit**
+- [ ] **Step 3: Create intervening evidence**
 
-Submit `research.add` for `RES-MODELPROBE001` at base revision 2 with body `Synthetic MODEL001 production probe evidence only; not business research.` Require a committed receipt to revision 3.
+At base revision 2, add `RES-MODELPROBE001` titled `MODEL001 synthetic production probe` with body `Synthetic MODEL001 production probe evidence only; not business research.` Require committed revision 3.
 
-- [ ] **Step 4: Prove stale lifecycle conflict without revision advance**
+- [ ] **Step 4: Prove stale lifecycle conflict**
 
-Submit `task.start` for `TASK-MODELPROBE001` using stale `base_revision: 2`. Require:
+Submit a fresh `task.start` transaction for `TASK-MODELPROBE001` with stale `base_revision: 2`. Require:
 
 ```text
 status=conflict
 code=STALE_REVISION
 new_revision=3
-no event_id
+event_id absent
 ```
 
-Refresh state and verify the project remains revision 3 and the task remains pending.
+Refresh canonical state and verify revision remains 3 and `TASK-MODELPROBE001` remains pending.
 
 - [ ] **Step 5: Prove exact-current lifecycle success**
 
-Submit the same semantic `task.start` as a fresh transaction at base revision 3. Require committed revision 4 and task status `active`.
+Submit a new `task.start` transaction at base revision 3. Require committed revision 4 and task status `active`.
 
-- [ ] **Step 6: Prove stale additive task creation still rebases**
+- [ ] **Step 6: Prove stale additive create still rebases**
 
 Submit `task.create` for unique `TASK-MODELPROBE002` using stale `base_revision: 2` while canonical state is revision 4. Require committed revision 5.
 
-- [ ] **Step 7: Close probe tasks and archive the probe project**
+- [ ] **Step 7: Close and archive the probe**
 
-Complete `TASK-MODELPROBE001` at revision 5 -> 6, complete `TASK-MODELPROBE002` at revision 6 -> 7, then archive the probe project at revision 7 -> 8 with reason `MODEL001 production proof completed`.
+Complete `TASK-MODELPROBE001` at base 5 -> revision 6; complete `TASK-MODELPROBE002` at base 6 -> revision 7; archive the probe project at base 7 -> revision 8 with reason `MODEL001 production proof completed`.
 
-- [ ] **Step 8: Verify existing projects remain readable without mutation**
+- [ ] **Step 8: Verify existing-project readability without mutation**
 
-Read PRJ-0002 canonical state and one existing historical project state through normal read paths. Do not write, repair, adopt, reject or otherwise modify PRJ-0003.
+Read PRJ-0002 canonical state and one historical schema-1.0 project through normal read paths. PRJ-0003 may be read only if needed for compatibility evidence; do not write, repair, adopt, reject, move or overwrite anything in PRJ-0003.
 
-- [ ] **Step 9: Record exact production proof evidence**
+- [ ] **Step 9: Capture proof evidence**
 
-Capture the deployment merge SHA, deployment workflow/run evidence, health result, probe project ID, committed/conflict receipt IDs and final archived revision. Do not include secret values.
+Record exact merge SHA, deployment workflow/run evidence, health result, probe project ID, every committed/conflict transaction ID and final archived revision. Record secret names only, never secret values.
 
 ---
 
-### Task 11: Canonically close MODEL001 and revalidate the downstream roadmap
+### Task 11: Canonically close MODEL001 and revalidate downstream roadmap
 
 **Files:**
-- Project OS typed transactions only for canonical closure.
-- Read-only revalidation: `docs/project-os-improvement-roadmap.md` and current downstream package docs.
+- Project OS typed transactions for canonical closure.
+- Read-only dependency revalidation against current `docs/project-os-improvement-roadmap.md` and current downstream package documents.
 
 **Interfaces:**
-- Consumes: exact production deployment/probe evidence from Tasks 9-10.
-- Produces: canonical implementation research, completed `TASK-IMPMODEL001`, and an explicit downstream dependency conclusion for `IMP-PERSIST001`.
+- Consumes: Tasks 9-10 exact production evidence.
+- Produces: `RES-IMPMODELIMPL001`, completed `TASK-IMPMODEL001`, and a fresh dependency conclusion for `IMP-PERSIST001`.
 
 - [ ] **Step 1: Refresh PRJ-0002 current revision**
 
-Never use a remembered base revision after production work.
+Use canonical structured state, not remembered chat revision.
 
-- [ ] **Step 2: Add canonical implementation/production evidence**
+- [ ] **Step 2: Add canonical implementation/production research**
 
-Create `RES-IMPMODELIMPL001` via `research.add`. Its body must state the implemented semantics, exact runtime PR number/head, exact merge SHA, focused/full verification results, Wrangler dry-run result, production deploy/health evidence, isolated probe project ID and receipt outcomes, continuity `stable`, MutationGate `observe`, and explicit confirmation that PRJ-0003 repair and SCHEMA runtime did not occur.
+Submit `research.add` for `RES-IMPMODELIMPL001`. Its body must include the implemented semantics, exact runtime PR number/head, exact merge SHA, focused/full verification results, Wrangler dry-run result, deployment/health evidence, probe project ID and receipt outcomes, continuity `stable`, MutationGate `observe`, and explicit confirmation that PRJ-0003 repair and SCHEMA runtime did not occur. Its `source` must cite exact GitHub/deployment evidence rather than this conversation.
 
-Its `source` must cite the exact GitHub implementation PR/merge and deployment evidence, not this chat.
+Continue only after its receipt is `committed`.
 
-- [ ] **Step 3: Complete `TASK-IMPMODEL001` only after the research receipt commits**
+- [ ] **Step 3: Complete `TASK-IMPMODEL001`**
 
-Use a fresh `task.complete` transaction with a result equivalent to:
+Submit `task.complete` at the refreshed current revision with this result text:
 
 ```text
 IMP-MODEL001 implemented, fully verified, merged and production-validated on the exact recorded commit. Formal lifecycle/concurrency semantics are active without a ProjectState schema bump; historical schema-1.0 compatibility is preserved; MutationGate remains observe; PRJ-0003 repair and SCHEMA runtime were not performed.
 ```
 
-Require `status=committed`.
+Require a committed receipt.
 
-- [ ] **Step 4: Re-read canonical HANDOFF/STATE and downstream roadmap**
+- [ ] **Step 4: Refresh HANDOFF/STATE and revalidate PERSIST001**
 
-Confirm MODEL001 is completed canonically. Revalidate `IMP-PERSIST001` against the exact new main rather than assuming the old roadmap analysis still holds.
-
-- [ ] **Step 5: Continue only with genuinely independent downstream work**
-
-If PERSIST001 remains independent of MutationGate/SCHEMA validation, begin its analysis/design gate next. Keep SCHEMA-dependent subsets isolated and keep MutationGate enforcement/PRJ-0003 repair on their separate gates.
+Confirm MODEL001 is canonically completed, then compare `IMP-PERSIST001` assumptions to the exact new `main`. If PERSIST001 remains independent of the still-separate MutationGate/SCHEMA gates, begin its analysis/design package next. Keep any genuine SCHEMA-dependent subset isolated.
 
 ---
 
-## Self-review checklist for this plan
+## Plan self-review result
 
-Before presenting this plan for user approval, verify:
-
-- Every approved MODEL001 design requirement maps to at least one task above.
-- There is no `TBD`, `TODO`, placeholder implementation, hidden schema change, or unspecified error handling.
-- The concurrency helper is fail closed: only four operations are stale-rebasable.
-- Task lifecycle preserves direct completion and exact-current blocked-reason refresh.
-- Phase completion cannot close pending/non-current phases and cannot leave a known second active phase.
-- New task/deliverable attachment to a completed phase is rejected.
-- Superseded decisions remain historical but cannot newly govern a deliverable.
-- Historical normalizer/recovery compatibility remains unchanged.
+- Every approved MODEL001 requirement maps to a concrete task above.
+- Every behavior-changing production edit has an explicit failing test first.
+- The concurrency policy fails closed: only four operations are stale-rebasable.
+- Direct task completion and exact-current blocker-reason refresh are preserved.
+- Pending/non-current phase completion is rejected; known multiple-active phase state fails closed.
+- Completed phases reject new task and normative deliverable attachment.
+- Phase/project closure does not fabricate child completion.
+- Superseded decisions stay in history but cannot newly govern a deliverable.
+- Historical schema-1.0 reader compatibility is protected without parser/schema tightening.
 - ProjectGuard serialization is reused rather than replaced.
-- Pre-merge tests/dry-run and post-merge production proof are distinct gates.
-- Plan approval does not itself authorize runtime merge/deployment.
-- MutationGate remains observe; no PRJ-0003 repair and no SCHEMA runtime are included.
+- Pre-merge verification, runtime merge/deployment approval, production proof and canonical closure are distinct gates.
+- MutationGate remains observe; PRJ-0003 repair and SCHEMA runtime remain outside this plan.

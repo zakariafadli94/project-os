@@ -1,5 +1,6 @@
 import type { DomainEvent } from "./event";
 import { eventIdForRevision } from "./event";
+import { mayRebaseStaleOperation } from "./concurrency-policy";
 import type { ProjectState } from "./project-state";
 import type { Transaction } from "./transaction";
 
@@ -83,28 +84,6 @@ function commit(state: ProjectState, tx: Transaction): TransitionResult {
   return { kind: "commit", state: next, event };
 }
 
-const exactRevisionOperations = new Set<Transaction["operation"]>([
-  "project.pause",
-  "project.resume",
-  "project.complete",
-  "project.archive",
-  "project.framing.update",
-  "artifact.route.configure",
-  "decision.accept",
-  "decision.supersede",
-  "plan.phase.create",
-  "plan.phase.update",
-  "plan.phase.complete",
-  "discovery.synthesis.update",
-  "deliverable.create",
-  "deliverable.start",
-  "deliverable.revise",
-  "deliverable.submit_review",
-  "deliverable.accept",
-  "deliverable.supersede",
-  "deliverable.abandon"
-]);
-
 export function applyTransaction(state: ProjectState | null, tx: Transaction): TransitionResult {
   if (tx.operation === "project.create") {
     if (state !== null) return rejected("PROJECT_EXISTS", "Project already exists");
@@ -130,7 +109,7 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
   }
 
   const stale = tx.base_revision !== state.revision;
-  if (stale && exactRevisionOperations.has(tx.operation)) {
+  if (stale && !mayRebaseStaleOperation(tx.operation)) {
     return conflict("STALE_REVISION", `${tx.operation} requires the current project revision`);
   }
 

@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ArtifactWriteReceipt } from "../src/domain/artifact-write";
 import type { Receipt } from "../src/domain/receipt";
+import { emptyProjectState } from "../src/domain/transitions";
 import type { Env } from "../src/env";
 import { DropboxClient } from "../src/dropbox/client";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
@@ -167,22 +168,8 @@ describe("MutationGate candidates", () => {
 
 function createdState(projectId: string, slug: string) {
   return {
-    schema_version: "1.0" as const,
-    project_id: projectId,
-    name: slug,
-    slug,
-    aliases: [],
-    objective: "Mutation gate candidate test",
-    status: "active" as const,
+    ...emptyProjectState(projectId, slug, slug, "Mutation gate candidate test"),
     revision: 1,
-    phases: {},
-    tasks: {},
-    decisions: {},
-    research: {},
-    deliverables: {},
-    constraints: {},
-    risks: {},
-    artifact_routes: {},
     created_at: at,
     updated_at: at
   };

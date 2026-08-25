@@ -1,4 +1,5 @@
 import type { ArtifactWriteReceipt } from "../domain/artifact-write";
+import { documentIdFor } from "../domain/managed-document";
 import type {
   MutationCandidateAdoptArtifactRequest,
   MutationCandidateAdoptWorkingRequest,
@@ -68,7 +69,17 @@ export class MutationCandidateResolutionService {
     const existing = resolutions.at(-1);
     if (existing) {
       if (existing.resolution_id === request.resolution_id && existing.action === actionFor(request)) {
-        return receiptFromRecord(existing);
+        const replay = receiptFromRecord(existing);
+        if (request.operation === "candidate.adopt_working") {
+          if (request.document_request.operation !== "working.write") {
+            throw new Error("Parsed candidate working adoption violated working.write invariant");
+          }
+          return {
+            ...replay,
+            document_id: await documentIdFor(request.project_id, request.document_request.logical_path)
+          };
+        }
+        return replay;
       }
       return terminal(request, "conflict", "CANDIDATE_ALREADY_RESOLVED", "Mutation candidate already has a terminal resolution");
     }

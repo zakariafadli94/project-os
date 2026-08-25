@@ -100,3 +100,65 @@ describe("MODEL001 concurrency", () => {
     })).kind).toBe("commit");
   });
 });
+
+describe("MODEL001 task lifecycle", () => {
+  it("allows pending to complete without mandatory start", () => {
+    let state = emptyProjectState("PRJ-4101", "Tasks", "tasks");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4101", title: "Direct completion"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4101", result: "Done naturally"
+    }));
+    expect(state.tasks["TASK-4101"]).toMatchObject({ status: "completed", result: "Done naturally" });
+  });
+
+  it("supports blocked reason refresh, resume, active block and blocked completion", () => {
+    let state = emptyProjectState("PRJ-4102", "Tasks", "tasks");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4102", title: "Recoverable"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4102", reason: "First blocker"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4102", reason: "Updated blocker"
+    }));
+    expect(state.tasks["TASK-4102"].blocked_reason).toBe("Updated blocker");
+
+    state = commit(state, tx(state.project_id, state.revision, "task.start", {
+      task_id: "TASK-4102"
+    }));
+    expect(state.tasks["TASK-4102"]).toMatchObject({ status: "active" });
+    expect(state.tasks["TASK-4102"].blocked_reason).toBeUndefined();
+
+    state = commit(state, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4102", reason: "Second blocker"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4102"
+    }));
+    expect(state.tasks["TASK-4102"].status).toBe("completed");
+    expect(state.tasks["TASK-4102"].blocked_reason).toBeUndefined();
+  });
+
+  it("keeps completed tasks terminal", () => {
+    let state = emptyProjectState("PRJ-4103", "Tasks", "tasks");
+    state = commit(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4103", title: "Terminal"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4103"
+    }));
+
+    expect(applyTransaction(state, tx(state.project_id, state.revision, "task.start", {
+      task_id: "TASK-4103"
+    })).kind).toBe("rejected");
+    expect(applyTransaction(state, tx(state.project_id, state.revision, "task.block", {
+      task_id: "TASK-4103", reason: "No"
+    })).kind).toBe("rejected");
+    expect(applyTransaction(state, tx(state.project_id, state.revision, "task.complete", {
+      task_id: "TASK-4103"
+    })).kind).toBe("rejected");
+  });
+});

@@ -23,6 +23,10 @@ class FakeArtifactIntentDropbox implements DropboxTransport {
     return this.files.get(path) ?? null;
   }
 
+  async getMetadata(): Promise<null> {
+    return null;
+  }
+
   async move(): Promise<void> {
     throw new Error("unused");
   }
@@ -77,20 +81,22 @@ function stateAfterRoute() {
 }
 
 describe("ArtifactMutationIntentService", () => {
-  it("freezes the resolved provider destination across route drift", async () => {
+  it("freezes the resolved provider destination and absent precondition across route drift", async () => {
     const transport = new FakeArtifactIntentDropbox();
     const gate = new MutationGateRepository(transport);
-    const service = new ArtifactMutationIntentService(gate);
+    const service = new ArtifactMutationIntentService(gate, transport);
     const artifact = await request();
 
     const first = await service.prepare(stateBeforeRoute(), artifact);
     expect(first.destination.path).toBe(
       "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/REVENUE-OS/foo.md"
     );
+    expect(first.intent.provider_precondition).toEqual({ kind: "absent" });
     await transport.upload(first.destination.path, artifact.content, "add");
 
     const replay = await service.prepare(stateAfterRoute(), artifact);
     expect(replay.destination.path).toBe(first.destination.path);
+    expect(replay.intent.provider_precondition).toEqual({ kind: "absent" });
 
     const repository = new ProjectRepository(transport, "v2");
     expect(await repository.writeArtifact(stateAfterRoute(), artifact, replay.destination)).toBe("idempotent");
@@ -100,7 +106,7 @@ describe("ArtifactMutationIntentService", () => {
   it("rejects exact request-id replay when durable intent binds different request JSON", async () => {
     const transport = new FakeArtifactIntentDropbox();
     const gate = new MutationGateRepository(transport);
-    const service = new ArtifactMutationIntentService(gate);
+    const service = new ArtifactMutationIntentService(gate, transport);
     const artifact = await request();
     await service.prepare(stateBeforeRoute(), artifact);
 

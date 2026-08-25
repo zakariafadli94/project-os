@@ -93,12 +93,19 @@ export class MutationCandidateResolutionService {
       return terminal(request, "rejected", "CANDIDATE_CONTENT_UNSUPPORTED", "Mutation candidate payload is not supported by the current text adoption API");
     }
 
-    const nestedContent = request.operation === "candidate.adopt_artifact"
-      ? request.artifact_request.content
-      : request.document_request.content;
-    const nestedSha = request.operation === "candidate.adopt_artifact"
-      ? request.artifact_request.content_sha256
-      : request.document_request.content_sha256;
+    let nestedContent: string;
+    let nestedSha: string;
+    if (request.operation === "candidate.adopt_artifact") {
+      nestedContent = request.artifact_request.content;
+      nestedSha = request.artifact_request.content_sha256;
+    } else {
+      if (request.document_request.operation !== "working.write") {
+        throw new Error("Parsed candidate working adoption violated working.write invariant");
+      }
+      nestedContent = request.document_request.content;
+      nestedSha = request.document_request.content_sha256;
+    }
+
     const payloadSha = await sha256Text(payload);
     if (nestedContent !== payload || nestedSha !== payloadSha) {
       return terminal(request, "conflict", "CANDIDATE_CONTENT_MISMATCH", "Nested governed request does not exactly match immutable candidate content");
@@ -128,13 +135,14 @@ export class MutationCandidateResolutionService {
       };
     }
 
+    const downstreamId = downstream.request_id ?? downstreamRequestId(request);
     const record = await this.repository.writeResolution({
       schema_version: "1.0",
       resolution_id: request.resolution_id,
       project_id: request.project_id,
       candidate_id: request.candidate_id,
       action: actionFor(request),
-      downstream_request_id: downstream.request_id ?? downstreamRequestId(request),
+      ...(downstreamId ? { downstream_request_id: downstreamId } : {}),
       downstream_receipt_status: "committed",
       resolved_at: new Date().toISOString()
     });

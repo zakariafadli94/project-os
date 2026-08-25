@@ -87,4 +87,16 @@ describe("MutationGate artifact verification state", () => {
       receipt_status: "committed"
     });
   });
+
+  it("fails closed when a committed receipt relative_path does not match the request frozen in the durable intent", async () => {
+    const { transport, request, prepared, service, receipt } = await fixture();
+    await transport.upload(prepared.destination.path, request.content);
+    await transport.upload(machineArtifactReceiptPath(request.request_id), JSON.stringify({
+      ...receipt,
+      relative_path: "status/forged.md"
+    }));
+
+    await expect(service.artifactStatus(request.project_id, request.request_id))
+      .rejects.toThrow(`Artifact receipt does not match durable mutation intent: ${request.request_id}`);
+  });
 });

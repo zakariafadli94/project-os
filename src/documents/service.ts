@@ -261,7 +261,66 @@ export class ManagedDocumentService {
     const review = await this.requireVersion(request.project_id, request.document_id, head.review_version_id);
     const reviewPath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);
     const publishedPath = workspaceManagedDocumentPath(state.project_id, state.slug, "deliverables", head.logical_path);
-    await this.assertProviderStillMatches(reviewPath, review, head.provider?.review, request.document_id);
+
+    const persistPublished = async (metadata: DropboxFileMetadata): Promise<ManagedDocumentReceipt> => {
+      const record = versionFromParent(review, {
+        version_id: versionId,
+        parent_version_id: review.version_id,
+        stage: "published",
+        source: "project_os",
+        created_at: request.created_at,
+        provider_content_hash: metadata.content_hash,
+        provider_file_id: metadata.id,
+        provider_rev: metadata.rev,
+        provider_path: publishedPath,
+        size: metadata.size,
+        request_id: request.request_id
+      });
+      await this.ledger.writeVersion(record);
+      await this.ledger.writeHead({
+        ...head,
+        working_version_id: undefined,
+        review_version_id: undefined,
+        published_version_id: versionId,
+        provider: compactProviderState({
+          ...head.provider,
+          working: undefined,
+          review: undefined,
+          published: providerObservation(metadata, publishedPath)
+        }),
+        reconciliation_status: "clean"
+      });
+      return receiptFor(request.request_id, record);
+    };
+
+    if (!this.transport.getMetadata) throw new Error("Dropbox transport does not support managed-document metadata");
+    const visibleReview = await this.transport.getMetadata(reviewPath);
+    if (!visibleReview) {
+      const visiblePublished = await this.transport.getMetadata(publishedPath);
+      if (
+        visiblePublished
+        && review.provider_content_hash
+        && review.size !== undefined
+        && visiblePublished.content_hash === review.provider_content_hash
+        && visiblePublished.size === review.size
+      ) {
+        return persistPublished(visiblePublished);
+      }
+      throw new ManagedDocumentConflictError(
+        "REVIEW_CONTENT_MISSING",
+        "Review candidate is missing and the published deliverable does not prove the expected interrupted publication",
+        request.document_id
+      );
+    }
+
+    const expectedReviewRev = head.provider?.review?.rev ?? review.provider_rev;
+    if (!expectedReviewRev || visibleReview.rev !== expectedReviewRev) {
+      throw new ManagedDocumentConflictError(
+        "PROVIDER_VERSION_CHANGED",
+        `Managed document visible file changed outside Project OS: ${reviewPath}`,
+        request.document_id
+      );
+    }
 
     let metadata: DropboxFileMetadata;
     if (head.published_version_id) {
@@ -294,34 +353,7 @@ export class ManagedDocumentService {
       metadata = await this.requireMetadata(publishedPath);
     }
 
-    const record = versionFromParent(review, {
-      version_id: versionId,
-      parent_version_id: review.version_id,
-      stage: "published",
-      source: "project_os",
-      created_at: request.created_at,
-      provider_content_hash: metadata.content_hash,
-      provider_file_id: metadata.id,
-      provider_rev: metadata.rev,
-      provider_path: publishedPath,
-      size: metadata.size,
-      request_id: request.request_id
-    });
-    await this.ledger.writeVersion(record);
-    await this.ledger.writeHead({
-      ...head,
-      working_version_id: undefined,
-      review_version_id: undefined,
-      published_version_id: versionId,
-      provider: compactProviderState({
-        ...head.provider,
-        working: undefined,
-        review: undefined,
-        published: providerObservation(metadata, publishedPath)
-      }),
-      reconciliation_status: "clean"
-    });
-    return receiptFor(request.request_id, record);
+    return persistPublished(metadata);
   }
 
   async reopenPublished(request: ManagedLifecycleRequest, state: ProjectState): Promise<ManagedDocumentReceipt> {

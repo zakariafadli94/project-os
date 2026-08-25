@@ -131,8 +131,8 @@ describe("managed document crash recovery", () => {
       endpoint: "/2/files/upload",
       path: versionPath,
       occurrence: 1,
-      status: 503,
-      error_summary: "injected/version_write_after_provider_cas"
+      status: 409,
+      error_summary: "path/conflict/file/injected_version_write_after_provider_cas"
     });
 
     const publishBody = {
@@ -147,7 +147,7 @@ describe("managed document crash recovery", () => {
     try {
       await documentCall(guard, publishBody);
     } catch {
-      // The injected transport failure is expected to escape the first attempt.
+      // The injected non-retryable ledger failure is expected to escape the first attempt.
     }
 
     const publishedPath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-managed-fault/DELIVERABLES/strategy/commercial.md`;

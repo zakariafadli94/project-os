@@ -51,10 +51,6 @@ export class ManagedDocumentReconciler {
     }
 
     for (const change of changes) {
-      if (change.tag !== "file") {
-        summary.ignored += 1;
-        continue;
-      }
       const classified = classifyManagedPath(state, change.path);
       if (!classified) {
         summary.ignored += 1;
@@ -64,6 +60,26 @@ export class ManagedDocumentReconciler {
         summary.ignored += 1;
         continue;
       }
+
+      if (change.tag === "deleted") {
+        if (classified.zone === "working" || classified.zone === "review" || classified.zone === "deliverables") {
+          const restored = await this.restoreDeletedWorkProduct(
+            state,
+            classified.zone,
+            classified.relativePath,
+            change.path
+          );
+          summary.restored += restored ? 1 : 0;
+          summary.ignored += restored ? 0 : 1;
+        } else {
+          // INPUTS deletion is a legitimate withdrawal. REFERENCES deletion currently
+          // lacks a provider file id in Dropbox DeletedMetadata, so it remains visible
+          // to higher-level recovery instead of guessing an identity from its path.
+          summary.ignored += 1;
+        }
+        continue;
+      }
+
       const metadata = await this.metadataFor(change);
       if (!metadata) {
         summary.ignored += 1;
@@ -102,6 +118,40 @@ export class ManagedDocumentReconciler {
       else summary.ignored += 1;
     }
     return summary;
+  }
+
+  private async restoreDeletedWorkProduct(
+    state: ProjectState,
+    zone: "working" | "review" | "deliverables",
+    logicalPath: string,
+    visiblePath: string
+  ): Promise<boolean> {
+    const current = await this.metadataMaybe(visiblePath);
+    if (current) return false;
+
+    const documentId = await documentIdFor(state.project_id, logicalPath);
+    const head = await this.ledger.readHead(state.project_id, documentId);
+    if (!head || head.kind !== "work_product") return false;
+    const versionId = zone === "working"
+      ? head.working_version_id
+      : zone === "review"
+        ? head.review_version_id
+        : head.published_version_id;
+    if (!versionId) return false;
+
+    const version = await this.requireVersion(state.project_id, documentId, versionId);
+    if (!this.transport.copy) throw new Error("Dropbox transport does not support deleted managed-document restore");
+    const restored = await this.transport.copy(version.immutable_payload_path, visiblePath);
+    const provider = { ...(head.provider ?? {}) };
+    if (zone === "working") provider.working = observation(visiblePath, restored);
+    if (zone === "review") provider.review = observation(visiblePath, restored);
+    if (zone === "deliverables") provider.published = observation(visiblePath, restored);
+    await this.ledger.writeHead({
+      ...head,
+      provider,
+      reconciliation_status: head.reconciliation_status
+    });
+    return true;
   }
 
   private async captureWorkProductEdit(

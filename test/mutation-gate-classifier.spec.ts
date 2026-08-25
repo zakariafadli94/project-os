@@ -43,6 +43,30 @@ function state() {
   return emptyProjectState("PRJ-0002", "Project OS", "project-os", "Mutation gate classification");
 }
 
+function stateWithSpecsRoute() {
+  const current = state();
+  current.decisions["DEC-ROUTESPEC001"] = {
+    decision_id: "DEC-ROUTESPEC001",
+    title: "Govern specification artifacts",
+    decision: "Route controlled specs into a governed SPECS subtree",
+    reason: "MutationGate classifier coverage",
+    impacts: [],
+    status: "accepted",
+    created_at: "2026-08-25T16:00:00+01:00",
+    updated_at: "2026-08-25T16:00:00+01:00"
+  };
+  current.artifact_routes["ROUTE-SPECS001"] = {
+    route_id: "ROUTE-SPECS001",
+    source_prefix: "controlled-specs",
+    target_prefix: "SPECS/governed",
+    exclusive: true,
+    decision_ids: ["DEC-ROUTESPEC001"],
+    created_at: "2026-08-25T16:00:00+01:00",
+    updated_at: "2026-08-25T16:00:00+01:00"
+  };
+  return current;
+}
+
 describe("MutationGateClassifier", () => {
   it("leaves collaborative zones outside strict final-zone classification", async () => {
     const transport = new FakeClassifierDropbox();
@@ -60,6 +84,24 @@ describe("MutationGateClassifier", () => {
 
     await expect(new MutationGateClassifier(transport).classify(state(), path, metadata))
       .resolves.toEqual({ kind: "external_candidate" });
+  });
+
+  it("classifies an unknown file under an artifact-route target as an external candidate", async () => {
+    const transport = new FakeClassifierDropbox();
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/SPECS/governed/direct.md";
+    const metadata = await transport.seed(path, "# routed bypass", "id:routed-bypass");
+
+    await expect(new MutationGateClassifier(transport).classify(stateWithSpecsRoute(), path, metadata))
+      .resolves.toEqual({ kind: "external_candidate" });
+  });
+
+  it("does not make an unrelated SPECS path strict merely because a different SPECS subtree is routed", async () => {
+    const transport = new FakeClassifierDropbox();
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/SPECS/freeform.md";
+    const metadata = await transport.seed(path, "# freeform");
+
+    await expect(new MutationGateClassifier(transport).classify(stateWithSpecsRoute(), path, metadata))
+      .resolves.toEqual({ kind: "not_final_zone" });
   });
 
   it("recognizes exact existing published provider evidence as governed current", async () => {

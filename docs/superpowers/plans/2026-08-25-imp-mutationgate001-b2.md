@@ -4,7 +4,7 @@
 
 **Goal:** Add a Project OS mutation gate that prevents raw provider files from silently becoming governed truth, preserves unknown final-zone writes as explicit external candidates, and gives artifact writes durable pre-effect provenance for deterministic recovery.
 
-**Architecture:** Extend IMP-ARTIFACT001 rather than replacing it. Add a small independently versioned mutation-gate ledger for artifact intents, external candidates, immutable candidate payloads, and resolutions; run final-zone provenance classification before DELIVERABLE bootstrap; keep collaborative zones under the existing managed-document reconciler; and expose typed candidate resolution through ProjectGuard. Production rolls out in `observe` mode first while continuity remains `stable`.
+**Architecture:** Extend IMP-ARTIFACT001 rather than replacing it. Add an independently versioned mutation-gate ledger for artifact intents, external candidates, immutable candidate payloads, and resolutions; classify final-zone provider changes before DELIVERABLE bootstrap; keep collaborative zones under the existing managed-document reconciler; and resolve candidates only by re-entering normal artifact or managed-document services. Production starts in `observe` mode while continuity remains `stable`.
 
 **Tech Stack:** TypeScript 5.9, Cloudflare Workers/Durable Objects SQLite, Dropbox HTTP API, Zod 4, Vitest 4, Wrangler 4.
 
@@ -21,6 +21,7 @@
 - Unknown new files in final/governed zones must be preserved before resolution and must not auto-bootstrap as published.
 - Managed-document request intent/receipt remains authoritative for managed-document operations; do not create a duplicate managed-document intent family.
 - Artifact provider effects require durable mutation intent before the effect and terminal artifact/document evidence after the effect.
+- An unresolved candidate at a destination path must block ordinary artifact/document replacement at that path; only an explicit candidate-resolution operation may adopt it.
 - Candidate capture is non-destructive by default; automatic unsafe delete/move of unknown final files is forbidden.
 - Status vocabulary is exactly `SUBMITTED -> COMMITTED -> CANONICAL VERIFIED -> ACCEPTED`; no provider upload alone advances those semantics.
 - No secret values in source, tests, docs, logs, Dropbox canonical notes, or chat.
@@ -39,22 +40,24 @@
 - Extend: `test/dropbox-paths.spec.ts`
 
 **Interfaces:**
-- Produces `MutationIntentRecord`, `ExternalMutationCandidateRecord`, `ExternalMutationResolutionRecord`, `MutationCandidateResolutionRequest`, parsers, deterministic `mutationIntentIdFor()`, `mutationCandidateIdFor()`, and `mutationResolutionIdFor()` helpers.
-- Produces `machineMutationGateRoot()`, `machineMutationIntentPath()`, `machineMutationIntentDestinationBindingPath()`, `machineMutationCandidatePath()`, `machineMutationCandidatePayloadPath()`, and `machineMutationResolutionPath()`.
+- Produces `MutationIntentRecord`, `ExternalMutationCandidateRecord`, `ExternalMutationResolutionRecord`, strict parsers, `MutationDetectionSource`, and deterministic `mutationIntentIdFor()`, `mutationCandidateIdFor()`, and `mutationResolutionIdFor()` helpers.
+- Produces `machineMutationGateRoot()`, `machineMutationIntentPath()`, `machineMutationIntentDestinationBindingRoot()`, `machineMutationCandidatePath()`, `machineMutationCandidatePayloadPath()`, and `machineMutationResolutionPath()`.
 
-- [ ] **Step 1: Write RED domain tests for strict versioned records and deterministic IDs**
+- [ ] **Step 1: Write RED domain tests**
+
+Create `test/mutation-gate-domain.spec.ts`:
 
 ```ts
 import { describe, expect, it } from "vitest";
 import {
   mutationCandidateIdFor,
   mutationIntentIdFor,
-  parseExternalMutationCandidateRecord,
-  parseMutationIntentRecord
+  mutationResolutionIdFor,
+  parseExternalMutationCandidateRecord
 } from "../src/domain/mutation-gate";
 
 describe("mutation gate domain", () => {
-  it("derives project-bound deterministic intent and candidate ids", async () => {
+  it("derives deterministic project-bound ids", async () => {
     const intent = await mutationIntentIdFor("PRJ-0002", "ART-MUTATION-000001");
     expect(intent).toMatch(/^MUTINT-[A-F0-9]{24}$/);
     expect(await mutationIntentIdFor("PRJ-0002", "ART-MUTATION-000001")).toBe(intent);
@@ -66,9 +69,12 @@ describe("mutation gate domain", () => {
       providerRev: "rev-17"
     });
     expect(candidate).toMatch(/^MUTCAND-[A-F0-9]{24}$/);
+
+    const resolution = await mutationResolutionIdFor("PRJ-0002", candidate, "candidate.reject");
+    expect(resolution).toMatch(/^MUTRES-[A-F0-9]{24}$/);
   });
 
-  it("rejects a candidate that claims a different project payload namespace", () => {
+  it("rejects candidate evidence bound to another project namespace", () => {
     expect(() => parseExternalMutationCandidateRecord({
       schema_version: "1.0",
       candidate_id: "MUTCAND-111111111111111111111111",
@@ -80,26 +86,26 @@ describe("mutation gate domain", () => {
       provider_rev: "rev-17",
       provider_content_hash: "a".repeat(64),
       size: 3,
-      immutable_payload_path: "/PROJECT_OS/.project-os/projects/PRJ-0003/mutation-gate/payloads/candidates/x/payload",
+      immutable_payload_path: "/PROJECT_OS/.project-os/projects/PRJ-0003/mutation-gate/payloads/candidates/MUTCAND-111111111111111111111111/payload",
       detected_at: "2026-08-25T16:00:00+01:00"
     })).toThrow(/project/i);
   });
 });
 ```
 
-- [ ] **Step 2: Run the new domain/path tests and confirm RED**
+Extend `test/dropbox-paths.spec.ts` with exact expected mutation-gate paths and traversal/ID rejection.
 
-Run:
+- [ ] **Step 2: Run RED tests**
 
 ```bash
 npx vitest run test/mutation-gate-domain.spec.ts test/dropbox-paths.spec.ts
 ```
 
-Expected: FAIL because `src/domain/mutation-gate.ts` and mutation-gate layout helpers do not exist.
+Expected: FAIL because the domain file and layout helpers do not exist.
 
-- [ ] **Step 3: Implement strict V1 schemas and deterministic IDs**
+- [ ] **Step 3: Implement strict V1 record schemas and ID helpers**
 
-Create `src/domain/mutation-gate.ts` with the exact core shapes:
+Create `src/domain/mutation-gate.ts` with these core schemas:
 
 ```ts
 import { z } from "zod";
@@ -110,6 +116,9 @@ const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
 const intentId = z.string().regex(/^MUTINT-[A-F0-9]{24}$/);
 const candidateId = z.string().regex(/^MUTCAND-[A-F0-9]{24}$/);
 const resolutionId = z.string().regex(/^MUTRES-[A-F0-9]{24}$/);
+
+export const mutationDetectionSourceSchema = z.enum(["incremental", "baseline", "cursor_reset"]);
+export type MutationDetectionSource = z.infer<typeof mutationDetectionSourceSchema>;
 
 export const mutationIntentRecordSchema = z.strictObject({
   schema_version: z.literal("1.0"),
@@ -133,7 +142,7 @@ export const externalMutationCandidateRecordSchema = z.strictObject({
   candidate_id: candidateId,
   project_id: projectId,
   source: z.literal("external_unverified"),
-  detection_source: z.enum(["incremental", "baseline", "cursor_reset"]),
+  detection_source: mutationDetectionSourceSchema,
   provider_path: z.string().min(1),
   provider_file_id: z.string().regex(/^id:[A-Za-z0-9_-]+$/),
   provider_rev: z.string().min(1),
@@ -155,9 +164,11 @@ export const externalMutationResolutionRecordSchema = z.strictObject({
 });
 ```
 
-Add `superRefine` checks so every provider/immutable path is absolute, traversal-free, and bound to the same `project_id`. Derive IDs with Web Crypto SHA-256 and the first 24 uppercase hex characters, following the existing managed-document ID pattern.
+Add `superRefine` checks that provider paths stay under the bound project's workspace and immutable payload paths stay under `/PROJECT_OS/.project-os/projects/<PRJ>/mutation-gate/`.
 
-- [ ] **Step 4: Add exact hidden path helpers**
+Use the existing Web Crypto SHA-256 pattern for IDs.
+
+- [ ] **Step 4: Add exact path helpers and validators**
 
 In `src/dropbox/layout.ts` add:
 
@@ -170,6 +181,10 @@ export function machineMutationIntentPath(projectId: string, requestId: string):
   return `${machineMutationGateRoot(projectId)}/intents/artifacts/${assertSafeArtifactRequestId(requestId)}.json`;
 }
 
+export function machineMutationIntentDestinationBindingRoot(projectId: string, pathHash: string): string {
+  return `${machineMutationGateRoot(projectId)}/intent-bindings/destination/${assertSafeSha256(pathHash)}`;
+}
+
 export function machineMutationCandidatePath(projectId: string, candidateId: string): string {
   return `${machineMutationGateRoot(projectId)}/candidates/${assertSafeMutationCandidateId(candidateId)}.json`;
 }
@@ -177,11 +192,15 @@ export function machineMutationCandidatePath(projectId: string, candidateId: str
 export function machineMutationCandidatePayloadPath(projectId: string, candidateId: string): string {
   return `${machineMutationGateRoot(projectId)}/payloads/candidates/${assertSafeMutationCandidateId(candidateId)}/payload`;
 }
+
+export function machineMutationResolutionPath(projectId: string, candidateId: string, resolutionId: string): string {
+  return `${machineMutationGateRoot(projectId)}/resolutions/${assertSafeMutationCandidateId(candidateId)}/${assertSafeMutationResolutionId(resolutionId)}.json`;
+}
 ```
 
-Add the destination-binding and resolution path helpers using hashed safe path keys rather than embedding arbitrary physical paths into machine filenames.
+Add exact regex validators for `MUTCAND-*` and `MUTRES-*`; reuse the existing artifact request and SHA-256 validators.
 
-- [ ] **Step 5: Run focused tests GREEN**
+- [ ] **Step 5: Run GREEN tests**
 
 ```bash
 npx vitest run test/mutation-gate-domain.spec.ts test/dropbox-paths.spec.ts
@@ -206,7 +225,7 @@ git commit -m "feat: define mutation gate durable records"
 - Extend: `test/helpers/mock-dropbox.ts`
 
 **Interfaces:**
-- Consumes Task 1 record parsers/path helpers and existing `DropboxTransport`/`ResilientDropboxTransport`.
+- Consumes Task 1 schemas and path helpers.
 - Produces `MutationGateRepository` methods:
   - `ensureArtifactIntent(record)`
   - `readArtifactIntent(projectId, requestId)`
@@ -215,14 +234,17 @@ git commit -m "feat: define mutation gate durable records"
   - `readCandidate(projectId, candidateId)`
   - `writeResolution(record)`
   - `readResolutions(projectId, candidateId)`
+  - `hasTerminalResolution(projectId, candidateId)`
 
-- [ ] **Step 1: Write RED tests for immutable intent/candidate/resolution evidence**
+- [ ] **Step 1: Write RED repository tests**
+
+Create `test/mutation-gate-repository.spec.ts` with a transport that implements strict add, `getMetadata`, `copy`, and `listFolder`.
 
 ```ts
-it("captures candidate bytes server-side before writing immutable candidate metadata", async () => {
+it("captures candidate bytes before immutable candidate metadata", async () => {
   const transport = new FakeMutationGateDropbox();
   const visible = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/direct.md";
-  const metadata = transport.seed(visible, "direct bytes");
+  const metadata = transport.seed(visible, "direct bytes", "id:direct");
   const repo = new MutationGateRepository(transport);
 
   const result = await repo.captureCandidate({
@@ -234,29 +256,52 @@ it("captures candidate bytes server-side before writing immutable candidate meta
   });
 
   expect(result.created).toBe(true);
-  expect(transport.copies[0].from).toBe(visible);
-  expect(transport.copies[0].to).toBe(result.record.immutable_payload_path);
+  expect(transport.copies).toEqual([{ from: visible, to: result.record.immutable_payload_path }]);
   expect(await repo.readCandidate("PRJ-0002", result.record.candidate_id)).toEqual(result.record);
 });
 
-it("replays the same candidate idempotently and rejects different immutable evidence", async () => {
-  // same project + file id + rev => same candidate; same bytes replay succeeds.
+it("replays the same candidate without duplicating payload evidence", async () => {
+  const transport = new FakeMutationGateDropbox();
+  const visible = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/direct.md";
+  const metadata = transport.seed(visible, "direct bytes", "id:direct");
+  const repo = new MutationGateRepository(transport);
+  const input = {
+    projectId: "PRJ-0002",
+    detectionSource: "incremental" as const,
+    visiblePath: visible,
+    metadata,
+    detectedAt: "2026-08-25T16:10:00+01:00"
+  };
+
+  const first = await repo.captureCandidate(input);
+  const replay = await repo.captureCandidate(input);
+
+  expect(replay.created).toBe(false);
+  expect(replay.record.candidate_id).toBe(first.record.candidate_id);
+  expect(transport.copies.filter((entry) => entry.to === first.record.immutable_payload_path)).toHaveLength(1);
+});
+
+it("rejects a second conflicting terminal resolution", async () => {
+  const repo = seededRepositoryWithCandidate();
+  await repo.writeResolution(rejectResolution("MUTRES-111111111111111111111111"));
+  await expect(repo.writeResolution(adoptResolution("MUTRES-222222222222222222222222")))
+    .rejects.toThrow(/conflicting terminal resolution/i);
 });
 ```
 
-Also test that an intent request ID cannot be rebound to different request JSON or destination, and a candidate cannot receive two conflicting terminal resolutions.
+Also add a test that the same artifact request ID cannot be rebound to different request JSON or destination.
 
-- [ ] **Step 2: Run focused repository test RED**
+- [ ] **Step 2: Run RED tests**
 
 ```bash
 npx vitest run test/mutation-gate-repository.spec.ts
 ```
 
-Expected: FAIL because repository does not exist.
+Expected: FAIL because `MutationGateRepository` does not exist.
 
-- [ ] **Step 3: Implement `MutationGateRepository` with safe-add semantics**
+- [ ] **Step 3: Implement safe-add repository semantics**
 
-Use the existing immutable repository pattern:
+Core intent behavior:
 
 ```ts
 async ensureArtifactIntent(record: MutationIntentRecord): Promise<MutationIntentRecord> {
@@ -277,13 +322,20 @@ async ensureArtifactIntent(record: MutationIntentRecord): Promise<MutationIntent
 }
 ```
 
-For `captureCandidate`, snapshot with provider-side `copy()` first, verify destination payload metadata has the same `content_hash` and size, then safe-add the immutable candidate record. Never download opaque bytes merely to capture the candidate.
+`captureCandidate()` must:
 
-- [ ] **Step 4: Add destination binding lookup**
+1. derive deterministic candidate ID from project + file ID + provider rev;
+2. derive hidden payload path;
+3. server-side copy visible bytes to that path;
+4. on copy conflict, verify existing payload metadata `content_hash` and size exactly match;
+5. only then safe-add candidate JSON;
+6. on candidate JSON replay, require semantic equality.
 
-Store one immutable binding per artifact request under a deterministic hashed destination directory. `listArtifactIntentsForDestination()` lists only that directory, parses each binding, then reads/validates the corresponding intent. Do not recursively scan every project intent.
+- [ ] **Step 4: Implement bounded destination intent lookup**
 
-- [ ] **Step 5: Run repository tests GREEN**
+Hash the physical destination path with SHA-256. Store one immutable binding file per artifact request under that hash directory. `listArtifactIntentsForDestination()` lists only that directory and validates every referenced intent before returning it.
+
+- [ ] **Step 5: Run GREEN tests**
 
 ```bash
 npx vitest run test/mutation-gate-repository.spec.ts test/resilient-document-transport.spec.ts
@@ -307,28 +359,37 @@ git commit -m "feat: persist mutation gate provenance and candidates"
 - Modify: `src/durable/project-guard.ts`
 - Modify: `src/dropbox/repository.ts`
 - Modify: `src/documents/legacy-artifact.ts`
-- Modify: `src/dropbox/artifact-routing.ts` only if a small exported snapshot helper is needed
 - Test: `test/artifact-mutation-intent.spec.ts`
 - Extend: `test/legacy-artifact-managed.spec.ts`
 - Extend: `test/project-guard-artifact.spec.ts`
 
 **Interfaces:**
-- Produces `ArtifactMutationIntentService.prepare(state, request): Promise<PreparedArtifactMutation>` where `PreparedArtifactMutation` contains the validated durable intent plus a frozen `ResolvedArtifactDestination`.
-- Changes `ProjectRepository.writeArtifact` to accept an optional already-resolved destination so recovery does not recompute a changed route.
+- Produces `PreparedArtifactMutation { intent: MutationIntentRecord; destination: ResolvedArtifactDestination }`.
+- Produces `ArtifactMutationIntentService.prepare(state, request)`.
+- Changes `ProjectRepository.writeArtifact(state, request, destination?)` and `LegacyArtifactDocumentWriter.writeIfManaged(state, request, destination?)` so exact recovery can consume the frozen destination.
 
-- [ ] **Step 1: Write RED test proving intent exists before the first visible artifact provider write**
+- [ ] **Step 1: Write RED intent-before-effect test**
 
 ```ts
-it("persists artifact mutation intent before provider effect", async () => {
+it("persists mutation intent before the first visible artifact write", async () => {
+  const mock = installDropboxMock();
+  const project = await createRoutedProject();
+  const guard = testEnv.PROJECT_GUARD.getByName(project.project_id);
+  const artifact = await artifactRequest(project.project_id, "ART-MUTATION-INTENT-0001", "# governed");
+
   const response = await guard.fetch("https://project-guard.internal/artifact", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(await artifactRequest("ART-MUTATION-INTENT-0001", "# governed"))
+    body: JSON.stringify(artifact)
   });
   expect(response.status).toBe(200);
 
-  const intentIndex = mock.uploadCalls.findIndex((p) => p.includes("/mutation-gate/intents/artifacts/ART-MUTATION-INTENT-0001.json"));
-  const visibleIndex = mock.uploadCalls.findIndex((p) => p.includes("/WORKSPACE/PROJECTS/") && p.endsWith("/DELIVERABLES/REVENUE-OS/foo.md"));
+  const intentIndex = mock.uploadCalls.findIndex((path) =>
+    path.endsWith("/mutation-gate/intents/artifacts/ART-MUTATION-INTENT-0001.json")
+  );
+  const visibleIndex = mock.uploadCalls.findIndex((path) =>
+    path.includes(`/WORKSPACE/PROJECTS/${project.project_id}-`) && path.endsWith("/DELIVERABLES/REVENUE-OS/foo.md")
+  );
   expect(intentIndex).toBeGreaterThanOrEqual(0);
   expect(visibleIndex).toBeGreaterThan(intentIndex);
 });
@@ -336,34 +397,52 @@ it("persists artifact mutation intent before provider effect", async () => {
 
 - [ ] **Step 2: Write RED route-drift recovery test**
 
-Scenario:
+Use an isolated state/repository fixture:
 
-1. prepare artifact at project revision N with route `REVENUE-OS -> DELIVERABLES/REVENUE-OS`;
-2. inject failure after provider create but before managed artifact/version receipt completion;
-3. advance canonical route configuration to a different target;
-4. replay the exact artifact request;
-5. assert recovery uses the destination stored in the original intent and does not silently publish to the new target.
+```ts
+it("replays an interrupted artifact at its frozen original destination", async () => {
+  const firstState = routedState("DELIVERABLES/REVENUE-OS");
+  const request = await artifactRequest("PRJ-0003", "ART-ROUTE-DRIFT-0001", "# payload");
+  const prepared = await intentService.prepare(firstState, request);
+  await simulateProviderCreateOnly(prepared.destination.path, request.content);
 
-- [ ] **Step 3: Run RED tests**
+  const changedState = routedState("DELIVERABLES/NEW-REVENUE-OS");
+  const recovered = await repository.writeArtifact(changedState, request, prepared.destination);
+
+  expect(recovered).toBe("idempotent");
+  expect(dropbox.files.get(prepared.destination.path)).toBe("# payload");
+  expect([...dropbox.files.keys()].some((path) => path.includes("/DELIVERABLES/NEW-REVENUE-OS/foo.md"))).toBe(false);
+});
+```
+
+- [ ] **Step 3: Run RED artifact tests**
 
 ```bash
 npx vitest run test/artifact-mutation-intent.spec.ts test/legacy-artifact-managed.spec.ts test/project-guard-artifact.spec.ts
 ```
 
-Expected: new intent and route-drift cases FAIL.
+Expected: FAIL because artifact intent/frozen-destination support does not exist.
 
-- [ ] **Step 4: Implement preparation service**
-
-Core flow:
+- [ ] **Step 4: Implement `ArtifactMutationIntentService`**
 
 ```ts
+export interface PreparedArtifactMutation {
+  intent: MutationIntentRecord;
+  destination: ResolvedArtifactDestination;
+}
+
 export class ArtifactMutationIntentService {
-  constructor(private readonly repo: MutationGateRepository) {}
+  constructor(private readonly repository: MutationGateRepository) {}
 
   async prepare(state: ProjectState, request: ArtifactWriteRequest): Promise<PreparedArtifactMutation> {
+    const existing = await this.repository.readArtifactIntent(request.project_id, request.request_id);
+    if (existing) {
+      return { intent: existing, destination: destinationFromIntent(existing) };
+    }
+
     const destination = resolveArtifactDestination(state, request.relative_path);
     const requestJson = JSON.stringify(request);
-    const record = await this.repo.ensureArtifactIntent({
+    const intent = await this.repository.ensureArtifactIntent({
       schema_version: "1.0",
       intent_id: await mutationIntentIdFor(request.project_id, request.request_id),
       project_id: request.project_id,
@@ -379,24 +458,51 @@ export class ArtifactMutationIntentService {
       mode: request.mode,
       recorded_at: new Date().toISOString()
     });
-    return { record, destination: destinationFromIntent(record) };
+    return { intent, destination };
   }
 }
 ```
 
-`destinationFromIntent()` must reconstruct only the frozen physical destination fields; it must not call `resolveArtifactDestination()` again.
+On replay, verify request JSON/hash matches the stored intent before returning `destinationFromIntent()`.
 
-- [ ] **Step 5: Wire ProjectGuard artifact handling to the prepared destination**
+- [ ] **Step 5: Wire ProjectGuard before provider write**
 
-In `handleArtifact`, after current request/project/hash validation and before `repository.writeArtifact`, call the intent service. Pass the prepared frozen destination into the repository writer.
+In `handleArtifact`, after existing project/hash validation:
 
-Keep existing terminal artifact receipt behavior unchanged.
+```ts
+const prepared = await this.artifactMutationIntent.prepare(state, artifact);
+await this.assertNoUnresolvedCandidateAtPath(state.project_id, prepared.destination.path);
+await this.repository.writeArtifact(state, artifact, prepared.destination);
+return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "committed"));
+```
 
-- [ ] **Step 6: Make managed legacy artifact writer consume the frozen destination**
+The candidate-collision helper is implemented in Task 5; until then use a local fail-closed stub covered by Task 5 RED tests, and keep Task 3 tests scoped to paths without candidates.
 
-Refactor `LegacyArtifactDocumentWriter.writeIfManaged(...)` so the caller may provide the already-resolved destination. The writer may validate that the destination remains inside the bound project workspace but must not choose a new route during exact replay.
+- [ ] **Step 6: Make repository and legacy writer honor frozen destination**
 
-- [ ] **Step 7: Run artifact suites GREEN**
+Change signatures to:
+
+```ts
+writeArtifact(
+  state: ProjectState,
+  request: ArtifactWriteRequest,
+  destination?: ResolvedArtifactDestination
+): Promise<"written" | "idempotent">;
+```
+
+and:
+
+```ts
+writeIfManaged(
+  state: ProjectState,
+  request: ArtifactWriteRequest,
+  destination: ResolvedArtifactDestination = resolveArtifactDestination(state, request.relative_path)
+): Promise<LegacyManagedArtifactWriteResult | null>;
+```
+
+Validate the frozen path is still inside `workspaceProjectRoot(state.project_id, state.slug)` before use.
+
+- [ ] **Step 7: Run GREEN artifact suites**
 
 ```bash
 npx vitest run test/artifact-mutation-intent.spec.ts test/legacy-artifact-managed.spec.ts test/artifact-routing.spec.ts test/project-guard-artifact.spec.ts
@@ -407,7 +513,7 @@ Expected: PASS.
 - [ ] **Step 8: Commit Task 3**
 
 ```bash
-git add src/mutation-gate/artifact-intent.ts src/durable/project-guard.ts src/dropbox/repository.ts src/documents/legacy-artifact.ts src/dropbox/artifact-routing.ts test/artifact-mutation-intent.spec.ts test/legacy-artifact-managed.spec.ts test/project-guard-artifact.spec.ts
+git add src/mutation-gate/artifact-intent.ts src/durable/project-guard.ts src/dropbox/repository.ts src/documents/legacy-artifact.ts test/artifact-mutation-intent.spec.ts test/legacy-artifact-managed.spec.ts test/project-guard-artifact.spec.ts
 git commit -m "feat: persist artifact intent before provider writes"
 ```
 
@@ -424,54 +530,58 @@ git commit -m "feat: persist artifact intent before provider writes"
 - Extend: `test/document-bootstrap.spec.ts`
 
 **Interfaces:**
-- Produces `FinalZoneMutationClassifier.classify(state, change, context)` returning:
-  - `governed_current`
-  - `governed_inflight`
-  - `external_candidate`
-  - `not_final_zone`
-- `ManagedDocumentChangeCoordinator` calls this classifier before final-zone bootstrap/reconciliation.
+- Produces `FinalZoneMutationClassifier.classify(state, change, detectionSource)` returning `not_final_zone`, `governed_current`, `governed_inflight`, or `external_candidate`.
+- Final-zone classification runs before any `published` bootstrap.
 
-- [ ] **Step 1: Write RED incremental unknown DELIVERABLE test**
+- [ ] **Step 1: Write RED incremental/baseline/reset table tests**
 
 ```ts
-it("records a direct new DELIVERABLE as candidate instead of ignoring or publishing it", async () => {
-  await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
-  const path = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-gate/DELIVERABLES/direct.md`;
-  await mock.writeExternal(path, "# direct bypass");
+it.each([
+  { source: "incremental" as const, reset: false },
+  { source: "baseline" as const, reset: false },
+  { source: "cursor_reset" as const, reset: true }
+])("does not publish an unknown deliverable seen via $source", async ({ source, reset }) => {
+  const fixture = await createChangeFixture({ seedBeforeBaseline: source !== "incremental", cursorReset: reset });
+  if (source === "incremental") await fixture.establishBaseline();
+  await fixture.writeExternalDeliverable("direct.md", "# bypass");
 
-  const response = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
-  expect(await response.json()).toMatchObject({ candidates: 1 });
+  const result = await fixture.reconcile();
+  expect(result.candidates).toBe(1);
+  expect(result.last_candidate_detection_source).toBe(source);
 
-  const documentId = await documentIdFor(projectId, "direct.md");
-  const status = await guard.fetch(`https://project-guard.internal/document-status?document_id=${documentId}`);
+  const documentId = await documentIdFor(fixture.projectId, "direct.md");
+  const status = await fixture.guard.fetch(`https://project-guard.internal/document-status?document_id=${documentId}`);
   expect(status.status).toBe(404);
 });
 ```
 
-- [ ] **Step 2: Write RED first-baseline and cursor-reset tests**
+- [ ] **Step 2: Write RED governed-inflight tests**
 
-Seed the unknown `DELIVERABLES/direct.md` **before** the first reconcile and assert baseline reports a candidate with `bootstrapped: 0` for that path. Repeat with a stored cursor, injected Dropbox reset, and assert `detection_source = "cursor_reset"` and no published head.
+```ts
+it("recognizes interrupted managed publish as governed inflight", async () => {
+  const fixture = await createInterruptedManagedPublishFixture();
+  const classification = await fixture.classifyPublishedChange();
+  expect(classification).toMatchObject({ kind: "governed_inflight" });
+  expect(await fixture.candidateCount()).toBe(0);
+});
 
-- [ ] **Step 3: Write RED governed-inflight tests**
+it("recognizes matching artifact intent as governed inflight", async () => {
+  const fixture = await createInterruptedArtifactFixture();
+  const classification = await fixture.classifyVisibleArtifactChange();
+  expect(classification).toMatchObject({ kind: "governed_inflight", requestId: fixture.requestId });
+  expect(await fixture.candidateCount()).toBe(0);
+});
+```
 
-Cover:
-
-- interrupted managed publish where REVIEW evidence matches visible DELIVERABLE bytes;
-- interrupted artifact create where a durable artifact intent matches the same physical destination/request content.
-
-Both must classify as `governed_inflight`, not candidate.
-
-- [ ] **Step 4: Run RED classifier/coordinator tests**
+- [ ] **Step 3: Run RED tests**
 
 ```bash
 npx vitest run test/mutation-gate-classifier.spec.ts test/document-change-coordinator.spec.ts test/document-bootstrap.spec.ts
 ```
 
-Expected: unknown final files still bootstrap/ignore under current behavior, so RED cases fail.
+Expected: current unknown DELIVERABLE behavior fails these assertions.
 
-- [ ] **Step 5: Implement strict final-zone classification**
-
-Classifier outline:
+- [ ] **Step 4: Implement classifier**
 
 ```ts
 export type FinalZoneClassification =
@@ -480,28 +590,34 @@ export type FinalZoneClassification =
   | { kind: "governed_inflight"; requestId?: string }
   | { kind: "external_candidate" };
 
-async classify(state: ProjectState, change: DropboxChangeEntry, detection: DetectionSource) {
-  const final = classifyFinalPath(state, change.path);
-  if (!final || change.tag !== "file") return { kind: "not_final_zone" } as const;
-
-  if (await this.matchesManagedCurrent(state, final, change)) return { kind: "governed_current" } as const;
-  if (await this.matchesManagedInflight(state, final, change)) return { kind: "governed_inflight" } as const;
-  if (await this.matchesArtifactIntent(state, final, change)) return { kind: "governed_inflight" } as const;
-  return { kind: "external_candidate" } as const;
+export class FinalZoneMutationClassifier {
+  async classify(
+    state: ProjectState,
+    change: DropboxChangeEntry,
+    detectionSource: MutationDetectionSource
+  ): Promise<FinalZoneClassification> {
+    const finalPath = classifyFinalBusinessPath(state, change.path);
+    if (!finalPath || change.tag !== "file") return { kind: "not_final_zone" };
+    if (await this.matchesManagedCurrent(state, finalPath, change)) return { kind: "governed_current" };
+    if (await this.matchesManagedInflight(state, finalPath, change)) return { kind: "governed_inflight" };
+    const artifactIntent = await this.matchArtifactIntent(state, finalPath, change);
+    if (artifactIntent) return { kind: "governed_inflight", requestId: artifactIntent.request_id };
+    return { kind: "external_candidate" };
+  }
 }
 ```
 
-Do not guess actor identity from Dropbox change metadata.
+`matchArtifactIntent()` must verify physical destination and exact candidate content against stored artifact request content for this text-oriented artifact API; do not match by path alone.
 
-- [ ] **Step 6: Change baseline candidate selection**
+- [ ] **Step 5: Remove unconditional published baseline adoption**
 
-In `ManagedDocumentChangeCoordinator.bootstrapCandidate`, remove the unconditional rule that returns `{ stage: "published" }` for every non-projected `DELIVERABLES/**` file. Only bootstrap `published` when classifier/evidence explicitly proves governance. Keep WORKING/REVIEW/REFERENCES compatibility bootstrap.
+In `ManagedDocumentChangeCoordinator`, do not emit a generic `{ stage: "published" }` bootstrap candidate for every `DELIVERABLES/**` file. Route final-zone files through the classifier first.
 
-- [ ] **Step 7: Add explicit bootstrap guard**
+Keep `WORKING`, `REVIEW`, and `REFERENCES` baseline compatibility adoption.
 
-`ManagedDocumentBootstrapper.bootstrapExistingManagedPath(..., "published")` must require an explicit provenance option/token from the caller rather than being callable as a generic inferred baseline.
+- [ ] **Step 6: Add explicit provenance requirement to published bootstrap**
 
-Example signature:
+Change signature:
 
 ```ts
 bootstrapExistingManagedPath(
@@ -513,17 +629,17 @@ bootstrapExistingManagedPath(
 )
 ```
 
-If `inferredStage === "published"` and `publishedProvenance` is absent, throw a fail-closed error.
+Fail closed when `inferredStage === "published"` and `publishedProvenance` is absent.
 
-- [ ] **Step 8: Run classifier/coordinator/bootstrap suites GREEN**
+- [ ] **Step 7: Run GREEN classifier/bootstrap suites**
 
 ```bash
-npx vitest run test/mutation-gate-classifier.spec.ts test/document-change-coordinator.spec.ts test/document-bootstrap.spec.ts test/document-external-edits.spec.ts
+npx vitest run test/mutation-gate-classifier.spec.ts test/document-change-coordinator.spec.ts test/document-bootstrap.spec.ts test/document-external-edits.spec.ts test/managed-document-faults.spec.ts
 ```
 
-Expected: PASS and existing managed external-edit behavior unchanged.
+Expected: PASS and existing managed edit/recovery behavior remains intact.
 
-- [ ] **Step 9: Commit Task 4**
+- [ ] **Step 8: Commit Task 4**
 
 ```bash
 git add src/mutation-gate/classifier.ts src/documents/change-coordinator.ts src/documents/bootstrap.ts test/mutation-gate-classifier.spec.ts test/document-change-coordinator.spec.ts test/document-bootstrap.spec.ts
@@ -532,7 +648,7 @@ git commit -m "feat: gate final-zone bootstrap by provenance"
 
 ---
 
-### Task 5: Capture external candidates non-destructively and expose compact status
+### Task 5: Capture candidates, block unresolved-path overwrite, and expose compact status
 
 **Files:**
 - Create: `src/mutation-gate/service.ts`
@@ -541,41 +657,55 @@ git commit -m "feat: gate final-zone bootstrap by provenance"
 - Modify: `src/index.ts`
 - Modify: `src/env.ts`
 - Test: `test/mutation-gate-candidate.spec.ts`
-- Extend: `test/document-change-coordinator.spec.ts`
+- Extend: `test/project-guard-artifact.spec.ts`
 - Extend: `test/index.spec.ts`
 
 **Interfaces:**
-- Produces `MutationGateService.captureExternalCandidate(...)`, `status(...)`, and `listUnresolved(...)`.
-- Adds `PROJECT_OS_MUTATION_GATE_MODE?: "observe" | "enforce"` with parser defaulting to `observe` until production cutover is explicitly accepted.
-- ProjectGuard internal endpoints:
-  - `GET /mutation-candidates`
-  - `GET /mutation-candidate-status?candidate_id=...`
-- Public/admin compact read route may expose counts/IDs but never contents/provider secrets.
+- Produces `MutationGateService.captureExternalCandidate()`, `assertDestinationClear()`, `status()`, and `listUnresolved()`.
+- Adds `PROJECT_OS_MUTATION_GATE_MODE?: "observe" | "enforce"`, default `observe`.
+- Adds ProjectGuard internal reads `GET /mutation-candidates` and `GET /mutation-candidate-status?candidate_id=...`.
 
-- [ ] **Step 1: Write RED candidate preservation test**
+- [ ] **Step 1: Write RED non-destructive capture test**
 
 ```ts
-it("snapshots candidate bytes and leaves visible bytes untouched in observe mode", async () => {
-  const path = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-gate/DELIVERABLES/direct.md`;
-  await mock.writeExternal(path, "# preserve me");
-  const before = mock.files.get(path);
+it("preserves candidate bytes and leaves visible bytes untouched", async () => {
+  const fixture = await createGateFixture("observe");
+  const path = await fixture.writeExternalDeliverable("direct.md", "# preserve me");
+  const revisionBefore = await fixture.canonicalRevision();
 
-  const result = await reconcile(projectId);
+  const result = await fixture.reconcile();
+
   expect(result).toMatchObject({ candidates: 1, mutation_gate_mode: "observe" });
-  expect(mock.files.get(path)).toBe(before);
-  expect([...mock.files.keys()].some((p) => p.includes("/mutation-gate/payloads/candidates/"))).toBe(true);
+  expect(fixture.mock.files.get(path)).toBe("# preserve me");
+  expect(await fixture.canonicalRevision()).toBe(revisionBefore);
+  expect([...fixture.mock.files.keys()].some((p) => p.includes("/mutation-gate/payloads/candidates/"))).toBe(true);
 });
 ```
 
-Also assert candidate detection does not change canonical project revision.
+- [ ] **Step 2: Write RED unresolved destination collision test**
 
-- [ ] **Step 2: Write RED hot-cache-loss candidate replay test**
+```ts
+it("blocks normal artifact replace when the destination has an unresolved candidate", async () => {
+  const fixture = await createRoutedGateFixture("observe");
+  await fixture.writeExternalRoutedDeliverable("# external");
+  await fixture.reconcile();
 
-Delete any new SQLite candidate cache rows if added, then replay reconciliation and assert the same immutable Dropbox candidate is returned without duplicate payload/record.
+  const response = await fixture.postArtifact(await fixture.replaceArtifact("# governed replacement"));
+  expect(await response.json()).toMatchObject({
+    status: "conflict",
+    code: "UNRESOLVED_EXTERNAL_CANDIDATE"
+  });
+  expect(await fixture.visibleContent()).toBe("# external");
+});
+```
 
-- [ ] **Step 3: Implement mode parser**
+Repeat the same test with mode `enforce`; both modes must preserve data correctness.
 
-In `src/env.ts` add the optional env type. In a focused helper (or `service.ts`) implement:
+- [ ] **Step 3: Write RED cache-loss replay test**
+
+Capture a candidate, delete any new mutation-gate SQLite cache rows if the implementation adds them, reconcile again, and assert the same candidate ID/payload remain with no duplicate immutable evidence.
+
+- [ ] **Step 4: Implement mode parser**
 
 ```ts
 export function parseMutationGateMode(value: string | undefined): "observe" | "enforce" {
@@ -585,41 +715,56 @@ export function parseMutationGateMode(value: string | undefined): "observe" | "e
 }
 ```
 
-Do not default to enforce.
+In V1, both modes enforce the same non-governance and unresolved-path collision rules. `observe` versus `enforce` is a rollout/readiness signal: observe reports candidates as warnings; enforce reports them as active policy violations. Neither mode automatically deletes unknown files.
 
-- [ ] **Step 4: Wire `external_candidate` classification to repository capture**
+- [ ] **Step 5: Wire `external_candidate` classification to immutable capture**
 
-For every candidate, call `captureCandidate()` before returning the reconcile summary. Add summary fields:
+Add reconcile summary fields:
 
 ```ts
 candidates: number;
 mutation_gate_mode: "observe" | "enforce";
+policy_violations: number;
+last_candidate_detection_source?: MutationDetectionSource;
 ```
 
-Observe and enforce use identical governance recognition. In this package, neither mode automatically deletes/moves an unknown candidate file. The difference is operational configuration/readiness, not unsafe destructive cleanup.
+For `external_candidate`, call `captureExternalCandidate()` before cursor advancement.
 
-- [ ] **Step 5: Add compact candidate status/list endpoints**
+- [ ] **Step 6: Implement unresolved-path guard**
 
-Return only IDs, path-safe metadata, detection source, resolution state, and timestamps. Do not return candidate payload contents through status endpoints.
+```ts
+async assertDestinationClear(projectId: string, destinationPath: string): Promise<void> {
+  const unresolved = await this.listUnresolved(projectId, { destinationPath });
+  if (unresolved.length > 0) {
+    throw new UnresolvedExternalCandidateError(destinationPath, unresolved.map((item) => item.candidate_id));
+  }
+}
+```
 
-- [ ] **Step 6: Run focused tests GREEN**
+Call this guard before ordinary artifact writes to the destination. Candidate-resolution execution receives an explicit bypass capability object internal to `ProjectGuard`; do not expose a boolean `skipGuard` field in public request JSON.
+
+- [ ] **Step 7: Add compact status/list endpoints**
+
+Return candidate ID, project ID, path, detection source, detected time, gate mode, and resolution state. Do not return candidate payload contents through status endpoints.
+
+- [ ] **Step 8: Run GREEN candidate/path-guard suites**
 
 ```bash
-npx vitest run test/mutation-gate-candidate.spec.ts test/document-change-coordinator.spec.ts test/index.spec.ts
+npx vitest run test/mutation-gate-candidate.spec.ts test/project-guard-artifact.spec.ts test/document-change-coordinator.spec.ts test/index.spec.ts
 ```
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 5**
+- [ ] **Step 9: Commit Task 5**
 
 ```bash
-git add src/mutation-gate/service.ts src/documents/change-coordinator.ts src/durable/project-guard.ts src/index.ts src/env.ts test/mutation-gate-candidate.spec.ts test/document-change-coordinator.spec.ts test/index.spec.ts
-git commit -m "feat: preserve external mutation candidates"
+git add src/mutation-gate/service.ts src/documents/change-coordinator.ts src/durable/project-guard.ts src/index.ts src/env.ts test/mutation-gate-candidate.spec.ts test/project-guard-artifact.spec.ts test/index.spec.ts
+git commit -m "feat: preserve and isolate external mutation candidates"
 ```
 
 ---
 
-### Task 6: Add typed, idempotent candidate resolution through normal governed services
+### Task 6: Add typed, idempotent candidate resolution through governed services
 
 **Files:**
 - Create: `src/domain/mutation-candidate-resolution.ts`
@@ -632,46 +777,83 @@ git commit -m "feat: preserve external mutation candidates"
 
 **Interfaces:**
 - Produces strict `MutationCandidateResolutionRequest` parser.
-- ProjectGuard internal endpoint: `POST /mutation-candidate-resolution`.
-- Public authenticated route: `POST /v1/mutation-candidates/resolve`.
-- Resolution service calls existing artifact or managed-document service logic; it never writes a final provider path directly.
+- Adds internal `POST /mutation-candidate-resolution` and public authenticated `POST /v1/mutation-candidates/resolve`.
+- Resolution uses normal artifact/document service logic and never directly publishes a provider file.
 
-- [ ] **Step 1: Write RED adopt-as-artifact test**
+- [ ] **Step 1: Write RED resolution parser tests**
 
 ```ts
-it("adopts a text candidate only by committing a normal artifact request first", async () => {
-  const candidate = await seedCandidate("# candidate artifact");
-  const request = {
-    operation: "candidate.adopt_artifact",
+it.each([
+  {
+    operation: "candidate.reject",
     resolution_id: "MUTRES-111111111111111111111111",
-    project_id: projectId,
-    candidate_id: candidate.candidate_id,
-    artifact_request: await artifactRequest("ART-CANDIDATE-ADOPT-0001", "# candidate artifact")
-  };
-
-  const receipt = await resolve(request);
-  expect(receipt).toMatchObject({ status: "committed", action: "adopt_as_artifact" });
-  expect(await artifactReceipt("ART-CANDIDATE-ADOPT-0001")).toMatchObject({ status: "committed" });
+    project_id: "PRJ-0002",
+    candidate_id: "MUTCAND-111111111111111111111111"
+  },
+  {
+    operation: "candidate.adopt_artifact",
+    resolution_id: "MUTRES-222222222222222222222222",
+    project_id: "PRJ-0002",
+    candidate_id: "MUTCAND-111111111111111111111111",
+    artifact_request: {
+      request_id: "ART-CANDIDATE-ADOPT-0001",
+      project_id: "PRJ-0002",
+      relative_path: "REVENUE-OS/direct.md",
+      content: "# candidate",
+      content_sha256: "a".repeat(64),
+      mode: "create"
+    }
+  }
+])("parses $operation", (request) => {
+  expect(parseMutationCandidateResolutionRequest(request)).toMatchObject({ operation: request.operation });
 });
 ```
 
-- [ ] **Step 2: Write RED adopt-as-working test**
+Add a test that `candidate.adopt_working` rejects any nested managed-document operation other than `working.write`.
 
-Nested document request must be `working.write`. Assert candidate adoption creates a WORKING managed document and `published_version_id` remains absent.
+- [ ] **Step 2: Write RED service behavior tests**
 
-- [ ] **Step 3: Write RED reject and conflicting-resolution tests**
+```ts
+it("records adopt-as-artifact only after downstream artifact commit", async () => {
+  const fixture = await candidateResolutionFixture("# candidate artifact");
+  const receipt = await fixture.resolveArtifact();
 
-First `candidate.reject` writes immutable resolution. Exact replay returns the same result. A later `candidate.adopt_artifact` for the same candidate returns a deterministic conflict and performs no downstream write.
+  expect(receipt).toMatchObject({ status: "committed", action: "adopt_as_artifact" });
+  expect(await fixture.artifactReceipt()).toMatchObject({ status: "committed" });
+  expect(await fixture.resolutionRecord()).toMatchObject({
+    action: "adopt_as_artifact",
+    downstream_receipt_status: "committed"
+  });
+});
 
-- [ ] **Step 4: Run RED resolution tests**
+it("adopt-as-working never creates a published pointer", async () => {
+  const fixture = await candidateResolutionFixture("# candidate working");
+  const receipt = await fixture.resolveWorking();
+  const status = await fixture.documentStatus(receipt.document_id);
+
+  expect(status.working_version_id).toBeDefined();
+  expect(status.published_version_id).toBeUndefined();
+});
+
+it("reject is idempotent and blocks a later conflicting adoption", async () => {
+  const fixture = await candidateResolutionFixture("# rejected");
+  const first = await fixture.reject();
+  expect(await fixture.reject()).toEqual(first);
+  await expect(fixture.resolveArtifact()).rejects.toMatchObject({ code: "CANDIDATE_ALREADY_RESOLVED" });
+});
+```
+
+- [ ] **Step 3: Run RED resolution tests**
 
 ```bash
 npx vitest run test/mutation-candidate-resolution.spec.ts test/project-guard-document.spec.ts test/project-guard-artifact.spec.ts
 ```
 
-Expected: FAIL because resolution family/service/routes do not exist.
+Expected: FAIL because resolution domain/service/routes do not exist.
 
-- [ ] **Step 5: Implement strict resolution parser**
+- [ ] **Step 4: Implement strict resolution request schema**
+
+Reuse exported `artifactWriteRequestSchema` and `managedDocumentRequestSchema` rather than duplicating them.
 
 ```ts
 export const mutationCandidateResolutionRequestSchema = z.discriminatedUnion("operation", [
@@ -702,27 +884,26 @@ export const mutationCandidateResolutionRequestSchema = z.discriminatedUnion("op
 ]);
 ```
 
-Export the existing artifact/document schemas if necessary rather than duplicating validation rules.
+- [ ] **Step 5: Implement resolution service with content binding**
 
-- [ ] **Step 6: Implement candidate/downstream content binding**
+For adoption:
 
-Before adoption:
+1. read candidate and ensure same project;
+2. fail if terminal resolution already exists unless exact replay;
+3. read immutable candidate payload only for the current text-oriented nested APIs;
+4. compare exact text and SHA-256 to nested artifact/document request;
+5. execute normal artifact/document service with an internal `candidateResolutionContext` that authorizes bypass of the unresolved-path guard for this candidate only;
+6. require downstream `status === "committed"`;
+7. write immutable resolution record;
+8. return a compact committed resolution receipt.
 
-1. read immutable candidate record;
-2. ensure no conflicting terminal resolution exists;
-3. verify nested request project matches candidate project;
-4. read candidate immutable payload only for supported text adoption;
-5. compare exact content with nested request content and SHA-256;
-6. call normal artifact/document service;
-7. only after downstream committed receipt, safe-add `ExternalMutationResolutionRecord`.
+If candidate payload cannot be represented safely as text, return `CANDIDATE_CONTENT_UNSUPPORTED` and preserve candidate unchanged.
 
-If the candidate payload cannot be represented safely by the current text API, return a deterministic `CANDIDATE_CONTENT_UNSUPPORTED` conflict and preserve the candidate unchanged.
+- [ ] **Step 6: Wire ProjectGuard and public route**
 
-- [ ] **Step 7: Wire ProjectGuard and public route**
+ProjectGuard keeps same-project serialization. `src/index.ts` authenticates with `INGRESS_TOKEN`, validates the request, and routes to the bound ProjectGuard.
 
-ProjectGuard keeps same-project serialization. `src/index.ts` public route authenticates with existing `INGRESS_TOKEN` and forwards to the bound `PROJECT_GUARD` Durable Object.
-
-- [ ] **Step 8: Run resolution suites GREEN**
+- [ ] **Step 7: Run GREEN resolution suites**
 
 ```bash
 npx vitest run test/mutation-candidate-resolution.spec.ts test/project-guard-document.spec.ts test/project-guard-artifact.spec.ts test/document-lifecycle.spec.ts
@@ -730,7 +911,7 @@ npx vitest run test/mutation-candidate-resolution.spec.ts test/project-guard-doc
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit Task 6**
+- [ ] **Step 8: Commit Task 6**
 
 ```bash
 git add src/domain/mutation-candidate-resolution.ts src/mutation-gate/resolution-service.ts src/durable/project-guard.ts src/index.ts test/mutation-candidate-resolution.spec.ts test/project-guard-document.spec.ts test/project-guard-artifact.spec.ts
@@ -739,157 +920,96 @@ git commit -m "feat: resolve mutation candidates through governed flows"
 
 ---
 
-### Task 7: Enforce lifecycle terminology and operator-routing contract
+### Task 7: Prove terminology, crash recovery, PRJ-0003-shaped bypasses, and isolation
 
 **Files:**
-- Modify: `docs/project-os-sop.md`
-- Modify: `docs/managed-documents.md`
-- Create: `docs/mutation-gate.md`
-- Modify: `src/index.ts` only if response metadata needs compact verification state
-- Test: `test/mutation-gate-status.spec.ts`
-
-**Interfaces:**
-- Produces the normative operator/runtime status contract and runtime documentation.
-- No new business semantics beyond the accepted B2 design.
-
-- [ ] **Step 1: Write RED status-contract tests**
-
-Test that:
-
-- an ingress artifact intent without terminal receipt is reported as `submitted`, not `committed`;
-- candidate detection reports `candidate`/unverified and never `published` or `accepted`;
-- a committed candidate adoption can be verified through downstream receipt plus resolution evidence;
-- no API field names a provider upload alone `accepted`.
-
-- [ ] **Step 2: Run RED status test**
-
-```bash
-npx vitest run test/mutation-gate-status.spec.ts
-```
-
-- [ ] **Step 3: Add concise runtime status helpers if needed**
-
-Use exact enums instead of prose parsing:
-
-```ts
-export type MutationVerificationState =
-  | "submitted"
-  | "committed"
-  | "canonical_verified"
-  | "external_candidate";
-```
-
-Do **not** manufacture an `accepted` runtime state unless the domain object has a real explicit acceptance lifecycle.
-
-- [ ] **Step 4: Update SOP with operator routing invariant**
-
-Add normative language:
-
-```text
-Project OS agent/operator writes must use typed transaction, artifact,
-managed-document, or candidate-resolution ingress. A generic Dropbox write
-into a governed final business destination is never an equivalent durable
-Project OS mutation. If such a file appears, treat it as external/unverified
-until ProjectGuard evidence proves otherwise.
-```
-
-Also document exact `SUBMITTED -> COMMITTED -> CANONICAL VERIFIED -> ACCEPTED` distinctions.
-
-- [ ] **Step 5: Document runtime design and recovery**
-
-`docs/mutation-gate.md` must include:
-
-- surface classification;
-- hidden ledger paths;
-- intent-before-effect ordering;
-- baseline/cursor-reset rule;
-- candidate capture and resolution;
-- observe/enforce semantics;
-- crash recovery;
-- rollback;
-- PRJ-0003 repair procedure after production validation;
-- SECURITY and SCHEMA boundaries.
-
-- [ ] **Step 6: Run status/docs-adjacent regression tests GREEN**
-
-```bash
-npx vitest run test/mutation-gate-status.spec.ts test/index.spec.ts test/project-guard-artifact.spec.ts test/project-guard-document.spec.ts
-```
-
-- [ ] **Step 7: Commit Task 7**
-
-```bash
-git add docs/project-os-sop.md docs/managed-documents.md docs/mutation-gate.md src/index.ts test/mutation-gate-status.spec.ts
-git commit -m "docs: define mutation gate operating contract"
-```
-
----
-
-### Task 8: Prove crash recovery, baseline/reset safety, and multi-project isolation
-
-**Files:**
+- Create: `test/mutation-gate-status.spec.ts`
 - Create: `test/mutation-gate-acceptance.spec.ts`
 - Create: `test/mutation-gate-faults.spec.ts`
 - Extend: `test/write-coordination-stress.spec.ts`
 - Extend: `test/helpers/mock-dropbox.ts`
 
-**Interfaces:** none new; this is the package acceptance gate.
+**Interfaces:** no new runtime API; this is the acceptance gate.
 
-- [ ] **Step 1: Add end-to-end PRJ-0003-shaped bypass acceptance test**
+- [ ] **Step 1: Add exact status vocabulary tests**
 
-Use a fresh isolated test project with a governed artifact route. Directly inject:
+```ts
+it("does not call a durable artifact intent committed before terminal receipt", async () => {
+  const fixture = await interruptedArtifactIntentFixture();
+  expect(await fixture.status()).toMatchObject({ verification_state: "submitted" });
+  expect(JSON.stringify(await fixture.status())).not.toContain('"accepted"');
+});
 
-```text
-DELIVERABLES/REVENUE-OS/.../01a-kit-execution-avis-temoignages.md
-DELIVERABLES/REVENUE-OS/.../02a-kit-execution-referral-recommandation.md
-ARTIFACTS/plan-action-executabilite-revenue-os.md
+it("reports an external candidate as unverified rather than published", async () => {
+  const fixture = await directCandidateFixture();
+  expect(await fixture.status()).toMatchObject({ verification_state: "external_candidate" });
+  expect(JSON.stringify(await fixture.status())).not.toContain('"published":true');
+});
 ```
 
-Assert:
+- [ ] **Step 2: Add PRJ-0003-shaped bypass acceptance test**
 
-- all three bytes are preserved;
-- all three become external candidates where the configured final-zone policy applies;
-- none creates a canonical project revision;
-- none creates an accepted decision;
-- none gets an artifact committed receipt;
-- none gets an implicit published managed-document pointer.
+Inject these exact relative shapes into an isolated routed project:
 
-- [ ] **Step 2: Add first-baseline and cursor-reset acceptance cases**
+```ts
+const directPaths = [
+  "DELIVERABLES/REVENUE-OS/04-playbooks-sectoriels/04b-pest-control/08-recurrence-reactivation-recommandation-support/01a-kit-execution-avis-temoignages.md",
+  "DELIVERABLES/REVENUE-OS/04-playbooks-sectoriels/04b-pest-control/08-recurrence-reactivation-recommandation-support/02a-kit-execution-referral-recommandation.md",
+  "ARTIFACTS/plan-action-executabilite-revenue-os-2026-08-25.md"
+];
 
-Prove the same files remain candidates when present before the initial baseline and when replayed after an injected `DropboxCursorResetError`.
+for (const path of directPaths) await fixture.writeExternal(path, `# direct ${path}`);
+const revisionBefore = await fixture.canonicalRevision();
+const result = await fixture.reconcile();
+expect(result.candidates).toBe(3);
+expect(await fixture.canonicalRevision()).toBe(revisionBefore);
+expect(await fixture.publishedHeadCountFor(directPaths)).toBe(0);
+expect(await fixture.artifactCommittedReceiptCountFor(directPaths)).toBe(0);
+```
 
-- [ ] **Step 3: Add artifact crash-after-provider-write test**
+- [ ] **Step 3: Add baseline and cursor-reset regression tests**
 
-Inject failure after visible provider create but before managed artifact/version/receipt completion. Assert durable intent exists first. Exact replay repairs the same request/destination and no candidate is created.
+Run the same unknown deliverable through first baseline and injected `DropboxCursorResetError`; assert candidate detection source differs but no published head is created.
 
-- [ ] **Step 4: Add route-change-during-recovery test**
+- [ ] **Step 4: Add artifact crash-after-provider-write recovery test**
 
-After the interrupted artifact write, apply a different route to the test state before replay. Assert the old intent's frozen destination is used and the new route is not silently chosen.
+Inject failure after visible provider create and before managed artifact/version/receipt completion. Assert:
 
-- [ ] **Step 5: Add managed publish crash regression**
+```ts
+expect(await fixture.intentExists()).toBe(true);
+expect(await fixture.candidateCount()).toBe(0);
+const replay = await fixture.replayArtifact();
+expect(replay).toMatchObject({ status: "committed" });
+expect(await fixture.versionCountForRequest()).toBe(1);
+```
 
-Reuse the current managed-document fault shape. Ensure MutationGate classifier treats the interrupted publication as governed-inflight and leaves existing exact replay repair intact.
+- [ ] **Step 5: Add route-drift and managed-publish crash regressions**
 
-- [ ] **Step 6: Add candidate resolution/replay matrix**
+Route drift must use stored artifact destination. Existing managed publish crash replay must remain `governed_inflight` and candidate count zero.
 
-Cover exact replay, reject, adopt artifact, adopt working, conflicting second resolution, unsupported content, and cache loss.
+- [ ] **Step 6: Add 50-operation multi-project stress test**
 
-- [ ] **Step 7: Add 50-operation multi-project stress test**
+```ts
+for (let index = 0; index < 25; index += 1) {
+  await Promise.all([
+    projectA.writeGovernedArtifact(index),
+    projectB.writeExternalCandidate(index)
+  ]);
+}
+await Promise.all([projectA.reconcile(), projectB.reconcile()]);
+expect(await projectA.foreignMutationGateRecordCount(projectB.projectId)).toBe(0);
+expect(await projectB.foreignMutationGateRecordCount(projectA.projectId)).toBe(0);
+expect(await projectA.duplicateIntentCount()).toBe(0);
+expect(await projectB.duplicateCandidateCount()).toBe(0);
+```
 
-Run mixed operations across two projects:
+Also delete Durable Object hot caches and replay one artifact intent plus one candidate to prove Dropbox evidence remains authoritative.
 
-- governed artifact writes;
-- managed working writes;
-- direct final-zone candidates;
-- candidate resolutions;
-- cursor reset on one project only.
-
-Assert no intent/candidate/resolution path crosses project roots and no request/candidate ID is rebound.
-
-- [ ] **Step 8: Run focused acceptance/fault/stress matrix**
+- [ ] **Step 7: Run focused acceptance/fault/stress matrix**
 
 ```bash
 npx vitest run \
+  test/mutation-gate-status.spec.ts \
   test/mutation-gate-acceptance.spec.ts \
   test/mutation-gate-faults.spec.ts \
   test/write-coordination-stress.spec.ts \
@@ -899,127 +1019,136 @@ npx vitest run \
 
 Expected: PASS.
 
-- [ ] **Step 9: Run full repository verification**
+- [ ] **Step 8: Run full repository gate**
 
 ```bash
 npm run check
 npx wrangler deploy --dry-run
 ```
 
-Expected: both commands exit 0. Do not proceed to production with any failing suite.
+Expected: both exit 0.
 
-- [ ] **Step 10: Commit Task 8**
+- [ ] **Step 9: Commit Task 7**
 
 ```bash
-git add test/mutation-gate-acceptance.spec.ts test/mutation-gate-faults.spec.ts test/write-coordination-stress.spec.ts test/helpers/mock-dropbox.ts
+git add test/mutation-gate-status.spec.ts test/mutation-gate-acceptance.spec.ts test/mutation-gate-faults.spec.ts test/write-coordination-stress.spec.ts test/helpers/mock-dropbox.ts
 git commit -m "test: prove mutation gate acceptance and recovery"
 ```
 
 ---
 
-### Task 9: Documentation PR, observe-mode production proof, enforcement gate, and canonical closure
+### Task 8: Operator docs, implementation PR, observe-mode production proof, enforcement gate, and canonical closure
 
 **Files:**
+- Create: `docs/mutation-gate.md`
+- Modify: `docs/project-os-sop.md`
+- Modify: `docs/managed-documents.md`
 - Modify: `docs/project-os-improvement-roadmap.md`
-- Modify: `docs/deployment.md` only for exact mutation-gate config/recovery instructions
-- Review: all files changed by Tasks 1-8
-- Canonical Project OS changes: separate receipt-gated transactions only after production evidence
+- Modify: `docs/deployment.md`
 
-**Interfaces:** operational release gate only.
+**Interfaces:** release/operations gate only.
 
-- [ ] **Step 1: Update roadmap truthfully before implementation PR merge**
+- [ ] **Step 1: Update SOP with exact operator routing invariant**
 
-Mark MUTATIONGATE as the active P0 item inserted before SCHEMA. Do not mark it complete until production proof and canonical closure exist.
-
-- [ ] **Step 2: Review exact diff for forbidden behavior**
-
-Check specifically for:
+Add this normative rule:
 
 ```text
-- unconditional DELIVERABLES baseline -> published adoption
-- raw final Dropbox writes from ChatGPT/operator-facing code paths
-- candidate deletion/move before immutable preservation
-- artifact provider write before durable mutation intent
-- artifact replay that recomputes a changed route
-- candidate detection that increments project business revision
-- content/secret logging
-- cross-project path construction
-- new ProjectState schema dependency
+Project OS agent/operator writes must use typed transaction, artifact,
+managed-document, or candidate-resolution ingress. A generic Dropbox write
+into a governed final business destination is never an equivalent durable
+Project OS mutation. If such a file appears, treat it as external/unverified
+until ProjectGuard evidence proves otherwise.
 ```
 
-- [ ] **Step 3: Open implementation PR from the isolated feature branch**
+Document exact `SUBMITTED`, `COMMITTED`, `CANONICAL VERIFIED`, and `ACCEPTED` distinctions.
 
-PR body must list exact acceptance suites, exact head SHA, expected production mode `observe`, and the statement that PRJ-0003 repair remains deferred until production validation.
+- [ ] **Step 2: Write runtime/operator mutation-gate documentation**
 
-- [ ] **Step 4: Verify exact PR head**
+`docs/mutation-gate.md` must explicitly include the B2 record paths, intent-before-effect ordering, final-zone classification, baseline/cursor-reset rule, unresolved-path guard, candidate resolution, observe/enforce semantics, crash recovery, rollback, PRJ-0003 repair sequence, SECURITY boundary, and SCHEMA boundary.
 
-Run/verify on the exact PR head:
+- [ ] **Step 3: Update managed-document docs and improvement roadmap truthfully**
 
-```bash
-npm run check
-npx wrangler deploy --dry-run
-```
+State that unknown final-zone files are no longer eligible for implicit published bootstrap. Insert `IMP-MUTATIONGATE001` before `IMP-SCHEMA001` and mark it active/pending implementation until production proof exists.
 
-Require GitHub CI green for the exact SHA.
+- [ ] **Step 4: Update deployment docs with exact configuration**
 
-- [ ] **Step 5: Merge only the exact green SHA**
-
-Use the repository's accepted merge method and record the merge SHA. Do not describe MUTATIONGATE as production-complete yet.
-
-- [ ] **Step 6: Deploy with continuity stable and mutation gate observe**
-
-Production configuration requirements:
+Document:
 
 ```text
 PROJECT_OS_CONTINUITY_MODE=stable
 PROJECT_OS_MUTATION_GATE_MODE=observe
 ```
 
-No connector permission change is part of this package rollout.
+and rollback:
 
-- [ ] **Step 7: Verify production health and read-only status**
+```text
+PROJECT_OS_MUTATION_GATE_MODE=enforce -> observe
+```
 
-Verify:
+Do not document or require any new secret for B2.
 
-- `/health` returns ok;
-- continuity reports `stable`;
-- mutation gate reports `observe`;
-- current project canonical revisions do not change merely from candidate inventory;
-- managed document reconciliation remains healthy.
+- [ ] **Step 5: Review exact implementation diff before PR**
 
-- [ ] **Step 8: Run non-destructive fleet candidate inventory**
+Reject the diff if any of these patterns exist:
 
-Scan active projects. Record counts/IDs/path-safe metadata only. Do not adopt, reject, move, delete, or repair candidates during this proof.
+```text
+unconditional DELIVERABLES baseline -> published adoption
+artifact provider write before durable mutation intent
+artifact exact replay that recomputes a changed route
+candidate deletion/move before immutable preservation
+ordinary artifact/document overwrite of unresolved candidate path
+candidate detection that increments ProjectState revision
+content or secret logging
+cross-project mutation-gate paths
+ProjectState schema bump introduced by MUTATIONGATE
+```
 
-- [ ] **Step 9: Validate false-positive rate against known governed writes**
+- [ ] **Step 6: Open implementation PR and verify exact head**
 
-Create isolated governed artifact and managed-document test operations through normal ingress and verify they are never classified as candidates. Inject one isolated raw final-zone test file and verify it becomes a candidate without publication/canonicalization.
+PR body must include exact head SHA, new/changed tests, `PROJECT_OS_MUTATION_GATE_MODE=observe`, continuity `stable`, and the statement that PRJ-0003 repair remains deferred.
 
-- [ ] **Step 10: Request explicit enforcement approval**
+Verify exact PR head:
 
-Present production evidence. Do not switch `PROJECT_OS_MUTATION_GATE_MODE=enforce` until the user explicitly accepts the production behavior and any inventory implications.
+```bash
+npm run check
+npx wrangler deploy --dry-run
+```
 
-- [ ] **Step 11: After explicit approval, activate enforce and repeat production proof**
+Require GitHub CI green for that exact SHA before merge.
 
-Keep continuity `stable`. Re-run governed-write and raw-bypass tests. Roll back to `observe` on unexpected classification behavior.
+- [ ] **Step 7: Merge exact green SHA and deploy observe mode**
 
-- [ ] **Step 12: Record PRJ-0002 production evidence through typed transactions**
+Deploy with continuity stable and gate mode observe. Verify `/health`, continuity status, mutation-gate mode, managed-document reconciliation, and that candidate inventory alone does not advance canonical project revisions.
 
-Refresh PRJ-0002 canonical revision first. Add accepted research/proof and complete `TASK-IMPMUTATIONGATE001` only when receipt status is committed and exact GitHub merge/deploy evidence is known.
+- [ ] **Step 8: Run non-destructive production inventory and false-positive proof**
 
-- [ ] **Step 13: Repair PRJ-0003 only after MUTATIONGATE closure**
+Inventory active-project candidates using IDs/path-safe metadata only. Then prove one normal governed artifact write and one normal managed-document publish are not candidates; prove one isolated raw final-zone test file is a candidate and remains non-governed.
 
-Bind PRJ-0003 separately, refresh its canonical state/revision, inventory the known direct files as candidates, preserve bytes, and route accepted business content through explicit governed adoption. Do not resubmit `DEC-EXECUTABILITY001`; it is already committed/accepted.
+- [ ] **Step 9: Request explicit enforcement approval**
 
-- [ ] **Step 14: Revalidate SCHEMA**
+Present observe evidence. Do not switch to `PROJECT_OS_MUTATION_GATE_MODE=enforce` until the user explicitly approves enforcement behavior.
 
-Return to PRJ-0002, refresh canonical revision, add the new mutation-gate record families to SCHEMA family compatibility/recovery review, and request explicit approval for the still-withheld SCHEMA rollout/implementation section.
+- [ ] **Step 10: After approval, switch to enforce and repeat proof**
+
+Keep continuity stable. If candidate classification unexpectedly catches governed writes, roll configuration back to observe and keep all durable candidate evidence.
+
+- [ ] **Step 11: Canonically close MUTATIONGATE only after production proof**
+
+Refresh PRJ-0002 revision. Add production research/evidence and complete `TASK-IMPMUTATIONGATE001` only through supported typed transactions with committed receipts and exact GitHub merge/deployment references.
+
+- [ ] **Step 12: Repair PRJ-0003 separately**
+
+Bind PRJ-0003, refresh its canonical revision, inventory the known direct files as candidates, preserve bytes, and route accepted content through explicit candidate adoption. Do not resubmit `DEC-EXECUTABILITY001`.
+
+- [ ] **Step 13: Revalidate SCHEMA before resuming it**
+
+Return to PRJ-0002, refresh canonical revision, include mutation-gate record families in SCHEMA compatibility/recovery review, and request explicit approval for the still-withheld SCHEMA rollout/implementation section.
 
 ---
 
 ## Plan self-review checklist
 
-Before implementation approval is requested, verify this plan against the B2 spec:
+Before requesting implementation approval, verify:
 
 - every unknown final-zone path is classified before published bootstrap;
 - artifact intent is durable before provider effect;
@@ -1027,7 +1156,8 @@ Before implementation approval is requested, verify this plan against the B2 spe
 - candidate bytes are preserved server-side before resolution;
 - candidate capture does not change ProjectState revision;
 - baseline and cursor reset cannot legitimize an unknown deliverable;
-- managed-document crash recovery is preserved;
+- ordinary writes cannot overwrite an unresolved candidate path;
+- managed-document crash recovery remains intact;
 - candidate resolution calls normal governed services;
 - observe mode is the first production mode;
 - no automatic destructive candidate cleanup exists;

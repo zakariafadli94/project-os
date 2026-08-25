@@ -72,6 +72,36 @@ describe("project state normalization", () => {
     expect(normalized.deliverables["DEL-3002"].accepted_at).toBeUndefined();
   });
 
+  it("keeps historical phase combinations readable without rewriting current phase or revision", () => {
+    const historical = legacyState();
+    historical.plan_phases = {
+      "PHASE-4401": {
+        phase_id: "PHASE-4401",
+        title: "Historical active",
+        next_actions: [],
+        status: "active",
+        created_at: at,
+        updated_at: at
+      },
+      "PHASE-4402": {
+        phase_id: "PHASE-4402",
+        title: "Historical pending",
+        next_actions: [],
+        status: "pending",
+        created_at: at,
+        updated_at: at
+      }
+    } as never;
+    historical.current_phase_id = null;
+
+    const normalized = normalizeProjectState(historical);
+
+    expect(normalized.revision).toBe(7);
+    expect(normalized.current_phase_id).toBeNull();
+    expect(normalized.plan_phases["PHASE-4401"].status).toBe("active");
+    expect(normalized.plan_phases["PHASE-4402"].status).toBe("pending");
+  });
+
   it("is idempotent", () => {
     const once = normalizeProjectState(legacyState());
     const twice = normalizeProjectState(once);

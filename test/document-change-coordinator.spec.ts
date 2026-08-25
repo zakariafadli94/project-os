@@ -80,6 +80,26 @@ describe("ProjectGuard managed document change reconciliation", () => {
     });
   });
 
+  it("does not bootstrap an unknown DELIVERABLE as published on the first baseline", async () => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-DOCCHANGE-PROJECT-0004", "doc-change-four");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const logicalPath = "strategy/direct.md";
+    const visiblePath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-doc-change-four/DELIVERABLES/${logicalPath}`;
+    await mock.writeExternal(visiblePath, "# ungoverned deliverable");
+
+    const baseline = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(await baseline.json()).toMatchObject({ baseline: true, bootstrapped: 0, conflicts: 0 });
+
+    const documentId = await documentIdFor(created.project_id, logicalPath);
+    const status = await guard.fetch(
+      `https://project-guard.internal/document-status?document_id=${encodeURIComponent(documentId)}`,
+      { method: "GET" }
+    );
+    expect(status.status).toBe(404);
+    expect(mock.files.get(visiblePath)).toBe("# ungoverned deliverable");
+  });
+
   it("captures only a new WORKING provider revision after the durable baseline cursor", async () => {
     const mock = installDropboxMock();
     const created = await createProject("TXN-DOCCHANGE-PROJECT-0001", "doc-change-one");
@@ -149,5 +169,34 @@ describe("ProjectGuard managed document change reconciliation", () => {
     );
     const head = await status.json<{ working_version_id: string }>();
     expect(head.working_version_id).not.toBe(document.version_id);
+  });
+
+  it("does not bootstrap an unknown DELIVERABLE as published after cursor reset", async () => {
+    const mock = installDropboxMock({
+      faults: [{
+        endpoint: "/2/files/list_folder/continue",
+        occurrence: 1,
+        status: 409,
+        error_summary: "reset/..."
+      }]
+    });
+    const created = await createProject("TXN-DOCCHANGE-PROJECT-0005", "doc-change-five");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+
+    const logicalPath = "strategy/reset-direct.md";
+    const visiblePath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-doc-change-five/DELIVERABLES/${logicalPath}`;
+    await mock.writeExternal(visiblePath, "# reset bypass");
+
+    const response = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(await response.json()).toMatchObject({ cursor_reset: true, baseline: true, bootstrapped: 0, conflicts: 0 });
+
+    const documentId = await documentIdFor(created.project_id, logicalPath);
+    const status = await guard.fetch(
+      `https://project-guard.internal/document-status?document_id=${encodeURIComponent(documentId)}`,
+      { method: "GET" }
+    );
+    expect(status.status).toBe(404);
+    expect(mock.files.get(visiblePath)).toBe("# reset bypass");
   });
 });

@@ -2,7 +2,6 @@ export * from "./repository-core";
 
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
 import type { ProjectState } from "../domain/project-state";
-import { LegacyArtifactDocumentWriter } from "../documents/legacy-artifact";
 import { ArtifactMutationIntentService } from "../mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../mutation-gate/repository";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
@@ -34,6 +33,7 @@ export class ProjectRepository extends CoreProjectRepository {
     }
     const replayState = stateForPreparedDestination(state, request, prepared.destination);
 
+    const { LegacyArtifactDocumentWriter } = await import("../documents/legacy-artifact");
     const managed = await new LegacyArtifactDocumentWriter(this.rawTransport).writeIfManaged(replayState, request);
     if (managed !== null) return managed;
     return super.writeArtifact(replayState, request);

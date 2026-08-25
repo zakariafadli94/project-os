@@ -29,6 +29,19 @@ export const mutationArtifactRouteSnapshotSchema = z.strictObject({
 
 export type MutationArtifactRouteSnapshot = z.infer<typeof mutationArtifactRouteSnapshotSchema>;
 
+export const mutationProviderPreconditionSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("absent") }),
+  z.strictObject({
+    kind: z.literal("existing"),
+    file_id: z.string().regex(/^id:[A-Za-z0-9_-]+$/),
+    rev: z.string().min(1).max(256),
+    content_hash: sha256Schema,
+    size: z.number().int().nonnegative().safe()
+  })
+]);
+
+export type MutationProviderPrecondition = z.infer<typeof mutationProviderPreconditionSchema>;
+
 export const mutationIntentRecordSchema = z.strictObject({
   schema_version: z.literal("1.0"),
   intent_id: mutationIntentIdSchema,
@@ -42,6 +55,7 @@ export const mutationIntentRecordSchema = z.strictObject({
   archive_path: z.string().min(1).optional(),
   route_id: z.string().regex(/^ROUTE-[A-Z0-9-]{4,}$/).optional(),
   route_snapshot: mutationArtifactRouteSnapshotSchema.optional(),
+  provider_precondition: mutationProviderPreconditionSchema,
   expected_content_sha256: sha256Schema,
   mode: z.enum(["create", "replace"]),
   recorded_at: z.string().min(1).max(128)

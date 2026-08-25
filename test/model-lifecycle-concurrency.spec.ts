@@ -193,4 +193,24 @@ describe("MODEL001 phase lifecycle", () => {
     }));
     expect(result).toMatchObject({ kind: "rejected", code: "PHASE_STATE_INCONSISTENT" });
   });
+
+  it("rejects new task and normative deliverable attachment to a completed phase", () => {
+    let state = emptyProjectState("PRJ-4203", "Phases", "phases");
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
+      phase_id: "PHASE-4205", title: "Closed phase"
+    }));
+    state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+      phase_id: "PHASE-4205"
+    }));
+
+    const task = applyTransaction(state, tx(state.project_id, state.revision, "task.create", {
+      task_id: "TASK-4201", title: "Too late", phase_id: "PHASE-4205"
+    }));
+    expect(task).toMatchObject({ kind: "rejected", code: "PHASE_COMPLETED" });
+
+    const deliverable = applyTransaction(state, tx(state.project_id, state.revision, "deliverable.create", {
+      deliverable_id: "DEL-4201", title: "Too late", version: "v1", phase_id: "PHASE-4205"
+    }));
+    expect(deliverable).toMatchObject({ kind: "rejected", code: "PHASE_COMPLETED" });
+  });
 });

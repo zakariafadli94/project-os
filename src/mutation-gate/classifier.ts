@@ -92,10 +92,16 @@ function strictZone(
   if (relative.startsWith("ARTIFACTS/") && relative.length > "ARTIFACTS/".length) {
     return { kind: "artifacts" };
   }
-  if (Object.values(state.artifact_routes).some((route) => pathMatchesPrefix(relative, route.target_prefix))) {
+  if (Object.values(state.artifact_routes).some((route) =>
+    routeTargetIsStrict(route.target_prefix) && pathMatchesPrefix(relative, route.target_prefix)
+  )) {
     return { kind: "artifacts" };
   }
   return null;
+}
+
+function routeTargetIsStrict(prefix: string): boolean {
+  return prefix !== "REFERENCES" && !prefix.startsWith("REFERENCES/");
 }
 
 function pathMatchesPrefix(path: string, prefix: string): boolean {

@@ -34,7 +34,7 @@ describe("IMP-MUTATIONGATE001 acceptance matrix", () => {
       "DELIVERABLES/REVENUE-OS/04-playbooks-sectoriels/04b-pest-control/08-recurrence-reactivation-recommandation-support/02a-kit-execution-referral-recommandation.md",
       "ARTIFACTS/plan-action-executabilite-revenue-os-2026-08-25.md"
     ];
-    const revisionBefore = canonicalRevision(dropbox, project.projectId);
+    const revisionBefore = await canonicalRevision(guard);
 
     for (const relative of directRelativePaths) {
       await dropbox.writeExternal(`${root}/${relative}`, `# direct ${relative}`);
@@ -49,7 +49,7 @@ describe("IMP-MUTATIONGATE001 acceptance matrix", () => {
       mutation_gate_mode: "observe",
       last_candidate_detection_source: "baseline"
     });
-    expect(canonicalRevision(dropbox, project.projectId)).toBe(revisionBefore);
+    expect(await canonicalRevision(guard)).toBe(revisionBefore);
 
     const candidates = await listCandidates(guard);
     expect(candidates).toHaveLength(3);
@@ -141,8 +141,8 @@ describe("IMP-MUTATIONGATE001 acceptance matrix", () => {
       governedGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" }),
       externalGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })
     ]);
-    const governedRevision = canonicalRevision(dropbox, governed.projectId);
-    const externalRevision = canonicalRevision(dropbox, external.projectId);
+    const governedRevision = await canonicalRevision(governedGuard);
+    const externalRevision = await canonicalRevision(externalGuard);
 
     const governedWrites = Array.from({ length: 25 }, async (_, index) => {
       const content = `# governed ${index}`;
@@ -173,8 +173,8 @@ describe("IMP-MUTATIONGATE001 acceptance matrix", () => {
     expect(await reconciliation.json()).toMatchObject({ candidates: 25, baseline: false });
     expect(await listCandidates(governedGuard)).toHaveLength(0);
     expect(await listCandidates(externalGuard)).toHaveLength(25);
-    expect(canonicalRevision(dropbox, governed.projectId)).toBe(governedRevision);
-    expect(canonicalRevision(dropbox, external.projectId)).toBe(externalRevision);
+    expect(await canonicalRevision(governedGuard)).toBe(governedRevision);
+    expect(await canonicalRevision(externalGuard)).toBe(externalRevision);
 
     const paths = [...dropbox.files.keys()];
     expect(paths.filter((path) => path.includes(`/projects/${governed.projectId}/mutation-gate/intents/artifacts/`))).toHaveLength(25);
@@ -203,10 +203,10 @@ async function createProject(transactionId: string, slug: string): Promise<Creat
   return { projectId: receipt.project_id, slug };
 }
 
-function canonicalRevision(dropbox: ReturnType<typeof installDropboxMock>, projectId: string): number {
-  const raw = dropbox.files.get(`/PROJECT_OS/.project-os/projects/${projectId}/state.json`);
-  if (!raw) throw new Error(`Missing canonical state for ${projectId}`);
-  return (JSON.parse(raw) as { revision: number }).revision;
+async function canonicalRevision(guard: DurableObjectStub): Promise<number> {
+  const response = await guard.fetch("https://project-guard.internal/materialization-status", { method: "GET" });
+  expect(response.status).toBe(200);
+  return (await response.json<{ canonical_revision: number }>()).canonical_revision;
 }
 
 async function listCandidates(guard: DurableObjectStub): Promise<CandidateStatus[]> {

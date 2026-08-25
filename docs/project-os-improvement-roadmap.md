@@ -129,9 +129,32 @@ Authoritative runtime/operator documentation: `docs/managed-documents.md`.
 
 Completion gate: exact green PR head, production deployment/health proof, read-only production smoke checks, then canonical Project OS evidence/task closure.
 
+#### 9A. `IMP-MUTATIONGATE001` — Project OS Mutation Gate — 🟠 implementation in review, production proof pending
+
+Purpose: prevent a raw Dropbox/provider mutation — including one caused by ChatGPT/operator misrouting — from silently becoming governed business truth when a typed Project OS path should have been used.
+
+Key outcomes:
+
+- durable artifact mutation intent recorded before provider effect, including frozen resolved destination and provider precondition;
+- strict final-zone provenance classification before bootstrap/reconciliation/cursor advancement;
+- unknown `DELIVERABLES/**` and business `ARTIFACTS/**` outputs preserved as immutable external mutation candidates rather than implicitly published;
+- baseline/cursor-reset safety: unknown final files never become published merely because they are discovered during rebuild;
+- typed candidate `reject`, `adopt_artifact`, and `adopt_working` resolution through normal governed services;
+- crash-safe candidate terminal resolution and idempotent recovery;
+- explicit `SUBMITTED -> COMMITTED -> CANONICAL VERIFIED -> ACCEPTED` vocabulary;
+- `observe` first rollout, with append-only evidence preserved across configuration rollback;
+- no ProjectState schema bump; MutationGate records start as independent schema-1.0 families;
+- no full credential/signature redesign; adversarial trust-boundary hardening remains owned by `IMP-SECURITY001`.
+
+Authoritative runtime/operator documentation: `docs/mutation-gate.md`.
+
+Dependency gate: MutationGate production validation occurs **before** SCHEMA runtime implementation/cutover. After MutationGate production proof, historical PRJ-0003 direct-write deviations are repaired separately through governed adoption/rejection; then SCHEMA rollout is revalidated against the new baseline.
+
 #### 10. `IMP-SCHEMA001` — Schema compatibility and migrations
 
 Purpose: make Project OS upgrades safe across projects created by different software/schema generations.
+
+Current gate: the accepted schema architecture/design checkpoint remains valid, but runtime implementation/rollout stays paused until `IMP-MUTATIONGATE001` has been production-validated, PRJ-0003 deviation repair is complete, and the schema rollout plan has been revalidated against those new durable record families.
 
 Key outcomes:
 
@@ -221,7 +244,9 @@ Key outcomes:
 - secret rotation procedures;
 - no secret values in chat/docs/GitHub;
 - installation-level client isolation;
-- explicit trust boundaries between UI, Project OS Core, hot state, and external persistence.
+- explicit trust boundaries between UI, Project OS Core, hot state, and external persistence;
+- where feasible, stronger capability/credential separation so an agent cannot physically perform unsupported final-zone provider writes;
+- cryptographic/non-forgeable provenance only if later threat modeling requires it.
 
 Explicit non-goal: global access to the user's computer filesystem.
 
@@ -344,6 +369,9 @@ Every remaining package must preserve these rules unless a later explicit archit
 - natural-language user workflow remains the default;
 - canonical committed history is never silently rewritten;
 - machine-managed canonical state is mutated only through supported Project OS mechanisms;
+- raw provider writes to strict final business zones never become governed truth merely from file presence;
+- unknown strict-zone outputs are preserved as external candidates until explicit governed resolution;
+- `SUBMITTED`, `COMMITTED`, `CANONICAL VERIFIED`, and `ACCEPTED` are not interchangeable states;
 - hot caches/read models are reconstructible from durable truth;
 - project isolation fails closed;
 - no product package requires direct PC/filesystem access;

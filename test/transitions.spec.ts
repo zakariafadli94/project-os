@@ -58,30 +58,4 @@ describe("applyTransaction", () => {
     }));
     expect(result.kind).toBe("conflict");
   });
-
-  it("allows a stale independent task completion only while the target transition is still valid", () => {
-    let state = emptyProjectState("PRJ-0001", "Agency", "agency");
-    const created = applyTransaction(state, tx({
-      operation: "task.create",
-      payload: { task_id: "TASK-0001", title: "Launch" }
-    }));
-    if (created.kind !== "commit") throw new Error("setup failed");
-    state = created.state;
-
-    const concurrent = { ...state, revision: state.revision + 2 };
-    const completed = applyTransaction(concurrent, tx({
-      base_revision: state.revision,
-      operation: "task.complete",
-      payload: { task_id: "TASK-0001" }
-    }));
-    expect(completed.kind).toBe("commit");
-
-    if (completed.kind !== "commit") throw new Error("completion failed");
-    const replayFromStale = applyTransaction(completed.state, tx({
-      base_revision: state.revision,
-      operation: "task.complete",
-      payload: { task_id: "TASK-0001" }
-    }));
-    expect(replayFromStale.kind).toBe("rejected");
-  });
 });

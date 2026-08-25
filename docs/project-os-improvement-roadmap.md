@@ -77,7 +77,7 @@ Purpose: poison-entry isolation, continued healthy processing, exact replay clea
 
 ### Projection, data integrity, and model foundation
 
-#### 8. `IMP-MATERIAL001` — Projection Engine — 🟡 active
+#### 8. `IMP-MATERIAL001` — Projection Engine — ✅ complete
 
 Purpose: replace full synchronous workspace rewrites with asynchronous, incremental, hash-aware, generation-verifiable materialization.
 
@@ -96,17 +96,38 @@ Key outcomes:
 
 Authoritative design: `docs/superpowers/specs/2026-08-24-imp-material001-projection-engine-design.md`.
 
-#### 9. `IMP-ARTIFACT001` — Artifact concurrency and stale-destination safety
+#### 9. `IMP-ARTIFACT001` — Managed Document & Artifact Governance — 🟢 active, implementation complete pending production proof
 
-Purpose: detect and fail safely when governed destination files changed concurrently or became stale between planning and write.
+Purpose: provide a safe lifecycle for human/AI documents while preventing stale or concurrent provider writes from silently overwriting work.
+
+Visible lifecycle:
+
+```text
+INPUTS -> REFERENCES
+
+WORKING -> REVIEW -> DELIVERABLES
+   ^                        |
+   +------ reopen ----------+
+```
 
 Key outcomes:
 
-- destination revision/hash preconditions;
-- stale-write detection;
-- safe concurrent edit handling;
-- no silent overwrite of unexpected content;
-- artifact operations remain idempotent and project-isolated.
+- explicit `INPUTS`, `REFERENCES`, `WORKING`, `REVIEW`, and `DELIVERABLES` governance;
+- immutable per-project document version ledger and repairable logical heads;
+- content-addressed SHA-256 text payloads plus opaque provider snapshots for binary files;
+- logical `expected_version_id` stale-context protection;
+- Dropbox `rev` compare-and-swap for atomic provider-side replacement protection;
+- external Obsidian/Dropbox edits captured as versions rather than silently overwritten;
+- direct edits to published deliverables preserved while the approved published version is restored;
+- reference ingestion, deduplication, explicit collection classification, and lazy legacy adoption;
+- durable incremental Dropbox change cursor with bounded reset/baseline recovery;
+- crash recovery when provider publication succeeds before ledger/head/receipt completion;
+- existing artifact API compatibility and project isolation;
+- generated Project OS projections remain distinct from collaborative managed documents.
+
+Authoritative runtime/operator documentation: `docs/managed-documents.md`.
+
+Completion gate: exact green PR head, production deployment/health proof, read-only production smoke checks, then canonical Project OS evidence/task closure.
 
 #### 10. `IMP-SCHEMA001` — Schema compatibility and migrations
 

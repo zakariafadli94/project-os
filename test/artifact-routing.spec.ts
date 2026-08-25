@@ -87,8 +87,6 @@ async function artifactRequest(overrides: Partial<ArtifactWriteRequest> = {}): P
     request_id: "ART-ROUTING-000001",
     project_id: "PRJ-0003",
     relative_path: "REVENUE-OS/04-playbooks-sectoriels/foo.md",
-    content,
-    content_sha256: await sha256Text(content),
     mode: "create",
     ...overrides,
     content,

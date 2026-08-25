@@ -135,6 +135,26 @@ describe("ManagedDocumentReconciler external edits", () => {
     expect(dropbox.downloads).not.toContain(path);
   });
 
+  it("restores a deleted WORKING file from its immutable active version without advancing history", async () => {
+    const dropbox = new FakeDocumentDropbox();
+    const project = state();
+    const service = new ManagedDocumentService(dropbox);
+    const working = await createWorking(service, project, "draft to protect");
+    const path = workspaceManagedDocumentPath(project.project_id, project.slug, "working", "strategy/commerciale.md");
+    await dropbox.delete(path);
+
+    const summary = await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [
+      { tag: "deleted", name: "commerciale.md", path }
+    ]);
+
+    const ledger = new DocumentLedgerRepository(dropbox);
+    const head = await ledger.readHead(project.project_id, working.document_id);
+    expect(summary.restored).toBe(1);
+    expect(dropbox.files.get(path)).toBe("draft to protect");
+    expect(head?.working_version_id).toBe(working.version_id);
+    expect(head?.provider?.working?.path).toBe(path);
+  });
+
   it("captures an external REVIEW edit as a new review candidate without publishing it", async () => {
     const dropbox = new FakeDocumentDropbox();
     const project = state();
@@ -193,6 +213,28 @@ describe("ManagedDocumentReconciler external edits", () => {
     expect(head?.working_version_id).toBe(await externalVersionIdFor(external.rev));
     expect(dropbox.files.get(publishedPath)).toBe("approved v1");
     expect(dropbox.files.get(workingPath)).toBe("human post-publish changes");
+  });
+
+  it("restores a deleted published deliverable without changing the frozen published version", async () => {
+    const dropbox = new FakeDocumentDropbox();
+    const project = state();
+    const service = new ManagedDocumentService(dropbox);
+    const working = await createWorking(service, project, "approved deletion-safe v1");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-DELETE-0001", project_id: project.project_id, document_id: working.document_id, expected_version_id: working.version_id, created_at: at }, project);
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-DELETE-0001", project_id: project.project_id, document_id: working.document_id, expected_version_id: review.version_id, created_at: at }, project);
+    const publishedPath = workspaceManagedDocumentPath(project.project_id, project.slug, "deliverables", "strategy/commerciale.md");
+    await dropbox.delete(publishedPath);
+
+    const summary = await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [
+      { tag: "deleted", name: "commerciale.md", path: publishedPath }
+    ]);
+
+    const ledger = new DocumentLedgerRepository(dropbox);
+    const head = await ledger.readHead(project.project_id, working.document_id);
+    expect(summary.restored).toBe(1);
+    expect(dropbox.files.get(publishedPath)).toBe("approved deletion-safe v1");
+    expect(head?.published_version_id).toBe(published.version_id);
+    expect(head?.provider?.published?.path).toBe(publishedPath);
   });
 
   it("preserves an existing WORKING draft when a published deliverable is edited externally", async () => {

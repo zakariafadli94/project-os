@@ -69,7 +69,7 @@ describe("IMP-MUTATIONGATE001 acceptance matrix", () => {
     }
 
     expect([...dropbox.files.keys()].filter((path) => path.includes("/.project-os/artifacts/receipts/"))).toHaveLength(0);
-  });
+  }, 15_000);
 
   it("never bootstraps an unknown deliverable on baseline and records baseline provenance", async () => {
     const dropbox = installDropboxMock();

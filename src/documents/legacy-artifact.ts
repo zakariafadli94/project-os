@@ -73,7 +73,8 @@ export class LegacyArtifactDocumentWriter {
         state,
         destination.path,
         metadata,
-        "published"
+        "published",
+        { publishedProvenance: "legacy_artifact" }
       )).head;
     }
 

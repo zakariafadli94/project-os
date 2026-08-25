@@ -193,7 +193,13 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
     case "task.create": {
       const p = tx.payload;
       if (next.tasks[p.task_id]) return rejected("TASK_EXISTS", `Task ${p.task_id} already exists`);
-      if (p.phase_id && !next.plan_phases[p.phase_id]) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+      if (p.phase_id) {
+        const phase = next.plan_phases[p.phase_id];
+        if (!phase) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+        if (phase.status === "completed") {
+          return rejected("PHASE_COMPLETED", `Cannot create task in completed phase ${p.phase_id}`);
+        }
+      }
       next.tasks[p.task_id] = {
         task_id: p.task_id,
         title: p.title,
@@ -382,7 +388,13 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
     case "deliverable.create": {
       const p = tx.payload;
       if (next.deliverables[p.deliverable_id]) return rejected("DELIVERABLE_EXISTS", `Deliverable ${p.deliverable_id} already exists`);
-      if (p.phase_id && !next.plan_phases[p.phase_id]) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+      if (p.phase_id) {
+        const phase = next.plan_phases[p.phase_id];
+        if (!phase) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+        if (phase.status === "completed") {
+          return rejected("PHASE_COMPLETED", `Cannot create deliverable in completed phase ${p.phase_id}`);
+        }
+      }
       for (const decisionId of p.decision_ids ?? []) {
         if (!next.decisions[decisionId]) return rejected("DECISION_NOT_FOUND", `Decision ${decisionId} does not exist`);
       }

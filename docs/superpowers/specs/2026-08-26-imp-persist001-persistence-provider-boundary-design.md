@@ -8,28 +8,26 @@ This document authorizes design/specification only. It does not authorize runtim
 
 ## Purpose
 
-Introduce a real provider-neutral runtime persistence boundary while keeping Dropbox as the only production persistence provider in this package.
+Introduce a real provider-neutral **runtime** persistence boundary while keeping Dropbox as the only production persistence provider in this package.
 
-The package must prevent Project OS Core, repositories, materialization, managed documents, MutationGate, inbox processing, and Durable Objects from depending directly on Dropbox client classes, Dropbox error classes, Dropbox retry classification, or Dropbox-specific capability probing.
+PERSIST001 removes Dropbox-specific operational coupling from Project OS Core, repositories, materialization, managed documents, MutationGate, inbox processing, ProjectGuard, and RegistryGuard. At the same time, it preserves every existing schema-1.0 persisted record and Dropbox V1 compatibility exactly.
 
-At the same time, it must preserve every existing schema-1.0 persisted record and Dropbox V1 compatibility exactly. Provider-shaped persisted fields and identities are intentionally not generalized in PERSIST001; that work remains a dependency of IMP-SCHEMA001.
+The package explicitly does **not** make historical serialized provider evidence provider-neutral. Generalizing persisted `provider_*` fields, MutationGate provider preconditions/candidates, provider-derived IDs, migrations, or upcasters remains owned by IMP-SCHEMA001.
 
-## Design decision
+## Architecture decision
 
-Adopt **Option B — provider-neutral runtime boundary with explicit Dropbox V1 compatibility seam**.
-
-The intended architecture is:
+Adopt **Option B — provider-neutral runtime boundary with an explicit Dropbox V1 schema compatibility seam**.
 
 ```text
 Domain / Project OS services
           |
           v
-persistence/*
+src/persistence/*
   - logical layout and paths
   - repositories
   - provider-neutral contracts
   - provider-neutral errors
-  - capability requirements
+  - explicit capability requirements
   - provider-neutral resilience
           |
           v
@@ -42,7 +40,7 @@ Dropbox persistence adapter
 Dropbox API
 ```
 
-Alongside that runtime boundary, schema-1.0 provider evidence remains isolated through an explicit compatibility seam:
+Persisted provider-shaped schema-1.0 evidence remains isolated:
 
 ```text
 provider-neutral runtime metadata/evidence
@@ -54,57 +52,50 @@ Dropbox V1 schema compatibility seam
 existing schema-1.0 fields and identities
 ```
 
-PERSIST001 therefore makes execution provider-neutral, not historical serialized formats provider-neutral.
+PERSIST001 therefore makes **execution** provider-neutral, not the historical durable format.
 
-## Goals
+## Baseline and hard constraints
 
-PERSIST001 must:
+The design is validated against:
 
-- keep Dropbox as the only production provider;
-- introduce a provider-neutral persistence contract used by runtime services and repositories;
-- make provider capabilities explicit and semantically defined;
-- remove direct Core dependencies on `DropboxTransport`, `DropboxConflictError`, Dropbox API errors, and Dropbox retry classification;
-- centralize provider construction so Dropbox credentials/client setup exist in one production factory rather than across multiple layers;
-- preserve all existing paths, records, IDs, schema versions, and Dropbox V1 behavior;
-- preserve current reliability semantics, including bounded retries, fail-closed conflict handling, idempotent recovery, server-side snapshots, CAS behavior, and cursor-reset recovery;
-- leave MutationGate in `observe`;
-- create no requirement for a local filesystem or user PC bridge;
-- establish a clean foundation for later INDEX/OBSERVE/SECURITY/PERF packages and a separately approved alternate provider.
+- canonical PRJ-0002 revision 92 at design validation;
+- `main` merge commit `946337526c8da541db00cd4ec5ff76207e6295a6`;
+- production layout mode `v2`;
+- continuity mode `stable`;
+- MutationGate mode `observe`.
 
-## Non-goals
+PERSIST001 must preserve these constraints:
 
-PERSIST001 must not:
-
-- add SharePoint, Google Drive, S3, filesystem, or any other production provider;
-- add a provider-selection environment variable or dynamic provider registry;
-- introduce a local filesystem provider, desktop daemon, or PC dependency;
-- migrate or rewrite persisted data;
-- bump any schema version;
-- introduce schema upcasters or migrations;
-- generalize persisted `provider_file_id`, `provider_rev`, `provider_content_hash`, provider paths, MutationGate provider preconditions, candidate records, or provider-derived IDs;
-- change candidate identity semantics;
-- change managed-document version identity semantics;
-- launch PRJ-0003 deviation repair;
-- launch SCHEMA runtime;
-- switch MutationGate from `observe` to `enforce`;
-- change continuity rollout mode;
-- retune retry budgets or make unrelated performance changes.
+- Dropbox remains the sole production provider.
+- No SharePoint, Google Drive, S3, filesystem, or other provider is added.
+- No local filesystem provider, desktop daemon, PC bridge, or direct PC dependency is added.
+- No provider-selection environment variable or dynamic provider registry is added.
+- No data migration or rewrite is performed.
+- No schema version is bumped.
+- No schema upcaster is introduced.
+- No persisted path value changes.
+- No existing schema-1.0 record shape, field, regex contract, provider-derived ID, or provider evidence is generalized.
+- MutationGate remains `observe`.
+- PRJ-0003 repair does not run.
+- SCHEMA runtime does not run.
+- Continuity rollout mode does not change.
+- Retry budgets are not retuned as part of this package.
 
 ## Current coupling being removed
 
-The current code uses `DropboxTransport` as both a low-level provider API and an implicit capability bag. Its metadata shape carries Dropbox concepts directly (`id`, `rev`, `content_hash`), optional methods are used as runtime feature detection, and callers catch `DropboxConflictError` directly.
+The current `DropboxTransport` is not a true provider boundary. It combines base object operations, optional capability methods, Dropbox metadata (`id`, `rev`, `content_hash`), and Dropbox-specific error semantics.
 
-`ResilientDropboxTransport` also knows Dropbox HTTP status behavior and Dropbox request IDs, and several repositories/services construct their own resilient wrappers.
+`ResilientDropboxTransport` additionally owns Dropbox HTTP retry classification and catches `DropboxConflictError` for recovery behavior. Multiple repositories/services independently create resilient wrappers.
 
-Direct `DropboxClient` construction currently occurs in multiple runtime composition locations, including worker helpers and Durable Object constructors.
+Direct `DropboxClient` construction currently occurs in multiple runtime composition locations, including Worker/admin helpers and Durable Object constructors.
 
-Provider-independent Project OS concepts such as logical storage paths, workspace layout, artifact routing, and repositories are also located under `src/dropbox/`, which makes the namespace itself falsely provider-specific.
+Provider-independent Project OS concepts such as logical layout, paths, artifact routing, and repositories also live under `src/dropbox/`, which makes the namespace itself falsely provider-specific.
 
 PERSIST001 must remove these forms of coupling rather than merely rename them.
 
-## Target package boundaries
+## Target source ownership
 
-The implementation plan may refine filenames, but the architectural ownership must follow this structure:
+The implementation plan may refine filenames, but ownership and dependency direction must follow this shape:
 
 ```text
 src/persistence/
@@ -128,31 +119,31 @@ src/persistence/
   production-factory
 ```
 
-Provider-independent artifact routing belongs with Project OS persistence/workspace governance rather than the Dropbox adapter.
+Provider-independent artifact routing belongs with Project OS persistence/workspace governance, not the Dropbox adapter.
 
-The exact persisted path strings remain unchanged. Moving path-building code between source modules must not alter any `/PROJECT_OS/...` value.
+Moving source files must not change any persisted `/PROJECT_OS/...` path value.
 
 ## Provider-neutral base contract
 
-The provider boundary represents a hierarchical Project OS object namespace. Paths are Project OS logical persistence paths; they are not declared to be native filesystem paths.
+The provider boundary represents a hierarchical Project OS object namespace. Paths are Project OS persistence paths; they are not declared to be local filesystem paths.
 
-The base contract must cover the operations that are universally required by current Project OS runtime flows:
+The base contract must preserve the operations and semantics used by current production flows:
 
 - read a text object and return absence explicitly;
-- create a text object without silent overwrite or autorename;
-- replace a text object according to the provider's ordinary replace semantics;
+- create a text object with **create-only** semantics, without silent overwrite or autorename;
+- **upsert/overwrite** a text object, creating it when absent and replacing it when present, preserving the current Dropbox `overwrite` behavior used by mutable heads/snapshots/views;
 - read object metadata and return absence explicitly;
-- list immediate children for a logical path;
-- move/rename an object without silent destination overwrite;
-- delete an object idempotently when absent.
+- list immediate children, returning the current empty/missing semantics expected by callers;
+- move/rename without silently overwriting a destination;
+- delete idempotently when the object is absent.
 
-Provider operations should return provider-neutral object metadata whenever the provider naturally supplies it. Callers must not parse provider-specific HTTP responses or error payloads.
+Provider operations return provider-neutral metadata where applicable. Core callers must not parse provider-specific HTTP responses or error payloads.
 
-The contract must preserve current fail-closed behavior. A provider adapter may not emulate an unsupported strong guarantee with a weaker read-then-write sequence and report it as equivalent.
+A provider adapter must never emulate an unsupported strong guarantee with a weaker sequence and advertise it as equivalent.
 
 ## Provider-neutral metadata
 
-Runtime metadata must use provider-neutral concepts:
+Runtime metadata uses provider-neutral concepts:
 
 ```text
 path
@@ -165,7 +156,7 @@ integrityHash?
 
 `objectId` and `revisionToken` are opaque strings. Core code must not parse or rely on Dropbox formats.
 
-`integrityHash` must carry both semantic identity and value, for example conceptually:
+`integrityHash` carries semantic/algorithm identity plus value, conceptually:
 
 ```text
 algorithm
@@ -174,147 +165,169 @@ value
 
 The Core must not assume Dropbox `content_hash` is SHA-256 or interchangeable with Project OS canonical SHA-256 content hashes.
 
-For Dropbox production, the adapter maps Dropbox metadata into this neutral representation. The schema-1.0 compatibility seam may then validate and serialize the exact legacy Dropbox values where existing records require them.
+For Dropbox production, the adapter maps Dropbox `id`, `rev`, and `content_hash` into this neutral representation.
 
-## Explicit capabilities
+## Explicit provider capabilities
 
-Capabilities are contracts with defined semantics, not merely booleans and not optional transport methods probed throughout business code.
+Capabilities are semantic contracts, not booleans with vague meaning and not optional transport methods probed throughout business code.
 
-The provider profile must describe these six capabilities:
+PERSIST001 makes these six capabilities explicit:
 
-### 1. Conditional write
+1. **conditional write**;
+2. **server-side copy**;
+3. **incremental change feed**;
+4. **stable object ID**;
+5. **revision token**;
+6. **integrity hash**.
 
-A conditional write is a true provider-side compare-and-swap against an opaque revision token.
+### Conditional write
 
-It must not be implemented as:
+A conditional write is true provider-side compare-and-swap against an opaque revision token.
 
-```text
-read metadata -> compare locally -> ordinary overwrite
-```
+`read metadata -> compare locally -> ordinary overwrite` is not equivalent and must not be advertised as this capability.
 
-because that sequence does not provide the concurrency guarantee required by managed-document publication.
+### Server-side copy
 
-### 2. Server-side copy
+A server-side copy duplicates/snapshots an object within provider storage without downloading and re-uploading the payload through Project OS.
 
-A server-side copy duplicates an object within provider storage without downloading and re-uploading the payload through Project OS.
+PERSIST001 must not silently substitute a client-side copy for managed-document or MutationGate snapshot operations, including opaque/binary payloads.
 
-PERSIST001 must not silently substitute client-side copy for this capability, because current managed-document and MutationGate snapshot semantics deliberately rely on provider-side copying, including binary/opaque payloads.
+### Incremental change feed
 
-### 3. Incremental change feed
+The provider supplies an opaque cursor, continuation from that cursor, file/folder/deletion observations required by current reconciliation, and an explicit cursor-reset condition.
 
-The provider can enumerate changes incrementally using an opaque cursor, including file, folder, and deletion observations needed by current managed-document reconciliation.
+### Stable object ID
 
-Cursor invalidation/reset must surface as a typed provider-neutral condition so the existing bounded baseline rebuild path remains possible.
+The provider supplies an opaque object identity stable under the rename/move semantics relied on by current Dropbox V1 managed-document and MutationGate records.
 
-### 4. Stable object ID
+### Revision token
 
-The provider supplies an opaque object identity stable enough for the existing Dropbox V1 managed-document and MutationGate identity semantics, including rename/move behavior relied upon by current records.
+The provider supplies an opaque version token suitable for equality and conditional-write preconditions. Core code does not inspect its internal representation.
 
-### 5. Revision token
+### Integrity hash
 
-The provider supplies an opaque object revision/version token suitable for equality and conditional-write preconditions.
-
-The Core must not inspect the token's internal format.
-
-### 6. Integrity hash
-
-The provider supplies content-integrity evidence with an identified algorithm/semantic. Equality is valid only when both algorithm and value match.
-
-The runtime abstraction must not rename arbitrary provider hashes to SHA-256.
+The provider supplies content-integrity evidence with identified semantics/algorithm. Neutral runtime equality requires compatible semantics plus equal value.
 
 ## Capability binding rules
 
-Services must bind required capabilities at construction/composition time rather than repeatedly testing for optional methods during operations.
+Runtime consumers must not detect capabilities via `if (transport.copy)`, `if (transport.uploadConditional)`, or equivalent optional-method checks.
+
+Capabilities are bound and validated at construction/composition time. Services receive the typed capability ports they require, or a prepared runtime bundle that has already passed fail-fast capability assertions.
 
 Examples:
 
-- ordinary canonical repository operations require only the base provider contract;
+- ordinary canonical repository operations require the base object contract;
 - managed-document publication/update requires conditional write plus revision-token capability;
 - provider snapshots require server-side copy;
-- managed-document change coordination requires incremental change feed;
+- managed-document reconciliation requires incremental change feed;
 - Dropbox V1 managed-document and MutationGate compatibility requires stable object ID, revision token, and Dropbox-compatible integrity evidence.
 
-If a required capability is missing, construction must fail explicitly before business mutation begins.
+Because Dropbox is the only production provider in PERSIST001 and all current features are enabled, production composition must validate the complete required Dropbox capability profile before business mutation begins.
 
-Because Dropbox is the only production provider in PERSIST001, production startup/composition must prove that the Dropbox adapter satisfies the complete capability profile needed by enabled Project OS features.
+A future provider lacking a required capability cannot be activated merely because it implements the base interface.
 
 ## Provider-neutral error model
 
-The Core must no longer catch Dropbox error classes.
+Core runtime consumers must no longer import or catch:
 
-The provider boundary must expose provider-neutral errors sufficient to preserve current semantics. At minimum the design needs:
+- `DropboxConflictError`;
+- `DropboxApiError`;
+- `DropboxCursorResetError`;
+- raw Dropbox HTTP status codes or Dropbox response-body strings.
 
-- general provider operation failure with a `retryable` classification;
-- conflict/already-exists failure;
+The provider boundary exposes neutral error categories sufficient for existing behavior, including at least:
+
+- provider operation failure with retryable/terminal classification;
+- create/destination conflict;
 - conditional-write/precondition failure;
-- cursor-reset failure;
-- unsupported/missing capability failure;
-- terminal provider failure.
+- change-cursor reset;
+- unsupported/missing capability.
 
-Provider-specific details such as Dropbox HTTP status, raw error payload, or request ID may be retained as opaque diagnostic metadata for logs, but business code must not branch on them.
+Not-found cases remain normal absence where current semantics use absence rather than failure.
 
-The Dropbox adapter is responsible for mapping raw Dropbox responses into the provider-neutral error taxonomy.
+Provider-specific diagnostics such as HTTP status, Dropbox request ID, or provider error code may be retained as opaque observability detail, but Core branching must not depend on them.
 
-A conditional Dropbox 409 must map to the provider-neutral precondition/CAS failure expected by managed-document logic rather than forcing business services to know Dropbox's status vocabulary.
+The Dropbox adapter owns mapping raw Dropbox failures to these neutral categories. A Dropbox conditional 409 becomes a provider-neutral precondition/CAS failure before managed-document business logic sees it.
 
 ## Resilience and retry boundary
 
-Retry is a provider-neutral decorator around a provider whose adapter has already classified errors.
+PERSIST001 separates provider-specific error normalization from generic retry behavior.
 
-The resilience layer may retry only failures marked retryable by the adapter/neutral error contract. It must not contain Dropbox response-body parsing or Dropbox status knowledge.
+The Dropbox adapter owns:
 
-PERSIST001 preserves the currently validated retry policy and timing behavior. It does not retune retry counts, backoff, or jitter.
+- OAuth/token refresh;
+- Dropbox HTTP requests;
+- parent-folder creation behavior;
+- Dropbox conflict/cursor-reset recognition;
+- raw error mapping;
+- Dropbox-specific operation normalization required to satisfy the neutral contract.
 
-A composition context must create the resilient provider once and inject it downward. Services and repositories must not repeatedly wrap the same raw provider in separate resilient transports.
+A provider-neutral resilience decorator owns bounded retries using only neutral error information such as `retryable`.
 
-The current move-recovery/idempotency semantics must be preserved behind provider-neutral conflict errors. Refactoring the boundary must not weaken inbox archival, workspace archive, or retry safety.
+The refactor must preserve the currently validated production behavior:
 
-## Production construction and injection
+- bounded attempts;
+- current base backoff behavior;
+- jitter behavior;
+- fail-closed terminal semantics;
+- current logging/correlation intent;
+- move/archive/replay idempotency behavior.
 
-Introduce one authoritative production factory, conceptually:
+PERSIST001 is not a retry-tuning or performance package.
+
+If move recovery depends on Dropbox-specific API collision behavior, that normalization belongs in the Dropbox adapter rather than leaking Dropbox error classes into Core.
+
+## Centralized production composition
+
+Introduce one authoritative production construction path, conceptually:
 
 ```text
 createProductionPersistence(env)
 ```
 
-The exact function name may change in the implementation plan, but the ownership rule is fixed:
+The exact name may be refined in the implementation plan, but the architectural rule is fixed:
 
-- it is the only production location that knows Dropbox credential names and constructs the Dropbox client/adapter;
+- it is the only ordinary production location that knows Dropbox credential names and constructs the Dropbox client/adapter;
 - it creates the provider-neutral Dropbox adapter;
-- it applies the provider-neutral resilience decorator once;
+- it applies the provider-neutral resilience layer exactly once;
 - it validates the production capability profile;
-- it returns the provider-neutral runtime object used by callers.
+- it returns a provider-neutral runtime/bundle for injection.
 
-PERSIST001 does not add `PROJECT_OS_PROVIDER` or any provider switch. The factory always builds Dropbox.
+PERSIST001 does not add `PROJECT_OS_PROVIDER` or another provider selector. The factory always builds Dropbox.
 
-Cloudflare Durable Objects are platform-created and therefore cannot receive an already-instantiated provider from the outer Worker. Their constructors may call the shared production factory with `env`; this is still centralized construction because direct `new DropboxClient(...)` is forbidden outside the factory.
+Cloudflare Durable Objects are platform-created and cannot receive an instantiated provider from the outer Worker. Their constructors may call the same authoritative factory with `env`; this is centralized construction because direct `new DropboxClient(...)` remains forbidden outside the factory.
 
-Within each Worker/DO composition context, the constructed provider is reused and injected into repositories/services rather than recreated inside them.
+Within a composition context:
+
+- `ProjectGuard` creates the prepared runtime once and injects it into its repository, managed-document services, change coordinator, and materialization writer;
+- `RegistryGuard` uses the same factory path once for its context;
+- Worker/admin/inbox flows use the same factory path rather than constructing Dropbox directly;
+- lower-level services do not add their own resilience wrappers.
 
 ## Logical layout and path ownership
 
-`layout.ts`, `paths.ts`, and provider-independent artifact routing express Project OS storage conventions and governance. They are not Dropbox API adapters.
+`layout.ts`, `paths.ts`, and provider-independent artifact routing express Project OS storage conventions/governance, not Dropbox API behavior.
 
-PERSIST001 moves their architectural ownership out of the Dropbox namespace into provider-independent persistence/workspace modules.
+PERSIST001 moves their architectural ownership out of the Dropbox namespace.
 
-All path values must remain byte-for-byte compatible with the current Dropbox V1 layout. Examples include, without limitation:
+Every generated legacy and V2 path string remains byte-for-byte identical to current `main`, including:
 
 - `/PROJECT_OS/.project-os/...` machine paths;
-- `/PROJECT_OS/WORKSPACE/...` human workspace paths;
-- `/PROJECT_OS/ARCHIVE/...` archived workspace paths;
-- legacy transaction/receipt/project paths still required for compatibility.
+- `/PROJECT_OS/WORKSPACE/...` workspace paths;
+- `/PROJECT_OS/ARCHIVE/...` archive paths;
+- legacy transaction, receipt, registry, event, decision, and project paths.
 
-The package performs no path migration and no data movement.
+No Dropbox data is renamed, moved, rewritten, or migrated.
 
 ## Dropbox V1 schema compatibility seam
 
-This is the critical scope boundary with IMP-SCHEMA001.
+This is the critical boundary with IMP-SCHEMA001.
 
-Current schema-1.0 records already persist Dropbox-shaped provider evidence. PERSIST001 must not change those structures.
+Existing schema-1.0 records already persist Dropbox-shaped provider evidence. PERSIST001 may translate neutral runtime metadata into those exact values, but it must not generalize them.
 
-The compatibility seam translates provider-neutral Dropbox runtime metadata into the exact existing schema-1.0 values and validates the reverse direction when runtime comparisons need legacy records.
+The compatibility seam consumes **provider-neutral runtime metadata** and existing domain records. It may know Dropbox V1 persisted value constraints and validation rules, but it must **not** import or depend on raw `DropboxClient`, `DropboxTransport`, Dropbox API error classes, or Dropbox retry helpers. Raw runtime Dropbox behavior belongs only in the Dropbox provider adapter/composition layer.
 
-It must preserve, without renaming or reinterpreting persisted fields:
+The seam preserves exactly:
 
 - `provider_file_id`;
 - `provider_rev`;
@@ -327,158 +340,160 @@ It must preserve, without renaming or reinterpreting persisted fields:
 - `ReferenceFingerprintRecord`;
 - MutationGate provider preconditions;
 - MutationGate candidate provider evidence;
-- provider-derived managed-document IDs/version IDs;
-- provider-derived MutationGate candidate IDs.
+- `documentIdForProviderFile` behavior;
+- external version IDs derived from provider revision;
+- MutationGate candidate IDs derived from `(project_id, provider_file_id, provider_rev)`;
+- all existing schema-1.0 field optionality, regex constraints, and path semantics.
 
-The compatibility seam must explicitly verify that the active production provider is Dropbox V1-compatible before producing these records. It must not pretend another provider could safely populate Dropbox-specific schema fields.
+The compatibility seam must fail explicitly if asked to produce Dropbox V1 records from runtime evidence that is not Dropbox V1-compatible.
 
-No `provider_kind`, hash-algorithm field, generalized provider ID object, or new discriminator is added to persisted schema 1.0 in this package.
+No persisted `provider_kind`, hash-algorithm field, generalized provider token object, discriminator, or schema-2 envelope is introduced by PERSIST001.
 
 ## Managed-document compatibility
 
-Managed-document runtime services must consume provider-neutral metadata and errors for provider operations.
+Managed-document runtime code moves to provider-neutral ports/errors for metadata lookup, create/upsert, true CAS, move/copy lifecycle operations, provider snapshots, and external-change reconciliation.
 
-When writing existing schema-1.0 `DocumentVersionRecord` or `ManagedDocumentHead` values, they must use the Dropbox V1 compatibility seam to preserve exact current serialized evidence.
+Business-level managed-document conflicts remain business conflicts. Provider CAS failures are translated into existing managed-document conflict outcomes without catching Dropbox error classes.
+
+When writing existing schema-1.0 `DocumentVersionRecord`, `ManagedDocumentHead`, provider-file binding, or reference fingerprint data, the service uses the Dropbox V1 compatibility seam and preserves current serialized evidence exactly.
 
 Existing semantics remain unchanged:
 
 - provider revision protects visible-file concurrency;
 - conditional update remains true CAS;
 - server-side copies remain provider-side snapshots;
-- external edits continue to produce managed versions rather than silent overwrite;
-- existing provider-file binding and reference fingerprint identities remain stable;
-- old schema-1.0 records remain readable without migration or rewrite.
+- external edits produce versions rather than silent overwrite;
+- provider-file binding and reference fingerprint identity remain stable;
+- historical schema-1.0 records remain readable without migration/rewrite.
 
-PERSIST001 does not redefine the long-term provider-neutral managed-document record format. SCHEMA001 owns that future format and any upcasting/migration strategy.
+PERSIST001 does not define the future provider-neutral managed-document record format.
 
 ## MutationGate compatibility
 
-MutationGate remains in `observe` throughout PERSIST001.
+MutationGate remains `observe` throughout PERSIST001.
 
-Its runtime provider operations move behind the neutral boundary, but all persisted schema-1.0 evidence remains unchanged.
+Runtime provider operations move behind neutral ports/errors for:
 
-In particular:
+- provider precondition observation;
+- change-feed entries;
+- candidate metadata;
+- provider-side candidate snapshot copy;
+- metadata verification;
+- collision/idempotency handling.
 
-- `provider_precondition.kind=existing` keeps the same `file_id`, `rev`, `content_hash`, and `size` fields;
-- external candidate records keep the same provider evidence fields;
-- `mutationCandidateIdFor(project_id, provider_file_id, provider_rev)` remains unchanged;
-- immutable candidate payload paths remain unchanged;
-- candidate classification and resolution semantics remain unchanged;
-- baseline and cursor-reset ordering remains unchanged;
-- PERSIST001 does not repair historical PRJ-0003 deviations;
-- PERSIST001 does not enable enforcement.
+The following remain unchanged:
 
-The compatibility seam is required because candidate identity itself currently depends on Dropbox V1 evidence. Generalizing that identity is explicitly deferred to SCHEMA001.
+- mutation intent schema;
+- provider precondition schema;
+- external candidate schema;
+- candidate identity derivation;
+- detection-source vocabulary;
+- candidate resolution semantics;
+- append-only evidence behavior;
+- baseline/cursor-reset ordering;
+- immutable candidate payload paths.
+
+PERSIST001 does not repair PRJ-0003 and does not enable enforcement.
+
+Candidate identity currently depends directly on Dropbox V1 evidence, so its generalization is explicitly deferred to SCHEMA001.
 
 ## Projection/materialization compatibility
 
-Projection writers and materialization repositories must use the provider-neutral base contract and provider-neutral conflict errors.
+Projection writers and materialization repositories consume the neutral base contract and neutral conflict categories.
 
-Project OS canonical SHA-256 output hashes remain Project OS hashes and must not be conflated with provider integrity hashes.
+Project OS canonical SHA-256 output hashes remain Project OS hashes. Provider integrity hashes must not replace or reinterpret them.
 
-All materialization paths, generation records, result-root hashes, output evidence, archive semantics, coalescing behavior, and recovery behavior remain unchanged.
+Materialization paths, generation records, output evidence, result-root hashes, projection version, archive semantics, coalescing, recovery, and critical-output verification remain unchanged.
 
-PERSIST001 does not alter projection versioning.
+## Inbox and canonical repository compatibility
 
-## Inbox compatibility
+Inbox processing and canonical repositories consume neutral persistence operations/errors while preserving:
 
-Worker inbox processing must consume the provider-neutral provider instance created by the production factory.
-
-The current behavior remains unchanged:
-
-- dependency-aware transaction ordering;
+- transaction filename binding;
+- dependency-aware inbox ordering;
 - poison-entry isolation;
-- safe terminal artifact creation;
-- idempotent archive/replay cleanup;
-- absence handling;
+- immutable terminal records;
+- receipt-gated canonical success;
+- idempotent source archival/replay cleanup;
+- canonical commit ordering/recovery;
 - no false committed receipts.
 
-Inbox code must not import Dropbox transport or Dropbox conflict classes after PERSIST001.
+No inbox/Core path may catch `DropboxConflictError` after PERSIST001.
 
 ## Dropbox webhook boundary
 
-The `/dropbox/webhook` endpoint remains explicitly Dropbox-specific.
+`/dropbox/webhook` remains explicitly Dropbox-specific.
 
-Webhook signature verification is a Dropbox ingress concern and is not generalized by this package.
+Webhook signature verification and Dropbox HMAC semantics are inbound integration concerns, not repository abstractions. Neutralizing them in PERSIST001 would be false generalization.
 
-After a verified Dropbox webhook wakes processing, persistence operations invoked by inbox/reconciliation must use the provider-neutral runtime boundary.
+After webhook verification, triggered Project OS work uses the neutral production persistence runtime.
 
-Attempting to create a generic webhook/provider event system in PERSIST001 would be false generalization and is out of scope.
+## Environment and credentials
 
-## Environment and secrets
-
-Existing Dropbox secrets remain unchanged:
+Existing Dropbox bindings remain unchanged:
 
 - `DROPBOX_APP_KEY`;
 - `DROPBOX_APP_SECRET`;
 - `DROPBOX_REFRESH_TOKEN`.
 
-PERSIST001 does not rename or migrate secrets.
+PERSIST001 adds no generic provider credentials or provider-selection configuration.
 
-No new provider-selection variable is added.
+Credential/permission redesign remains outside this package.
 
-Existing Project OS continuity/layout/MutationGate configuration remains unchanged, including production `PROJECT_OS_MUTATION_GATE_MODE=observe`.
+## Dependency boundaries
 
-## Testing strategy
+### IMP-MODEL001
 
-Implementation must be test-driven and preserve the existing regression suite.
+Satisfied prerequisite. PERSIST001 is validated against the merged MODEL001 baseline.
 
-The final implementation must add provider-boundary tests covering at least:
+### IMP-MUTATIONGATE001
 
-### Contract and capability tests
+Not a blocking prerequisite for the runtime boundary, but MutationGate is an affected high-risk consumer and its full regression suite is mandatory.
 
-- base provider create/read/replace/list/move/delete semantics;
-- no silent overwrite/autorename on create;
-- conditional write is represented as a distinct capability;
-- server-side copy is represented as a distinct capability;
-- change-feed cursor/reset semantics;
-- stable object ID and revision-token opacity;
-- integrity hash includes semantic/algorithm identity;
-- required capability absence fails before mutation.
+PERSIST001 does not alter MutationGate rollout mode or authorize enforcement.
 
-A deterministic in-memory test double may implement the neutral contract for unit tests. It is not a production alternate provider and must not become runtime configuration.
+### IMP-SCHEMA001
 
-### Dropbox adapter tests
+Deferred hard dependency for persisted provider generalization and any future non-Dropbox activation, not a prerequisite for runtime decoupling.
 
-- Dropbox metadata maps correctly to provider-neutral metadata;
-- Dropbox conflict/CAS/cursor/transient errors map to neutral errors;
-- retryability classification matches current validated behavior;
-- Dropbox server-side copy and change feed satisfy declared capabilities;
-- Dropbox V1 compatibility codec reproduces the exact current persisted values.
+PERSIST001 establishes the runtime seam now. SCHEMA001 remains responsible for provider-aware durable models, compatibility policies, migrations, and upcasting.
 
-### Golden compatibility tests
+### PRJ-0003 repair
 
-Fixtures must prove byte/semantic compatibility for existing schema-1.0 families, including:
+No dependency. PERSIST001 neither triggers nor performs the repair.
 
-- managed document head/version records;
-- provider-file bindings;
-- reference fingerprints;
-- MutationGate intents/preconditions;
-- external mutation candidate records;
-- candidate IDs;
-- managed-document provider-derived IDs/version IDs;
-- paths and layout values.
+### IMP-INDEX001
 
-No fixture may require rewriting old data.
+Downstream beneficiary. INDEX001 should consume provider-neutral persistence/read interfaces rather than bind directly to Dropbox.
 
-### Existing reliability regression
+## Non-goals summary
 
-The implementation must keep green the existing tests for:
+PERSIST001 does not:
 
-- Dropbox read/write resilience;
-- fault injection;
-- commit/receipt ordering;
-- recovery;
-- inbox replay/cleanup/isolation;
-- materialization faults/reconciliation;
-- managed-document concurrency/external edits;
-- MutationGate candidate/classification/fault/status behavior;
-- MODEL001 lifecycle/concurrency semantics;
-- historical schema-1.0 readability.
+- implement an alternate provider;
+- prove an alternate provider works;
+- add provider selection UI/configuration;
+- migrate or rewrite data;
+- bump schemas;
+- generalize schema-1.0 provider evidence;
+- change business lifecycle semantics;
+- change canonical commit semantics;
+- change materialization record formats;
+- activate MutationGate enforcement;
+- repair PRJ-0003;
+- start SCHEMA runtime;
+- redesign Dropbox webhook authentication;
+- retune performance/retry policy beyond behavior-preserving refactoring.
 
-## Static boundary acceptance checks
+## Required tests
 
-At completion, source-level checks must prove that outside the Dropbox provider adapter, Dropbox webhook code, Dropbox V1 compatibility seam, and production factory, Project OS Core does not import or reference:
+Implementation must be test-driven and preserve the complete relevant regression suite.
+
+### Architecture boundary checks
+
+Add an enforceable dependency/static check proving that raw Dropbox runtime types are confined to the Dropbox provider implementation and authoritative production composition.
+
+After PERSIST001, provider-independent repositories, managed documents, MutationGate, materialization, inbox code, ProjectGuard, and RegistryGuard must not import or reference:
 
 - `DropboxClient`;
 - `DropboxTransport`;
@@ -487,94 +502,124 @@ At completion, source-level checks must prove that outside the Dropbox provider 
 - `DropboxCursorResetError`;
 - Dropbox retry parsing/status helpers.
 
-Provider-independent repositories, managed documents, MutationGate, materialization, inbox code, ProjectGuard, and RegistryGuard must compile against provider-neutral interfaces.
+Dropbox webhook code may remain Dropbox-specific for HMAC/route semantics, but it should not become a back door for repository/runtime Dropbox dependencies.
+
+The Dropbox V1 compatibility seam may contain Dropbox V1 **serialized-format** terminology/validators, but it consumes neutral runtime metadata and must not import raw Dropbox client/transport/error/retry classes.
 
 Direct `new DropboxClient(...)` must exist only in the authoritative production factory or adapter-internal tests.
 
-## Dependencies
+### Provider contract/capability tests
 
-### IMP-MODEL001
+Test neutral semantics for:
 
-Satisfied. PERSIST001 is validated against the completed MODEL001 baseline on `main` merge `946337526c8da541db00cd4ec5ff76207e6295a6`.
+- create-only collision;
+- upsert/overwrite create-when-absent and replace-when-present behavior;
+- absent read/metadata;
+- direct-child listing and missing-root behavior;
+- move conflict;
+- idempotent delete;
+- conditional-write success/failure;
+- server-side copy;
+- change-feed continuation and cursor reset;
+- metadata identity/revision/hash mapping;
+- missing required capability fail-fast behavior.
 
-### IMP-MUTATIONGATE001
+A deterministic in-memory test double may implement the neutral interfaces for unit tests. It is not a production provider and must not become runtime configuration.
 
-Not a blocking prerequisite for the runtime boundary, but a high-value compatibility surface.
+### Dropbox adapter tests
 
-PERSIST001 may refactor MutationGate provider plumbing only while preserving its existing schema-1.0 record families, candidate identity, provenance behavior, recovery behavior, and `observe` mode.
+Preserve/migrate tests proving:
 
-No enforcement activation is authorized.
+- token/API behavior;
+- parent-folder creation;
+- conflict and CAS mapping;
+- cursor-reset mapping;
+- transient error classification;
+- bounded retry behavior;
+- move/idempotency recovery;
+- server-side copy capability;
+- change-feed capability;
+- no silent autorename.
 
-### IMP-SCHEMA001
+### Golden schema-1.0 compatibility tests
 
-A deferred hard dependency for provider-neutral persisted evidence and any alternate provider.
+Before/after fixtures must prove exact durable compatibility for representative:
 
-PERSIST001 can complete the runtime abstraction before SCHEMA runtime begins. However, no non-Dropbox provider may be production-enabled for provider-evidence-dependent flows until SCHEMA001 defines and validates the generalized persisted model, compatibility policy, and migrations/upcasters.
+- managed-document version records;
+- managed-document heads/provider observations;
+- provider-file bindings;
+- reference fingerprints;
+- MutationGate intents/provider preconditions;
+- external mutation candidates;
+- candidate IDs;
+- provider-derived managed-document IDs/version IDs.
 
-### PRJ-0003 deviation repair
+A runtime refactor that changes these durable values fails PERSIST001.
 
-No dependency for PERSIST001 and explicitly out of scope.
+### Path golden tests
 
-### IMP-INDEX001
+All legacy and V2 path helpers must produce exactly the same strings as current `main`.
 
-Downstream. INDEX001 should consume provider-neutral persistence/read interfaces rather than couple itself directly to Dropbox.
+### Full regression suite
 
-## Rollout invariants
+Existing commit consistency, recovery, rollback, inbox, materialization, artifacts, managed documents, MutationGate, MODEL001 lifecycle/concurrency, fault injection, and Dropbox resilience tests remain green.
 
-When implementation is later authorized:
+## Acceptance criteria
 
-- continuity remains stable unless separately changed by its own approved package;
-- MutationGate remains observe;
-- no schema migration runs;
-- no PRJ-0003 repair runs;
-- no SCHEMA runtime runs;
-- no alternate provider is enabled;
-- exact current Dropbox paths and schema-1.0 records remain compatible;
-- production proof must use normal typed Project OS operations and historical read checks;
-- rollback is code/config rollback only, never canonical history rewrite.
+PERSIST001 implementation is acceptable only when all of the following hold:
 
-## Completion criteria
+1. Dropbox remains the only production provider.
+2. Runtime repositories/services use provider-neutral contracts/errors.
+3. Core runtime consumers no longer import Dropbox transport/error/client classes.
+4. Raw Dropbox HTTP/status/body semantics do not drive Core branching.
+5. Capabilities are explicit, semantic, typed/fail-fast, and not inferred from optional methods.
+6. Production provider construction is centralized through one authoritative assembly path.
+7. Lower-level services do not construct Dropbox clients or resilience wrappers.
+8. Logical layout/path/repository ownership is provider-independent while every persisted path value remains unchanged.
+9. The compatibility seam consumes neutral metadata, not raw Dropbox runtime classes.
+10. Existing schema-1.0 managed-document and MutationGate formats/IDs remain unchanged.
+11. No migration, upcasting, or schema bump occurs.
+12. MutationGate remains `observe`.
+13. PRJ-0003 repair is not run.
+14. SCHEMA runtime is not run.
+15. Full CI/regression tests are green at the exact final PR head.
+16. Production validation is separately authorized and completed at an exact merged commit before canonical task closure.
 
-IMP-PERSIST001 runtime implementation is not complete until all of the following are proven:
+## Production validation boundary
 
-1. provider-neutral runtime contracts and errors are in place;
-2. capabilities are explicit and semantically tested;
-3. provider construction is centralized through the production factory;
-4. Core/repository/service imports no longer depend directly on Dropbox runtime types/errors;
-5. logical layout/path ownership is provider-independent with identical persisted values;
-6. Dropbox V1 compatibility seam preserves every existing schema-1.0 provider-shaped record and derived identity;
-7. the full relevant regression suite is green;
-8. `npm run check` is green at the exact final PR head;
-9. deployment, health, and production proof are separately authorized and successful;
-10. MutationGate is still observe;
-11. no PRJ-0003 repair or SCHEMA runtime action occurred;
-12. canonical PRJ-0002 evidence and task closure are recorded only after production proof.
+The later implementation plan must define a production proof isolated from PRJ-0003 and SCHEMA runtime.
 
-## Deferred follow-up owned by IMP-SCHEMA001
+At minimum it must demonstrate through normal Project OS paths:
 
-The following are intentionally deferred and must not leak back into PERSIST001:
+- production health and continuity remain stable;
+- MutationGate reports `observe`;
+- historical schema-1.0 project state remains readable without migration/rewrite;
+- an isolated synthetic `PRJ-AUTO` project can commit/recover through the neutral repository path;
+- projection/materialization reaches a verified current head;
+- managed-document create/update/CAS behavior works with Dropbox V1 evidence preserved;
+- incremental change-feed reconciliation still works;
+- no PRJ-0003 repair or SCHEMA runtime action occurred.
 
-- generalized provider evidence fields;
-- provider-kind discriminators in durable records;
-- algorithm-aware persisted provider integrity hashes;
-- generic provider object IDs/revision-token schemas;
-- generic MutationGate preconditions/candidates;
-- new candidate identity semantics;
-- managed-document provider-state schema redesign;
-- old-record upcasters;
-- migrations;
-- compatibility cutover strategy for a second provider.
+Exact merge SHA and deployment evidence are required for closure.
 
-Only after those schema concerns are explicitly designed, migrated, and proven may a separate package production-enable a provider other than Dropbox.
+## Rollback principle
 
-## Final design statement
+PERSIST001 is a runtime/source boundary refactor with no data migration.
 
-PERSIST001 establishes a **real provider-neutral runtime boundary** while preserving **Dropbox V1 as the only production provider and the exact schema-1.0 persisted contract**.
+Rollback is code/config rollback through the existing continuity/deployment mechanism. Canonical history and schema-1.0 records are never rewritten to emulate rollback.
 
-The package succeeds by separating three concerns that are currently conflated:
+Because persisted paths and schemas do not change, reverting runtime code must leave Dropbox V1 data directly consumable by the pre-PERSIST implementation.
 
-1. Project OS logical persistence behavior;
-2. provider runtime capabilities/errors/resilience;
-3. historical Dropbox-shaped schema-1.0 compatibility.
+## Deferred SCHEMA handoff
 
-It does not solve future provider-neutral persistence schemas. That boundary is deliberate, testable, and required to avoid performing IMP-SCHEMA001 implicitly inside a persistence refactor.
+PERSIST001 leaves an explicit seam for SCHEMA001 rather than hidden coupling.
+
+SCHEMA001 may later decide how to evolve durable provider evidence, including possible provider discriminators, provider-neutral object identity/revision-token representation, algorithm-aware integrity hashes, Dropbox V1 upcasting, migration/cutover rules, and generalized MutationGate provider evidence.
+
+Those structures are deliberately **not** designed or implemented by PERSIST001 beyond preserving the seam where future translation can occur.
+
+## Final architectural invariant
+
+After PERSIST001, adding a future provider should require a new provider adapter plus separately approved schema/provider compatibility work where durable evidence demands it. It must not require rewriting Project OS business logic merely to replace `DropboxClient`, Dropbox error classes, Dropbox retry parsing, or Dropbox-specific optional transport methods.
+
+That is the success condition for this package.

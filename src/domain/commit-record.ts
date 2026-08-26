@@ -1,3 +1,4 @@
+import { mayRebaseStaleOperation } from "./concurrency-policy";
 import type { DomainEvent } from "./event";
 import type { ProjectState } from "./project-state";
 import { normalizeProjectState } from "./project-state-normalizer";
@@ -44,7 +45,10 @@ export function parseCanonicalCommitRecord(value: unknown): CanonicalCommitRecor
     }
   }
 
-  if (transaction.base_revision !== previousRevision) {
+  if (transaction.base_revision > previousRevision) {
+    throw new Error("Transaction base revision cannot be ahead of commit previous_revision");
+  }
+  if (transaction.base_revision !== previousRevision && !mayRebaseStaleOperation(transaction.operation)) {
     throw new Error("Transaction base revision does not match commit previous_revision");
   }
   if (state.revision !== newRevision) {

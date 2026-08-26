@@ -239,7 +239,13 @@ describe("ProjectGuard", () => {
       payload: { task_id: "TASK-1010" }
     };
     const conflict = await submit(projectId, staleCompletionTx);
-    expect(conflict).toMatchObject({ status: "conflict", code: "STALE_REVISION", new_revision: 3 });
+    expect(conflict).toMatchObject({
+      status: "conflict",
+      code: "STALE_REVISION",
+      previous_revision: 3,
+      new_revision: 3
+    });
+    expect(conflict.event_id).toBeUndefined();
 
     const replay = await submit(projectId, staleCompletionTx);
     expect(replay).toEqual(conflict);

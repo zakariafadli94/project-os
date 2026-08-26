@@ -49,9 +49,7 @@ export function asProjectOsPersistence(input: PersistenceInput): ProjectOsPersis
 export function toProviderObjectMetadata(
   metadata: ProviderObjectMetadata | LegacyDropboxFileMetadata
 ): ProviderObjectMetadata {
-  if ("objectId" in metadata || "revisionToken" in metadata || "integrityHash" in metadata) {
-    return metadata as ProviderObjectMetadata;
-  }
+  if (!("id" in metadata)) return metadata;
   return {
     path: metadata.path,
     size: metadata.size,

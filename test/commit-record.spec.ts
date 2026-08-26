@@ -4,21 +4,29 @@ import { machineCommitRecordPath } from "../src/dropbox/layout";
 
 const at = "2026-08-24T00:45:00.000Z";
 
-function validRecord() {
+function validRecord(options: {
+  previousRevision?: number;
+  baseRevision?: number;
+  operation?: string;
+  payload?: Record<string, unknown>;
+} = {}) {
+  const previousRevision = options.previousRevision ?? 1;
+  const newRevision = previousRevision + 1;
+  const eventId = `EVT-${newRevision.toString().padStart(6, "0")}`;
   const transaction = {
     schema_version: "1.0",
     transaction_id: "TXN-COMMIT-1201-TASK",
     project_id: "PRJ-1201",
-    base_revision: 1,
-    operation: "task.create",
+    base_revision: options.baseRevision ?? previousRevision,
+    operation: options.operation ?? "task.create",
     created_at: at,
-    payload: { task_id: "TASK-COMMIT1201", title: "Commit exactly once" }
+    payload: options.payload ?? { task_id: "TASK-COMMIT1201", title: "Commit exactly once" }
   };
   const event = {
     schema_version: "1.0",
-    event_id: "EVT-000002",
+    event_id: eventId,
     project_id: "PRJ-1201",
-    revision: 2,
+    revision: newRevision,
     transaction_id: transaction.transaction_id,
     type: transaction.operation,
     timestamp: at,
@@ -32,7 +40,7 @@ function validRecord() {
     aliases: [],
     objective: "Prove crash-safe commits",
     status: "active",
-    revision: 2,
+    revision: newRevision,
     current_phase_id: null,
     artifact_routes: {},
     constraints: {},
@@ -50,16 +58,16 @@ function validRecord() {
     transaction_id: transaction.transaction_id,
     status: "committed",
     project_id: "PRJ-1201",
-    previous_revision: 1,
-    new_revision: 2,
+    previous_revision: previousRevision,
+    new_revision: newRevision,
     event_id: event.event_id,
     committed_at: at
   };
   return {
     schema_version: "1.0",
     project_id: "PRJ-1201",
-    previous_revision: 1,
-    new_revision: 2,
+    previous_revision: previousRevision,
+    new_revision: newRevision,
     transaction,
     state,
     event,
@@ -79,6 +87,37 @@ describe("canonical commit record", () => {
     expect(record.project_id).toBe("PRJ-1201");
     expect(record.new_revision).toBe(2);
     expect(record.receipt.status).toBe("committed");
+  });
+
+  it("preserves an approved stale additive base revision while recording the effective previous revision", () => {
+    const record = parseCanonicalCommitRecord(validRecord({
+      previousRevision: 3,
+      baseRevision: 1,
+      operation: "research.add",
+      payload: { research_id: "RES-COMMIT1201", title: "Rebased evidence", body: "Preserve submitted provenance" }
+    }));
+
+    expect(record.transaction.base_revision).toBe(1);
+    expect(record.previous_revision).toBe(3);
+    expect(record.new_revision).toBe(4);
+  });
+
+  it("rejects a stale exact-current lifecycle transaction inside a committed record", () => {
+    expect(() => parseCanonicalCommitRecord(validRecord({
+      previousRevision: 3,
+      baseRevision: 1,
+      operation: "task.complete",
+      payload: { task_id: "TASK-COMMIT1201" }
+    }))).toThrow(/base revision/i);
+  });
+
+  it("rejects a transaction base revision ahead of the effective previous revision", () => {
+    expect(() => parseCanonicalCommitRecord(validRecord({
+      previousRevision: 1,
+      baseRevision: 2,
+      operation: "research.add",
+      payload: { research_id: "RES-COMMIT1202", title: "Future evidence", body: "Invalid" }
+    }))).toThrow(/ahead/i);
   });
 
   it("rejects a non-contiguous revision", () => {

@@ -203,6 +203,65 @@ describe("ProjectGuard", () => {
     expect(receipt.new_revision).toBe(2);
   });
 
+  it("enforces MODEL001 stale lifecycle conflicts and stale additive rebasing at the receipt boundary", async () => {
+    const projectId = "PRJ-1010";
+    await submit(projectId, createTx(projectId, "TXN-MODEL-GUARD-PROJECT-0001"));
+
+    const task = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-MODEL-GUARD-TASK-0001",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "task.create",
+      created_at: at,
+      payload: { task_id: "TASK-1010", title: "Concurrent target" }
+    });
+    expect(task.new_revision).toBe(2);
+
+    const unrelated = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-MODEL-GUARD-RESEARCH-0001",
+      project_id: projectId,
+      base_revision: 2,
+      operation: "research.add",
+      created_at: at,
+      payload: { research_id: "RES-1010", title: "Unrelated", body: "Advance revision" }
+    });
+    expect(unrelated.new_revision).toBe(3);
+
+    const staleCompletionTx = {
+      schema_version: "1.0",
+      transaction_id: "TXN-MODEL-GUARD-STALE-0001",
+      project_id: projectId,
+      base_revision: 2,
+      operation: "task.complete",
+      created_at: at,
+      payload: { task_id: "TASK-1010" }
+    };
+    const conflict = await submit(projectId, staleCompletionTx);
+    expect(conflict).toMatchObject({
+      status: "conflict",
+      code: "STALE_REVISION",
+      previous_revision: 3,
+      new_revision: 3
+    });
+    expect(conflict.event_id).toBeUndefined();
+
+    const replay = await submit(projectId, staleCompletionTx);
+    expect(replay).toEqual(conflict);
+
+    const staleAdditive = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-MODEL-GUARD-RESEARCH-0002",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "research.add",
+      created_at: at,
+      payload: { research_id: "RES-1011", title: "Stale additive", body: "Still independent" }
+    });
+    expect(staleAdditive).toMatchObject({ status: "committed", previous_revision: 3, new_revision: 4 });
+  });
+
   it("preserves revision and idempotency state across Durable Object eviction", async () => {
     const projectId = "PRJ-1004";
     const stub = testEnv.PROJECT_GUARD.getByName(projectId);

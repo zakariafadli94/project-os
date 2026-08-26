@@ -270,11 +270,24 @@ Unexpected external edits to generated projection files must be preserved as rec
 
 ## 13. Concurrency
 
-Project Guard is authoritative for compatibility.
+Project Guard is authoritative for compatibility and serializes same-project domain mutation. Do not add a second concurrency coordinator merely to resolve business races.
 
-Never semantically auto-merge competing direction-changing changes simply because one seems preferable.
+Never semantically auto-merge competing lifecycle or direction-changing changes simply because one seems preferable.
 
-Additive independent changes may be accepted only according to deterministic Guard rules.
+A stale canonical transaction may rebase only for these four additive compatibility operations:
+
+```text
+research.add
+constraint.add
+task.create
+deliverable.add
+```
+
+`deliverable.add` is deprecated. All four stale-rebasable operations must still be validated against current canonical state: stable IDs must remain unique and any current-state references/invariants must still hold. A failed invariant after rebase is a business rejection.
+
+Every other canonical operation requires the current project revision. A stale exact-current operation returns `conflict` with `STALE_REVISION` and creates no business revision/event. A submitted base ahead of canonical state also conflicts.
+
+For a committed stale additive rebase, preserve the originally submitted `transaction.base_revision` as provenance. The canonical commit record separately stores the effective `previous_revision` immediately before the commit; exact-current commits have equal values, while an approved stale rebase may have `transaction.base_revision < previous_revision` but never greater.
 
 Projection concurrency is separate from business concurrency. Parallel Dropbox output writes are bounded and must not be interpreted as parallel domain mutation.
 
@@ -286,6 +299,8 @@ Managed-document concurrency has two protections:
 A provider CAS conflict is not a transient overwrite opportunity. Preserve the newer external reality and reconcile it.
 
 Candidate resolution is same-project serialized through ProjectGuard. Its internal unresolved-path capability is bound to the exact candidate and destination and must never be exposed as a public `skipGuard` option.
+
+Detailed canonical lifecycle/concurrency contract: `docs/domain-model.md`.
 
 ## 14. Decisions and plans
 
@@ -299,15 +314,38 @@ Supported project lifecycle remains:
 
 ```text
 active -> paused -> active
-active/paused -> completed -> archived
-active/paused -> archived
+active/paused -> completed
+active/paused/completed -> archived
 ```
 
-Archive is terminal. There is no destructive project delete operation.
+Archive is terminal. There is no destructive project delete operation. Project completion does not fabricate task, phase or deliverable completion.
+
+Task lifecycle is:
+
+```text
+pending -> active|blocked|completed
+active  -> blocked|completed
+blocked -> active|blocked|completed
+completed -> terminal
+```
+
+A blocked task may be blocked again at the current revision to refresh its blocker reason. Direct `pending -> completed` remains valid. Task lifecycle operations require the current project revision; only `task.create` is stale-rebasable under Section 13.
+
+The first plan phase is active/current and later phases are pending. Only the single active `current_phase_id` may complete. Completing a pending/non-current phase is rejected; a historical multiple-active phase state fails closed on completion rather than being silently repaired. The lexicographically lowest pending `phase_id` is promoted next, and `current_phase_id` clears when no pending phase remains.
+
+New tasks and normative deliverables cannot attach to a completed phase. Completing a phase does not fabricate child task/deliverable completion.
+
+Decisions are accepted then explicitly superseded without deleting history. New governed deliverables may reference only decisions that are currently accepted. Research remains append-only evidence; Discovery remains the mutable synthesis layer.
+
+The normative deliverable lifecycle remains planned → in-progress → review → accepted with explicit revision, supersession and abandonment behavior plus `legacy_completed` compatibility. Deprecated `deliverable.complete` is exact-current; deprecated additive `deliverable.add` remains the stale-rebasable compatibility exception.
+
+MODEL001 write-time invariants do not rewrite or reject structurally valid schema-1.0 historical snapshots merely because their stored combination could no longer be newly produced. No ProjectState/transaction schema bump or hidden migration is part of these rules.
 
 Archive workspace movement is asynchronous projection work after the archived business state commits.
 
 Archived projects do not accept new managed working/reference mutations and managed-document reconciliation must not resurrect an active workspace.
+
+Detailed domain contract: `docs/domain-model.md`.
 
 ## 16. Portfolio behavior
 

@@ -314,6 +314,19 @@ Requirements:
 
 For MutationGate, pre-merge CI must include PRJ-0003-shaped bypasses, baseline/reset, governed crash recovery, candidate resolution crash recovery, multi-project isolation, service recreation and status-vocabulary tests.
 
+For MODEL001, pre-merge CI must additionally prove:
+
+- stale task/lifecycle and legacy completion operations conflict without a business revision;
+- only `research.add`, `constraint.add`, `task.create`, and deprecated `deliverable.add` may stale-rebase;
+- a committed stale additive rebase preserves submitted `transaction.base_revision` while recording the effective commit `previous_revision`;
+- task lifecycle compatibility remains intact;
+- pending/non-current or multiple-active phase completion fails closed;
+- completed phases reject new task/normative deliverable attachment;
+- phase completion does not fabricate child completion;
+- superseded decisions cannot newly govern deliverables;
+- historical schema-1.0 lifecycle combinations remain readable;
+- ProjectGuard receipts expose the same conflict/commit semantics.
+
 ## 13. Exact-commit production deployment validation
 
 After merge, record the exact merge commit SHA.
@@ -392,6 +405,31 @@ After MutationGate itself is production-validated, historical PRJ-0003 direct-wr
 
 After that repair, revalidate the accepted SCHEMA rollout design against MutationGate record families before resuming SCHEMA runtime implementation.
 
+## 14B. `IMP-MODEL001` isolated production proof
+
+MODEL001 production validation is a separate gate from MutationGate enforcement and from SCHEMA runtime. It must keep:
+
+```text
+PROJECT_OS_CONTINUITY_MODE=stable
+PROJECT_OS_MUTATION_GATE_MODE=observe
+```
+
+Use an isolated synthetic project allocated through `PRJ-AUTO`; do not use PRJ-0003 or another business project as the mutation target.
+
+The proof must record the exact MODEL001 merge SHA and demonstrate all of the following through normal typed transaction/receipt paths:
+
+1. create the isolated project and a pending lifecycle target task;
+2. add intervening research so canonical revision advances;
+3. submit a stale lifecycle mutation against the target task and require `status=conflict`, `code=STALE_REVISION`, no event, and no revision increment;
+4. submit the same lifecycle operation at the exact current revision and require a committed revision;
+5. submit a unique stale additive `task.create` from an older base and require a committed revision after current-state validation;
+6. verify the immutable commit record for the stale additive preserves the submitted `transaction.base_revision` and separately records the effective `previous_revision`;
+7. close the probe work and archive the synthetic project through normal typed lifecycle operations;
+8. read PRJ-0002 and at least one historical schema-1.0 project through normal paths without migration/rewrite;
+9. verify production health, continuity `stable`, MutationGate `observe`, and confirm no PRJ-0003 repair or SCHEMA runtime action occurred.
+
+MODEL001 rollback is code rollback only. Never rewrite canonical commit history to emulate rollback.
+
 ## 15. Recovery validation
 
 Recovery scenarios to keep tested/documented:
@@ -401,6 +439,7 @@ Recovery scenarios to keep tested/documented:
 - output upload interrupted → resume missing/uncertain output only;
 - completed-generation record exists but head update failed → repair head with zero workspace rewrite;
 - four fast canonical revisions → coalesce human projection safely while preserving every commit record;
+- stale additive canonical commit → preserve original submitted base revision plus effective previous revision during read/recovery;
 - archived projection retry → never resurrect active workspace;
 - MutationGate artifact intent written + provider bytes landed + receipt missing → governed in-flight replay, no candidate;
 - MutationGate candidate terminal marker written + resolution detail missing → repair detail without rerunning downstream;
@@ -432,3 +471,5 @@ Likewise, alternate persistence providers are not introduced here. Dropbox remai
 - canonical PRJ-0002 research evidence and task closure are recorded through normal receipt-gated transactions.
 
 `IMP-MUTATIONGATE001` is production-complete only after its own exact final PR head/merge deployment proof, observe-mode production validation, accepted decision on enforcement rollout, any separately approved enforcement activation, and canonical PRJ-0002 evidence. PR CI alone does not authorize merge, deployment, `enforce`, PRJ-0003 repair or SCHEMA resumption.
+
+`IMP-MODEL001` is production-complete only after exact final PR head verification, a separately authorized runtime merge/deployment, exact-merge deployment/health proof, isolated lifecycle/concurrency production proof, historical readability verification, and canonical PRJ-0002 research/task closure. MODEL001 completion does not authorize MutationGate `enforce`, PRJ-0003 repair or SCHEMA runtime.

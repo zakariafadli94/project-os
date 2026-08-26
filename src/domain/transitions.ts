@@ -1,5 +1,6 @@
 import type { DomainEvent } from "./event";
 import { eventIdForRevision } from "./event";
+import { mayRebaseStaleOperation } from "./concurrency-policy";
 import type { ProjectState } from "./project-state";
 import type { Transaction } from "./transaction";
 
@@ -83,28 +84,6 @@ function commit(state: ProjectState, tx: Transaction): TransitionResult {
   return { kind: "commit", state: next, event };
 }
 
-const exactRevisionOperations = new Set<Transaction["operation"]>([
-  "project.pause",
-  "project.resume",
-  "project.complete",
-  "project.archive",
-  "project.framing.update",
-  "artifact.route.configure",
-  "decision.accept",
-  "decision.supersede",
-  "plan.phase.create",
-  "plan.phase.update",
-  "plan.phase.complete",
-  "discovery.synthesis.update",
-  "deliverable.create",
-  "deliverable.start",
-  "deliverable.revise",
-  "deliverable.submit_review",
-  "deliverable.accept",
-  "deliverable.supersede",
-  "deliverable.abandon"
-]);
-
 export function applyTransaction(state: ProjectState | null, tx: Transaction): TransitionResult {
   if (tx.operation === "project.create") {
     if (state !== null) return rejected("PROJECT_EXISTS", "Project already exists");
@@ -130,7 +109,7 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
   }
 
   const stale = tx.base_revision !== state.revision;
-  if (stale && exactRevisionOperations.has(tx.operation)) {
+  if (stale && !mayRebaseStaleOperation(tx.operation)) {
     return conflict("STALE_REVISION", `${tx.operation} requires the current project revision`);
   }
 
@@ -214,7 +193,13 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
     case "task.create": {
       const p = tx.payload;
       if (next.tasks[p.task_id]) return rejected("TASK_EXISTS", `Task ${p.task_id} already exists`);
-      if (p.phase_id && !next.plan_phases[p.phase_id]) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+      if (p.phase_id) {
+        const phase = next.plan_phases[p.phase_id];
+        if (!phase) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+        if (phase.status === "completed") {
+          return rejected("PHASE_COMPLETED", `Cannot create task in completed phase ${p.phase_id}`);
+        }
+      }
       next.tasks[p.task_id] = {
         task_id: p.task_id,
         title: p.title,
@@ -326,6 +311,15 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
       const phase = next.plan_phases[tx.payload.phase_id];
       if (!phase) return rejected("PHASE_NOT_FOUND", `Phase ${tx.payload.phase_id} does not exist`);
       if (phase.status === "completed") return rejected("PHASE_COMPLETED", `Phase ${phase.phase_id} is already completed`);
+      if (phase.status !== "active" || next.current_phase_id !== phase.phase_id) {
+        return rejected("PHASE_NOT_CURRENT", `Only the active current phase can be completed: ${phase.phase_id}`);
+      }
+      const otherActive = Object.values(next.plan_phases).find(
+        (candidate) => candidate.phase_id !== phase.phase_id && candidate.status === "active"
+      );
+      if (otherActive) {
+        return rejected("PHASE_STATE_INCONSISTENT", `Multiple active phases exist: ${phase.phase_id}, ${otherActive.phase_id}`);
+      }
       phase.status = "completed";
       phase.updated_at = tx.created_at;
       const nextPhase = Object.values(next.plan_phases)
@@ -394,9 +388,22 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
     case "deliverable.create": {
       const p = tx.payload;
       if (next.deliverables[p.deliverable_id]) return rejected("DELIVERABLE_EXISTS", `Deliverable ${p.deliverable_id} already exists`);
-      if (p.phase_id && !next.plan_phases[p.phase_id]) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+      if (p.phase_id) {
+        const phase = next.plan_phases[p.phase_id];
+        if (!phase) return rejected("PHASE_NOT_FOUND", `Phase ${p.phase_id} does not exist`);
+        if (phase.status === "completed") {
+          return rejected("PHASE_COMPLETED", `Cannot create deliverable in completed phase ${p.phase_id}`);
+        }
+      }
       for (const decisionId of p.decision_ids ?? []) {
-        if (!next.decisions[decisionId]) return rejected("DECISION_NOT_FOUND", `Decision ${decisionId} does not exist`);
+        const decision = next.decisions[decisionId];
+        if (!decision) return rejected("DECISION_NOT_FOUND", `Decision ${decisionId} does not exist`);
+        if (decision.status !== "accepted") {
+          return rejected(
+            "DELIVERABLE_DECISION_NOT_ACCEPTED",
+            `Decision ${decisionId} must be currently accepted to govern a new deliverable`
+          );
+        }
       }
       next.deliverables[p.deliverable_id] = {
         deliverable_id: p.deliverable_id,

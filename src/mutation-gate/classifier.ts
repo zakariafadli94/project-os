@@ -1,11 +1,18 @@
 import { documentIdFor, type ManagedProviderObservation } from "../domain/managed-document";
 import type { MutationIntentRecord } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
-import type { DropboxFileMetadata, DropboxTransport } from "../dropbox/client";
-import { workspaceProjectRoot } from "../dropbox/layout";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
 import { DocumentLedgerRepository } from "../documents/repository";
 import { sha256Text } from "../documents/hash";
+import { requireDropboxV1Evidence } from "../persistence/compatibility/dropbox-v1-evidence";
+import {
+  asProjectOsPersistence,
+  toProviderObjectMetadata,
+  type LegacyDropboxFileMetadata,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
+import { workspaceProjectRoot } from "../persistence/layout";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { MutationGateRepository } from "./repository";
 
 export type MutationGateClassification =
@@ -15,24 +22,29 @@ export type MutationGateClassification =
   | { kind: "external_candidate" };
 
 export class MutationGateClassifier {
-  private readonly transport: ResilientDropboxTransport;
+  private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly documents: DocumentLedgerRepository;
   private readonly mutations: MutationGateRepository;
 
-  constructor(transport: DropboxTransport) {
-    this.transport = new ResilientDropboxTransport(transport);
-    this.documents = new DocumentLedgerRepository(transport);
-    this.mutations = new MutationGateRepository(transport);
+  constructor(input: PersistenceInput) {
+    this.runtime = asProjectOsPersistence(input);
+    this.documents = new DocumentLedgerRepository(this.runtime);
+    this.mutations = new MutationGateRepository(this.runtime);
   }
 
   async classify(
     state: ProjectState,
     path: string,
-    metadata: DropboxFileMetadata
+    metadataInput: ProviderObjectMetadata | LegacyDropboxFileMetadata
   ): Promise<MutationGateClassification> {
     const zone = strictZone(state, path);
     if (!zone) return { kind: "not_final_zone" };
-    if (metadata.path !== path) throw new Error(`Mutation classification metadata path mismatch: ${metadata.path} != ${path}`);
+
+    const metadata = toProviderObjectMetadata(metadataInput);
+    if (metadata.path !== path) {
+      throw new Error(`Mutation classification metadata path mismatch: ${metadata.path} != ${path}`);
+    }
+    const evidence = requireDropboxV1Evidence(metadata);
 
     if (zone.kind === "deliverables") {
       const documentId = await documentIdFor(state.project_id, zone.logicalPath);
@@ -45,10 +57,10 @@ export class MutationGateClassifier {
         if (
           version
           && version.provider_path === path
-          && version.provider_file_id === metadata.id
-          && version.provider_rev === metadata.rev
-          && version.provider_content_hash === metadata.content_hash
-          && version.size === metadata.size
+          && version.provider_file_id === evidence.file_id
+          && version.provider_rev === evidence.rev
+          && version.provider_content_hash === evidence.content_hash
+          && version.size === evidence.size
         ) {
           return { kind: "governed_current", documentId };
         }
@@ -57,7 +69,7 @@ export class MutationGateClassifier {
 
     const intents = await this.mutations.listArtifactIntentsForDestination(state.project_id, path);
     if (intents.length > 0) {
-      const visible = await this.transport.download(path);
+      const visible = await this.runtime.objects.readText(path);
       if (visible !== null) {
         const contentSha256 = await sha256Text(visible);
         const exact = intents.find((intent) =>
@@ -71,12 +83,13 @@ export class MutationGateClassifier {
   }
 }
 
-function intentExplainsProviderChange(intent: MutationIntentRecord, metadata: DropboxFileMetadata): boolean {
+function intentExplainsProviderChange(intent: MutationIntentRecord, metadata: ProviderObjectMetadata): boolean {
   if (intent.provider_precondition.kind === "absent") return true;
-  return metadata.id !== intent.provider_precondition.file_id
-    || metadata.rev !== intent.provider_precondition.rev
-    || metadata.content_hash !== intent.provider_precondition.content_hash
-    || metadata.size !== intent.provider_precondition.size;
+  const evidence = requireDropboxV1Evidence(metadata);
+  return evidence.file_id !== intent.provider_precondition.file_id
+    || evidence.rev !== intent.provider_precondition.rev
+    || evidence.content_hash !== intent.provider_precondition.content_hash
+    || evidence.size !== intent.provider_precondition.size;
 }
 
 function strictZone(
@@ -108,11 +121,12 @@ function pathMatchesPrefix(path: string, prefix: string): boolean {
   return path === prefix || path.startsWith(`${prefix}/`);
 }
 
-function sameObservation(value: ManagedProviderObservation | undefined, metadata: DropboxFileMetadata): boolean {
-  return !!value
-    && value.path === metadata.path
-    && value.file_id === metadata.id
-    && value.rev === metadata.rev
-    && value.content_hash === metadata.content_hash
-    && value.size === metadata.size;
+function sameObservation(value: ManagedProviderObservation | undefined, metadata: ProviderObjectMetadata): boolean {
+  if (!value) return false;
+  const evidence = requireDropboxV1Evidence(metadata);
+  return value.path === metadata.path
+    && value.file_id === evidence.file_id
+    && value.rev === evidence.rev
+    && value.content_hash === evidence.content_hash
+    && value.size === evidence.size;
 }

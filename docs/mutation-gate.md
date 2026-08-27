@@ -265,3 +265,13 @@ Before normal enforcement or PRJ-0003 repair:
 9. SCHEMA rollout is revalidated against that new baseline before resuming.
 
 No step in this document authorizes production deployment, `enforce`, PRJ-0003 repair or SCHEMA implementation by itself.
+
+## Persistence boundary compatibility
+
+MutationGate runtime code consumes provider-neutral object metadata, change entries, errors, server-side copy and change-feed capabilities. Candidate classification/capture does not depend on Dropbox transport classes. Dropbox-specific error/status parsing remains confined to the production adapter.
+
+The durable MutationGate schema remains exactly `1.0`. Candidate identity continues to use the historical Dropbox V1 `provider_file_id` + `provider_rev`, and candidate/precondition records continue to serialize `provider_file_id`, `provider_rev`, `provider_content_hash`, `size` and existing paths exactly as before. No `provider_kind`, generalized token object or hash-algorithm field is added to these records.
+
+The compatibility seam may validate and reconstruct those historical Dropbox values from neutral runtime metadata, but it must not redefine them. Any durable provider generalization, migration/upcasting, alternate provider, or revised MutationGate record family belongs to IMP-SCHEMA001 and requires a separate accepted rollout.
+
+This runtime boundary does not change the MutationGate rollout gate: production remains `observe`; `enforce`, PRJ-0003 repair and SCHEMA runtime remain separately authorized actions.

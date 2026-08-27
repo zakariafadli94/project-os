@@ -11,12 +11,12 @@ import {
 } from "../mutation-gate/service";
 import { LegacyArtifactDocumentWriter } from "../documents/legacy-artifact";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
+import type { LayoutMode } from "./layout";
+import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
 import {
   asProjectOsPersistence,
   type PersistenceInput
-} from "./compatibility/legacy-dropbox-runtime";
-import type { LayoutMode } from "./layout";
-import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
+} from "./provider/runtime";
 import { ProjectRepository as CoreProjectRepository } from "./repository-core";
 
 export class ProjectRepository extends CoreProjectRepository {

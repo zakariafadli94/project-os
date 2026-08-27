@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseArtifactWriteRequest } from "../src/domain/artifact-write";
-import { workspaceArtifactPath } from "../src/dropbox/layout";
+import { workspaceArtifactPath } from "../src/persistence/layout";
 
 const hash = "a".repeat(64);
 

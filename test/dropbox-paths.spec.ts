@@ -16,8 +16,8 @@ import {
   workspaceManagedDocumentPath,
   workspaceManagedZoneRoot,
   workspaceProjectRoot
-} from "../src/dropbox/layout";
-import { assertSafeSlug, projectRoot, receiptPath } from "../src/dropbox/paths";
+} from "../src/persistence/layout";
+import { assertSafeSlug, projectRoot, receiptPath } from "../src/persistence/paths";
 
 it("builds a canonical project path", () => {
   expect(projectRoot("PRJ-0001", "agency")).toBe("/PROJECT_OS/PROJECTS/PRJ-0001-agency");

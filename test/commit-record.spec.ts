@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseCanonicalCommitRecord } from "../src/domain/commit-record";
-import { machineCommitRecordPath } from "../src/dropbox/layout";
+import { machineCommitRecordPath } from "../src/persistence/layout";
 
 const at = "2026-08-24T00:45:00.000Z";
 

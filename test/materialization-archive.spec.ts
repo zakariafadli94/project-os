@@ -8,7 +8,7 @@ import {
   machineMaterializationHeadPath,
   machineMaterializationRecordPath,
   workspaceProjectRoot
-} from "../src/dropbox/layout";
+} from "../src/persistence/layout";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;

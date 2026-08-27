@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DropboxClient, DropboxConflictError, DropboxCursorResetError } from "../src/dropbox/client";
+import { DropboxClient, DropboxConflictError, DropboxCursorResetError } from "../src/persistence/providers/dropbox/client";
 
 const contentHash = "a".repeat(64);
 const metadata = {

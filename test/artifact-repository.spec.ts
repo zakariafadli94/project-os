@@ -8,6 +8,7 @@ import {
   type DropboxTransport
 } from "../src/dropbox/client";
 import { ArtifactContentConflictError, ProjectRepository } from "../src/dropbox/repository";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -105,7 +106,7 @@ function hasCandidateEvidence(transport: FakeTransport) {
 describe("ProjectRepository artifact writes", () => {
   it("creates a new artifact after durable mutation evidence", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
 
     await expect(repository.writeArtifact(state(), request)).resolves.toBe("written");
     expect(visibleUploads(transport)).toHaveLength(1);
@@ -115,7 +116,7 @@ describe("ProjectRepository artifact writes", () => {
 
   it("treats same-content governed create replay as idempotent", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     await repository.writeArtifact(state(), request);
 
     await expect(repository.writeArtifact(state(), request)).resolves.toBe("idempotent");
@@ -125,7 +126,7 @@ describe("ProjectRepository artifact writes", () => {
 
   it("captures and blocks a different pre-existing artifact on create", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/playbooks/06-acquisition-multicanale.md";
     transport.files.set(path, "different");
 
@@ -138,7 +139,7 @@ describe("ProjectRepository artifact writes", () => {
 
   it("blocks ordinary replace when the destination is an unresolved external candidate", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/playbooks/06-acquisition-multicanale.md";
     transport.files.set(path, "old");
 
@@ -151,7 +152,7 @@ describe("ProjectRepository artifact writes", () => {
 
   it("does not launder a same-content pre-existing file as an idempotent replace", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/playbooks/06-acquisition-multicanale.md";
     transport.files.set(path, "# Acquisition");
 

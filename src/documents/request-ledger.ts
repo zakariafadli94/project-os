@@ -1,6 +1,10 @@
-import { DropboxConflictError, type DropboxTransport } from "../dropbox/client";
-import { machineDocumentRoot } from "../dropbox/layout";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+import {
+  asProjectOsPersistence,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
+import { machineDocumentRoot } from "../persistence/layout";
+import type { ObjectPersistence } from "../persistence/provider/contract";
+import { ProviderConflictError } from "../persistence/provider/errors";
 import { sha256Text } from "./hash";
 
 export interface ManagedDocumentRequestIntentRecord {
@@ -22,15 +26,17 @@ export class ManagedDocumentRequestIntentConflictError extends Error {
 }
 
 export class ManagedDocumentRequestLedger {
-  private readonly transport: ResilientDropboxTransport;
+  private readonly objects: ObjectPersistence;
 
-  constructor(transport: DropboxTransport) {
-    this.transport = new ResilientDropboxTransport(transport);
+  constructor(input: ObjectPersistence | PersistenceInput) {
+    this.objects = isObjectPersistence(input)
+      ? input
+      : asProjectOsPersistence(input).objects;
   }
 
   async readIntent(projectId: string, requestId: string): Promise<ManagedDocumentRequestIntentRecord | null> {
     assertRequestId(requestId);
-    const raw = await this.transport.download(intentPath(projectId, requestId));
+    const raw = await this.objects.readText(intentPath(projectId, requestId));
     if (raw === null) return null;
     const parsed = JSON.parse(raw) as Partial<ManagedDocumentRequestIntentRecord>;
     if (
@@ -56,10 +62,10 @@ export class ManagedDocumentRequestLedger {
     };
     const content = pretty(record);
     try {
-      await this.transport.upload(intentPath(projectId, requestId), content, "add");
+      await this.objects.createText(intentPath(projectId, requestId), content);
       return record;
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
+      if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.readIntent(projectId, requestId);
       if (!existing) throw error;
       if (existing.request_sha256 !== requestSha256) {
@@ -71,7 +77,7 @@ export class ManagedDocumentRequestLedger {
 
   async readReceipt(projectId: string, requestId: string): Promise<ManagedDocumentRequestReceiptRecord | null> {
     assertRequestId(requestId);
-    const raw = await this.transport.download(receiptPath(projectId, requestId));
+    const raw = await this.objects.readText(receiptPath(projectId, requestId));
     if (raw === null) return null;
     const parsed = JSON.parse(raw) as Partial<ManagedDocumentRequestReceiptRecord>;
     if (
@@ -104,10 +110,10 @@ export class ManagedDocumentRequestLedger {
     };
     const content = pretty(record);
     try {
-      await this.transport.upload(receiptPath(projectId, requestId), content, "add");
+      await this.objects.createText(receiptPath(projectId, requestId), content);
       return record;
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
+      if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.readReceipt(projectId, requestId);
       if (!existing) throw error;
       if (existing.request_sha256 !== requestSha256 || existing.receipt_json !== receiptJson) {
@@ -131,6 +137,14 @@ function assertRequestId(value: string): string {
     throw new Error(`Unsafe managed document request id: ${value}`);
   }
   return value;
+}
+
+function isObjectPersistence(input: ObjectPersistence | PersistenceInput): input is ObjectPersistence {
+  return typeof input === "object"
+    && input !== null
+    && "readText" in input
+    && "createText" in input
+    && "upsertText" in input;
 }
 
 function pretty(value: unknown): string {

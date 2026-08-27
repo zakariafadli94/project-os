@@ -1,11 +1,7 @@
-import type { DropboxTransport } from "../providers/dropbox/client";
-import { createDropboxPersistence } from "../providers/dropbox/adapter";
 import type { ProjectOsPersistenceRuntime } from "../provider/capabilities";
 import type { ProviderChangeEntry, ProviderObjectMetadata } from "../provider/contract";
-import { ProviderCapabilityError } from "../provider/errors";
-import { withProviderResilience } from "../provider/resilience";
 
-export type PersistenceInput = ProjectOsPersistenceRuntime | DropboxTransport;
+export type PersistenceInput = ProjectOsPersistenceRuntime;
 
 export interface LegacyDropboxFileMetadata {
   id: string;
@@ -28,28 +24,7 @@ export interface LegacyDropboxChangeEntry {
 }
 
 export function asProjectOsPersistence(input: PersistenceInput): ProjectOsPersistenceRuntime {
-  if (isPreparedRuntime(input)) return input;
-
-  const raw = forwardLegacyDropboxTransport(input);
-  const runtime = withProviderResilience(createDropboxPersistence(raw));
-  return {
-    providerId: runtime.providerId,
-    objects: runtime.objects,
-    conditionalWrite: runtime.conditionalWrite ?? {
-      writeTextConditional: missing("conditional-write")
-    },
-    serverSideCopy: runtime.serverSideCopy ?? {
-      copyObject: missing("server-side-copy")
-    },
-    changeFeed: runtime.changeFeed ?? {
-      listChanges: missing("incremental-change-feed")
-    },
-    evidence: {
-      stableObjectId: runtime.evidence?.stableObjectId ?? { semantics: "stable-through-move" },
-      revisionToken: runtime.evidence?.revisionToken ?? { semantics: "opaque-object-revision" },
-      integrityHash: runtime.evidence?.integrityHash ?? { semantics: "identified-algorithm" }
-    }
-  };
+  return input;
 }
 
 export function toProviderObjectMetadata(
@@ -95,54 +70,4 @@ export function toProviderChangeEntry(
     });
   }
   return result;
-}
-
-function forwardLegacyDropboxTransport(input: DropboxTransport): DropboxTransport {
-  return {
-    upload: (path, content, mode) => input.upload(path, content, mode),
-    download: (path) => input.download(path),
-    move: (from, to) => input.move(from, to),
-    getMetadata: input.getMetadata
-      ? (path) => input.getMetadata!(path)
-      : missing("metadata"),
-    listFolder: input.listFolder
-      ? (path) => input.listFolder!(path)
-      : missing("list"),
-    delete: input.delete
-      ? (path) => input.delete!(path)
-      : missing("delete"),
-    ...(input.uploadConditional
-      ? {
-          uploadConditional: (path: string, content: string, expectedRev: string) =>
-            input.uploadConditional!(path, content, expectedRev)
-        }
-      : {}),
-    ...(input.copy
-      ? {
-          copy: (from: string, to: string) => input.copy!(from, to)
-        }
-      : {}),
-    ...(input.listFolderChanges
-      ? {
-          listFolderChanges: (root?: string, cursor?: string) => input.listFolderChanges!(root, cursor)
-        }
-      : {})
-  };
-}
-
-function isPreparedRuntime(input: PersistenceInput): input is ProjectOsPersistenceRuntime {
-  return typeof input === "object"
-    && input !== null
-    && "providerId" in input
-    && "objects" in input
-    && "conditionalWrite" in input
-    && "serverSideCopy" in input
-    && "changeFeed" in input;
-}
-
-function missing<T extends (...args: never[]) => Promise<never>>(capability: string): T;
-function missing(capability: string) {
-  return async (..._args: unknown[]): Promise<never> => {
-    throw new ProviderCapabilityError(capability);
-  };
 }

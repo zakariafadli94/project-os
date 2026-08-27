@@ -16,4 +16,5 @@ jobs:
           node-version: 22
       - run: npm install
       - run: npm run check
+      - run: npm run test:persistence-high-risk
       - run: npx wrangler deploy --dry-run

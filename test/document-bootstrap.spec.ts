@@ -7,6 +7,7 @@ import { ManagedDocumentBootstrapper } from "../src/documents/bootstrap";
 import { sha256Text } from "../src/documents/hash";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { ManagedDocumentService } from "../src/documents/service";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, { content: string; metadata: DropboxFileMetadata }>();
@@ -87,15 +88,16 @@ const publishedPath = workspaceManagedDocumentPath("PRJ-0002", "project-os", "de
 describe("ManagedDocumentBootstrapper", () => {
   it("refuses to infer publication from an unknown DELIVERABLE provider file", async () => {
     const transport = new FakeTransport();
+    const runtime = persistenceFromDropbox(transport);
     const content = "# Strategy\n\nUnknown provider file";
     const metadata = transport.seed(publishedPath, content, "id:published-unknown");
-    const bootstrap = new ManagedDocumentBootstrapper(transport);
+    const bootstrap = new ManagedDocumentBootstrapper(runtime);
 
     await expect(bootstrap.bootstrapExistingManagedPath(state(), publishedPath, metadata, "published"))
       .rejects.toThrow(/published provenance/i);
 
     const documentId = await documentIdFor("PRJ-0002", logicalPath);
-    expect(await new DocumentLedgerRepository(transport).readHead("PRJ-0002", documentId)).toBeNull();
+    expect(await new DocumentLedgerRepository(runtime).readHead("PRJ-0002", documentId)).toBeNull();
     expect(transport.files.get(publishedPath)?.content).toBe(content);
     expect(transport.visibleUploads).toEqual([]);
     expect(transport.copies).toHaveLength(0);
@@ -105,7 +107,7 @@ describe("ManagedDocumentBootstrapper", () => {
     const transport = new FakeTransport();
     const content = "# Strategy\n\nPublished legacy version";
     const metadata = transport.seed(publishedPath, content, "id:published-legacy");
-    const bootstrap = new ManagedDocumentBootstrapper(transport);
+    const bootstrap = new ManagedDocumentBootstrapper(persistenceFromDropbox(transport));
 
     const result = await bootstrap.bootstrapExistingManagedPath(
       state(), publishedPath, metadata, "published", { publishedProvenance: "legacy_artifact" }
@@ -122,11 +124,12 @@ describe("ManagedDocumentBootstrapper", () => {
 
   it("adopts a pre-ledger WORKING file and the next AI write updates it through CAS", async () => {
     const transport = new FakeTransport();
+    const runtime = persistenceFromDropbox(transport);
     const content = "# Strategy\n\nHuman draft";
     const metadata = transport.seed(workingPath, content, "id:working-legacy");
-    const bootstrap = new ManagedDocumentBootstrapper(transport);
+    const bootstrap = new ManagedDocumentBootstrapper(runtime);
     const adopted = await bootstrap.bootstrapExistingManagedPath(state(), workingPath, metadata, "working");
-    const service = new ManagedDocumentService(transport);
+    const service = new ManagedDocumentService(runtime);
     const next = "# Strategy\n\nHuman draft\n\n## ICP\nMid-market";
 
     const receipt = await service.writeWorking({
@@ -148,7 +151,7 @@ describe("ManagedDocumentBootstrapper", () => {
   it("merges an explicitly governed published baseline and a later WORKING baseline", async () => {
     const transport = new FakeTransport();
     const published = transport.seed(publishedPath, "# Strategy\n\nPublished V10", "id:pub-same-doc");
-    const bootstrap = new ManagedDocumentBootstrapper(transport);
+    const bootstrap = new ManagedDocumentBootstrapper(persistenceFromDropbox(transport));
     const publishedAdoption = await bootstrap.bootstrapExistingManagedPath(
       state(), publishedPath, published, "published", { publishedProvenance: "legacy_artifact" }
     );
@@ -169,7 +172,7 @@ describe("ManagedDocumentBootstrapper", () => {
     const transport = new FakeTransport();
     const referencePath = workspaceManagedDocumentPath("PRJ-0002", "project-os", "references", "MARKET/Reports/crm.pdf");
     const metadata = transport.seed(referencePath, "%PDF CRM market report", "id:reference-existing");
-    const bootstrap = new ManagedDocumentBootstrapper(transport);
+    const bootstrap = new ManagedDocumentBootstrapper(persistenceFromDropbox(transport));
 
     const result = await bootstrap.bootstrapExistingManagedPath(state(), referencePath, metadata, "reference");
 
@@ -183,13 +186,14 @@ describe("ManagedDocumentBootstrapper", () => {
 
   it("uses a durable provider-file binding during baseline rebuild instead of duplicating an ingested reference", async () => {
     const transport = new FakeTransport();
+    const runtime = persistenceFromDropbox(transport);
     const referencePath = workspaceManagedDocumentPath("PRJ-0002", "project-os", "references", "UNCLASSIFIED/report.pdf");
-    const bootstrap = new ManagedDocumentBootstrapper(transport);
+    const bootstrap = new ManagedDocumentBootstrapper(runtime);
     const originalMetadata = transport.seed(referencePath, "%PDF durable source", "id:reference-original");
     const original = await bootstrap.bootstrapExistingManagedPath(state(), referencePath, originalMetadata, "reference");
 
     const copiedMetadata = transport.seed(referencePath, "%PDF durable source", "id:reference-after-copy");
-    const ledger = new DocumentLedgerRepository(transport);
+    const ledger = new DocumentLedgerRepository(runtime);
     await ledger.writeProviderFileBinding({
       schema_version: "1.0",
       project_id: "PRJ-0002",

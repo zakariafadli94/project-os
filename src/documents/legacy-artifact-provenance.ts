@@ -7,7 +7,7 @@ import {
   type ManagedProviderObservation
 } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
-import { ArtifactContentConflictError } from "../dropbox/repository-core";
+import { ArtifactContentConflictError } from "../persistence/repository-core";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "../persistence/artifact-routing";
 import {
   requireDropboxV1Evidence,

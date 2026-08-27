@@ -9,6 +9,7 @@ import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { MutationGateService, parseMutationGateMode } from "../src/mutation-gate/service";
 import { sha256Text } from "../src/documents/hash";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-25T16:45:00+01:00";
@@ -105,8 +106,9 @@ describe("MutationGate candidates", () => {
       appSecret: testEnv.DROPBOX_APP_SECRET,
       refreshToken: testEnv.DROPBOX_REFRESH_TOKEN
     });
-    const freshService = new MutationGateService(client, "observe");
-    const freshRepository = new MutationGateRepository(client);
+    const runtime = persistenceFromDropbox(client);
+    const freshService = new MutationGateService(runtime, "observe");
+    const freshRepository = new MutationGateRepository(runtime);
     const rebuilt = await freshService.list(created.project_id);
 
     expect(rebuilt).toEqual([

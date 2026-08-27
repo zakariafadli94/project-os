@@ -10,6 +10,7 @@ import {
   machineMaterializationRecordPath
 } from "../src/dropbox/layout";
 import { ProjectRepository } from "../src/dropbox/repository";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -101,7 +102,7 @@ describe("durable materialization evidence repository", () => {
 
   it("replays identical completed evidence idempotently and rejects a different immutable reality", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const path = machineMaterializationRecordPath(completed.project_id, completed.target_revision, completed.projection_version);
 
     await repository.writeCompletedMaterializationRecord(completed);
@@ -119,7 +120,7 @@ describe("durable materialization evidence repository", () => {
 
   it("does not advance head implicitly and only publishes a head backed by matching immutable evidence", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
 
     await repository.writeCompletedMaterializationRecord(completed);
     await expect(repository.readMaterializationHead("PRJ-3101")).resolves.toBeNull();
@@ -135,7 +136,7 @@ describe("durable materialization evidence repository", () => {
 
   it("validates record/head bindings and lists only valid generation filenames in deterministic order", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
 
     await repository.writeCompletedMaterializationRecord(completed);
     const later: CompletedMaterializationRecord = {

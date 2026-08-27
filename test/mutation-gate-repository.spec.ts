@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DropboxConflictError, type DropboxEntry, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import type { ExternalMutationResolutionRecord, MutationIntentRecord } from "../src/domain/mutation-gate";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeMutationGateDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
@@ -113,7 +114,7 @@ describe("MutationGateRepository", () => {
     const transport = new FakeMutationGateDropbox();
     const visible = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/direct.md";
     const metadata = await transport.seed(visible, "direct bytes", "id:direct");
-    const repo = new MutationGateRepository(transport);
+    const repo = new MutationGateRepository(persistenceFromDropbox(transport));
 
     const result = await repo.captureCandidate({
       projectId: "PRJ-0002",
@@ -135,7 +136,7 @@ describe("MutationGateRepository", () => {
     const transport = new FakeMutationGateDropbox();
     const visible = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/direct.md";
     const metadata = await transport.seed(visible, "direct bytes", "id:direct");
-    const repo = new MutationGateRepository(transport);
+    const repo = new MutationGateRepository(persistenceFromDropbox(transport));
     const input = {
       projectId: "PRJ-0002",
       detectionSource: "incremental" as const,
@@ -154,7 +155,7 @@ describe("MutationGateRepository", () => {
 
   it("keeps artifact intent immutable and indexes it by exact destination", async () => {
     const transport = new FakeMutationGateDropbox();
-    const repo = new MutationGateRepository(transport);
+    const repo = new MutationGateRepository(persistenceFromDropbox(transport));
     const original = intent();
 
     expect(await repo.ensureArtifactIntent(original)).toEqual(original);
@@ -170,7 +171,7 @@ describe("MutationGateRepository", () => {
     const transport = new FakeMutationGateDropbox();
     const visible = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/direct.md";
     const metadata = await transport.seed(visible, "direct bytes", "id:direct");
-    const repo = new MutationGateRepository(transport);
+    const repo = new MutationGateRepository(persistenceFromDropbox(transport));
     const candidate = (await repo.captureCandidate({
       projectId: "PRJ-0002",
       detectionSource: "incremental",

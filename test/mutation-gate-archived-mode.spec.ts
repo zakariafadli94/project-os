@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
 import { ManagedDocumentChangeCoordinator } from "../src/documents/change-coordinator";
 import type { DropboxTransport } from "../src/dropbox/client";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 function unusedTransport(): DropboxTransport {
   return {
@@ -18,7 +19,7 @@ describe("MutationGate archived reconciliation mode", () => {
       put: vi.fn(async () => undefined),
       delete: vi.fn(async () => true)
     };
-    const coordinator = new ManagedDocumentChangeCoordinator(unusedTransport(), cursorStore, "enforce");
+    const coordinator = new ManagedDocumentChangeCoordinator(persistenceFromDropbox(unusedTransport()), cursorStore, "enforce");
     const state = emptyProjectState("PRJ-9903", "Archived Gate", "archived-gate", "Archived mode contract");
     state.status = "archived";
 

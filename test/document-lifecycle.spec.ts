@@ -11,6 +11,7 @@ import {
   ManagedDocumentService
 } from "../src/documents/service";
 import { sha256Text } from "../src/documents/hash";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, { content: string; metadata: DropboxFileMetadata }>();
@@ -110,7 +111,7 @@ async function write(service: ManagedDocumentService, requestId: string, content
 describe("ManagedDocumentService work-product lifecycle", () => {
   it("builds one visible working file over multiple immutable versions and tracks its current provider rev", async () => {
     const transport = new FakeTransport();
-    const service = new ManagedDocumentService(transport);
+    const service = new ManagedDocumentService(persistenceFromDropbox(transport));
 
     const v1 = await write(service, "DOCREQ-WORK-000001", "# Strategy\n\n## ICP\nTBD");
     const v2 = await write(service, "DOCREQ-WORK-000002", "# Strategy\n\n## ICP\nMid-market", v1.version_id);
@@ -129,7 +130,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
 
   it("rejects an AI write based on a stale logical version without touching the newer working file", async () => {
     const transport = new FakeTransport();
-    const service = new ManagedDocumentService(transport);
+    const service = new ManagedDocumentService(persistenceFromDropbox(transport));
     const v1 = await write(service, "DOCREQ-WORK-000003", "one");
     const v2 = await write(service, "DOCREQ-WORK-000004", "two", v1.version_id);
 
@@ -141,7 +142,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
 
   it("promotes working to review, allows review edits, and publishes only on explicit publish", async () => {
     const transport = new FakeTransport();
-    const service = new ManagedDocumentService(transport);
+    const service = new ManagedDocumentService(persistenceFromDropbox(transport));
     const working = await write(service, "DOCREQ-WORK-000006", "draft");
 
     const review = await service.promoteToReview({
@@ -188,7 +189,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
 
   it("reopens a published deliverable into working while keeping the published version frozen and provider observations independent", async () => {
     const transport = new FakeTransport();
-    const service = new ManagedDocumentService(transport);
+    const service = new ManagedDocumentService(persistenceFromDropbox(transport));
     const working = await write(service, "DOCREQ-WORK-000007", "published content");
     const review = await service.promoteToReview({
       request_id: "DOCREQ-REVIEW-000003", project_id: "PRJ-0002", document_id: working.document_id,
@@ -216,7 +217,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
 
   it("writes immutable publish evidence before advancing the mutable document head", async () => {
     const transport = new FakeTransport();
-    const service = new ManagedDocumentService(transport);
+    const service = new ManagedDocumentService(persistenceFromDropbox(transport));
     const working = await write(service, "DOCREQ-WORK-000008", "candidate");
     const review = await service.promoteToReview({
       request_id: "DOCREQ-REVIEW-000004", project_id: "PRJ-0002", document_id: working.document_id,
@@ -238,7 +239,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
 
   it("preserves a human deliverable edit that races between observation and publish CAS", async () => {
     const transport = new FakeTransport();
-    const service = new ManagedDocumentService(transport);
+    const service = new ManagedDocumentService(persistenceFromDropbox(transport));
     const firstWorking = await write(service, "DOCREQ-WORK-000009", "published v1");
     const firstReview = await service.promoteToReview({
       request_id: "DOCREQ-REVIEW-000005", project_id: "PRJ-0002", document_id: firstWorking.document_id,

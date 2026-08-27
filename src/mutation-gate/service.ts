@@ -1,11 +1,19 @@
 import { parseArtifactWriteRequest, type ArtifactWriteReceipt } from "../domain/artifact-write";
 import type { MutationDetectionSource } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
-import type { DropboxChangeEntry, DropboxFileMetadata, DropboxTransport } from "../dropbox/client";
-import { machineArtifactReceiptPath } from "../dropbox/layout";
-import { ArtifactContentConflictError } from "../dropbox/repository-core";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+import { ArtifactContentConflictError } from "../persistence/repository-core";
 import { sha256Text } from "../documents/hash";
+import {
+  asProjectOsPersistence,
+  toProviderChangeEntry,
+  toProviderObjectMetadata,
+  type LegacyDropboxChangeEntry,
+  type LegacyDropboxFileMetadata,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
+import { machineArtifactReceiptPath } from "../persistence/layout";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type { ProviderChangeEntry, ProviderObjectMetadata } from "../persistence/provider/contract";
 import { MutationGateClassifier } from "./classifier";
 import { MutationGateRepository } from "./repository";
 
@@ -84,27 +92,28 @@ export function parseMutationGateMode(value: string | undefined): MutationGateMo
 }
 
 export class MutationGateService {
-  private readonly transport: ResilientDropboxTransport;
+  private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly classifier: MutationGateClassifier;
   private readonly repository: MutationGateRepository;
 
   constructor(
-    transport: DropboxTransport,
+    input: PersistenceInput,
     private readonly mode: MutationGateMode = "observe"
   ) {
-    this.transport = new ResilientDropboxTransport(transport);
-    this.classifier = new MutationGateClassifier(transport);
-    this.repository = new MutationGateRepository(transport);
+    this.runtime = asProjectOsPersistence(input);
+    this.classifier = new MutationGateClassifier(this.runtime);
+    this.repository = new MutationGateRepository(this.runtime);
   }
 
   async processChanges(
     state: ProjectState,
-    changes: DropboxChangeEntry[],
+    changes: Array<ProviderChangeEntry | LegacyDropboxChangeEntry>,
     detectionSource: MutationDetectionSource
   ): Promise<MutationGateProcessSummary> {
     let candidates = 0;
-    for (const change of changes) {
-      if (change.tag !== "file") continue;
+    for (const changeInput of changes) {
+      const change = toProviderChangeEntry(changeInput);
+      if (change.kind !== "file") continue;
       const metadata = await this.metadataFor(change);
       if (!metadata) continue;
       const classification = await this.classifier.classify(state, change.path, metadata);
@@ -123,15 +132,16 @@ export class MutationGateService {
   async captureExternalCandidate(
     state: ProjectState,
     path: string,
-    metadata: DropboxFileMetadata,
+    metadataInput: ProviderObjectMetadata | LegacyDropboxFileMetadata,
     detectionSource: MutationDetectionSource
   ) {
+    const metadata = toProviderObjectMetadata(metadataInput);
     return this.repository.captureCandidate({
       projectId: state.project_id,
       detectionSource,
       visiblePath: path,
       metadata,
-      detectedAt: metadata.server_modified ?? new Date().toISOString()
+      detectedAt: metadata.modifiedAt ?? new Date().toISOString()
     });
   }
 
@@ -144,7 +154,7 @@ export class MutationGateService {
       throw new Error("Candidate resolution capability does not match artifact destination");
     }
 
-    const metadata = await this.transport.getMetadata(destinationPath);
+    const metadata = await this.runtime.objects.getMetadata(destinationPath);
     if (metadata) {
       const classification = await this.classifier.classify(state, destinationPath, metadata);
       if (classification.kind === "external_candidate") {
@@ -178,7 +188,7 @@ export class MutationGateService {
     const intent = await this.repository.readArtifactIntent(projectId, requestId);
     if (!intent) return null;
 
-    const rawReceipt = await this.transport.download(machineArtifactReceiptPath(requestId));
+    const rawReceipt = await this.runtime.objects.readText(machineArtifactReceiptPath(requestId));
     if (rawReceipt === null) {
       return {
         request_id: requestId,
@@ -203,7 +213,7 @@ export class MutationGateService {
       };
     }
 
-    const visible = await this.transport.download(intent.destination_path);
+    const visible = await this.runtime.objects.readText(intent.destination_path);
     const finalEffectVerified = visible !== null
       && await sha256Text(visible) === intent.expected_content_sha256;
     return {
@@ -268,18 +278,9 @@ export class MutationGateService {
     };
   }
 
-  private async metadataFor(change: DropboxChangeEntry): Promise<DropboxFileMetadata | null> {
-    if (change.id && change.rev && change.content_hash && change.size !== undefined) {
-      return {
-        id: change.id,
-        path: change.path,
-        rev: change.rev,
-        content_hash: change.content_hash,
-        size: change.size,
-        ...(change.server_modified ? { server_modified: change.server_modified } : {})
-      };
-    }
-    return this.transport.getMetadata(change.path);
+  private async metadataFor(change: ProviderChangeEntry): Promise<ProviderObjectMetadata | null> {
+    if (change.metadata) return change.metadata;
+    return this.runtime.objects.getMetadata(change.path);
   }
 }
 

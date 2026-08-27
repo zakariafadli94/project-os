@@ -8,12 +8,20 @@ import {
   type ManagedProviderObservation
 } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
-import type { DropboxFileMetadata, DropboxTransport } from "../dropbox/client";
+import {
+  requireDropboxV1Evidence,
+  toManagedProviderObservation
+} from "../persistence/compatibility/dropbox-v1-evidence";
+import {
+  toProviderObjectMetadata,
+  type LegacyDropboxFileMetadata
+} from "../persistence/compatibility/dropbox-v1-legacy-data";
 import {
   machineDocumentProviderPayloadPath,
   workspaceManagedZoneRoot
-} from "../dropbox/layout";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+} from "../persistence/layout";
+import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import type { PersistenceInput } from "../persistence/provider/runtime";
 import { DocumentLedgerRepository } from "./repository";
 
 export type BootstrapManagedStage = "reference" | "working" | "review" | "published";
@@ -30,18 +38,16 @@ export interface ManagedDocumentBootstrapResult {
 }
 
 export class ManagedDocumentBootstrapper {
-  private readonly transport: ResilientDropboxTransport;
   private readonly ledger: DocumentLedgerRepository;
 
-  constructor(transport: DropboxTransport) {
-    this.transport = new ResilientDropboxTransport(transport);
-    this.ledger = new DocumentLedgerRepository(transport);
+  constructor(input: PersistenceInput) {
+    this.ledger = new DocumentLedgerRepository(input);
   }
 
   async bootstrapExistingManagedPath(
     state: ProjectState,
     visiblePath: string,
-    metadata: DropboxFileMetadata,
+    metadataInput: ProviderObjectMetadata | LegacyDropboxFileMetadata,
     inferredStage: BootstrapManagedStage,
     options: ManagedDocumentBootstrapOptions = {}
   ): Promise<ManagedDocumentBootstrapResult> {
@@ -53,13 +59,15 @@ export class ManagedDocumentBootstrapper {
       throw new Error("Published provenance is required before DELIVERABLES bootstrap");
     }
 
+    const metadata = toProviderObjectMetadata(metadataInput);
+    const evidence = requireDropboxV1Evidence(metadata);
     const parsed = parseVisiblePath(state, visiblePath, inferredStage);
     const kind: ManagedDocumentKind = inferredStage === "reference" ? "reference" : "work_product";
     const providerBinding = inferredStage === "reference"
-      ? await this.ledger.readProviderFileBinding(state.project_id, metadata.id)
+      ? await this.ledger.readProviderFileBinding(state.project_id, evidence.file_id)
       : null;
     const documentId = inferredStage === "reference"
-      ? providerBinding?.document_id ?? await documentIdForProviderFile(state.project_id, metadata.id)
+      ? providerBinding?.document_id ?? await documentIdForProviderFile(state.project_id, evidence.file_id)
       : await documentIdFor(state.project_id, parsed.logicalPath);
     const existingHead = await this.ledger.readHead(state.project_id, documentId);
 
@@ -77,7 +85,7 @@ export class ManagedDocumentBootstrapper {
       }
     }
 
-    const versionId = await externalVersionIdFor(metadata.rev);
+    const versionId = await externalVersionIdFor(evidence.rev);
     const immutablePayloadPath = machineDocumentProviderPayloadPath(state.project_id, documentId, versionId);
     await this.ledger.snapshotProviderFile(
       state.project_id,
@@ -98,13 +106,13 @@ export class ManagedDocumentBootstrapper {
       stage: inferredStage,
       logical_path: existingHead?.logical_path ?? parsed.logicalPath,
       source: sourceForBootstrap(inferredStage, options),
-      created_at: metadata.server_modified ?? "1970-01-01T00:00:00.000Z",
+      created_at: metadata.modifiedAt ?? "1970-01-01T00:00:00.000Z",
       immutable_payload_path: immutablePayloadPath,
-      provider_content_hash: metadata.content_hash,
-      provider_file_id: metadata.id,
-      provider_rev: metadata.rev,
+      provider_content_hash: evidence.content_hash,
+      provider_file_id: evidence.file_id,
+      provider_rev: evidence.rev,
       provider_path: visiblePath,
-      size: metadata.size
+      size: evidence.size
     };
     await this.ledger.writeVersion(version);
 
@@ -125,13 +133,13 @@ export class ManagedDocumentBootstrapper {
       await this.ledger.writeProviderFileBinding({
         schema_version: "1.0",
         project_id: state.project_id,
-        provider_file_id: metadata.id,
+        provider_file_id: evidence.file_id,
         document_id: documentId
       });
       await this.ledger.writeReferenceFingerprint({
         schema_version: "1.0",
         project_id: state.project_id,
-        provider_content_hash: metadata.content_hash,
+        provider_content_hash: evidence.content_hash,
         document_id: documentId,
         version_id: versionId
       });
@@ -252,12 +260,6 @@ function pointerFor(head: ManagedDocumentHead, stage: BootstrapManagedStage): st
   return head.published_version_id;
 }
 
-function observation(path: string, metadata: DropboxFileMetadata): ManagedProviderObservation {
-  return {
-    path,
-    file_id: metadata.id,
-    rev: metadata.rev,
-    content_hash: metadata.content_hash,
-    size: metadata.size
-  };
+function observation(path: string, metadata: ProviderObjectMetadata): ManagedProviderObservation {
+  return toManagedProviderObservation({ ...metadata, path });
 }

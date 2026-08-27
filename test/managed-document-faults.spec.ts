@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import { sha256Text } from "../src/documents/hash";
-import { machineDocumentVersionPath } from "../src/dropbox/layout";
+import { machineDocumentVersionPath } from "../src/persistence/layout";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;

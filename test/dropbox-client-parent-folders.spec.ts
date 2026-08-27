@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DropboxClient } from "../src/dropbox/client";
+import { DropboxClient } from "../src/persistence/providers/dropbox/client";
 
 describe("DropboxClient parent folder recovery", () => {
   afterEach(() => vi.restoreAllMocks());

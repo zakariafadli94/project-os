@@ -8,11 +8,13 @@ import {
   type MutationDetectionSource,
   type MutationIntentRecord
 } from "../domain/mutation-gate";
+import { requireDropboxV1Evidence } from "../persistence/compatibility/dropbox-v1-evidence";
 import {
-  DropboxConflictError,
-  type DropboxFileMetadata,
-  type DropboxTransport
-} from "../dropbox/client";
+  asProjectOsPersistence,
+  toProviderObjectMetadata,
+  type LegacyDropboxFileMetadata,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
 import {
   machineMutationCandidatePath,
   machineMutationCandidatePayloadPath,
@@ -20,8 +22,10 @@ import {
   machineMutationIntentDestinationBindingRoot,
   machineMutationIntentPath,
   machineMutationResolutionPath
-} from "../dropbox/layout";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+} from "../persistence/layout";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import { ProviderConflictError } from "../persistence/provider/errors";
 import { sha256Text } from "../documents/hash";
 
 interface MutationIntentDestinationBindingRecord {
@@ -45,7 +49,7 @@ export interface CaptureExternalMutationCandidateInput {
   projectId: string;
   detectionSource: MutationDetectionSource;
   visiblePath: string;
-  metadata: DropboxFileMetadata;
+  metadata: ProviderObjectMetadata | LegacyDropboxFileMetadata;
   detectedAt: string;
 }
 
@@ -76,10 +80,10 @@ export class MutationResolutionConflictError extends Error {
 }
 
 export class MutationGateRepository {
-  private readonly transport: ResilientDropboxTransport;
+  private readonly runtime: ProjectOsPersistenceRuntime;
 
-  constructor(transport: DropboxTransport) {
-    this.transport = new ResilientDropboxTransport(transport);
+  constructor(input: PersistenceInput) {
+    this.runtime = asProjectOsPersistence(input);
   }
 
   async ensureArtifactIntent(record: MutationIntentRecord): Promise<MutationIntentRecord> {
@@ -88,9 +92,9 @@ export class MutationGateRepository {
     let effective = validated;
 
     try {
-      await this.transport.upload(path, pretty(validated), "add");
+      await this.runtime.objects.createText(path, pretty(validated));
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
+      if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.readArtifactIntent(validated.project_id, validated.request_id);
       if (!existing || !sameJson(existing, validated)) {
         throw new MutationIntentConflictError(validated.request_id);
@@ -104,7 +108,7 @@ export class MutationGateRepository {
 
   async readArtifactIntent(projectId: string, requestId: string): Promise<MutationIntentRecord | null> {
     const path = machineMutationIntentPath(projectId, requestId);
-    const raw = await this.transport.download(path);
+    const raw = await this.runtime.objects.readText(path);
     if (raw === null) return null;
     const record = parseMutationIntentRecord(JSON.parse(raw));
     if (record.project_id !== projectId || record.request_id !== requestId) {
@@ -116,11 +120,11 @@ export class MutationGateRepository {
   async listArtifactIntentsForDestination(projectId: string, destinationPath: string): Promise<MutationIntentRecord[]> {
     const pathHash = await sha256Text(destinationPath);
     const root = machineMutationIntentDestinationBindingRoot(projectId, pathHash);
-    const entries = await this.transport.listFolder(root);
+    const entries = await this.runtime.objects.listChildren(root);
     const records: MutationIntentRecord[] = [];
 
     for (const entry of entries) {
-      if (entry.tag !== "file") continue;
+      if (entry.kind !== "file") continue;
       const match = /^(ART-[A-Z0-9-]{10,})\.json$/.exec(entry.name);
       if (!match) continue;
       const binding = await this.readDestinationBinding(projectId, destinationPath, match[1]);
@@ -136,11 +140,13 @@ export class MutationGateRepository {
   }
 
   async captureCandidate(input: CaptureExternalMutationCandidateInput): Promise<CaptureExternalMutationCandidateResult> {
-    validateSourceMetadata(input.visiblePath, input.metadata);
+    const metadata = toProviderObjectMetadata(input.metadata);
+    validateSourceMetadata(input.visiblePath, metadata);
+    const evidence = requireDropboxV1Evidence(metadata);
     const candidateId = await mutationCandidateIdFor({
       projectId: input.projectId,
-      providerFileId: input.metadata.id,
-      providerRev: input.metadata.rev
+      providerFileId: evidence.file_id,
+      providerRev: evidence.rev
     });
     const immutablePayloadPath = machineMutationCandidatePayloadPath(input.projectId, candidateId);
     const candidate = parseExternalMutationCandidateRecord({
@@ -150,10 +156,10 @@ export class MutationGateRepository {
       source: "external_unverified",
       detection_source: input.detectionSource,
       provider_path: input.visiblePath,
-      provider_file_id: input.metadata.id,
-      provider_rev: input.metadata.rev,
-      provider_content_hash: input.metadata.content_hash,
-      size: input.metadata.size,
+      provider_file_id: evidence.file_id,
+      provider_rev: evidence.rev,
+      provider_content_hash: evidence.content_hash,
+      size: evidence.size,
       immutable_payload_path: immutablePayloadPath,
       detected_at: input.detectedAt
     });
@@ -170,10 +176,10 @@ export class MutationGateRepository {
     await this.snapshotCandidatePayload(candidate);
     const path = machineMutationCandidatePath(input.projectId, candidateId);
     try {
-      await this.transport.upload(path, pretty(candidate), "add");
+      await this.runtime.objects.createText(path, pretty(candidate));
       return { created: true, record: candidate };
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
+      if (!(error instanceof ProviderConflictError)) throw error;
       const raced = await this.readCandidate(input.projectId, candidateId);
       if (!raced || !sameCandidateEvidence(raced, candidate)) {
         throw new MutationCandidateEvidenceConflictError(candidateId);
@@ -184,7 +190,7 @@ export class MutationGateRepository {
   }
 
   async readCandidate(projectId: string, candidateId: string): Promise<ExternalMutationCandidateRecord | null> {
-    const raw = await this.transport.download(machineMutationCandidatePath(projectId, candidateId));
+    const raw = await this.runtime.objects.readText(machineMutationCandidatePath(projectId, candidateId));
     if (raw === null) return null;
     const record = parseExternalMutationCandidateRecord(JSON.parse(raw));
     if (record.project_id !== projectId || record.candidate_id !== candidateId) {
@@ -195,10 +201,10 @@ export class MutationGateRepository {
 
   async listCandidates(projectId: string): Promise<ExternalMutationCandidateRecord[]> {
     const root = `${machineMutationGateRoot(projectId)}/candidates`;
-    const entries = await this.transport.listFolder(root);
+    const entries = await this.runtime.objects.listChildren(root);
     const records: ExternalMutationCandidateRecord[] = [];
     for (const entry of entries) {
-      if (entry.tag !== "file") continue;
+      if (entry.kind !== "file") continue;
       const match = /^(MUTCAND-[A-F0-9]{24})\.json$/.exec(entry.name);
       if (!match) continue;
       const record = await this.readCandidate(projectId, match[1]);
@@ -210,7 +216,7 @@ export class MutationGateRepository {
   async readCandidatePayload(projectId: string, candidateId: string): Promise<string | null> {
     const candidate = await this.readCandidate(projectId, candidateId);
     if (!candidate) return null;
-    return this.transport.download(candidate.immutable_payload_path);
+    return this.runtime.objects.readText(candidate.immutable_payload_path);
   }
 
   async writeResolution(
@@ -238,13 +244,12 @@ export class MutationGateRepository {
 
     if (!terminal) {
       try {
-        await this.transport.upload(
+        await this.runtime.objects.createText(
           terminalResolutionPath(validated.project_id, validated.candidate_id),
-          pretty(terminalEvidence),
-          "add"
+          pretty(terminalEvidence)
         );
       } catch (error) {
-        if (!(error instanceof DropboxConflictError)) throw error;
+        if (!(error instanceof ProviderConflictError)) throw error;
         const raced = await this.readTerminalResolutionRecord(validated.project_id, validated.candidate_id);
         if (!raced) throw new MutationResolutionConflictError(validated.candidate_id);
         assertTerminalCompatible(raced, validated, requestHash);
@@ -253,10 +258,10 @@ export class MutationGateRepository {
 
     const path = machineMutationResolutionPath(validated.project_id, validated.candidate_id, validated.resolution_id);
     try {
-      await this.transport.upload(path, pretty(validated), "add");
+      await this.runtime.objects.createText(path, pretty(validated));
       return validated;
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
+      if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.readResolution(validated.project_id, validated.candidate_id, validated.resolution_id);
       if (!existing || !sameJson(existing, validated)) {
         throw new MutationResolutionConflictError(validated.candidate_id);
@@ -267,10 +272,10 @@ export class MutationGateRepository {
 
   async readResolutions(projectId: string, candidateId: string): Promise<ExternalMutationResolutionRecord[]> {
     const root = resolutionRoot(projectId, candidateId);
-    const entries = await this.transport.listFolder(root);
+    const entries = await this.runtime.objects.listChildren(root);
     const records: ExternalMutationResolutionRecord[] = [];
     for (const entry of entries) {
-      if (entry.tag !== "file") continue;
+      if (entry.kind !== "file") continue;
       const match = /^(MUTRES-[A-F0-9]{24})\.json$/.exec(entry.name);
       if (!match) continue;
       const record = await this.readResolution(projectId, candidateId, match[1]);
@@ -283,7 +288,7 @@ export class MutationGateRepository {
     projectId: string,
     candidateId: string
   ): Promise<MutationResolutionTerminalEvidence | null> {
-    const raw = await this.transport.download(terminalResolutionPath(projectId, candidateId));
+    const raw = await this.runtime.objects.readText(terminalResolutionPath(projectId, candidateId));
     if (raw === null) return null;
     const parsed = JSON.parse(raw) as Partial<MutationResolutionTerminalEvidence>;
     if (
@@ -330,10 +335,10 @@ export class MutationGateRepository {
     const path = await destinationBindingPath(intent.project_id, intent.destination_path, intent.request_id);
     const content = pretty(binding);
     try {
-      await this.transport.upload(path, content, "add");
+      await this.runtime.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const existing = await this.transport.download(path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.readText(path);
       if (existing !== content) throw new MutationIntentConflictError(intent.request_id);
     }
   }
@@ -344,7 +349,7 @@ export class MutationGateRepository {
     requestId: string
   ): Promise<MutationIntentDestinationBindingRecord | null> {
     const path = await destinationBindingPath(projectId, destinationPath, requestId);
-    const raw = await this.transport.download(path);
+    const raw = await this.runtime.objects.readText(path);
     if (raw === null) return null;
     const parsed = JSON.parse(raw) as Partial<MutationIntentDestinationBindingRecord>;
     if (
@@ -362,18 +367,18 @@ export class MutationGateRepository {
 
   private async snapshotCandidatePayload(candidate: ExternalMutationCandidateRecord): Promise<void> {
     try {
-      const copied = await this.transport.copy(candidate.provider_path, candidate.immutable_payload_path);
+      const copied = await this.runtime.serverSideCopy.copyObject(candidate.provider_path, candidate.immutable_payload_path);
       assertPayloadMetadata(candidate, copied);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const existing = await this.transport.getMetadata(candidate.immutable_payload_path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.getMetadata(candidate.immutable_payload_path);
       if (!existing) throw error;
       assertPayloadMetadata(candidate, existing);
     }
   }
 
   private async verifyCandidatePayload(candidate: ExternalMutationCandidateRecord): Promise<void> {
-    const metadata = await this.transport.getMetadata(candidate.immutable_payload_path);
+    const metadata = await this.runtime.objects.getMetadata(candidate.immutable_payload_path);
     if (!metadata) {
       throw new MutationCandidateEvidenceConflictError(candidate.candidate_id);
     }
@@ -385,7 +390,7 @@ export class MutationGateRepository {
     candidateId: string,
     resolutionId: string
   ): Promise<ExternalMutationResolutionRecord | null> {
-    const raw = await this.transport.download(machineMutationResolutionPath(projectId, candidateId, resolutionId));
+    const raw = await this.runtime.objects.readText(machineMutationResolutionPath(projectId, candidateId, resolutionId));
     if (raw === null) return null;
     const record = parseExternalMutationResolutionRecord(JSON.parse(raw));
     if (record.project_id !== projectId || record.candidate_id !== candidateId || record.resolution_id !== resolutionId) {
@@ -412,16 +417,16 @@ function terminalResolutionPath(projectId: string, candidateId: string): string 
   return `${resolutionRoot(projectId, candidateId)}/terminal.json`;
 }
 
-function validateSourceMetadata(visiblePath: string, metadata: DropboxFileMetadata): void {
-  if (metadata.path !== visiblePath) throw new Error(`Mutation candidate metadata path mismatch: ${metadata.path} != ${visiblePath}`);
-  if (!/^id:[A-Za-z0-9_-]+$/.test(metadata.id)) throw new Error(`Invalid provider file id: ${metadata.id}`);
-  if (!metadata.rev) throw new Error("Mutation candidate requires provider rev");
-  if (!/^[a-f0-9]{64}$/.test(metadata.content_hash)) throw new Error("Mutation candidate requires provider content hash");
-  if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) throw new Error("Mutation candidate requires safe provider size");
+function validateSourceMetadata(visiblePath: string, metadata: ProviderObjectMetadata): void {
+  if (metadata.path !== visiblePath) {
+    throw new Error(`Mutation candidate metadata path mismatch: ${metadata.path} != ${visiblePath}`);
+  }
+  requireDropboxV1Evidence(metadata);
 }
 
-function assertPayloadMetadata(candidate: ExternalMutationCandidateRecord, metadata: DropboxFileMetadata): void {
-  if (metadata.content_hash !== candidate.provider_content_hash || metadata.size !== candidate.size) {
+function assertPayloadMetadata(candidate: ExternalMutationCandidateRecord, metadata: ProviderObjectMetadata): void {
+  const evidence = requireDropboxV1Evidence(metadata);
+  if (evidence.content_hash !== candidate.provider_content_hash || evidence.size !== candidate.size) {
     throw new MutationCandidateEvidenceConflictError(candidate.candidate_id);
   }
 }

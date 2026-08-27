@@ -6,6 +6,8 @@ import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { ManagedDocumentService } from "../src/documents/service";
+import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class ReferenceTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -46,21 +48,34 @@ class ReferenceTransport implements DropboxTransport {
   }
 }
 
+function change(metadata: DropboxFileMetadata): ProviderChangeEntry {
+  return {
+    kind: "file",
+    name: metadata.path.split("/").at(-1)!,
+    path: metadata.path,
+    metadata: {
+      path: metadata.path,
+      size: metadata.size,
+      objectId: metadata.id,
+      revisionToken: metadata.rev,
+      integrityHash: { algorithm: "dropbox-content-hash", value: metadata.content_hash }
+    }
+  };
+}
+
 describe("managed reference classification", () => {
   it("moves an ingested reference into a project taxonomy without changing logical document identity", async () => {
     const dropbox = new ReferenceTransport();
+    const runtime = persistenceFromDropbox(dropbox);
     const state = emptyProjectState("PRJ-4020", "Reference", "reference", "Classify refs");
     const inputPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "market/report.pdf");
     const input = await dropbox.externalAdd(inputPath, "report bytes");
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(state, [{
-      tag: "file", name: "report.pdf", path: inputPath, id: input.id, rev: input.rev,
-      content_hash: input.content_hash, size: input.size
-    }]);
+    await new ManagedDocumentReconciler(runtime).reconcileChanges(state, [change(input)]);
 
     const documentId = await documentIdForProviderFile(state.project_id, input.id);
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const before = await ledger.readHead(state.project_id, documentId);
-    const receipt = await new ManagedDocumentService(dropbox).classifyReference({
+    const receipt = await new ManagedDocumentService(runtime).classifyReference({
       request_id: "DOCREQ-CLASSIFY-0001",
       project_id: state.project_id,
       document_id: documentId,

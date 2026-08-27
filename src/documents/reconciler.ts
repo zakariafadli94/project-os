@@ -7,13 +7,23 @@ import {
   type ManagedProviderObservation
 } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
-import type { DropboxChangeEntry, DropboxFileMetadata, DropboxTransport } from "../dropbox/client";
+import {
+  requireDropboxV1Evidence,
+  toManagedProviderObservation
+} from "../persistence/compatibility/dropbox-v1-evidence";
+import {
+  asProjectOsPersistence,
+  toProviderChangeEntry,
+  type LegacyDropboxChangeEntry,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
 import {
   machineDocumentProviderPayloadPath,
   workspaceManagedDocumentPath,
   workspaceProjectRoot
-} from "../dropbox/layout";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+} from "../persistence/layout";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type { ProviderChangeEntry, ProviderObjectMetadata } from "../persistence/provider/contract";
 import { DocumentLedgerRepository, type ReferenceFingerprintRecord } from "./repository";
 
 export interface ManagedDocumentReconcileSummary {
@@ -27,15 +37,18 @@ export interface ManagedDocumentReconcileSummary {
 }
 
 export class ManagedDocumentReconciler {
-  private readonly transport: ResilientDropboxTransport;
+  private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly ledger: DocumentLedgerRepository;
 
-  constructor(transport: DropboxTransport) {
-    this.transport = new ResilientDropboxTransport(transport);
-    this.ledger = new DocumentLedgerRepository(transport);
+  constructor(input: PersistenceInput) {
+    this.runtime = asProjectOsPersistence(input);
+    this.ledger = new DocumentLedgerRepository(this.runtime);
   }
 
-  async reconcileChanges(state: ProjectState, changes: DropboxChangeEntry[]): Promise<ManagedDocumentReconcileSummary> {
+  async reconcileChanges(
+    state: ProjectState,
+    changes: Array<ProviderChangeEntry | LegacyDropboxChangeEntry>
+  ): Promise<ManagedDocumentReconcileSummary> {
     const summary: ManagedDocumentReconcileSummary = {
       scanned: changes.length,
       ignored: 0,
@@ -50,7 +63,8 @@ export class ManagedDocumentReconciler {
       return summary;
     }
 
-    for (const change of changes) {
+    for (const changeInput of changes) {
+      const change = toProviderChangeEntry(changeInput);
       const classified = classifyManagedPath(state, change.path);
       if (!classified) {
         summary.ignored += 1;
@@ -61,7 +75,7 @@ export class ManagedDocumentReconciler {
         continue;
       }
 
-      if (change.tag === "deleted") {
+      if (change.kind === "deleted") {
         if (classified.zone === "working" || classified.zone === "review" || classified.zone === "deliverables") {
           const restored = await this.restoreDeletedWorkProduct(
             state,
@@ -72,8 +86,8 @@ export class ManagedDocumentReconciler {
           summary.restored += restored ? 1 : 0;
           summary.ignored += restored ? 0 : 1;
         } else {
-          // INPUTS deletion is a legitimate withdrawal. REFERENCES deletion currently
-          // lacks a provider file id in Dropbox DeletedMetadata, so it remains visible
+          // INPUTS deletion is a legitimate withdrawal. Deleted change entries do
+          // not carry a stable object id, so REFERENCES deletion remains visible
           // to higher-level recovery instead of guessing an identity from its path.
           summary.ignored += 1;
         }
@@ -140,8 +154,7 @@ export class ManagedDocumentReconciler {
     if (!versionId) return false;
 
     const version = await this.requireVersion(state.project_id, documentId, versionId);
-    if (!this.transport.copy) throw new Error("Dropbox transport does not support deleted managed-document restore");
-    const restored = await this.transport.copy(version.immutable_payload_path, visiblePath);
+    const restored = await this.runtime.serverSideCopy.copyObject(version.immutable_payload_path, visiblePath);
     const provider = { ...(head.provider ?? {}) };
     if (zone === "working") provider.working = observation(visiblePath, restored);
     if (zone === "review") provider.review = observation(visiblePath, restored);
@@ -159,7 +172,7 @@ export class ManagedDocumentReconciler {
     zone: "working" | "review",
     logicalPath: string,
     visiblePath: string,
-    metadata: DropboxFileMetadata
+    metadata: ProviderObjectMetadata
   ): Promise<boolean> {
     const documentId = await documentIdFor(state.project_id, logicalPath);
     const head = await this.ledger.readHead(state.project_id, documentId);
@@ -170,14 +183,15 @@ export class ManagedDocumentReconciler {
     const parentVersionId = zone === "working" ? head.working_version_id : head.review_version_id;
     if (!parentVersionId) return false;
     const parent = await this.requireVersion(state.project_id, documentId, parentVersionId);
-    const versionId = await externalVersionIdFor(metadata.rev);
+    const evidence = requireDropboxV1Evidence(metadata);
+    const versionId = await externalVersionIdFor(evidence.rev);
     const existing = await this.ledger.readVersion(state.project_id, documentId, versionId);
     if (!existing) {
       await this.ledger.snapshotProviderFile(state.project_id, documentId, versionId, visiblePath, metadata);
       await this.ledger.writeVersion(externalVersion(parent, {
         versionId,
         stage: zone,
-        createdAt: metadata.server_modified,
+        createdAt: metadata.modifiedAt,
         immutablePayloadPath: machineDocumentProviderPayloadPath(state.project_id, documentId, versionId),
         providerPath: visiblePath,
         metadata
@@ -191,24 +205,25 @@ export class ManagedDocumentReconciler {
     state: ProjectState,
     relativePath: string,
     visiblePath: string,
-    metadata: DropboxFileMetadata
+    metadata: ProviderObjectMetadata
   ): Promise<boolean> {
-    const binding = await this.ledger.readProviderFileBinding(state.project_id, metadata.id);
-    const directDocumentId = await documentIdForProviderFile(state.project_id, metadata.id);
+    const evidence = requireDropboxV1Evidence(metadata);
+    const binding = await this.ledger.readProviderFileBinding(state.project_id, evidence.file_id);
+    const directDocumentId = await documentIdForProviderFile(state.project_id, evidence.file_id);
     const documentId = binding?.document_id ?? directDocumentId;
     const head = await this.ledger.readHead(state.project_id, documentId);
     if (!head || head.kind !== "reference" || !head.reference_version_id) return false;
     if (sameObservation(head.provider?.reference, metadata)) return false;
     const parent = await this.requireVersion(state.project_id, documentId, head.reference_version_id);
 
-    const versionId = await externalVersionIdFor(metadata.rev);
+    const versionId = await externalVersionIdFor(evidence.rev);
     const existing = await this.ledger.readVersion(state.project_id, documentId, versionId);
     if (!existing) {
       await this.ledger.snapshotProviderFile(state.project_id, documentId, versionId, visiblePath, metadata);
       await this.ledger.writeVersion(externalVersion(parent, {
         versionId,
         stage: "reference",
-        createdAt: metadata.server_modified,
+        createdAt: metadata.modifiedAt,
         immutablePayloadPath: machineDocumentProviderPayloadPath(state.project_id, documentId, versionId),
         providerPath: visiblePath,
         metadata
@@ -225,13 +240,13 @@ export class ManagedDocumentReconciler {
     await this.ledger.writeProviderFileBinding({
       schema_version: "1.0",
       project_id: state.project_id,
-      provider_file_id: metadata.id,
+      provider_file_id: evidence.file_id,
       document_id: documentId
     });
     await this.ledger.writeReferenceFingerprint({
       schema_version: "1.0",
       project_id: state.project_id,
-      provider_content_hash: metadata.content_hash,
+      provider_content_hash: evidence.content_hash,
       document_id: documentId,
       version_id: versionId
     });
@@ -242,17 +257,17 @@ export class ManagedDocumentReconciler {
     state: ProjectState,
     logicalPath: string,
     inputPath: string,
-    metadata: DropboxFileMetadata
+    metadata: ProviderObjectMetadata
   ): Promise<"ingested" | "duplicate" | "ignored"> {
-    const documentId = await documentIdForProviderFile(state.project_id, metadata.id);
-    const versionId = await externalVersionIdFor(metadata.rev);
+    const evidence = requireDropboxV1Evidence(metadata);
+    const documentId = await documentIdForProviderFile(state.project_id, evidence.file_id);
+    const versionId = await externalVersionIdFor(evidence.rev);
     const existing = await this.ledger.readVersion(state.project_id, documentId, versionId);
     if (existing) return "ignored";
 
-    const fingerprint = await this.ledger.readReferenceFingerprint(state.project_id, metadata.content_hash);
-    if (fingerprint && await this.isCurrentReferenceFingerprint(state.project_id, metadata.content_hash, fingerprint)) {
-      if (!this.transport.delete) throw new Error("Dropbox transport does not support duplicate input cleanup");
-      await this.transport.delete(inputPath);
+    const fingerprint = await this.ledger.readReferenceFingerprint(state.project_id, evidence.content_hash);
+    if (fingerprint && await this.isCurrentReferenceFingerprint(state.project_id, evidence.content_hash, fingerprint)) {
+      await this.runtime.objects.delete(inputPath);
       return "duplicate";
     }
 
@@ -263,19 +278,19 @@ export class ManagedDocumentReconciler {
       "references",
       `UNCLASSIFIED/${logicalPath}`
     );
-    if (!this.transport.copy || !this.transport.delete) {
-      throw new Error("Dropbox transport does not support binary-safe input ingestion");
-    }
 
-    let targetMetadata: DropboxFileMetadata;
+    let targetMetadata: ProviderObjectMetadata;
     try {
-      targetMetadata = await this.transport.copy(inputPath, targetPath);
+      targetMetadata = await this.runtime.serverSideCopy.copyObject(inputPath, targetPath);
     } catch (error) {
       const target = await this.metadataMaybe(targetPath);
-      if (!target || target.content_hash !== metadata.content_hash || target.size !== metadata.size) throw error;
+      if (!target) throw error;
+      const targetEvidence = requireDropboxV1Evidence(target);
+      if (targetEvidence.content_hash !== evidence.content_hash || targetEvidence.size !== evidence.size) throw error;
       targetMetadata = target;
     }
-    await this.transport.delete(inputPath);
+    await this.runtime.objects.delete(inputPath);
+    const targetEvidence = requireDropboxV1Evidence(targetMetadata);
 
     await this.ledger.writeVersion({
       schema_version: "1.0",
@@ -286,13 +301,13 @@ export class ManagedDocumentReconciler {
       stage: "reference",
       logical_path: logicalPath,
       source: "input_ingest",
-      created_at: metadata.server_modified ?? new Date().toISOString(),
+      created_at: metadata.modifiedAt ?? new Date().toISOString(),
       immutable_payload_path: machineDocumentProviderPayloadPath(state.project_id, documentId, versionId),
-      provider_content_hash: targetMetadata.content_hash,
-      provider_file_id: targetMetadata.id,
-      provider_rev: targetMetadata.rev,
+      provider_content_hash: targetEvidence.content_hash,
+      provider_file_id: targetEvidence.file_id,
+      provider_rev: targetEvidence.rev,
       provider_path: targetPath,
-      size: targetMetadata.size
+      size: targetEvidence.size
     });
     await this.ledger.writeHead({
       schema_version: "1.0",
@@ -308,13 +323,13 @@ export class ManagedDocumentReconciler {
     await this.ledger.writeProviderFileBinding({
       schema_version: "1.0",
       project_id: state.project_id,
-      provider_file_id: targetMetadata.id,
+      provider_file_id: targetEvidence.file_id,
       document_id: documentId
     });
     await this.ledger.writeReferenceFingerprint({
       schema_version: "1.0",
       project_id: state.project_id,
-      provider_content_hash: targetMetadata.content_hash,
+      provider_content_hash: targetEvidence.content_hash,
       document_id: documentId,
       version_id: versionId
     });
@@ -331,8 +346,9 @@ export class ManagedDocumentReconciler {
     const currentVersion = await this.ledger.readVersion(projectId, fingerprint.document_id, head.reference_version_id);
     if (!currentVersion || currentVersion.kind !== "reference" || currentVersion.provider_content_hash !== contentHash) return false;
     const currentMetadata = await this.metadataMaybe(head.provider.reference.path);
-    return !!currentMetadata
-      && currentMetadata.content_hash === contentHash
+    if (!currentMetadata) return false;
+    const currentEvidence = requireDropboxV1Evidence(currentMetadata);
+    return currentEvidence.content_hash === contentHash
       && sameObservation(head.provider.reference, currentMetadata);
   }
 
@@ -340,7 +356,7 @@ export class ManagedDocumentReconciler {
     state: ProjectState,
     logicalPath: string,
     publishedPath: string,
-    eventMetadata: DropboxFileMetadata
+    eventMetadata: ProviderObjectMetadata
   ): Promise<"working" | "conflict" | "ignored"> {
     const documentId = await documentIdFor(state.project_id, logicalPath);
     const head = await this.ledger.readHead(state.project_id, documentId);
@@ -349,9 +365,10 @@ export class ManagedDocumentReconciler {
     const currentPublished = await this.metadataMaybe(publishedPath);
     if (currentPublished && sameObservation(head.provider?.published, currentPublished)) return "ignored";
     const metadata = currentPublished ?? eventMetadata;
+    const evidence = requireDropboxV1Evidence(metadata);
     const published = await this.requireVersion(state.project_id, documentId, head.published_version_id);
 
-    const versionId = await externalVersionIdFor(metadata.rev);
+    const versionId = await externalVersionIdFor(evidence.rev);
     const existing = await this.ledger.readVersion(state.project_id, documentId, versionId);
     if (!existing) {
       await this.ledger.snapshotProviderFile(state.project_id, documentId, versionId, publishedPath, metadata);
@@ -362,13 +379,13 @@ export class ManagedDocumentReconciler {
     const canPromoteToWorking = !head.working_version_id && !head.review_version_id && !workingMetadata;
 
     if (canPromoteToWorking) {
-      await this.transport.move(publishedPath, workingPath);
+      await this.runtime.objects.move(publishedPath, workingPath);
       const movedMetadata = await this.requireMetadata(workingPath);
       if (!existing) {
         await this.ledger.writeVersion(externalVersion(published, {
           versionId,
           stage: "working",
-          createdAt: metadata.server_modified,
+          createdAt: metadata.modifiedAt,
           immutablePayloadPath: machineDocumentProviderPayloadPath(state.project_id, documentId, versionId),
           providerPath: workingPath,
           metadata: movedMetadata
@@ -392,13 +409,13 @@ export class ManagedDocumentReconciler {
       await this.ledger.writeVersion(externalVersion(published, {
         versionId,
         stage: "recovered_external",
-        createdAt: metadata.server_modified,
+        createdAt: metadata.modifiedAt,
         immutablePayloadPath: machineDocumentProviderPayloadPath(state.project_id, documentId, versionId),
         providerPath: publishedPath,
         metadata
       }));
     }
-    if (currentPublished && this.transport.delete) await this.transport.delete(publishedPath);
+    if (currentPublished) await this.runtime.objects.delete(publishedPath);
     const restoredMetadata = await this.restorePublished(published, publishedPath);
     await this.ledger.writeHead({
       ...head,
@@ -408,33 +425,20 @@ export class ManagedDocumentReconciler {
     return "conflict";
   }
 
-  private async restorePublished(version: DocumentVersionRecord, publishedPath: string): Promise<DropboxFileMetadata> {
-    if (!this.transport.copy) throw new Error("Dropbox transport does not support published document restore");
-    return this.transport.copy(version.immutable_payload_path, publishedPath);
+  private restorePublished(version: DocumentVersionRecord, publishedPath: string): Promise<ProviderObjectMetadata> {
+    return this.runtime.serverSideCopy.copyObject(version.immutable_payload_path, publishedPath);
   }
 
-  private async metadataFor(change: DropboxChangeEntry): Promise<DropboxFileMetadata | null> {
+  private async metadataFor(change: ProviderChangeEntry): Promise<ProviderObjectMetadata | null> {
     const current = await this.metadataMaybe(change.path);
-    if (current) return current;
-    if (change.id && change.rev && change.content_hash && change.size !== undefined) {
-      return {
-        id: change.id,
-        path: change.path,
-        rev: change.rev,
-        content_hash: change.content_hash,
-        size: change.size,
-        ...(change.server_modified ? { server_modified: change.server_modified } : {})
-      };
-    }
-    return null;
+    return current ?? change.metadata ?? null;
   }
 
-  private async metadataMaybe(path: string): Promise<DropboxFileMetadata | null> {
-    if (!this.transport.getMetadata) throw new Error("Dropbox transport does not support managed-document metadata");
-    return this.transport.getMetadata(path);
+  private metadataMaybe(path: string): Promise<ProviderObjectMetadata | null> {
+    return this.runtime.objects.getMetadata(path);
   }
 
-  private async requireMetadata(path: string): Promise<DropboxFileMetadata> {
+  private async requireMetadata(path: string): Promise<ProviderObjectMetadata> {
     const metadata = await this.metadataMaybe(path);
     if (!metadata) throw new Error(`Managed document provider file missing: ${path}`);
     return metadata;
@@ -477,9 +481,10 @@ function externalVersion(
     createdAt?: string;
     immutablePayloadPath: string;
     providerPath: string;
-    metadata: DropboxFileMetadata;
+    metadata: ProviderObjectMetadata;
   }
 ): DocumentVersionRecord {
+  const evidence = requireDropboxV1Evidence(input.metadata);
   return {
     schema_version: "1.0",
     project_id: parent.project_id,
@@ -492,31 +497,26 @@ function externalVersion(
     source: "external_human",
     created_at: input.createdAt ?? new Date().toISOString(),
     immutable_payload_path: input.immutablePayloadPath,
-    provider_content_hash: input.metadata.content_hash,
-    provider_file_id: input.metadata.id,
-    provider_rev: input.metadata.rev,
+    provider_content_hash: evidence.content_hash,
+    provider_file_id: evidence.file_id,
+    provider_rev: evidence.rev,
     provider_path: input.providerPath,
-    size: input.metadata.size,
+    size: evidence.size,
     ...(parent.media_type ? { media_type: parent.media_type } : {})
   };
 }
 
-function sameObservation(observationValue: ManagedProviderObservation | undefined, metadata: DropboxFileMetadata): boolean {
-  return !!observationValue
-    && observationValue.rev === metadata.rev
-    && observationValue.file_id === metadata.id
-    && observationValue.content_hash === metadata.content_hash
-    && observationValue.size === metadata.size;
+function sameObservation(observationValue: ManagedProviderObservation | undefined, metadata: ProviderObjectMetadata): boolean {
+  if (!observationValue) return false;
+  const evidence = requireDropboxV1Evidence(metadata);
+  return observationValue.rev === evidence.rev
+    && observationValue.file_id === evidence.file_id
+    && observationValue.content_hash === evidence.content_hash
+    && observationValue.size === evidence.size;
 }
 
-function observation(path: string, metadata: DropboxFileMetadata): ManagedProviderObservation {
-  return {
-    path,
-    file_id: metadata.id,
-    rev: metadata.rev,
-    content_hash: metadata.content_hash,
-    size: metadata.size
-  };
+function observation(path: string, metadata: ProviderObjectMetadata): ManagedProviderObservation {
+  return toManagedProviderObservation({ ...metadata, path });
 }
 
 function updateWorkHead(
@@ -524,7 +524,7 @@ function updateWorkHead(
   zone: "working" | "review",
   versionId: string,
   visiblePath: string,
-  metadata: DropboxFileMetadata,
+  metadata: ProviderObjectMetadata,
   reconciliationStatus: ManagedDocumentHead["reconciliation_status"]
 ): ManagedDocumentHead {
   const provider = { ...(head.provider ?? {}) };

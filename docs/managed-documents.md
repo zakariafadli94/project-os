@@ -247,3 +247,11 @@ Mutation candidate list/status/resolution routes are documented in `docs/mutatio
 - Collaborative legacy files may be adopted lazily; strict final files require governed provenance.
 - Durable history/intent/receipt evidence survives loss of hot SQLite rows.
 - Continuity mode remains `stable`; managed-document/MutationGate work does not perform transparent deployment cutover.
+
+## Persistence boundary compatibility
+
+Managed-document services and repositories consume the provider-neutral persistence runtime. Base reads/writes/list/move/delete operations are provider-independent, while conditional write, server-side copy and incremental change feed are explicit capabilities. Dropbox-specific transport/errors/retry do not belong in managed-document Core code.
+
+The durable schema remains exactly `1.0`. Existing provider observations still serialize Dropbox V1 fields (`file_id`, `rev`, `content_hash`, `size`), and provider-derived document/version identity remains unchanged. The compatibility seam converts neutral runtime metadata back to those historical values and fails closed when it cannot reproduce valid Dropbox V1 evidence.
+
+`content_hash` in schema-1.0 records remains the Dropbox content-hash value; it is not renamed or reinterpreted as a generic SHA-256. Generalized durable provider kinds, revision/hash token structures, migrations/upcasters or alternate providers belong to IMP-SCHEMA001, not managed-document runtime refactoring.

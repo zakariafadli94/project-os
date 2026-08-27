@@ -142,6 +142,16 @@ The Worker-side inbox scanner follows the same principle for terminal archival: 
 - Implementation plan: `docs/superpowers/plans/2026-08-23-dropbox-write-coordination.md`
 - Deployment: `docs/deployment.md`
 
+## Persistence provider boundary
+
+Project OS Core depends on a provider-neutral persistence runtime rather than Dropbox transport classes. The runtime exposes base object operations plus explicit conditional-write, server-side-copy, incremental-change-feed, stable-object-ID, revision-token, and integrity-hash capabilities. Provider errors and retry policy are neutral at the Core boundary; Dropbox status/error parsing stays inside the Dropbox adapter.
+
+Production remains intentionally **Dropbox-only**. `createProductionPersistence` constructs the Dropbox adapter directly, there is no `PROJECT_OS_PROVIDER` selector, and the existing Dropbox secret names remain the production configuration contract. The Dropbox webhook is provider-specific by design.
+
+Persisted records remain schema `1.0`. Historical fields such as `provider_file_id`, `provider_rev`, and `provider_content_hash` keep their exact Dropbox V1 meaning through an explicit compatibility seam. IMP-PERSIST001 is runtime-neutral, not persisted-format-neutral: adding a durable provider kind, generalized revision/hash tokens, migration/upcasting, or another provider is owned by IMP-SCHEMA001 rather than this boundary.
+
+Operational modes remain unchanged: continuity is `stable` and MutationGate production mode remains `observe`.
+
 ## Commands
 
 ```bash

@@ -6,6 +6,7 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
+    "rootDirs": [".", "test/compat"],
     "lib": ["ES2022", "DOM", "WebWorker"],
     "types": [
       "vitest/globals",

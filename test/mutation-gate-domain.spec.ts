@@ -18,10 +18,29 @@ describe("mutation gate domain", () => {
       providerFileId: "id:abc",
       providerRev: "rev-17"
     });
-    expect(candidate).toMatch(/^MUTCAND-[A-F0-9]{24}$/);
+    expect(candidate).toBe("MUTCAND-0AECD6C3005E1999896EA4DA");
 
     const resolution = await mutationResolutionIdFor("PRJ-0002", candidate, "candidate.reject");
     expect(resolution).toMatch(/^MUTRES-[A-F0-9]{24}$/);
+  });
+
+  it("preserves the exact schema-1.0 external candidate record", () => {
+    const input = {
+      schema_version: "1.0" as const,
+      candidate_id: "MUTCAND-0AECD6C3005E1999896EA4DA",
+      project_id: "PRJ-0002",
+      source: "external_unverified" as const,
+      detection_source: "incremental" as const,
+      provider_path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/x.md",
+      provider_file_id: "id:abc",
+      provider_rev: "rev-17",
+      provider_content_hash: "a".repeat(64),
+      size: 3,
+      immutable_payload_path: "/PROJECT_OS/.project-os/projects/PRJ-0002/mutation-gate/payloads/candidates/MUTCAND-0AECD6C3005E1999896EA4DA/payload",
+      detected_at: "2026-08-25T16:00:00+01:00"
+    };
+
+    expect(parseExternalMutationCandidateRecord(input)).toEqual(input);
   });
 
   it("rejects candidate evidence bound to another project namespace", () => {

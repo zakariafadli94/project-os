@@ -1,34 +1,47 @@
 import { describe, expect, it, vi } from "vitest";
 import { DropboxApiError, DropboxConflictError, type DropboxEntry, type DropboxTransport } from "../src/dropbox/client";
-import { ResilientDropboxTransport } from "../src/dropbox/resilient-transport";
+import { createDropboxPersistence } from "../src/persistence/providers/dropbox/adapter";
+import { ProviderConflictError } from "../src/persistence/provider/errors";
+import { withProviderResilience } from "../src/persistence/provider/resilience";
 
-function fakeTransport(upload: DropboxTransport["upload"]): DropboxTransport {
+function fakeTransport(overrides: Partial<DropboxTransport> = {}): DropboxTransport {
   return {
-    upload,
+    upload: async () => undefined,
     download: async () => null,
-    move: async () => undefined
+    move: async () => undefined,
+    getMetadata: async () => null,
+    listFolder: async () => [],
+    delete: async () => undefined,
+    ...overrides
   };
 }
 
-describe("ResilientDropboxTransport", () => {
-  it("retries transient Dropbox API failures", async () => {
+describe("Dropbox adapter with provider resilience", () => {
+  it("retries transient Dropbox API failures with neutral retry diagnostics", async () => {
     const upload = vi.fn<DropboxTransport["upload"]>()
       .mockRejectedValueOnce(new DropboxApiError("busy", 409, "req-1", "too_many_write_operations"))
       .mockResolvedValueOnce(undefined);
     const sleep = vi.fn(async () => undefined);
     const logs: Record<string, unknown>[] = [];
-    const transport = new ResilientDropboxTransport(fakeTransport(upload), {
+    const runtime = withProviderResilience(createDropboxPersistence(fakeTransport({ upload })), {
       sleep,
       random: () => 0,
       baseDelayMs: 100,
       log: (entry) => logs.push(entry)
     });
 
-    await transport.upload("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-x/ARTIFACTS/a.md", "a", "add");
+    await runtime.objects.createText("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-x/ARTIFACTS/a.md", "a");
 
     expect(upload).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledWith(100);
-    expect(logs[0]).toMatchObject({ project_id: "PRJ-0003", attempt: 1, dropbox_request_id: "req-1" });
+    expect(logs[0]).toMatchObject({
+      operation: "create",
+      project_id: "PRJ-0003",
+      provider_id: "dropbox",
+      attempt: 1,
+      provider_status: 409,
+      provider_request_id: "req-1"
+    });
   });
 
   it("retries transient downloads and returns the successful read", async () => {
@@ -37,53 +50,50 @@ describe("ResilientDropboxTransport", () => {
       .mockResolvedValueOnce("canonical-state");
     const sleep = vi.fn(async () => undefined);
     const logs: Record<string, unknown>[] = [];
-    const base = fakeTransport(async () => undefined);
-    const transport = new ResilientDropboxTransport({ ...base, download }, {
+    const runtime = withProviderResilience(createDropboxPersistence(fakeTransport({ download })), {
       sleep,
       random: () => 0,
       baseDelayMs: 100,
       log: (entry) => logs.push(entry)
     });
 
-    await expect(transport.download("/PROJECT_OS/.project-os/projects/PRJ-0002/state.json"))
+    await expect(runtime.objects.readText("/PROJECT_OS/.project-os/projects/PRJ-0002/state.json"))
       .resolves.toBe("canonical-state");
 
     expect(download).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledWith(100);
     expect(logs[0]).toMatchObject({
-      operation: "download",
+      operation: "read",
       project_id: "PRJ-0002",
-      attempt: 1,
-      dropbox_status: 503,
-      dropbox_request_id: "req-read"
+      provider_status: 503,
+      provider_request_id: "req-read"
     });
   });
 
-  it("retries transient folder listings and returns the successful listing", async () => {
+  it("retries transient folder listings and returns the successful neutral listing", async () => {
     const entries: DropboxEntry[] = [{ tag: "file", name: "TXN-TEST.json", path_display: "/PROJECT_OS/incoming/TXN-TEST.json" }];
     const listFolder = vi.fn<(path: string) => Promise<DropboxEntry[]>>()
       .mockRejectedValueOnce(new DropboxApiError("rate limited", 429, "req-list", "too_many_requests"))
       .mockResolvedValueOnce(entries);
     const sleep = vi.fn(async () => undefined);
     const logs: Record<string, unknown>[] = [];
-    const base = fakeTransport(async () => undefined);
-    const transport = new ResilientDropboxTransport({ ...base, listFolder }, {
+    const runtime = withProviderResilience(createDropboxPersistence(fakeTransport({ listFolder })), {
       sleep,
       random: () => 0,
       baseDelayMs: 100,
       log: (entry) => logs.push(entry)
     });
 
-    await expect(transport.listFolder("/PROJECT_OS/.project-os/transactions/incoming"))
-      .resolves.toEqual(entries);
+    await expect(runtime.objects.listChildren("/PROJECT_OS/.project-os/transactions/incoming"))
+      .resolves.toEqual([{ kind: "file", name: "TXN-TEST.json", path: "/PROJECT_OS/incoming/TXN-TEST.json" }]);
 
     expect(listFolder).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledWith(100);
     expect(logs[0]).toMatchObject({
-      operation: "list_folder",
+      operation: "list",
       attempt: 1,
-      dropbox_status: 429,
-      dropbox_request_id: "req-list"
+      provider_status: 429,
+      provider_request_id: "req-list"
     });
   });
 
@@ -91,9 +101,9 @@ describe("ResilientDropboxTransport", () => {
     const upload = vi.fn<DropboxTransport["upload"]>()
       .mockRejectedValue(new DropboxConflictError("conflict", "req-2", "path/conflict/file"));
     const sleep = vi.fn(async () => undefined);
-    const transport = new ResilientDropboxTransport(fakeTransport(upload), { sleep, random: () => 0 });
+    const runtime = withProviderResilience(createDropboxPersistence(fakeTransport({ upload })), { sleep, random: () => 0 });
 
-    await expect(transport.upload("/PROJECT_OS/x", "x", "add")).rejects.toBeInstanceOf(DropboxConflictError);
+    await expect(runtime.objects.createText("/PROJECT_OS/x", "x")).rejects.toBeInstanceOf(ProviderConflictError);
     expect(upload).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
   });
@@ -103,14 +113,13 @@ describe("ResilientDropboxTransport", () => {
       .mockRejectedValueOnce(new DropboxApiError("busy", 409, "req-delete", "too_many_write_operations"))
       .mockResolvedValueOnce(undefined);
     const sleep = vi.fn(async () => undefined);
-    const base = fakeTransport(async () => undefined);
-    const transport = new ResilientDropboxTransport({ ...base, delete: remove }, {
+    const runtime = withProviderResilience(createDropboxPersistence(fakeTransport({ delete: remove })), {
       sleep,
       random: () => 0,
       baseDelayMs: 100
     });
 
-    await transport.delete("/PROJECT_OS/.project-os/artifacts/incoming/ART-TEST-000001.json");
+    await runtime.objects.delete("/PROJECT_OS/.project-os/artifacts/incoming/ART-TEST-000001.json");
 
     expect(remove).toHaveBeenCalledTimes(2);
     expect(sleep).toHaveBeenCalledWith(100);
@@ -125,9 +134,9 @@ describe("ResilientDropboxTransport", () => {
     const upload = vi.fn<DropboxTransport["upload"]>().mockResolvedValue(undefined);
     const remove = vi.fn<NonNullable<DropboxTransport["delete"]>>().mockResolvedValue(undefined);
     const download = vi.fn<DropboxTransport["download"]>(async (path) => path === from ? content : null);
-    const transport = new ResilientDropboxTransport({ upload, download, move, delete: remove }, { random: () => 0 });
+    const runtime = withProviderResilience(createDropboxPersistence(fakeTransport({ upload, download, move, delete: remove })), { random: () => 0 });
 
-    await transport.move(from, to);
+    await runtime.objects.move(from, to);
 
     expect(upload).toHaveBeenCalledWith(to, content, "add");
     expect(remove).toHaveBeenCalledWith(from);
@@ -141,9 +150,9 @@ describe("ResilientDropboxTransport", () => {
     const upload = vi.fn<DropboxTransport["upload"]>().mockResolvedValue(undefined);
     const remove = vi.fn<NonNullable<DropboxTransport["delete"]>>().mockResolvedValue(undefined);
     const download = vi.fn<DropboxTransport["download"]>(async (path) => path === from ? "source" : "different");
-    const transport = new ResilientDropboxTransport({ upload, download, move, delete: remove }, { random: () => 0 });
+    const runtime = withProviderResilience(createDropboxPersistence(fakeTransport({ upload, download, move, delete: remove })), { random: () => 0 });
 
-    await expect(transport.move(from, to)).rejects.toBe(conflict);
+    await expect(runtime.objects.move(from, to)).rejects.toBeInstanceOf(ProviderConflictError);
     expect(upload).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
   });

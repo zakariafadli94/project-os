@@ -6,6 +6,7 @@ import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
 import { DropboxConflictError, type DropboxTransport } from "../src/dropbox/client";
 import { machineCommitRecordPath, machineReceiptPath } from "../src/dropbox/layout";
 import { ProjectRepository } from "../src/dropbox/repository";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -73,7 +74,7 @@ function fixture(): CanonicalCommitRecord {
 describe("ProjectRepository canonical commit records", () => {
   it("publishes one immutable V2 commit record and replays identical content idempotently", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const record = fixture();
     const path = machineCommitRecordPath(record.project_id, record.new_revision);
 
@@ -88,7 +89,7 @@ describe("ProjectRepository canonical commit records", () => {
 
   it("keeps different content at the same project revision as a terminal immutable conflict", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const record = fixture();
     await repository.writeCommitRecord(record);
 
@@ -99,7 +100,7 @@ describe("ProjectRepository canonical commit records", () => {
 
   it("materializes event, V2 snapshots, human views and standalone receipt from a committed record", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const record = fixture();
 
     await repository.writeCommitRecord(record);

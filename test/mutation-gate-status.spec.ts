@@ -18,6 +18,7 @@ import { ArtifactMutationIntentService } from "../src/mutation-gate/artifact-int
 import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { MutationCandidateResolutionService } from "../src/mutation-gate/resolution-service";
 import { MutationGateService } from "../src/mutation-gate/service";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 const testEnv = env as unknown as Env;
 
@@ -104,11 +105,12 @@ async function artifactRequest(): Promise<ArtifactWriteRequest> {
 describe("MutationGate status vocabulary", () => {
   it("keeps SUBMITTED durable intent distinct from COMMITTED and ACCEPTED", async () => {
     const transport = new FakeStatusDropbox();
-    const repository = new MutationGateRepository(transport);
-    const gate = new MutationGateService(transport, "observe");
+    const runtime = persistenceFromDropbox(transport);
+    const repository = new MutationGateRepository(runtime);
+    const gate = new MutationGateService(runtime, "observe");
     const request = await artifactRequest();
 
-    const prepared = await new ArtifactMutationIntentService(repository, transport).prepare(state(), request);
+    const prepared = await new ArtifactMutationIntentService(repository, runtime).prepare(state(), request);
     const intentPath = machineMutationIntentPath(request.project_id, request.request_id);
     const intentRaw = transport.files.get(intentPath);
     const status = await gate.artifactStatus(request.project_id, request.request_id);
@@ -128,8 +130,9 @@ describe("MutationGate status vocabulary", () => {
 
   it("reports unresolved provider presence as external_candidate, never published or accepted", async () => {
     const transport = new FakeStatusDropbox();
-    const gate = new MutationGateService(transport, "observe");
-    const repository = new MutationGateRepository(transport);
+    const runtime = persistenceFromDropbox(transport);
+    const gate = new MutationGateService(runtime, "observe");
+    const repository = new MutationGateRepository(runtime);
     const project = state();
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-9901-mutation-status/ARTIFACTS/direct.md";
     const metadata = await transport.seed(path, "# external candidate");
@@ -156,14 +159,15 @@ describe("MutationGate status vocabulary", () => {
 
   it("reports durable candidate resolution as canonical_verified without creating ACCEPTED state", async () => {
     const transport = new FakeStatusDropbox();
-    const gate = new MutationGateService(transport, "observe");
+    const runtime = persistenceFromDropbox(transport);
+    const gate = new MutationGateService(runtime, "observe");
     const project = state();
     const revisionBefore = project.revision;
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-9901-mutation-status/ARTIFACTS/rejected.md";
     const metadata = await transport.seed(path, "# reject me");
     const candidate = await gate.captureExternalCandidate(project, path, metadata, "incremental");
 
-    const receipt = await new MutationCandidateResolutionService(transport).resolve({
+    const receipt = await new MutationCandidateResolutionService(runtime).resolve({
       operation: "candidate.reject",
       resolution_id: "MUTRES-AAAAAAAAAAAAAAAAAAAAAAAA",
       project_id: project.project_id,

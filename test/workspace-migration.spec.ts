@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DropboxConflictError, type DropboxTransport } from "../src/dropbox/client";
 import { machineEventPath, machineReceiptPath, machineTransactionPath } from "../src/dropbox/layout";
 import { mirrorLegacyEvents, mirrorLegacyLedger } from "../src/migration/workspace-v2";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -41,18 +42,20 @@ class FakeTransport implements DropboxTransport {
 describe("workspace v2 migration", () => {
   it("mirrors legacy immutable events idempotently", async () => {
     const transport = new FakeTransport();
+    const objects = persistenceFromDropbox(transport).objects;
     const legacy = "/PROJECT_OS/PROJECTS/PRJ-0001-agency/.system/events/EVT-000001.json";
     const content = '{"event_id":"EVT-000001"}\n';
     transport.files.set(legacy, content);
 
-    await mirrorLegacyEvents(transport, "PRJ-0001", "agency");
-    await mirrorLegacyEvents(transport, "PRJ-0001", "agency");
+    await mirrorLegacyEvents(objects, "PRJ-0001", "agency");
+    await mirrorLegacyEvents(objects, "PRJ-0001", "agency");
 
     expect(transport.files.get(machineEventPath("PRJ-0001", "EVT-000001"))).toBe(content);
   });
 
   it("resumes after an interrupted migration without duplicating or losing events", async () => {
     const transport = new FakeTransport();
+    const objects = persistenceFromDropbox(transport).objects;
     transport.files.set(
       "/PROJECT_OS/PROJECTS/PRJ-0001-agency/.system/events/EVT-000001.json",
       '{"event_id":"EVT-000001"}\n'
@@ -63,8 +66,8 @@ describe("workspace v2 migration", () => {
     );
     transport.failOnceOnAdd = machineEventPath("PRJ-0001", "EVT-000002");
 
-    await expect(mirrorLegacyEvents(transport, "PRJ-0001", "agency")).rejects.toThrow("simulated interruption");
-    await mirrorLegacyEvents(transport, "PRJ-0001", "agency");
+    await expect(mirrorLegacyEvents(objects, "PRJ-0001", "agency")).rejects.toThrow("simulated interruption");
+    await mirrorLegacyEvents(objects, "PRJ-0001", "agency");
 
     expect(transport.files.get(machineEventPath("PRJ-0001", "EVT-000001"))).toBe('{"event_id":"EVT-000001"}\n');
     expect(transport.files.get(machineEventPath("PRJ-0001", "EVT-000002"))).toBe('{"event_id":"EVT-000002"}\n');
@@ -72,14 +75,15 @@ describe("workspace v2 migration", () => {
 
   it("mirrors legacy terminal transactions and receipts idempotently", async () => {
     const transport = new FakeTransport();
+    const objects = persistenceFromDropbox(transport).objects;
     const txId = "TXN-LEDGER-00000001";
     const txContent = '{"transaction_id":"TXN-LEDGER-00000001"}\n';
     const receiptContent = '{"transaction_id":"TXN-LEDGER-00000001","status":"committed"}\n';
     transport.files.set(`/PROJECT_OS/TRANSACTIONS/committed/${txId}.json`, txContent);
     transport.files.set(`/PROJECT_OS/RECEIPTS/${txId}.json`, receiptContent);
 
-    const first = await mirrorLegacyLedger(transport);
-    const second = await mirrorLegacyLedger(transport);
+    const first = await mirrorLegacyLedger(objects);
+    const second = await mirrorLegacyLedger(objects);
 
     expect(first).toEqual({ transactions: 1, receipts: 1 });
     expect(second).toEqual({ transactions: 1, receipts: 1 });
@@ -89,13 +93,14 @@ describe("workspace v2 migration", () => {
 
   it("preserves rejected transaction source artifacts", async () => {
     const transport = new FakeTransport();
+    const objects = persistenceFromDropbox(transport).objects;
     const txId = "TXN-LEDGER-00000005";
     const terminal = '{"status":"rejected"}\n';
     const source = '{"transaction_id":"TXN-LEDGER-00000005","bad":true}\n';
     transport.files.set(`/PROJECT_OS/TRANSACTIONS/rejected/${txId}.json`, terminal);
     transport.files.set(`/PROJECT_OS/TRANSACTIONS/rejected/${txId}.source.json`, source);
 
-    await mirrorLegacyLedger(transport);
+    await mirrorLegacyLedger(objects);
 
     expect(transport.files.get(machineTransactionPath("rejected", txId))).toBe(terminal);
     expect(transport.files.get(machineTransactionPath("rejected", txId).replace(/\.json$/, ".source.json"))).toBe(source);
@@ -103,14 +108,15 @@ describe("workspace v2 migration", () => {
 
   it("resumes ledger migration after interruption without losing immutable history", async () => {
     const transport = new FakeTransport();
+    const objects = persistenceFromDropbox(transport).objects;
     const firstId = "TXN-LEDGER-00000002";
     const secondId = "TXN-LEDGER-00000003";
     transport.files.set(`/PROJECT_OS/TRANSACTIONS/committed/${firstId}.json`, '{"transaction_id":"TXN-LEDGER-00000002"}\n');
     transport.files.set(`/PROJECT_OS/TRANSACTIONS/committed/${secondId}.json`, '{"transaction_id":"TXN-LEDGER-00000003"}\n');
     transport.failOnceOnAdd = machineTransactionPath("committed", secondId);
 
-    await expect(mirrorLegacyLedger(transport)).rejects.toThrow("simulated interruption");
-    await mirrorLegacyLedger(transport);
+    await expect(mirrorLegacyLedger(objects)).rejects.toThrow("simulated interruption");
+    await mirrorLegacyLedger(objects);
 
     expect(transport.files.get(machineTransactionPath("committed", firstId))).toBe('{"transaction_id":"TXN-LEDGER-00000002"}\n');
     expect(transport.files.get(machineTransactionPath("committed", secondId))).toBe('{"transaction_id":"TXN-LEDGER-00000003"}\n');
@@ -118,10 +124,11 @@ describe("workspace v2 migration", () => {
 
   it("fails closed when an existing v2 immutable ledger file has different content", async () => {
     const transport = new FakeTransport();
+    const objects = persistenceFromDropbox(transport).objects;
     const txId = "TXN-LEDGER-00000004";
     transport.files.set(`/PROJECT_OS/TRANSACTIONS/committed/${txId}.json`, '{"transaction_id":"TXN-LEDGER-00000004","value":1}\n');
     transport.files.set(machineTransactionPath("committed", txId), '{"transaction_id":"TXN-LEDGER-00000004","value":2}\n');
 
-    await expect(mirrorLegacyLedger(transport)).rejects.toThrow("Migration conflict with different immutable content");
+    await expect(mirrorLegacyLedger(objects)).rejects.toThrow("Migration conflict with different immutable content");
   });
 });

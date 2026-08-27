@@ -7,18 +7,25 @@ import {
   type ManagedProviderObservation
 } from "../domain/managed-document";
 import {
-  DropboxConflictError,
-  type DropboxFileMetadata,
-  type DropboxTransport
-} from "../dropbox/client";
-import {
   machineDocumentHeadPath,
   machineDocumentProviderPayloadPath,
   machineDocumentRoot,
   machineDocumentTextPayloadPath,
   machineDocumentVersionPath
-} from "../dropbox/layout";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+} from "../persistence/layout";
+import {
+  requireDropboxV1Evidence,
+  toManagedProviderObservation
+} from "../persistence/compatibility/dropbox-v1-evidence";
+import {
+  asProjectOsPersistence,
+  toProviderObjectMetadata,
+  type LegacyDropboxFileMetadata,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type { ObjectPersistence, ProviderObjectMetadata } from "../persistence/provider/contract";
+import { ProviderConflictError } from "../persistence/provider/errors";
 import { sha256Text } from "./hash";
 
 export interface ReferenceFingerprintRecord {
@@ -37,14 +44,14 @@ export interface ProviderFileBindingRecord {
 }
 
 export class DocumentLedgerRepository {
-  private readonly transport: DropboxTransport;
+  private readonly runtime: ProjectOsPersistenceRuntime;
 
-  constructor(transport: DropboxTransport) {
-    this.transport = new ResilientDropboxTransport(transport);
+  constructor(input: PersistenceInput) {
+    this.runtime = asProjectOsPersistence(input);
   }
 
   async readHead(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
-    const raw = await this.transport.download(machineDocumentHeadPath(projectId, documentId));
+    const raw = await this.runtime.objects.readText(machineDocumentHeadPath(projectId, documentId));
     if (raw === null) return null;
     const head = parseManagedDocumentHead(JSON.parse(raw));
     if (head.project_id !== projectId || head.document_id !== documentId) {
@@ -54,7 +61,7 @@ export class DocumentLedgerRepository {
   }
 
   async readVersion(projectId: string, documentId: string, versionId: string): Promise<DocumentVersionRecord | null> {
-    const raw = await this.transport.download(machineDocumentVersionPath(projectId, documentId, versionId));
+    const raw = await this.runtime.objects.readText(machineDocumentVersionPath(projectId, documentId, versionId));
     if (raw === null) return null;
     const record = parseDocumentVersionRecord(JSON.parse(raw));
     if (record.project_id !== projectId || record.document_id !== documentId || record.version_id !== versionId) {
@@ -66,12 +73,13 @@ export class DocumentLedgerRepository {
   async writeVersion(record: DocumentVersionRecord): Promise<void> {
     const validated = parseDocumentVersionRecord(record);
     const path = machineDocumentVersionPath(validated.project_id, validated.document_id, validated.version_id);
+    const content = pretty(validated);
     try {
-      await this.transport.upload(path, pretty(validated), "add");
+      await this.runtime.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const existing = await this.transport.download(path);
-      if (existing !== pretty(validated)) {
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.readText(path);
+      if (existing !== content) {
         throw new Error(`Immutable document version conflict with different content: ${path}`);
       }
     }
@@ -98,16 +106,15 @@ export class DocumentLedgerRepository {
       }
     }
 
-    await this.transport.upload(
+    await this.runtime.objects.upsertText(
       machineDocumentHeadPath(validated.project_id, validated.document_id),
-      pretty(validated),
-      "overwrite"
+      pretty(validated)
     );
   }
 
   async readProviderFileBinding(projectId: string, providerFileId: string): Promise<ProviderFileBindingRecord | null> {
     const path = await providerFileBindingPath(projectId, providerFileId);
-    const raw = await this.transport.download(path);
+    const raw = await this.runtime.objects.readText(path);
     if (raw === null) return null;
     const parsed = JSON.parse(raw) as Partial<ProviderFileBindingRecord>;
     if (
@@ -135,10 +142,10 @@ export class DocumentLedgerRepository {
     const path = await providerFileBindingPath(record.project_id, record.provider_file_id);
     const content = pretty(record);
     try {
-      await this.transport.upload(path, content, "add");
+      await this.runtime.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const existing = await this.transport.download(path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.readText(path);
       if (existing !== content) {
         throw new Error(`Provider file id is already bound to a different managed document: ${record.provider_file_id}`);
       }
@@ -147,7 +154,7 @@ export class DocumentLedgerRepository {
 
   async readReferenceFingerprint(projectId: string, providerContentHash: string): Promise<ReferenceFingerprintRecord | null> {
     const hash = assertProviderContentHash(providerContentHash);
-    const raw = await this.transport.download(referenceFingerprintPath(projectId, hash));
+    const raw = await this.runtime.objects.readText(referenceFingerprintPath(projectId, hash));
     if (raw === null) return null;
     const parsed = JSON.parse(raw) as Partial<ReferenceFingerprintRecord>;
     if (
@@ -182,10 +189,10 @@ export class DocumentLedgerRepository {
     };
     const path = referenceFingerprintPath(record.project_id, hash);
     try {
-      await this.transport.upload(path, pretty(validated), "add");
+      await this.runtime.objects.createText(path, pretty(validated));
       return validated;
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
+      if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.readReferenceFingerprint(record.project_id, hash);
       if (!existing) throw error;
       return existing;
@@ -199,10 +206,10 @@ export class DocumentLedgerRepository {
     }
     const path = machineDocumentTextPayloadPath(projectId, actual);
     try {
-      await this.transport.upload(path, content, "add");
+      await this.runtime.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const existing = await this.transport.download(path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.readText(path);
       if (existing !== content) throw new Error(`Immutable document payload conflict with different content: ${path}`);
     }
     return path;
@@ -213,21 +220,32 @@ export class DocumentLedgerRepository {
     documentId: string,
     versionId: string,
     sourcePath: string,
-    sourceMetadata: DropboxFileMetadata
-  ): Promise<DropboxFileMetadata> {
-    if (!this.transport.copy) throw new Error("Dropbox transport does not support provider-side document snapshots");
+    sourceMetadataInput: ProviderObjectMetadata | LegacyDropboxFileMetadata
+  ): Promise<ProviderObjectMetadata> {
+    const sourceMetadata = toProviderObjectMetadata(sourceMetadataInput);
+    const sourceEvidence = requireDropboxV1Evidence(sourceMetadata);
     const path = machineDocumentProviderPayloadPath(projectId, documentId, versionId);
     try {
-      return await this.transport.copy(sourcePath, path);
-    } catch (error) {
-      if (!(error instanceof DropboxConflictError) || !this.transport.getMetadata) throw error;
-      const existing = await this.transport.getMetadata(path);
+      const copied = await this.runtime.serverSideCopy.copyObject(sourcePath, path);
+      const copiedEvidence = requireDropboxV1Evidence(copied);
       if (
-        existing
-        && existing.content_hash === sourceMetadata.content_hash
-        && existing.size === sourceMetadata.size
+        copiedEvidence.content_hash !== sourceEvidence.content_hash
+        || copiedEvidence.size !== sourceEvidence.size
       ) {
-        return existing;
+        throw new Error(`Immutable provider document payload conflict with different content: ${path}`);
+      }
+      return copied;
+    } catch (error) {
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.getMetadata(path);
+      if (existing) {
+        const existingEvidence = requireDropboxV1Evidence(existing);
+        if (
+          existingEvidence.content_hash === sourceEvidence.content_hash
+          && existingEvidence.size === sourceEvidence.size
+        ) {
+          return existing;
+        }
       }
       throw new Error(`Immutable provider document payload conflict with different content: ${path}`);
     }
@@ -235,13 +253,12 @@ export class DocumentLedgerRepository {
 
   async restoreHeadFromVersions(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
     if (!/^DOC-[A-F0-9]{24}$/.test(documentId)) throw new Error(`Unsafe document id: ${documentId}`);
-    if (!this.transport.listFolder) throw new Error("Dropbox transport does not support document version listing");
     const versionRoot = `${machineDocumentRoot(projectId)}/versions/${documentId}`;
-    const entries = await this.transport.listFolder(versionRoot);
+    const entries = await this.runtime.objects.listChildren(versionRoot);
     const records = new Map<string, DocumentVersionRecord>();
 
     for (const entry of entries) {
-      if (entry.tag !== "file") continue;
+      if (entry.kind !== "file") continue;
       const match = /^(VER-(?:EXT|REQ)-[A-F0-9]{24})\.json$/.exec(entry.name);
       if (!match) continue;
       const record = await this.readVersion(projectId, documentId, match[1]);
@@ -274,7 +291,7 @@ export class DocumentLedgerRepository {
       if (tip.stage !== "reference") {
         throw new Error(`Managed reference history has non-reference active tip ${tip.version_id}`);
       }
-      const provider = await providerObservationForVersion(this.transport, tip);
+      const provider = await providerObservationForVersion(this.runtime.objects, tip);
       head = {
         schema_version: "1.0",
         project_id: projectId,
@@ -295,10 +312,10 @@ export class DocumentLedgerRepository {
         : nearestAncestorAtStage(tip, records, "published");
       const provider: Record<string, ManagedProviderObservation> = {};
       const publishedProvider = publishedAncestor
-        ? await providerObservationForVersion(this.transport, publishedAncestor)
+        ? await providerObservationForVersion(this.runtime.objects, publishedAncestor)
         : undefined;
       if (publishedProvider) provider.published = publishedProvider;
-      const tipProvider = await providerObservationForVersion(this.transport, tip);
+      const tipProvider = await providerObservationForVersion(this.runtime.objects, tip);
       if (tipProvider && tip.stage === "working") provider.working = tipProvider;
       if (tipProvider && tip.stage === "review") provider.review = tipProvider;
       if (tipProvider && tip.stage === "published") provider.published = tipProvider;
@@ -377,24 +394,21 @@ function nearestAncestorAtStage(
 }
 
 async function providerObservationForVersion(
-  transport: DropboxTransport,
+  objects: ObjectPersistence,
   record: DocumentVersionRecord
 ): Promise<ManagedProviderObservation | undefined> {
   const stored = providerObservationFromVersion(record);
-  if (!stored || !transport.getMetadata) return stored;
-  const current = await transport.getMetadata(stored.path);
-  if (
-    current
-    && current.content_hash === stored.content_hash
-    && current.size === stored.size
-  ) {
-    return {
-      path: stored.path,
-      file_id: current.id,
-      rev: current.rev,
-      content_hash: current.content_hash,
-      size: current.size
-    };
+  if (!stored) return undefined;
+  const current = await objects.getMetadata(stored.path);
+  if (current) {
+    try {
+      const evidence = requireDropboxV1Evidence(current);
+      if (evidence.content_hash === stored.content_hash && evidence.size === stored.size) {
+        return toManagedProviderObservation(current);
+      }
+    } catch {
+      // Fall back to durable schema-1.0 evidence when live metadata cannot be proven compatible.
+    }
   }
   return stored;
 }

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import type { ProjectionOutputEvidence } from "../src/domain/materialization";
-import { DropboxConflictError, type DropboxTransport } from "../src/dropbox/client";
 import { sha256Text } from "../src/materialization/hash";
 import type { PlannedProjectionOutput, ProjectionPlan } from "../src/materialization/planner";
 import {
@@ -8,9 +7,11 @@ import {
   parseProjectionConcurrency,
   WorkspaceProjectionWriter
 } from "../src/materialization/writer";
+import type { ObjectPersistence, ProviderEntry, ProviderObjectMetadata } from "../src/persistence/provider/contract";
+import { ProviderConflictError } from "../src/persistence/provider/errors";
 import { MANAGED_NOTICE } from "../src/render/shared";
 
-class InstrumentedTransport implements DropboxTransport {
+class InstrumentedObjects implements ObjectPersistence {
   files = new Map<string, string>();
   uploads: Array<{ path: string; mode: "add" | "overwrite" }> = [];
   downloads: string[] = [];
@@ -19,27 +20,40 @@ class InstrumentedTransport implements DropboxTransport {
   maxInFlight = 0;
   failPath: string | null = null;
 
-  async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
+  async readText(path: string): Promise<string | null> {
+    this.downloads.push(path);
+    return this.files.get(path) ?? null;
+  }
+
+  async createText(path: string, content: string): Promise<void> {
+    await this.write(path, content, "add");
+  }
+
+  async upsertText(path: string, content: string): Promise<void> {
+    await this.write(path, content, "overwrite");
+  }
+
+  async getMetadata(path: string): Promise<ProviderObjectMetadata | null> {
+    const content = this.files.get(path);
+    return content === undefined ? null : { path, size: new TextEncoder().encode(content).byteLength };
+  }
+
+  async listChildren(_path: string): Promise<ProviderEntry[]> { return []; }
+  async move(): Promise<void> { throw new Error("not used"); }
+  async delete(path: string): Promise<void> { this.files.delete(path); }
+
+  private async write(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
     this.inFlight += 1;
     this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
     try {
       if (this.uploadDelay) await new Promise((resolve) => setTimeout(resolve, this.uploadDelay));
       if (path === this.failPath) throw new Error(`injected failure for ${path}`);
-      if (mode === "add" && this.files.has(path)) throw new DropboxConflictError("exists", "req-writer");
+      if (mode === "add" && this.files.has(path)) throw new ProviderConflictError("exists");
       this.files.set(path, content);
       this.uploads.push({ path, mode });
     } finally {
       this.inFlight -= 1;
     }
-  }
-
-  async download(path: string): Promise<string | null> {
-    this.downloads.push(path);
-    return this.files.get(path) ?? null;
-  }
-
-  async move(): Promise<void> {
-    throw new Error("not used");
   }
 }
 
@@ -76,30 +90,30 @@ function plan(outputs: PlannedProjectionOutput[]): ProjectionPlan {
 }
 
 describe("WorkspaceProjectionWriter", () => {
-  it("uses add for a missing destination", async () => {
-    const transport = new InstrumentedTransport();
-    const writer = new WorkspaceProjectionWriter(transport, 1);
+  it("uses create for a missing destination", async () => {
+    const objects = new InstrumentedObjects();
+    const writer = new WorkspaceProjectionWriter(objects, 1);
     const item = await output("global:BRIEF", "BRIEF.md", `${MANAGED_NOTICE}\nbrief`);
 
     await writer.materialize(plan([item]), { workspaceRoot: "/workspace" });
 
-    expect(transport.uploads).toEqual([{ path: "/workspace/BRIEF.md", mode: "add" }]);
+    expect(objects.uploads).toEqual([{ path: "/workspace/BRIEF.md", mode: "add" }]);
   });
 
   it("skips upload when destination already has desired bytes", async () => {
-    const transport = new InstrumentedTransport();
+    const objects = new InstrumentedObjects();
     const content = `${MANAGED_NOTICE}\nalready current`;
-    transport.files.set("/workspace/BRIEF.md", content);
-    const writer = new WorkspaceProjectionWriter(transport, 1);
+    objects.files.set("/workspace/BRIEF.md", content);
+    const writer = new WorkspaceProjectionWriter(objects, 1);
     const item = await output("global:BRIEF", "BRIEF.md", content);
 
     await writer.materialize(plan([item]), { workspaceRoot: "/workspace" });
 
-    expect(transport.uploads).toHaveLength(0);
+    expect(objects.uploads).toHaveLength(0);
   });
 
   it("fails closed and durably quarantines current bytes when they match neither baseline nor desired", async () => {
-    const transport = new InstrumentedTransport();
+    const objects = new InstrumentedObjects();
     const baselineContent = `${MANAGED_NOTICE}\nbaseline`;
     const baseline: ProjectionOutputEvidence = {
       relative_path: "BRIEF.md",
@@ -108,23 +122,23 @@ describe("WorkspaceProjectionWriter", () => {
       source_revision: 3
     };
     const humanEdit = `${MANAGED_NOTICE}\nunexpected edit`;
-    transport.files.set("/workspace/BRIEF.md", humanEdit);
-    const writer = new WorkspaceProjectionWriter(transport, 1);
+    objects.files.set("/workspace/BRIEF.md", humanEdit);
+    const writer = new WorkspaceProjectionWriter(objects, 1);
     const item = await output("global:BRIEF", "BRIEF.md", `${MANAGED_NOTICE}\ndesired`, { baseline });
 
     await expect(writer.materialize(plan([item]), { workspaceRoot: "/workspace" }))
       .rejects.toBeInstanceOf(MaterializationOutputConflictError);
-    expect(transport.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
+    expect(objects.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
     const hash = await sha256Text(humanEdit);
-    expect(transport.files.get(`/PROJECT_OS/.project-os/projects/PRJ-3301/recovery/projections/payloads/sha256/${hash}.md`))
+    expect(objects.files.get(`/PROJECT_OS/.project-os/projects/PRJ-3301/recovery/projections/payloads/sha256/${hash}.md`))
       .toBe(humanEdit);
-    expect([...transport.files.keys()].some((path) =>
+    expect([...objects.files.keys()].some((path) =>
       path.startsWith("/PROJECT_OS/.project-os/projects/PRJ-3301/recovery/projections/records/")
     )).toBe(true);
   });
 
   it("offers already-preserved unexpected human bytes to a recovery hook before failing closed", async () => {
-    const transport = new InstrumentedTransport();
+    const objects = new InstrumentedObjects();
     const baselineContent = `${MANAGED_NOTICE}\nbaseline`;
     const baseline: ProjectionOutputEvidence = {
       relative_path: "STATE.md",
@@ -133,8 +147,8 @@ describe("WorkspaceProjectionWriter", () => {
       source_revision: 3
     };
     const humanEdit = `${MANAGED_NOTICE}\nhuman changed this in Obsidian`;
-    transport.files.set("/workspace/STATE.md", humanEdit);
-    const writer = new WorkspaceProjectionWriter(transport, 1);
+    objects.files.set("/workspace/STATE.md", humanEdit);
+    const writer = new WorkspaceProjectionWriter(objects, 1);
     const item = await output("global:STATE", "STATE.md", `${MANAGED_NOTICE}\ncanonical state`, { baseline, critical: true });
     const preserved: Array<{ key: string; path: string; currentContent: string; currentHash: string }> = [];
 
@@ -149,47 +163,47 @@ describe("WorkspaceProjectionWriter", () => {
       currentContent: humanEdit,
       currentHash: await sha256Text(humanEdit)
     }]);
-    expect(transport.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
+    expect(objects.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
   });
 
   it("bootstrap may overwrite a known machine-managed note but quarantines and refuses an untracked human file", async () => {
-    const managedTransport = new InstrumentedTransport();
-    managedTransport.files.set("/workspace/BRIEF.md", `${MANAGED_NOTICE}\nold generated`);
-    const managedWriter = new WorkspaceProjectionWriter(managedTransport, 1);
+    const managedObjects = new InstrumentedObjects();
+    managedObjects.files.set("/workspace/BRIEF.md", `${MANAGED_NOTICE}\nold generated`);
+    const managedWriter = new WorkspaceProjectionWriter(managedObjects, 1);
     const desired = await output("global:BRIEF", "BRIEF.md", `${MANAGED_NOTICE}\nnew generated`);
 
     await managedWriter.materialize(plan([desired]), { workspaceRoot: "/workspace" });
-    expect(managedTransport.uploads).toEqual([{ path: "/workspace/BRIEF.md", mode: "overwrite" }]);
+    expect(managedObjects.uploads).toEqual([{ path: "/workspace/BRIEF.md", mode: "overwrite" }]);
 
-    const humanTransport = new InstrumentedTransport();
-    humanTransport.files.set("/workspace/BRIEF.md", "human-owned content");
-    const humanWriter = new WorkspaceProjectionWriter(humanTransport, 1);
+    const humanObjects = new InstrumentedObjects();
+    humanObjects.files.set("/workspace/BRIEF.md", "human-owned content");
+    const humanWriter = new WorkspaceProjectionWriter(humanObjects, 1);
     await expect(humanWriter.materialize(plan([desired]), { workspaceRoot: "/workspace" }))
       .rejects.toBeInstanceOf(MaterializationOutputConflictError);
-    expect(humanTransport.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
-    expect([...humanTransport.files.keys()].some((path) =>
+    expect(humanObjects.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
+    expect([...humanObjects.files.keys()].some((path) =>
       path.startsWith("/PROJECT_OS/.project-os/projects/PRJ-3301/recovery/projections/payloads/")
     )).toBe(true);
   });
 
   it("does not read back non-critical success but verifies critical output after upload", async () => {
-    const nonCriticalTransport = new InstrumentedTransport();
-    const nonCriticalWriter = new WorkspaceProjectionWriter(nonCriticalTransport, 1);
+    const nonCriticalObjects = new InstrumentedObjects();
+    const nonCriticalWriter = new WorkspaceProjectionWriter(nonCriticalObjects, 1);
     const brief = await output("global:BRIEF", "BRIEF.md", `${MANAGED_NOTICE}\nbrief`);
     await nonCriticalWriter.materialize(plan([brief]), { workspaceRoot: "/workspace" });
-    expect(nonCriticalTransport.downloads.filter((path) => path === "/workspace/BRIEF.md")).toHaveLength(1);
+    expect(nonCriticalObjects.downloads.filter((path) => path === "/workspace/BRIEF.md")).toHaveLength(1);
 
-    const criticalTransport = new InstrumentedTransport();
-    const criticalWriter = new WorkspaceProjectionWriter(criticalTransport, 1);
+    const criticalObjects = new InstrumentedObjects();
+    const criticalWriter = new WorkspaceProjectionWriter(criticalObjects, 1);
     const state = await output("global:STATE", "STATE.md", `${MANAGED_NOTICE}\nstate`, { critical: true });
     await criticalWriter.materialize(plan([state]), { workspaceRoot: "/workspace" });
-    expect(criticalTransport.downloads.filter((path) => path === "/workspace/STATE.md")).toHaveLength(2);
+    expect(criticalObjects.downloads.filter((path) => path === "/workspace/STATE.md")).toHaveLength(2);
   });
 
   it("keeps verified callbacks from earlier outputs when a later output fails", async () => {
-    const transport = new InstrumentedTransport();
-    transport.files.set("/workspace/SECOND.md", "human edit");
-    const writer = new WorkspaceProjectionWriter(transport, 1);
+    const objects = new InstrumentedObjects();
+    objects.files.set("/workspace/SECOND.md", "human edit");
+    const writer = new WorkspaceProjectionWriter(objects, 1);
     const first = await output("one", "FIRST.md", `${MANAGED_NOTICE}\nfirst`);
     const second = await output("two", "SECOND.md", `${MANAGED_NOTICE}\nsecond`);
     const verified: string[] = [];
@@ -202,18 +216,18 @@ describe("WorkspaceProjectionWriter", () => {
     expect(verified).toContain("one");
   });
 
-  it("never exceeds configured concurrent uploads", async () => {
-    const transport = new InstrumentedTransport();
-    transport.uploadDelay = 10;
-    const writer = new WorkspaceProjectionWriter(transport, 2);
+  it("never exceeds configured concurrent writes", async () => {
+    const objects = new InstrumentedObjects();
+    objects.uploadDelay = 10;
+    const writer = new WorkspaceProjectionWriter(objects, 2);
     const outputs = await Promise.all(
       [1, 2, 3, 4, 5, 6].map((index) => output(`key-${index}`, `F-${index}.md`, `${MANAGED_NOTICE}\n${index}`))
     );
 
     await writer.materialize(plan(outputs), { workspaceRoot: "/workspace" });
 
-    expect(transport.maxInFlight).toBeLessThanOrEqual(2);
-    expect(transport.maxInFlight).toBeGreaterThan(1);
+    expect(objects.maxInFlight).toBeLessThanOrEqual(2);
+    expect(objects.maxInFlight).toBeGreaterThan(1);
   });
 
   it("parses only conservative concurrency 1..4 and defaults to 4", () => {

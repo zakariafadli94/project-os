@@ -1,7 +1,11 @@
 import type { ProjectionOutputEvidence } from "../domain/materialization";
-import { DropboxConflictError, type DropboxTransport } from "../dropbox/client";
-import { machineProjectRoot } from "../dropbox/layout";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+import {
+  asProjectOsPersistence,
+  type PersistenceInput
+} from "../persistence/provider/runtime";
+import { machineProjectRoot } from "../persistence/layout";
+import type { ObjectPersistence } from "../persistence/provider/contract";
+import { ProviderConflictError } from "../persistence/provider/errors";
 import { MANAGED_NOTICE } from "../render/shared";
 import { sha256Text } from "./hash";
 import type { PlannedProjectionOutput, ProjectionPlan } from "./planner";
@@ -44,13 +48,18 @@ export interface WorkspaceProjectionWriterOptions {
 }
 
 export class WorkspaceProjectionWriter {
-  private readonly transport: DropboxTransport;
+  private readonly objects: ObjectPersistence;
 
-  constructor(transport: DropboxTransport, private readonly concurrency: number) {
+  constructor(
+    input: ObjectPersistence | PersistenceInput,
+    private readonly concurrency: number
+  ) {
     if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 4) {
       throw new Error(`Invalid projection writer concurrency: ${concurrency}`);
     }
-    this.transport = new ResilientDropboxTransport(transport);
+    this.objects = isObjectPersistence(input)
+      ? input
+      : asProjectOsPersistence(input).objects;
   }
 
   async materialize(
@@ -83,7 +92,7 @@ export class WorkspaceProjectionWriter {
     for (const output of plan.changed_outputs.values()) {
       if (!output.critical) continue;
       const path = joinWorkspacePath(root, output.relative_path);
-      const persisted = await this.transport.download(path);
+      const persisted = await this.objects.readText(path);
       if (persisted === null || await sha256Text(persisted) !== output.content_hash) {
         throw new MaterializationOutputConflictError(
           output.key,
@@ -135,7 +144,7 @@ export class WorkspaceProjectionWriter {
     options: WorkspaceProjectionWriterOptions
   ): Promise<{ evidence: ProjectionOutputEvidence; outcome: ProjectionWriteOutcome }> {
     const path = joinWorkspacePath(root, output.relative_path);
-    const current = await this.transport.download(path);
+    const current = await this.objects.readText(path);
     const currentHash = current === null ? null : await sha256Text(current);
     const desired = evidenceFor(output);
 
@@ -173,10 +182,11 @@ export class WorkspaceProjectionWriter {
       );
     }
 
-    await this.transport.upload(path, output.content, current === null ? "add" : "overwrite");
+    if (current === null) await this.objects.createText(path, output.content);
+    else await this.objects.upsertText(path, output.content);
 
     if (output.critical) {
-      const persisted = await this.transport.download(path);
+      const persisted = await this.objects.readText(path);
       if (persisted === null || await sha256Text(persisted) !== output.content_hash) {
         throw new MaterializationOutputConflictError(
           output.key,
@@ -214,15 +224,23 @@ export class WorkspaceProjectionWriter {
 
   private async safeAdd(path: string, content: string): Promise<void> {
     try {
-      await this.transport.upload(path, content, "add");
+      await this.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const existing = await this.transport.download(path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.objects.readText(path);
       if (existing !== content) {
         throw new Error(`Projection recovery evidence conflict with different content: ${path}`);
       }
     }
   }
+}
+
+function isObjectPersistence(input: ObjectPersistence | PersistenceInput): input is ObjectPersistence {
+  return typeof input === "object"
+    && input !== null
+    && "readText" in input
+    && "createText" in input
+    && "upsertText" in input;
 }
 
 function evidenceFor(output: PlannedProjectionOutput): ProjectionOutputEvidence {

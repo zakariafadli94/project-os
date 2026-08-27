@@ -25,7 +25,7 @@ import { renderRoadmap } from "../render/roadmap";
 import { renderState } from "../render/state";
 import { renderTask } from "../render/task";
 import { ArtifactGovernanceConflictError, resolveArtifactDestination } from "./artifact-routing";
-import { DropboxConflictError, type DropboxTransport } from "./client";
+import { asProjectOsPersistence, type PersistenceInput } from "./compatibility/legacy-dropbox-runtime";
 import {
   archiveProjectRoot,
   type LayoutMode,
@@ -56,7 +56,8 @@ import {
   registryMarkdownPath,
   transactionPath
 } from "./paths";
-import { ResilientDropboxTransport } from "./resilient-transport";
+import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
+import { ProviderConflictError } from "./provider/errors";
 
 export { ArtifactGovernanceConflictError } from "./artifact-routing";
 
@@ -72,18 +73,18 @@ export class ArtifactContentConflictError extends Error {
 }
 
 export class ProjectRepository {
-  private readonly transport: DropboxTransport;
+  protected readonly persistence: ProjectOsPersistenceRuntime;
 
   constructor(
-    transport: DropboxTransport,
-    private readonly mode: LayoutMode = "legacy"
+    input: PersistenceInput,
+    protected readonly mode: LayoutMode = "legacy"
   ) {
-    this.transport = new ResilientDropboxTransport(transport);
+    this.persistence = asProjectOsPersistence(input);
   }
 
   async readProjectState(projectId: string): Promise<ProjectState | null> {
     if (this.mode === "legacy") return null;
-    const raw = await this.transport.download(machineStatePath(projectId));
+    const raw = await this.persistence.objects.readText(machineStatePath(projectId));
     if (raw === null) return null;
     const state = normalizeProjectState(JSON.parse(raw));
     if (state.project_id !== projectId) {
@@ -94,7 +95,7 @@ export class ProjectRepository {
 
   async readCommitRecord(projectId: string, revision: number): Promise<CanonicalCommitRecord | null> {
     if (this.mode !== "v2") return null;
-    const raw = await this.transport.download(machineCommitRecordPath(projectId, revision));
+    const raw = await this.persistence.objects.readText(machineCommitRecordPath(projectId, revision));
     if (raw === null) return null;
     const record = parseCanonicalCommitRecord(JSON.parse(raw));
     if (record.project_id !== projectId || record.new_revision !== revision) {
@@ -105,7 +106,7 @@ export class ProjectRepository {
 
   async readMaterializationHead(projectId: string): Promise<MaterializationHead | null> {
     if (this.mode !== "v2") return null;
-    const raw = await this.transport.download(machineMaterializationHeadPath(projectId));
+    const raw = await this.persistence.objects.readText(machineMaterializationHeadPath(projectId));
     if (raw === null) return null;
     const head = parseMaterializationHead(JSON.parse(raw));
     if (head.project_id !== projectId) {
@@ -124,7 +125,7 @@ export class ProjectRepository {
     projectionVersion: number
   ): Promise<CompletedMaterializationRecord | null> {
     if (this.mode !== "v2") return null;
-    const raw = await this.transport.download(machineMaterializationRecordPath(projectId, revision, projectionVersion));
+    const raw = await this.persistence.objects.readText(machineMaterializationRecordPath(projectId, revision, projectionVersion));
     if (raw === null) return null;
     const record = parseCompletedMaterializationRecord(JSON.parse(raw));
     if (
@@ -139,11 +140,10 @@ export class ProjectRepository {
 
   async listMaterializationRecordRefs(projectId: string): Promise<MaterializationGenerationRef[]> {
     if (this.mode !== "v2") return [];
-    if (!this.transport.listFolder) throw new Error("Dropbox transport does not support materialization record listing");
-    const entries = await this.transport.listFolder(machineMaterializationRoot(projectId));
+    const entries = await this.persistence.objects.listChildren(machineMaterializationRoot(projectId));
     const refs: MaterializationGenerationRef[] = [];
     for (const entry of entries) {
-      if (entry.tag !== "file") continue;
+      if (entry.kind !== "file") continue;
       const match = /^REV-(\d{6,})-PV-(\d{4,})\.json$/.exec(entry.name);
       if (!match) continue;
       const target_revision = Number.parseInt(match[1], 10);
@@ -160,7 +160,7 @@ export class ProjectRepository {
     const path = this.mode === "v2"
       ? machineReceiptPath(transactionId)
       : receiptPath(transactionId);
-    const raw = await this.transport.download(path);
+    const raw = await this.persistence.objects.readText(path);
     if (raw === null) return null;
     const receipt = JSON.parse(raw) as Receipt;
     if (receipt.transaction_id !== transactionId) {
@@ -171,7 +171,7 @@ export class ProjectRepository {
 
   async readRegistry(): Promise<unknown | null> {
     const path = this.mode === "v2" ? machineRegistryJsonPath() : registryJsonPath();
-    const raw = await this.transport.download(path);
+    const raw = await this.persistence.objects.readText(path);
     return raw === null ? null : JSON.parse(raw);
   }
 
@@ -223,10 +223,9 @@ export class ProjectRepository {
     ) {
       throw new Error("Materialization head does not match its immutable completed record");
     }
-    await this.transport.upload(
+    await this.persistence.objects.upsertText(
       machineMaterializationHeadPath(validated.project_id),
-      pretty(validated),
-      "overwrite"
+      pretty(validated)
     );
   }
 
@@ -294,7 +293,7 @@ export class ProjectRepository {
 
     const destination = resolveArtifactDestination(state, request.relative_path);
     const path = destination.path;
-    const existing = await this.transport.download(path);
+    const existing = await this.persistence.objects.readText(path);
     if (existing === request.content) return "idempotent";
 
     if (request.mode === "create" && existing !== null) {
@@ -306,15 +305,16 @@ export class ProjectRepository {
     }
 
     try {
-      await this.transport.upload(path, request.content, existing === null ? "add" : "overwrite");
+      if (existing === null) await this.persistence.objects.createText(path, request.content);
+      else await this.persistence.objects.upsertText(path, request.content);
       return "written";
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const current = await this.transport.download(path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const current = await this.persistence.objects.readText(path);
       if (current === request.content) return "idempotent";
       if (request.mode === "create") throw new ArtifactContentConflictError(path);
       if (current !== null && destination.archive_path) await this.archiveExisting(destination.archive_path, current);
-      await this.transport.upload(path, request.content, "overwrite");
+      await this.persistence.objects.upsertText(path, request.content);
       return "written";
     }
   }
@@ -326,48 +326,43 @@ export class ProjectRepository {
 
   async writeHumanViews(state: ProjectState): Promise<void> {
     for (const id of Object.keys(state.decisions).sort()) {
-      await this.transport.upload(
+      await this.persistence.objects.upsertText(
         workspaceEntityPath(state.project_id, state.slug, "DECISIONS", id),
-        renderDecision(state, state.decisions[id]),
-        "overwrite"
+        renderDecision(state, state.decisions[id])
       );
     }
     for (const id of Object.keys(state.constraints).sort()) {
-      await this.transport.upload(
+      await this.persistence.objects.upsertText(
         workspaceEntityPath(state.project_id, state.slug, "CONSTRAINTS", id),
-        renderConstraint(state, state.constraints[id]),
-        "overwrite"
+        renderConstraint(state, state.constraints[id])
       );
     }
     for (const id of Object.keys(state.tasks).sort()) {
-      await this.transport.upload(
+      await this.persistence.objects.upsertText(
         workspaceEntityPath(state.project_id, state.slug, "TASKS", id),
-        renderTask(state, state.tasks[id]),
-        "overwrite"
+        renderTask(state, state.tasks[id])
       );
     }
     for (const id of Object.keys(state.research).sort()) {
-      await this.transport.upload(
+      await this.persistence.objects.upsertText(
         workspaceEntityPath(state.project_id, state.slug, "RESEARCH", id),
-        renderResearch(state, state.research[id]),
-        "overwrite"
+        renderResearch(state, state.research[id])
       );
     }
     for (const id of Object.keys(state.deliverables).sort()) {
-      await this.transport.upload(
+      await this.persistence.objects.upsertText(
         workspaceEntityPath(state.project_id, state.slug, "DELIVERABLES", id),
-        renderDeliverable(state, state.deliverables[id]),
-        "overwrite"
+        renderDeliverable(state, state.deliverables[id])
       );
     }
 
-    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "BRIEF.md"), renderBrief(state), "overwrite");
-    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "DISCOVERY.md"), renderDiscovery(state), "overwrite");
-    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "ROADMAP.md"), renderRoadmap(state), "overwrite");
-    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "PROJECT.md"), renderProject(state), "overwrite");
-    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "STATE.md"), renderState(state), "overwrite");
-    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "PLAN.md"), renderPlan(state), "overwrite");
-    await this.transport.upload(workspaceProjectFile(state.project_id, state.slug, "HANDOFF.md"), renderHandoff(state), "overwrite");
+    await this.persistence.objects.upsertText(workspaceProjectFile(state.project_id, state.slug, "BRIEF.md"), renderBrief(state));
+    await this.persistence.objects.upsertText(workspaceProjectFile(state.project_id, state.slug, "DISCOVERY.md"), renderDiscovery(state));
+    await this.persistence.objects.upsertText(workspaceProjectFile(state.project_id, state.slug, "ROADMAP.md"), renderRoadmap(state));
+    await this.persistence.objects.upsertText(workspaceProjectFile(state.project_id, state.slug, "PROJECT.md"), renderProject(state));
+    await this.persistence.objects.upsertText(workspaceProjectFile(state.project_id, state.slug, "STATE.md"), renderState(state));
+    await this.persistence.objects.upsertText(workspaceProjectFile(state.project_id, state.slug, "PLAN.md"), renderPlan(state));
+    await this.persistence.objects.upsertText(workspaceProjectFile(state.project_id, state.slug, "HANDOFF.md"), renderHandoff(state));
   }
 
   async archiveHumanWorkspace(state: ProjectState): Promise<void> {
@@ -376,14 +371,14 @@ export class ProjectRepository {
     const from = workspaceProjectRoot(state.project_id, state.slug);
     const to = archiveProjectRoot(state.project_id, state.slug);
     try {
-      await this.transport.move(from, to);
+      await this.persistence.objects.move(from, to);
       return;
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
+      if (!(error instanceof ProviderConflictError)) throw error;
     }
 
-    const archivedProject = await this.transport.download(`${to}/PROJECT.md`);
-    const workspaceProject = await this.transport.download(`${from}/PROJECT.md`);
+    const archivedProject = await this.persistence.objects.readText(`${to}/PROJECT.md`);
+    const workspaceProject = await this.persistence.objects.readText(`${from}/PROJECT.md`);
     if (archivedProject !== null && workspaceProject === null) return;
     if (archivedProject === null && workspaceProject === null) return;
     throw new Error(`Archived workspace move is inconsistent: ${from} -> ${to}`);
@@ -395,8 +390,8 @@ export class ProjectRepository {
   }
 
   async writeMachineSnapshot(state: ProjectState): Promise<void> {
-    await this.transport.upload(machineStatePath(state.project_id), pretty(state), "overwrite");
-    await this.transport.upload(machineManifestPath(state.project_id), pretty(manifestFor(state)), "overwrite");
+    await this.persistence.objects.upsertText(machineStatePath(state.project_id), pretty(state));
+    await this.persistence.objects.upsertText(machineManifestPath(state.project_id), pretty(manifestFor(state)));
   }
 
   async materializeWorkspace(state: ProjectState): Promise<void> {
@@ -434,21 +429,21 @@ export class ProjectRepository {
 
   async writeRegistry(registry: unknown, markdown: string): Promise<void> {
     if (this.mode === "legacy" || this.mode === "shadow") {
-      await this.transport.upload(registryJsonPath(), pretty(registry), "overwrite");
-      await this.transport.upload(registryMarkdownPath(), markdown, "overwrite");
+      await this.persistence.objects.upsertText(registryJsonPath(), pretty(registry));
+      await this.persistence.objects.upsertText(registryMarkdownPath(), markdown);
     }
     if (this.mode === "shadow" || this.mode === "v2") {
-      await this.transport.upload(machineRegistryJsonPath(), pretty(registry), "overwrite");
-      await this.transport.upload(machineRegistryMarkdownPath(), markdown, "overwrite");
-      await this.transport.upload(workspacePortfolioDashboardPath(), markdown, "overwrite");
+      await this.persistence.objects.upsertText(machineRegistryJsonPath(), pretty(registry));
+      await this.persistence.objects.upsertText(machineRegistryMarkdownPath(), markdown);
+      await this.persistence.objects.upsertText(workspacePortfolioDashboardPath(), markdown);
     }
   }
 
   private async materializeArchivedWorkspace(state: ProjectState): Promise<void> {
     const archivedProjectPath = `${archiveProjectRoot(state.project_id, state.slug)}/PROJECT.md`;
     const workspaceProjectPath = `${workspaceProjectRoot(state.project_id, state.slug)}/PROJECT.md`;
-    const archivedProject = await this.transport.download(archivedProjectPath);
-    const workspaceProject = await this.transport.download(workspaceProjectPath);
+    const archivedProject = await this.persistence.objects.readText(archivedProjectPath);
+    const workspaceProject = await this.persistence.objects.readText(workspaceProjectPath);
 
     if (archivedProject !== null) {
       if (workspaceProject !== null) {
@@ -475,14 +470,14 @@ export class ProjectRepository {
       const decisionId = String(event.payload.decision_id);
       const decision = state.decisions[decisionId];
       if (!decision) throw new Error(`Superseded decision ${decisionId} missing from state`);
-      await this.transport.upload(decisionPath(state.project_id, state.slug, decisionId), renderDecision(state, decision), "overwrite");
+      await this.persistence.objects.upsertText(decisionPath(state.project_id, state.slug, decisionId), renderDecision(state, decision));
     }
 
-    await this.transport.upload(projectFile(state.project_id, state.slug, "PROJECT.md"), renderProject(state), "overwrite");
-    await this.transport.upload(projectFile(state.project_id, state.slug, "STATE.md"), renderState(state), "overwrite");
-    await this.transport.upload(projectFile(state.project_id, state.slug, "PLAN.md"), renderPlan(state), "overwrite");
-    await this.transport.upload(projectFile(state.project_id, state.slug, "HANDOFF.md"), renderHandoff(state), "overwrite");
-    await this.transport.upload(manifestPath(state.project_id, state.slug), pretty(manifestFor(state)), "overwrite");
+    await this.persistence.objects.upsertText(projectFile(state.project_id, state.slug, "PROJECT.md"), renderProject(state));
+    await this.persistence.objects.upsertText(projectFile(state.project_id, state.slug, "STATE.md"), renderState(state));
+    await this.persistence.objects.upsertText(projectFile(state.project_id, state.slug, "PLAN.md"), renderPlan(state));
+    await this.persistence.objects.upsertText(projectFile(state.project_id, state.slug, "HANDOFF.md"), renderHandoff(state));
+    await this.persistence.objects.upsertText(manifestPath(state.project_id, state.slug), pretty(manifestFor(state)));
   }
 
   private async archiveExisting(basePath: string, content: string): Promise<void> {
@@ -498,12 +493,12 @@ export class ProjectRepository {
 
   private async safeAdd(path: string, content: string): Promise<void> {
     try {
-      await this.transport.upload(path, content, "add");
+      await this.persistence.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const existing = await this.transport.download(path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.persistence.objects.readText(path);
       if (existing !== content) {
-        throw new Error(`Immutable Dropbox path conflict with different content: ${path}`);
+        throw new Error(`Immutable persistence path conflict with different content: ${path}`);
       }
     }
   }

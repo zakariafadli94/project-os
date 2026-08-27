@@ -9,24 +9,32 @@ import {
   type CandidateResolutionContext,
   type MutationGateMode
 } from "../mutation-gate/service";
+import { LegacyArtifactDocumentWriter } from "../documents/legacy-artifact";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
-import type { DropboxTransport } from "./client";
 import type { LayoutMode } from "./layout";
+import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
+import {
+  asProjectOsPersistence,
+  type PersistenceInput
+} from "./provider/runtime";
 import { ProjectRepository as CoreProjectRepository } from "./repository-core";
 
 export class ProjectRepository extends CoreProjectRepository {
+  private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;
 
   constructor(
-    private readonly rawTransport: DropboxTransport,
+    input: PersistenceInput,
     private readonly repositoryMode: LayoutMode = "legacy",
     mutationGateMode: MutationGateMode = "observe"
   ) {
-    super(rawTransport, repositoryMode);
-    const mutationRepository = new MutationGateRepository(rawTransport);
-    this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, rawTransport);
-    this.mutationGate = new MutationGateService(rawTransport, mutationGateMode);
+    const runtime = asProjectOsPersistence(input);
+    super(runtime, repositoryMode);
+    this.runtime = runtime;
+    const mutationRepository = new MutationGateRepository(runtime);
+    this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
+    this.mutationGate = new MutationGateService(runtime, mutationGateMode);
   }
 
   override async writeArtifact(
@@ -44,8 +52,7 @@ export class ProjectRepository extends CoreProjectRepository {
     const replayState = stateForPreparedDestination(state, request, prepared.destination);
     await this.mutationGate.assertDestinationClear(replayState, prepared.destination.path, resolutionContext);
 
-    const { LegacyArtifactDocumentWriter } = await import("../documents/legacy-artifact");
-    const managed = await new LegacyArtifactDocumentWriter(this.rawTransport).writeIfManaged(replayState, request);
+    const managed = await new LegacyArtifactDocumentWriter(this.runtime).writeIfManaged(replayState, request);
     if (managed !== null) return managed;
     return super.writeArtifact(replayState, request);
   }

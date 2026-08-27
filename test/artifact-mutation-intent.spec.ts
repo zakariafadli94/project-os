@@ -7,6 +7,7 @@ import { ProjectRepository } from "../src/dropbox/repository";
 import { ArtifactMutationIntentService } from "../src/mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { MutationGateService } from "../src/mutation-gate/service";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeArtifactIntentDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
@@ -84,8 +85,9 @@ function stateAfterRoute() {
 describe("ArtifactMutationIntentService", () => {
   it("freezes the resolved provider destination and absent precondition across route drift", async () => {
     const transport = new FakeArtifactIntentDropbox();
-    const gate = new MutationGateRepository(transport);
-    const service = new ArtifactMutationIntentService(gate, transport);
+    const runtime = persistenceFromDropbox(transport);
+    const gate = new MutationGateRepository(runtime);
+    const service = new ArtifactMutationIntentService(gate, runtime);
     const artifact = await request();
 
     const first = await service.prepare(stateBeforeRoute(), artifact);
@@ -99,15 +101,16 @@ describe("ArtifactMutationIntentService", () => {
     expect(replay.destination.path).toBe(first.destination.path);
     expect(replay.intent.provider_precondition).toEqual({ kind: "absent" });
 
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(runtime, "v2");
     expect(await repository.writeArtifact(stateAfterRoute(), artifact, replay.destination)).toBe("idempotent");
     expect([...transport.files.keys()].some((path) => path.includes("/DELIVERABLES/REVENUE-OS/foo.md"))).toBe(false);
   });
 
   it("recovers a provider-written artifact from durable intent without creating a candidate", async () => {
     const transport = new FakeArtifactIntentDropbox();
-    const mutationRepository = new MutationGateRepository(transport);
-    const intentService = new ArtifactMutationIntentService(mutationRepository, transport);
+    const runtime = persistenceFromDropbox(transport);
+    const mutationRepository = new MutationGateRepository(runtime);
+    const intentService = new ArtifactMutationIntentService(mutationRepository, runtime);
     const artifact = await request();
     const state = stateBeforeRoute();
     const prepared = await intentService.prepare(state, artifact);
@@ -117,7 +120,7 @@ describe("ArtifactMutationIntentService", () => {
     await transport.upload(prepared.destination.path, artifact.content, "add");
     expect([...transport.files.keys()].some((path) => path.includes("/.project-os/artifacts/receipts/"))).toBe(false);
 
-    const summary = await new MutationGateService(transport, "observe").processChanges(state, [{
+    const summary = await new MutationGateService(runtime, "observe").processChanges(state, [{
       tag: "file",
       name: "foo.md",
       path: prepared.destination.path,
@@ -131,7 +134,7 @@ describe("ArtifactMutationIntentService", () => {
     expect(summary).toMatchObject({ candidates: 0, policy_violations: 0 });
     expect(await mutationRepository.listCandidates(artifact.project_id)).toHaveLength(0);
 
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(runtime, "v2");
     expect(await repository.writeArtifact(state, artifact, prepared.destination)).toBe("idempotent");
     expect(await mutationRepository.listCandidates(artifact.project_id)).toHaveLength(0);
     expect([...transport.files.keys()].some((path) => path.includes("/.project-os/artifacts/receipts/"))).toBe(false);
@@ -148,8 +151,9 @@ describe("ArtifactMutationIntentService", () => {
 
   it("rejects exact request-id replay when durable intent binds different request JSON", async () => {
     const transport = new FakeArtifactIntentDropbox();
-    const gate = new MutationGateRepository(transport);
-    const service = new ArtifactMutationIntentService(gate, transport);
+    const runtime = persistenceFromDropbox(transport);
+    const gate = new MutationGateRepository(runtime);
+    const service = new ArtifactMutationIntentService(gate, runtime);
     const artifact = await request();
     await service.prepare(stateBeforeRoute(), artifact);
 

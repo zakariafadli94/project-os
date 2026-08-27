@@ -1,5 +1,7 @@
 import { expect, it } from "vitest";
 import {
+  archiveProjectRoot,
+  machineCommitRecordPath,
   machineDocumentHeadPath,
   machineDocumentProviderPayloadPath,
   machineDocumentTextPayloadPath,
@@ -10,13 +12,28 @@ import {
   machineMutationIntentDestinationBindingRoot,
   machineMutationIntentPath,
   machineMutationResolutionPath,
+  machineStatePath,
   workspaceManagedDocumentPath,
-  workspaceManagedZoneRoot
-} from "../src/dropbox/layout";
-import { assertSafeSlug, projectRoot } from "../src/dropbox/paths";
+  workspaceManagedZoneRoot,
+  workspaceProjectRoot
+} from "../src/persistence/layout";
+import { assertSafeSlug, projectRoot, receiptPath } from "../src/persistence/paths";
 
 it("builds a canonical project path", () => {
   expect(projectRoot("PRJ-0001", "agency")).toBe("/PROJECT_OS/PROJECTS/PRJ-0001-agency");
+});
+
+it("pins legacy and V2 persistence path values", () => {
+  expect(machineStatePath("PRJ-0002"))
+    .toBe("/PROJECT_OS/.project-os/projects/PRJ-0002/state.json");
+  expect(machineCommitRecordPath("PRJ-0002", 94))
+    .toBe("/PROJECT_OS/.project-os/projects/PRJ-0002/commits/REV-000094.json");
+  expect(workspaceProjectRoot("PRJ-0002", "project-os"))
+    .toBe("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os");
+  expect(archiveProjectRoot("PRJ-0002", "project-os"))
+    .toBe("/PROJECT_OS/ARCHIVE/PROJECTS/PRJ-0002-project-os");
+  expect(receiptPath("TXN-EXAMPLE-000001"))
+    .toBe("/PROJECT_OS/RECEIPTS/TXN-EXAMPLE-000001.json");
 });
 
 it("rejects traversal and separators in slug", () => {

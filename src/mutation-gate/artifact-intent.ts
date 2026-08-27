@@ -8,9 +8,13 @@ import type { ProjectState } from "../domain/project-state";
 import {
   resolveArtifactDestination,
   type ResolvedArtifactDestination
-} from "../dropbox/artifact-routing";
-import type { DropboxTransport } from "../dropbox/client";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+} from "../persistence/artifact-routing";
+import { requireDropboxV1Evidence } from "../persistence/compatibility/dropbox-v1-evidence";
+import {
+  asProjectOsPersistence,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { sha256Text } from "../documents/hash";
 import { MutationGateRepository, MutationIntentConflictError } from "./repository";
 
@@ -20,13 +24,13 @@ export interface PreparedArtifactMutation {
 }
 
 export class ArtifactMutationIntentService {
-  private readonly transport: ResilientDropboxTransport;
+  private readonly runtime: ProjectOsPersistenceRuntime;
 
   constructor(
     private readonly repository: MutationGateRepository,
-    transport: DropboxTransport
+    input: PersistenceInput
   ) {
-    this.transport = new ResilientDropboxTransport(transport);
+    this.runtime = asProjectOsPersistence(input);
   }
 
   async prepare(state: ProjectState, request: ArtifactWriteRequest): Promise<PreparedArtifactMutation> {
@@ -84,14 +88,15 @@ export class ArtifactMutationIntentService {
   }
 
   private async providerPrecondition(path: string): Promise<MutationProviderPrecondition> {
-    const metadata = await this.transport.getMetadata(path);
+    const metadata = await this.runtime.objects.getMetadata(path);
     if (!metadata) return { kind: "absent" };
+    const evidence = requireDropboxV1Evidence(metadata);
     return {
       kind: "existing",
-      file_id: metadata.id,
-      rev: metadata.rev,
-      content_hash: metadata.content_hash,
-      size: metadata.size
+      file_id: evidence.file_id,
+      rev: evidence.rev,
+      content_hash: evidence.content_hash,
+      size: evidence.size
     };
   }
 }

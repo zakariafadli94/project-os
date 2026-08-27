@@ -8,7 +8,8 @@
     "test:watch": "vitest",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
-    "check": "npm run types && npm run typecheck && npm test",
+    "check:persistence-boundary": "node scripts/check-persistence-boundary.mjs",
+    "check": "npm run types && npm run typecheck && npm run check:persistence-boundary && npm test",
     "deploy": "wrangler deploy"
   },
   "dependencies": {

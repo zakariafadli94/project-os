@@ -7,6 +7,7 @@ import { DropboxConflictError, type DropboxTransport } from "../src/dropbox/clie
 import { machineReceiptPath, machineStatePath, machineTransactionPath } from "../src/dropbox/layout";
 import { ProjectRepository } from "../src/dropbox/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -39,7 +40,7 @@ describe("V2 persistence boundaries", () => {
 
   it("keeps rejected terminal transactions entirely in the machine layer", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const transaction: Transaction = {
       schema_version: "1.0",
       transaction_id: "TXN-TERMINAL-V2-0001",

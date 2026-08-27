@@ -13,6 +13,8 @@ import {
 } from "../persistence/compatibility/dropbox-v1-evidence";
 import {
   asProjectOsPersistence,
+  toProviderChangeEntry,
+  type LegacyDropboxChangeEntry,
   type PersistenceInput
 } from "../persistence/compatibility/legacy-dropbox-runtime";
 import {
@@ -43,7 +45,10 @@ export class ManagedDocumentReconciler {
     this.ledger = new DocumentLedgerRepository(this.runtime);
   }
 
-  async reconcileChanges(state: ProjectState, changes: ProviderChangeEntry[]): Promise<ManagedDocumentReconcileSummary> {
+  async reconcileChanges(
+    state: ProjectState,
+    changes: Array<ProviderChangeEntry | LegacyDropboxChangeEntry>
+  ): Promise<ManagedDocumentReconcileSummary> {
     const summary: ManagedDocumentReconcileSummary = {
       scanned: changes.length,
       ignored: 0,
@@ -58,7 +63,8 @@ export class ManagedDocumentReconciler {
       return summary;
     }
 
-    for (const change of changes) {
+    for (const changeInput of changes) {
+      const change = toProviderChangeEntry(changeInput);
       const classified = classifyManagedPath(state, change.path);
       if (!classified) {
         summary.ignored += 1;

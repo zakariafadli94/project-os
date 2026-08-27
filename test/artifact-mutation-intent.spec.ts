@@ -7,6 +7,7 @@ import { ProjectRepository } from "../src/dropbox/repository";
 import { ArtifactMutationIntentService } from "../src/mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { MutationGateService } from "../src/mutation-gate/service";
+import { asProjectOsPersistence } from "../src/persistence/compatibility/legacy-dropbox-runtime";
 
 class FakeArtifactIntentDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
@@ -85,7 +86,7 @@ describe("ArtifactMutationIntentService", () => {
   it("freezes the resolved provider destination and absent precondition across route drift", async () => {
     const transport = new FakeArtifactIntentDropbox();
     const gate = new MutationGateRepository(transport);
-    const service = new ArtifactMutationIntentService(gate, transport);
+    const service = new ArtifactMutationIntentService(gate, asProjectOsPersistence(transport));
     const artifact = await request();
 
     const first = await service.prepare(stateBeforeRoute(), artifact);

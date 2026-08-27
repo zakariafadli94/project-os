@@ -61,5 +61,5 @@ it("reads canonical state through the neutral persistence runtime", async () => 
   );
 
   const repository = new ProjectRepository(runtime, "v2");
-  await expect(repository.readState("PRJ-0002")).resolves.toEqual(state);
+  await expect(repository.readProjectState("PRJ-0002")).resolves.toEqual(state);
 });

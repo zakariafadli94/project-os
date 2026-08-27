@@ -8,6 +8,7 @@ import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { ManagedDocumentService } from "../src/documents/service";
 import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeDocumentDropbox implements DropboxTransport {
   files = new Map<string, string>();
@@ -135,19 +136,20 @@ async function createWorking(service: ManagedDocumentService, project = state(),
 describe("ManagedDocumentReconciler external edits", () => {
   it("captures a human WORKING edit as the next working version without decoding a different provider file", async () => {
     const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const project = state();
-    const service = new ManagedDocumentService(dropbox);
+    const service = new ManagedDocumentService(runtime);
     const first = await createWorking(service, project);
     const path = workspaceManagedDocumentPath(project.project_id, project.slug, "working", "strategy/commerciale.md");
     const external = await dropbox.externalWrite(path, "human section edit");
     dropbox.downloads.length = 0;
 
-    const reconciler = new ManagedDocumentReconciler(dropbox);
+    const reconciler = new ManagedDocumentReconciler(runtime);
     await reconciler.reconcileChanges(project, [change(external)]);
 
     const documentId = await documentIdFor(project.project_id, "strategy/commerciale.md");
     const versionId = await externalVersionIdFor(external.rev);
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(project.project_id, documentId);
     const version = await ledger.readVersion(project.project_id, documentId, versionId);
     expect(head?.working_version_id).toBe(versionId);
@@ -158,15 +160,16 @@ describe("ManagedDocumentReconciler external edits", () => {
 
   it("restores a deleted WORKING file from its immutable active version without advancing history", async () => {
     const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const project = state();
-    const service = new ManagedDocumentService(dropbox);
+    const service = new ManagedDocumentService(runtime);
     const working = await createWorking(service, project, "draft to protect");
     const path = workspaceManagedDocumentPath(project.project_id, project.slug, "working", "strategy/commerciale.md");
     await dropbox.delete(path);
 
-    const summary = await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [deleted(path)]);
+    const summary = await new ManagedDocumentReconciler(runtime).reconcileChanges(project, [deleted(path)]);
 
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(project.project_id, working.document_id);
     expect(summary.restored).toBe(1);
     expect(dropbox.files.get(path)).toBe("draft to protect");
@@ -176,16 +179,17 @@ describe("ManagedDocumentReconciler external edits", () => {
 
   it("captures an external REVIEW edit as a new review candidate without publishing it", async () => {
     const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const project = state();
-    const service = new ManagedDocumentService(dropbox);
+    const service = new ManagedDocumentService(runtime);
     const working = await createWorking(service, project);
     const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-0001", project_id: project.project_id, document_id: working.document_id, expected_version_id: working.version_id, created_at: at }, project);
     const path = workspaceManagedDocumentPath(project.project_id, project.slug, "review", "strategy/commerciale.md");
     const external = await dropbox.externalWrite(path, "human QA edit");
 
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [change(external)]);
+    await new ManagedDocumentReconciler(runtime).reconcileChanges(project, [change(external)]);
 
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const versionId = await externalVersionIdFor(external.rev);
     const head = await ledger.readHead(project.project_id, working.document_id);
     expect(head?.review_version_id).toBe(versionId);
@@ -195,17 +199,18 @@ describe("ManagedDocumentReconciler external edits", () => {
 
   it("ingests INPUTS into REFERENCES/UNCLASSIFIED with a stable provider-file identity", async () => {
     const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const project = state();
     const inputPath = workspaceManagedDocumentPath(project.project_id, project.slug, "inputs", "sources/market-study.pdf");
     const input = await dropbox.externalAdd(inputPath, "binary-opaque-pdf-bytes");
 
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [change(input)]);
+    await new ManagedDocumentReconciler(runtime).reconcileChanges(project, [change(input)]);
 
     const target = workspaceManagedDocumentPath(project.project_id, project.slug, "references", "UNCLASSIFIED/sources/market-study.pdf");
     expect(dropbox.files.has(inputPath)).toBe(false);
     expect(dropbox.files.get(target)).toBe("binary-opaque-pdf-bytes");
     const documentId = await documentIdForProviderFile(project.project_id, input.id);
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(project.project_id, documentId);
     expect(head).toMatchObject({ kind: "reference", logical_path: "sources/market-study.pdf", collection_path: "UNCLASSIFIED" });
     expect(head?.reference_version_id).toBeDefined();
@@ -215,8 +220,9 @@ describe("ManagedDocumentReconciler external edits", () => {
 
   it("turns a direct human DELIVERABLE edit into a new WORKING draft and restores the published bytes", async () => {
     const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const project = state();
-    const service = new ManagedDocumentService(dropbox);
+    const service = new ManagedDocumentService(runtime);
     const working = await createWorking(service, project, "approved v1");
     const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-0002", project_id: project.project_id, document_id: working.document_id, expected_version_id: working.version_id, created_at: at }, project);
     const published = await service.publish({ request_id: "DOCREQ-PUBLISH-0001", project_id: project.project_id, document_id: working.document_id, expected_version_id: review.version_id, created_at: at }, project);
@@ -224,9 +230,9 @@ describe("ManagedDocumentReconciler external edits", () => {
     const workingPath = workspaceManagedDocumentPath(project.project_id, project.slug, "working", "strategy/commerciale.md");
     const external = await dropbox.externalWrite(publishedPath, "human post-publish changes");
 
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [change(external)]);
+    await new ManagedDocumentReconciler(runtime).reconcileChanges(project, [change(external)]);
 
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(project.project_id, working.document_id);
     expect(head?.published_version_id).toBe(published.version_id);
     expect(head?.working_version_id).toBe(await externalVersionIdFor(external.rev));
@@ -236,17 +242,18 @@ describe("ManagedDocumentReconciler external edits", () => {
 
   it("restores a deleted published deliverable without changing the frozen published version", async () => {
     const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const project = state();
-    const service = new ManagedDocumentService(dropbox);
+    const service = new ManagedDocumentService(runtime);
     const working = await createWorking(service, project, "approved deletion-safe v1");
     const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-DELETE-0001", project_id: project.project_id, document_id: working.document_id, expected_version_id: working.version_id, created_at: at }, project);
     const published = await service.publish({ request_id: "DOCREQ-PUBLISH-DELETE-0001", project_id: project.project_id, document_id: working.document_id, expected_version_id: review.version_id, created_at: at }, project);
     const publishedPath = workspaceManagedDocumentPath(project.project_id, project.slug, "deliverables", "strategy/commerciale.md");
     await dropbox.delete(publishedPath);
 
-    const summary = await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [deleted(publishedPath)]);
+    const summary = await new ManagedDocumentReconciler(runtime).reconcileChanges(project, [deleted(publishedPath)]);
 
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(project.project_id, working.document_id);
     expect(summary.restored).toBe(1);
     expect(dropbox.files.get(publishedPath)).toBe("approved deletion-safe v1");
@@ -256,8 +263,9 @@ describe("ManagedDocumentReconciler external edits", () => {
 
   it("preserves an existing WORKING draft when a published deliverable is edited externally", async () => {
     const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const project = state();
-    const service = new ManagedDocumentService(dropbox);
+    const service = new ManagedDocumentService(runtime);
     const working = await createWorking(service, project, "approved v1");
     const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-0003", project_id: project.project_id, document_id: working.document_id, expected_version_id: working.version_id, created_at: at }, project);
     const published = await service.publish({ request_id: "DOCREQ-PUBLISH-0002", project_id: project.project_id, document_id: working.document_id, expected_version_id: review.version_id, created_at: at }, project);
@@ -267,9 +275,9 @@ describe("ManagedDocumentReconciler external edits", () => {
     const workingPath = workspaceManagedDocumentPath(project.project_id, project.slug, "working", "strategy/commerciale.md");
     const external = await dropbox.externalWrite(publishedPath, "human conflicting published edit");
 
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [change(external)]);
+    await new ManagedDocumentReconciler(runtime).reconcileChanges(project, [change(external)]);
 
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(project.project_id, working.document_id);
     expect(head?.published_version_id).toBe(published.version_id);
     expect(head?.working_version_id).toBe(aiDraft.version_id);

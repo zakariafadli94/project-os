@@ -158,6 +158,31 @@ it("maps transient Dropbox API failures to retryable neutral failures", async ()
   }
 });
 
+it("keeps Dropbox 409 write contention retryable before conflict normalization", async () => {
+  const runtime = createDropboxPersistence(rawTransport({
+    upload: async () => {
+      throw new DropboxConflictError(
+        "write contention",
+        "req-write-contention",
+        JSON.stringify({ error_summary: "too_many_write_operations/..." })
+      );
+    }
+  }));
+
+  try {
+    await runtime.objects.createText("/PROJECT_OS/contention.txt", "new");
+    throw new Error("expected provider failure");
+  } catch (error) {
+    expect(error).toBeInstanceOf(ProviderOperationError);
+    expect((error as ProviderOperationError).retryable).toBe(true);
+    expect((error as ProviderOperationError).diagnostics).toMatchObject({
+      providerId: "dropbox",
+      status: 409,
+      requestId: "req-write-contention"
+    });
+  }
+});
+
 it("maps terminal Dropbox API failures to non-retryable neutral failures", async () => {
   const runtime = createDropboxPersistence(rawTransport({
     download: async () => { throw new DropboxApiError("bad request", 400, "req-4", "bad request"); }

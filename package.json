@@ -6,6 +6,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:persistence-high-risk": "vitest run test/commit-repository.spec.ts test/project-guard-commit-recovery.spec.ts test/registry-guard-recovery.spec.ts test/inbox-isolation.spec.ts test/inbox-replay-cleanup.spec.ts test/materialization-faults.spec.ts test/document-external-edits.spec.ts test/dropbox-document-concurrency.spec.ts test/mutation-gate-faults.spec.ts test/mutation-gate-candidate.spec.ts test/model-lifecycle-concurrency.spec.ts test/project-guard-commit-compat.spec.ts",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
     "check:persistence-boundary": "node scripts/check-persistence-boundary.mjs",

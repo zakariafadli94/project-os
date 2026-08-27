@@ -4,6 +4,7 @@ import { DropboxConflictError, type DropboxEntry, type DropboxFileMetadata, type
 import { machineDocumentHeadPath } from "../src/dropbox/layout";
 import { sha256Text } from "../src/documents/hash";
 import { ManagedDocumentService } from "../src/documents/service";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class RecoveryTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -96,7 +97,7 @@ async function write(service: ManagedDocumentService, requestId: string, content
 describe("managed document head recovery", () => {
   it("reconstructs a missing head from immutable versions for status and the next CAS write", async () => {
     const transport = new RecoveryTransport();
-    const service = new ManagedDocumentService(transport);
+    const service = new ManagedDocumentService(persistenceFromDropbox(transport));
     const first = await write(service, "DOCREQ-HEADREC-0001", "version one");
     const headPath = machineDocumentHeadPath(project.project_id, first.document_id);
 

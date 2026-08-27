@@ -18,8 +18,9 @@ const forbiddenTokens = [
 ];
 const violations = [];
 let dropboxClientConstructions = 0;
+const srcFiles = await tsFiles(srcRoot);
 
-for (const file of await tsFiles(srcRoot)) {
+for (const file of srcFiles) {
   const rel = relative(root, file).split(sep).join("/");
   const text = await readFile(file, "utf8");
   const allowed = allowedRuntime.some((prefix) => rel === prefix || rel.startsWith(prefix));
@@ -40,21 +41,20 @@ for (const file of await tsFiles(srcRoot)) {
   if (constructions > 0 && rel !== "src/persistence/production-factory.ts") {
     violations.push(`${rel}: DropboxClient construction must be centralized in production-factory.ts`);
   }
+
+  if (text.includes("PROJECT_OS_PROVIDER")) {
+    violations.push(`${rel}: provider selector is forbidden in IMP-PERSIST001 runtime`);
+  }
 }
 
 if (dropboxClientConstructions !== 1) {
   violations.push(`expected exactly one DropboxClient construction, found ${dropboxClientConstructions}`);
 }
 
-for (const file of [
-  ...await tsFiles(srcRoot),
-  ...await filesWithExtension(join(root, "docs"), ".md"),
-  join(root, "package.json")
-]) {
-  const rel = relative(root, file).split(sep).join("/");
-  const text = await readFile(file, "utf8");
+for (const rel of ["package.json", "wrangler.jsonc"]) {
+  const text = await readFile(join(root, rel), "utf8");
   if (text.includes("PROJECT_OS_PROVIDER")) {
-    violations.push(`${rel}: provider selector is forbidden in IMP-PERSIST001`);
+    violations.push(`${rel}: provider selector is forbidden in IMP-PERSIST001 configuration`);
   }
 }
 

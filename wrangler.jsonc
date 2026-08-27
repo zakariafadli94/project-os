@@ -6,7 +6,7 @@
   "vars": {
     "PROJECT_OS_LAYOUT_MODE": "v2",
     "PROJECT_OS_CONTINUITY_MODE": "stable",
-    "PROJECT_OS_MUTATION_GATE_MODE": "observe"
+    "PROJECT_OS_MUTATION_GATE_MODE": "enforce"
   },
   "triggers": {
     "crons": ["*/5 * * * *"]

@@ -7,9 +7,9 @@ import type {
 } from "../domain/mutation-candidate-resolution";
 import type { ExternalMutationResolutionRecord } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
-import { resolveArtifactDestination } from "../dropbox/artifact-routing";
-import type { DropboxTransport } from "../dropbox/client";
 import { sha256Text } from "../documents/hash";
+import { resolveArtifactDestination } from "../persistence/artifact-routing";
+import type { PersistenceInput } from "../persistence/compatibility/legacy-dropbox-runtime";
 import { MutationGateRepository } from "./repository";
 
 export interface CandidateResolutionDownstreamReceipt {
@@ -47,8 +47,8 @@ export interface MutationCandidateResolutionExecutors {
 export class MutationCandidateResolutionService {
   private readonly repository: MutationGateRepository;
 
-  constructor(transport: DropboxTransport) {
-    this.repository = new MutationGateRepository(transport);
+  constructor(input: PersistenceInput) {
+    this.repository = new MutationGateRepository(input);
   }
 
   async resolve(

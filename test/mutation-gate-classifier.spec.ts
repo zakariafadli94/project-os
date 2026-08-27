@@ -7,6 +7,7 @@ import { MutationGateClassifier } from "../src/mutation-gate/classifier";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeClassifierDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
@@ -147,7 +148,7 @@ describe("MutationGateClassifier", () => {
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/WORKING/strategy/draft.md";
     const metadata = await transport.seed(path, "# draft");
 
-    await expect(new MutationGateClassifier(transport).classify(state(), path, metadata))
+    await expect(new MutationGateClassifier(persistenceFromDropbox(transport)).classify(state(), path, metadata))
       .resolves.toEqual({ kind: "not_final_zone" });
   });
 
@@ -156,7 +157,7 @@ describe("MutationGateClassifier", () => {
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/strategy/direct.md";
     const metadata = await transport.seed(path, "# direct bypass", "id:direct-bypass");
 
-    await expect(new MutationGateClassifier(transport).classify(state(), path, metadata))
+    await expect(new MutationGateClassifier(persistenceFromDropbox(transport)).classify(state(), path, metadata))
       .resolves.toEqual({ kind: "external_candidate" });
   });
 
@@ -165,7 +166,7 @@ describe("MutationGateClassifier", () => {
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/SPECS/governed/direct.md";
     const metadata = await transport.seed(path, "# routed bypass", "id:routed-bypass");
 
-    await expect(new MutationGateClassifier(transport).classify(stateWithSpecsRoute(), path, metadata))
+    await expect(new MutationGateClassifier(persistenceFromDropbox(transport)).classify(stateWithSpecsRoute(), path, metadata))
       .resolves.toEqual({ kind: "external_candidate" });
   });
 
@@ -174,7 +175,7 @@ describe("MutationGateClassifier", () => {
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/REFERENCES/MARKET/human-edit.md";
     const metadata = await transport.seed(path, "# human reference edit", "id:routed-reference");
 
-    await expect(new MutationGateClassifier(transport).classify(stateWithReferencesRoute(), path, metadata))
+    await expect(new MutationGateClassifier(persistenceFromDropbox(transport)).classify(stateWithReferencesRoute(), path, metadata))
       .resolves.toEqual({ kind: "not_final_zone" });
   });
 
@@ -183,7 +184,7 @@ describe("MutationGateClassifier", () => {
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/SPECS/freeform.md";
     const metadata = await transport.seed(path, "# freeform");
 
-    await expect(new MutationGateClassifier(transport).classify(stateWithSpecsRoute(), path, metadata))
+    await expect(new MutationGateClassifier(persistenceFromDropbox(transport)).classify(stateWithSpecsRoute(), path, metadata))
       .resolves.toEqual({ kind: "not_final_zone" });
   });
 
@@ -212,7 +213,7 @@ describe("MutationGateClassifier", () => {
       reconciliation_status: "clean"
     }, null, 2)}\n`, "overwrite");
 
-    await expect(new MutationGateClassifier(transport).classify(state(), path, metadata))
+    await expect(new MutationGateClassifier(persistenceFromDropbox(transport)).classify(state(), path, metadata))
       .resolves.toEqual({ kind: "governed_current", documentId });
   });
 });

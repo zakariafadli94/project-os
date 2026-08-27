@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import { ManagedDocumentChangeCoordinator } from "../src/documents/change-coordinator";
 import { emptyProjectState } from "../src/domain/transitions";
+import { MutationCandidateResolutionService } from "../src/mutation-gate/resolution-service";
 import { MutationGateService } from "../src/mutation-gate/service";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
@@ -119,4 +120,23 @@ it("resets a stale neutral change-feed cursor before rebuilding the baseline", a
     policy_violations: 0
   });
   expect(cursors.values.get("managed-document-change-cursor-v1")).toBe("cursor-rebuilt");
+});
+
+it("resolves a missing candidate through neutral persistence without invoking downstream adoption", async () => {
+  const service = new MutationCandidateResolutionService(neutralRuntime());
+  const receipt = await service.resolve({
+    operation: "candidate.reject",
+    resolution_id: "MUTRES-111111111111111111111111",
+    project_id: "PRJ-0002",
+    candidate_id: "MUTCAND-111111111111111111111111"
+  }, state(), {
+    artifact: async () => { throw new Error("unused"); },
+    working: async () => { throw new Error("unused"); }
+  });
+
+  expect(receipt).toMatchObject({
+    status: "rejected",
+    code: "CANDIDATE_NOT_FOUND",
+    candidate_id: "MUTCAND-111111111111111111111111"
+  });
 });

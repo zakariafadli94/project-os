@@ -16,7 +16,7 @@ import {
 import {
   asProjectOsPersistence,
   type PersistenceInput
-} from "../persistence/compatibility/legacy-dropbox-runtime";
+} from "../persistence/provider/runtime";
 import { workspaceProjectRoot } from "../persistence/layout";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { DocumentLedgerRepository } from "./repository";

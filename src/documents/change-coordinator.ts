@@ -6,10 +6,12 @@ import {
   type DropboxFileMetadata,
   type DropboxTransport
 } from "../dropbox/client";
-import { workspaceProjectRoot } from "../dropbox/layout";
 import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
 import { MutationGateClassifier } from "../mutation-gate/classifier";
 import { MutationGateService, type MutationGateMode, type MutationGateProcessSummary } from "../mutation-gate/service";
+import { toProviderObjectMetadata } from "../persistence/compatibility/legacy-dropbox-runtime";
+import { workspaceProjectRoot } from "../persistence/layout";
+import type { ProviderChangeEntry } from "../persistence/provider/contract";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
 import {
   ManagedDocumentReconciler,
@@ -93,7 +95,8 @@ export class ManagedDocumentChangeCoordinator {
       bootstrapped = await this.bootstrapBaseline(state, page.entries);
     }
 
-    const summary = await this.reconciler.reconcileChanges(state, page.entries);
+    const providerChanges = page.entries.map(toProviderChangeEntry);
+    const summary = await this.reconciler.reconcileChanges(state, providerChanges);
     const cursorAdvanced = page.cursor.length > 0 && page.cursor !== existingCursor;
     if (page.cursor.length > 0) await this.cursorStore.put(CURSOR_KEY, page.cursor);
 
@@ -175,6 +178,31 @@ export class ManagedDocumentChangeCoordinator {
   private mutationGateMode(): MutationGateMode {
     return this.gateMode;
   }
+}
+
+function toProviderChangeEntry(change: DropboxChangeEntry): ProviderChangeEntry {
+  const result: ProviderChangeEntry = {
+    kind: change.tag,
+    name: change.name,
+    path: change.path
+  };
+  if (
+    change.tag === "file"
+    && change.id
+    && change.rev
+    && change.content_hash
+    && change.size !== undefined
+  ) {
+    result.metadata = toProviderObjectMetadata({
+      id: change.id,
+      path: change.path,
+      rev: change.rev,
+      content_hash: change.content_hash,
+      size: change.size,
+      ...(change.server_modified ? { server_modified: change.server_modified } : {})
+    });
+  }
+  return result;
 }
 
 function isProjectedDeliverableMetadata(state: ProjectState, relativePath: string): boolean {

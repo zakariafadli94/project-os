@@ -1,9 +1,14 @@
 import { expect, it } from "vitest";
+import { ManagedDocumentChangeCoordinator } from "../src/documents/change-coordinator";
 import { emptyProjectState } from "../src/domain/transitions";
 import { MutationGateService } from "../src/mutation-gate/service";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
-import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
+import {
+  ProviderConflictError,
+  ProviderCursorResetError,
+  ProviderPreconditionFailedError
+} from "../src/persistence/provider/errors";
 
 function neutralRuntime(): ProjectOsPersistenceRuntime {
   const files = new Map<string, string>();
@@ -38,8 +43,24 @@ function neutralRuntime(): ProjectOsPersistenceRuntime {
   };
 }
 
+function state() {
+  return emptyProjectState("PRJ-0002", "Project OS", "project-os", "Mutation gate neutral runtime");
+}
+
+function cursorStore(initial?: string) {
+  const values = new Map<string, unknown>();
+  if (initial) values.set("managed-document-change-cursor-v1", initial);
+  return {
+    values,
+    store: {
+      get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+      put: async (key: string, value: unknown) => { values.set(key, value); },
+      delete: async (key: string) => values.delete(key)
+    }
+  };
+}
+
 it("processes neutral provider changes without Dropbox runtime types", async () => {
-  const state = emptyProjectState("PRJ-0002", "Project OS", "project-os", "Mutation gate neutral runtime");
   const change: ProviderChangeEntry = {
     kind: "deleted",
     name: "removed.md",
@@ -47,7 +68,7 @@ it("processes neutral provider changes without Dropbox runtime types", async () 
   };
 
   await expect(new MutationGateService(neutralRuntime(), "observe").processChanges(
-    state,
+    state(),
     [change],
     "incremental"
   )).resolves.toEqual({
@@ -55,4 +76,47 @@ it("processes neutral provider changes without Dropbox runtime types", async () 
     mutation_gate_mode: "observe",
     policy_violations: 0
   });
+});
+
+it("coordinates managed-document reconciliation through the neutral change feed", async () => {
+  const runtime = neutralRuntime();
+  runtime.changeFeed.listChanges = async () => ({ entries: [], cursor: "cursor-1" });
+  const cursors = cursorStore();
+
+  const summary = await new ManagedDocumentChangeCoordinator(runtime, cursors.store, "observe").reconcile(state());
+
+  expect(summary).toMatchObject({
+    baseline: true,
+    cursor_reset: false,
+    cursor_advanced: true,
+    candidates: 0,
+    mutation_gate_mode: "observe",
+    policy_violations: 0,
+    archived: false
+  });
+  expect(cursors.values.get("managed-document-change-cursor-v1")).toBe("cursor-1");
+});
+
+it("resets a stale neutral change-feed cursor before rebuilding the baseline", async () => {
+  const runtime = neutralRuntime();
+  let calls = 0;
+  runtime.changeFeed.listChanges = async (input) => {
+    calls += 1;
+    if (input.cursor) throw new ProviderCursorResetError("reset");
+    return { entries: [], cursor: "cursor-rebuilt" };
+  };
+  const cursors = cursorStore("cursor-stale");
+
+  const summary = await new ManagedDocumentChangeCoordinator(runtime, cursors.store, "observe").reconcile(state());
+
+  expect(calls).toBe(2);
+  expect(summary).toMatchObject({
+    baseline: true,
+    cursor_reset: true,
+    cursor_advanced: true,
+    candidates: 0,
+    mutation_gate_mode: "observe",
+    policy_violations: 0
+  });
+  expect(cursors.values.get("managed-document-change-cursor-v1")).toBe("cursor-rebuilt");
 });

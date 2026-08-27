@@ -4,6 +4,9 @@ import { emptyProjectState } from "../src/domain/transitions";
 import { type DropboxEntry, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import { machineDocumentHeadPath } from "../src/dropbox/layout";
 import { MutationGateClassifier } from "../src/mutation-gate/classifier";
+import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
+import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
+import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
 
 class FakeClassifierDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
@@ -91,7 +94,54 @@ function stateWithReferencesRoute() {
   return current;
 }
 
+function neutralRuntime(): ProjectOsPersistenceRuntime {
+  const files = new Map<string, string>();
+  return {
+    providerId: "dropbox",
+    objects: {
+      readText: async (path) => files.get(path) ?? null,
+      createText: async (path, content) => {
+        if (files.has(path)) throw new ProviderConflictError("exists");
+        files.set(path, content);
+      },
+      upsertText: async (path, content) => { files.set(path, content); },
+      getMetadata: async () => null,
+      listChildren: async () => [],
+      move: async () => undefined,
+      delete: async () => undefined
+    },
+    conditionalWrite: {
+      writeTextConditional: async () => { throw new ProviderPreconditionFailedError("unused"); }
+    },
+    serverSideCopy: {
+      copyObject: async (_from, to) => ({ path: to, size: 0 })
+    },
+    changeFeed: {
+      listChanges: async () => ({ entries: [], cursor: "cursor" })
+    },
+    evidence: {
+      stableObjectId: { semantics: "stable-through-move" },
+      revisionToken: { semantics: "opaque-object-revision" },
+      integrityHash: { semantics: "identified-algorithm" }
+    }
+  };
+}
+
 describe("MutationGateClassifier", () => {
+  it("classifies neutral provider metadata through the neutral runtime", async () => {
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/strategy/neutral.md";
+    const metadata: ProviderObjectMetadata = {
+      path,
+      size: 7,
+      objectId: "id:neutral-classifier",
+      revisionToken: "rev-neutral-1",
+      integrityHash: { algorithm: "dropbox-content-hash", value: "a".repeat(64) }
+    };
+
+    await expect(new MutationGateClassifier(neutralRuntime()).classify(state(), path, metadata))
+      .resolves.toEqual({ kind: "external_candidate" });
+  });
+
   it("leaves collaborative zones outside strict final-zone classification", async () => {
     const transport = new FakeClassifierDropbox();
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/WORKING/strategy/draft.md";

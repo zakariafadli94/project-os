@@ -5,6 +5,7 @@ import { sha256Text } from "../src/documents/hash";
 import { machineMutationResolutionPath } from "../src/dropbox/layout";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { MutationCandidateResolutionService } from "../src/mutation-gate/resolution-service";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class CrashableMutationGateDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
@@ -79,7 +80,7 @@ class CrashableMutationGateDropbox implements DropboxTransport {
 const state = emptyProjectState("PRJ-0002", "Project OS", "project-os", "Mutation gate fault test");
 
 async function capturedCandidate(transport: CrashableMutationGateDropbox, path: string, content: string, id: string) {
-  const repository = new MutationGateRepository(transport);
+  const repository = new MutationGateRepository(persistenceFromDropbox(transport));
   const metadata = await transport.seed(path, content, id);
   const candidate = (await repository.captureCandidate({
     projectId: state.project_id,
@@ -94,7 +95,7 @@ async function capturedCandidate(transport: CrashableMutationGateDropbox, path: 
 describe("MutationGate terminal resolution crash recovery", () => {
   it("blocks a conflicting downstream after terminal marker survives but resolution JSON is missing", async () => {
     const transport = new CrashableMutationGateDropbox();
-    const service = new MutationCandidateResolutionService(transport);
+    const service = new MutationCandidateResolutionService(persistenceFromDropbox(transport));
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/direct.md";
     const content = "# candidate";
     const { repository, candidate } = await capturedCandidate(transport, path, content, "id:direct");
@@ -147,7 +148,7 @@ describe("MutationGate terminal resolution crash recovery", () => {
 
   it("rejects a changed request that reuses the marker-only resolution id without rerunning downstream", async () => {
     const transport = new CrashableMutationGateDropbox();
-    const service = new MutationCandidateResolutionService(transport);
+    const service = new MutationCandidateResolutionService(persistenceFromDropbox(transport));
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/replay.md";
     const content = "# governed candidate";
     const { repository, candidate } = await capturedCandidate(transport, path, content, "id:replay");
@@ -203,7 +204,7 @@ describe("MutationGate terminal resolution crash recovery", () => {
 
   it("repairs exact marker-only replay without rerunning the governed downstream", async () => {
     const transport = new CrashableMutationGateDropbox();
-    const service = new MutationCandidateResolutionService(transport);
+    const service = new MutationCandidateResolutionService(persistenceFromDropbox(transport));
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/exact.md";
     const content = "# exact governed candidate";
     const { repository, candidate } = await capturedCandidate(transport, path, content, "id:exact");

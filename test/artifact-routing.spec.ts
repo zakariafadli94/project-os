@@ -5,6 +5,7 @@ import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
 import { sha256Text } from "../src/documents/hash";
 import { DropboxConflictError, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import { ArtifactGovernanceConflictError, ProjectRepository } from "../src/dropbox/repository";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -120,7 +121,7 @@ function configuredState() {
 describe("project artifact routing", () => {
   it("routes a configured domain into its governed business tree instead of ARTIFACTS", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     await repository.writeArtifact(configuredState(), await artifactRequest());
 
     const activePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/DELIVERABLES/REVENUE-OS/04-playbooks-sectoriels/foo.md";
@@ -131,7 +132,7 @@ describe("project artifact routing", () => {
 
   it("keeps the legacy ARTIFACTS root when no route matches", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const state = emptyProjectState("PRJ-0003", "Growth", "growth", "Build growth agency");
     await repository.writeArtifact(state, await artifactRequest({ relative_path: "OTHER/foo.md" }));
     const visiblePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/OTHER/foo.md";
@@ -141,7 +142,7 @@ describe("project artifact routing", () => {
   });
 
   it("blocks a physical ARTIFACTS bypass for an exclusive governed domain", async () => {
-    const repository = new ProjectRepository(new FakeTransport(), "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(new FakeTransport()), "v2");
     await expect(repository.writeArtifact(configuredState(), await artifactRequest({
       relative_path: "ARTIFACTS/REVENUE-OS/04-playbooks-sectoriels/foo.md"
     }))).rejects.toBeInstanceOf(ArtifactGovernanceConflictError);
@@ -150,13 +151,13 @@ describe("project artifact routing", () => {
   it("blocks writes when a governing decision is no longer accepted", async () => {
     const state = configuredState();
     state.decisions["DEC-REVENUESINGLETREE001"].status = "superseded";
-    const repository = new ProjectRepository(new FakeTransport(), "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(new FakeTransport()), "v2");
     await expect(repository.writeArtifact(state, await artifactRequest())).rejects.toBeInstanceOf(ArtifactGovernanceConflictError);
   });
 
   it("archives the replaced governed active content under ARCHIVES without polluting DELIVERABLES", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const activePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/DELIVERABLES/REVENUE-OS/04-playbooks-sectoriels/foo.md";
 
     await repository.writeArtifact(configuredState(), await artifactRequest({

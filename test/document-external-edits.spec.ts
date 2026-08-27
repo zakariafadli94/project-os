@@ -7,6 +7,7 @@ import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { ManagedDocumentService } from "../src/documents/service";
+import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
 
 class FakeDocumentDropbox implements DropboxTransport {
   files = new Map<string, string>();
@@ -100,6 +101,26 @@ async function sha256(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function change(metadata: DropboxFileMetadata): ProviderChangeEntry {
+  return {
+    kind: "file",
+    name: metadata.path.split("/").at(-1)!,
+    path: metadata.path,
+    metadata: {
+      path: metadata.path,
+      size: metadata.size,
+      ...(metadata.server_modified ? { modifiedAt: metadata.server_modified } : {}),
+      objectId: metadata.id,
+      revisionToken: metadata.rev,
+      integrityHash: { algorithm: "dropbox-content-hash", value: metadata.content_hash }
+    }
+  };
+}
+
+function deleted(path: string): ProviderChangeEntry {
+  return { kind: "deleted", name: path.split("/").at(-1)!, path };
+}
+
 async function createWorking(service: ManagedDocumentService, project = state(), content = "draft") {
   return service.writeWorking({
     request_id: "DOCREQ-WORKING-0001",
@@ -122,7 +143,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     dropbox.downloads.length = 0;
 
     const reconciler = new ManagedDocumentReconciler(dropbox);
-    await reconciler.reconcileChanges(project, [{ tag: "file", name: "commerciale.md", path, id: external.id, rev: external.rev, content_hash: external.content_hash, size: external.size, server_modified: external.server_modified }]);
+    await reconciler.reconcileChanges(project, [change(external)]);
 
     const documentId = await documentIdFor(project.project_id, "strategy/commerciale.md");
     const versionId = await externalVersionIdFor(external.rev);
@@ -143,9 +164,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const path = workspaceManagedDocumentPath(project.project_id, project.slug, "working", "strategy/commerciale.md");
     await dropbox.delete(path);
 
-    const summary = await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [
-      { tag: "deleted", name: "commerciale.md", path }
-    ]);
+    const summary = await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [deleted(path)]);
 
     const ledger = new DocumentLedgerRepository(dropbox);
     const head = await ledger.readHead(project.project_id, working.document_id);
@@ -164,7 +183,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const path = workspaceManagedDocumentPath(project.project_id, project.slug, "review", "strategy/commerciale.md");
     const external = await dropbox.externalWrite(path, "human QA edit");
 
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [{ tag: "file", name: "commerciale.md", path, id: external.id, rev: external.rev, content_hash: external.content_hash, size: external.size, server_modified: external.server_modified }]);
+    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [change(external)]);
 
     const ledger = new DocumentLedgerRepository(dropbox);
     const versionId = await externalVersionIdFor(external.rev);
@@ -180,7 +199,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const inputPath = workspaceManagedDocumentPath(project.project_id, project.slug, "inputs", "sources/market-study.pdf");
     const input = await dropbox.externalAdd(inputPath, "binary-opaque-pdf-bytes");
 
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [{ tag: "file", name: "market-study.pdf", path: inputPath, id: input.id, rev: input.rev, content_hash: input.content_hash, size: input.size, server_modified: input.server_modified }]);
+    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [change(input)]);
 
     const target = workspaceManagedDocumentPath(project.project_id, project.slug, "references", "UNCLASSIFIED/sources/market-study.pdf");
     expect(dropbox.files.has(inputPath)).toBe(false);
@@ -205,7 +224,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const workingPath = workspaceManagedDocumentPath(project.project_id, project.slug, "working", "strategy/commerciale.md");
     const external = await dropbox.externalWrite(publishedPath, "human post-publish changes");
 
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [{ tag: "file", name: "commerciale.md", path: publishedPath, id: external.id, rev: external.rev, content_hash: external.content_hash, size: external.size, server_modified: external.server_modified }]);
+    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [change(external)]);
 
     const ledger = new DocumentLedgerRepository(dropbox);
     const head = await ledger.readHead(project.project_id, working.document_id);
@@ -225,9 +244,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const publishedPath = workspaceManagedDocumentPath(project.project_id, project.slug, "deliverables", "strategy/commerciale.md");
     await dropbox.delete(publishedPath);
 
-    const summary = await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [
-      { tag: "deleted", name: "commerciale.md", path: publishedPath }
-    ]);
+    const summary = await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [deleted(publishedPath)]);
 
     const ledger = new DocumentLedgerRepository(dropbox);
     const head = await ledger.readHead(project.project_id, working.document_id);
@@ -250,7 +267,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const workingPath = workspaceManagedDocumentPath(project.project_id, project.slug, "working", "strategy/commerciale.md");
     const external = await dropbox.externalWrite(publishedPath, "human conflicting published edit");
 
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [{ tag: "file", name: "commerciale.md", path: publishedPath, id: external.id, rev: external.rev, content_hash: external.content_hash, size: external.size, server_modified: external.server_modified }]);
+    await new ManagedDocumentReconciler(dropbox).reconcileChanges(project, [change(external)]);
 
     const ledger = new DocumentLedgerRepository(dropbox);
     const head = await ledger.readHead(project.project_id, working.document_id);

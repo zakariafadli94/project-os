@@ -3,6 +3,7 @@ import { emptyProjectState } from "../src/domain/transitions";
 import { ManagedDocumentBootstrapper } from "../src/documents/bootstrap";
 import { sha256Text } from "../src/documents/hash";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
+import { ManagedDocumentRequestLedger } from "../src/documents/request-ledger";
 import { ManagedDocumentService } from "../src/documents/service";
 import { workspaceManagedDocumentPath } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
@@ -167,4 +168,18 @@ it("reconciles neutral provider change entries without Dropbox runtime types", a
   const summary = await new ManagedDocumentReconciler(runtime).reconcileChanges(state, [change]);
 
   expect(summary).toMatchObject({ scanned: 1, ignored: 1, restored: 0, conflicts: 0 });
+});
+
+it("persists managed request intents and receipts through object persistence", async () => {
+  const { runtime } = neutralRuntime();
+  const ledger = new ManagedDocumentRequestLedger(runtime.objects);
+  const requestId = "DOCREQ-NEUTRAL-LEDGER-0001";
+  const requestJson = JSON.stringify({ request_id: requestId, project_id: "PRJ-0002" });
+  const receiptJson = JSON.stringify({ status: "committed" });
+
+  const intent = await ledger.ensureIntent("PRJ-0002", requestId, requestJson);
+  expect(await ledger.readIntent("PRJ-0002", requestId)).toEqual(intent);
+
+  const receipt = await ledger.writeReceipt("PRJ-0002", requestId, requestJson, receiptJson);
+  expect(await ledger.readReceipt("PRJ-0002", requestId)).toEqual(receipt);
 });

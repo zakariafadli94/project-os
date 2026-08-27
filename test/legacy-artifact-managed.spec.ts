@@ -5,6 +5,7 @@ import { DropboxConflictError, type DropboxFileMetadata, type DropboxTransport }
 import { workspaceProjectRoot } from "../src/dropbox/layout";
 import { LegacyArtifactDocumentWriter } from "../src/documents/legacy-artifact";
 import { DocumentLedgerRepository } from "../src/documents/repository";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeDropbox implements DropboxTransport {
   files = new Map<string, string>();
@@ -124,14 +125,15 @@ async function request(content: string, mode: "create" | "replace", requestId: s
 describe("legacy artifact managed-document compatibility", () => {
   it("records a routed DELIVERABLES artifact as a published managed-document version", async () => {
     const dropbox = new FakeDropbox();
-    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const runtime = persistenceFromDropbox(dropbox);
+    const writer = new LegacyArtifactDocumentWriter(runtime);
     const result = await writer.writeIfManaged(state(), await request("published v1", "create", "ART-LEGACY-000001"));
 
     expect(result).toBe("written");
     const visible = `${workspaceProjectRoot("PRJ-0003", "growth")}/DELIVERABLES/REVENUE-OS/strategy/commercial.md`;
     expect(dropbox.files.get(visible)).toBe("published v1");
 
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const heads = [...dropbox.files.keys()].filter((path) => path.includes("/documents/heads/"));
     expect(heads).toHaveLength(1);
     const head = JSON.parse(dropbox.files.get(heads[0])!);
@@ -141,7 +143,7 @@ describe("legacy artifact managed-document compatibility", () => {
 
   it("replaces a governed deliverable through provider CAS and keeps the legacy archive", async () => {
     const dropbox = new FakeDropbox();
-    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const writer = new LegacyArtifactDocumentWriter(persistenceFromDropbox(dropbox));
     await writer.writeIfManaged(state(), await request("published v1", "create", "ART-LEGACY-000002"));
     await writer.writeIfManaged(state(), await request("published v2", "replace", "ART-LEGACY-000003"));
 
@@ -155,7 +157,7 @@ describe("legacy artifact managed-document compatibility", () => {
 
   it("fails closed when a human edit races with a legacy deliverable replace", async () => {
     const dropbox = new FakeDropbox();
-    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const writer = new LegacyArtifactDocumentWriter(persistenceFromDropbox(dropbox));
     await writer.writeIfManaged(state(), await request("published v1", "create", "ART-LEGACY-000004"));
     const visible = `${workspaceProjectRoot("PRJ-0003", "growth")}/DELIVERABLES/REVENUE-OS/strategy/commercial.md`;
     dropbox.raceBeforeConditional = { path: visible, content: "human edit" };
@@ -167,7 +169,7 @@ describe("legacy artifact managed-document compatibility", () => {
 
   it("records a routed REFERENCES artifact as a managed reference without changing the legacy API contract", async () => {
     const dropbox = new FakeDropbox();
-    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const writer = new LegacyArtifactDocumentWriter(persistenceFromDropbox(dropbox));
     const result = await writer.writeIfManaged(state("REFERENCES/MARKET"), await request("reference bytes", "create", "ART-LEGACY-000006"));
 
     expect(result).toBe("written");
@@ -180,7 +182,8 @@ describe("legacy artifact managed-document compatibility", () => {
 
   it("repairs an interrupted first DELIVERABLES create by attaching the original artifact request provenance", async () => {
     const dropbox = new FakeDropbox();
-    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const runtime = persistenceFromDropbox(dropbox);
+    const writer = new LegacyArtifactDocumentWriter(runtime);
     const visible = `${workspaceProjectRoot("PRJ-0003", "growth")}/DELIVERABLES/REVENUE-OS/strategy/commercial.md`;
     dropbox.seed(visible, "partial published");
 
@@ -189,13 +192,14 @@ describe("legacy artifact managed-document compatibility", () => {
 
     const heads = [...dropbox.files.keys()].filter((path) => path.includes("/documents/heads/"));
     const head = JSON.parse(dropbox.files.get(heads[0])!);
-    const version = await new DocumentLedgerRepository(dropbox).readVersion("PRJ-0003", head.document_id, head.published_version_id);
+    const version = await new DocumentLedgerRepository(runtime).readVersion("PRJ-0003", head.document_id, head.published_version_id);
     expect(version).toMatchObject({ source: "legacy_artifact_api", request_id: "ART-LEGACY-000008", stage: "published" });
   });
 
   it("repairs an interrupted first REFERENCES create by attaching the original artifact request provenance", async () => {
     const dropbox = new FakeDropbox();
-    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const runtime = persistenceFromDropbox(dropbox);
+    const writer = new LegacyArtifactDocumentWriter(runtime);
     const visible = `${workspaceProjectRoot("PRJ-0003", "growth")}/REFERENCES/MARKET/strategy/commercial.md`;
     dropbox.seed(visible, "partial reference");
 
@@ -204,13 +208,13 @@ describe("legacy artifact managed-document compatibility", () => {
 
     const heads = [...dropbox.files.keys()].filter((path) => path.includes("/documents/heads/"));
     const head = JSON.parse(dropbox.files.get(heads[0])!);
-    const version = await new DocumentLedgerRepository(dropbox).readVersion("PRJ-0003", head.document_id, head.reference_version_id);
+    const version = await new DocumentLedgerRepository(runtime).readVersion("PRJ-0003", head.document_id, head.reference_version_id);
     expect(version).toMatchObject({ source: "legacy_artifact_api", request_id: "ART-LEGACY-000009", stage: "reference" });
   });
 
   it("returns null for historical artifact destinations that are not managed-document zones", async () => {
     const dropbox = new FakeDropbox();
-    const writer = new LegacyArtifactDocumentWriter(dropbox);
+    const writer = new LegacyArtifactDocumentWriter(persistenceFromDropbox(dropbox));
     const result = await writer.writeIfManaged(emptyProjectState("PRJ-0003", "Growth", "growth", "Build"), await request("plain", "create", "ART-LEGACY-000007"));
     expect(result).toBeNull();
   });

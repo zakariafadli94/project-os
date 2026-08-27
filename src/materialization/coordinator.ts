@@ -8,7 +8,7 @@ import {
   type ProjectionOutputEvidence
 } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
-import { archiveProjectRoot, machineMaterializationRecordPath, workspaceProjectRoot } from "../dropbox/layout";
+import { archiveProjectRoot, machineMaterializationRecordPath, workspaceProjectRoot } from "../persistence/layout";
 import { projectionIndexRootHash } from "./hash";
 import {
   planProjection,

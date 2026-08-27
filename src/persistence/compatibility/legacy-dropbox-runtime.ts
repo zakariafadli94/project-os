@@ -19,12 +19,7 @@ export interface LegacyDropboxFileMetadata {
 export function asProjectOsPersistence(input: PersistenceInput): ProjectOsPersistenceRuntime {
   if (isPreparedRuntime(input)) return input;
 
-  const raw: DropboxTransport = {
-    ...input,
-    getMetadata: input.getMetadata ?? missing("metadata"),
-    listFolder: input.listFolder ?? missing("list"),
-    delete: input.delete ?? missing("delete")
-  };
+  const raw = forwardLegacyDropboxTransport(input);
   const runtime = withProviderResilience(createDropboxPersistence(raw));
   return {
     providerId: runtime.providerId,
@@ -60,6 +55,39 @@ export function toProviderObjectMetadata(
       algorithm: "dropbox-content-hash",
       value: metadata.content_hash
     }
+  };
+}
+
+function forwardLegacyDropboxTransport(input: DropboxTransport): DropboxTransport {
+  return {
+    upload: (path, content, mode) => input.upload(path, content, mode),
+    download: (path) => input.download(path),
+    move: (from, to) => input.move(from, to),
+    getMetadata: input.getMetadata
+      ? (path) => input.getMetadata!(path)
+      : missing("metadata"),
+    listFolder: input.listFolder
+      ? (path) => input.listFolder!(path)
+      : missing("list"),
+    delete: input.delete
+      ? (path) => input.delete!(path)
+      : missing("delete"),
+    ...(input.uploadConditional
+      ? {
+          uploadConditional: (path: string, content: string, expectedRev: string) =>
+            input.uploadConditional!(path, content, expectedRev)
+        }
+      : {}),
+    ...(input.copy
+      ? {
+          copy: (from: string, to: string) => input.copy!(from, to)
+        }
+      : {}),
+    ...(input.listFolderChanges
+      ? {
+          listFolderChanges: (root?: string, cursor?: string) => input.listFolderChanges!(root, cursor)
+        }
+      : {})
   };
 }
 

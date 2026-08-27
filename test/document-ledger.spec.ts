@@ -4,6 +4,7 @@ import { DropboxConflictError, type DropboxEntry, type DropboxFileMetadata, type
 import { machineDocumentProviderPayloadPath, machineDocumentTextPayloadPath } from "../src/dropbox/layout";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { sha256Text } from "../src/documents/hash";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -87,7 +88,7 @@ function head(overrides: Partial<ManagedDocumentHead> = {}): ManagedDocumentHead
 describe("DocumentLedgerRepository", () => {
   it("writes immutable versions idempotently and rejects different content at the same version path", async () => {
     const transport = new FakeTransport();
-    const repository = new DocumentLedgerRepository(transport);
+    const repository = new DocumentLedgerRepository(persistenceFromDropbox(transport));
     const first = record();
 
     await repository.writeVersion(first);
@@ -96,13 +97,13 @@ describe("DocumentLedgerRepository", () => {
   });
 
   it("does not advance a document head to a missing version", async () => {
-    const repository = new DocumentLedgerRepository(new FakeTransport());
+    const repository = new DocumentLedgerRepository(persistenceFromDropbox(new FakeTransport()));
     await expect(repository.writeHead(head())).rejects.toThrow(/missing version/i);
   });
 
   it("stores text payloads content-addressed and verifies caller hashes", async () => {
     const transport = new FakeTransport();
-    const repository = new DocumentLedgerRepository(transport);
+    const repository = new DocumentLedgerRepository(persistenceFromDropbox(transport));
     const content = "# Commercial strategy";
     const hash = await sha256Text(content);
 
@@ -115,7 +116,7 @@ describe("DocumentLedgerRepository", () => {
 
   it("snapshots an opaque provider file with a server-side copy and no content download", async () => {
     const transport = new FakeTransport();
-    const repository = new DocumentLedgerRepository(transport);
+    const repository = new DocumentLedgerRepository(persistenceFromDropbox(transport));
     const source = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/INPUTS/report.pdf";
     const sourceMetadata: DropboxFileMetadata = {
       id: "id:source",
@@ -135,7 +136,7 @@ describe("DocumentLedgerRepository", () => {
 
   it("rebuilds independent published and newer working pointers from causal immutable versions", async () => {
     const transport = new FakeTransport();
-    const repository = new DocumentLedgerRepository(transport);
+    const repository = new DocumentLedgerRepository(persistenceFromDropbox(transport));
     const published = record({
       version_id: v1,
       stage: "published",
@@ -180,7 +181,7 @@ describe("DocumentLedgerRepository", () => {
 
   it("uses a newer live provider rev during head recovery when bytes still match immutable evidence", async () => {
     const transport = new FakeTransport();
-    const repository = new DocumentLedgerRepository(transport);
+    const repository = new DocumentLedgerRepository(persistenceFromDropbox(transport));
     const publishedPath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/strategy/commercial.md";
     const immutable = record({
       version_id: v1,
@@ -213,7 +214,7 @@ describe("DocumentLedgerRepository", () => {
 
   it("does not resurrect consumed working or review pointers after a completed publication", async () => {
     const transport = new FakeTransport();
-    const repository = new DocumentLedgerRepository(transport);
+    const repository = new DocumentLedgerRepository(persistenceFromDropbox(transport));
     await repository.writeVersion(record({
       version_id: v1,
       stage: "working",
@@ -247,7 +248,7 @@ describe("DocumentLedgerRepository", () => {
 
   it("keeps the frozen published ancestor while restoring a newer active review candidate", async () => {
     const transport = new FakeTransport();
-    const repository = new DocumentLedgerRepository(transport);
+    const repository = new DocumentLedgerRepository(persistenceFromDropbox(transport));
     await repository.writeVersion(record({
       version_id: v1,
       stage: "published",

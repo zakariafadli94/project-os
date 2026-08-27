@@ -1,7 +1,7 @@
 import {
   asProjectOsPersistence,
   type PersistenceInput
-} from "../persistence/compatibility/legacy-dropbox-runtime";
+} from "../persistence/provider/runtime";
 import { machineEventPath, machineReceiptPath, machineTransactionPath } from "../persistence/layout";
 import { assertSafeProjectId, assertSafeSlug, PROJECT_OS_ROOT, projectRoot } from "../persistence/paths";
 import type { ObjectPersistence } from "../persistence/provider/contract";

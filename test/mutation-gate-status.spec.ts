@@ -188,8 +188,8 @@ describe("MutationGate status vocabulary", () => {
     expect(JSON.stringify({ receipt, status })).not.toMatch(/accepted|published/i);
   });
 
-  it("keeps production continuity stable while MutationGate defaults to observe", () => {
+  it("keeps production continuity stable while production MutationGate mode is enforce", () => {
     expect(testEnv.PROJECT_OS_CONTINUITY_MODE).toBe("stable");
-    expect(testEnv.PROJECT_OS_MUTATION_GATE_MODE).toBe("observe");
+    expect(testEnv.PROJECT_OS_MUTATION_GATE_MODE).toBe("enforce");
   });
 });

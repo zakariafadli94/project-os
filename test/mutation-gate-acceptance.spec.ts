@@ -46,7 +46,7 @@ describe("IMP-MUTATIONGATE001 acceptance matrix", () => {
       baseline: true,
       candidates: 3,
       bootstrapped: 0,
-      mutation_gate_mode: "observe",
+      mutation_gate_mode: "enforce",
       last_candidate_detection_source: "baseline"
     });
     expect(await canonicalRevision(guard)).toBe(revisionBefore);

@@ -59,8 +59,8 @@ describe("MutationGate candidates", () => {
     expect(await response.json()).toMatchObject({
       baseline: false,
       candidates: 1,
-      mutation_gate_mode: "observe",
-      policy_violations: 0,
+      mutation_gate_mode: "enforce",
+      policy_violations: 1,
       last_candidate_detection_source: "incremental"
     });
     expect(mock.files.get(path)).toBe("# preserve me");
@@ -72,12 +72,12 @@ describe("MutationGate candidates", () => {
     expect(listed.candidates[0]).toMatchObject({
       provider_path: path,
       resolution_state: "unresolved",
-      gate_mode: "observe"
+      gate_mode: "enforce"
     });
     expect(JSON.stringify(listed)).not.toContain("preserve me");
 
     const replay = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
-    expect(await replay.json()).toMatchObject({ candidates: 0, mutation_gate_mode: "observe" });
+    expect(await replay.json()).toMatchObject({ candidates: 0, mutation_gate_mode: "enforce" });
     const listReplay = await guard.fetch("https://project-guard.internal/mutation-candidates", { method: "GET" });
     expect((await listReplay.json<{ candidates: unknown[] }>()).candidates).toHaveLength(1);
   });

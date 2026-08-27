@@ -1,15 +1,21 @@
 import { expect, it } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
+import { ManagedDocumentBootstrapper } from "../src/documents/bootstrap";
 import { sha256Text } from "../src/documents/hash";
 import { ManagedDocumentService } from "../src/documents/service";
+import { workspaceManagedDocumentPath } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
+import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
 
-function neutralRuntime(): ProjectOsPersistenceRuntime {
+function neutralRuntime(): {
+  runtime: ProjectOsPersistenceRuntime;
+  seed: (path: string, content: string, objectId?: string) => ProviderObjectMetadata;
+} {
   const files = new Map<string, { content: string; objectId: string; revisionToken: string; integrityHash: string }>();
   let revision = 0;
 
-  const metadata = (path: string) => {
+  const metadata = (path: string): ProviderObjectMetadata | null => {
     const file = files.get(path);
     return file
       ? {
@@ -22,7 +28,7 @@ function neutralRuntime(): ProjectOsPersistenceRuntime {
       : null;
   };
 
-  const put = (path: string, content: string, objectId?: string) => {
+  const put = (path: string, content: string, objectId?: string): ProviderObjectMetadata => {
     revision += 1;
     files.set(path, {
       content,
@@ -82,7 +88,7 @@ function neutralRuntime(): ProjectOsPersistenceRuntime {
     }
   };
 
-  return runtime;
+  return { runtime, seed: put };
 }
 
 function contentHash(content: string): string {
@@ -92,7 +98,7 @@ function contentHash(content: string): string {
 }
 
 it("writes a managed working document through the neutral runtime contract", async () => {
-  const runtime = neutralRuntime();
+  const { runtime } = neutralRuntime();
   const service = new ManagedDocumentService(runtime);
   const content = "# Strategy\n\nNeutral runtime";
 
@@ -110,5 +116,34 @@ it("writes a managed working document through the neutral runtime contract", asy
     project_id: "PRJ-0002",
     stage: "working",
     status: "committed"
+  });
+});
+
+it("bootstraps an existing managed file through neutral metadata and copy capabilities", async () => {
+  const { runtime, seed } = neutralRuntime();
+  const state = emptyProjectState("PRJ-0002", "Project OS", "project-os", "Managed docs");
+  const visiblePath = workspaceManagedDocumentPath(
+    state.project_id,
+    state.slug,
+    "working",
+    "strategy/existing.md"
+  );
+  const metadata = seed(visiblePath, "# Existing managed file", "id:neutral-existing");
+  const bootstrapper = new ManagedDocumentBootstrapper(runtime);
+
+  const result = await bootstrapper.bootstrapExistingManagedPath(
+    state,
+    visiblePath,
+    metadata,
+    "working"
+  );
+
+  expect(result.adopted).toBe(true);
+  expect(result.version).toMatchObject({
+    schema_version: "1.0",
+    stage: "working",
+    provider_file_id: "id:neutral-existing",
+    provider_rev: metadata.revisionToken,
+    provider_content_hash: metadata.integrityHash?.value
   });
 });

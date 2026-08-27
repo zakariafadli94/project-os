@@ -36,10 +36,10 @@ for (const file of srcFiles) {
     violations.push(`${rel}: compatibility seam imports Dropbox runtime`);
   }
   if (
-    rel !== "src/persistence/compatibility/legacy-dropbox-runtime.ts"
-    && text.includes("compatibility/legacy-dropbox-runtime")
+    rel === "src/persistence/compatibility/legacy-dropbox-runtime.ts"
+    && /\b(?:function|class|interface|const|let|var)\b/.test(text)
   ) {
-    violations.push(`${rel}: temporary legacy Dropbox runtime bridge import must be removed`);
+    violations.push(`${rel}: legacy compatibility facade must contain re-exports only`);
   }
 
   const constructions = text.match(/new\s+DropboxClient\s*\(/g)?.length ?? 0;

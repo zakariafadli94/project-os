@@ -14,14 +14,14 @@ import {
 } from "../persistence/compatibility/dropbox-v1-evidence";
 import {
   toProviderObjectMetadata,
-  type LegacyDropboxFileMetadata,
-  type PersistenceInput
-} from "../persistence/compatibility/legacy-dropbox-runtime";
+  type LegacyDropboxFileMetadata
+} from "../persistence/compatibility/dropbox-v1-legacy-data";
 import {
   machineDocumentProviderPayloadPath,
   workspaceManagedZoneRoot
 } from "../persistence/layout";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import type { PersistenceInput } from "../persistence/provider/runtime";
 import { DocumentLedgerRepository } from "./repository";
 
 export type BootstrapManagedStage = "reference" | "working" | "review" | "published";

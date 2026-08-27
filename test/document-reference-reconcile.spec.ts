@@ -6,6 +6,7 @@ import { DropboxConflictError } from "../src/dropbox/client";
 import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { DocumentLedgerRepository } from "../src/documents/repository";
+import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
 
 class ReferenceDropbox implements DropboxTransport {
   files = new Map<string, string>();
@@ -70,8 +71,20 @@ async function hash(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function change(meta: DropboxFileMetadata) {
-  return { tag: "file" as const, name: meta.path.split("/").at(-1)!, path: meta.path, id: meta.id, rev: meta.rev, content_hash: meta.content_hash, size: meta.size, server_modified: meta.server_modified };
+function change(meta: DropboxFileMetadata): ProviderChangeEntry {
+  return {
+    kind: "file",
+    name: meta.path.split("/").at(-1)!,
+    path: meta.path,
+    metadata: {
+      path: meta.path,
+      size: meta.size,
+      ...(meta.server_modified ? { modifiedAt: meta.server_modified } : {}),
+      objectId: meta.id,
+      revisionToken: meta.rev,
+      integrityHash: { algorithm: "dropbox-content-hash", value: meta.content_hash }
+    }
+  };
 }
 
 describe("reference reconciliation", () => {

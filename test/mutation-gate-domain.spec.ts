@@ -18,7 +18,7 @@ describe("mutation gate domain", () => {
       providerFileId: "id:abc",
       providerRev: "rev-17"
     });
-    expect(candidate).toMatch(/^MUTCAND-[A-F0-9]{24}$/);
+    expect(candidate).toBe("MUTCAND-0AECD6C3005E1999896EA4DA");
 
     const resolution = await mutationResolutionIdFor("PRJ-0002", candidate, "candidate.reject");
     expect(resolution).toMatch(/^MUTRES-[A-F0-9]{24}$/);

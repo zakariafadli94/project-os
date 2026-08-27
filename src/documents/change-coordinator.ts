@@ -1,17 +1,18 @@
 import type { ProjectState } from "../domain/project-state";
-import {
-  DropboxCursorResetError,
-  type DropboxChangeEntry,
-  type DropboxChangePage,
-  type DropboxFileMetadata,
-  type DropboxTransport
-} from "../dropbox/client";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
 import { MutationGateClassifier } from "../mutation-gate/classifier";
 import { MutationGateService, type MutationGateMode, type MutationGateProcessSummary } from "../mutation-gate/service";
-import { toProviderObjectMetadata } from "../persistence/compatibility/legacy-dropbox-runtime";
+import {
+  asProjectOsPersistence,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
 import { workspaceProjectRoot } from "../persistence/layout";
-import type { ProviderChangeEntry } from "../persistence/provider/contract";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type {
+  ProviderChangeEntry,
+  ProviderChangePage,
+  ProviderObjectMetadata
+} from "../persistence/provider/contract";
+import { ProviderCursorResetError } from "../persistence/provider/errors";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
 import {
   ManagedDocumentReconciler,
@@ -35,54 +36,51 @@ export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSu
 }
 
 interface BootstrapCandidate {
-  change: DropboxChangeEntry;
+  change: ProviderChangeEntry;
   stage: BootstrapManagedStage;
   priority: number;
 }
 
 export class ManagedDocumentChangeCoordinator {
-  private readonly transport: ResilientDropboxTransport;
+  private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly reconciler: ManagedDocumentReconciler;
   private readonly bootstrapper: ManagedDocumentBootstrapper;
   private readonly mutationClassifier: MutationGateClassifier;
   private readonly mutationGate: MutationGateService;
 
   constructor(
-    transport: DropboxTransport,
+    input: PersistenceInput,
     private readonly cursorStore: ManagedDocumentCursorStore,
     private readonly gateMode: MutationGateMode = "observe"
   ) {
-    this.transport = new ResilientDropboxTransport(transport);
-    this.reconciler = new ManagedDocumentReconciler(transport);
-    this.bootstrapper = new ManagedDocumentBootstrapper(transport);
-    this.mutationClassifier = new MutationGateClassifier(transport);
-    this.mutationGate = new MutationGateService(transport, gateMode);
+    this.runtime = asProjectOsPersistence(input);
+    this.reconciler = new ManagedDocumentReconciler(this.runtime);
+    this.bootstrapper = new ManagedDocumentBootstrapper(this.runtime);
+    this.mutationClassifier = new MutationGateClassifier(this.runtime);
+    this.mutationGate = new MutationGateService(this.runtime, gateMode);
   }
 
   async reconcile(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
     if (state.status === "archived") {
       return emptySummary({ archived: true }, this.mutationGateMode());
     }
-    if (!this.transport.listFolderChanges) {
-      throw new Error("Dropbox transport does not support managed-document change cursors");
-    }
 
     const root = workspaceProjectRoot(state.project_id, state.slug);
     const existingCursor = await this.cursorStore.get<string>(CURSOR_KEY);
     let cursorReset = false;
     let baseline = !existingCursor;
-    let page: DropboxChangePage;
+    let page: ProviderChangePage;
 
     try {
       page = existingCursor
-        ? await this.transport.listFolderChanges(undefined, existingCursor)
-        : await this.transport.listFolderChanges(root);
+        ? await this.runtime.changeFeed.listChanges({ cursor: existingCursor })
+        : await this.runtime.changeFeed.listChanges({ root });
     } catch (error) {
-      if (!(error instanceof DropboxCursorResetError)) throw error;
+      if (!(error instanceof ProviderCursorResetError)) throw error;
       cursorReset = true;
       baseline = true;
       await this.cursorStore.delete(CURSOR_KEY);
-      page = await this.transport.listFolderChanges(root);
+      page = await this.runtime.changeFeed.listChanges({ root });
     }
 
     const detectionSource = cursorReset ? "cursor_reset" : baseline ? "baseline" : "incremental";
@@ -95,8 +93,7 @@ export class ManagedDocumentChangeCoordinator {
       bootstrapped = await this.bootstrapBaseline(state, page.entries);
     }
 
-    const providerChanges = page.entries.map(toProviderChangeEntry);
-    const summary = await this.reconciler.reconcileChanges(state, providerChanges);
+    const summary = await this.reconciler.reconcileChanges(state, page.entries);
     const cursorAdvanced = page.cursor.length > 0 && page.cursor !== existingCursor;
     if (page.cursor.length > 0) await this.cursorStore.put(CURSOR_KEY, page.cursor);
 
@@ -111,7 +108,7 @@ export class ManagedDocumentChangeCoordinator {
     };
   }
 
-  private async bootstrapBaseline(state: ProjectState, changes: DropboxChangeEntry[]): Promise<number> {
+  private async bootstrapBaseline(state: ProjectState, changes: ProviderChangeEntry[]): Promise<number> {
     const candidates = changes
       .map((change) => this.bootstrapCandidate(state, change))
       .filter((candidate): candidate is BootstrapCandidate => candidate !== null)
@@ -138,8 +135,8 @@ export class ManagedDocumentChangeCoordinator {
     return adopted;
   }
 
-  private bootstrapCandidate(state: ProjectState, change: DropboxChangeEntry): BootstrapCandidate | null {
-    if (change.tag !== "file") return null;
+  private bootstrapCandidate(state: ProjectState, change: ProviderChangeEntry): BootstrapCandidate | null {
+    if (change.kind !== "file") return null;
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!change.path.startsWith(root)) return null;
     const relative = change.path.slice(root.length);
@@ -161,48 +158,14 @@ export class ManagedDocumentChangeCoordinator {
     return null;
   }
 
-  private async metadataFor(change: DropboxChangeEntry): Promise<DropboxFileMetadata | null> {
-    if (change.id && change.rev && change.content_hash && change.size !== undefined) {
-      return {
-        id: change.id,
-        path: change.path,
-        rev: change.rev,
-        content_hash: change.content_hash,
-        size: change.size,
-        ...(change.server_modified ? { server_modified: change.server_modified } : {})
-      };
-    }
-    return this.transport.getMetadata(change.path);
+  private async metadataFor(change: ProviderChangeEntry): Promise<ProviderObjectMetadata | null> {
+    if (change.metadata) return change.metadata;
+    return this.runtime.objects.getMetadata(change.path);
   }
 
   private mutationGateMode(): MutationGateMode {
     return this.gateMode;
   }
-}
-
-function toProviderChangeEntry(change: DropboxChangeEntry): ProviderChangeEntry {
-  const result: ProviderChangeEntry = {
-    kind: change.tag,
-    name: change.name,
-    path: change.path
-  };
-  if (
-    change.tag === "file"
-    && change.id
-    && change.rev
-    && change.content_hash
-    && change.size !== undefined
-  ) {
-    result.metadata = toProviderObjectMetadata({
-      id: change.id,
-      path: change.path,
-      rev: change.rev,
-      content_hash: change.content_hash,
-      size: change.size,
-      ...(change.server_modified ? { server_modified: change.server_modified } : {})
-    });
-  }
-  return result;
 }
 
 function isProjectedDeliverableMetadata(state: ProjectState, relativePath: string): boolean {

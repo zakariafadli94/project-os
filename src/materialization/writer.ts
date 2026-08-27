@@ -1,4 +1,8 @@
 import type { ProjectionOutputEvidence } from "../domain/materialization";
+import {
+  asProjectOsPersistence,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
 import { machineProjectRoot } from "../persistence/layout";
 import type { ObjectPersistence } from "../persistence/provider/contract";
 import { ProviderConflictError } from "../persistence/provider/errors";
@@ -44,13 +48,18 @@ export interface WorkspaceProjectionWriterOptions {
 }
 
 export class WorkspaceProjectionWriter {
+  private readonly objects: ObjectPersistence;
+
   constructor(
-    private readonly objects: ObjectPersistence,
+    input: ObjectPersistence | PersistenceInput,
     private readonly concurrency: number
   ) {
     if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 4) {
       throw new Error(`Invalid projection writer concurrency: ${concurrency}`);
     }
+    this.objects = isObjectPersistence(input)
+      ? input
+      : asProjectOsPersistence(input).objects;
   }
 
   async materialize(
@@ -224,6 +233,14 @@ export class WorkspaceProjectionWriter {
       }
     }
   }
+}
+
+function isObjectPersistence(input: ObjectPersistence | PersistenceInput): input is ObjectPersistence {
+  return typeof input === "object"
+    && input !== null
+    && "readText" in input
+    && "createText" in input
+    && "upsertText" in input;
 }
 
 function evidenceFor(output: PlannedProjectionOutput): ProjectionOutputEvidence {

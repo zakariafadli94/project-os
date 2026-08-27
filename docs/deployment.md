@@ -473,3 +473,13 @@ Likewise, alternate persistence providers are not introduced here. Dropbox remai
 `IMP-MUTATIONGATE001` is production-complete only after its own exact final PR head/merge deployment proof, observe-mode production validation, accepted decision on enforcement rollout, any separately approved enforcement activation, and canonical PRJ-0002 evidence. PR CI alone does not authorize merge, deployment, `enforce`, PRJ-0003 repair or SCHEMA resumption.
 
 `IMP-MODEL001` is production-complete only after exact final PR head verification, a separately authorized runtime merge/deployment, exact-merge deployment/health proof, isolated lifecycle/concurrency production proof, historical readability verification, and canonical PRJ-0002 research/task closure. MODEL001 completion does not authorize MutationGate `enforce`, PRJ-0003 repair or SCHEMA runtime.
+
+## 18. Persistence provider boundary operations
+
+Production persistence construction is centralized in `createProductionPersistence` and remains hard-wired to the Dropbox adapter. There is no provider-selection environment variable. Keep the existing `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, and `DROPBOX_REFRESH_TOKEN` secret contract unchanged.
+
+Core Worker/Durable Object code consumes provider-neutral object operations and explicit capabilities for conditional write, server-side copy, incremental change feed, stable object ID, revision token, and integrity hash. Retry handling consumes neutral provider errors; Dropbox-specific status and request diagnostics are translated inside the Dropbox adapter.
+
+Schema `1.0` durable evidence remains Dropbox V1-shaped. `provider_file_id`, `provider_rev`, `provider_content_hash`, MutationGate provider preconditions/candidates, and related managed-document observations must not be generalized by deployment configuration. Any persisted-format generalization, alternate provider, migration or upcaster belongs to IMP-SCHEMA001 and requires a separate rollout.
+
+Persistence-boundary rollout must not change `PROJECT_OS_CONTINUITY_MODE=stable` or `PROJECT_OS_MUTATION_GATE_MODE=observe`. It does not authorize PRJ-0003 repair, MutationGate enforcement, or SCHEMA runtime.

@@ -5,14 +5,16 @@ import { DocumentLedgerRepository } from "../documents/repository";
 import { sha256Text } from "../documents/hash";
 import { requireDropboxV1Evidence } from "../persistence/compatibility/dropbox-v1-evidence";
 import {
-  asProjectOsPersistence,
   toProviderObjectMetadata,
-  type LegacyDropboxFileMetadata,
-  type PersistenceInput
-} from "../persistence/compatibility/legacy-dropbox-runtime";
+  type LegacyDropboxFileMetadata
+} from "../persistence/compatibility/dropbox-v1-legacy-data";
 import { workspaceProjectRoot } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import {
+  asProjectOsPersistence,
+  type PersistenceInput
+} from "../persistence/provider/runtime";
 import { MutationGateRepository } from "./repository";
 
 export type MutationGateClassification =

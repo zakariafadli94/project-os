@@ -7,9 +7,7 @@ import {
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Env } from "../env";
-import { DropboxClient } from "../dropbox/client";
-import { parseLayoutMode } from "../dropbox/layout";
-import { ArtifactContentConflictError, ProjectRepository } from "../dropbox/repository";
+import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
 import {
   MutationCandidateResolutionService,
   type CandidateResolutionDownstreamReceipt
@@ -53,16 +51,11 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
     super(ctx, env);
     this.boundProjectId = this.ctx.id.name ?? "";
     this.gateMode = parseMutationGateMode(env.PROJECT_OS_MUTATION_GATE_MODE);
-    const dropbox = new DropboxClient({
-      appKey: env.DROPBOX_APP_KEY,
-      appSecret: env.DROPBOX_APP_SECRET,
-      refreshToken: env.DROPBOX_REFRESH_TOKEN
-    });
-    this.gate = new MutationGateService(dropbox, this.gateMode);
-    this.resolutionService = new MutationCandidateResolutionService(dropbox);
+    this.gate = new MutationGateService(this.persistence, this.gateMode);
+    this.resolutionService = new MutationCandidateResolutionService(this.persistence);
     this.resolutionRepository = new ProjectRepository(
-      dropbox,
-      parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE),
+      this.persistence,
+      this.layoutMode,
       this.gateMode
     );
   }

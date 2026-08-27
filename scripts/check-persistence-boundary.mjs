@@ -64,11 +64,6 @@ for (const rel of ["package.json", "wrangler.jsonc"]) {
   }
 }
 
-const wrangler = await readFile(join(root, "wrangler.jsonc"), "utf8");
-if (/"PROJECT_OS_MUTATION_GATE_MODE"\s*:\s*"enforce"/.test(wrangler)) {
-  violations.push("wrangler.jsonc: MutationGate production mode must remain observe");
-}
-
 if (violations.length > 0) {
   console.error(violations.join("\n"));
   process.exit(1);

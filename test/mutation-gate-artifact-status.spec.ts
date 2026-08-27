@@ -7,6 +7,7 @@ import { sha256Text } from "../src/documents/hash";
 import { ArtifactMutationIntentService } from "../src/mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { MutationGateService } from "../src/mutation-gate/service";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeStatusTransport implements DropboxTransport {
   readonly files = new Map<string, string>();
@@ -43,6 +44,7 @@ class FakeStatusTransport implements DropboxTransport {
 
 async function fixture() {
   const transport = new FakeStatusTransport();
+  const runtime = persistenceFromDropbox(transport);
   const state = emptyProjectState("PRJ-9902", "Artifact Status", "artifact-status", "Verify artifact status");
   const content = "# verified artifact";
   const request: ArtifactWriteRequest = {
@@ -53,9 +55,9 @@ async function fixture() {
     content_sha256: await sha256Text(content),
     mode: "create"
   };
-  const repository = new MutationGateRepository(transport);
-  const prepared = await new ArtifactMutationIntentService(repository, transport).prepare(state, request);
-  const service = new MutationGateService(transport, "observe");
+  const repository = new MutationGateRepository(runtime);
+  const prepared = await new ArtifactMutationIntentService(repository, runtime).prepare(state, request);
+  const service = new MutationGateService(runtime, "observe");
   const receipt = {
     request_id: request.request_id,
     project_id: request.project_id,

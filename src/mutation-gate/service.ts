@@ -1,7 +1,7 @@
 import { parseArtifactWriteRequest, type ArtifactWriteReceipt } from "../domain/artifact-write";
 import type { MutationDetectionSource } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
-import { ArtifactContentConflictError } from "../dropbox/repository-core";
+import { ArtifactContentConflictError } from "../persistence/repository-core";
 import { sha256Text } from "../documents/hash";
 import {
   asProjectOsPersistence,

@@ -9,7 +9,7 @@ import type { ExternalMutationResolutionRecord } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import { sha256Text } from "../documents/hash";
 import { resolveArtifactDestination } from "../persistence/artifact-routing";
-import type { PersistenceInput } from "../persistence/compatibility/legacy-dropbox-runtime";
+import type { PersistenceInput } from "../persistence/provider/runtime";
 import { MutationGateRepository } from "./repository";
 
 export interface CandidateResolutionDownstreamReceipt {

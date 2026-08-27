@@ -6,6 +6,7 @@ import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { ManagedDocumentService } from "../src/documents/service";
+import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
 
 class ReferenceTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -46,16 +47,28 @@ class ReferenceTransport implements DropboxTransport {
   }
 }
 
+function change(metadata: DropboxFileMetadata): ProviderChangeEntry {
+  return {
+    kind: "file",
+    name: metadata.path.split("/").at(-1)!,
+    path: metadata.path,
+    metadata: {
+      path: metadata.path,
+      size: metadata.size,
+      objectId: metadata.id,
+      revisionToken: metadata.rev,
+      integrityHash: { algorithm: "dropbox-content-hash", value: metadata.content_hash }
+    }
+  };
+}
+
 describe("managed reference classification", () => {
   it("moves an ingested reference into a project taxonomy without changing logical document identity", async () => {
     const dropbox = new ReferenceTransport();
     const state = emptyProjectState("PRJ-4020", "Reference", "reference", "Classify refs");
     const inputPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "market/report.pdf");
     const input = await dropbox.externalAdd(inputPath, "report bytes");
-    await new ManagedDocumentReconciler(dropbox).reconcileChanges(state, [{
-      tag: "file", name: "report.pdf", path: inputPath, id: input.id, rev: input.rev,
-      content_hash: input.content_hash, size: input.size
-    }]);
+    await new ManagedDocumentReconciler(dropbox).reconcileChanges(state, [change(input)]);
 
     const documentId = await documentIdForProviderFile(state.project_id, input.id);
     const ledger = new DocumentLedgerRepository(dropbox);

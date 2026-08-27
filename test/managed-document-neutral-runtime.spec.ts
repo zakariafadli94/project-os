@@ -2,6 +2,7 @@ import { expect, it } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
 import { ManagedDocumentBootstrapper } from "../src/documents/bootstrap";
 import { sha256Text } from "../src/documents/hash";
+import { LegacyArtifactDocumentWriter } from "../src/documents/legacy-artifact";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { ManagedDocumentRequestLedger } from "../src/documents/request-ledger";
 import { ManagedDocumentService } from "../src/documents/service";
@@ -182,4 +183,9 @@ it("persists managed request intents and receipts through object persistence", a
 
   const receipt = await ledger.writeReceipt("PRJ-0002", requestId, requestJson, receiptJson);
   expect(await ledger.readReceipt("PRJ-0002", requestId)).toEqual(receipt);
+});
+
+it("constructs the legacy managed artifact writer from the neutral runtime", () => {
+  const { runtime } = neutralRuntime();
+  expect(new LegacyArtifactDocumentWriter(runtime)).toBeInstanceOf(LegacyArtifactDocumentWriter);
 });

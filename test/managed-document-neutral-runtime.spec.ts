@@ -3,6 +3,7 @@ import { emptyProjectState } from "../src/domain/transitions";
 import { ManagedDocumentBootstrapper } from "../src/documents/bootstrap";
 import { sha256Text } from "../src/documents/hash";
 import { LegacyArtifactDocumentWriter } from "../src/documents/legacy-artifact";
+import { ensureLegacyArtifactRequestProvenance } from "../src/documents/legacy-artifact-provenance";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { ManagedDocumentRequestLedger } from "../src/documents/request-ledger";
 import { ManagedDocumentService } from "../src/documents/service";
@@ -188,4 +189,19 @@ it("persists managed request intents and receipts through object persistence", a
 it("constructs the legacy managed artifact writer from the neutral runtime", () => {
   const { runtime } = neutralRuntime();
   expect(new LegacyArtifactDocumentWriter(runtime)).toBeInstanceOf(LegacyArtifactDocumentWriter);
+});
+
+it("accepts the neutral runtime when checking legacy artifact provenance", async () => {
+  const { runtime } = neutralRuntime();
+  const state = emptyProjectState("PRJ-0002", "Project OS", "project-os", "Managed docs");
+  const content = "neutral provenance";
+
+  await expect(ensureLegacyArtifactRequestProvenance(state, {
+    request_id: "ART-NEUTRAL-PROVENANCE-0001",
+    project_id: state.project_id,
+    relative_path: "notes/provenance.txt",
+    content,
+    content_sha256: await sha256Text(content),
+    mode: "create"
+  }, runtime)).resolves.toBeUndefined();
 });

@@ -8,14 +8,26 @@ import {
   type ManagedProviderObservation
 } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
+import { ArtifactContentConflictError } from "../dropbox/repository";
 import {
   resolveArtifactDestination,
   type ResolvedArtifactDestination
-} from "../dropbox/artifact-routing";
-import { DropboxConflictError, type DropboxFileMetadata, type DropboxTransport } from "../dropbox/client";
-import { workspaceProjectRoot } from "../dropbox/layout";
-import { ArtifactContentConflictError } from "../dropbox/repository";
-import { ResilientDropboxTransport } from "../dropbox/resilient-transport";
+} from "../persistence/artifact-routing";
+import {
+  requireDropboxV1Evidence,
+  toManagedProviderObservation
+} from "../persistence/compatibility/dropbox-v1-evidence";
+import {
+  asProjectOsPersistence,
+  type PersistenceInput
+} from "../persistence/compatibility/legacy-dropbox-runtime";
+import { workspaceProjectRoot } from "../persistence/layout";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import {
+  ProviderConflictError,
+  ProviderPreconditionFailedError
+} from "../persistence/provider/errors";
 import { ManagedDocumentBootstrapper } from "./bootstrap";
 import { sha256Text } from "./hash";
 import { DocumentLedgerRepository } from "./repository";
@@ -27,14 +39,14 @@ type ManagedArtifactDestination =
   | { zone: "references"; path: string; logicalPath: string; collectionPath: string; archivePath?: string };
 
 export class LegacyArtifactDocumentWriter {
-  private readonly transport: ResilientDropboxTransport;
+  private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly ledger: DocumentLedgerRepository;
   private readonly bootstrapper: ManagedDocumentBootstrapper;
 
-  constructor(transport: DropboxTransport) {
-    this.transport = new ResilientDropboxTransport(transport);
-    this.ledger = new DocumentLedgerRepository(transport);
-    this.bootstrapper = new ManagedDocumentBootstrapper(transport);
+  constructor(input: PersistenceInput) {
+    this.runtime = asProjectOsPersistence(input);
+    this.ledger = new DocumentLedgerRepository(this.runtime);
+    this.bootstrapper = new ManagedDocumentBootstrapper(this.runtime);
   }
 
   async writeIfManaged(
@@ -81,7 +93,7 @@ export class LegacyArtifactDocumentWriter {
     if (head && head.kind !== "work_product") throw new ArtifactContentConflictError(destination.path);
     if (head?.working_version_id || head?.review_version_id) throw new ArtifactContentConflictError(destination.path);
 
-    const currentContent = metadata ? await this.transport.download(destination.path) : null;
+    const currentContent = metadata ? await this.runtime.objects.readText(destination.path) : null;
     if (metadata && currentContent === null) throw new ArtifactContentConflictError(destination.path);
 
     if (metadata && currentContent === request.content) {
@@ -101,7 +113,11 @@ export class LegacyArtifactDocumentWriter {
       if (destination.archivePath && currentContent !== null) {
         await this.archiveExisting(destination.archivePath, currentContent);
       }
-      metadata = await this.conditionalReplace(destination.path, request.content, metadata.rev);
+      metadata = await this.conditionalReplace(
+        destination.path,
+        request.content,
+        requireDropboxV1Evidence(metadata).rev
+      );
     } else {
       metadata = await this.createVisible(destination.path, request.content);
     }
@@ -121,8 +137,9 @@ export class LegacyArtifactDocumentWriter {
     let head: ManagedDocumentHead | null = null;
 
     if (metadata) {
-      const binding = await this.ledger.readProviderFileBinding(request.project_id, metadata.id);
-      documentId = binding?.document_id ?? await documentIdForProviderFile(request.project_id, metadata.id);
+      const evidence = requireDropboxV1Evidence(metadata);
+      const binding = await this.ledger.readProviderFileBinding(request.project_id, evidence.file_id);
+      documentId = binding?.document_id ?? await documentIdForProviderFile(request.project_id, evidence.file_id);
       head = await this.readOrRestoreHead(request.project_id, documentId);
       if (!head) head = await this.adoptExistingReference(state, destination, metadata, documentId);
     } else {
@@ -137,7 +154,7 @@ export class LegacyArtifactDocumentWriter {
     }
 
     if (head && head.kind !== "reference") throw new ArtifactContentConflictError(destination.path);
-    const currentContent = metadata ? await this.transport.download(destination.path) : null;
+    const currentContent = metadata ? await this.runtime.objects.readText(destination.path) : null;
     if (metadata && currentContent === null) throw new ArtifactContentConflictError(destination.path);
 
     if (metadata && currentContent === request.content) {
@@ -165,11 +182,18 @@ export class LegacyArtifactDocumentWriter {
       if (destination.archivePath && currentContent !== null) {
         await this.archiveExisting(destination.archivePath, currentContent);
       }
-      metadata = await this.conditionalReplace(destination.path, request.content, metadata.rev);
+      metadata = await this.conditionalReplace(
+        destination.path,
+        request.content,
+        requireDropboxV1Evidence(metadata).rev
+      );
       documentId = knownDocumentId!;
     } else {
       metadata = await this.createVisible(destination.path, request.content);
-      documentId = await documentIdForProviderFile(request.project_id, metadata.id);
+      documentId = await documentIdForProviderFile(
+        request.project_id,
+        requireDropboxV1Evidence(metadata).file_id
+      );
       head = await this.readOrRestoreHead(request.project_id, documentId);
     }
 
@@ -180,10 +204,11 @@ export class LegacyArtifactDocumentWriter {
   private async adoptExistingReference(
     state: ProjectState,
     destination: Extract<ManagedArtifactDestination, { zone: "references" }>,
-    metadata: DropboxFileMetadata,
+    metadata: ProviderObjectMetadata,
     documentId: string
   ): Promise<ManagedDocumentHead> {
-    const versionId = await externalVersionIdFor(metadata.rev);
+    const evidence = requireDropboxV1Evidence(metadata);
+    const versionId = await externalVersionIdFor(evidence.rev);
     const existing = await this.ledger.readVersion(state.project_id, documentId, versionId);
     if (!existing) {
       const snapshot = await this.ledger.snapshotProviderFile(
@@ -202,13 +227,13 @@ export class LegacyArtifactDocumentWriter {
         stage: "reference",
         logical_path: destination.logicalPath,
         source: "external_human",
-        created_at: metadata.server_modified ?? new Date().toISOString(),
+        created_at: metadata.modifiedAt ?? new Date().toISOString(),
         immutable_payload_path: snapshot.path,
-        provider_content_hash: metadata.content_hash,
-        provider_file_id: metadata.id,
-        provider_rev: metadata.rev,
+        provider_content_hash: evidence.content_hash,
+        provider_file_id: evidence.file_id,
+        provider_rev: evidence.rev,
         provider_path: destination.path,
-        size: metadata.size
+        size: evidence.size
       });
     }
     const head: ManagedDocumentHead = {
@@ -226,13 +251,13 @@ export class LegacyArtifactDocumentWriter {
     await this.ledger.writeProviderFileBinding({
       schema_version: "1.0",
       project_id: state.project_id,
-      provider_file_id: metadata.id,
+      provider_file_id: evidence.file_id,
       document_id: documentId
     });
     await this.ledger.writeReferenceFingerprint({
       schema_version: "1.0",
       project_id: state.project_id,
-      provider_content_hash: metadata.content_hash,
+      provider_content_hash: evidence.content_hash,
       document_id: documentId,
       version_id: versionId
     });
@@ -246,8 +271,9 @@ export class LegacyArtifactDocumentWriter {
     documentId: string,
     versionId: string,
     head: ManagedDocumentHead | null,
-    metadata: DropboxFileMetadata
+    metadata: ProviderObjectMetadata
   ): Promise<void> {
+    const evidence = requireDropboxV1Evidence(metadata);
     const record: DocumentVersionRecord = {
       schema_version: "1.0",
       project_id: request.project_id,
@@ -258,14 +284,14 @@ export class LegacyArtifactDocumentWriter {
       stage: "published",
       logical_path: destination.logicalPath,
       source: "legacy_artifact_api",
-      created_at: metadata.server_modified ?? new Date().toISOString(),
+      created_at: metadata.modifiedAt ?? new Date().toISOString(),
       immutable_payload_path: payloadPath,
       content_sha256: request.content_sha256,
-      provider_content_hash: metadata.content_hash,
-      provider_file_id: metadata.id,
-      provider_rev: metadata.rev,
+      provider_content_hash: evidence.content_hash,
+      provider_file_id: evidence.file_id,
+      provider_rev: evidence.rev,
       provider_path: destination.path,
-      size: metadata.size,
+      size: evidence.size,
       request_id: request.request_id
     };
     await this.ledger.writeVersion(record);
@@ -288,8 +314,9 @@ export class LegacyArtifactDocumentWriter {
     documentId: string,
     versionId: string,
     head: ManagedDocumentHead | null,
-    metadata: DropboxFileMetadata
+    metadata: ProviderObjectMetadata
   ): Promise<void> {
+    const evidence = requireDropboxV1Evidence(metadata);
     const record: DocumentVersionRecord = {
       schema_version: "1.0",
       project_id: request.project_id,
@@ -300,14 +327,14 @@ export class LegacyArtifactDocumentWriter {
       stage: "reference",
       logical_path: destination.logicalPath,
       source: "legacy_artifact_api",
-      created_at: metadata.server_modified ?? new Date().toISOString(),
+      created_at: metadata.modifiedAt ?? new Date().toISOString(),
       immutable_payload_path: payloadPath,
       content_sha256: request.content_sha256,
-      provider_content_hash: metadata.content_hash,
-      provider_file_id: metadata.id,
-      provider_rev: metadata.rev,
+      provider_content_hash: evidence.content_hash,
+      provider_file_id: evidence.file_id,
+      provider_rev: evidence.rev,
       provider_path: destination.path,
-      size: metadata.size,
+      size: evidence.size,
       request_id: request.request_id
     };
     await this.ledger.writeVersion(record);
@@ -325,13 +352,13 @@ export class LegacyArtifactDocumentWriter {
     await this.ledger.writeProviderFileBinding({
       schema_version: "1.0",
       project_id: request.project_id,
-      provider_file_id: metadata.id,
+      provider_file_id: evidence.file_id,
       document_id: documentId
     });
     await this.ledger.writeReferenceFingerprint({
       schema_version: "1.0",
       project_id: request.project_id,
-      provider_content_hash: metadata.content_hash,
+      provider_content_hash: evidence.content_hash,
       document_id: documentId,
       version_id: versionId
     });
@@ -356,7 +383,7 @@ export class LegacyArtifactDocumentWriter {
 
   private async assertPublishedBaseline(
     head: ManagedDocumentHead | null,
-    metadata: DropboxFileMetadata,
+    metadata: ProviderObjectMetadata,
     path: string
   ): Promise<void> {
     if (!head?.published_version_id) throw new ArtifactContentConflictError(path);
@@ -364,13 +391,14 @@ export class LegacyArtifactDocumentWriter {
     if (observationValue && !sameObservation(observationValue, metadata)) throw new ArtifactContentConflictError(path);
     if (!observationValue) {
       const version = await this.ledger.readVersion(head.project_id, head.document_id, head.published_version_id);
-      if (!version?.provider_rev || version.provider_rev !== metadata.rev) throw new ArtifactContentConflictError(path);
+      const evidence = requireDropboxV1Evidence(metadata);
+      if (!version?.provider_rev || version.provider_rev !== evidence.rev) throw new ArtifactContentConflictError(path);
     }
   }
 
   private async assertReferenceBaseline(
     head: ManagedDocumentHead | null,
-    metadata: DropboxFileMetadata,
+    metadata: ProviderObjectMetadata,
     path: string
   ): Promise<void> {
     if (!head?.reference_version_id) throw new ArtifactContentConflictError(path);
@@ -378,38 +406,45 @@ export class LegacyArtifactDocumentWriter {
     if (observationValue && !sameObservation(observationValue, metadata)) throw new ArtifactContentConflictError(path);
     if (!observationValue) {
       const version = await this.ledger.readVersion(head.project_id, head.document_id, head.reference_version_id);
-      if (!version?.provider_rev || version.provider_rev !== metadata.rev) throw new ArtifactContentConflictError(path);
+      const evidence = requireDropboxV1Evidence(metadata);
+      if (!version?.provider_rev || version.provider_rev !== evidence.rev) throw new ArtifactContentConflictError(path);
     }
   }
 
-  private async createVisible(path: string, content: string): Promise<DropboxFileMetadata> {
+  private async createVisible(path: string, content: string): Promise<ProviderObjectMetadata> {
     try {
-      await this.transport.upload(path, content, "add");
+      await this.runtime.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const current = await this.transport.download(path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const current = await this.runtime.objects.readText(path);
       if (current !== content) throw new ArtifactContentConflictError(path);
     }
     const metadata = await this.metadataMaybe(path);
     if (!metadata) throw new Error(`Legacy managed artifact provider metadata missing after create: ${path}`);
-    const persisted = await this.transport.download(path);
+    const persisted = await this.runtime.objects.readText(path);
     if (persisted !== content) throw new ArtifactContentConflictError(path);
     return metadata;
   }
 
-  private async conditionalReplace(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata> {
-    if (!this.transport.uploadConditional) throw new Error("Dropbox transport does not support legacy managed artifact CAS");
+  private async conditionalReplace(
+    path: string,
+    content: string,
+    expectedRevisionToken: string
+  ): Promise<ProviderObjectMetadata> {
     try {
-      return await this.transport.uploadConditional(path, content, expectedRev);
+      return await this.runtime.conditionalWrite.writeTextConditional(
+        path,
+        content,
+        expectedRevisionToken
+      );
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
+      if (!(error instanceof ProviderPreconditionFailedError)) throw error;
       throw new ArtifactContentConflictError(path);
     }
   }
 
-  private async metadataMaybe(path: string): Promise<DropboxFileMetadata | null> {
-    if (!this.transport.getMetadata) throw new Error("Dropbox transport does not support legacy managed artifact metadata");
-    return this.transport.getMetadata(path);
+  private metadataMaybe(path: string): Promise<ProviderObjectMetadata | null> {
+    return this.runtime.objects.getMetadata(path);
   }
 
   private validateReplay(
@@ -436,10 +471,10 @@ export class LegacyArtifactDocumentWriter {
 
   private async safeAdd(path: string, content: string): Promise<void> {
     try {
-      await this.transport.upload(path, content, "add");
+      await this.runtime.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof DropboxConflictError)) throw error;
-      const existing = await this.transport.download(path);
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.readText(path);
       if (existing !== content) throw new Error(`Immutable legacy archive conflict with different content: ${path}`);
     }
   }
@@ -492,21 +527,16 @@ async function legacyVersionIdFor(requestId: string, stage: "reference" | "publi
   return `VER-REQ-${digest.slice(0, 24).toUpperCase()}`;
 }
 
-function observation(path: string, metadata: DropboxFileMetadata): ManagedProviderObservation {
-  return {
-    path,
-    file_id: metadata.id,
-    rev: metadata.rev,
-    content_hash: metadata.content_hash,
-    size: metadata.size
-  };
+function observation(path: string, metadata: ProviderObjectMetadata): ManagedProviderObservation {
+  return toManagedProviderObservation({ ...metadata, path });
 }
 
-function sameObservation(value: ManagedProviderObservation | undefined, metadata: DropboxFileMetadata): boolean {
-  return !!value
-    && value.path === metadata.path
-    && value.file_id === metadata.id
-    && value.rev === metadata.rev
-    && value.content_hash === metadata.content_hash
-    && value.size === metadata.size;
+function sameObservation(value: ManagedProviderObservation | undefined, metadata: ProviderObjectMetadata): boolean {
+  if (!value) return false;
+  const evidence = requireDropboxV1Evidence(metadata);
+  return value.path === metadata.path
+    && value.file_id === evidence.file_id
+    && value.rev === evidence.rev
+    && value.content_hash === evidence.content_hash
+    && value.size === evidence.size;
 }

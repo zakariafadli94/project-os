@@ -1,65 +1,56 @@
-import { describe, expect, it, vi } from "vitest";
-import { isTransientDropboxFailure, retryDropboxWrite } from "../src/dropbox/retry";
+import { describe, expect, it } from "vitest";
+import { DropboxApiError, DropboxConflictError } from "../src/persistence/providers/dropbox/client";
+import { mapDropboxError } from "../src/persistence/providers/dropbox/error-mapping";
+import {
+  ProviderConflictError,
+  ProviderOperationError,
+  ProviderPreconditionFailedError
+} from "../src/persistence/provider/errors";
 
-describe("Dropbox transient retry policy", () => {
-  it("classifies only infrastructure-style failures as transient", () => {
-    expect(isTransientDropboxFailure(429, "rate_limit")).toBe(true);
-    expect(isTransientDropboxFailure(503, "service unavailable")).toBe(true);
-    expect(isTransientDropboxFailure(409, "too_many_write_operations")).toBe(true);
-    expect(isTransientDropboxFailure(409, "internal_error")).toBe(true);
-    expect(isTransientDropboxFailure(409, "path/conflict/file")).toBe(false);
-    expect(isTransientDropboxFailure(403, "insufficient_permissions")).toBe(false);
+describe("Dropbox provider error mapping", () => {
+  it("classifies infrastructure failures as retryable provider operations", () => {
+    const rateLimited = mapDropboxError(
+      new DropboxApiError("rate limited", 429, "req-rate", "rate_limit"),
+      "read"
+    );
+    const unavailable = mapDropboxError(
+      new DropboxApiError("unavailable", 503, "req-503", "service unavailable"),
+      "metadata"
+    );
+    const writePressure = mapDropboxError(
+      new DropboxConflictError("busy", "req-write", "too_many_write_operations"),
+      "create"
+    );
+
+    expect(rateLimited).toBeInstanceOf(ProviderOperationError);
+    expect(rateLimited).toMatchObject({ retryable: true });
+    expect(unavailable).toBeInstanceOf(ProviderOperationError);
+    expect(unavailable).toMatchObject({ retryable: true });
+    expect(writePressure).toBeInstanceOf(ProviderOperationError);
+    expect(writePressure).toMatchObject({ retryable: true });
   });
 
-  it("retries transient failures and returns the first success", async () => {
-    const sleep = vi.fn(async (_delayMs: number) => undefined);
-    const operation = vi.fn()
-      .mockResolvedValueOnce({ ok: false, status: 409, body: "too_many_write_operations" })
-      .mockResolvedValueOnce({ ok: false, status: 503, body: "busy" })
-      .mockResolvedValueOnce({ ok: true, status: 200, body: "ok" });
+  it("keeps semantic conflicts terminal and provider-neutral", () => {
+    const conflict = mapDropboxError(
+      new DropboxConflictError("exists", "req-conflict", "path/conflict/file"),
+      "create"
+    );
+    const forbidden = mapDropboxError(
+      new DropboxApiError("forbidden", 403, "req-403", "insufficient_permissions"),
+      "read"
+    );
 
-    const result = await retryDropboxWrite(operation, {
-      sleep,
-      random: () => 0,
-      baseDelayMs: 100,
-      maxAttempts: 5
-    });
-
-    expect(result.ok).toBe(true);
-    expect(operation).toHaveBeenCalledTimes(3);
-    expect(sleep).toHaveBeenCalledTimes(2);
-    expect(sleep.mock.calls.map((call) => call[0])).toEqual([100, 200]);
+    expect(conflict).toBeInstanceOf(ProviderConflictError);
+    expect(forbidden).toBeInstanceOf(ProviderOperationError);
+    expect(forbidden).toMatchObject({ retryable: false });
   });
 
-  it("does not retry semantic conflicts", async () => {
-    const sleep = vi.fn(async (_delayMs: number) => undefined);
-    const operation = vi.fn().mockResolvedValue({ ok: false, status: 409, body: "path/conflict/file" });
+  it("maps conditional-write conflicts to neutral precondition failures", () => {
+    const conflict = mapDropboxError(
+      new DropboxConflictError("stale rev", "req-cas", "path/conflict/file"),
+      "conditional-write"
+    );
 
-    const result = await retryDropboxWrite(operation, {
-      sleep,
-      random: () => 0,
-      baseDelayMs: 100,
-      maxAttempts: 5
-    });
-
-    expect(result.ok).toBe(false);
-    expect(operation).toHaveBeenCalledTimes(1);
-    expect(sleep).not.toHaveBeenCalled();
-  });
-
-  it("stops after the configured maximum attempts", async () => {
-    const sleep = vi.fn(async (_delayMs: number) => undefined);
-    const operation = vi.fn().mockResolvedValue({ ok: false, status: 429, body: "rate_limit" });
-
-    const result = await retryDropboxWrite(operation, {
-      sleep,
-      random: () => 0,
-      baseDelayMs: 50,
-      maxAttempts: 5
-    });
-
-    expect(result.ok).toBe(false);
-    expect(operation).toHaveBeenCalledTimes(5);
-    expect(sleep).toHaveBeenCalledTimes(4);
+    expect(conflict).toBeInstanceOf(ProviderPreconditionFailedError);
   });
 });

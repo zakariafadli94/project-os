@@ -5,6 +5,7 @@ import { ProjectRepository } from "../src/dropbox/repository";
 import type { DomainEvent } from "../src/domain/event";
 import type { Receipt } from "../src/domain/receipt";
 import { emptyProjectState } from "../src/domain/transitions";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
@@ -65,7 +66,7 @@ function fixture() {
 describe("ProjectRepository", () => {
   it("writes immutable event first, materialized views next, and receipt last", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport);
+    const repository = new ProjectRepository(persistenceFromDropbox(transport));
     const { state, event, receipt } = fixture();
 
     await repository.writeCommit(state, event, receipt);
@@ -77,7 +78,7 @@ describe("ProjectRepository", () => {
 
   it("retries without duplicating immutable events or producing a false receipt", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport);
+    const repository = new ProjectRepository(persistenceFromDropbox(transport));
     const { state, event, receipt } = fixture();
     transport.failOnceOn = "/STATE.md";
 
@@ -93,7 +94,7 @@ describe("ProjectRepository", () => {
 
   it("shadow mode keeps legacy canonical writes and also materializes V2 workspace", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "shadow");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "shadow");
     const { state, event, receipt } = fixture();
     state.research["RES-CODE0001"] = {
       research_id: "RES-CODE0001",
@@ -117,7 +118,7 @@ describe("ProjectRepository", () => {
 
   it("shadow registry writes legacy and V2 machine registry plus human portfolio dashboard", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "shadow");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "shadow");
     const registry = { schema_version: "1.0", projects: [] };
 
     await repository.writeRegistry(registry, "# Project Index\n");
@@ -129,7 +130,7 @@ describe("ProjectRepository", () => {
 
   it("v2 writes its receipt last and never publishes it after an earlier view failure", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const { state, event, receipt } = fixture();
     transport.failOnceOn = "/STATE.md";
 
@@ -142,7 +143,7 @@ describe("ProjectRepository", () => {
 
   it("never publishes a committed receipt when a human brief write fails", async () => {
     const transport = new FakeTransport();
-    const repository = new ProjectRepository(transport, "v2");
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const { state, event, receipt } = fixture();
     transport.failOnceOn = "/BRIEF.md";
 

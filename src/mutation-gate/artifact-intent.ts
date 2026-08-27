@@ -10,11 +10,11 @@ import {
   type ResolvedArtifactDestination
 } from "../persistence/artifact-routing";
 import { requireDropboxV1Evidence } from "../persistence/compatibility/dropbox-v1-evidence";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import {
   asProjectOsPersistence,
   type PersistenceInput
-} from "../persistence/compatibility/legacy-dropbox-runtime";
-import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+} from "../persistence/provider/runtime";
 import { sha256Text } from "../documents/hash";
 import { MutationGateRepository, MutationIntentConflictError } from "./repository";
 

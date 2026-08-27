@@ -27,6 +27,9 @@ export function mapDropboxError(error: unknown, operation: DropboxOperation): Er
     return new ProviderCursorResetError(error.message, diagnostics(error));
   }
   if (error instanceof DropboxConflictError) {
+    if (isTransientDropboxFailure(error.status, error.responseBody)) {
+      return new ProviderOperationError(error.message, true, diagnostics(error));
+    }
     if (operation === "conditional-write") {
       return new ProviderPreconditionFailedError(error.message, diagnostics(error));
     }

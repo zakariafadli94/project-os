@@ -7,6 +7,7 @@ import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class ReferenceDropbox implements DropboxTransport {
   files = new Map<string, string>();
@@ -90,10 +91,11 @@ function change(meta: DropboxFileMetadata): ProviderChangeEntry {
 describe("reference reconciliation", () => {
   it("captures a human edit of a managed reference as a new reference version", async () => {
     const dropbox = new ReferenceDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const state = project();
     const inputPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "market/report.pdf");
     const first = await dropbox.externalAdd(inputPath, "report-v1");
-    const reconciler = new ManagedDocumentReconciler(dropbox);
+    const reconciler = new ManagedDocumentReconciler(runtime);
     await reconciler.reconcileChanges(state, [change(first)]);
 
     const referencePath = workspaceManagedDocumentPath(state.project_id, state.slug, "references", "UNCLASSIFIED/market/report.pdf");
@@ -102,7 +104,7 @@ describe("reference reconciliation", () => {
 
     const documentId = await documentIdForProviderFile(state.project_id, first.id);
     const versionId = await externalVersionIdFor(edited.rev);
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(state.project_id, documentId);
     expect(head?.reference_version_id).toBe(versionId);
     expect(head?.provider?.reference).toMatchObject({ path: referencePath, rev: edited.rev, content_hash: edited.content_hash });
@@ -111,17 +113,18 @@ describe("reference reconciliation", () => {
 
   it("removes a duplicate INPUTS file when identical content is already the current managed reference", async () => {
     const dropbox = new ReferenceDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const state = project();
     const firstPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "market/report.pdf");
     const first = await dropbox.externalAdd(firstPath, "same-report-bytes");
-    const reconciler = new ManagedDocumentReconciler(dropbox);
+    const reconciler = new ManagedDocumentReconciler(runtime);
     await reconciler.reconcileChanges(state, [change(first)]);
 
     const secondPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "duplicates/report-copy.pdf");
     const duplicate = await dropbox.externalAdd(secondPath, "same-report-bytes");
     const result = await reconciler.reconcileChanges(state, [change(duplicate)]);
 
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     const fingerprint = await ledger.readReferenceFingerprint(state.project_id, duplicate.content_hash);
     const originalDocumentId = await documentIdForProviderFile(state.project_id, first.id);
     const duplicateDocumentId = await documentIdForProviderFile(state.project_id, duplicate.id);
@@ -133,10 +136,11 @@ describe("reference reconciliation", () => {
 
   it("does not deduplicate against an old historical fingerprint after the managed reference changed", async () => {
     const dropbox = new ReferenceDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
     const state = project();
     const originalInput = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "market/report.pdf");
     const first = await dropbox.externalAdd(originalInput, "old-report-bytes");
-    const reconciler = new ManagedDocumentReconciler(dropbox);
+    const reconciler = new ManagedDocumentReconciler(runtime);
     await reconciler.reconcileChanges(state, [change(first)]);
 
     const referencePath = workspaceManagedDocumentPath(state.project_id, state.slug, "references", "UNCLASSIFIED/market/report.pdf");
@@ -148,7 +152,7 @@ describe("reference reconciliation", () => {
     const result = await reconciler.reconcileChanges(state, [change(historicalCopy)]);
 
     const secondDocumentId = await documentIdForProviderFile(state.project_id, historicalCopy.id);
-    const ledger = new DocumentLedgerRepository(dropbox);
+    const ledger = new DocumentLedgerRepository(runtime);
     expect(result).toMatchObject({ ingested: 1, duplicates: 0 });
     expect(await ledger.readHead(state.project_id, secondDocumentId)).toMatchObject({
       kind: "reference",

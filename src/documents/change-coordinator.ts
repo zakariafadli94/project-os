@@ -1,12 +1,12 @@
 import type { ProjectState } from "../domain/project-state";
 import { MutationGateClassifier } from "../mutation-gate/classifier";
 import { MutationGateService, type MutationGateMode, type MutationGateProcessSummary } from "../mutation-gate/service";
+import { workspaceProjectRoot } from "../persistence/layout";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import {
   asProjectOsPersistence,
   type PersistenceInput
-} from "../persistence/compatibility/legacy-dropbox-runtime";
-import { workspaceProjectRoot } from "../persistence/layout";
-import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+} from "../persistence/provider/runtime";
 import type {
   ProviderChangeEntry,
   ProviderChangePage,

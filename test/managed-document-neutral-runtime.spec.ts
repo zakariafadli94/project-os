@@ -2,10 +2,11 @@ import { expect, it } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
 import { ManagedDocumentBootstrapper } from "../src/documents/bootstrap";
 import { sha256Text } from "../src/documents/hash";
+import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { ManagedDocumentService } from "../src/documents/service";
 import { workspaceManagedDocumentPath } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
-import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
+import type { ProviderChangeEntry, ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
 
 function neutralRuntime(): {
@@ -146,4 +147,24 @@ it("bootstraps an existing managed file through neutral metadata and copy capabi
     provider_rev: metadata.revisionToken,
     provider_content_hash: metadata.integrityHash?.value
   });
+});
+
+it("reconciles neutral provider change entries without Dropbox runtime types", async () => {
+  const { runtime } = neutralRuntime();
+  const state = emptyProjectState("PRJ-0002", "Project OS", "project-os", "Managed docs");
+  const path = workspaceManagedDocumentPath(
+    state.project_id,
+    state.slug,
+    "working",
+    "strategy/missing.md"
+  );
+  const change: ProviderChangeEntry = {
+    kind: "deleted",
+    name: "missing.md",
+    path
+  };
+
+  const summary = await new ManagedDocumentReconciler(runtime).reconcileChanges(state, [change]);
+
+  expect(summary).toMatchObject({ scanned: 1, ignored: 1, restored: 0, conflicts: 0 });
 });

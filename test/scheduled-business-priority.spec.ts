@@ -70,6 +70,12 @@ function blockNextInboxList(mock: ReturnType<typeof installDropboxMock>) {
   };
 }
 
+function maintenanceCallsWhileInboxBlocked(calls: string[]): string[] {
+  // Dropbox auth refresh belongs to the already-started inbox path. Any other
+  // provider call while list_folder is blocked must come from maintenance.
+  return calls.filter((call) => call !== "POST /oauth2/token");
+}
+
 function researchTransaction(
   projectId: string,
   transactionId: string,
@@ -125,7 +131,7 @@ describe("business ingress priority", () => {
     const scheduledBaseline = mock.calls.length;
     await new Promise((resolve) => setTimeout(resolve, 100));
     const scheduledBlocked = scheduledGate.blocked();
-    const scheduledCallsWhileBlocked = mock.calls.slice(scheduledBaseline);
+    const scheduledCallsWhileBlocked = maintenanceCallsWhileInboxBlocked(mock.calls.slice(scheduledBaseline));
 
     scheduledGate.releaseInbox();
     await waitOnExecutionContext(scheduledCtx);
@@ -157,7 +163,7 @@ describe("business ingress priority", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 100));
     const webhookBlocked = webhookGate.blocked();
-    const webhookCallsWhileBlocked = mock.calls.slice(webhookBaseline);
+    const webhookCallsWhileBlocked = maintenanceCallsWhileInboxBlocked(mock.calls.slice(webhookBaseline));
 
     webhookGate.releaseInbox();
     await waitOnExecutionContext(webhookCtx);

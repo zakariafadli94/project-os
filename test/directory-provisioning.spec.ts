@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseTransaction } from "../src/domain/transaction";
 import { applyTransaction } from "../src/domain/transitions";
+import { requireProjectOsPersistence } from "../src/persistence/provider/capabilities";
 import { createDropboxPersistence } from "../src/persistence/providers/dropbox/adapter";
 import {
   DropboxClient,
@@ -94,9 +95,9 @@ describe("directory provisioning capability", () => {
 
   it("does not bootstrap managed zones for an explicitly requested projection v1 materialization", async () => {
     const calls: string[] = [];
-    const runtime = createDropboxPersistence(rawTransport({
+    const runtime = requireProjectOsPersistence(createDropboxPersistence(rawTransport({
       ensureDirectory: async (path) => { calls.push(path); }
-    }));
+    })));
     const repository = new ProjectRepository(runtime, "v2");
 
     await repository.materializeCanonicalDerivatives(projectRecord(), {

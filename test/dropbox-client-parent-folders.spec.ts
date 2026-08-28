@@ -4,7 +4,7 @@ import { DropboxClient } from "../src/persistence/providers/dropbox/client";
 describe("DropboxClient parent folder recovery", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("creates missing parent folders and retries an upload after path/not_found", async () => {
+  it("creates the missing immediate parent and retries an upload after path/not_found", async () => {
     const createdFolders: string[] = [];
     let uploadAttempts = 0;
 
@@ -50,14 +50,11 @@ describe("DropboxClient parent folder recovery", () => {
 
     expect(uploadAttempts).toBe(2);
     expect(createdFolders).toEqual([
-      "/PROJECT_OS",
-      "/PROJECT_OS/WORKSPACE",
-      "/PROJECT_OS/WORKSPACE/PROJECTS",
       "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os"
     ]);
   });
 
-  it("creates missing destination parent folders and retries a move after to/not_found", async () => {
+  it("creates the missing destination parent and retries a move after to/not_found", async () => {
     const createdFolders: string[] = [];
     let moveAttempts = 0;
 
@@ -102,8 +99,6 @@ describe("DropboxClient parent folder recovery", () => {
 
     expect(moveAttempts).toBe(2);
     expect(createdFolders).toEqual([
-      "/PROJECT_OS",
-      "/PROJECT_OS/ARCHIVE",
       "/PROJECT_OS/ARCHIVE/PROJECTS"
     ]);
   });

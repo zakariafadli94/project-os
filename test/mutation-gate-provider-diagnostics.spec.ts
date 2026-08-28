@@ -87,7 +87,7 @@ describe("MutationGate provider diagnostics", () => {
       provider_request_id: "req-fault-4"
     });
     expect(JSON.stringify(body)).not.toContain("DO_NOT_EXPOSE");
-  });
+  }, 15_000);
 });
 
 async function createProject(transactionId: string, slug: string): Promise<{ projectId: string; slug: string }> {

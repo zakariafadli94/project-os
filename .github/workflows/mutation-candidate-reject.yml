@@ -88,20 +88,56 @@ jobs:
           console.log(`Validated ${candidateIds.length} candidate reject request(s) for ${projectId}`);
           NODE
 
-      - name: Generate ephemeral operator token
+      - name: Generate ephemeral operator token and version tags
         shell: bash
         run: |
           set -euo pipefail
           OPERATOR_TOKEN=$(node -e 'const { randomBytes } = require("node:crypto"); process.stdout.write(`${Date.now()}.${randomBytes(32).toString("hex")}`)')
+          OPERATOR_VERSION_TAG="mg-op-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          CLEAN_BASE_VERSION_TAG="mg-clean-base-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          CLEANUP_VERSION_TAG="mg-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "::add-mask::$OPERATOR_TOKEN"
-          echo "OPERATOR_TOKEN=$OPERATOR_TOKEN" >> "$GITHUB_ENV"
+          {
+            echo "OPERATOR_TOKEN=$OPERATOR_TOKEN"
+            echo "OPERATOR_VERSION_TAG=$OPERATOR_VERSION_TAG"
+            echo "CLEAN_BASE_VERSION_TAG=$CLEAN_BASE_VERSION_TAG"
+            echo "CLEANUP_VERSION_TAG=$CLEANUP_VERSION_TAG"
+            echo "CLEAN_BASE_VERSION_CREATED=false"
+            echo "TOKEN_VERSION_CREATED=false"
+            echo "TOKEN_VERSION_DEPLOYED=false"
+          } >> "$GITHUB_ENV"
 
-      - name: Install ephemeral operator token
+      - name: Stage clean fallback version
         shell: bash
         run: |
           set -euo pipefail
-          node -e 'process.stdout.write(JSON.stringify({MUTATION_GATE_OPERATOR_TOKEN: process.env.OPERATOR_TOKEN}))' \
-            | npx wrangler secret bulk
+          npx wrangler versions upload \
+            --tag "$CLEAN_BASE_VERSION_TAG" \
+            --message "MutationGate clean fallback for run $GITHUB_RUN_ID"
+          echo "CLEAN_BASE_VERSION_CREATED=true" >> "$GITHUB_ENV"
+
+      - name: Create ephemeral operator-token version
+        shell: bash
+        run: |
+          set -euo pipefail
+          secret_file="$RUNNER_TEMP/mutationgate-operator-secrets.json"
+          trap 'rm -f "$secret_file"' EXIT
+          node -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({MUTATION_GATE_OPERATOR_TOKEN: process.env.OPERATOR_TOKEN}), { mode: 0o600 })' "$secret_file"
+          npx wrangler versions upload \
+            --secrets-file "$secret_file" \
+            --tag "$OPERATOR_VERSION_TAG" \
+            --message "MutationGate ephemeral operator token for run $GITHUB_RUN_ID"
+          echo "TOKEN_VERSION_CREATED=true" >> "$GITHUB_ENV"
+
+      - name: Deploy ephemeral operator-token version
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler versions deploy \
+            --version-tag "$OPERATOR_VERSION_TAG@100%" \
+            --message "MutationGate operator window for run $GITHUB_RUN_ID" \
+            --yes
+          echo "TOKEN_VERSION_DEPLOYED=true" >> "$GITHUB_ENV"
 
       - name: Verify ephemeral operator token readiness
         shell: bash
@@ -221,25 +257,79 @@ jobs:
         run: |
           set -u -o pipefail
           if [ -z "${OPERATOR_TOKEN:-}" ]; then
-            echo "No operator token was generated; no remote operator secret could have been installed."
+            echo "No operator token was generated; no remote operator version could have been created."
             exit 0
           fi
 
           cleanup_failed=0
+          cleanup_deployed=0
 
-          if ! printf '%s' '{"MUTATION_GATE_OPERATOR_TOKEN":null}' | npx wrangler secret bulk; then
-            echo "Failed to delete MUTATION_GATE_OPERATOR_TOKEN."
+          if [ "${TOKEN_VERSION_CREATED:-false}" = "true" ]; then
+            latest_ok=0
+            if npx wrangler versions list --json > "$RUNNER_TEMP/mutationgate-versions.json"; then
+              if node <<'NODE'
+          const fs = require("node:fs");
+          const versions = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/mutationgate-versions.json", "utf8"));
+          if (!Array.isArray(versions) || versions.length === 0) process.exit(1);
+          const strings = [];
+          const collect = (value) => {
+            if (typeof value === "string") strings.push(value);
+            else if (Array.isArray(value)) value.forEach(collect);
+            else if (value && typeof value === "object") Object.values(value).forEach(collect);
+          };
+          collect(versions[0]);
+          if (!strings.includes(process.env.OPERATOR_VERSION_TAG)) process.exit(1);
+          NODE
+              then
+                latest_ok=1
+              fi
+            fi
+
+            if [ "$latest_ok" -eq 1 ]; then
+              if npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN \
+                --tag "$CLEANUP_VERSION_TAG" \
+                --message "MutationGate operator-token cleanup for run $GITHUB_RUN_ID"; then
+                if npx wrangler versions deploy \
+                  --version-tag "$CLEANUP_VERSION_TAG@100%" \
+                  --message "MutationGate clean production after run $GITHUB_RUN_ID" \
+                  --yes; then
+                  cleanup_deployed=1
+                else
+                  echo "Failed to deploy the versioned operator-token cleanup."
+                fi
+              else
+                echo "Failed to create the versioned operator-token cleanup."
+              fi
+            else
+              echo "Latest Worker version drifted after operator-token creation; refusing to derive cleanup from an unknown version."
+            fi
+          fi
+
+          if [ "$cleanup_deployed" -ne 1 ] && [ "${CLEAN_BASE_VERSION_CREATED:-false}" = "true" ]; then
+            echo "Deploying the pre-token clean fallback version."
+            if npx wrangler versions deploy \
+              --version-tag "$CLEAN_BASE_VERSION_TAG@100%" \
+              --message "MutationGate emergency clean fallback for run $GITHUB_RUN_ID" \
+              --yes; then
+              cleanup_deployed=1
+            else
+              echo "Failed to deploy the pre-token clean fallback version."
+            fi
+          fi
+
+          if [ "${TOKEN_VERSION_DEPLOYED:-false}" = "true" ] && [ "$cleanup_deployed" -ne 1 ]; then
+            echo "Operator-token version was deployed but no clean version could be restored."
             cleanup_failed=1
           fi
 
           health_ok=0
-          for attempt in 1 2 3 4 5; do
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
             if response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health"); then
               echo "$response"
               health_ok=1
               break
             fi
-            sleep 5
+            sleep 3
           done
           if [ "$health_ok" -ne 1 ]; then
             echo "Production health check failed after operator-token cleanup."

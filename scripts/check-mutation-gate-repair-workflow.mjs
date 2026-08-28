@@ -20,6 +20,13 @@ const requireText = (needle, label = needle) => {
 const forbid = (pattern, label) => {
   if (pattern.test(workflow)) throw new Error(`MutationGate repair workflow must not contain ${label}`);
 };
+const requireBefore = (first, second, label) => {
+  const firstIndex = workflow.indexOf(first);
+  const secondIndex = workflow.indexOf(second);
+  if (firstIndex === -1 || secondIndex === -1 || firstIndex >= secondIndex) {
+    throw new Error(`MutationGate repair workflow has invalid ordering for ${label}`);
+  }
+};
 
 requireText("workflow_dispatch:", "manual workflow_dispatch trigger");
 requireText("issues:", "connector-accessible issue trigger");
@@ -30,13 +37,24 @@ forbid(/PROJECT_OS_INGRESS_TOKEN/, "persistent GitHub ingress-token dependency")
 requireText("CLOUDFLARE_API_TOKEN", "existing Cloudflare API credential");
 requireText("CLOUDFLARE_ACCOUNT_ID", "existing Cloudflare account credential");
 requireText("MUTATION_GATE_OPERATOR_TOKEN", "ephemeral Worker operator secret");
-requireText("wrangler secret bulk", "non-interactive Worker secret lifecycle");
+requireText("npx wrangler versions upload", "fresh exact-head Worker version upload");
+requireText("npx wrangler versions secret bulk", "version-scoped Worker secret installation");
+requireText("npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN", "prebuilt no-token cleanup version");
+requireText("OPERATOR_BASE_TAG", "unique base version tag");
+requireText("OPERATOR_SECRET_TAG", "unique operator-secret version tag");
+requireText("OPERATOR_CLEANUP_TAG", "unique cleanup version tag");
+requireText('--version-tag "${OPERATOR_SECRET_TAG}@100%"', "100-percent operator-secret version deployment");
+requireText('--version-tag "${OPERATOR_CLEANUP_TAG}@100%"', "100-percent cleanup version deployment");
+requireText("OPERATOR_VERSIONS_PREPARED=true", "prepared-version lifecycle marker");
+requireText("OPERATOR_VERSION_DEPLOYED=true", "deployed operator-version lifecycle marker");
+requireText("group: project-os-production", "shared production deployment concurrency lock");
+forbid(/group: mutation-candidate-reject-operator/, "operator-only concurrency group");
+forbid(/\bnpx wrangler secret bulk\b/, "legacy immediate secret mutation command");
 requireText("::add-mask::", "GitHub log masking");
 requireText("if: always()", "unconditional cleanup path");
 requireText("HTTP 401", "post-cleanup revocation verification");
 requireText("github.repository_owner", "owner-only issue trigger guard");
 requireText("[operator] MutationGate PRJ-0003 reject repair", "exact connector control issue title");
-requireText("group: mutation-candidate-reject-operator", "global operator-token concurrency lock");
 requireText("cancel-in-progress: false", "non-cancelling operator queue");
 requireText("/v1/mutation-candidates/resolve", "governed resolution endpoint");
 requireText('{"operation":"candidate.reject"', "explicit candidate.reject payload");
@@ -52,6 +70,9 @@ requireText("candidate reject received HTTP 401", "per-candidate 401 retry diagn
 requireText("await new Promise((resolve) => setTimeout(resolve, 3000))", "bounded per-candidate retry delay");
 requireText("for (let attempt = 1; attempt <= 10; attempt += 1)", "bounded per-candidate retry loop");
 requireText("const payloadJson = JSON.stringify(payload)", "stable retry payload serialization");
+requireBefore("npx wrangler versions upload", "npx wrangler versions secret bulk", "fresh base upload before secret patch");
+requireBefore("npx wrangler versions secret bulk", "npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN", "secret version before cleanup version");
+requireBefore("npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN", '--version-tag "${OPERATOR_SECRET_TAG}@100%"', "cleanup version prepared before operator version deployment");
 forbid(/Verify production health after token install/, "health-only operator-token readiness check");
 forbid(/dropbox/i, "direct Dropbox access");
 

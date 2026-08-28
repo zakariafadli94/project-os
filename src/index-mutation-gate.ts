@@ -5,12 +5,15 @@ import baseWorker from "./index";
 export { MutationGateProjectGuard as ProjectGuard } from "./durable/project-guard-mutation-gate";
 export { RegistryGuard } from "./durable/registry-guard";
 
+const OPERATOR_TOKEN_TTL_MS = 15 * 60_000;
+const OPERATOR_TOKEN_FUTURE_SKEW_MS = 60_000;
+
 const worker = {
   ...baseWorker,
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/v1/mutation-candidates/resolve") {
-      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      if (!authorizedResolution(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 
       let resolution;
       try {
@@ -36,9 +39,28 @@ const worker = {
 
 export default worker;
 
-function authorized(request: Request, env: Env): boolean {
+function authorizedResolution(request: Request, env: Env, now = Date.now()): boolean {
   const authorization = request.headers.get("authorization");
-  return Boolean(authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`));
+  if (!authorization) return false;
+
+  if (secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`)) return true;
+
+  const operatorToken = env.MUTATION_GATE_OPERATOR_TOKEN;
+  if (!operatorToken || !validOperatorToken(operatorToken, now)) return false;
+
+  return secureStringEqual(authorization, `Bearer ${operatorToken}`);
+}
+
+function validOperatorToken(token: string, now: number): boolean {
+  const separator = token.indexOf(".");
+  if (separator <= 0) return false;
+
+  const issuedAt = Number(token.slice(0, separator));
+  if (!Number.isSafeInteger(issuedAt)) return false;
+  if (issuedAt > now + OPERATOR_TOKEN_FUTURE_SKEW_MS) return false;
+  if (now - issuedAt > OPERATOR_TOKEN_TTL_MS) return false;
+
+  return true;
 }
 
 function secureStringEqual(left: string, right: string): boolean {

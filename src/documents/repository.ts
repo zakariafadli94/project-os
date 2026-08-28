@@ -1,7 +1,5 @@
 import {
   documentIdForProviderFile,
-  parseDocumentVersionRecord,
-  parseManagedDocumentHead,
   type DocumentVersionRecord,
   type ManagedDocumentHead,
   type ManagedProviderObservation
@@ -26,6 +24,19 @@ import {
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ObjectPersistence, ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderConflictError } from "../persistence/provider/errors";
+import {
+  encodeDocumentVersionRecord,
+  encodeManagedDocumentHead,
+  readDocumentVersionRecord,
+  readManagedDocumentHead,
+  type CurrentDocumentVersionRecord,
+  type CurrentManagedDocumentHead,
+  type CurrentManagedProviderObservation,
+  type DocumentVersionWriteInput,
+  type ManagedDocumentHeadWriteInput
+} from "../schema/managed-document";
+import { upcastDropboxV1Observation, type ProviderObservation } from "../schema/provider-evidence";
+import type { SchemaWriterStage } from "../schema/writer-stage";
 import { sha256Text } from "./hash";
 
 export interface ReferenceFingerprintRecord {
@@ -46,47 +57,55 @@ export interface ProviderFileBindingRecord {
 export class DocumentLedgerRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
 
-  constructor(input: PersistenceInput) {
+  constructor(
+    input: PersistenceInput,
+    private readonly schemaWriterStage: SchemaWriterStage = "v1_only"
+  ) {
     this.runtime = asProjectOsPersistence(input);
   }
 
-  async readHead(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
+  async readHead(projectId: string, documentId: string): Promise<CurrentManagedDocumentHead | null> {
     const raw = await this.runtime.objects.readText(machineDocumentHeadPath(projectId, documentId));
     if (raw === null) return null;
-    const head = parseManagedDocumentHead(JSON.parse(raw));
+    const head = readManagedDocumentHead(JSON.parse(raw)).head;
     if (head.project_id !== projectId || head.document_id !== documentId) {
       throw new Error(`Managed document head binding mismatch for ${projectId}/${documentId}`);
     }
     return head;
   }
 
-  async readVersion(projectId: string, documentId: string, versionId: string): Promise<DocumentVersionRecord | null> {
+  async readVersion(projectId: string, documentId: string, versionId: string): Promise<CurrentDocumentVersionRecord | null> {
     const raw = await this.runtime.objects.readText(machineDocumentVersionPath(projectId, documentId, versionId));
     if (raw === null) return null;
-    const record = parseDocumentVersionRecord(JSON.parse(raw));
+    const record = readDocumentVersionRecord(JSON.parse(raw)).record;
     if (record.project_id !== projectId || record.document_id !== documentId || record.version_id !== versionId) {
       throw new Error(`Managed document version binding mismatch for ${projectId}/${documentId}/${versionId}`);
     }
     return record;
   }
 
-  async writeVersion(record: DocumentVersionRecord): Promise<void> {
-    const validated = parseDocumentVersionRecord(record);
+  async writeVersion(record: DocumentVersionWriteInput): Promise<void> {
+    const serialized = encodeDocumentVersionRecord(record, this.schemaWriterStage);
+    const validated = readDocumentVersionRecord(serialized).record;
     const path = machineDocumentVersionPath(validated.project_id, validated.document_id, validated.version_id);
-    const content = pretty(validated);
+    const content = pretty(serialized);
     try {
       await this.runtime.objects.createText(path, content);
     } catch (error) {
       if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.runtime.objects.readText(path);
-      if (existing !== content) {
+      if (existing === null) throw error;
+      const existingRecord = readDocumentVersionRecord(JSON.parse(existing)).record;
+      const canonicalExisting = pretty(encodeDocumentVersionRecord(existingRecord, this.schemaWriterStage));
+      if (canonicalExisting !== content) {
         throw new Error(`Immutable document version conflict with different content: ${path}`);
       }
     }
   }
 
-  async writeHead(head: ManagedDocumentHead): Promise<void> {
-    const validated = parseManagedDocumentHead(head);
+  async writeHead(head: ManagedDocumentHeadWriteInput): Promise<void> {
+    const serialized = encodeManagedDocumentHead(head, this.schemaWriterStage);
+    const validated = readManagedDocumentHead(serialized).head;
     const pointers: Array<[keyof ManagedDocumentHead, string | undefined]> = [
       ["reference_version_id", validated.reference_version_id],
       ["working_version_id", validated.working_version_id],
@@ -108,7 +127,7 @@ export class DocumentLedgerRepository {
 
     await this.runtime.objects.upsertText(
       machineDocumentHeadPath(validated.project_id, validated.document_id),
-      pretty(validated)
+      pretty(serialized)
     );
   }
 
@@ -251,11 +270,11 @@ export class DocumentLedgerRepository {
     }
   }
 
-  async restoreHeadFromVersions(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
+  async restoreHeadFromVersions(projectId: string, documentId: string): Promise<CurrentManagedDocumentHead | null> {
     if (!/^DOC-[A-F0-9]{24}$/.test(documentId)) throw new Error(`Unsafe document id: ${documentId}`);
     const versionRoot = `${machineDocumentRoot(projectId)}/versions/${documentId}`;
     const entries = await this.runtime.objects.listChildren(versionRoot);
-    const records = new Map<string, DocumentVersionRecord>();
+    const records = new Map<string, CurrentDocumentVersionRecord>();
 
     for (const entry of entries) {
       if (entry.kind !== "file") continue;
@@ -286,7 +305,7 @@ export class DocumentLedgerRepository {
     }
     const tip = tips[0];
 
-    let head: ManagedDocumentHead;
+    let head: CurrentManagedDocumentHead;
     if (kind === "reference") {
       if (tip.stage !== "reference") {
         throw new Error(`Managed reference history has non-reference active tip ${tip.version_id}`);
@@ -310,7 +329,7 @@ export class DocumentLedgerRepository {
       const publishedAncestor = tip.stage === "published"
         ? tip
         : nearestAncestorAtStage(tip, records, "published");
-      const provider: Record<string, ManagedProviderObservation> = {};
+      const provider: Record<string, CurrentManagedProviderObservation> = {};
       const publishedProvider = publishedAncestor
         ? await providerObservationForVersion(this.runtime.objects, publishedAncestor)
         : undefined;
@@ -334,9 +353,8 @@ export class DocumentLedgerRepository {
       };
     }
 
-    const validated = parseManagedDocumentHead(head);
-    await this.writeHead(validated);
-    return validated;
+    await this.writeHead(head);
+    return head;
   }
 }
 
@@ -363,8 +381,8 @@ function pointerAcceptsStage(field: keyof ManagedDocumentHead, stage: DocumentVe
 }
 
 function isCausallyComplete(
-  record: DocumentVersionRecord,
-  records: ReadonlyMap<string, DocumentVersionRecord>,
+  record: CurrentDocumentVersionRecord,
+  records: ReadonlyMap<string, CurrentDocumentVersionRecord>,
   visiting: Set<string>
 ): boolean {
   if (!record.parent_version_id) return true;
@@ -378,11 +396,11 @@ function isCausallyComplete(
 }
 
 function nearestAncestorAtStage(
-  record: DocumentVersionRecord,
-  records: ReadonlyMap<string, DocumentVersionRecord>,
+  record: CurrentDocumentVersionRecord,
+  records: ReadonlyMap<string, CurrentDocumentVersionRecord>,
   stage: DocumentVersionRecord["stage"]
-): DocumentVersionRecord | undefined {
-  let current: DocumentVersionRecord | undefined = record;
+): CurrentDocumentVersionRecord | undefined {
+  let current: CurrentDocumentVersionRecord | undefined = record;
   const visited = new Set<string>();
   while (current?.parent_version_id) {
     if (visited.has(current.version_id)) return undefined;
@@ -395,8 +413,8 @@ function nearestAncestorAtStage(
 
 async function providerObservationForVersion(
   objects: ObjectPersistence,
-  record: DocumentVersionRecord
-): Promise<ManagedProviderObservation | undefined> {
+  record: CurrentDocumentVersionRecord
+): Promise<CurrentManagedProviderObservation | undefined> {
   const stored = providerObservationFromVersion(record);
   if (!stored) return undefined;
   const current = await objects.getMetadata(stored.path);
@@ -404,16 +422,19 @@ async function providerObservationForVersion(
     try {
       const evidence = requireDropboxV1Evidence(current);
       if (evidence.content_hash === stored.content_hash && evidence.size === stored.size) {
-        return toManagedProviderObservation(current);
+        return currentObservationFromLegacy(toManagedProviderObservation(current));
       }
     } catch {
-      // Fall back to durable schema-1.0 evidence when live metadata cannot be proven compatible.
+      // Fall back to durable evidence when live metadata cannot be proven compatible.
     }
   }
   return stored;
 }
 
-function providerObservationFromVersion(record: DocumentVersionRecord): ManagedProviderObservation | undefined {
+function providerObservationFromVersion(
+  record: CurrentDocumentVersionRecord
+): CurrentManagedProviderObservation | undefined {
+  if (record.provider_evidence) return currentObservationFromProvider(record.provider_evidence);
   if (
     !record.provider_path
     || !record.provider_file_id
@@ -421,16 +442,34 @@ function providerObservationFromVersion(record: DocumentVersionRecord): ManagedP
     || !record.provider_content_hash
     || record.size === undefined
   ) return undefined;
-  return {
-    path: record.provider_path,
-    file_id: record.provider_file_id,
-    rev: record.provider_rev,
-    content_hash: record.provider_content_hash,
+  return currentObservationFromProvider(upcastDropboxV1Observation({
+    provider_path: record.provider_path,
+    provider_file_id: record.provider_file_id,
+    provider_rev: record.provider_rev,
+    provider_content_hash: record.provider_content_hash,
     size: record.size
+  }));
+}
+
+function currentObservationFromLegacy(value: ManagedProviderObservation): CurrentManagedProviderObservation {
+  return currentObservationFromProvider(upcastDropboxV1Observation(value));
+}
+
+function currentObservationFromProvider(value: ProviderObservation): CurrentManagedProviderObservation {
+  return {
+    path: value.path,
+    file_id: value.object_id,
+    rev: value.revision_token,
+    content_hash: value.integrity_hash.value,
+    size: value.size,
+    provider_id: value.provider_id,
+    object_id: value.object_id,
+    revision_token: value.revision_token,
+    integrity_hash: value.integrity_hash
   };
 }
 
-function referenceCollectionFromVersion(record: DocumentVersionRecord): string | undefined {
+function referenceCollectionFromVersion(record: CurrentDocumentVersionRecord): string | undefined {
   if (!record.provider_path) return undefined;
   const marker = "/REFERENCES/";
   const index = record.provider_path.indexOf(marker);

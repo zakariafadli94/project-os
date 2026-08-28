@@ -160,34 +160,48 @@ jobs:
               project_id: projectId,
               candidate_id: candidateId
             };
+            const payloadJson = JSON.stringify(payload);
 
-            const response = await fetch(`${baseUrl}/v1/mutation-candidates/resolve`, {
-              method: "POST",
-              headers: {
-                authorization: `Bearer ${token}`,
-                "content-type": "application/json"
-              },
-              body: JSON.stringify(payload)
-            });
-            const raw = await response.text();
-            let body;
-            try {
-              body = JSON.parse(raw);
-            } catch {
-              throw new Error(`${candidateId}: non-JSON response (${response.status})`);
-            }
+            for (let attempt = 1; attempt <= 10; attempt += 1) {
+              const response = await fetch(`${baseUrl}/v1/mutation-candidates/resolve`, {
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  "content-type": "application/json"
+                },
+                body: payloadJson
+              });
+              const raw = await response.text();
 
-            if (!response.ok) {
-              throw new Error(`${candidateId}: HTTP ${response.status}: ${raw}`);
-            }
-            if (body.status !== "committed" || body.action !== "reject") {
-              throw new Error(`${candidateId}: expected {"status":"committed","action":"reject"}, received ${raw}`);
-            }
-            if (body.project_id !== projectId || body.candidate_id !== candidateId || body.resolution_id !== resolutionId) {
-              throw new Error(`${candidateId}: response identity mismatch`);
-            }
+              if (response.status === 401) {
+                if (attempt === 10) {
+                  throw new Error(`${candidateId}: HTTP 401 after ${attempt} attempts: ${raw}`);
+                }
+                console.log(`${candidateId}: candidate reject received HTTP 401 on attempt ${attempt}; retrying the same resolution request.`);
+                await new Promise((resolve) => setTimeout(resolve, 3000));
+                continue;
+              }
 
-            console.log(`${candidateId}: committed reject (${resolutionId})`);
+              let body;
+              try {
+                body = JSON.parse(raw);
+              } catch {
+                throw new Error(`${candidateId}: non-JSON response (${response.status})`);
+              }
+
+              if (!response.ok) {
+                throw new Error(`${candidateId}: HTTP ${response.status}: ${raw}`);
+              }
+              if (body.status !== "committed" || body.action !== "reject") {
+                throw new Error(`${candidateId}: expected {"status":"committed","action":"reject"}, received ${raw}`);
+              }
+              if (body.project_id !== projectId || body.candidate_id !== candidateId || body.resolution_id !== resolutionId) {
+                throw new Error(`${candidateId}: response identity mismatch`);
+              }
+
+              console.log(`${candidateId}: committed reject (${resolutionId})`);
+              return;
+            }
           }
 
           (async () => {

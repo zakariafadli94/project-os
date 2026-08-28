@@ -48,6 +48,10 @@ requireText("Verify ephemeral operator token readiness", "authenticated operator
 requireText("invalid_mutation_candidate_resolution", "readiness probe authenticated-response contract");
 requireText("readiness probe received HTTP 401", "readiness retry on stale Worker version");
 requireText("--data '{}'", "non-mutating invalid readiness probe payload");
+requireText("candidate reject received HTTP 401", "per-candidate 401 retry diagnostic");
+requireText("await new Promise((resolve) => setTimeout(resolve, 3000))", "bounded per-candidate retry delay");
+requireText("for (let attempt = 1; attempt <= 10; attempt += 1)", "bounded per-candidate retry loop");
+requireText("const payloadJson = JSON.stringify(payload)", "stable retry payload serialization");
 forbid(/Verify production health after token install/, "health-only operator-token readiness check");
 forbid(/dropbox/i, "direct Dropbox access");
 

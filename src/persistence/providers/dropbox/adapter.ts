@@ -79,6 +79,12 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
     };
   }
 
+  if (raw.ensureDirectory) {
+    runtime.directoryProvisioning = {
+      ensureDirectory: (path) => call("ensure-directory", () => raw.ensureDirectory!(path))
+    };
+  }
+
   return runtime;
 }
 

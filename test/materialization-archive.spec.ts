@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import {
@@ -72,7 +73,7 @@ describe("archive-safe materialization", () => {
 
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     const activeHead = JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}");
-    expect(activeHead).toMatchObject({ target_revision: 1, projection_version: 1, workspace_location: "active" });
+    expect(activeHead).toMatchObject({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION, workspace_location: "active" });
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(true);
 
     const archived = await archiveProject(projectId, "TXN-MATARCH-ARCHIVE-000001");
@@ -84,8 +85,8 @@ describe("archive-safe materialization", () => {
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);
 
     const head = JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}");
-    expect(head).toMatchObject({ target_revision: 2, projection_version: 1, workspace_location: "archive" });
-    const record = JSON.parse(mock.files.get(machineMaterializationRecordPath(projectId, 2, 1)) ?? "{}");
+    expect(head).toMatchObject({ target_revision: 2, projection_version: CURRENT_PROJECTION_VERSION, workspace_location: "archive" });
+    const record = JSON.parse(mock.files.get(machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION)) ?? "{}");
     expect(record.workspace_location).toBe("archive");
     expect(record.outputs["global:STATE"].relative_path).toBe("STATE.md");
     expect(record.outputs["global:HANDOFF"].relative_path).toBe("HANDOFF.md");
@@ -113,7 +114,7 @@ describe("archive-safe materialization", () => {
     faults.push({
       endpoint: "/2/files/upload",
       method: "POST",
-      path: machineMaterializationRecordPath(projectId, 2, 1),
+      path: machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION),
       occurrence: 1,
       status: 400,
       error_summary: "injected/archive_record_failure"
@@ -125,7 +126,7 @@ describe("archive-safe materialization", () => {
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(false);
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
-    expect(mock.files.has(machineMaterializationRecordPath(projectId, 2, 1))).toBe(false);
+    expect(mock.files.has(machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION))).toBe(false);
 
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(false);

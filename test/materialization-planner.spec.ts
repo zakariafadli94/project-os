@@ -235,7 +235,7 @@ describe("projection hashing and incremental planning", () => {
     expect(plan.changed_outputs.has("global:PROJECT")).toBe(false);
   });
 
-  it("projection-version change rematerializes every output at the same business revision", async () => {
+  it("projection-version change rematerializes every legacy output plus OPERATING at the same business revision", async () => {
     const { record } = fixture();
     const baselinePlan = await planProjection(record, null, 1);
     const baseline = baselineFrom(baselinePlan);
@@ -243,7 +243,8 @@ describe("projection hashing and incremental planning", () => {
 
     expect(planV2.target_revision).toBe(record.new_revision);
     expect(planV2.projection_version).toBe(2);
-    expect(planV2.changed_outputs.size).toBe(baseline.outputs.size);
+    expect(planV2.changed_outputs.size).toBe(baseline.outputs.size + 1);
+    expect(planV2.changed_outputs.has("global:OPERATING")).toBe(true);
     expect(planV2.carried_forward.size).toBe(0);
     expect(planV2.source_event_id).toBe(record.event.event_id);
   });

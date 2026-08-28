@@ -1,5 +1,6 @@
 import type {
   ConditionalWritePort,
+  DirectoryProvisioningPort,
   IncrementalChangeFeedPort,
   ObjectPersistence,
   ServerSideCopyPort
@@ -18,6 +19,7 @@ export interface PersistenceRuntime {
   conditionalWrite?: ConditionalWritePort;
   serverSideCopy?: ServerSideCopyPort;
   changeFeed?: IncrementalChangeFeedPort;
+  directoryProvisioning?: DirectoryProvisioningPort;
   evidence?: Partial<ProviderEvidenceCapabilities>;
 }
 
@@ -27,6 +29,7 @@ export interface ProjectOsPersistenceRuntime {
   conditionalWrite: ConditionalWritePort;
   serverSideCopy: ServerSideCopyPort;
   changeFeed: IncrementalChangeFeedPort;
+  directoryProvisioning?: DirectoryProvisioningPort;
   evidence: ProviderEvidenceCapabilities;
 }
 

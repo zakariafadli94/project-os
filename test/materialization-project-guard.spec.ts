@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Receipt } from "../src/domain/receipt";
 import {
   machineCommitRecordPath,
@@ -168,14 +169,14 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(before).toMatchObject({
       project_id: projectId,
       canonical_revision: 1,
-      projection_version: 1,
+      projection_version: CURRENT_PROJECTION_VERSION,
       materialized_head: null
     });
     expect(JSON.stringify(before)).not.toContain("# Brief");
 
     expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);
     const after = await status(projectId);
-    expect(after.materialized_head).toEqual({ revision: 1, projection_version: 1 });
+    expect(after.materialized_head).toEqual({ revision: 1, projection_version: CURRENT_PROJECTION_VERSION });
     expect(after.output_count).toBeGreaterThan(0);
   });
 

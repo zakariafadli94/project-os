@@ -13,7 +13,8 @@ import { renderConstraint } from "../render/constraint";
 import { renderDecision } from "../render/decision";
 import { renderDeliverable } from "../render/deliverable";
 import { renderDiscovery } from "../render/discovery";
-import { renderHandoff } from "../render/handoff";
+import { renderHandoff, renderLegacyHandoff } from "../render/handoff";
+import { OPERATING_CONTRACT_VERSION, renderOperating } from "../render/operating";
 import { renderPlan } from "../render/plan";
 import { renderProject } from "../render/project";
 import { renderResearch } from "../render/research";
@@ -61,6 +62,7 @@ const GLOBAL_PATHS = {
   ROADMAP: "ROADMAP.md",
   PROJECT: "PROJECT.md",
   PLAN: "PLAN.md",
+  OPERATING: "OPERATING.md",
   STATE: "STATE.md",
   HANDOFF: "HANDOFF.md"
 } as const;
@@ -166,8 +168,8 @@ function inputForDeliverable(state: ProjectState, record: DeliverableRecord): un
   };
 }
 
-function globalDescriptors(state: ProjectState, targetRevision: number): OutputDescriptor[] {
-  return [
+function globalDescriptors(state: ProjectState, targetRevision: number, projectionVersion: number): OutputDescriptor[] {
+  const descriptors: OutputDescriptor[] = [
     {
       key: "global:BRIEF",
       relative_path: GLOBAL_PATHS.BRIEF,
@@ -207,7 +209,25 @@ function globalDescriptors(state: ProjectState, targetRevision: number): OutputD
       semantic_input: planInput(state),
       render: () => renderPlan(state),
       entity: false
-    },
+    }
+  ];
+
+  if (projectionVersion >= 2) {
+    descriptors.push({
+      key: "global:OPERATING",
+      relative_path: GLOBAL_PATHS.OPERATING,
+      critical: false,
+      semantic_input: {
+        ...identity(state),
+        target_revision: targetRevision,
+        operating_contract_version: OPERATING_CONTRACT_VERSION
+      },
+      render: () => renderOperating(state),
+      entity: false
+    });
+  }
+
+  descriptors.push(
     {
       key: "global:STATE",
       relative_path: GLOBAL_PATHS.STATE,
@@ -220,11 +240,14 @@ function globalDescriptors(state: ProjectState, targetRevision: number): OutputD
       key: "global:HANDOFF",
       relative_path: GLOBAL_PATHS.HANDOFF,
       critical: true,
-      semantic_input: { target_revision: targetRevision, state },
-      render: () => renderHandoff(state),
+      semantic_input: projectionVersion >= 2
+        ? { target_revision: targetRevision, state, operating_contract_version: OPERATING_CONTRACT_VERSION }
+        : { target_revision: targetRevision, state },
+      render: () => projectionVersion >= 2 ? renderHandoff(state) : renderLegacyHandoff(state),
       entity: false
     }
-  ];
+  );
+  return descriptors;
 }
 
 function entityDescriptors(state: ProjectState): OutputDescriptor[] {
@@ -321,27 +344,6 @@ async function semanticHash(value: unknown, projectionVersion: number): Promise<
   return sha256Canonical({ projection_version: projectionVersion, semantic_input: value });
 }
 
-async function renderChanged(
-  descriptor: OutputDescriptor,
-  record: CanonicalCommitRecord,
-  projectionVersion: number,
-  baseline?: ProjectionOutputEvidence
-): Promise<PlannedProjectionOutput> {
-  const input_hash = await semanticHash(descriptor.semantic_input, projectionVersion);
-  const content = descriptor.render();
-  const content_hash = await sha256Text(content);
-  return {
-    key: descriptor.key,
-    relative_path: descriptor.relative_path,
-    input_hash,
-    content_hash,
-    source_revision: record.new_revision,
-    content,
-    critical: descriptor.critical,
-    ...(baseline ? { baseline } : {})
-  };
-}
-
 export async function planProjection(
   record: CanonicalCommitRecord,
   baseline: ProjectionBaseline | null,
@@ -354,7 +356,7 @@ export async function planProjection(
   const state = record.state;
   const changed_outputs = new Map<string, PlannedProjectionOutput>();
   const carried_forward = new Map<string, ProjectionOutputEvidence>();
-  const globals = globalDescriptors(state, record.new_revision);
+  const globals = globalDescriptors(state, record.new_revision, projectionVersion);
   const entities = entityDescriptors(state);
   const descriptors = [...globals, ...entities];
   const expected = new Set(descriptors.map((item) => item.key));

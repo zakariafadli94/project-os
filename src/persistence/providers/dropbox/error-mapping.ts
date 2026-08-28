@@ -20,7 +20,8 @@ export type DropboxOperation =
   | "move"
   | "copy"
   | "delete"
-  | "changes";
+  | "changes"
+  | "ensure-directory";
 
 export function mapDropboxError(error: unknown, operation: DropboxOperation): Error {
   if (error instanceof DropboxCursorResetError) {

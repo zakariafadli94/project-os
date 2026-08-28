@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
-import {
-  CURRENT_PROJECTION_VERSION,
-  type CompletedMaterializationRecord,
-  type MaterializationHead
+import type {
+  CompletedMaterializationRecord,
+  MaterializationHead
 } from "../src/domain/materialization";
 import { DropboxConflictError, type DropboxEntry, type DropboxTransport } from "../src/dropbox/client";
 import {
@@ -50,7 +49,7 @@ const completed: CompletedMaterializationRecord = {
   schema_version: "1.0",
   project_id: "PRJ-3101",
   target_revision: 7,
-  projection_version: CURRENT_PROJECTION_VERSION,
+  projection_version: 1,
   record_kind: "snapshot",
   parent: null,
   chain_depth: 0,

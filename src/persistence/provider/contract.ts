@@ -51,3 +51,7 @@ export interface ServerSideCopyPort {
 export interface IncrementalChangeFeedPort {
   listChanges(input: { root?: string; cursor?: string }): Promise<ProviderChangePage>;
 }
+
+export interface DirectoryProvisioningPort {
+  ensureDirectory(path: string): Promise<void>;
+}

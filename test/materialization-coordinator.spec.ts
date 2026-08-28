@@ -260,7 +260,7 @@ describe("MaterializationCoordinator", () => {
     value.requestTarget(record.new_revision);
     await value.runNext();
 
-    const completed = repo.records.get(`PRJ-3501:${record.new_revision}:1`)!;
+    const completed = repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)!;
     expect(completed.record_kind).toBe("snapshot");
     expect(completed.parent).toBeNull();
     expect(completed.chain_depth).toBe(0);
@@ -282,9 +282,9 @@ describe("MaterializationCoordinator", () => {
     value.requestTarget(second.new_revision);
     await value.runNext();
 
-    const delta = repo.records.get(`PRJ-3501:${second.new_revision}:1`)!;
+    const delta = repo.records.get(`PRJ-3501:${second.new_revision}:${CURRENT_PROJECTION_VERSION}`)!;
     expect(delta.record_kind).toBe("delta");
-    expect(delta.parent).toEqual({ target_revision: first.new_revision, projection_version: 1 });
+    expect(delta.parent).toEqual({ target_revision: first.new_revision, projection_version: CURRENT_PROJECTION_VERSION });
     expect(delta.outputs["global:BRIEF"]).toBeUndefined();
     expect(delta.outputs["task:TASK-COORD3501"]).toBeDefined();
     expect(delta.outputs["global:STATE"]).toBeDefined();
@@ -316,33 +316,33 @@ describe("MaterializationCoordinator", () => {
       source_revision: 0
     };
     const root = await projectionIndexRootHash(new Map([["global:BRIEF", seed]]));
-    repo.records.set("PRJ-3501:0:1", {
-      schema_version: "1.0", project_id: "PRJ-3501", target_revision: 0, projection_version: 1,
+    repo.records.set(`PRJ-3501:0:${CURRENT_PROJECTION_VERSION}`, {
+      schema_version: "1.0", project_id: "PRJ-3501", target_revision: 0, projection_version: CURRENT_PROJECTION_VERSION,
       record_kind: "snapshot", parent: null, chain_depth: 0, workspace_location: "active",
       outputs: { "global:BRIEF": seed }, removed_outputs: [], total_output_count: 1, result_root_hash: root,
       coalesced_revisions: [], source_event_id: null, completed_at: at
     });
     for (let revision = 1; revision <= 127; revision += 1) {
-      repo.records.set(`PRJ-3501:${revision}:1`, {
-        schema_version: "1.0", project_id: "PRJ-3501", target_revision: revision, projection_version: 1,
-        record_kind: "delta", parent: { target_revision: revision - 1, projection_version: 1 }, chain_depth: revision,
+      repo.records.set(`PRJ-3501:${revision}:${CURRENT_PROJECTION_VERSION}`, {
+        schema_version: "1.0", project_id: "PRJ-3501", target_revision: revision, projection_version: CURRENT_PROJECTION_VERSION,
+        record_kind: "delta", parent: { target_revision: revision - 1, projection_version: CURRENT_PROJECTION_VERSION }, chain_depth: revision,
         workspace_location: "active", outputs: {}, removed_outputs: [], total_output_count: 1, result_root_hash: root,
         coalesced_revisions: [], source_event_id: null, completed_at: at
       });
     }
     repo.head = {
-      schema_version: "1.0", project_id: "PRJ-3501", target_revision: 127, projection_version: 1,
-      workspace_location: "active", record_path: machineMaterializationRecordPath("PRJ-3501", 127, 1),
+      schema_version: "1.0", project_id: "PRJ-3501", target_revision: 127, projection_version: CURRENT_PROJECTION_VERSION,
+      workspace_location: "active", record_path: machineMaterializationRecordPath("PRJ-3501", 127, CURRENT_PROJECTION_VERSION),
       result_root_hash: root, completed_at: at
     };
     const ledger = new FakeLedger();
-    ledger.restoreExternalBaseline({ revision: 127, projection_version: 1 }, new Map([["global:BRIEF", seed]]));
+    ledger.restoreExternalBaseline({ revision: 127, projection_version: CURRENT_PROJECTION_VERSION }, new Map([["global:BRIEF", seed]]));
     const { value } = coordinator(repo, ledger);
 
     value.requestTarget(target.new_revision);
     await value.runNext();
 
-    const completed = repo.records.get(`PRJ-3501:${target.new_revision}:1`)!;
+    const completed = repo.records.get(`PRJ-3501:${target.new_revision}:${CURRENT_PROJECTION_VERSION}`)!;
     expect(completed.record_kind).toBe("snapshot");
     expect(completed.chain_depth).toBe(0);
   });
@@ -381,7 +381,7 @@ describe("MaterializationCoordinator", () => {
     next.value.requestTarget(second.new_revision);
     await next.value.runNext();
 
-    expect(freshLedger.head).toEqual({ revision: second.new_revision, projection_version: 1 });
+    expect(freshLedger.head).toEqual({ revision: second.new_revision, projection_version: CURRENT_PROJECTION_VERSION });
     expect(freshLedger.baseline.size).toBeGreaterThan(0);
   });
 
@@ -430,24 +430,24 @@ describe("MaterializationCoordinator", () => {
     const { value } = coordinator(repo, ledger);
     value.requestTarget(record.new_revision);
     await value.runNext();
-    expect(repo.records.get(`PRJ-3501:${record.new_revision}:1`)?.coalesced_revisions).toEqual([72, 73, 74]);
+    expect(repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)?.coalesced_revisions).toEqual([72, 73, 74]);
   });
 
   it("projection version bump rematerializes the same canonical revision as a new snapshot", async () => {
     const record = createFixture();
     const repo = new FakeRepository();
     repo.commits.set(record.new_revision, record);
-    const v1 = coordinator(repo);
-    v1.value.requestTarget(record.new_revision);
+    const v1 = coordinator(repo, new FakeLedger(), new FakeWriter(), 1);
+    v1.value.requestTarget(record.new_revision, 1);
     await v1.value.runNext();
 
     const ledgerV2 = new FakeLedger();
-    const v2 = coordinator(repo, ledgerV2, new FakeWriter(), 2);
-    v2.value.requestTarget(record.new_revision, 2);
+    const v2 = coordinator(repo, ledgerV2, new FakeWriter(), CURRENT_PROJECTION_VERSION);
+    v2.value.requestTarget(record.new_revision, CURRENT_PROJECTION_VERSION);
     await v2.value.runNext();
-    const recordV2 = repo.records.get(`PRJ-3501:${record.new_revision}:2`)!;
+    const recordV2 = repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)!;
     expect(recordV2.record_kind).toBe("snapshot");
-    expect(recordV2.projection_version).toBe(2);
+    expect(recordV2.projection_version).toBe(CURRENT_PROJECTION_VERSION);
     expect(repo.commits.size).toBe(1);
   });
 

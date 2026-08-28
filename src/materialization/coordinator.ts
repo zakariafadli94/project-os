@@ -31,7 +31,7 @@ export interface MaterializationRepositoryPort {
   writeMaterializationHead(head: MaterializationHead): Promise<void>;
   materializeCanonicalDerivatives(
     record: CanonicalCommitRecord,
-    options?: { publishReceipt?: boolean }
+    options?: { publishReceipt?: boolean; projectionVersion?: number }
   ): Promise<void>;
   archiveHumanWorkspace?(state: ProjectState): Promise<void>;
 }
@@ -208,10 +208,10 @@ export class MaterializationCoordinator {
     const metrics: MaterializationAttemptMetrics = { uploaded: 0, contentHash: 0, attemptReuse: 0 };
 
     try {
-      await this.repository.materializeCanonicalDerivatives(
-        record,
-        record.transaction.operation === "project.create" ? { publishReceipt: false } : undefined
-      );
+      await this.repository.materializeCanonicalDerivatives(record, {
+        ...(record.transaction.operation === "project.create" ? { publishReceipt: false } : {}),
+        projectionVersion: target.projection_version
+      });
 
       const baseline = await this.loadExternalBaseline(target.revision);
       if (baseline) {

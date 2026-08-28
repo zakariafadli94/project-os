@@ -112,11 +112,13 @@ export interface CurrentManagedProviderObservation extends ManagedProviderObserv
   integrity_hash: { algorithm: string; value: string };
 }
 
+export type TransitionalManagedProviderObservation = ManagedProviderObservation | CurrentManagedProviderObservation;
+
 export interface CurrentManagedDocumentProviderState {
-  reference?: CurrentManagedProviderObservation;
-  working?: CurrentManagedProviderObservation;
-  review?: CurrentManagedProviderObservation;
-  published?: CurrentManagedProviderObservation;
+  reference?: TransitionalManagedProviderObservation;
+  working?: TransitionalManagedProviderObservation;
+  review?: TransitionalManagedProviderObservation;
+  published?: TransitionalManagedProviderObservation;
 }
 
 export interface CurrentManagedDocumentHead extends Omit<ManagedDocumentHead, "provider"> {
@@ -147,22 +149,24 @@ export function readManagedDocumentHead(input: unknown): ManagedDocumentHeadRead
   const raw = requireRecord(input, "ManagedDocumentHead");
   if (raw.schema_version === "1.0") {
     const parsed = parseManagedDocumentHead(raw);
+    const { provider, ...rest } = parsed;
     return {
       sourceVersion: "1.0",
       head: {
-        ...parsed,
-        ...(parsed.provider ? { provider: upcastProviderState(parsed.provider) } : {})
+        ...rest,
+        ...(provider ? { provider: upcastProviderState(provider) } : {})
       }
     };
   }
   if (raw.schema_version === "2.0") {
     const parsed = headV2Schema.parse(raw);
+    const { provider, ...rest } = withoutSchemaVersion(parsed);
     return {
       sourceVersion: "2.0",
       head: {
-        ...withoutSchemaVersion(parsed),
+        ...rest,
         schema_version: "1.0",
-        ...(parsed.provider ? { provider: currentProviderState(parsed.provider) } : {})
+        ...(provider ? { provider: currentProviderState(provider) } : {})
       }
     };
   }
@@ -264,7 +268,7 @@ function neutralProviderState(
   state: ManagedDocumentProviderState | CurrentManagedDocumentProviderState
 ): Record<string, ProviderObservation> {
   return Object.fromEntries(
-    Object.entries(state).map(([key, value]) => [key, neutralObservation(value as ManagedProviderObservation | CurrentManagedProviderObservation)])
+    Object.entries(state).map(([key, value]) => [key, neutralObservation(value as TransitionalManagedProviderObservation)])
   );
 }
 
@@ -272,13 +276,11 @@ function legacyProviderState(
   state: ManagedDocumentProviderState | CurrentManagedDocumentProviderState
 ): ManagedDocumentProviderState {
   return Object.fromEntries(
-    Object.entries(state).map(([key, value]) => [key, legacyObservation(value as ManagedProviderObservation | CurrentManagedProviderObservation)])
+    Object.entries(state).map(([key, value]) => [key, legacyObservation(value as TransitionalManagedProviderObservation)])
   ) as ManagedDocumentProviderState;
 }
 
-function neutralObservation(
-  value: ManagedProviderObservation | CurrentManagedProviderObservation
-): ProviderObservation {
+function neutralObservation(value: TransitionalManagedProviderObservation): ProviderObservation {
   if (isCurrentObservation(value)) {
     return parseProviderObservation({
       provider_id: value.provider_id,
@@ -306,9 +308,7 @@ function currentObservation(value: ProviderObservation): CurrentManagedProviderO
   };
 }
 
-function legacyObservation(
-  value: ManagedProviderObservation | CurrentManagedProviderObservation
-): ManagedProviderObservation {
+function legacyObservation(value: TransitionalManagedProviderObservation): ManagedProviderObservation {
   if (!isCurrentObservation(value)) return value;
   if (value.provider_id !== "dropbox" || value.integrity_hash.algorithm !== "dropbox-content-hash") {
     throw new Error(`Cannot encode provider ${value.provider_id}/${value.integrity_hash.algorithm} as managed-document V1 evidence`);
@@ -322,9 +322,7 @@ function legacyObservation(
   };
 }
 
-function isCurrentObservation(
-  value: ManagedProviderObservation | CurrentManagedProviderObservation
-): value is CurrentManagedProviderObservation {
+function isCurrentObservation(value: TransitionalManagedProviderObservation): value is CurrentManagedProviderObservation {
   return "provider_id" in value
     && "object_id" in value
     && "revision_token" in value

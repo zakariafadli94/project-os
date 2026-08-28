@@ -27,7 +27,7 @@ permissions:
   issues: read
 
 concurrency:
-  group: mutation-candidate-reject-operator
+  group: project-os-production
   cancel-in-progress: false
 
 jobs:
@@ -104,6 +104,7 @@ jobs:
             echo "CLEANUP_VERSION_TAG=$CLEANUP_VERSION_TAG"
             echo "CLEAN_BASE_VERSION_CREATED=false"
             echo "TOKEN_VERSION_CREATED=false"
+            echo "CLEANUP_VERSION_CREATED=false"
             echo "TOKEN_VERSION_DEPLOYED=false"
           } >> "$GITHUB_ENV"
 
@@ -128,6 +129,15 @@ jobs:
             --tag "$OPERATOR_VERSION_TAG" \
             --message "MutationGate ephemeral operator token for run $GITHUB_RUN_ID"
           echo "TOKEN_VERSION_CREATED=true" >> "$GITHUB_ENV"
+
+      - name: Prebuild operator-token cleanup version
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN \
+            --tag "$CLEANUP_VERSION_TAG" \
+            --message "MutationGate prebuilt operator-token cleanup for run $GITHUB_RUN_ID"
+          echo "CLEANUP_VERSION_CREATED=true" >> "$GITHUB_ENV"
 
       - name: Deploy ephemeral operator-token version
         shell: bash
@@ -264,44 +274,14 @@ jobs:
           cleanup_failed=0
           cleanup_deployed=0
 
-          if [ "${TOKEN_VERSION_CREATED:-false}" = "true" ]; then
-            latest_ok=0
-            if npx wrangler versions list --json > "$RUNNER_TEMP/mutationgate-versions.json"; then
-              if node <<'NODE'
-          const fs = require("node:fs");
-          const versions = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/mutationgate-versions.json", "utf8"));
-          if (!Array.isArray(versions) || versions.length === 0) process.exit(1);
-          const strings = [];
-          const collect = (value) => {
-            if (typeof value === "string") strings.push(value);
-            else if (Array.isArray(value)) value.forEach(collect);
-            else if (value && typeof value === "object") Object.values(value).forEach(collect);
-          };
-          collect(versions[0]);
-          if (!strings.includes(process.env.OPERATOR_VERSION_TAG)) process.exit(1);
-          NODE
-              then
-                latest_ok=1
-              fi
-            fi
-
-            if [ "$latest_ok" -eq 1 ]; then
-              if npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN \
-                --tag "$CLEANUP_VERSION_TAG" \
-                --message "MutationGate operator-token cleanup for run $GITHUB_RUN_ID"; then
-                if npx wrangler versions deploy \
-                  --version-tag "$CLEANUP_VERSION_TAG@100%" \
-                  --message "MutationGate clean production after run $GITHUB_RUN_ID" \
-                  --yes; then
-                  cleanup_deployed=1
-                else
-                  echo "Failed to deploy the versioned operator-token cleanup."
-                fi
-              else
-                echo "Failed to create the versioned operator-token cleanup."
-              fi
+          if [ "${CLEANUP_VERSION_CREATED:-false}" = "true" ]; then
+            if npx wrangler versions deploy \
+              --version-tag "$CLEANUP_VERSION_TAG@100%" \
+              --message "MutationGate clean production after run $GITHUB_RUN_ID" \
+              --yes; then
+              cleanup_deployed=1
             else
-              echo "Latest Worker version drifted after operator-token creation; refusing to derive cleanup from an unknown version."
+              echo "Failed to deploy the prebuilt operator-token cleanup version."
             fi
           fi
 
@@ -317,8 +297,8 @@ jobs:
             fi
           fi
 
-          if [ "${TOKEN_VERSION_DEPLOYED:-false}" = "true" ] && [ "$cleanup_deployed" -ne 1 ]; then
-            echo "Operator-token version was deployed but no clean version could be restored."
+          if [ "${TOKEN_VERSION_CREATED:-false}" = "true" ] && [ "$cleanup_deployed" -ne 1 ]; then
+            echo "Operator-token version existed but no clean version could be restored."
             cleanup_failed=1
           fi
 
@@ -336,20 +316,28 @@ jobs:
             cleanup_failed=1
           fi
 
-          revoke_status=$(curl --silent --show-error --max-time 15 \
-            --output /tmp/operator-revoke-body.json \
-            --write-out '%{http_code}' \
-            --request POST \
-            --header "Authorization: Bearer $OPERATOR_TOKEN" \
-            --header 'Content-Type: application/json' \
-            --data '{}' \
-            "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
-          if [ "$revoke_status" != "401" ]; then
-            echo "Expected HTTP 401 after operator-token cleanup; received ${revoke_status:-curl-error}."
+          revoked=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            revoke_status=$(curl --silent --show-error --max-time 15 \
+              --output /tmp/operator-revoke-body.json \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer $OPERATOR_TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data '{}' \
+              "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
+            if [ "$revoke_status" = "401" ]; then
+              echo "Operator token revocation verified with HTTP 401."
+              revoked=1
+              break
+            fi
+            echo "Operator token still not verified revoked on attempt $attempt; received ${revoke_status:-curl-error}."
             cat /tmp/operator-revoke-body.json 2>/dev/null || true
+            sleep 3
+          done
+          if [ "$revoked" -ne 1 ]; then
+            echo "Expected HTTP 401 after operator-token cleanup."
             cleanup_failed=1
-          else
-            echo "Operator token revocation verified with HTTP 401."
           fi
 
           exit "$cleanup_failed"

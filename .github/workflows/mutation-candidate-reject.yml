@@ -27,7 +27,7 @@ permissions:
   issues: read
 
 concurrency:
-  group: mutation-candidate-reject-operator
+  group: project-os-production
   cancel-in-progress: false
 
 jobs:
@@ -93,15 +93,48 @@ jobs:
         run: |
           set -euo pipefail
           OPERATOR_TOKEN=$(node -e 'const { randomBytes } = require("node:crypto"); process.stdout.write(`${Date.now()}.${randomBytes(32).toString("hex")}`)')
+          OPERATOR_BASE_TAG="mutationgate-base-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          OPERATOR_SECRET_TAG="mutationgate-secret-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          OPERATOR_CLEANUP_TAG="mutationgate-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "::add-mask::$OPERATOR_TOKEN"
-          echo "OPERATOR_TOKEN=$OPERATOR_TOKEN" >> "$GITHUB_ENV"
+          {
+            echo "OPERATOR_TOKEN=$OPERATOR_TOKEN"
+            echo "OPERATOR_BASE_TAG=$OPERATOR_BASE_TAG"
+            echo "OPERATOR_SECRET_TAG=$OPERATOR_SECRET_TAG"
+            echo "OPERATOR_CLEANUP_TAG=$OPERATOR_CLEANUP_TAG"
+          } >> "$GITHUB_ENV"
 
-      - name: Install ephemeral operator token
+      - name: Prepare ephemeral operator Worker versions
         shell: bash
         run: |
           set -euo pipefail
+
+          npx wrangler versions upload \
+            --tag "$OPERATOR_BASE_TAG" \
+            --message "MutationGate operator exact-head base ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+
           node -e 'process.stdout.write(JSON.stringify({MUTATION_GATE_OPERATOR_TOKEN: process.env.OPERATOR_TOKEN}))' \
-            | npx wrangler secret bulk
+            > /tmp/mutationgate-operator-secrets.json
+
+          npx wrangler versions secret bulk /tmp/mutationgate-operator-secrets.json \
+            --tag "$OPERATOR_SECRET_TAG" \
+            --message "MutationGate ephemeral operator token ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+
+          npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN \
+            --tag "$OPERATOR_CLEANUP_TAG" \
+            --message "MutationGate prebuilt operator-token cleanup ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+
+          echo "OPERATOR_VERSIONS_PREPARED=true" >> "$GITHUB_ENV"
+
+      - name: Deploy ephemeral operator token version
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler versions deploy \
+            --version-tag "${OPERATOR_SECRET_TAG}@100%" \
+            --message "Activate MutationGate operator token ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
+            --yes
+          echo "OPERATOR_VERSION_DEPLOYED=true" >> "$GITHUB_ENV"
 
       - name: Verify ephemeral operator token readiness
         shell: bash
@@ -123,7 +156,7 @@ jobs:
             fi
 
             if [ "$readiness_status" = "401" ]; then
-              echo "readiness probe received HTTP 401 on attempt $attempt; waiting for the new Worker version."
+              echo "readiness probe received HTTP 401 on attempt $attempt; waiting for the operator Worker version."
               sleep 3
               continue
             fi
@@ -221,15 +254,25 @@ jobs:
         run: |
           set -u -o pipefail
           if [ -z "${OPERATOR_TOKEN:-}" ]; then
-            echo "No operator token was generated; no remote operator secret could have been installed."
+            echo "No operator token was generated; no operator-token version could have been prepared."
             exit 0
           fi
 
           cleanup_failed=0
 
-          if ! printf '%s' '{"MUTATION_GATE_OPERATOR_TOKEN":null}' | npx wrangler secret bulk; then
-            echo "Failed to delete MUTATION_GATE_OPERATOR_TOKEN."
-            cleanup_failed=1
+          if [ "${OPERATOR_VERSION_DEPLOYED:-false}" = "true" ]; then
+            if [ "${OPERATOR_VERSIONS_PREPARED:-false}" != "true" ] || [ -z "${OPERATOR_CLEANUP_TAG:-}" ]; then
+              echo "Operator token was deployed without a prepared cleanup version marker."
+              cleanup_failed=1
+            elif ! npx wrangler versions deploy \
+              --version-tag "${OPERATOR_CLEANUP_TAG}@100%" \
+              --message "Revoke MutationGate operator token ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
+              --yes; then
+              echo "Failed to deploy the prebuilt no-token cleanup version."
+              cleanup_failed=1
+            fi
+          else
+            echo "Operator token version was never deployed; no cleanup deployment is required."
           fi
 
           health_ok=0
@@ -246,20 +289,28 @@ jobs:
             cleanup_failed=1
           fi
 
-          revoke_status=$(curl --silent --show-error --max-time 15 \
-            --output /tmp/operator-revoke-body.json \
-            --write-out '%{http_code}' \
-            --request POST \
-            --header "Authorization: Bearer $OPERATOR_TOKEN" \
-            --header 'Content-Type: application/json' \
-            --data '{}' \
-            "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
-          if [ "$revoke_status" != "401" ]; then
-            echo "Expected HTTP 401 after operator-token cleanup; received ${revoke_status:-curl-error}."
+          revoked=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            revoke_status=$(curl --silent --show-error --max-time 15 \
+              --output /tmp/operator-revoke-body.json \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer $OPERATOR_TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data '{}' \
+              "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
+            if [ "$revoke_status" = "401" ]; then
+              echo "Operator token revocation verified with HTTP 401."
+              revoked=1
+              break
+            fi
+            echo "Operator token still not verified revoked on attempt $attempt; received ${revoke_status:-curl-error}."
             cat /tmp/operator-revoke-body.json 2>/dev/null || true
+            sleep 3
+          done
+          if [ "$revoked" -ne 1 ]; then
+            echo "Expected HTTP 401 after operator-token cleanup."
             cleanup_failed=1
-          else
-            echo "Operator token revocation verified with HTTP 401."
           fi
 
           exit "$cleanup_failed"

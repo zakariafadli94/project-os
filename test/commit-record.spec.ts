@@ -9,6 +9,7 @@ function validRecord(options: {
   baseRevision?: number;
   operation?: string;
   payload?: Record<string, unknown>;
+  stateSchemaVersion?: "1.0" | "2.0";
 } = {}) {
   const previousRevision = options.previousRevision ?? 1;
   const newRevision = previousRevision + 1;
@@ -33,12 +34,25 @@ function validRecord(options: {
     payload: transaction.payload
   };
   const state = {
-    schema_version: "1.0",
+    schema_version: options.stateSchemaVersion ?? "1.0",
     project_id: "PRJ-1201",
     name: "Commit 1201",
     slug: "commit-1201",
     aliases: [],
     objective: "Prove crash-safe commits",
+    framing: {
+      scope: [],
+      out_of_scope: [],
+      success_criteria: [],
+      stakeholders: [],
+      open_questions: []
+    },
+    discovery: {
+      confirmed_findings: [],
+      provisional_findings: [],
+      unresolved_questions: [],
+      next_exploration: []
+    },
     status: "active",
     revision: newRevision,
     current_phase_id: null,
@@ -87,6 +101,20 @@ describe("canonical commit record", () => {
     expect(record.project_id).toBe("PRJ-1201");
     expect(record.new_revision).toBe(2);
     expect(record.receipt.status).toBe("committed");
+  });
+
+  it("keeps envelope 1.0 while accepting nested ProjectState 2.0", () => {
+    const record = parseCanonicalCommitRecord(validRecord({ stateSchemaVersion: "2.0" }));
+    expect(record.schema_version).toBe("1.0");
+    expect(record.state.schema_version).toBe("2.0");
+    expect(record.state.revision).toBe(record.new_revision);
+    expect(record.state.last_event_id).toBe(record.event.event_id);
+  });
+
+  it("rejects an unsupported nested ProjectState generation", () => {
+    const record = validRecord() as ReturnType<typeof validRecord> & { state: Record<string, unknown> };
+    record.state.schema_version = "3.0";
+    expect(() => parseCanonicalCommitRecord(record)).toThrow(/ProjectState.*3\.0/i);
   });
 
   it("preserves an approved stale additive base revision while recording the effective previous revision", () => {

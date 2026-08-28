@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import {
@@ -110,7 +111,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
       expect.objectContaining({
         project_id: projectId,
         target_revision: 6,
-        projection_version: 1,
+        projection_version: CURRENT_PROJECTION_VERSION,
         source_transaction_id: startTx.transaction_id,
         outputs_uploaded: expect.any(Number),
         outputs_carried_forward: expect.any(Number),
@@ -153,7 +154,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     });
 
     await expect(runDurableObjectAlarm(stub)).rejects.toThrow();
-    expect(mock.files.has(machineMaterializationRecordPath(projectId, 2, 1))).toBe(true);
+    expect(mock.files.has(machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION))).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
     const workspaceWritesBeforeRepair = mock.uploadCalls.filter((path) => path.startsWith(`${root}/`)).length;
 
@@ -230,9 +231,9 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
       expect(mock.files.has(machineCommitRecordPath(projectId, revision))).toBe(true);
     }
     for (const revision of [2, 3, 4]) {
-      expect(mock.files.has(machineMaterializationRecordPath(projectId, revision, 1))).toBe(false);
+      expect(mock.files.has(machineMaterializationRecordPath(projectId, revision, CURRENT_PROJECTION_VERSION))).toBe(false);
     }
-    const record = JSON.parse(mock.files.get(machineMaterializationRecordPath(projectId, 5, 1)) ?? "{}");
+    const record = JSON.parse(mock.files.get(machineMaterializationRecordPath(projectId, 5, CURRENT_PROJECTION_VERSION)) ?? "{}");
     expect(record.coalesced_revisions).toEqual([2, 3, 4]);
     expect(record.target_revision).toBe(5);
     expect(mock.maxConcurrentUploads()).toBeLessThanOrEqual(4);

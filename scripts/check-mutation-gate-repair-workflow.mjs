@@ -46,7 +46,9 @@ requireText("OPERATOR_CLEANUP_TAG", "unique cleanup version tag");
 requireText('--version-tag "${OPERATOR_SECRET_TAG}@100%"', "100-percent operator-secret version deployment");
 requireText('--version-tag "${OPERATOR_CLEANUP_TAG}@100%"', "100-percent cleanup version deployment");
 requireText("OPERATOR_VERSIONS_PREPARED=true", "prepared-version lifecycle marker");
+requireText("OPERATOR_VERSION_DEPLOY_ATTEMPTED=true", "operator-version deploy-attempt marker");
 requireText("OPERATOR_VERSION_DEPLOYED=true", "deployed operator-version lifecycle marker");
+requireText('[ "${OPERATOR_VERSION_DEPLOY_ATTEMPTED:-false}" = "true" ]', "cleanup on attempted operator-version deployment");
 requireText("group: project-os-production", "shared production deployment concurrency lock");
 forbid(/group: mutation-candidate-reject-operator/, "operator-only concurrency group");
 forbid(/\bnpx wrangler secret bulk\b/, "legacy immediate secret mutation command");
@@ -73,6 +75,7 @@ requireText("const payloadJson = JSON.stringify(payload)", "stable retry payload
 requireBefore("npx wrangler versions upload", "npx wrangler versions secret bulk", "fresh base upload before secret patch");
 requireBefore("npx wrangler versions secret bulk", "npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN", "secret version before cleanup version");
 requireBefore("npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN", '--version-tag "${OPERATOR_SECRET_TAG}@100%"', "cleanup version prepared before operator version deployment");
+requireBefore("OPERATOR_VERSION_DEPLOY_ATTEMPTED=true", '--version-tag "${OPERATOR_SECRET_TAG}@100%"', "deploy-attempt marker before operator version deployment");
 forbid(/Verify production health after token install/, "health-only operator-token readiness check");
 forbid(/dropbox/i, "direct Dropbox access");
 

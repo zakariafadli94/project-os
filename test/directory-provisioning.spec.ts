@@ -54,6 +54,7 @@ describe("directory provisioning capability", () => {
   it("creates missing directory ancestors in order and succeeds idempotently when the folder already exists", async () => {
     const created: string[] = [];
     let idempotentPass = false;
+    let targetAttempts = 0;
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const request = input instanceof Request ? input : new Request(String(input), init);
@@ -68,7 +69,11 @@ describe("directory provisioning capability", () => {
           return new Response(JSON.stringify({ error_summary: "path/conflict/folder/" }), { status: 409 });
         }
         if (body.path.endsWith("/REFERENCES/UNCLASSIFIED")) {
-          return new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 });
+          targetAttempts += 1;
+          if (targetAttempts === 1) {
+            return new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 });
+          }
+          return Response.json({ metadata: { ".tag": "folder", path_display: body.path } });
         }
         if (body.path.endsWith("/REFERENCES")) {
           return Response.json({ metadata: { ".tag": "folder", path_display: body.path } });

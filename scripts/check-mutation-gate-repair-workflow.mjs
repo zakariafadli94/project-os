@@ -20,6 +20,13 @@ const requireText = (needle, label = needle) => {
 const forbid = (pattern, label) => {
   if (pattern.test(workflow)) throw new Error(`MutationGate repair workflow must not contain ${label}`);
 };
+const requireBefore = (first, second, label) => {
+  const firstIndex = workflow.indexOf(first);
+  const secondIndex = workflow.indexOf(second);
+  if (firstIndex === -1 || secondIndex === -1 || firstIndex >= secondIndex) {
+    throw new Error(`MutationGate repair workflow has invalid ordering for ${label}`);
+  }
+};
 
 requireText("workflow_dispatch:", "manual workflow_dispatch trigger");
 requireText("issues:", "connector-accessible issue trigger");
@@ -41,13 +48,19 @@ requireText("@100%", "100-percent version deployment");
 requireText("wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN", "versioned operator-token removal");
 requireText("TOKEN_VERSION_CREATED", "token-version creation state tracking");
 requireText("TOKEN_VERSION_DEPLOYED", "token-version deployment state tracking");
-requireText("wrangler versions list --json", "latest-version drift guard");
+requireText("Prebuild operator-token cleanup version", "prebuilt cleanup step");
+requireText("CLEANUP_VERSION_CREATED=true", "cleanup-version creation state tracking");
+requireText('[ "${CLEANUP_VERSION_CREATED:-false}" = "true" ]', "unconditional prepared-cleanup deployment gate");
+requireText("group: project-os-production", "shared production deployment concurrency lock");
+forbid(/group: mutation-candidate-reject-operator/, "operator-only concurrency group");
+forbid(/wrangler versions list --json/, "cleanup-time latest-version dependency");
 requireText("::add-mask::", "GitHub log masking");
 requireText("if: always()", "unconditional cleanup path");
 requireText("HTTP 401", "post-cleanup revocation verification");
+requireText("Operator token still not verified revoked on attempt", "bounded revocation retry diagnostic");
+requireText("revoked=0", "revocation retry state");
 requireText("github.repository_owner", "owner-only issue trigger guard");
 requireText("[operator] MutationGate PRJ-0003 reject repair", "exact connector control issue title");
-requireText("group: mutation-candidate-reject-operator", "global operator-token concurrency lock");
 requireText("cancel-in-progress: false", "non-cancelling operator queue");
 requireText("/v1/mutation-candidates/resolve", "governed resolution endpoint");
 requireText('{"operation":"candidate.reject"', "explicit candidate.reject payload");
@@ -63,6 +76,9 @@ requireText("candidate reject received HTTP 401", "per-candidate 401 retry diagn
 requireText("await new Promise((resolve) => setTimeout(resolve, 3000))", "bounded per-candidate retry delay");
 requireText("for (let attempt = 1; attempt <= 10; attempt += 1)", "bounded per-candidate retry loop");
 requireText("const payloadJson = JSON.stringify(payload)", "stable retry payload serialization");
+requireBefore("Create ephemeral operator-token version", "Prebuild operator-token cleanup version", "operator version before cleanup derivation");
+requireBefore("Prebuild operator-token cleanup version", "Deploy ephemeral operator-token version", "cleanup prepared before token activation");
+requireBefore("wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN", 'npx wrangler versions deploy \\\n            --version-tag "$OPERATOR_VERSION_TAG@100%"', "cleanup version creation before token deployment");
 forbid(/Verify production health after token install/, "health-only operator-token readiness check");
 forbid(/dropbox/i, "direct Dropbox access");
 

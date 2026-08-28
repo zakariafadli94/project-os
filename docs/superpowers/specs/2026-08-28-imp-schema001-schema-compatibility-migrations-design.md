@@ -68,7 +68,7 @@ The target baseline contains material changes that did not exist when the origin
 - production layout mode is `v2`;
 - continuity mode remains `stable`;
 - canonical immutable commit records are the recovery history for revisions that have them;
-- `state.json` is a mutable canonical snapshot/derivative that can be reconstructed or converged without creating a business revision;
+- `state.json` is a mutable canonical snapshot that can converge in representation without creating a business revision;
 - Durable Object SQLite is hot operational state and is not canonical business truth;
 - projection/materialization is asynchronous and independently versioned.
 
@@ -129,6 +129,7 @@ All SCHEMA implementation and rollout work must preserve these invariants.
 11. **MutationGate stays enforce.** Schema rollout does not weaken final-zone governance.
 12. **Project isolation fails closed.** No migration or reader may bind evidence from one project into another project.
 13. **Rollback never down-migrates durable truth.** Recovery after a writer cutover is forward-compatible, not history-rewriting.
+14. **All canonical reads pass through family codecs.** Canonical repositories must not use unvalidated `JSON.parse(...) as Type` shortcuts for versioned durable families.
 
 ## Versioning policy
 
@@ -138,15 +139,34 @@ Each durable record family owns its own `schema_version` and compatibility polic
 
 There is no top-level `PROJECT_OS_SCHEMA_VERSION` whose value forces unrelated records to migrate.
 
-### Version semantics
+### Version identifiers are explicit generations, not implicit semver negotiation
 
-Use major/minor string versions with current production convention such as `"1.0"` and `"2.0"`.
+Durable versions retain the existing string form such as `"1.0"` and `"2.0"`, but readers do **not** infer compatibility from the numeric syntax.
 
-For this package:
+Every supported serialized version has an explicit parser and, when needed, an explicit migration path.
 
-- a **major** change means old software cannot safely interpret the new representation without an explicit parser/upcaster change;
-- a family does not receive a bump merely because a release changed code elsewhere;
-- compatible implementation refactors that preserve the durable contract do not change schema version.
+A future `1.1` would not automatically mean that a `1.0` reader can consume it. It may be emitted only when compatibility with the exact older parser contract is proven or when readers are explicitly updated to understand it.
+
+### What counts as incompatible under current strict parsers
+
+Because current Zod durable schemas frequently use `strictObject`, seemingly additive changes can break old readers. From SCHEMA001 onward, the following are treated as incompatible for writer/read compatibility unless proven otherwise by exact parser tests:
+
+- adding a serialized field to a strict object, even if conceptually optional;
+- removing or renaming a field;
+- changing field type or nesting;
+- adding a value to a closed enum/discriminated union when old readers reject unknown values;
+- changing ID regex or path constraints so a new writer can emit values old readers reject;
+- tightening validation so previously valid historical records become invalid;
+- changing the semantic meaning of an existing field or enum value;
+- changing required/optional presence in a way that affects exact historical parsing.
+
+A pure runtime refactor with byte-compatible durable output does not require a bump.
+
+### Support lifetime
+
+Every durable version that Project OS has actually emitted remains readable indefinitely unless a later explicit deprecation/migration package proves that no authoritative durable records of that version remain or provides a separately approved archival strategy.
+
+SCHEMA001 does not deprecate schema 1.0.
 
 ### Read support
 
@@ -160,13 +180,31 @@ schema_version = 2.0 -> parse V2 strictly -> current model
 anything else       -> unsupported-version failure
 ```
 
-Missing `schema_version` is not silently interpreted as current. Historical exceptions, if any are required by real durable evidence, must be represented as an explicit legacy parser and test fixture rather than a permissive fallback.
+Missing `schema_version` is not silently interpreted as current. Historical exceptions, if real durable evidence requires one, must be represented as an explicit legacy parser and test fixture rather than a permissive fallback.
 
 ### Write support
 
-Every family has one configured current write version for normal new records.
+Every family has one active current write version for normal new records.
 
-Reader compatibility and writer activation are separate rollout controls. Shipping V2 readers does not activate V2 writes.
+Reader compatibility and writer activation are separate rollout controls. Shipping V2 readers/encoders does not activate V2 writes.
+
+The semantic rollout stage is:
+
+```text
+v1_only -> core_v2 -> provider_v2
+```
+
+The implementation may expose this as an internal/deployment configuration, but the stage semantics are fixed by this design. Once production has crossed a durable frontier, operational rollback must preserve a writer stage capable of writing the already-activated generation; production must not intentionally regress to a lower writer stage.
+
+## Central codec requirement
+
+Version dispatch belongs at durable-family boundaries, not scattered through business services.
+
+Each versioned family exposes one canonical read function that returns the current semantic type after strict parse/upcast, plus the source schema version when rollback/migration guards need provenance.
+
+Existing direct durable casts/checks such as standalone receipt `JSON.parse(...) as Receipt`, manual partial registry checks, manual managed-document request record casts, and similar patterns must be brought behind explicit family codecs when that family is in SCHEMA scope.
+
+Business transitions, projection renderers, reconciliation logic and provider-neutral runtime code consume current semantic models only. They do not branch on historical schema versions.
 
 ## Family version matrix
 
@@ -175,7 +213,7 @@ The validated target matrix is:
 | Durable family | Current production | Target normal writes | Rationale |
 | --- | --- | --- | --- |
 | ProjectState | 1.0 | **2.0** | Freeze the current formal business model as a strict canonical representation |
-| machine manifest | derived from state version today | **2.0** | Make manifest representation explicit and stop accidental coupling to state implementation |
+| machine manifest | implicitly mirrors state version | **2.0** | Give manifest an explicit independent contract and state-schema pointer |
 | CanonicalCommitRecord envelope | 1.0 | 1.0 | Envelope structure does not require a bump; nested family versions are independent |
 | Transaction | 1.0 | 1.0 | No incompatible transaction change is required by SCHEMA |
 | DomainEvent | 1.0 | 1.0 | No incompatible event-envelope change is required |
@@ -185,7 +223,7 @@ The validated target matrix is:
 | `projection_version` | 1 | 1 | Bump only when projection semantics/rendering require it |
 | ManagedDocumentHead | 1.0 | **2.0** | Replace Dropbox-shaped provider observations with provider-neutral durable evidence |
 | DocumentVersionRecord | 1.0 | **2.0 for new versions** | Preserve immutable V1 versions; new provider-bearing versions use neutral evidence |
-| provider-object binding | 1.0 | **2.0** | Qualify object identity by provider |
+| provider-file/object binding | 1.0 | **2.0** | Qualify object identity by provider |
 | reference integrity fingerprint | 1.0 | **2.0** | Qualify integrity evidence by provider + algorithm |
 | managed-document request intent | 1.0 | 1.0 | No provider-shaped evidence requires change |
 | managed-document request receipt | 1.0 | 1.0 | No provider-shaped evidence requires change |
@@ -238,6 +276,27 @@ A V1 `state.json` may be read and upcast to the current semantic model without w
 
 After a later legitimate canonical/materialization operation writes the mutable current snapshot, `state.json` may converge to schema 2.0 while retaining the same business revision if no business transaction occurred solely for conversion.
 
+## Machine manifest 2.0
+
+The current manifest inherits `schema_version` from ProjectState even though it is a distinct record shape. V2 makes the contract independent.
+
+Manifest 2.0 contains exactly:
+
+```text
+schema_version: "2.0"
+project_id
+slug
+revision
+status
+last_event_id
+project_state_schema_version
+updated_at
+```
+
+`project_state_schema_version` records the schema generation of the state snapshot represented by that manifest. Manifest version and ProjectState version can therefore evolve independently later.
+
+V1 manifests remain readable. Manifest convergence creates no business revision.
+
 ## Canonical commits and recovery
 
 ### Mixed nested versions
@@ -260,15 +319,15 @@ REV-000107 -> commit 1.0 / state 2.0
 
 Recovery after total SQLite loss must produce the same final business state regardless of where the state-version transition occurs in a supported contiguous commit chain.
 
-### Historical V2 snapshots predating commit records
+### Historical V2-layout snapshots predating commit records
 
-Current compatibility paths support V2 layout snapshots that may predate immutable commit records. SCHEMA must preserve this bounded historical recovery behavior; it may not require synthetic commits to fill historical gaps.
+Current compatibility paths support V2-layout snapshots that may predate immutable commit records. SCHEMA must preserve this bounded historical recovery behavior; it may not require synthetic commits to fill historical gaps.
 
 ## Provider-neutral durable evidence V2
 
-### Common representation
+### Common observation
 
-Provider-bearing V2 records use the following semantic structure where applicable:
+When a V2 record carries complete provider object evidence, it uses this structure:
 
 ```text
 provider_id
@@ -281,7 +340,7 @@ integrity_hash:
 size
 ```
 
-Field optionality remains family-specific. The common semantic model does not imply that every record must carry every field.
+`provider_id`, `object_id` and `revision_token` are opaque strings to Project OS business logic. `integrity_hash.algorithm` is part of equality semantics; equal values under different algorithms are not equal evidence.
 
 ### Dropbox V1 upcast
 
@@ -307,6 +366,121 @@ This package creates a durable format capable of naming a provider and evidence 
 
 A future provider still requires a separate approved provider implementation and must prove that the capabilities required by the affected business flows are satisfied.
 
+## Provider-bearing V2 record shapes
+
+### ManagedDocumentHead 2.0
+
+Business fields and lifecycle pointers remain unchanged. The V1 stage map of Dropbox observations becomes a V2 stage map whose values use the common provider observation above:
+
+```text
+schema_version: "2.0"
+project_id
+document_id
+kind
+logical_path
+collection_path?
+reference_version_id?
+working_version_id?
+review_version_id?
+published_version_id?
+provider?:
+  reference?: <provider observation>
+  working?: <provider observation>
+  review?: <provider observation>
+  published?: <provider observation>
+reconciliation_status
+```
+
+All existing pointer/stage invariants remain unchanged.
+
+### DocumentVersionRecord 2.0
+
+Business/history fields remain unchanged. Flattened V1 provider fields are replaced by one optional complete provider-evidence object:
+
+```text
+schema_version: "2.0"
+project_id
+document_id
+version_id
+parent_version_id?
+kind
+stage
+logical_path
+source
+created_at
+immutable_payload_path
+content_sha256?
+provider_evidence?: <provider observation>
+media_type?
+request_id?
+```
+
+A version must continue to carry canonical `content_sha256` and/or complete provider integrity evidence according to the existing content type/lifecycle semantics. Partial provider observations are not serialized as a valid V2 `provider_evidence` object.
+
+### Provider object binding 2.0
+
+```text
+schema_version: "2.0"
+project_id
+provider_id
+object_id
+document_id
+```
+
+### Reference integrity fingerprint 2.0
+
+```text
+schema_version: "2.0"
+project_id
+provider_id
+integrity_hash:
+  algorithm
+  value
+document_id
+version_id
+```
+
+### MutationGate artifact intent 2.0
+
+All existing request/destination/route/content fields remain unchanged. Only the provider precondition representation changes:
+
+```text
+provider_precondition:
+  kind: "absent"
+  provider_id
+```
+
+or:
+
+```text
+provider_precondition:
+  kind: "existing"
+  provider_id
+  object_id
+  revision_token
+  integrity_hash:
+    algorithm
+    value
+  size
+```
+
+The destination path remains frozen separately exactly as today.
+
+### MutationGate external candidate 2.0
+
+```text
+schema_version: "2.0"
+candidate_id
+project_id
+source: "external_unverified"
+detection_source
+provider: <provider observation>
+immutable_payload_path
+detected_at
+```
+
+Candidate resolution and terminal evidence continue to reference the same `candidate_id`; they do not duplicate provider evidence.
+
 ## Identity preservation
 
 Schema evolution changes representation, not historical logical identity.
@@ -324,31 +498,44 @@ The following existing IDs are never recalculated during V1 -> V2 migration/upca
 
 For Dropbox, existing deterministic identity algorithms remain the compatibility identity algorithms for new V2 records as well. This prevents the same physical Dropbox object from acquiring a different logical Project OS identity simply because the schema writer was upgraded.
 
+For Dropbox V2:
+
+- `documentIdForProviderFile` receives the same Dropbox object ID string as historical V1 `file_id`;
+- external version ID derivation receives the same Dropbox revision-token string as historical V1 `rev`;
+- MutationGate candidate ID derivation receives the same `(project_id, object_id, revision_token)` values that V1 represented as `(project_id, provider_file_id, provider_rev)`.
+
 The V2 record stores provider-neutral evidence around that identity; it does not redefine the identity itself.
 
 A future non-Dropbox provider must define its identity policy explicitly before activation. SCHEMA does not invent a cross-provider identity equivalence rule without a real provider and validated semantics.
 
 ## Provider-qualified indexes and bindings
 
-Mutable/reconstructible indexes that are currently keyed only by Dropbox evidence need provider-qualified V2 keys.
+Legacy V1 indexes remain at their existing paths.
 
-Conceptually:
+New V2 indexes use these exact deterministic namespaces:
 
 ```text
-provider object binding key =
-  SHA256(provider_id + "\n" + object_id)
-
-provider integrity fingerprint key =
-  SHA256(provider_id + "\n" + integrity_hash.algorithm + "\n" + integrity_hash.value)
+.project-os/projects/<PRJ>/documents/provider-file-bindings/v2/<KEY>.json
+.project-os/projects/<PRJ>/documents/reference-fingerprints/v2/<KEY>.json
 ```
 
-The exact storage-path encoding may be finalized in the implementation plan but must be deterministic and project-isolated.
+where:
+
+```text
+provider object binding KEY =
+  lowercase hex SHA256(provider_id + "\n" + object_id)
+
+reference fingerprint KEY =
+  lowercase hex SHA256(provider_id + "\n" + integrity_hash.algorithm + "\n" + integrity_hash.value)
+```
+
+`KEY` is the full 64-character SHA-256 hex digest, not a truncated logical object ID.
 
 Readers support both namespaces during compatibility:
 
-1. check provider-qualified V2 evidence;
-2. check legacy Dropbox V1 evidence where applicable;
-3. if both exist and bind to contradictory logical objects, fail closed instead of choosing one silently.
+1. read provider-qualified V2 evidence;
+2. read legacy Dropbox V1 evidence where applicable;
+3. if both exist and bind the same provider evidence to contradictory logical objects, fail closed instead of choosing one silently.
 
 There is no automatic full backfill of old indexes and no write-on-read migration.
 
@@ -397,7 +584,7 @@ MutationGate remains `enforce` throughout SCHEMA rollout.
 
 New V2 artifact mutation intents preserve the existing frozen-destination and route-snapshot guarantees while expressing provider preconditions with explicit provider identity/evidence semantics.
 
-An `absent` precondition is also provider-bound so replay cannot silently reinterpret the same frozen intent against a different provider.
+An `absent` precondition is provider-bound so replay cannot silently reinterpret the same frozen intent against a different provider.
 
 ### External candidates
 
@@ -435,6 +622,16 @@ SCHEMA must preserve this carry-forward behavior.
 
 Critical `STATE.md` and `HANDOFF.md` may be regenerated when their semantic input includes the new current state representation; unrelated projections should not be forced to rewrite merely because a durable schema version changed.
 
+## API and protocol compatibility
+
+Public/internal HTTP route versioning is independent from durable record schema versioning.
+
+SCHEMA does not rename or bump `/v1/...` routes merely because ProjectState or provider-bearing records become schema 2.0. A protocol route receives a new version only for an incompatible request/response contract change.
+
+Typed business transaction operations are also a durable compatibility surface. The current schema-1.0 Transaction operation set is frozen for SCHEMA001. A future new operation or payload shape must be evaluated under the strict compatibility rules above instead of silently extending the existing 1.0 closed union.
+
+The same rule applies to DomainEvent operation discriminants derived from Transaction operations.
+
 ## Durable Object SQLite storage schema
 
 Canonical durable record schema version and Cloudflare Durable Object SQLite storage schema are separate concepts.
@@ -455,7 +652,7 @@ Unknown future local storage schema fails closed.
 
 ProjectGuard SQLite is hot acceleration for project state, receipts, artifact requests, managed-document request cache and materialization coordination. Durable external truth must remain sufficient to restore canonical business state and durable request bindings.
 
-During the compatibility-reader rollout, local JSON caches remain encoded in a form readable by the pre-writer rollback release. Merely reading/upcasting external V1 does not opportunistically convert local durable cache representation in a way that destroys rollback compatibility.
+During the compatibility-reader rollout, local JSON caches remain encoded in a form readable by the designated compatibility rollback release. Merely reading/upcasting external V1 does not opportunistically convert local durable cache representation in a way that destroys rollback compatibility.
 
 ### RegistryGuard
 
@@ -531,13 +728,15 @@ Rollback is divided by the durable write frontier.
 
 ### Before the first V2 durable write
 
-A compatibility-reader release reads V1+V2 but writes V1 only. If no V2 durable object exists yet, rollback to the pre-SCHEMA production release remains valid.
+The compatibility release contains V1+V2 readers, V2 encoders/migrations, and a `v1_only` active writer policy. If no V2 durable object exists yet, rollback to the pre-SCHEMA production release remains valid.
 
 ### After the first V2 durable write
 
 A pre-SCHEMA V1-only Worker is no longer an allowed production fallback.
 
-Rollback may target only a release proven to read every durable generation already written. The designated rollback release therefore becomes the compatibility reader, not the historical V1-only stable release.
+Rollback may target only a release proven to read every durable generation already written **and** capable of preserving the active writer generation. The designated schema-capable rollback release must therefore retain `core_v2` after R2 and `provider_v2` after R3; it must not silently return to `v1_only`.
+
+For ProjectState, a schema-capable writer encountering a current V2 state while configured to emit V1 must fail closed rather than generate a V2 -> V1 writer regression.
 
 ### No down-migration
 
@@ -546,7 +745,7 @@ Rollback never means rewriting V2 history into V1.
 If a V2 writer defect is found after committed durable V2 records exist:
 
 - stop/limit new affected writes if necessary;
-- roll execution back to a V1+V2-compatible reader/writer-safe release;
+- roll execution back to a V1+V2-compatible release that preserves the active writer stage;
 - diagnose against preserved immutable truth;
 - repair forward with a corrected compatible release.
 
@@ -574,13 +773,14 @@ Preferred architecture is one explicit production promoter. GitHub Actions is th
 
 The exact deployment-pipeline mutation requires its own explicit operational approval; this spec records the cutover requirement, not authorization to change deployment infrastructure.
 
-### R1 — compatibility reader
+### R1 — compatibility reader / dormant V2 writer capability
 
 Deploy software that:
 
 ```text
 reads all supported V1 + V2 family records
-writes V1 for every family
+contains tested V2 encoders/upcasters
+active writer stage = v1_only
 ```
 
 No V2 durable record is intentionally produced.
@@ -605,30 +805,30 @@ Rollback to the pre-SCHEMA release remains valid while the durable frontier is s
 
 ### R2 — core state V2 writer
 
-Activate only:
+Activate writer stage `core_v2`:
 
 - ProjectState 2.0 writes;
-- machine manifest 2.0 writes.
-
-All provider-bearing managed-document and MutationGate families still write V1 at this gate.
+- machine manifest 2.0 writes;
+- all provider-bearing managed-document and MutationGate families still write V1.
 
 Required validation:
 
-- first V2 state on an isolated/canary project;
+- first V2 state on an isolated production probe/canary project before broad use;
 - commit envelope remains valid at 1.0;
 - nested state 2.0 preserves revision/event/receipt bindings;
+- manifest 2.0 points to the exact ProjectState schema generation;
 - mixed V1/V2 commit-chain recovery;
 - state snapshot convergence without extra business revision;
 - total SQLite-loss recovery;
 - current projection version and materialization root-hash invariants;
 - no forced unrelated projection rewrites;
-- project isolation across V1-only and V2-writing projects.
+- project isolation across V1-only history and V2-writing projects.
 
 Once any durable ProjectState 2.0 is committed, the pre-SCHEMA V1-only release is permanently outside the supported rollback set.
 
 ### R3 — provider evidence V2 writer
 
-Activate new writes for:
+Activate writer stage `provider_v2` for new writes of:
 
 - ManagedDocumentHead 2.0;
 - DocumentVersionRecord 2.0;
@@ -644,6 +844,7 @@ Required validation:
 - head reconstruction through V1+V2 history is deterministic;
 - Dropbox CAS semantics remain intact;
 - provider integrity algorithms are compared explicitly;
+- exact V2 binding/fingerprint paths are deterministic and isolated;
 - no `DOC`, `VER`, `MUTINT` or `MUTCAND` duplication caused by schema generation;
 - legacy and V2 provider-qualified bindings detect contradictions fail-closed;
 - all eight repaired PRJ-0003 candidates remain terminal and unchanged;
@@ -664,7 +865,7 @@ After production evidence proves R2 and R3:
 
 Implementation must include a deterministic matrix covering at minimum:
 
-### ProjectState
+### ProjectState / manifest
 
 - minimal/sparse historical V1;
 - modern V1;
@@ -675,16 +876,20 @@ Implementation must include a deterministic matrix covering at minimum:
 - malformed `1.0` rejection;
 - malformed `2.0` rejection;
 - migration repeatability;
-- no generated timestamp/ID/business fact.
+- no generated timestamp/ID/business fact;
+- manifest V1 read;
+- manifest V2 read and exact state-schema binding.
 
-### Canonical commits
+### Canonical commits / receipts / transactions / events
 
 - commit 1.0 with nested state 1.0;
 - commit 1.0 with nested state 2.0;
 - mixed chains crossing V1 -> V2;
 - recovery after total SQLite loss;
 - crash after immutable commit publication but before snapshot/local persistence;
-- exact revision, transaction, event, receipt and `last_event_id` binding checks.
+- exact revision, transaction, event, receipt and `last_event_id` binding checks;
+- canonical standalone receipt read through the family codec;
+- current Transaction 1.0 operation corpus remains unchanged and strictly parseable.
 
 ### Managed documents
 
@@ -692,7 +897,9 @@ Implementation must include a deterministic matrix covering at minimum:
 - V2 head/version read;
 - V1 -> V2 upcast of Dropbox evidence;
 - V1/V2 causal chain head reconstruction;
-- V2 provider-qualified binding/fingerprint lookup with V1 fallback;
+- exact V2 provider object binding path/key;
+- exact V2 fingerprint path/key;
+- V2 lookup with V1 fallback;
 - contradictory V1/V2 index evidence conflict;
 - exact replay/idempotency;
 - published/working/review/reference lifecycle preservation;
@@ -724,9 +931,11 @@ Implementation must include a deterministic matrix covering at minimum:
 - R1 software against an all-V1 durable corpus;
 - R1 rollback to pre-SCHEMA before any V2 durable write;
 - R2 first-state-V2 frontier detection;
-- rollback from R2 to designated V1+V2 compatibility release;
-- proof that V1-only release is rejected/never selected after frontier crossing;
+- writer configured `v1_only` against current V2 state fails closed;
+- rollback from R2 to designated V1+V2 schema-capable release while preserving `core_v2`;
+- proof that V1-only release is never selected after frontier crossing;
 - R3 provider-evidence V2 mixed corpus;
+- rollback from R3 preserves `provider_v2` writer capability;
 - recovery with provider temporarily unavailable where only pure durable upcast is required;
 - deployment identity proof preventing delayed old release promotion.
 
@@ -743,7 +952,8 @@ At minimum, schema-related failures and rollout proof should identify:
 - canonical revision when applicable;
 - deployment/Git SHA identity;
 - migration or parser failure class;
-- whether the operation occurred before or after the V2 durable frontier.
+- active writer stage;
+- whether the operation occurred before or after the first V2 durable frontier.
 
 Logs must not expose provider secrets or raw sensitive payloads merely to diagnose a schema failure.
 
@@ -771,20 +981,20 @@ A family should be understandable independently:
 
 ```text
 project-state/
-  v1 parser
-  v2 parser
-  v1-to-v2 migration
+  V1 parser
+  V2 parser
+  V1-to-V2 migration
   current reader/encoder
 
 managed-document provider evidence/
-  v1 parser
-  v2 parser
-  v1-to-v2 migration
+  V1 parser
+  V2 parser
+  V1-to-V2 migration
 
 mutation-gate provider evidence/
-  v1 parser
-  v2 parser
-  v1-to-v2 migration
+  V1 parser
+  V2 parser
+  V1-to-V2 migration
 ```
 
 Exact filenames may follow the existing repository structure, but dependency direction is fixed: business logic consumes current semantic types, not historical schema unions.

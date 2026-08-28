@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker from "../src/index";
+import worker from "../src/index-mutation-gate";
 import type { Env } from "../src/env";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
@@ -162,10 +162,10 @@ describe("business ingress priority", () => {
     webhookGate.releaseInbox();
     await waitOnExecutionContext(webhookCtx);
 
-    expect(scheduledBlocked).toBe(true);
-    expect(scheduledCallsWhileBlocked).toHaveLength(0);
-    expect(webhookBlocked).toBe(true);
-    expect(webhookCallsWhileBlocked).toHaveLength(0);
+    expect.soft(scheduledBlocked, "scheduled inbox scan should block").toBe(true);
+    expect.soft(scheduledCallsWhileBlocked, "scheduled maintenance overtook inbox processing").toHaveLength(0);
+    expect.soft(webhookBlocked, "webhook inbox scan should block").toBe(true);
+    expect.soft(webhookCallsWhileBlocked, "webhook maintenance overtook inbox processing").toHaveLength(0);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${webhookTransaction.transaction_id}.json`)).toBe(true);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/incoming/${webhookTransaction.transaction_id}.json`)).toBe(false);
   });

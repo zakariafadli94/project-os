@@ -58,17 +58,29 @@ jobs:
 
       - name: Publish deployment status
         if: always()
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ github.token }}
           DEPLOY_STATUS: ${{ job.status }}
           COMMIT_SHA: ${{ github.sha }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        shell: bash
-        run: |
-          title="[automation] Project OS deployment status"
-          issue_number=$(gh issue list --state open --search "$title in:title" --json number,title --jq '.[] | select(.title == "'"$title"'") | .number' | head -n 1)
-          if [ -z "$issue_number" ]; then
-            issue_url=$(gh issue create --title "$title" --body "Automated deployment status log for Project OS production.")
-            issue_number=${issue_url##*/}
-          fi
-          gh issue comment "$issue_number" --body "status=$DEPLOY_STATUS commit=$COMMIT_SHA run=$RUN_URL"
+        with:
+          script: |
+            const title = "[automation] Project OS deployment status";
+            const { owner, repo } = context.repo;
+            const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: "open", per_page: 100 });
+            let issue = issues.find((candidate) => candidate.title === title && !candidate.pull_request);
+            if (!issue) {
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body: "Automated deployment status log for Project OS production."
+              });
+              issue = created.data;
+            }
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issue.number,
+              body: `status=${process.env.DEPLOY_STATUS} commit=${process.env.COMMIT_SHA} run=${process.env.RUN_URL}`
+            });

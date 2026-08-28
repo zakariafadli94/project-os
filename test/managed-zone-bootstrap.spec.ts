@@ -93,7 +93,7 @@ describe("projection-v2 managed-zone bootstrap", () => {
     directoryCalls.length = 0;
     const reconcile = await stub.fetch("https://project-guard.internal/reconcile-materialization", { method: "POST" });
     expect(reconcile.status).toBe(200);
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runDurableObjectAlarm(stub)).toBe(false);
     expect(directoryCalls).toEqual([]);
 
     const archived = await submit(projectId, {

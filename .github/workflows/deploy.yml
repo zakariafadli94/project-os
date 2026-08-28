@@ -65,10 +65,50 @@ jobs:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |
-          title="[automation] Project OS deployment status"
-          issue_number=$(gh issue list --state open --search "$title in:title" --json number,title --jq '.[] | select(.title == "'"$title"'") | .number' | head -n 1)
-          if [ -z "$issue_number" ]; then
-            issue_url=$(gh issue create --title "$title" --body "Automated deployment status log for Project OS production.")
-            issue_number=${issue_url##*/}
-          fi
-          gh issue comment "$issue_number" --body "status=$DEPLOY_STATUS commit=$COMMIT_SHA run=$RUN_URL"
+          node <<'NODE'
+          const token = process.env.GH_TOKEN;
+          const repository = process.env.GITHUB_REPOSITORY;
+          const api = process.env.GITHUB_API_URL || "https://api.github.com";
+          const status = process.env.DEPLOY_STATUS;
+          const commit = process.env.COMMIT_SHA;
+          const runUrl = process.env.RUN_URL;
+          const title = "[automation] Project OS deployment status";
+
+          if (!token || !repository) throw new Error("GitHub Actions token or repository identity missing");
+
+          const headers = {
+            authorization: `Bearer ${token}`,
+            accept: "application/vnd.github+json",
+            "content-type": "application/json",
+            "x-github-api-version": "2022-11-28"
+          };
+
+          async function request(url, options = {}) {
+            const response = await fetch(url, { ...options, headers: { ...headers, ...(options.headers || {}) } });
+            const raw = await response.text();
+            let body = null;
+            if (raw) {
+              try { body = JSON.parse(raw); } catch { body = raw; }
+            }
+            if (!response.ok) {
+              throw new Error(`GitHub API ${response.status}: ${typeof body === "string" ? body : JSON.stringify(body)}`);
+            }
+            return body;
+          }
+
+          const query = encodeURIComponent(`${title} in:title is:issue is:open repo:${repository}`);
+          const search = await request(`${api}/search/issues?q=${query}&per_page=20`);
+          let issue = search.items.find((item) => item.title === title);
+          if (!issue) {
+            issue = await request(`${api}/repos/${repository}/issues`, {
+              method: "POST",
+              body: JSON.stringify({ title, body: "Automated deployment status log for Project OS production." })
+            });
+          }
+
+          await request(`${api}/repos/${repository}/issues/${issue.number}/comments`, {
+            method: "POST",
+            body: JSON.stringify({ body: `status=${status} commit=${commit} run=${runUrl}` })
+          });
+          console.log(`Published deployment status to issue #${issue.number}`);
+          NODE

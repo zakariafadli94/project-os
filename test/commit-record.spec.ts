@@ -112,7 +112,7 @@ describe("canonical commit record", () => {
   });
 
   it("rejects an unsupported nested ProjectState generation", () => {
-    const record = validRecord() as ReturnType<typeof validRecord> & { state: Record<string, unknown> };
+    const record = validRecord() as any;
     record.state.schema_version = "3.0";
     expect(() => parseCanonicalCommitRecord(record)).toThrow(/ProjectState.*3\.0/i);
   });

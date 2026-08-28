@@ -27,7 +27,7 @@ permissions:
   issues: read
 
 concurrency:
-  group: mutation-candidate-reject-${{ github.event_name == 'issues' && 'PRJ-0003' || inputs.project_id }}
+  group: mutation-candidate-reject-operator
   cancel-in-progress: false
 
 jobs:

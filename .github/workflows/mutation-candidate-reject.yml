@@ -69,21 +69,12 @@ jobs:
           fi
           node <<'NODE'
           const projectId = process.env.PROJECT_ID ?? "";
-          if (!/^PRJ-[0-9]{4,}$/.test(projectId)) {
-            throw new Error("Invalid project_id");
-          }
-
+          if (!/^PRJ-[0-9]{4,}$/.test(projectId)) throw new Error("Invalid project_id");
           const candidateIds = JSON.parse(process.env.CANDIDATE_IDS_JSON ?? "");
-          if (!Array.isArray(candidateIds) || candidateIds.length === 0) {
-            throw new Error("candidate_ids_json must be a non-empty JSON array");
-          }
-          if (new Set(candidateIds).size !== candidateIds.length) {
-            throw new Error("candidate_ids_json contains duplicates");
-          }
+          if (!Array.isArray(candidateIds) || candidateIds.length === 0) throw new Error("candidate_ids_json must be a non-empty JSON array");
+          if (new Set(candidateIds).size !== candidateIds.length) throw new Error("candidate_ids_json contains duplicates");
           for (const candidateId of candidateIds) {
-            if (typeof candidateId !== "string" || !/^MUTCAND-[A-F0-9]{24}$/.test(candidateId)) {
-              throw new Error(`Invalid candidate ID: ${String(candidateId)}`);
-            }
+            if (typeof candidateId !== "string" || !/^MUTCAND-[A-F0-9]{24}$/.test(candidateId)) throw new Error(`Invalid candidate ID: ${String(candidateId)}`);
           }
           console.log(`Validated ${candidateIds.length} candidate reject request(s) for ${projectId}`);
           NODE
@@ -94,27 +85,15 @@ jobs:
           set -euo pipefail
           OPERATOR_TOKEN=$(node -e 'const { randomBytes } = require("node:crypto"); process.stdout.write(`${Date.now()}.${randomBytes(32).toString("hex")}`)')
           OPERATOR_VERSION_TAG="mg-op-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          CLEAN_BASE_VERSION_TAG="mg-clean-base-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           CLEANUP_VERSION_TAG="mg-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "::add-mask::$OPERATOR_TOKEN"
           {
             echo "OPERATOR_TOKEN=$OPERATOR_TOKEN"
             echo "OPERATOR_VERSION_TAG=$OPERATOR_VERSION_TAG"
-            echo "CLEAN_BASE_VERSION_TAG=$CLEAN_BASE_VERSION_TAG"
             echo "CLEANUP_VERSION_TAG=$CLEANUP_VERSION_TAG"
-            echo "CLEAN_BASE_VERSION_CREATED=false"
             echo "TOKEN_VERSION_CREATED=false"
             echo "TOKEN_VERSION_DEPLOYED=false"
           } >> "$GITHUB_ENV"
-
-      - name: Stage clean fallback version
-        shell: bash
-        run: |
-          set -euo pipefail
-          npx wrangler versions upload \
-            --tag "$CLEAN_BASE_VERSION_TAG" \
-            --message "MutationGate clean fallback for run $GITHUB_RUN_ID"
-          echo "CLEAN_BASE_VERSION_CREATED=true" >> "$GITHUB_ENV"
 
       - name: Create ephemeral operator-token version
         shell: bash
@@ -152,23 +131,19 @@ jobs:
               --header 'Content-Type: application/json' \
               --data '{}' \
               "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
-
             if [ "$readiness_status" = "400" ] && grep -q '"error":"invalid_mutation_candidate_resolution"' /tmp/operator-readiness-body.json; then
               echo "Ephemeral operator token is active on the serving Worker version."
               exit 0
             fi
-
             if [ "$readiness_status" = "401" ]; then
               echo "readiness probe received HTTP 401 on attempt $attempt; waiting for the new Worker version."
               sleep 3
               continue
             fi
-
             echo "Unexpected operator-token readiness response: HTTP ${readiness_status:-curl-error}."
             cat /tmp/operator-readiness-body.json 2>/dev/null || true
             exit 1
           done
-
           echo "Ephemeral operator token did not become ready within the bounded retry window."
           exit 1
 
@@ -178,7 +153,6 @@ jobs:
           set -euo pipefail
           node <<'NODE'
           const { createHash } = require("node:crypto");
-
           const projectId = process.env.PROJECT_ID;
           const candidateIds = JSON.parse(process.env.CANDIDATE_IDS_JSON);
           const baseUrl = process.env.PROJECT_OS_URL;
@@ -186,64 +160,34 @@ jobs:
           const operation = "candidate.reject";
 
           async function rejectCandidate(candidateId) {
-            const resolutionId = `MUTRES-${createHash("sha256")
-              .update(`${projectId}\n${candidateId}\n${operation}`)
-              .digest("hex")
-              .slice(0, 24)
-              .toUpperCase()}`;
-            const payload = {"operation":"candidate.reject",
-              resolution_id: resolutionId,
-              project_id: projectId,
-              candidate_id: candidateId
-            };
+            const resolutionId = `MUTRES-${createHash("sha256").update(`${projectId}\n${candidateId}\n${operation}`).digest("hex").slice(0, 24).toUpperCase()}`;
+            const payload = {"operation":"candidate.reject", resolution_id: resolutionId, project_id: projectId, candidate_id: candidateId};
             const payloadJson = JSON.stringify(payload);
-
             for (let attempt = 1; attempt <= 10; attempt += 1) {
               const response = await fetch(`${baseUrl}/v1/mutation-candidates/resolve`, {
                 method: "POST",
-                headers: {
-                  authorization: `Bearer ${token}`,
-                  "content-type": "application/json"
-                },
+                headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
                 body: payloadJson
               });
               const raw = await response.text();
-
               if (response.status === 401) {
-                if (attempt === 10) {
-                  throw new Error(`${candidateId}: HTTP 401 after ${attempt} attempts: ${raw}`);
-                }
+                if (attempt === 10) throw new Error(`${candidateId}: HTTP 401 after ${attempt} attempts: ${raw}`);
                 console.log(`${candidateId}: candidate reject received HTTP 401 on attempt ${attempt}; retrying the same resolution request.`);
                 await new Promise((resolve) => setTimeout(resolve, 3000));
                 continue;
               }
-
               let body;
-              try {
-                body = JSON.parse(raw);
-              } catch {
-                throw new Error(`${candidateId}: non-JSON response (${response.status})`);
-              }
-
-              if (!response.ok) {
-                throw new Error(`${candidateId}: HTTP ${response.status}: ${raw}`);
-              }
-              if (body.status !== "committed" || body.action !== "reject") {
-                throw new Error(`${candidateId}: expected {"status":"committed","action":"reject"}, received ${raw}`);
-              }
-              if (body.project_id !== projectId || body.candidate_id !== candidateId || body.resolution_id !== resolutionId) {
-                throw new Error(`${candidateId}: response identity mismatch`);
-              }
-
+              try { body = JSON.parse(raw); } catch { throw new Error(`${candidateId}: non-JSON response (${response.status})`); }
+              if (!response.ok) throw new Error(`${candidateId}: HTTP ${response.status}: ${raw}`);
+              if (body.status !== "committed" || body.action !== "reject") throw new Error(`${candidateId}: expected {"status":"committed","action":"reject"}, received ${raw}`);
+              if (body.project_id !== projectId || body.candidate_id !== candidateId || body.resolution_id !== resolutionId) throw new Error(`${candidateId}: response identity mismatch`);
               console.log(`${candidateId}: committed reject (${resolutionId})`);
               return;
             }
           }
 
           (async () => {
-            for (const candidateId of candidateIds) {
-              await rejectCandidate(candidateId);
-            }
+            for (const candidateId of candidateIds) await rejectCandidate(candidateId);
             console.log(`Committed ${candidateIds.length} candidate reject resolution(s) for ${projectId}`);
           })().catch((error) => {
             console.error(error instanceof Error ? error.message : String(error));
@@ -265,55 +209,19 @@ jobs:
           cleanup_deployed=0
 
           if [ "${TOKEN_VERSION_CREATED:-false}" = "true" ]; then
-            latest_ok=0
-            if npx wrangler versions list --json > "$RUNNER_TEMP/mutationgate-versions.json"; then
-              if node <<'NODE'
-          const fs = require("node:fs");
-          const versions = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/mutationgate-versions.json", "utf8"));
-          if (!Array.isArray(versions) || versions.length === 0) process.exit(1);
-          const strings = [];
-          const collect = (value) => {
-            if (typeof value === "string") strings.push(value);
-            else if (Array.isArray(value)) value.forEach(collect);
-            else if (value && typeof value === "object") Object.values(value).forEach(collect);
-          };
-          collect(versions[0]);
-          if (!strings.includes(process.env.OPERATOR_VERSION_TAG)) process.exit(1);
-          NODE
-              then
-                latest_ok=1
-              fi
-            fi
-
-            if [ "$latest_ok" -eq 1 ]; then
-              if npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN \
-                --tag "$CLEANUP_VERSION_TAG" \
-                --message "MutationGate operator-token cleanup for run $GITHUB_RUN_ID"; then
-                if npx wrangler versions deploy \
-                  --version-tag "$CLEANUP_VERSION_TAG@100%" \
-                  --message "MutationGate clean production after run $GITHUB_RUN_ID" \
-                  --yes; then
-                  cleanup_deployed=1
-                else
-                  echo "Failed to deploy the versioned operator-token cleanup."
-                fi
+            if npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN \
+              --tag "$CLEANUP_VERSION_TAG" \
+              --message "MutationGate operator-token cleanup for run $GITHUB_RUN_ID"; then
+              if npx wrangler versions deploy \
+                --version-tag "$CLEANUP_VERSION_TAG@100%" \
+                --message "MutationGate clean production after run $GITHUB_RUN_ID" \
+                --yes; then
+                cleanup_deployed=1
               else
-                echo "Failed to create the versioned operator-token cleanup."
+                echo "Failed to deploy the versioned operator-token cleanup."
               fi
             else
-              echo "Latest Worker version drifted after operator-token creation; refusing to derive cleanup from an unknown version."
-            fi
-          fi
-
-          if [ "$cleanup_deployed" -ne 1 ] && [ "${CLEAN_BASE_VERSION_CREATED:-false}" = "true" ]; then
-            echo "Deploying the pre-token clean fallback version."
-            if npx wrangler versions deploy \
-              --version-tag "$CLEAN_BASE_VERSION_TAG@100%" \
-              --message "MutationGate emergency clean fallback for run $GITHUB_RUN_ID" \
-              --yes; then
-              cleanup_deployed=1
-            else
-              echo "Failed to deploy the pre-token clean fallback version."
+              echo "Failed to create the versioned operator-token cleanup from the latest Worker version."
             fi
           fi
 

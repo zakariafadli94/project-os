@@ -32,6 +32,8 @@ When `HANDOFF.md` exposes an operating contract, load the referenced `OPERATING.
 
 Old chats are not exempt. Their prior instructions and document copies are stale working context until refreshed against the current project bootstrap.
 
+For a project materialized with projection v2 or later, the project-local `HANDOFF.md` + linked `OPERATING.md` are the current operational routing contract. If an older generic SOP sentence conflicts with that project-local contract — for example legacy wording that managed folders are exposed only lazily — the current project-local contract governs. Canonical business-state authority and typed mutation rules are unchanged by this precedence rule.
+
 The compact routing contract is:
 
 ```text

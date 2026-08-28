@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseTransaction } from "../src/domain/transaction";
+import { applyTransaction } from "../src/domain/transitions";
 import { createDropboxPersistence } from "../src/persistence/providers/dropbox/adapter";
 import {
   DropboxClient,
   DropboxConflictError,
   type DropboxTransport
 } from "../src/persistence/providers/dropbox/client";
+import { ProjectRepository } from "../src/persistence/repository";
 
 function rawTransport(overrides: Partial<DropboxTransport> = {}): DropboxTransport {
   return {
@@ -33,6 +36,44 @@ function rawTransport(overrides: Partial<DropboxTransport> = {}): DropboxTranspo
   };
 }
 
+function projectRecord() {
+  const transaction = parseTransaction({
+    schema_version: "1.0",
+    transaction_id: "TXN-DIR-PV1-000001",
+    project_id: "PRJ-7002",
+    base_revision: 0,
+    operation: "project.create",
+    created_at: "2026-08-28T22:30:00+01:00",
+    payload: {
+      name: "PV1 Directory Fixture",
+      slug: "pv1-directory-fixture",
+      aliases: [],
+      objective: "Prove PV1 does not activate PV2 folders"
+    }
+  });
+  const result = applyTransaction(null, transaction);
+  if (result.kind !== "commit") throw new Error(`fixture transition failed: ${result.kind}`);
+  return {
+    schema_version: "1.0" as const,
+    project_id: transaction.project_id,
+    previous_revision: 0,
+    new_revision: result.state.revision,
+    transaction,
+    state: result.state,
+    event: result.event,
+    receipt: {
+      schema_version: "1.0" as const,
+      transaction_id: transaction.transaction_id,
+      status: "committed" as const,
+      project_id: transaction.project_id,
+      previous_revision: 0,
+      new_revision: result.state.revision,
+      event_id: result.event.event_id,
+      committed_at: "2026-08-28T22:30:00+01:00"
+    }
+  };
+}
+
 describe("directory provisioning capability", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -49,6 +90,21 @@ describe("directory provisioning capability", () => {
     expect(calls).toEqual([
       "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-7001-activation/REFERENCES/UNCLASSIFIED"
     ]);
+  });
+
+  it("does not bootstrap managed zones for an explicitly requested projection v1 materialization", async () => {
+    const calls: string[] = [];
+    const runtime = createDropboxPersistence(rawTransport({
+      ensureDirectory: async (path) => { calls.push(path); }
+    }));
+    const repository = new ProjectRepository(runtime, "v2");
+
+    await repository.materializeCanonicalDerivatives(projectRecord(), {
+      publishReceipt: false,
+      projectionVersion: 1
+    });
+
+    expect(calls).toEqual([]);
   });
 
   it("creates missing directory ancestors in order and succeeds idempotently when the folder already exists", async () => {

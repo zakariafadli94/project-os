@@ -10,8 +10,15 @@ import {
   type MutationGateMode
 } from "../mutation-gate/service";
 import { LegacyArtifactDocumentWriter } from "../documents/legacy-artifact";
+import { encodeManifest } from "../schema/manifest";
+import { encodeProjectState } from "../schema/project-state";
+import type { SchemaWriterStage } from "../schema/writer-stage";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
-import type { LayoutMode } from "./layout";
+import {
+  type LayoutMode,
+  machineManifestPath,
+  machineStatePath
+} from "./layout";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
 import {
   asProjectOsPersistence,
@@ -27,7 +34,8 @@ export class ProjectRepository extends CoreProjectRepository {
   constructor(
     input: PersistenceInput,
     private readonly repositoryMode: LayoutMode = "legacy",
-    mutationGateMode: MutationGateMode = "observe"
+    mutationGateMode: MutationGateMode = "observe",
+    private readonly schemaWriterStage: SchemaWriterStage = "v1_only"
   ) {
     const runtime = asProjectOsPersistence(input);
     super(runtime, repositoryMode);
@@ -35,6 +43,13 @@ export class ProjectRepository extends CoreProjectRepository {
     const mutationRepository = new MutationGateRepository(runtime);
     this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
     this.mutationGate = new MutationGateService(runtime, mutationGateMode);
+  }
+
+  override async writeMachineSnapshot(state: ProjectState): Promise<void> {
+    const encodedState = encodeProjectState(state, this.schemaWriterStage);
+    const encodedManifest = encodeManifest(state, this.schemaWriterStage);
+    await this.runtime.objects.upsertText(machineStatePath(state.project_id), pretty(encodedState));
+    await this.runtime.objects.upsertText(machineManifestPath(state.project_id), pretty(encodedManifest));
   }
 
   override async writeArtifact(
@@ -88,4 +103,8 @@ function sameDestination(left: ResolvedArtifactDestination, right: ResolvedArtif
     && left.route?.source_prefix === right.route?.source_prefix
     && left.route?.target_prefix === right.route?.target_prefix
     && left.route?.archive_prefix === right.route?.archive_prefix;
+}
+
+function pretty(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
 }

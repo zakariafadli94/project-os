@@ -20,6 +20,10 @@ import {
 } from "./provider/runtime";
 import { ProjectRepository as CoreProjectRepository, type CommitWriteOptions } from "./repository-core";
 
+type ActivationDerivativeOptions = CommitWriteOptions & {
+  projectionVersion?: number;
+};
+
 export class ProjectRepository extends CoreProjectRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
@@ -40,7 +44,7 @@ export class ProjectRepository extends CoreProjectRepository {
 
   override async materializeCanonicalDerivatives(
     record: CanonicalCommitRecord,
-    options: CommitWriteOptions = {}
+    options: ActivationDerivativeOptions = {}
   ): Promise<void> {
     await super.materializeCanonicalDerivatives(record, options);
     if (

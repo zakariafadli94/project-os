@@ -43,7 +43,12 @@ export class ProjectRepository extends CoreProjectRepository {
     options: CommitWriteOptions = {}
   ): Promise<void> {
     await super.materializeCanonicalDerivatives(record, options);
-    if (this.repositoryMode !== "v2" || record.state.status === "archived") return;
+    if (
+      this.repositoryMode !== "v2"
+      || options.projectionVersion === undefined
+      || options.projectionVersion < 2
+      || record.state.status === "archived"
+    ) return;
     await this.ensureManagedWorkspaceDirectories(record.state);
   }
 

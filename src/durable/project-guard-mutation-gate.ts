@@ -7,6 +7,7 @@ import {
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Env } from "../env";
+import { ProviderOperationError } from "../persistence/provider/errors";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
 import {
   MutationCandidateResolutionService,
@@ -126,16 +127,23 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
       });
     }
 
-    const state = await this.loadResolutionState();
-    if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+    try {
+      const state = await this.loadResolutionState();
+      if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
 
-    const receipt = await this.resolutionService.resolve(resolution, state, {
-      artifact: (adoption, currentState, candidatePath) =>
-        this.executeArtifactAdoption(adoption, currentState, candidatePath),
-      working: (adoption, currentState) =>
-        this.executeWorkingAdoption(adoption, currentState)
-    });
-    return Response.json(receipt);
+      const receipt = await this.resolutionService.resolve(resolution, state, {
+        artifact: (adoption, currentState, candidatePath) =>
+          this.executeArtifactAdoption(adoption, currentState, candidatePath),
+        working: (adoption, currentState) =>
+          this.executeWorkingAdoption(adoption, currentState)
+      });
+      return Response.json(receipt);
+    } catch (error) {
+      if (error instanceof ProviderOperationError && error.retryable) {
+        return providerUnavailableResponse(error);
+      }
+      throw error;
+    }
   }
 
   private async executeArtifactAdoption(
@@ -268,6 +276,19 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
       release();
     }
   }
+}
+
+function providerUnavailableResponse(error: ProviderOperationError): Response {
+  const diagnostics = error.diagnostics;
+  const body: Record<string, unknown> = {
+    error: "persistence_provider_unavailable",
+    provider_id: diagnostics?.providerId ?? "unknown"
+  };
+  if (diagnostics?.operation) body.provider_operation = diagnostics.operation;
+  if (typeof diagnostics?.status === "number") body.provider_status = diagnostics.status;
+  if (diagnostics?.code) body.provider_code = diagnostics.code;
+  if (typeof diagnostics?.requestId === "string") body.provider_request_id = diagnostics.requestId;
+  return Response.json(body, { status: 503 });
 }
 
 function artifactReceipt(

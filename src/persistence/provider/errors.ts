@@ -3,6 +3,7 @@ export interface ProviderDiagnostics {
   status?: number;
   requestId?: string | null;
   code?: string;
+  operation?: string;
 }
 
 export class ProviderOperationError extends Error {

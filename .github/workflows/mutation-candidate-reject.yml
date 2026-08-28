@@ -19,33 +19,52 @@ on:
         required: true
         default: false
         type: boolean
+  issues:
+    types: [opened]
 
 permissions:
   contents: read
+  issues: read
 
 concurrency:
-  group: mutation-candidate-reject-${{ inputs.project_id }}
+  group: mutation-candidate-reject-operator
   cancel-in-progress: false
 
 jobs:
   reject:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' &&
+       github.actor == github.repository_owner &&
+       github.event.issue.title == '[operator] MutationGate PRJ-0003 reject repair')
     runs-on: ubuntu-latest
     env:
       PROJECT_OS_URL: https://project-os-guard.zakaria-fadli-94.workers.dev
-      PROJECT_OS_INGRESS_TOKEN: ${{ secrets.PROJECT_OS_INGRESS_TOKEN }}
-      PROJECT_ID: ${{ inputs.project_id }}
-      CANDIDATE_IDS_JSON: ${{ inputs.candidate_ids_json }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PROJECT_ID: ${{ github.event_name == 'issues' && 'PRJ-0003' || inputs.project_id }}
+      CANDIDATE_IDS_JSON: ${{ github.event_name == 'issues' && '["MUTCAND-A546CDBE7CF04684BD3A0C80","MUTCAND-5A8935635AAEB09CCF1ABA29","MUTCAND-A0F80BD3D82FED5C45DA472F","MUTCAND-40BE82147A4DDA2B277AA2EE","MUTCAND-F70FB05673E9F63940717150","MUTCAND-A0FF170F4D6D3412953AFACB","MUTCAND-D95D6E3FD68ACD3A2B93DB3A","MUTCAND-34C0FA6FF7DA80ACDA79EA88"]' || inputs.candidate_ids_json }}
+      CONFIRM_REJECT: ${{ github.event_name == 'issues' && 'true' || inputs.confirm_reject }}
     steps:
-      - name: Validate operator inputs
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Validate operator request
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ inputs.confirm_reject }}" != "true" ]; then
+          if [ "$CONFIRM_REJECT" != "true" ]; then
             echo "confirm_reject must be explicitly enabled."
             exit 1
           fi
-          if [ -z "${PROJECT_OS_INGRESS_TOKEN}" ]; then
-            echo "PROJECT_OS_INGRESS_TOKEN is not configured."
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "Existing Cloudflare deployment credentials are not configured."
             exit 1
           fi
           node <<'NODE'
@@ -69,6 +88,35 @@ jobs:
           console.log(`Validated ${candidateIds.length} candidate reject request(s) for ${projectId}`);
           NODE
 
+      - name: Generate ephemeral operator token
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPERATOR_TOKEN=$(node -e 'const { randomBytes } = require("node:crypto"); process.stdout.write(`${Date.now()}.${randomBytes(32).toString("hex")}`)')
+          echo "::add-mask::$OPERATOR_TOKEN"
+          echo "OPERATOR_TOKEN=$OPERATOR_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Install ephemeral operator token
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e 'process.stdout.write(JSON.stringify({MUTATION_GATE_OPERATOR_TOKEN: process.env.OPERATOR_TOKEN}))' \
+            | npx wrangler secret bulk
+
+      - name: Verify production health after token install
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health"); then
+              echo "$response"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Production health check failed after operator-token installation."
+          exit 1
+
       - name: Reject candidates through governed ingress
         shell: bash
         run: |
@@ -79,7 +127,7 @@ jobs:
           const projectId = process.env.PROJECT_ID;
           const candidateIds = JSON.parse(process.env.CANDIDATE_IDS_JSON);
           const baseUrl = process.env.PROJECT_OS_URL;
-          const token = process.env.PROJECT_OS_INGRESS_TOKEN;
+          const token = process.env.OPERATOR_TOKEN;
           const operation = "candidate.reject";
 
           async function rejectCandidate(candidateId) {
@@ -133,3 +181,52 @@ jobs:
             process.exit(1);
           });
           NODE
+
+      - name: Revoke ephemeral operator token and verify cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -u -o pipefail
+          if [ -z "${OPERATOR_TOKEN:-}" ]; then
+            echo "No operator token was generated; no remote operator secret could have been installed."
+            exit 0
+          fi
+
+          cleanup_failed=0
+
+          if ! printf '%s' '{"MUTATION_GATE_OPERATOR_TOKEN":null}' | npx wrangler secret bulk; then
+            echo "Failed to delete MUTATION_GATE_OPERATOR_TOKEN."
+            cleanup_failed=1
+          fi
+
+          health_ok=0
+          for attempt in 1 2 3 4 5; do
+            if response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health"); then
+              echo "$response"
+              health_ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$health_ok" -ne 1 ]; then
+            echo "Production health check failed after operator-token cleanup."
+            cleanup_failed=1
+          fi
+
+          revoke_status=$(curl --silent --show-error --max-time 15 \
+            --output /tmp/operator-revoke-body.json \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer $OPERATOR_TOKEN" \
+            --header 'Content-Type: application/json' \
+            --data '{}' \
+            "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
+          if [ "$revoke_status" != "401" ]; then
+            echo "Expected HTTP 401 after operator-token cleanup; received ${revoke_status:-curl-error}."
+            cat /tmp/operator-revoke-body.json 2>/dev/null || true
+            cleanup_failed=1
+          else
+            echo "Operator token revocation verified with HTTP 401."
+          fi
+
+          exit "$cleanup_failed"

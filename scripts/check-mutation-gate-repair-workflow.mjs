@@ -22,9 +22,20 @@ const forbid = (pattern, label) => {
 };
 
 requireText("workflow_dispatch:", "manual workflow_dispatch trigger");
+requireText("issues:", "connector-accessible issue trigger");
+requireText("types: [opened]", "opened-issue trigger scope");
 forbid(/^\s*push:/m, "push trigger");
 forbid(/^\s*pull_request:/m, "pull_request trigger");
-requireText("PROJECT_OS_INGRESS_TOKEN", "dedicated ingress secret");
+forbid(/PROJECT_OS_INGRESS_TOKEN/, "persistent GitHub ingress-token dependency");
+requireText("CLOUDFLARE_API_TOKEN", "existing Cloudflare API credential");
+requireText("CLOUDFLARE_ACCOUNT_ID", "existing Cloudflare account credential");
+requireText("MUTATION_GATE_OPERATOR_TOKEN", "ephemeral Worker operator secret");
+requireText("wrangler secret bulk", "non-interactive Worker secret lifecycle");
+requireText("::add-mask::", "GitHub log masking");
+requireText("if: always()", "unconditional cleanup path");
+requireText("HTTP 401", "post-cleanup revocation verification");
+requireText("github.repository_owner", "owner-only issue trigger guard");
+requireText("[operator] MutationGate PRJ-0003 reject repair", "exact connector control issue title");
 requireText("/v1/mutation-candidates/resolve", "governed resolution endpoint");
 requireText('{"operation":"candidate.reject"', "explicit candidate.reject payload");
 requireText('{"status":"committed"', "committed receipt check");

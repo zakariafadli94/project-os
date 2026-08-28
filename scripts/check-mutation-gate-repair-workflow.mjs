@@ -44,6 +44,11 @@ requireText('{"status":"committed"', "committed receipt check");
 requireText('"action":"reject"', "reject action check");
 requireText("confirm_reject", "explicit operator confirmation input");
 requireText("candidate_ids_json", "candidate list input");
+requireText("Verify ephemeral operator token readiness", "authenticated operator-token readiness probe");
+requireText("invalid_mutation_candidate_resolution", "readiness probe authenticated-response contract");
+requireText("readiness probe received HTTP 401", "readiness retry on stale Worker version");
+requireText("--data '{}'", "non-mutating invalid readiness probe payload");
+forbid(/Verify production health after token install/, "health-only operator-token readiness check");
 forbid(/dropbox/i, "direct Dropbox access");
 
 for (const candidateId of expectedCandidates) {

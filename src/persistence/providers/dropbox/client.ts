@@ -8,6 +8,7 @@ export interface DropboxTransport {
   uploadConditional?(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata>;
   copy?(from: string, to: string): Promise<DropboxFileMetadata>;
   listFolderChanges?(root?: string, cursor?: string): Promise<DropboxChangePage>;
+  ensureDirectory?(path: string): Promise<void>;
 }
 
 export interface DropboxEntry {
@@ -247,6 +248,34 @@ export class DropboxClient implements DropboxTransport {
     throw this.errorFromResponse(`Dropbox delete failed for ${path}`, response, text);
   }
 
+  async ensureDirectory(path: string): Promise<void> {
+    if (!path.startsWith("/") || path === "/") {
+      throw new Error(`Dropbox directory path must be an absolute non-root path: ${path}`);
+    }
+    const token = await this.accessToken();
+    const missingDescendants: string[] = [];
+    let current = path;
+
+    for (;;) {
+      const result = await this.createFolder(token, current);
+      if (result !== "parent_missing") break;
+
+      missingDescendants.push(current);
+      const parentSlash = current.lastIndexOf("/");
+      if (parentSlash <= 0) {
+        throw new Error(`Dropbox directory provisioning could not find an existing ancestor for ${path}`);
+      }
+      current = current.slice(0, parentSlash);
+    }
+
+    for (const missingPath of missingDescendants.reverse()) {
+      const result = await this.createFolder(token, missingPath);
+      if (result === "parent_missing") {
+        throw new Error(`Dropbox directory provisioning lost its parent while creating ${missingPath}`);
+      }
+    }
+  }
+
   async listFolder(path: string): Promise<DropboxEntry[]> {
     const token = await this.accessToken();
     const entries: DropboxEntry[] = [];
@@ -437,8 +466,15 @@ export class DropboxClient implements DropboxTransport {
     if (response.ok) return "created";
 
     const text = await response.text();
-    if (response.status === 409 && text.includes("conflict")) return "exists";
+    if (response.status === 409 && text.includes("conflict/folder")) return "exists";
     if (response.status === 409 && text.includes("not_found")) return "parent_missing";
+    if (response.status === 409) {
+      throw new DropboxConflictError(
+        `Dropbox directory conflict for ${path}`,
+        response.headers.get("x-dropbox-request-id"),
+        text
+      );
+    }
     throw this.errorFromResponse(`Dropbox create_folder failed for ${path}`, response, text);
   }
 

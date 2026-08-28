@@ -80,12 +80,14 @@ describe("scheduled business priority", () => {
     } as ScheduledController, testEnv, scheduledCtx);
 
     await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(blockedInboxList).toBe(true);
-    expect(mock.calls).toHaveLength(0);
+    const blocked = blockedInboxList;
+    const callsWhileInboxBlocked = [...mock.calls];
 
     releaseInbox();
     await waitOnExecutionContext(scheduledCtx);
 
+    expect(blocked).toBe(true);
+    expect(callsWhileInboxBlocked).toHaveLength(0);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${transaction.transaction_id}.json`)).toBe(true);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`)).toBe(false);
   });

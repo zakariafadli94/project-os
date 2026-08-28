@@ -1,0 +1,136 @@
+name: MutationGate candidate reject
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: Project whose MutationGate candidates will be rejected
+        required: true
+        default: PRJ-0003
+        type: string
+      candidate_ids_json:
+        description: JSON array of candidate IDs to reject
+        required: true
+        default: >-
+          ["MUTCAND-A546CDBE7CF04684BD3A0C80","MUTCAND-5A8935635AAEB09CCF1ABA29","MUTCAND-A0F80BD3D82FED5C45DA472F","MUTCAND-40BE82147A4DDA2B277AA2EE","MUTCAND-F70FB05673E9F63940717150","MUTCAND-A0FF170F4D6D3412953AFACB","MUTCAND-D95D6E3FD68ACD3A2B93DB3A","MUTCAND-34C0FA6FF7DA80ACDA79EA88"]
+        type: string
+      confirm_reject:
+        description: Confirm that every listed candidate should receive a terminal reject resolution
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-candidate-reject-${{ inputs.project_id }}
+  cancel-in-progress: false
+
+jobs:
+  reject:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_OS_URL: https://project-os-guard.zakaria-fadli-94.workers.dev
+      PROJECT_OS_INGRESS_TOKEN: ${{ secrets.PROJECT_OS_INGRESS_TOKEN }}
+      PROJECT_ID: ${{ inputs.project_id }}
+      CANDIDATE_IDS_JSON: ${{ inputs.candidate_ids_json }}
+    steps:
+      - name: Validate operator inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.confirm_reject }}" != "true" ]; then
+            echo "confirm_reject must be explicitly enabled."
+            exit 1
+          fi
+          if [ -z "${PROJECT_OS_INGRESS_TOKEN}" ]; then
+            echo "PROJECT_OS_INGRESS_TOKEN is not configured."
+            exit 1
+          fi
+          node <<'NODE'
+          const projectId = process.env.PROJECT_ID ?? "";
+          if (!/^PRJ-[0-9]{4,}$/.test(projectId)) {
+            throw new Error("Invalid project_id");
+          }
+
+          const candidateIds = JSON.parse(process.env.CANDIDATE_IDS_JSON ?? "");
+          if (!Array.isArray(candidateIds) || candidateIds.length === 0) {
+            throw new Error("candidate_ids_json must be a non-empty JSON array");
+          }
+          if (new Set(candidateIds).size !== candidateIds.length) {
+            throw new Error("candidate_ids_json contains duplicates");
+          }
+          for (const candidateId of candidateIds) {
+            if (typeof candidateId !== "string" || !/^MUTCAND-[A-F0-9]{24}$/.test(candidateId)) {
+              throw new Error(`Invalid candidate ID: ${String(candidateId)}`);
+            }
+          }
+          console.log(`Validated ${candidateIds.length} candidate reject request(s) for ${projectId}`);
+          NODE
+
+      - name: Reject candidates through governed ingress
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const { createHash } = require("node:crypto");
+
+          const projectId = process.env.PROJECT_ID;
+          const candidateIds = JSON.parse(process.env.CANDIDATE_IDS_JSON);
+          const baseUrl = process.env.PROJECT_OS_URL;
+          const token = process.env.PROJECT_OS_INGRESS_TOKEN;
+          const operation = "candidate.reject";
+
+          async function rejectCandidate(candidateId) {
+            const resolutionId = `MUTRES-${createHash("sha256")
+              .update(`${projectId}\n${candidateId}\n${operation}`)
+              .digest("hex")
+              .slice(0, 24)
+              .toUpperCase()}`;
+            const payload = {
+              operation,
+              resolution_id: resolutionId,
+              project_id: projectId,
+              candidate_id: candidateId
+            };
+
+            const response = await fetch(`${baseUrl}/v1/mutation-candidates/resolve`, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${token}`,
+                "content-type": "application/json"
+              },
+              body: JSON.stringify(payload)
+            });
+            const raw = await response.text();
+            let body;
+            try {
+              body = JSON.parse(raw);
+            } catch {
+              throw new Error(`${candidateId}: non-JSON response (${response.status})`);
+            }
+
+            if (!response.ok) {
+              throw new Error(`${candidateId}: HTTP ${response.status}: ${raw}`);
+            }
+            if (body.status !== "committed" || body.action !== "reject") {
+              throw new Error(`${candidateId}: expected {"status":"committed","action":"reject"}, received ${raw}`);
+            }
+            if (body.project_id !== projectId || body.candidate_id !== candidateId || body.resolution_id !== resolutionId) {
+              throw new Error(`${candidateId}: response identity mismatch`);
+            }
+
+            console.log(`${candidateId}: committed reject (${resolutionId})`);
+          }
+
+          (async () => {
+            for (const candidateId of candidateIds) {
+              await rejectCandidate(candidateId);
+            }
+            console.log(`Committed ${candidateIds.length} candidate reject resolution(s) for ${projectId}`);
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exit(1);
+          });
+          NODE

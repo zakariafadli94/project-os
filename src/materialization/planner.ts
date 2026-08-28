@@ -14,6 +14,7 @@ import { renderDecision } from "../render/decision";
 import { renderDeliverable } from "../render/deliverable";
 import { renderDiscovery } from "../render/discovery";
 import { renderHandoff } from "../render/handoff";
+import { OPERATING_CONTRACT_VERSION, renderOperating } from "../render/operating";
 import { renderPlan } from "../render/plan";
 import { renderProject } from "../render/project";
 import { renderResearch } from "../render/research";
@@ -61,6 +62,7 @@ const GLOBAL_PATHS = {
   ROADMAP: "ROADMAP.md",
   PROJECT: "PROJECT.md",
   PLAN: "PLAN.md",
+  OPERATING: "OPERATING.md",
   STATE: "STATE.md",
   HANDOFF: "HANDOFF.md"
 } as const;
@@ -209,6 +211,18 @@ function globalDescriptors(state: ProjectState, targetRevision: number): OutputD
       entity: false
     },
     {
+      key: "global:OPERATING",
+      relative_path: GLOBAL_PATHS.OPERATING,
+      critical: false,
+      semantic_input: {
+        ...identity(state),
+        target_revision: targetRevision,
+        operating_contract_version: OPERATING_CONTRACT_VERSION
+      },
+      render: () => renderOperating(state),
+      entity: false
+    },
+    {
       key: "global:STATE",
       relative_path: GLOBAL_PATHS.STATE,
       critical: true,
@@ -220,7 +234,7 @@ function globalDescriptors(state: ProjectState, targetRevision: number): OutputD
       key: "global:HANDOFF",
       relative_path: GLOBAL_PATHS.HANDOFF,
       critical: true,
-      semantic_input: { target_revision: targetRevision, state },
+      semantic_input: { target_revision: targetRevision, state, operating_contract_version: OPERATING_CONTRACT_VERSION },
       render: () => renderHandoff(state),
       entity: false
     }
@@ -319,27 +333,6 @@ function affectedEntityKeys(record: CanonicalCommitRecord): Set<string> {
 
 async function semanticHash(value: unknown, projectionVersion: number): Promise<string> {
   return sha256Canonical({ projection_version: projectionVersion, semantic_input: value });
-}
-
-async function renderChanged(
-  descriptor: OutputDescriptor,
-  record: CanonicalCommitRecord,
-  projectionVersion: number,
-  baseline?: ProjectionOutputEvidence
-): Promise<PlannedProjectionOutput> {
-  const input_hash = await semanticHash(descriptor.semantic_input, projectionVersion);
-  const content = descriptor.render();
-  const content_hash = await sha256Text(content);
-  return {
-    key: descriptor.key,
-    relative_path: descriptor.relative_path,
-    input_hash,
-    content_hash,
-    source_revision: record.new_revision,
-    content,
-    critical: descriptor.critical,
-    ...(baseline ? { baseline } : {})
-  };
 }
 
 export async function planProjection(

@@ -13,7 +13,7 @@ import { renderConstraint } from "../render/constraint";
 import { renderDecision } from "../render/decision";
 import { renderDeliverable } from "../render/deliverable";
 import { renderDiscovery } from "../render/discovery";
-import { renderHandoff } from "../render/handoff";
+import { renderHandoff, renderLegacyHandoff } from "../render/handoff";
 import { OPERATING_CONTRACT_VERSION, renderOperating } from "../render/operating";
 import { renderPlan } from "../render/plan";
 import { renderProject } from "../render/project";
@@ -168,8 +168,8 @@ function inputForDeliverable(state: ProjectState, record: DeliverableRecord): un
   };
 }
 
-function globalDescriptors(state: ProjectState, targetRevision: number): OutputDescriptor[] {
-  return [
+function globalDescriptors(state: ProjectState, targetRevision: number, projectionVersion: number): OutputDescriptor[] {
+  const descriptors: OutputDescriptor[] = [
     {
       key: "global:BRIEF",
       relative_path: GLOBAL_PATHS.BRIEF,
@@ -209,8 +209,11 @@ function globalDescriptors(state: ProjectState, targetRevision: number): OutputD
       semantic_input: planInput(state),
       render: () => renderPlan(state),
       entity: false
-    },
-    {
+    }
+  ];
+
+  if (projectionVersion >= 2) {
+    descriptors.push({
       key: "global:OPERATING",
       relative_path: GLOBAL_PATHS.OPERATING,
       critical: false,
@@ -221,7 +224,10 @@ function globalDescriptors(state: ProjectState, targetRevision: number): OutputD
       },
       render: () => renderOperating(state),
       entity: false
-    },
+    });
+  }
+
+  descriptors.push(
     {
       key: "global:STATE",
       relative_path: GLOBAL_PATHS.STATE,
@@ -234,11 +240,14 @@ function globalDescriptors(state: ProjectState, targetRevision: number): OutputD
       key: "global:HANDOFF",
       relative_path: GLOBAL_PATHS.HANDOFF,
       critical: true,
-      semantic_input: { target_revision: targetRevision, state, operating_contract_version: OPERATING_CONTRACT_VERSION },
-      render: () => renderHandoff(state),
+      semantic_input: projectionVersion >= 2
+        ? { target_revision: targetRevision, state, operating_contract_version: OPERATING_CONTRACT_VERSION }
+        : { target_revision: targetRevision, state },
+      render: () => projectionVersion >= 2 ? renderHandoff(state) : renderLegacyHandoff(state),
       entity: false
     }
-  ];
+  );
+  return descriptors;
 }
 
 function entityDescriptors(state: ProjectState): OutputDescriptor[] {
@@ -347,7 +356,7 @@ export async function planProjection(
   const state = record.state;
   const changed_outputs = new Map<string, PlannedProjectionOutput>();
   const carried_forward = new Map<string, ProjectionOutputEvidence>();
-  const globals = globalDescriptors(state, record.new_revision);
+  const globals = globalDescriptors(state, record.new_revision, projectionVersion);
   const entities = entityDescriptors(state);
   const descriptors = [...globals, ...entities];
   const expected = new Set(descriptors.map((item) => item.key));

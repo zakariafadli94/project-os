@@ -19,7 +19,7 @@ async function hmac(body: string): Promise<string> {
   return [...signed].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function createProject(transactionId: string, slug: string) {
+async function createProject() {
   const ctx = createExecutionContext();
   const response = await worker.fetch(new Request("https://example.com/v1/transactions", {
     method: "POST",
@@ -29,14 +29,14 @@ async function createProject(transactionId: string, slug: string) {
     },
     body: JSON.stringify({
       schema_version: "1.0",
-      transaction_id: transactionId,
+      transaction_id: "TXN-PRIORITY-PROJECT-0001",
       project_id: "PRJ-AUTO",
       base_revision: 0,
       operation: "project.create",
       created_at: "2026-08-28T19:50:00.000Z",
       payload: {
         name: "Priority Project",
-        slug,
+        slug: "priority-project",
         aliases: [],
         objective: "Prove business ingress priority"
       }
@@ -48,7 +48,7 @@ async function createProject(transactionId: string, slug: string) {
   return created;
 }
 
-function blockFirstInboxList(mock: ReturnType<typeof installDropboxMock>) {
+function blockNextInboxList(mock: ReturnType<typeof installDropboxMock>) {
   const delegate = mock.spy.getMockImplementation();
   if (!delegate) throw new Error("Dropbox mock implementation unavailable");
 
@@ -70,32 +70,51 @@ function blockFirstInboxList(mock: ReturnType<typeof installDropboxMock>) {
   };
 }
 
+function researchTransaction(
+  projectId: string,
+  transactionId: string,
+  researchId: string,
+  baseRevision: number,
+  createdAt: string,
+  title: string
+) {
+  return {
+    schema_version: "1.0",
+    transaction_id: transactionId,
+    project_id: projectId,
+    base_revision: baseRevision,
+    operation: "research.add",
+    created_at: createdAt,
+    payload: {
+      research_id: researchId,
+      title,
+      body: "Maintenance must never overtake an already-started business inbox scan.",
+      source: "Regression test"
+    }
+  };
+}
+
 describe("business ingress priority", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("does not start scheduled maintenance until inbox processing completes", async () => {
+  it("keeps scheduled and webhook maintenance behind inbox processing", async () => {
     const mock = installDropboxMock();
-    const created = await createProject("TXN-PRIORITY-PROJECT-0001", "priority-project");
-    const transaction = {
-      schema_version: "1.0",
-      transaction_id: "TXN-PRIORITY-RESEARCH-0001",
-      project_id: created.project_id,
-      base_revision: 1,
-      operation: "research.add",
-      created_at: "2026-08-28T19:51:00.000Z",
-      payload: {
-        research_id: "RES-PRIORITY001",
-        title: "Business ingress priority",
-        body: "Scheduled maintenance must never overtake an already-started inbox scan.",
-        source: "Regression test"
-      }
-    };
+    const created = await createProject();
+
+    const scheduledTransaction = researchTransaction(
+      created.project_id,
+      "TXN-PRIORITY-RESEARCH-0001",
+      "RES-PRIORITY001",
+      1,
+      "2026-08-28T19:51:00.000Z",
+      "Scheduled business ingress priority"
+    );
     mock.files.set(
-      `/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`,
-      JSON.stringify(transaction)
+      `/PROJECT_OS/.project-os/transactions/incoming/${scheduledTransaction.transaction_id}.json`,
+      JSON.stringify(scheduledTransaction)
     );
 
-    const gate = blockFirstInboxList(mock);
+    const scheduledGate = blockNextInboxList(mock);
     const scheduledCtx = createExecutionContext();
     await worker.scheduled?.({
       cron: "*/5 * * * *",
@@ -103,42 +122,30 @@ describe("business ingress priority", () => {
       noRetry: () => undefined
     } as ScheduledController, testEnv, scheduledCtx);
 
+    const scheduledBaseline = mock.calls.length;
     await new Promise((resolve) => setTimeout(resolve, 100));
-    const blocked = gate.blocked();
-    const callsWhileInboxBlocked = [...mock.calls];
+    const scheduledBlocked = scheduledGate.blocked();
+    const scheduledCallsWhileBlocked = mock.calls.slice(scheduledBaseline);
 
-    gate.releaseInbox();
+    scheduledGate.releaseInbox();
     await waitOnExecutionContext(scheduledCtx);
+    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${scheduledTransaction.transaction_id}.json`)).toBe(true);
 
-    expect(blocked).toBe(true);
-    expect(callsWhileInboxBlocked).toHaveLength(0);
-    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${transaction.transaction_id}.json`)).toBe(true);
-    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`)).toBe(false);
-  });
-
-  it("does not start webhook maintenance until inbox processing completes", async () => {
-    const mock = installDropboxMock();
-    const created = await createProject("TXN-PRIORITY-PROJECT-0002", "priority-webhook-project");
-    const transaction = {
-      schema_version: "1.0",
-      transaction_id: "TXN-PRIORITY-RESEARCH-0002",
-      project_id: created.project_id,
-      base_revision: 1,
-      operation: "research.add",
-      created_at: "2026-08-28T19:52:00.000Z",
-      payload: {
-        research_id: "RES-PRIORITY002",
-        title: "Webhook business ingress priority",
-        body: "Dropbox webhook maintenance must not overtake an already-started inbox scan.",
-        source: "Regression test"
-      }
-    };
+    const webhookTransaction = researchTransaction(
+      created.project_id,
+      "TXN-PRIORITY-RESEARCH-0002",
+      "RES-PRIORITY002",
+      2,
+      "2026-08-28T19:52:00.000Z",
+      "Webhook business ingress priority"
+    );
     mock.files.set(
-      `/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`,
-      JSON.stringify(transaction)
+      `/PROJECT_OS/.project-os/transactions/incoming/${webhookTransaction.transaction_id}.json`,
+      JSON.stringify(webhookTransaction)
     );
 
-    const gate = blockFirstInboxList(mock);
+    const webhookGate = blockNextInboxList(mock);
+    const webhookBaseline = mock.calls.length;
     const body = '{"list_folder":{"accounts":["dbid:test"]}}';
     const webhookCtx = createExecutionContext();
     const response = await worker.fetch(new Request("https://example.com/dropbox/webhook", {
@@ -149,15 +156,17 @@ describe("business ingress priority", () => {
     expect(response.status).toBe(200);
 
     await new Promise((resolve) => setTimeout(resolve, 100));
-    const blocked = gate.blocked();
-    const callsWhileInboxBlocked = [...mock.calls];
+    const webhookBlocked = webhookGate.blocked();
+    const webhookCallsWhileBlocked = mock.calls.slice(webhookBaseline);
 
-    gate.releaseInbox();
+    webhookGate.releaseInbox();
     await waitOnExecutionContext(webhookCtx);
 
-    expect(blocked).toBe(true);
-    expect(callsWhileInboxBlocked).toHaveLength(0);
-    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${transaction.transaction_id}.json`)).toBe(true);
-    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`)).toBe(false);
+    expect(scheduledBlocked).toBe(true);
+    expect(scheduledCallsWhileBlocked).toHaveLength(0);
+    expect(webhookBlocked).toBe(true);
+    expect(webhookCallsWhileBlocked).toHaveLength(0);
+    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${webhookTransaction.transaction_id}.json`)).toBe(true);
+    expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/incoming/${webhookTransaction.transaction_id}.json`)).toBe(false);
   });
 });

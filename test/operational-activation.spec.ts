@@ -3,7 +3,7 @@ import type { CanonicalCommitRecord } from "../src/domain/commit-record";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Receipt } from "../src/domain/receipt";
 import { parseTransaction } from "../src/domain/transaction";
-import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
+import { applyTransaction } from "../src/domain/transitions";
 import { planProjection } from "../src/materialization/planner";
 import { renderHandoff } from "../src/render/handoff";
 import { OPERATING_CONTRACT_VERSION, renderOperating } from "../src/render/operating";
@@ -11,7 +11,6 @@ import { OPERATING_CONTRACT_VERSION, renderOperating } from "../src/render/opera
 const at = "2026-08-28T20:45:00+01:00";
 
 function projectRecord(): CanonicalCommitRecord {
-  const state = emptyProjectState("PRJ-7001", "Activation Fixture", "activation-fixture", "Prove operational activation");
   const transaction = parseTransaction({
     schema_version: "1.0",
     transaction_id: "TXN-ACTIVATION-PROJECT-0001",
@@ -26,7 +25,7 @@ function projectRecord(): CanonicalCommitRecord {
       objective: "Prove operational activation"
     }
   });
-  const result = applyTransaction(state, transaction);
+  const result = applyTransaction(null, transaction);
   if (result.kind !== "commit") throw new Error(`fixture transition failed: ${result.kind}`);
   const receipt: Receipt & { status: "committed"; event_id: string } = {
     schema_version: "1.0",

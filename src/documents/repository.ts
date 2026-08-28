@@ -35,9 +35,20 @@ import {
   type DocumentVersionWriteInput,
   type ManagedDocumentHeadWriteInput
 } from "../schema/managed-document";
+import {
+  parseProviderFileBindingV1,
+  parseProviderFileBindingV2,
+  parseReferenceFingerprintV1,
+  parseReferenceFingerprintV2,
+  type ProviderFileBindingV2Record,
+  type ReferenceFingerprintV2Record
+} from "../schema/provider-index";
 import { upcastDropboxV1Observation, type ProviderObservation } from "../schema/provider-evidence";
-import type { SchemaWriterStage } from "../schema/writer-stage";
+import { writesProviderV2, type SchemaWriterStage } from "../schema/writer-stage";
 import { sha256Text } from "./hash";
+
+const DROPBOX_PROVIDER_ID = "dropbox";
+const DROPBOX_CONTENT_HASH_ALGORITHM = "dropbox-content-hash";
 
 export interface ReferenceFingerprintRecord {
   schema_version: "1.0";
@@ -132,89 +143,141 @@ export class DocumentLedgerRepository {
   }
 
   async readProviderFileBinding(projectId: string, providerFileId: string): Promise<ProviderFileBindingRecord | null> {
-    const path = await providerFileBindingPath(projectId, providerFileId);
-    const raw = await this.runtime.objects.readText(path);
-    if (raw === null) return null;
-    const parsed = JSON.parse(raw) as Partial<ProviderFileBindingRecord>;
-    if (
-      parsed.schema_version !== "1.0"
-      || parsed.project_id !== projectId
-      || parsed.provider_file_id !== providerFileId
-      || typeof parsed.document_id !== "string"
-      || !/^DOC-[A-F0-9]{24}$/.test(parsed.document_id)
-    ) {
-      throw new Error(`Invalid provider-file document binding for ${projectId}/${providerFileId}`);
+    const v2Path = await providerFileBindingV2Path(projectId, DROPBOX_PROVIDER_ID, providerFileId);
+    const v1Path = await providerFileBindingPath(projectId, providerFileId);
+    const v2Raw = await this.runtime.objects.readText(v2Path);
+    const v1Raw = await this.runtime.objects.readText(v1Path);
+    const v2 = v2Raw === null ? null : normalizeProviderFileBindingV2(
+      parseBoundProviderFileBindingV2(JSON.parse(v2Raw), projectId, providerFileId)
+    );
+    const v1 = v1Raw === null ? null : parseBoundProviderFileBindingV1(
+      JSON.parse(v1Raw),
+      projectId,
+      providerFileId
+    );
+
+    if (v2 && v1 && v2.document_id !== v1.document_id) {
+      throw new Error(`Contradictory V1/V2 provider-file bindings for ${projectId}/${providerFileId}`);
     }
-    return parsed as ProviderFileBindingRecord;
+    return v2 ?? v1;
   }
 
   async writeProviderFileBinding(record: ProviderFileBindingRecord): Promise<void> {
-    if (
-      record.schema_version !== "1.0"
-      || !record.provider_file_id
-      || !/^DOC-[A-F0-9]{24}$/.test(record.document_id)
-    ) {
-      throw new Error("Invalid provider-file document binding");
+    const validated = parseBoundProviderFileBindingV1(record, record.project_id, record.provider_file_id);
+    const head = await this.readHead(validated.project_id, validated.document_id);
+    if (!head) throw new Error(`Provider-file binding references missing managed document head: ${validated.document_id}`);
+
+    const existing = await this.readProviderFileBinding(validated.project_id, validated.provider_file_id);
+    if (existing) {
+      if (existing.document_id !== validated.document_id) {
+        throw new Error(`Provider file id is already bound to a different managed document: ${validated.provider_file_id}`);
+      }
+      return;
     }
-    const head = await this.readHead(record.project_id, record.document_id);
-    if (!head) throw new Error(`Provider-file binding references missing managed document head: ${record.document_id}`);
-    const path = await providerFileBindingPath(record.project_id, record.provider_file_id);
-    const content = pretty(record);
+
+    const useV2 = writesProviderV2(this.schemaWriterStage);
+    const serialized: ProviderFileBindingRecord | ProviderFileBindingV2Record = useV2
+      ? parseProviderFileBindingV2({
+          schema_version: "2.0",
+          project_id: validated.project_id,
+          provider_id: DROPBOX_PROVIDER_ID,
+          object_id: validated.provider_file_id,
+          document_id: validated.document_id
+        })
+      : validated;
+    const path = useV2
+      ? await providerFileBindingV2Path(validated.project_id, DROPBOX_PROVIDER_ID, validated.provider_file_id)
+      : await providerFileBindingPath(validated.project_id, validated.provider_file_id);
+
     try {
-      await this.runtime.objects.createText(path, content);
+      await this.runtime.objects.createText(path, pretty(serialized));
     } catch (error) {
       if (!(error instanceof ProviderConflictError)) throw error;
-      const existing = await this.runtime.objects.readText(path);
-      if (existing !== content) {
-        throw new Error(`Provider file id is already bound to a different managed document: ${record.provider_file_id}`);
+      const raced = await this.readProviderFileBinding(validated.project_id, validated.provider_file_id);
+      if (!raced || raced.document_id !== validated.document_id) {
+        throw new Error(`Provider file id is already bound to a different managed document: ${validated.provider_file_id}`);
       }
     }
   }
 
   async readReferenceFingerprint(projectId: string, providerContentHash: string): Promise<ReferenceFingerprintRecord | null> {
     const hash = assertProviderContentHash(providerContentHash);
-    const raw = await this.runtime.objects.readText(referenceFingerprintPath(projectId, hash));
-    if (raw === null) return null;
-    const parsed = JSON.parse(raw) as Partial<ReferenceFingerprintRecord>;
+    const v2Path = await referenceFingerprintV2Path(
+      projectId,
+      DROPBOX_PROVIDER_ID,
+      DROPBOX_CONTENT_HASH_ALGORITHM,
+      hash
+    );
+    const v1Path = referenceFingerprintPath(projectId, hash);
+    const v2Raw = await this.runtime.objects.readText(v2Path);
+    const v1Raw = await this.runtime.objects.readText(v1Path);
+    const v2 = v2Raw === null ? null : normalizeReferenceFingerprintV2(
+      parseBoundReferenceFingerprintV2(JSON.parse(v2Raw), projectId, hash)
+    );
+    const v1 = v1Raw === null ? null : parseBoundReferenceFingerprintV1(JSON.parse(v1Raw), projectId, hash);
+
     if (
-      parsed.schema_version !== "1.0"
-      || parsed.project_id !== projectId
-      || parsed.provider_content_hash !== hash
-      || typeof parsed.document_id !== "string"
-      || !/^DOC-[A-F0-9]{24}$/.test(parsed.document_id)
-      || typeof parsed.version_id !== "string"
-      || !/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/.test(parsed.version_id)
+      v2
+      && v1
+      && (v2.document_id !== v1.document_id || v2.version_id !== v1.version_id)
     ) {
-      throw new Error(`Invalid reference fingerprint record for ${projectId}/${hash}`);
+      throw new Error(`Contradictory V1/V2 reference fingerprints for ${projectId}/${hash}`);
     }
-    return parsed as ReferenceFingerprintRecord;
+    return v2 ?? v1;
   }
 
   async writeReferenceFingerprint(record: ReferenceFingerprintRecord): Promise<ReferenceFingerprintRecord> {
     const hash = assertProviderContentHash(record.provider_content_hash);
-    if (record.schema_version !== "1.0" || !/^DOC-[A-F0-9]{24}$/.test(record.document_id) || !/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/.test(record.version_id)) {
-      throw new Error("Invalid reference fingerprint record");
-    }
-    const version = await this.readVersion(record.project_id, record.document_id, record.version_id);
+    const validated = parseBoundReferenceFingerprintV1(record, record.project_id, hash);
+    const version = await this.readVersion(validated.project_id, validated.document_id, validated.version_id);
     if (!version || version.kind !== "reference" || version.stage !== "reference" || version.provider_content_hash !== hash) {
-      throw new Error(`Reference fingerprint does not match a durable reference version: ${record.document_id}/${record.version_id}`);
+      throw new Error(`Reference fingerprint does not match a durable reference version: ${validated.document_id}/${validated.version_id}`);
     }
-    const validated: ReferenceFingerprintRecord = {
-      schema_version: "1.0",
-      project_id: record.project_id,
-      provider_content_hash: hash,
-      document_id: record.document_id,
-      version_id: record.version_id
-    };
-    const path = referenceFingerprintPath(record.project_id, hash);
+
+    const existing = await this.readReferenceFingerprint(validated.project_id, hash);
+    if (existing) {
+      if (existing.document_id !== validated.document_id || existing.version_id !== validated.version_id) {
+        throw new Error(`Provider integrity fingerprint is already bound to different reference evidence: ${hash}`);
+      }
+      return existing;
+    }
+
+    const useV2 = writesProviderV2(this.schemaWriterStage);
+    if (useV2 && !hasDropboxProviderEvidence(version, hash)) {
+      throw new Error(`Reference fingerprint V2 requires complete Dropbox provider evidence: ${validated.document_id}/${validated.version_id}`);
+    }
+    const serialized: ReferenceFingerprintRecord | ReferenceFingerprintV2Record = useV2
+      ? parseReferenceFingerprintV2({
+          schema_version: "2.0",
+          project_id: validated.project_id,
+          provider_id: DROPBOX_PROVIDER_ID,
+          integrity_hash: {
+            algorithm: DROPBOX_CONTENT_HASH_ALGORITHM,
+            value: hash
+          },
+          document_id: validated.document_id,
+          version_id: validated.version_id
+        })
+      : validated;
+    const path = useV2
+      ? await referenceFingerprintV2Path(
+          validated.project_id,
+          DROPBOX_PROVIDER_ID,
+          DROPBOX_CONTENT_HASH_ALGORITHM,
+          hash
+        )
+      : referenceFingerprintPath(validated.project_id, hash);
+
     try {
-      await this.runtime.objects.createText(path, pretty(validated));
+      await this.runtime.objects.createText(path, pretty(serialized));
       return validated;
     } catch (error) {
       if (!(error instanceof ProviderConflictError)) throw error;
-      const existing = await this.readReferenceFingerprint(record.project_id, hash);
-      if (!existing) throw error;
-      return existing;
+      const raced = await this.readReferenceFingerprint(validated.project_id, hash);
+      if (!raced || raced.document_id !== validated.document_id || raced.version_id !== validated.version_id) {
+        throw new Error(`Provider integrity fingerprint is already bound to different reference evidence: ${hash}`);
+      }
+      return raced;
     }
   }
 
@@ -365,6 +428,115 @@ function referenceFingerprintPath(projectId: string, providerContentHash: string
 async function providerFileBindingPath(projectId: string, providerFileId: string): Promise<string> {
   const key = await documentIdForProviderFile(projectId, providerFileId);
   return `${machineDocumentRoot(projectId)}/provider-file-bindings/${key}.json`;
+}
+
+export async function providerFileBindingV2Path(
+  projectId: string,
+  providerId: string,
+  objectId: string
+): Promise<string> {
+  const key = await sha256Text(`${assertIndexPart(providerId, "provider_id")}\n${assertIndexPart(objectId, "object_id")}`);
+  return `${machineDocumentRoot(projectId)}/provider-file-bindings/v2/${key}.json`;
+}
+
+export async function referenceFingerprintV2Path(
+  projectId: string,
+  providerId: string,
+  algorithm: string,
+  value: string
+): Promise<string> {
+  const key = await sha256Text(
+    `${assertIndexPart(providerId, "provider_id")}\n${assertIndexPart(algorithm, "integrity_hash.algorithm")}\n${assertIndexPart(value, "integrity_hash.value")}`
+  );
+  return `${machineDocumentRoot(projectId)}/reference-fingerprints/v2/${key}.json`;
+}
+
+function parseBoundProviderFileBindingV1(
+  input: unknown,
+  projectId: string,
+  providerFileId: string
+): ProviderFileBindingRecord {
+  const parsed = parseProviderFileBindingV1(input);
+  if (parsed.project_id !== projectId || parsed.provider_file_id !== providerFileId) {
+    throw new Error(`Invalid provider-file document binding for ${projectId}/${providerFileId}`);
+  }
+  return parsed;
+}
+
+function parseBoundProviderFileBindingV2(
+  input: unknown,
+  projectId: string,
+  providerFileId: string
+): ProviderFileBindingV2Record {
+  const parsed = parseProviderFileBindingV2(input);
+  if (
+    parsed.project_id !== projectId
+    || parsed.provider_id !== DROPBOX_PROVIDER_ID
+    || parsed.object_id !== providerFileId
+  ) {
+    throw new Error(`Invalid provider-qualified document binding for ${projectId}/${providerFileId}`);
+  }
+  return parsed;
+}
+
+function normalizeProviderFileBindingV2(record: ProviderFileBindingV2Record): ProviderFileBindingRecord {
+  return {
+    schema_version: "1.0",
+    project_id: record.project_id,
+    provider_file_id: record.object_id,
+    document_id: record.document_id
+  };
+}
+
+function parseBoundReferenceFingerprintV1(
+  input: unknown,
+  projectId: string,
+  providerContentHash: string
+): ReferenceFingerprintRecord {
+  const parsed = parseReferenceFingerprintV1(input);
+  if (parsed.project_id !== projectId || parsed.provider_content_hash !== providerContentHash) {
+    throw new Error(`Invalid reference fingerprint record for ${projectId}/${providerContentHash}`);
+  }
+  return parsed;
+}
+
+function parseBoundReferenceFingerprintV2(
+  input: unknown,
+  projectId: string,
+  providerContentHash: string
+): ReferenceFingerprintV2Record {
+  const parsed = parseReferenceFingerprintV2(input);
+  if (
+    parsed.project_id !== projectId
+    || parsed.provider_id !== DROPBOX_PROVIDER_ID
+    || parsed.integrity_hash.algorithm !== DROPBOX_CONTENT_HASH_ALGORITHM
+    || parsed.integrity_hash.value !== providerContentHash
+  ) {
+    throw new Error(`Invalid provider-qualified reference fingerprint for ${projectId}/${providerContentHash}`);
+  }
+  return parsed;
+}
+
+function normalizeReferenceFingerprintV2(record: ReferenceFingerprintV2Record): ReferenceFingerprintRecord {
+  return {
+    schema_version: "1.0",
+    project_id: record.project_id,
+    provider_content_hash: record.integrity_hash.value,
+    document_id: record.document_id,
+    version_id: record.version_id
+  };
+}
+
+function hasDropboxProviderEvidence(record: CurrentDocumentVersionRecord, hash: string): boolean {
+  const evidence = record.provider_evidence;
+  return evidence?.provider_id === DROPBOX_PROVIDER_ID
+    && evidence.integrity_hash.algorithm === DROPBOX_CONTENT_HASH_ALGORITHM
+    && evidence.integrity_hash.value === hash;
+}
+
+function assertIndexPart(value: string, label: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${label} must be a non-empty string`);
+  return value;
 }
 
 function assertProviderContentHash(value: string): string {

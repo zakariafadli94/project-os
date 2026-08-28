@@ -36,6 +36,8 @@ requireText("if: always()", "unconditional cleanup path");
 requireText("HTTP 401", "post-cleanup revocation verification");
 requireText("github.repository_owner", "owner-only issue trigger guard");
 requireText("[operator] MutationGate PRJ-0003 reject repair", "exact connector control issue title");
+requireText("group: mutation-candidate-reject-operator", "global operator-token concurrency lock");
+requireText("cancel-in-progress: false", "non-cancelling operator queue");
 requireText("/v1/mutation-candidates/resolve", "governed resolution endpoint");
 requireText('{"operation":"candidate.reject"', "explicit candidate.reject payload");
 requireText('{"status":"committed"', "committed receipt check");

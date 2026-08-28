@@ -26,21 +26,30 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   return response.json<Receipt>();
 }
 
-function createTx(projectId: string, slug: string) {
-  return {
-    schema_version: "1.0",
-    transaction_id: "TXN-ACTIVATION-BOOTSTRAP-CREATE",
-    project_id: projectId,
-    base_revision: 0,
-    operation: "project.create",
-    created_at: at,
-    payload: {
-      name: "Managed Zone Bootstrap",
-      slug,
-      aliases: [],
-      objective: "Prove managed workspace activation"
+async function createProject(slug: string): Promise<Receipt> {
+  const response = await testEnv.REGISTRY_GUARD.getByName("global").fetch(
+    "https://registry-guard.internal/create",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: "1.0",
+        transaction_id: "TXN-ACTIVATION-BOOTSTRAP-CREATE",
+        project_id: "PRJ-AUTO",
+        base_revision: 0,
+        operation: "project.create",
+        created_at: at,
+        payload: {
+          name: "Managed Zone Bootstrap",
+          slug,
+          aliases: [],
+          objective: "Prove managed workspace activation"
+        }
+      })
     }
-  };
+  );
+  expect(response.status).toBe(200);
+  return response.json<Receipt>();
 }
 
 function expectedManagedDirectories(projectId: string, slug: string): string[] {
@@ -74,12 +83,11 @@ describe("projection-v2 managed-zone bootstrap", () => {
       return baseImplementation(input, init);
     });
 
-    const projectId = "PRJ-7101";
     const slug = "managed-zone-bootstrap";
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
-
-    const created = await submit(projectId, createTx(projectId, slug));
+    const created = await createProject(slug);
     expect(created).toMatchObject({ status: "committed", previous_revision: 0, new_revision: 1 });
+    const projectId = created.project_id;
+    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
     expect(directoryCalls).toEqual(expectedManagedDirectories(projectId, slug));

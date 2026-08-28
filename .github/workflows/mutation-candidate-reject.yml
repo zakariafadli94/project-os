@@ -103,18 +103,37 @@ jobs:
           node -e 'process.stdout.write(JSON.stringify({MUTATION_GATE_OPERATOR_TOKEN: process.env.OPERATOR_TOKEN}))' \
             | npx wrangler secret bulk
 
-      - name: Verify production health after token install
+      - name: Verify ephemeral operator token readiness
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in 1 2 3 4 5; do
-            if response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health"); then
-              echo "$response"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            readiness_status=$(curl --silent --show-error --max-time 15 \
+              --output /tmp/operator-readiness-body.json \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer $OPERATOR_TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data '{}' \
+              "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
+
+            if [ "$readiness_status" = "400" ] && grep -q '"error":"invalid_mutation_candidate_resolution"' /tmp/operator-readiness-body.json; then
+              echo "Ephemeral operator token is active on the serving Worker version."
               exit 0
             fi
-            sleep 5
+
+            if [ "$readiness_status" = "401" ]; then
+              echo "readiness probe received HTTP 401 on attempt $attempt; waiting for the new Worker version."
+              sleep 3
+              continue
+            fi
+
+            echo "Unexpected operator-token readiness response: HTTP ${readiness_status:-curl-error}."
+            cat /tmp/operator-readiness-body.json 2>/dev/null || true
+            exit 1
           done
-          echo "Production health check failed after operator-token installation."
+
+          echo "Ephemeral operator token did not become ready within the bounded retry window."
           exit 1
 
       - name: Reject candidates through governed ingress

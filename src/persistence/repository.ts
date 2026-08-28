@@ -1,6 +1,7 @@
 export * from "./repository-core";
 
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
+import type { CanonicalCommitRecord } from "../domain/commit-record";
 import type { ProjectState } from "../domain/project-state";
 import { ArtifactMutationIntentService } from "../mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../mutation-gate/repository";
@@ -11,13 +12,13 @@ import {
 } from "../mutation-gate/service";
 import { LegacyArtifactDocumentWriter } from "../documents/legacy-artifact";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
-import type { LayoutMode } from "./layout";
+import { workspaceManagedZoneRoot, type LayoutMode } from "./layout";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
 import {
   asProjectOsPersistence,
   type PersistenceInput
 } from "./provider/runtime";
-import { ProjectRepository as CoreProjectRepository } from "./repository-core";
+import { ProjectRepository as CoreProjectRepository, type CommitWriteOptions } from "./repository-core";
 
 export class ProjectRepository extends CoreProjectRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
@@ -35,6 +36,34 @@ export class ProjectRepository extends CoreProjectRepository {
     const mutationRepository = new MutationGateRepository(runtime);
     this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
     this.mutationGate = new MutationGateService(runtime, mutationGateMode);
+  }
+
+  override async materializeCanonicalDerivatives(
+    record: CanonicalCommitRecord,
+    options: CommitWriteOptions = {}
+  ): Promise<void> {
+    await super.materializeCanonicalDerivatives(record, options);
+    if (this.repositoryMode !== "v2" || record.state.status === "archived") return;
+    await this.ensureManagedWorkspaceDirectories(record.state);
+  }
+
+  async ensureManagedWorkspaceDirectories(state: ProjectState): Promise<void> {
+    const provisioning = this.runtime.directoryProvisioning;
+    if (!provisioning) {
+      throw new Error("Projection-v2 managed-zone bootstrap requires directory-provisioning capability");
+    }
+
+    const references = workspaceManagedZoneRoot(state.project_id, state.slug, "references");
+    const directories = [
+      workspaceManagedZoneRoot(state.project_id, state.slug, "inputs"),
+      references,
+      `${references}/UNCLASSIFIED`,
+      workspaceManagedZoneRoot(state.project_id, state.slug, "working"),
+      workspaceManagedZoneRoot(state.project_id, state.slug, "review"),
+      workspaceManagedZoneRoot(state.project_id, state.slug, "deliverables")
+    ];
+
+    for (const path of directories) await provisioning.ensureDirectory(path);
   }
 
   override async writeArtifact(

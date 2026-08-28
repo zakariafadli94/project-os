@@ -85,4 +85,14 @@ describe("Operational Activation Contract", () => {
     expect(operating?.relative_path).toBe("OPERATING.md");
     expect(operating?.content).toContain("operating_contract_version: 1");
   });
+
+  it("keeps projection v1 byte-contract behavior without OPERATING or the new HANDOFF bootstrap", async () => {
+    const record = projectRecord();
+    const plan = await planProjection(record, null, 1);
+
+    expect(plan.changed_outputs.has("global:OPERATING")).toBe(false);
+    expect(plan.expected_output_keys).not.toContain("global:OPERATING");
+    expect(plan.changed_outputs.get("global:HANDOFF")?.content).not.toContain("## Operating contract");
+    expect(plan.changed_outputs.get("global:HANDOFF")?.content).not.toContain("[[OPERATING|Current operating contract]]");
+  });
 });

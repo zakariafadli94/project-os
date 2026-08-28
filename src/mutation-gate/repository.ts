@@ -229,8 +229,16 @@ export class MutationGateRepository {
     if (!candidate) throw new Error(`Mutation candidate does not exist: ${validated.candidate_id}`);
 
     const terminal = await this.readTerminalResolutionRecord(validated.project_id, validated.candidate_id);
+    const path = machineMutationResolutionPath(validated.project_id, validated.candidate_id, validated.resolution_id);
     if (terminal) {
       assertTerminalCompatible(terminal, validated, requestHash);
+      const existing = await this.readResolution(validated.project_id, validated.candidate_id, validated.resolution_id);
+      if (existing) {
+        if (!sameJson(existing, validated)) {
+          throw new MutationResolutionConflictError(validated.candidate_id);
+        }
+        return existing;
+      }
     }
 
     const terminalEvidence: MutationResolutionTerminalEvidence = {
@@ -256,7 +264,6 @@ export class MutationGateRepository {
       }
     }
 
-    const path = machineMutationResolutionPath(validated.project_id, validated.candidate_id, validated.resolution_id);
     try {
       await this.runtime.objects.createText(path, pretty(validated));
       return validated;

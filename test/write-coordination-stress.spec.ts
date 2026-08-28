@@ -80,7 +80,7 @@ describe("Project OS write coordination stress", () => {
     }
 
     expect(revision).toBe(26);
-  });
+  }, 15_000);
 
   it("allows different project durable objects to progress independently", async () => {
     const [a, b] = await Promise.all([

@@ -128,6 +128,15 @@ export function withProviderResilience(
         )
       }
     } : {}),
+    ...(runtime.directoryProvisioning ? {
+      directoryProvisioning: {
+        ensureDirectory: (path) => retry(
+          "ensure-directory",
+          path,
+          () => runtime.directoryProvisioning!.ensureDirectory(path)
+        )
+      }
+    } : {}),
     ...(runtime.evidence ? { evidence: runtime.evidence } : {})
   };
 }

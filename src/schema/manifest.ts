@@ -26,7 +26,7 @@ const manifestV2Schema = z.strictObject({
   revision: z.number().int().nonnegative(),
   status,
   last_event_id: z.string().nullable(),
-  project_state_schema_version: z.union([z.literal("1.0"), z.literal("2.0")]),
+  project_state_schema_version: z.string().min(1),
   updated_at: timestamp
 });
 

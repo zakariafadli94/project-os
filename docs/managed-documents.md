@@ -8,11 +8,24 @@ The normal user workflow stays natural-language. Users do not select versions, r
 
 ## Visible project zones
 
-Each project may expose these folders lazily under:
+Projection v2 eagerly exposes the managed-zone folder skeleton for every non-archived project under:
 
 ```text
 WORKSPACE/PROJECTS/<PRJ>-<slug>/
 ```
+
+The visible skeleton is:
+
+```text
+INPUTS/
+REFERENCES/
+REFERENCES/UNCLASSIFIED/
+WORKING/
+REVIEW/
+DELIVERABLES/
+```
+
+This eager folder activation does **not** bulk-migrate or reinterpret historical content. Existing managed or legacy content is still adopted lazily and governed according to the rules below. No sentinel files, fake versions or implicit publications are created merely to expose the folders.
 
 Normal human filenames may contain spaces and Unicode characters. Project OS still rejects traversal, control characters, unsafe path segments and characters that are not portable through Dropbox Desktop / common desktop filesystems.
 
@@ -87,6 +100,7 @@ ROADMAP.md
 STATE.md
 PLAN.md
 HANDOFF.md
+OPERATING.md
 TASKS/
 DECISIONS/
 CONSTRAINTS/
@@ -198,9 +212,9 @@ Processing rules:
 - durable provider-file bindings are honored during baseline rebuild so copied references do not become duplicate logical documents;
 - archived projects do not reconcile into active workspaces.
 
-## Lazy adoption / legacy compatibility
+## Eager zone skeleton / lazy content adoption / legacy compatibility
 
-Existing projects are not bulk-rewritten.
+Existing project content is not bulk-rewritten. Projection v2 only ensures the empty managed-zone skeleton and exposes the current operating contract. Historical files remain in place unless a governed Managed Documents operation or reconciliation rule adopts them.
 
 When a pre-ledger file is first encountered:
 
@@ -239,6 +253,7 @@ Mutation candidate list/status/resolution routes are documented in `docs/mutatio
 
 - No direct PC/filesystem access is part of correctness.
 - Dropbox Desktop/Obsidian are optional human interfaces over Dropbox files.
+- The PV2 managed-zone skeleton is eager for non-archived projects; historical content adoption remains lazy.
 - An already governed `DELIVERABLES` edit never auto-publishes a new version.
 - An unknown `DELIVERABLES` file never becomes an initial published version from path presence alone.
 - Generated projection edits never auto-become canonical facts.
@@ -250,7 +265,7 @@ Mutation candidate list/status/resolution routes are documented in `docs/mutatio
 
 ## Persistence boundary compatibility
 
-Managed-document services and repositories consume the provider-neutral persistence runtime. Base reads/writes/list/move/delete operations are provider-independent, while conditional write, server-side copy and incremental change feed are explicit capabilities. Dropbox-specific transport/errors/retry do not belong in managed-document Core code.
+Managed-document services and repositories consume the provider-neutral persistence runtime. Base reads/writes/list/move/delete operations are provider-independent, while conditional write, server-side copy, directory provisioning and incremental change feed are explicit capabilities. Dropbox-specific transport/errors/retry do not belong in managed-document Core code.
 
 The durable schema remains exactly `1.0`. Existing provider observations still serialize Dropbox V1 fields (`file_id`, `rev`, `content_hash`, `size`), and provider-derived document/version identity remains unchanged. The compatibility seam converts neutral runtime metadata back to those historical values and fails closed when it cannot reproduce valid Dropbox V1 evidence.
 

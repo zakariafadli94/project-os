@@ -75,6 +75,7 @@ export interface DropboxCredentials {
 }
 
 type DropboxUploadMode = "add" | "overwrite" | { ".tag": "update"; update: string };
+type DropboxFolderCreateResult = "created" | "exists" | "parent_missing";
 
 interface RawDropboxMetadata {
   ".tag"?: string;
@@ -401,24 +402,44 @@ export class DropboxClient implements DropboxTransport {
     const finalSlash = filePath.lastIndexOf("/");
     if (finalSlash <= 0) return;
     const parentPath = filePath.slice(0, finalSlash);
-    const parts = parentPath.split("/").filter(Boolean);
-    let current = "";
+    const missingDescendants: string[] = [];
+    let current = parentPath;
 
-    for (const part of parts) {
-      current += `/${part}`;
-      const response = await fetch("https://api.dropboxapi.com/2/files/create_folder_v2", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ path: current, autorename: false })
-      });
-      if (response.ok) continue;
-      const text = await response.text();
-      if (response.status === 409 && text.includes("conflict")) continue;
-      throw this.errorFromResponse(`Dropbox create_folder failed for ${current}`, response, text);
+    for (;;) {
+      const result = await this.createFolder(token, current);
+      if (result !== "parent_missing") break;
+
+      missingDescendants.push(current);
+      const parentSlash = current.lastIndexOf("/");
+      if (parentSlash <= 0) {
+        throw new Error(`Dropbox parent folder recovery could not find an existing ancestor for ${parentPath}`);
+      }
+      current = current.slice(0, parentSlash);
     }
+
+    for (const missingPath of missingDescendants.reverse()) {
+      const result = await this.createFolder(token, missingPath);
+      if (result === "parent_missing") {
+        throw new Error(`Dropbox parent folder recovery lost its parent while creating ${missingPath}`);
+      }
+    }
+  }
+
+  private async createFolder(token: string, path: string): Promise<DropboxFolderCreateResult> {
+    const response = await fetch("https://api.dropboxapi.com/2/files/create_folder_v2", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ path, autorename: false })
+    });
+    if (response.ok) return "created";
+
+    const text = await response.text();
+    if (response.status === 409 && text.includes("conflict")) return "exists";
+    if (response.status === 409 && text.includes("not_found")) return "parent_missing";
+    throw this.errorFromResponse(`Dropbox create_folder failed for ${path}`, response, text);
   }
 
   private errorFromResponse(message: string, response: Response, responseBody: string): DropboxApiError {

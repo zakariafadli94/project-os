@@ -131,6 +131,8 @@ export type DocumentVersionWriteInput = Omit<CurrentDocumentVersionRecord, "sche
   schema_version: "1.0" | "2.0";
 };
 
+export type ManagedDocumentHeadWriteInput = ManagedDocumentHead | CurrentManagedDocumentHead;
+
 export interface ManagedDocumentHeadReadResult {
   sourceVersion: "1.0" | "2.0";
   head: CurrentManagedDocumentHead;
@@ -182,14 +184,13 @@ export function readDocumentVersionRecord(input: unknown): DocumentVersionReadRe
   }
   if (raw.schema_version === "2.0") {
     const parsed = versionV2Schema.parse(raw);
-    const semantic = currentVersionFromV2(parsed);
-    return { sourceVersion: "2.0", record: semantic };
+    return { sourceVersion: "2.0", record: currentVersionFromV2(parsed) };
   }
   return unsupportedSchemaVersion("DocumentVersionRecord", raw.schema_version);
 }
 
 export function encodeManagedDocumentHead(
-  head: CurrentManagedDocumentHead,
+  head: ManagedDocumentHeadWriteInput,
   stage: SchemaWriterStage
 ): unknown {
   if (!writesProviderV2(stage)) {
@@ -237,21 +238,9 @@ export function encodeDocumentVersionRecord(
 function completeV1VersionEvidence(
   record: Pick<DocumentVersionRecord, "provider_path" | "provider_file_id" | "provider_rev" | "provider_content_hash" | "size">
 ): ProviderObservation | undefined {
-  const values = [
-    record.provider_path,
-    record.provider_file_id,
-    record.provider_rev,
-    record.provider_content_hash,
-    record.size
-  ];
+  const values = [record.provider_path, record.provider_file_id, record.provider_rev, record.provider_content_hash, record.size];
   if (values.every((value) => value === undefined)) return undefined;
-  if (
-    !record.provider_path
-    || !record.provider_file_id
-    || !record.provider_rev
-    || !record.provider_content_hash
-    || record.size === undefined
-  ) {
+  if (!record.provider_path || !record.provider_file_id || !record.provider_rev || !record.provider_content_hash || record.size === undefined) {
     return undefined;
   }
   return upcastDropboxV1Observation(record);
@@ -263,26 +252,34 @@ function upcastProviderState(state: ManagedDocumentProviderState): CurrentManage
   ) as CurrentManagedDocumentProviderState;
 }
 
-function currentProviderState(state: Partial<Record<"reference" | "working" | "review" | "published", ProviderObservation>>): CurrentManagedDocumentProviderState {
+function currentProviderState(
+  state: Partial<Record<"reference" | "working" | "review" | "published", ProviderObservation>>
+): CurrentManagedDocumentProviderState {
   return Object.fromEntries(
     Object.entries(state).map(([key, value]) => [key, currentObservation(parseProviderObservation(value))])
   ) as CurrentManagedDocumentProviderState;
 }
 
-function neutralProviderState(state: CurrentManagedDocumentProviderState): Record<string, ProviderObservation> {
+function neutralProviderState(
+  state: ManagedDocumentProviderState | CurrentManagedDocumentProviderState
+): Record<string, ProviderObservation> {
   return Object.fromEntries(
-    Object.entries(state).map(([key, value]) => [key, neutralObservation(value)])
+    Object.entries(state).map(([key, value]) => [key, neutralObservation(value as ManagedProviderObservation | CurrentManagedProviderObservation)])
   );
 }
 
-function legacyProviderState(state: CurrentManagedDocumentProviderState): ManagedDocumentProviderState {
+function legacyProviderState(
+  state: ManagedDocumentProviderState | CurrentManagedDocumentProviderState
+): ManagedDocumentProviderState {
   return Object.fromEntries(
-    Object.entries(state).map(([key, value]) => [key, legacyObservation(value)])
+    Object.entries(state).map(([key, value]) => [key, legacyObservation(value as ManagedProviderObservation | CurrentManagedProviderObservation)])
   ) as ManagedDocumentProviderState;
 }
 
-function neutralObservation(value: CurrentManagedProviderObservation): ProviderObservation {
-  if (value.provider_id && value.object_id && value.revision_token && value.integrity_hash) {
+function neutralObservation(
+  value: ManagedProviderObservation | CurrentManagedProviderObservation
+): ProviderObservation {
+  if (isCurrentObservation(value)) {
     return parseProviderObservation({
       provider_id: value.provider_id,
       path: value.path,
@@ -309,7 +306,10 @@ function currentObservation(value: ProviderObservation): CurrentManagedProviderO
   };
 }
 
-function legacyObservation(value: CurrentManagedProviderObservation): ManagedProviderObservation {
+function legacyObservation(
+  value: ManagedProviderObservation | CurrentManagedProviderObservation
+): ManagedProviderObservation {
+  if (!isCurrentObservation(value)) return value;
   if (value.provider_id !== "dropbox" || value.integrity_hash.algorithm !== "dropbox-content-hash") {
     throw new Error(`Cannot encode provider ${value.provider_id}/${value.integrity_hash.algorithm} as managed-document V1 evidence`);
   }
@@ -320,6 +320,15 @@ function legacyObservation(value: CurrentManagedProviderObservation): ManagedPro
     content_hash: value.integrity_hash.value,
     size: value.size
   };
+}
+
+function isCurrentObservation(
+  value: ManagedProviderObservation | CurrentManagedProviderObservation
+): value is CurrentManagedProviderObservation {
+  return "provider_id" in value
+    && "object_id" in value
+    && "revision_token" in value
+    && "integrity_hash" in value;
 }
 
 function currentVersionFromV2(parsed: z.infer<typeof versionV2Schema>): CurrentDocumentVersionRecord {
@@ -340,10 +349,7 @@ function currentVersionFromV2(parsed: z.infer<typeof versionV2Schema>): CurrentD
   };
 }
 
-function validateHeadLifecycle(
-  value: z.infer<typeof headV2Schema>,
-  ctx: z.RefinementCtx
-): void {
+function validateHeadLifecycle(value: z.infer<typeof headV2Schema>, ctx: z.RefinementCtx): void {
   if (value.kind === "reference") {
     if (value.working_version_id || value.review_version_id || value.published_version_id) {
       ctx.addIssue({ code: "custom", message: "Reference document heads cannot carry work-product lifecycle pointers" });

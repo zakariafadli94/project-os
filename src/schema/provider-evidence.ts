@@ -5,12 +5,12 @@ const dropboxFileIdSchema = z.string().regex(/^id:[A-Za-z0-9_-]+$/);
 const dropboxRevisionSchema = z.string().min(1).max(256);
 const dropboxContentHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 
-const providerIntegrityHashSchema = z.strictObject({
+export const providerIntegrityHashSchema = z.strictObject({
   algorithm: z.string().min(1),
   value: z.string().min(1)
 });
 
-const providerObservationSchema = z.strictObject({
+export const providerObservationSchema = z.strictObject({
   provider_id: z.string().min(1),
   path: z.string().min(1),
   object_id: z.string().min(1),

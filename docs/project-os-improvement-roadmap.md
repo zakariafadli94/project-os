@@ -193,6 +193,27 @@ Key outcomes:
 
 Non-goal: direct PC/local filesystem access.
 
+#### 12A. `IMP-DOCIDENTITY001` — Managed Document identity visibility — 🟢 active
+
+Purpose: expose the stable Managed Document `document_id` in governed human documents so users can identify a logical document directly in Dropbox or Obsidian without inspecting `.project-os/` internals.
+
+Field evidence: `PRJ-0002/INPUTS/REFERRAL-PRJ0003-DOCUMENT-IDENTITY-VISIBILITY-IMPROVEMENT-20260830.md`, observed in PRJ-0003 during WORKING/REVIEW/DELIVERABLES operations.
+
+Key outcomes to validate:
+
+- governed human Managed Documents expose `project_id` + the ledger-authoritative `document_id`;
+- WORKING -> REVIEW -> DELIVERABLES preserves the same logical `document_id`;
+- immutable `version_id` changes remain distinct from stable `document_id`;
+- task/decision IDs remain associated business identities, not substitutes for document identity;
+- provider object IDs such as Dropbox `file_id` never become business document identity;
+- reconciliation detects a visible `document_id` mismatch instead of silently accepting it;
+- legacy artifact routes remain compatible;
+- historical documents are not blindly bulk-rewritten merely to expose IDs.
+
+Architecture questions intentionally remain open for design/review: whether identity is injected into source frontmatter or exposed through another human representation, rename/logical-path identity semantics, and any opportunistic versus explicit historical backfill policy.
+
+Sequencing rationale: complete this package before `IMP-INDEX001` so future indexing/search surfaces are built on a clear human-visible document identity contract rather than reproducing the current ambiguity.
+
 #### 13. `IMP-INDEX001` — Fast read/search model — 🆕
 
 Purpose: make cross-project research retrieval fast without recursively scanning/downloading Dropbox content for every query.

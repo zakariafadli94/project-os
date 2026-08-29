@@ -90,25 +90,49 @@ describe("schema runtime policy", () => {
     expect(seen).toEqual(["core_v2", "core_v2", "core_v2"]);
   });
 
-  it("reports provider-v2 evidence only from provider-bearing document and MutationGate namespaces", async () => {
+  it("reports provider-v2 evidence from every first-write provider namespace and ignores unrelated schema 2.0", async () => {
     const wrapped = withSchemaRuntimePolicy(runtime(), "provider_v2");
     const seen: string[] = [];
     configureSchemaEvidenceObserver(wrapped, (stage) => seen.push(stage));
+    const root = "/PROJECT_OS/.project-os/projects/PRJ-9108";
 
     await wrapped.objects.upsertText(
-      "/PROJECT_OS/.project-os/projects/PRJ-9108/documents/heads/DOC-AAAAAAAAAAAAAAAAAAAAAAAA.json",
+      `${root}/documents/heads/DOC-AAAAAAAAAAAAAAAAAAAAAAAA.json`,
       JSON.stringify({ schema_version: "2.0" })
     );
     await wrapped.objects.createText(
-      "/PROJECT_OS/.project-os/projects/PRJ-9108/mutation-gate/candidates/MUTCAND-AAAAAAAAAAAAAAAAAAAAAAAA.json",
+      `${root}/documents/versions/DOC-AAAAAAAAAAAAAAAAAAAAAAAA/VER-REQ-AAAAAAAAAAAAAAAAAAAAAAAA.json`,
       JSON.stringify({ schema_version: "2.0" })
     );
     await wrapped.objects.createText(
-      "/PROJECT_OS/.project-os/projects/PRJ-9108/materializations/REV-000001-PV-0002.json",
+      `${root}/documents/provider-file-bindings/v2/${"a".repeat(64)}.json`,
+      JSON.stringify({ schema_version: "2.0" })
+    );
+    await wrapped.objects.createText(
+      `${root}/documents/reference-fingerprints/v2/${"b".repeat(64)}.json`,
+      JSON.stringify({ schema_version: "2.0" })
+    );
+    await wrapped.objects.createText(
+      `${root}/mutation-gate/intents/artifacts/ART-RUNTIME-POLICY-9108.json`,
+      JSON.stringify({ schema_version: "2.0" })
+    );
+    await wrapped.objects.createText(
+      `${root}/mutation-gate/candidates/MUTCAND-AAAAAAAAAAAAAAAAAAAAAAAA.json`,
+      JSON.stringify({ schema_version: "2.0" })
+    );
+    await wrapped.objects.createText(
+      `${root}/materializations/REV-000001-PV-0002.json`,
       JSON.stringify({ schema_version: "2.0" })
     );
 
-    expect(seen).toEqual(["provider_v2", "provider_v2"]);
+    expect(seen).toEqual([
+      "provider_v2",
+      "provider_v2",
+      "provider_v2",
+      "provider_v2",
+      "provider_v2",
+      "provider_v2"
+    ]);
   });
 
   it("reconstructs evidence from reads and ignores V1 or non-JSON payloads", async () => {

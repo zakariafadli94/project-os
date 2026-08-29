@@ -72,7 +72,7 @@ function fixture(): CanonicalCommitRecord {
 }
 
 describe("ProjectRepository canonical commit records", () => {
-  it("publishes one immutable V2 commit record and replays identical content idempotently", async () => {
+  it("publishes one immutable V2-layout commit record and replays identical content idempotently", async () => {
     const transport = new FakeTransport();
     const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
     const record = fixture();
@@ -85,6 +85,37 @@ describe("ProjectRepository canonical commit records", () => {
     expect(transport.uploads.filter((write) => write.path === path)).toHaveLength(1);
     await expect(repository.readCommitRecord(record.project_id, record.new_revision)).resolves.toEqual(record);
     await expect(repository.readCommitRecord(record.project_id, record.new_revision + 1)).resolves.toBeNull();
+  });
+
+  it("writes envelope 1.0 with nested ProjectState 2.0 at core_v2 and reads it back semantically", async () => {
+    const transport = new FakeTransport();
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2", "observe", "core_v2");
+    const record = fixture();
+    const path = machineCommitRecordPath(record.project_id, record.new_revision);
+
+    await repository.writeCommitRecord(record);
+
+    const durable = JSON.parse(transport.files.get(path)!);
+    expect(durable.schema_version).toBe("1.0");
+    expect(durable.state.schema_version).toBe("2.0");
+    expect(durable.transaction.schema_version).toBe("1.0");
+    expect(durable.event.schema_version).toBe("1.0");
+    expect(durable.receipt.schema_version).toBe("1.0");
+
+    const readBack = await repository.readCommitRecord(record.project_id, record.new_revision);
+    expect(readBack?.schema_version).toBe("1.0");
+    expect(readBack?.state.schema_version).toBe("2.0");
+    expect({ ...readBack?.state, schema_version: "1.0" }).toEqual(record.state);
+  });
+
+  it("fails closed when a v1_only writer encounters an already-current ProjectState V2", async () => {
+    const transport = new FakeTransport();
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2", "observe", "v1_only");
+    const record = fixture();
+    record.state = { ...record.state, schema_version: "2.0" };
+
+    await expect(repository.writeCommitRecord(record)).rejects.toThrow(/V2 writer regression|V1/i);
+    expect(transport.files.has(machineCommitRecordPath(record.project_id, record.new_revision))).toBe(false);
   });
 
   it("keeps different content at the same project revision as a terminal immutable conflict", async () => {

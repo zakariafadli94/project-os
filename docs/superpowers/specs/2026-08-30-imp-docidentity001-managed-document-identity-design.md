@@ -68,7 +68,7 @@ The identity model is:
 
 ### 4.1 Initial ID allocation
 
-For compatibility, a newly created work product may continue to obtain its initial `document_id` using the existing deterministic function based on:
+For compatibility, newly created work products **continue to use the existing deterministic initial allocation** based on:
 
 ```text
 project_id + first logical_path
@@ -100,7 +100,7 @@ Conceptually:
 (project_id, normalized_logical_path) -> document_id
 ```
 
-A path claim is immutable after creation.
+A committed path claim is immutable after creation.
 
 Recommended record semantics:
 
@@ -126,15 +126,16 @@ For Dropbox, equality must account for Dropbox path semantics, including case-in
 
 ### 5.2 Claim invariants
 
-- A normalized logical path can be claimed by only one `document_id` for the lifetime of the project.
+- A normalized logical path can be permanently claimed by only one `document_id` for the lifetime of the project.
 - Reclaiming the same path for the same `document_id` is idempotent.
 - Claiming an already claimed path for another `document_id` fails closed.
 - The current path is the `ManagedDocumentHead.logical_path`.
-- Every prior claim for the same document is a historical alias/reservation.
+- Every prior committed claim for the same document is a historical alias/reservation.
 - A historical alias may be used again only by the same document via governed rename.
 - A historical alias is never silently reactivated by `working.write`; attempting to create/write through a non-current alias fails with a dedicated historical-path conflict and requires an explicit rename back.
+- A rename request that fails before any provider effect must not create a permanent historical alias merely because it attempted a destination.
 
-This prevents path reuse from creating ambiguous identity histories.
+This prevents path reuse from creating ambiguous identity histories without poisoning unused paths after harmless precondition failures.
 
 ## 6. Human-visible frontmatter contract
 
@@ -223,12 +224,14 @@ Before provider mutation, Project OS must:
 2. load/restore the work-product head by `document_id`;
 3. compare `expected_versions` to the current head;
 4. validate `new_logical_path`;
-5. ensure the destination path claim is free or already belongs to the same document;
-6. ensure all current active provider observations still match their expected revisions/evidence;
-7. durably reserve the new path claim;
-8. persist a durable rename intent before moving any provider object.
+5. ensure the destination path has no permanent claim owned by another document;
+6. ensure no other live rename intent reserves the destination for another document/request;
+7. ensure all current active provider observations still match their expected revisions/evidence;
+8. persist a durable rename intent whose destination acts as the **temporary reservation** before moving any provider object.
 
-## 8. Crash-safe rename intent
+A permanent path claim for the destination is not created at this precondition stage.
+
+## 8. Crash-safe rename intent and reservation
 
 Governed rename is a resumable multi-step operation.
 
@@ -251,7 +254,7 @@ interface ManagedDocumentRenameIntentV2 {
     review?: RenameStageIntent;
     published?: RenameStageIntent;
   };
-  status: "prepared" | "applying" | "committed";
+  status: "prepared" | "applying" | "committed" | "aborted";
 }
 ```
 
@@ -259,28 +262,36 @@ Each stage intent freezes source path, destination path, active version ID, and 
 
 The precise storage structure may use an immutable intent plus append-only step/terminal records instead of mutating the intent in place. The required semantic is append-only/recoverable progress, not a specific file layout.
 
-### 8.1 Rename execution
+### 8.1 Reservation semantics
+
+A non-terminal rename intent reserves `to_logical_path` for its `document_id`/`request_id` before provider effects. Other creates/renames must treat that destination as unavailable.
+
+If the operation fails **before any provider effect**, it may write a terminal `aborted` result; the temporary reservation then ceases to block the path and no permanent path claim is created.
+
+After any provider effect has occurred, the operation is no longer safely abortable by simply releasing the path. Recovery must converge the intent to a consistent committed state or require explicit administrative recovery; it must not silently free the destination while partial provider effects exist.
+
+The permanent append-only path claim for `to_logical_path` is written only after all required provider/stage steps have succeeded and immediately before/folded into the final logical head transition. A crash after that claim but before head finalization is recoverable from the still-live rename intent and must converge to completion.
+
+### 8.2 Rename execution
 
 For every active representation in the head (`working`, `review`, and/or `published`):
 
 1. verify whether the source or destination already reflects a prior completed step;
 2. move the provider object only when the step has not already happened;
 3. read destination metadata/evidence;
-4. create a new document version for that stage;
-5. point the new version at the same immutable content payload when bytes are unchanged;
-6. store the new `logical_path` and provider path/evidence in the new version;
-7. persist step completion.
+4. for an identity-stamped Markdown representation whose bytes are unchanged, reuse the immutable content payload;
+5. for a legacy unstamped Markdown representation, normalize/inject the controlled identity during the rename, persist the new canonical payload/hash, and write those final bytes under provider preconditions;
+6. create a new document version for that stage;
+7. store the new `logical_path` and provider path/evidence in the new version;
+8. persist step completion.
 
-After all active stages have completed, update the head atomically/logically to:
+After all active stages have completed:
 
-- keep the same `document_id`;
-- set `logical_path` to the new path;
-- point each active stage to its new rename-generated version;
-- update provider observations to destination paths;
-- keep `reconciliation_status: clean`;
-- mark the rename terminal/committed.
+1. write/verify the permanent destination path claim for the same `document_id`;
+2. update the head atomically/logically to keep the same `document_id`, set `logical_path` to the new path, point each active stage to its new rename-generated version, update provider observations, and keep `reconciliation_status: clean`;
+3. mark the rename terminal `committed`.
 
-### 8.2 Rename creates versions
+### 8.3 Rename creates versions
 
 A rename creates a new `version_id` for each moved active stage even when content bytes are unchanged.
 
@@ -294,7 +305,7 @@ DOC-X / VER-1 / A.md
 DOC-X / VER-2 / B.md
 ```
 
-The old version remains immutable and retains `A.md`. The new version may reuse the same immutable payload object while carrying `B.md` and new provider evidence.
+The old version remains immutable and retains `A.md`. The new version reuses the old immutable payload only when final bytes are unchanged; a legacy unstamped Markdown rename creates a newly normalized payload containing the controlled identity.
 
 Rename version IDs must be deterministic from `request_id` plus the specific rename stage so retries cannot create duplicate business effects.
 
@@ -332,7 +343,7 @@ A provider-side move or rename is never automatically accepted as a logical rena
 If a moved file exposes a known `document_id` under a path different from `head.logical_path`:
 
 - recognize it as evidence associated with that document;
-- do not mutate `head.logical_path` or create a new path claim automatically;
+- do not mutate `head.logical_path` or create a permanent path claim automatically;
 - preserve external bytes/version evidence where possible;
 - surface a conflict;
 - restore the governed current representation when required by lifecycle/recovery rules.
@@ -351,8 +362,9 @@ Existing heads, versions, and visible documents remain valid.
 
 For an existing legacy work product:
 
-- if it has no path claim, the next governed mutation first claims its current `head.logical_path` for its existing `document_id`;
-- the next governed text-producing operation (`working.write`, `review.write`, publication replacement, reopen/edit path where content is rewritten, or governed rename where a visible Markdown file is rewritten as part of the operation) injects the controlled identity;
+- if it has no permanent path claim, the next governed mutation establishes the claim for its current `head.logical_path` and existing `document_id` as part of that successful mutation/recovery path;
+- the next governed text-producing operation (`working.write`, `review.write`, publication replacement, or other content write) injects the controlled identity;
+- **governed rename itself also stamps any active legacy Markdown representation** even if the rename would otherwise only move bytes;
 - simple reader/recovery operations do not rewrite bytes solely to stamp identity;
 - immutable historical payloads are never modified.
 
@@ -372,10 +384,11 @@ References written through legacy artifact routes remain outside this package's 
 
 Bootstrap/recovery must remain reader-first.
 
-- Existing legacy work products may still be found using current path/head/version evidence where no claim exists.
-- Once a claim exists, claim lookup is authoritative for path-to-document resolution.
+- Existing legacy work products may still be found using current path/head/version evidence where no permanent claim exists.
+- Once a permanent claim exists, claim lookup is authoritative for path-to-document resolution.
+- Live rename intents act as temporary path reservations and recovery instructions, not historical aliases until committed.
 - Recovery that reconstructs heads from immutable versions must preserve the original `document_id` even if the latest version has a renamed `logical_path`.
-- Recovery must rebuild or validate path claims from durable claim records; it must not infer that old paths became reusable.
+- Recovery must rebuild or validate permanent path claims from durable claim records; it must not infer that old paths became reusable.
 - Rename intent recovery must finish or reconcile interrupted provider moves before normal reconciliation treats those changes as external.
 
 ## 13. Schema and compatibility rules
@@ -387,7 +400,7 @@ This package follows the A2 family-selective schema architecture already deploye
 - no bulk rewrite;
 - no write-on-read historical mutation;
 - new provider-bearing rename evidence uses provider-neutral V2 semantics;
-- non-provider path claims may start as an independent schema-1.0 family;
+- non-provider permanent path claims may start as an independent schema-1.0 family;
 - projection version is independent and should not bump unless a generated projection contract actually changes.
 
 The visible Markdown frontmatter change is a Managed Document content contract, not a ProjectState schema migration.
@@ -396,7 +409,8 @@ The visible Markdown frontmatter change is a Managed Document content contract, 
 
 The system fails closed for:
 
-- destination path already claimed by another document;
+- destination path already permanently claimed by another document;
+- destination path temporarily reserved by another live rename;
 - destination provider path occupied by unrelated content;
 - controlled frontmatter mismatch;
 - duplicate/ambiguous controlled identity keys;
@@ -406,7 +420,7 @@ The system fails closed for:
 - external rename presented as if it were governed;
 - attempt to create/write a new document through another document's historical alias.
 
-No failure path may allocate a second `document_id` for the same governed document or silently transfer a path claim.
+No failure path may allocate a second `document_id` for the same governed document, silently transfer a path claim, or permanently reserve a never-used rename destination after a clean pre-provider abort.
 
 ## 15. Invariants
 
@@ -434,7 +448,7 @@ Provider object IDs are never treated as work-product logical identity.
 Controlled frontmatter mismatch is detected and never silently accepted.
 
 ### `INV-DOCID-008`
-A normalized logical path claim can never belong to two different `document_id` values.
+A permanently claimed normalized logical path can never belong to two different `document_id` values.
 
 ### `INV-DOCID-009`
 Governed rename preserves `document_id` and creates a new version for each active representation moved.
@@ -443,10 +457,13 @@ Governed rename preserves `document_id` and creates a new version for each activ
 External provider rename/move never changes `head.logical_path` automatically.
 
 ### `INV-DOCID-011`
-Historical aliases remain permanently reserved to their original `document_id`.
+Committed historical aliases remain permanently reserved to their original `document_id`.
 
 ### `INV-DOCID-012`
 Once a governed version is identity-stamped, later removal of controlled identity fields is a conflict.
+
+### `INV-DOCID-013`
+A rename aborted before any provider effect does not create a permanent historical alias for its attempted destination.
 
 ## 16. Required test matrix
 
@@ -467,14 +484,16 @@ Once a governed version is identity-stamped, later removal of controlled identit
 - publish V1 -> reopen/edit -> publish V2 keeps same `document_id` and changes versions;
 - task-linked document exposes both `task_id` and `document_id` without conflation.
 
-### Path claims
+### Path claims and reservations
 
-- initial create claims path;
-- same-document claim retry is idempotent;
+- initial successful create establishes permanent path claim;
+- same-document permanent claim retry is idempotent;
 - second document cannot claim historical/current path;
 - case-equivalent provider path collision is rejected;
 - historical alias cannot be silently reused by `working.write`;
-- same document can explicitly rename back to a historical alias.
+- same document can explicitly rename back to a historical alias;
+- pre-provider rename failure/abort releases temporary destination reservation and creates no permanent alias;
+- concurrent/live rename reservation blocks another create/rename from taking that destination.
 
 ### Governed rename
 
@@ -484,7 +503,8 @@ Once a governed version is identity-stamped, later removal of controlled identit
 - rename published-only document;
 - rename `A.md -> B.md -> A.md`;
 - all moved stages receive deterministic new version IDs;
-- immutable content payload may be reused when bytes are unchanged;
+- immutable content payload is reused when final bytes are unchanged;
+- legacy unstamped Markdown is stamped during rename and receives a new canonical payload/hash;
 - stale `expected_versions` fails before provider mutation;
 - occupied provider target fails closed.
 
@@ -492,15 +512,15 @@ Once a governed version is identity-stamped, later removal of controlled identit
 
 Inject deterministic faults after each durable/provider step:
 
-- after destination claim reservation;
-- after rename intent persistence;
+- after rename intent/temporary reservation persistence;
 - after first provider move;
 - after destination evidence capture;
 - after first rename version record;
-- after all provider moves but before head update;
+- after all provider moves but before permanent path claim;
+- after permanent path claim but before head update;
 - after head update but before terminal marker.
 
-Every retry/recovery must converge to one document identity, one current logical path, one set of active stage versions, and no duplicate provider effects.
+Every retry/recovery must converge to one document identity, one current logical path, one set of active stage versions, and no duplicate provider effects. A pre-provider terminal abort must leave the attempted destination reusable because no permanent claim was committed.
 
 ### Reconciliation
 
@@ -522,7 +542,7 @@ Every retry/recovery must converge to one document identity, one current logical
 
 ### Isolation and schema compatibility
 
-- path claims are project-scoped;
+- path claims/reservations are project-scoped;
 - same logical path in two projects is allowed with independent identities;
 - V1 historical document records remain readable;
 - existing provider V2 evidence remains readable;
@@ -546,9 +566,9 @@ Proof: isolated production probe demonstrates exact head/frontmatter identity ma
 
 ### Gate R2 — governed rename
 
-Enable `document.rename`, path claims, durable rename intent, and crash recovery.
+Enable `document.rename`, temporary path reservations, permanent path claims, durable rename intent, and crash recovery.
 
-Proof: isolated production probe demonstrates stable identity across rename and lifecycle plus historical alias reservation.
+Proof: isolated production probe demonstrates stable identity across rename and lifecycle plus historical alias reservation and clean pre-provider abort semantics.
 
 ### Gate R3 — steady state
 
@@ -567,11 +587,12 @@ The proof must demonstrate at minimum:
 3. promote to REVIEW and publish with the same ID;
 4. reopen and create another version with the same ID;
 5. governed rename `A.md -> B.md` preserving ID;
-6. verify old path is reserved and cannot be claimed by another document;
+6. verify old path is permanently reserved and cannot be claimed by another document;
 7. governed rename back to `A.md`;
-8. verify forged identity is detected in a controlled probe;
-9. verify an external/manual rename is not silently adopted;
-10. verify no business revision or project outside the isolated probe changes as a side effect.
+8. verify a pre-provider failed rename does not permanently consume its unused destination;
+9. verify forged identity is detected in a controlled probe;
+10. verify an external/manual rename is not silently adopted;
+11. verify no business revision or project outside the isolated probe changes as a side effect.
 
 Probe cleanup must preserve machine-managed audit evidence and follow normal provider mutation confirmation rules.
 
@@ -600,9 +621,10 @@ The package is acceptable only when all of the following are true:
 - new governed Markdown work products visibly expose correct `project_id` and `document_id`;
 - the same ID survives lifecycle transitions, reopen, versions, and governed rename;
 - a rename does not derive a new ID from the new path;
-- historical logical paths remain reserved to the original document;
+- committed historical logical paths remain reserved to the original document;
+- a clean pre-provider rename abort does not create a permanent unused alias;
 - mismatched/forged identity fails closed;
-- legacy unstamped documents remain readable and are stamped opportunistically, not via mass rewrite;
+- legacy unstamped documents remain readable and are stamped opportunistically, including during governed rename, not via mass rewrite;
 - rename is deterministic, idempotent, concurrency-safe, and recoverable after every tested interruption;
 - external/manual rename never silently changes logical identity/path;
 - legacy Artifact API Markdown publication uses the same identity contract;

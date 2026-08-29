@@ -37,7 +37,7 @@ forbid(/PROJECT_OS_INGRESS_TOKEN/, "persistent GitHub ingress-token dependency")
 requireText("CLOUDFLARE_API_TOKEN", "existing Cloudflare API credential");
 requireText("CLOUDFLARE_ACCOUNT_ID", "existing Cloudflare account credential");
 requireText("MUTATION_GATE_OPERATOR_TOKEN", "ephemeral Worker operator secret");
-requireText("runs-on: [self-hosted, linux, x64, project-os]", "Project OS self-hosted runner");
+requireText("runs-on: ubuntu-latest", "GitHub-hosted runner");
 forbid(/wrangler secret bulk/, "legacy immediate secret lifecycle");
 requireText("Capture active production deployment", "authoritative base capture");
 requireText("workers/scripts/$WORKER_NAME/deployments", "Cloudflare active deployment API");

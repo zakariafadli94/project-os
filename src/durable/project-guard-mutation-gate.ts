@@ -6,6 +6,7 @@ import {
 } from "../domain/mutation-candidate-resolution";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
+import { AUTO_PROJECT_ID } from "../domain/transaction";
 import type { Env } from "../env";
 import {
   machineDocumentRoot,
@@ -275,6 +276,13 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
 
   private async reconcileSchemaFrontierForMutation(): Promise<void> {
     if (this.schemaFrontierReconciled || !this.boundProjectId) return;
+    if (this.boundProjectId === AUTO_PROJECT_ID) {
+      // The allocation sentinel is not a real project identity. Let the base
+      // guard reject it through the existing transaction validation path
+      // before any persistence path is materialized.
+      this.schemaFrontierReconciled = true;
+      return;
+    }
 
     // provider_v2 is capable of preserving every lower frontier. It can
     // reconstruct the local marker lazily as V2 records are naturally read or

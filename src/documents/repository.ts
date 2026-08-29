@@ -44,6 +44,7 @@ import {
   type ReferenceFingerprintV2Record
 } from "../schema/provider-index";
 import { upcastDropboxV1Observation, type ProviderObservation } from "../schema/provider-evidence";
+import { schemaWriterStageFor } from "../schema/runtime-policy";
 import { writesProviderV2, type SchemaWriterStage } from "../schema/writer-stage";
 import { sha256Text } from "./hash";
 
@@ -67,12 +68,14 @@ export interface ProviderFileBindingRecord {
 
 export class DocumentLedgerRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
+  private readonly schemaWriterStage: SchemaWriterStage;
 
   constructor(
     input: PersistenceInput,
-    private readonly schemaWriterStage: SchemaWriterStage = "v1_only"
+    schemaWriterStage: SchemaWriterStage = "v1_only"
   ) {
     this.runtime = asProjectOsPersistence(input);
+    this.schemaWriterStage = schemaWriterStageFor(this.runtime, schemaWriterStage);
   }
 
   async readHead(projectId: string, documentId: string): Promise<CurrentManagedDocumentHead | null> {

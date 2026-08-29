@@ -15,6 +15,7 @@ import { LegacyArtifactDocumentWriter } from "../documents/legacy-artifact";
 import { encodeManifest } from "../schema/manifest";
 import { encodeProjectState, readProjectState as readProjectStateRecord } from "../schema/project-state";
 import { readReceipt as readReceiptRecord } from "../schema/receipt";
+import { schemaWriterStageFor } from "../schema/runtime-policy";
 import type { SchemaWriterStage } from "../schema/writer-stage";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
 import {
@@ -42,19 +43,22 @@ export class ProjectRepository extends CoreProjectRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;
+  private readonly requestedSchemaWriterStage?: SchemaWriterStage;
 
   constructor(
     input: PersistenceInput,
     private readonly repositoryMode: LayoutMode = "legacy",
     mutationGateMode: MutationGateMode = "observe",
-    private readonly schemaWriterStage: SchemaWriterStage = "v1_only"
+    schemaWriterStage?: SchemaWriterStage
   ) {
     const runtime = asProjectOsPersistence(input);
     super(runtime, repositoryMode);
     this.runtime = runtime;
-    const mutationRepository = new MutationGateRepository(runtime, schemaWriterStage);
+    this.requestedSchemaWriterStage = schemaWriterStage;
+    const writerStage = this.writerStage();
+    const mutationRepository = new MutationGateRepository(runtime, writerStage);
     this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
-    this.mutationGate = new MutationGateService(runtime, mutationGateMode, schemaWriterStage);
+    this.mutationGate = new MutationGateService(runtime, mutationGateMode, writerStage);
   }
 
   override async readProjectState(projectId: string): Promise<ProjectState | null> {
@@ -86,7 +90,7 @@ export class ProjectRepository extends CoreProjectRepository {
     const validated = parseCanonicalCommitRecord(record);
     const durableRecord = {
       ...validated,
-      state: encodeProjectState(validated.state, this.schemaWriterStage)
+      state: encodeProjectState(validated.state, this.writerStage())
     };
     // Reparse before publication so the envelope and nested family binding are
     // proven together while preserving the 1.0 commit envelope.
@@ -105,8 +109,9 @@ export class ProjectRepository extends CoreProjectRepository {
   }
 
   override async writeMachineSnapshot(state: ProjectState): Promise<void> {
-    const encodedState = encodeProjectState(state, this.schemaWriterStage);
-    const encodedManifest = encodeManifest(state, this.schemaWriterStage);
+    const writerStage = this.writerStage();
+    const encodedState = encodeProjectState(state, writerStage);
+    const encodedManifest = encodeManifest(state, writerStage);
     await this.runtime.objects.upsertText(machineStatePath(state.project_id), pretty(encodedState));
     await this.runtime.objects.upsertText(machineManifestPath(state.project_id), pretty(encodedManifest));
   }
@@ -162,6 +167,10 @@ export class ProjectRepository extends CoreProjectRepository {
     const managed = await new LegacyArtifactDocumentWriter(this.runtime).writeIfManaged(replayState, request);
     if (managed !== null) return managed;
     return super.writeArtifact(replayState, request);
+  }
+
+  private writerStage(): SchemaWriterStage {
+    return schemaWriterStageFor(this.runtime, this.requestedSchemaWriterStage);
   }
 }
 

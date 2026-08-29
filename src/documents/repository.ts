@@ -235,11 +235,12 @@ export class DocumentLedgerRepository {
     }
 
     const existing = await this.readReferenceFingerprint(validated.project_id, hash);
-    if (existing) {
-      if (existing.document_id !== validated.document_id || existing.version_id !== validated.version_id) {
-        throw new Error(`Provider integrity fingerprint is already bound to different reference evidence: ${hash}`);
-      }
-      return existing;
+    const sameEvidence = existing
+      && existing.document_id === validated.document_id
+      && existing.version_id === validated.version_id;
+    if (sameEvidence) return existing;
+    if (existing && await this.isCurrentReferenceFingerprint(existing)) {
+      throw new Error(`Provider integrity fingerprint is already bound to different current reference evidence: ${hash}`);
     }
 
     const useV2 = writesProviderV2(this.schemaWriterStage);
@@ -259,6 +260,7 @@ export class DocumentLedgerRepository {
           version_id: validated.version_id
         })
       : validated;
+    const v1Path = referenceFingerprintPath(validated.project_id, hash);
     const path = useV2
       ? await referenceFingerprintV2Path(
           validated.project_id,
@@ -266,7 +268,17 @@ export class DocumentLedgerRepository {
           DROPBOX_CONTENT_HASH_ALGORITHM,
           hash
         )
-      : referenceFingerprintPath(validated.project_id, hash);
+      : v1Path;
+
+    if (existing) {
+      // Fingerprint indexes are reconstructible current bindings, unlike immutable document versions.
+      // Same-project managed-document writes are serialized by ProjectGuard; only a binding proven stale is replaced.
+      if (useV2 && await this.runtime.objects.readText(v1Path) !== null) {
+        await this.runtime.objects.upsertText(v1Path, pretty(validated));
+      }
+      await this.runtime.objects.upsertText(path, pretty(serialized));
+      return validated;
+    }
 
     try {
       await this.runtime.objects.createText(path, pretty(serialized));
@@ -275,10 +287,25 @@ export class DocumentLedgerRepository {
       if (!(error instanceof ProviderConflictError)) throw error;
       const raced = await this.readReferenceFingerprint(validated.project_id, hash);
       if (!raced || raced.document_id !== validated.document_id || raced.version_id !== validated.version_id) {
-        throw new Error(`Provider integrity fingerprint is already bound to different reference evidence: ${hash}`);
+        throw new Error(`Provider integrity fingerprint is already bound to different current reference evidence: ${hash}`);
       }
       return raced;
     }
+  }
+
+  private async isCurrentReferenceFingerprint(record: ReferenceFingerprintRecord): Promise<boolean> {
+    const head = await this.readHead(record.project_id, record.document_id);
+    if (
+      !head
+      || head.kind !== "reference"
+      || head.reference_version_id !== record.version_id
+      || !head.provider?.reference
+      || head.provider.reference.content_hash !== record.provider_content_hash
+    ) return false;
+    const version = await this.readVersion(record.project_id, record.document_id, record.version_id);
+    return version?.kind === "reference"
+      && version.stage === "reference"
+      && version.provider_content_hash === record.provider_content_hash;
   }
 
   async storeTextPayload(projectId: string, expectedSha256: string, content: string): Promise<string> {

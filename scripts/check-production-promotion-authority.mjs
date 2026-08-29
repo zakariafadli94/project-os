@@ -6,8 +6,10 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const workflowsDir = join(root, ".github", "workflows");
 const deployPath = join(workflowsDir, "deploy.yml");
 const operatorPath = join(workflowsDir, "mutation-candidate-reject.yml");
+const disableBuildsPath = join(workflowsDir, "r0-disable-cloudflare-workers-builds.yml");
 const deploy = readFileSync(deployPath, "utf8");
 const operator = readFileSync(operatorPath, "utf8");
+const disableBuilds = readFileSync(disableBuildsPath, "utf8");
 
 const requireText = (text, needle, label = needle) => {
   if (!text.includes(needle)) throw new Error(`Production promotion authority missing ${label}`);
@@ -26,7 +28,7 @@ requireText(deploy, "workflow_dispatch:", "manual production trigger");
 requireText(deploy, "group: project-os-production", "shared production serialization lock");
 requireText(deploy, "git-${GITHUB_SHA}", "exact Git-SHA Worker version tag");
 requireText(deploy, "worker_version_id", "post-deploy Worker version identity verification");
-requireText(deploy, "worker_version_tag", "post-deploy Worker version identity verification");
+requireText(deploy, "worker_version_tag", "post-deploy Worker tag verification");
 requireText(deploy, "git_sha", "post-deploy Git SHA verification");
 
 // MutationGate may temporarily attach an operator version at 0% and address it
@@ -42,10 +44,23 @@ forbid(operator, /OPERATOR_VERSION_(?:ID|TAG)[^\n]*@(?:[1-9][0-9]*(?:\.[0-9]+)?|
 forbid(operator, /CLEANUP_VERSION_TAG/, "cleanup version that can become a second production release");
 forbid(operator, /wrangler\s+rollback\b/, "operator rollback command");
 
+// R0 account cutover removes Cloudflare Workers Builds triggers and delegates
+// the final republish to deploy.yml rather than promoting Worker code itself.
+requireText(disableBuilds, "[operator] Project OS R0 disable Cloudflare Workers Builds", "owner-only R0 cutover control issue");
+requireText(disableBuilds, "/workers/scripts", "immutable Worker-tag lookup");
+requireText(disableBuilds, "/builds/workers/$WORKER_TAG/triggers", "Workers Builds trigger listing");
+requireText(disableBuilds, "--request DELETE", "Workers Builds trigger deletion");
+requireText(disableBuilds, "/builds/triggers/$trigger_id", "trigger-specific deletion endpoint");
+requireText(disableBuilds, "body.result.length !== 0", "zero-trigger verification");
+requireText(disableBuilds, "/actions/workflows/deploy.yml/dispatches", "authoritative promoter republish request");
+if (directPromotionLines(disableBuilds).length > 0) {
+  throw new Error("Production promotion authority must not contain direct Worker promotion from R0 cutover workflow");
+}
+
 // No third workflow may mutate Worker production deployment state. A Wrangler
 // dry-run in CI is explicitly non-promoting and remains allowed.
 for (const name of readdirSync(workflowsDir).filter((entry) => /\.ya?ml$/.test(entry))) {
-  if (name === "deploy.yml" || name === "mutation-candidate-reject.yml") continue;
+  if (name === "deploy.yml" || name === "mutation-candidate-reject.yml" || name === "r0-disable-cloudflare-workers-builds.yml") continue;
   const content = readFileSync(join(workflowsDir, name), "utf8");
   const offenders = directPromotionLines(content);
   if (offenders.length > 0) {

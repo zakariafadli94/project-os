@@ -20,7 +20,8 @@ export default defineConfig({
           DROPBOX_APP_KEY: "test-app-key",
           DROPBOX_APP_SECRET: "test-app-secret",
           DROPBOX_REFRESH_TOKEN: "test-refresh-token",
-          INGRESS_TOKEN: "test-ingress-token"
+          INGRESS_TOKEN: "test-ingress-token",
+          PROJECT_OS_SCHEMA_WRITER_STAGE: "v1_only"
         }
       }
     })

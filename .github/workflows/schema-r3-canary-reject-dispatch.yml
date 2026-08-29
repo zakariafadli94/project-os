@@ -13,28 +13,47 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch governed MutationGate reject
+      - name: Cancel stale self-hosted-era run and dispatch hosted reject
         env:
           GH_TOKEN: ${{ github.token }}
           PROJECT_ID: PRJ-0006
           CANDIDATE_ID: MUTCAND-1E671BAEB46DF9373395AF19
+          STALE_RUN_ID: "33271379067"
         run: |
           node <<'NODE'
           const repository = process.env.GITHUB_REPOSITORY;
           const token = process.env.GH_TOKEN;
           const projectId = process.env.PROJECT_ID;
           const candidateId = process.env.CANDIDATE_ID;
+          const staleRunId = process.env.STALE_RUN_ID;
           if (!repository || !token) throw new Error("GitHub workflow identity/token missing");
+
+          const headers = {
+            authorization: `Bearer ${token}`,
+            accept: "application/vnd.github+json",
+            "content-type": "application/json",
+            "x-github-api-version": "2022-11-28"
+          };
+
+          const stale = await fetch(`https://api.github.com/repos/${repository}/actions/runs/${staleRunId}`, { headers });
+          if (!stale.ok) throw new Error(`Could not inspect stale run: HTTP ${stale.status} ${await stale.text()}`);
+          const staleBody = await stale.json();
+          if (staleBody.status !== "completed") {
+            const cancel = await fetch(`https://api.github.com/repos/${repository}/actions/runs/${staleRunId}/cancel`, {
+              method: "POST",
+              headers
+            });
+            if (cancel.status !== 202) throw new Error(`Stale run cancellation failed: HTTP ${cancel.status} ${await cancel.text()}`);
+            console.log(`Cancellation requested for stale run ${staleRunId}`);
+          } else {
+            console.log(`Stale run ${staleRunId} already completed; no cancellation needed`);
+          }
+
           const response = await fetch(
             `https://api.github.com/repos/${repository}/actions/workflows/mutation-candidate-reject.yml/dispatches`,
             {
               method: "POST",
-              headers: {
-                authorization: `Bearer ${token}`,
-                accept: "application/vnd.github+json",
-                "content-type": "application/json",
-                "x-github-api-version": "2022-11-28"
-              },
+              headers,
               body: JSON.stringify({
                 ref: "main",
                 inputs: {
@@ -49,5 +68,5 @@ jobs:
           if (response.status !== 204) {
             throw new Error(`Workflow dispatch failed: HTTP ${response.status} ${raw}`);
           }
-          console.log(`Dispatched governed candidate.reject for ${projectId} / ${candidateId}`);
+          console.log(`Dispatched GitHub-hosted candidate.reject for ${projectId} / ${candidateId}`);
           NODE

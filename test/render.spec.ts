@@ -180,7 +180,7 @@ describe("Markdown renderers", () => {
     expect(discovery).not.toContain("Publish offer");
   });
 
-  it("retains the SOP-aligned roadmap and renders real deliverable lifecycle status", () => {
+  it("retains the SOP-aligned roadmap and renders real deliverable lifecycle status without linking registry cards", () => {
     const roadmap = renderRoadmap(sampleState());
     expect(roadmap).toContain("# Roadmap — Agency");
     expect(roadmap).toContain("## Current");
@@ -191,7 +191,8 @@ describe("Markdown renderers", () => {
     expect(roadmap).toContain("Get approval — Waiting for client");
     expect(roadmap).toContain("Publish offer");
     expect(roadmap).toContain("Scale — Expand repeatable acquisition");
-    expect(roadmap).toContain("[[DELIVERABLES/DEL-OFFER001|Validated offer]] — review");
+    expect(roadmap).toContain("Validated offer — review");
+    expect(roadmap).not.toContain("[[DELIVERABLES/DEL-OFFER001");
   });
 
   it("keeps human views explicit for a sparse new project", () => {

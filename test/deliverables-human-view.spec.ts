@@ -181,7 +181,9 @@ describe("human deliverables view", () => {
 
     await expect(writer.materialize(plan, {
       workspaceRoot: "/workspace",
-      onUnexpectedContent: (entry) => preserved.push(entry.currentContent)
+      onUnexpectedContent: (entry) => {
+        preserved.push(entry.currentContent);
+      }
     })).rejects.toBeInstanceOf(MaterializationOutputConflictError);
 
     expect(objects.deleted).toEqual([]);

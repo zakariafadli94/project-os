@@ -84,6 +84,7 @@ export class WorkspaceProjectionWriter {
 
     await this.runStage(plan.project_id, nonCritical, root, verified, options);
     await this.runStage(plan.project_id, critical, root, verified, options);
+    await this.removeObsoleteOutputs(plan, root, options);
     return verified;
   }
 
@@ -135,6 +136,42 @@ export class WorkspaceProjectionWriter {
 
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
     if (errors.length > 0) throw errors[0];
+  }
+
+  private async removeObsoleteOutputs(
+    plan: ProjectionPlan,
+    root: string,
+    options: WorkspaceProjectionWriterOptions
+  ): Promise<void> {
+    if (plan.removed_outputs.length === 0) return;
+    if (!plan.removed_output_evidence) {
+      throw new Error("Removed projection outputs require completed baseline evidence");
+    }
+
+    for (const key of plan.removed_outputs) {
+      const evidence = plan.removed_output_evidence.get(key);
+      if (!evidence) {
+        throw new Error(`Removed projection output is missing completed baseline evidence: ${key}`);
+      }
+      const path = joinWorkspacePath(root, evidence.relative_path);
+      const current = await this.objects.readText(path);
+      if (current === null) continue;
+      const currentHash = await sha256Text(current);
+      if (currentHash !== evidence.content_hash) {
+        await this.preserveUnexpectedContent(plan.project_id, {
+          key,
+          path,
+          currentContent: current,
+          currentHash
+        }, options.onUnexpectedContent);
+        throw new MaterializationOutputConflictError(
+          key,
+          path,
+          `Refusing to delete an obsolete projection whose bytes changed since the completed baseline: ${path}`
+        );
+      }
+      await this.objects.delete(path);
+    }
   }
 
   private async materializeOne(

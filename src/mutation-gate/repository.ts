@@ -32,6 +32,7 @@ import {
   type CurrentMutationIntentRecord
 } from "../schema/mutation-gate";
 import { upcastDropboxV1Observation } from "../schema/provider-evidence";
+import { schemaWriterStageFor } from "../schema/runtime-policy";
 import type { SchemaWriterStage } from "../schema/writer-stage";
 
 interface MutationIntentDestinationBindingRecord {
@@ -87,12 +88,14 @@ export class MutationResolutionConflictError extends Error {
 
 export class MutationGateRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
+  private readonly schemaWriterStage: SchemaWriterStage;
 
   constructor(
     input: PersistenceInput,
-    private readonly schemaWriterStage: SchemaWriterStage = "v1_only"
+    schemaWriterStage: SchemaWriterStage = "v1_only"
   ) {
     this.runtime = asProjectOsPersistence(input);
+    this.schemaWriterStage = schemaWriterStageFor(this.runtime, schemaWriterStage);
   }
 
   async ensureArtifactIntent(record: CurrentMutationIntentRecord): Promise<CurrentMutationIntentRecord> {

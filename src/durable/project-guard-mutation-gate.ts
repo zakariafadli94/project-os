@@ -1,3 +1,4 @@
+import { deploymentIdentity } from "../deployment/identity";
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
 import {
   parseMutationCandidateResolutionRequest,
@@ -29,7 +30,8 @@ import {
 } from "../schema/runtime-policy";
 import {
   initializeSchemaRolloutStorage,
-  SchemaRolloutState
+  SchemaRolloutState,
+  schemaDiagnostic
 } from "../schema/rollout";
 import type { SchemaWriterStage } from "../schema/writer-stage";
 import { ProjectGuard as BaseProjectGuard } from "./project-guard";
@@ -62,23 +64,28 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
   private readonly resolutionRepository: ProjectRepository;
   private readonly schemaRollout: SchemaRolloutState;
   private readonly schemaWriterStage: SchemaWriterStage;
+  private readonly schemaDeploymentIdentity: string;
   private outerQueue: Promise<void> = Promise.resolve();
   private schemaFrontierReconciled = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.boundProjectId = this.ctx.id.name ?? "";
+    this.schemaDeploymentIdentity = formatSchemaDeploymentIdentity(env);
     this.schemaWriterStage = schemaWriterStageFor(this.persistence);
     initializeSchemaRolloutStorage(this.ctx.storage);
     this.schemaRollout = new SchemaRolloutState(this.ctx.storage);
-    this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
+    this.assertSchemaWriterStage("rollout_frontier", null);
     configureSchemaEvidenceObserver(this.persistence, (stage) => {
       // Evidence is durable reality. Record it first so even a rejected old
       // binary restart cannot forget the rollback frontier it just observed.
       this.schemaRollout.noteDurableWrite(stage);
-      this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
+      this.assertSchemaWriterStage(
+        stage === "core_v2" ? "ProjectState" : "ProviderEvidence",
+        "2.0"
+      );
     });
 
-    this.boundProjectId = this.ctx.id.name ?? "";
     this.gateMode = parseMutationGateMode(env.PROJECT_OS_MUTATION_GATE_MODE);
     this.gate = new MutationGateService(this.persistence, this.gateMode);
     this.resolutionService = new MutationCandidateResolutionService(this.persistence);
@@ -274,6 +281,35 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
     );
   }
 
+  private assertSchemaWriterStage(family: string, encounteredVersion: string | null): void {
+    try {
+      this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
+    } catch (error) {
+      let frontier: SchemaWriterStage = "v1_only";
+      let failureClass = "writer_stage_regression";
+      try {
+        frontier = this.schemaRollout.status().frontier;
+      } catch {
+        failureClass = "rollout_storage_version";
+      }
+      console.error(
+        "Project OS schema compatibility failure",
+        schemaDiagnostic({
+          projectId: this.boundProjectId || null,
+          family,
+          encounteredVersion,
+          semanticVersion: "2.0",
+          canonicalRevision: this.localResolutionState()?.revision ?? null,
+          deploymentIdentity: this.schemaDeploymentIdentity,
+          failureClass,
+          writerStage: this.schemaWriterStage,
+          frontier
+        })
+      );
+      throw error;
+    }
+  }
+
   private async reconcileSchemaFrontierForMutation(): Promise<void> {
     if (this.schemaFrontierReconciled || !this.boundProjectId) return;
     if (this.boundProjectId === AUTO_PROJECT_ID) {
@@ -322,7 +358,7 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
       }
     }
 
-    this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
+    this.assertSchemaWriterStage("rollout_frontier", null);
     this.schemaFrontierReconciled = true;
   }
 
@@ -394,6 +430,16 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
       release();
     }
   }
+}
+
+function formatSchemaDeploymentIdentity(env: Env): string {
+  const identity = deploymentIdentity(env);
+  const parts = [
+    identity.git_sha ? `git:${identity.git_sha}` : null,
+    identity.worker_version_id ? `worker:${identity.worker_version_id}` : null,
+    identity.worker_version_tag ? `tag:${identity.worker_version_tag}` : null
+  ].filter((value): value is string => value !== null);
+  return parts.join("|") || "unattributed";
 }
 
 function providerUnavailableResponse(error: ProviderOperationError): Response {

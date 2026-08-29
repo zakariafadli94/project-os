@@ -15,6 +15,10 @@ const requireText = (text, needle, label = needle) => {
 const forbid = (text, pattern, label) => {
   if (pattern.test(text)) throw new Error(`Production promotion authority must not contain ${label}`);
 };
+const directPromotionLines = (text) => text
+  .split(/\r?\n/)
+  .filter((line) => /\bnpm\s+run\s+deploy\b|\bwrangler\s+deploy\b|\bwrangler\s+rollback\b|\bwrangler\s+versions\s+deploy\b/.test(line))
+  .filter((line) => !/\bwrangler\s+deploy\b.*--dry-run\b/.test(line));
 
 // GitHub deploy.yml is the sole positive-traffic production promoter.
 requireText(deploy, "branches: [main]", "main-only automatic production trigger");
@@ -22,7 +26,7 @@ requireText(deploy, "workflow_dispatch:", "manual production trigger");
 requireText(deploy, "group: project-os-production", "shared production serialization lock");
 requireText(deploy, "git-${GITHUB_SHA}", "exact Git-SHA Worker version tag");
 requireText(deploy, "worker_version_id", "post-deploy Worker version identity verification");
-requireText(deploy, "worker_version_tag", "post-deploy Worker tag verification");
+requireText(deploy, "worker_version_tag", "post-deploy Worker version identity verification");
 requireText(deploy, "git_sha", "post-deploy Git SHA verification");
 
 // MutationGate may temporarily attach an operator version at 0% and address it
@@ -38,12 +42,14 @@ forbid(operator, /OPERATOR_VERSION_(?:ID|TAG)[^\n]*@(?:[1-9][0-9]*(?:\.[0-9]+)?|
 forbid(operator, /CLEANUP_VERSION_TAG/, "cleanup version that can become a second production release");
 forbid(operator, /wrangler\s+rollback\b/, "operator rollback command");
 
-// No third workflow may mutate Worker production deployment state.
+// No third workflow may mutate Worker production deployment state. A Wrangler
+// dry-run in CI is explicitly non-promoting and remains allowed.
 for (const name of readdirSync(workflowsDir).filter((entry) => /\.ya?ml$/.test(entry))) {
   if (name === "deploy.yml" || name === "mutation-candidate-reject.yml") continue;
   const content = readFileSync(join(workflowsDir, name), "utf8");
-  if (/\bnpm\s+run\s+deploy\b|\bwrangler\s+deploy\b|\bwrangler\s+rollback\b|\bwrangler\s+versions\s+deploy\b/.test(content)) {
-    throw new Error(`Workflow ${name} contains an unauthorized production deployment command`);
+  const offenders = directPromotionLines(content);
+  if (offenders.length > 0) {
+    throw new Error(`Workflow ${name} contains an unauthorized production deployment command: ${offenders[0].trim()}`);
   }
 }
 

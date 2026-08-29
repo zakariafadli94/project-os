@@ -55,9 +55,9 @@ describe("Operational Activation Contract", () => {
     const operating = renderOperating(state);
     const handoff = renderHandoff(state);
 
-    expect(OPERATING_CONTRACT_VERSION).toBe(1);
+    expect(OPERATING_CONTRACT_VERSION).toBe(2);
     expect(operating).toContain("note_id: OPERATING");
-    expect(operating).toContain("operating_contract_version: 1");
+    expect(operating).toContain("operating_contract_version: 2");
     expect(operating).toContain("INPUTS/");
     expect(operating).toContain("REFERENCES/UNCLASSIFIED/");
     expect(operating).toContain("WORKING/");
@@ -67,7 +67,7 @@ describe("Operational Activation Contract", () => {
     expect(operating).toContain("receipt");
 
     expect(handoff).toContain("## Operating contract");
-    expect(handoff).toContain("Operating contract version: 1");
+    expect(handoff).toContain("Operating contract version: 2");
     expect(handoff).toContain("[[OPERATING|Current operating contract]]");
     expect(handoff).toContain("Sources → INPUTS/ → REFERENCES/");
     expect(handoff).toContain("Drafts → WORKING/ → REVIEW/");
@@ -82,7 +82,7 @@ describe("Operational Activation Contract", () => {
     const plan = await planProjection(record, null, CURRENT_PROJECTION_VERSION);
     const operating = plan.changed_outputs.get("global:OPERATING");
     expect(operating?.relative_path).toBe("OPERATING.md");
-    expect(operating?.content).toContain("operating_contract_version: 1");
+    expect(operating?.content).toContain("operating_contract_version: 2");
   });
 
   it("keeps projection v1 byte-contract behavior without OPERATING or the new HANDOFF bootstrap", async () => {

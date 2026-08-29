@@ -1,3 +1,4 @@
+import { deploymentIdentity } from "./deployment/identity";
 import { parseMutationCandidateResolutionRequest } from "./domain/mutation-candidate-resolution";
 import type { Env } from "./env";
 import baseWorker from "./index";
@@ -12,6 +13,21 @@ const worker = {
   ...baseWorker,
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/health") {
+      return Response.json({ status: "ok", ...deploymentIdentity(env) });
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/admin/schema-status") {
+      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const projectId = url.searchParams.get("project_id");
+      if (!projectId || !/^PRJ-[0-9]{4,}$/.test(projectId)) {
+        return Response.json({ error: "invalid_project_id" }, { status: 400 });
+      }
+      const stub = env.PROJECT_GUARD.getByName(projectId);
+      return stub.fetch("https://project-guard.internal/schema-status", { method: "GET" });
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/mutation-candidates/resolve") {
       if (!authorizedResolution(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 
@@ -38,6 +54,11 @@ const worker = {
 } satisfies ExportedHandler<Env>;
 
 export default worker;
+
+function authorizedIngress(request: Request, env: Env): boolean {
+  const authorization = request.headers.get("authorization");
+  return !!authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`);
+}
 
 function authorizedResolution(request: Request, env: Env, now = Date.now()): boolean {
   const authorization = request.headers.get("authorization");

@@ -8,6 +8,9 @@
     "PROJECT_OS_CONTINUITY_MODE": "stable",
     "PROJECT_OS_MUTATION_GATE_MODE": "enforce"
   },
+  "version_metadata": {
+    "binding": "CF_VERSION_METADATA"
+  },
   "triggers": {
     "crons": ["*/5 * * * *"]
   },

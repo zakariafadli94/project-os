@@ -40,20 +40,47 @@ jobs:
       - name: Verify project
         run: npm run check
 
-      - name: Deploy Project OS Worker
-        run: npm run deploy
-
-      - name: Verify production health
+      - name: Deploy exact Git release
         shell: bash
         run: |
+          set -euo pipefail
+          npm run deploy -- \
+            --tag "git-${GITHUB_SHA}" \
+            --message "GitHub Actions production ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
+
+      - name: Verify exact production identity and health
+        shell: bash
+        run: |
+          set -euo pipefail
           for attempt in 1 2 3 4 5; do
             if response=$(curl --fail --silent --show-error --max-time 15 "$HEALTH_URL"); then
               echo "$response"
-              exit 0
+              if RESPONSE="$response" node <<'NODE'
+          const fs = require("node:fs");
+          const body = JSON.parse(process.env.RESPONSE ?? "null");
+          const expectedSha = (process.env.GITHUB_SHA ?? "").toLowerCase();
+          const expectedTag = `git-${expectedSha}`;
+          const versionId = body?.worker_version_id;
+          if (body?.status !== "ok") throw new Error("Production health status is not ok");
+          if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(versionId ?? ""))) {
+            throw new Error(`Production Worker version id is invalid: ${String(versionId)}`);
+          }
+          if (body?.worker_version_tag !== expectedTag) {
+            throw new Error(`Production Worker tag mismatch: expected ${expectedTag}, got ${String(body?.worker_version_tag)}`);
+          }
+          if (body?.git_sha !== expectedSha) {
+            throw new Error(`Production Git SHA mismatch: expected ${expectedSha}, got ${String(body?.git_sha)}`);
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, `DEPLOYED_WORKER_VERSION_ID=${versionId}\n`);
+          console.log(`Verified exact production identity: ${versionId} ${expectedTag}`);
+          NODE
+              then
+                exit 0
+              fi
             fi
             sleep 5
           done
-          echo "Production health check failed after deployment."
+          echo "Production health/identity check failed after deployment."
           exit 1
 
       - name: Publish deployment status
@@ -62,6 +89,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DEPLOY_STATUS: ${{ job.status }}
           COMMIT_SHA: ${{ github.sha }}
+          WORKER_VERSION_ID: ${{ env.DEPLOYED_WORKER_VERSION_ID }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |
@@ -71,6 +99,7 @@ jobs:
           const api = process.env.GITHUB_API_URL || "https://api.github.com";
           const status = process.env.DEPLOY_STATUS;
           const commit = process.env.COMMIT_SHA;
+          const workerVersionId = process.env.WORKER_VERSION_ID || "unverified";
           const runUrl = process.env.RUN_URL;
           const title = "[automation] Project OS deployment status";
 
@@ -108,7 +137,7 @@ jobs:
 
           await request(`${api}/repos/${repository}/issues/${issue.number}/comments`, {
             method: "POST",
-            body: JSON.stringify({ body: `status=${status} commit=${commit} run=${runUrl}` })
+            body: JSON.stringify({ body: `status=${status} commit=${commit} worker_version=${workerVersionId} run=${runUrl}` })
           });
           console.log(`Published deployment status to issue #${issue.number}`);
           NODE

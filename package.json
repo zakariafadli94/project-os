@@ -10,8 +10,9 @@
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
     "check:persistence-boundary": "node scripts/check-persistence-boundary.mjs",
+    "check:production-promotion-authority": "node scripts/check-production-promotion-authority.mjs",
     "check:mutation-gate-repair-workflow": "node scripts/check-mutation-gate-repair-workflow.mjs",
-    "check": "npm run types && npm run typecheck && npm run check:persistence-boundary && npm run check:mutation-gate-repair-workflow && npm test",
+    "check": "npm run types && npm run typecheck && npm run check:persistence-boundary && npm run check:production-promotion-authority && npm run check:mutation-gate-repair-workflow && npm test",
     "deploy": "wrangler deploy"
   },
   "dependencies": {

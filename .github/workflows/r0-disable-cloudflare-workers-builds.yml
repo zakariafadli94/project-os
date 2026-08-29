@@ -1,0 +1,135 @@
+name: Disable Cloudflare Workers Builds
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: project-os-r0-workers-builds-cutover
+  cancel-in-progress: false
+
+jobs:
+  disable:
+    if: >-
+      github.actor == github.repository_owner &&
+      github.event.issue.title == '[operator] Project OS R0 disable Cloudflare Workers Builds'
+    runs-on: [self-hosted, linux, x64, project-os]
+    env:
+      WORKER_NAME: project-os-guard
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      HEALTH_URL: https://project-os-guard.zakaria-fadli-94.workers.dev/health
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify required credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "Cloudflare API credentials are not configured."
+            exit 1
+          fi
+
+      - name: Resolve Worker tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts_json=$(curl --fail --silent --show-error --max-time 30 \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts")
+          WORKER_TAG=$(SCRIPTS_JSON="$scripts_json" node <<'NODE'
+          const body = JSON.parse(process.env.SCRIPTS_JSON ?? "null");
+          if (body?.success !== true || !Array.isArray(body?.result)) {
+            throw new Error(`Workers Scripts API failed: ${JSON.stringify(body?.errors ?? [])}`);
+          }
+          const worker = body.result.find((item) => item?.id === process.env.WORKER_NAME);
+          if (!worker || typeof worker.tag !== "string" || worker.tag.length === 0) {
+            throw new Error(`Could not resolve immutable Worker tag for ${process.env.WORKER_NAME}`);
+          }
+          process.stdout.write(worker.tag);
+          NODE
+          )
+          echo "WORKER_TAG=$WORKER_TAG" >> "$GITHUB_ENV"
+          echo "Resolved Worker tag $WORKER_TAG"
+
+      - name: Delete every Workers Builds trigger for Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          list_triggers() {
+            curl --fail --silent --show-error --max-time 30 \
+              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/builds/workers/$WORKER_TAG/triggers"
+          }
+
+          before=$(list_triggers)
+          trigger_ids=$(TRIGGERS_JSON="$before" node <<'NODE'
+          const body = JSON.parse(process.env.TRIGGERS_JSON ?? "null");
+          if (body?.success !== true || !Array.isArray(body?.result)) {
+            const errors = JSON.stringify(body?.errors ?? []);
+            throw new Error(`Workers Builds trigger listing failed. The Cloudflare token needs Workers Builds Configuration: Edit / Workers CI Write. errors=${errors}`);
+          }
+          for (const trigger of body.result) {
+            if (typeof trigger?.trigger_uuid !== "string") throw new Error("Workers Builds trigger is missing trigger_uuid");
+            console.log(trigger.trigger_uuid);
+          }
+          NODE
+          )
+
+          if [ -z "$trigger_ids" ]; then
+            echo "Workers Builds already has zero triggers for this Worker."
+          else
+            while IFS= read -r trigger_id; do
+              [ -n "$trigger_id" ] || continue
+              echo "Deleting Workers Builds trigger $trigger_id"
+              response=$(curl --fail --silent --show-error --max-time 30 \
+                --request DELETE \
+                --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                "$api/builds/triggers/$trigger_id")
+              DELETE_JSON="$response" node -e 'const b=JSON.parse(process.env.DELETE_JSON||"null"); if (b?.success!==true) throw new Error(`trigger delete failed: ${JSON.stringify(b?.errors??[])}`)'
+            done <<< "$trigger_ids"
+          fi
+
+          after=$(list_triggers)
+          TRIGGERS_JSON="$after" node <<'NODE'
+          const body = JSON.parse(process.env.TRIGGERS_JSON ?? "null");
+          if (body?.success !== true || !Array.isArray(body?.result)) throw new Error("Workers Builds verification listing failed");
+          if (body.result.length !== 0) {
+            throw new Error(`R0 requires zero Workers Builds triggers; still present=${body.result.map((item) => item?.trigger_uuid).join(",")}`);
+          }
+          console.log("Verified: zero Cloudflare Workers Builds triggers remain for project-os-guard.");
+          NODE
+
+      - name: Verify current production remains healthy
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail --silent --show-error --max-time 15 "$HEALTH_URL")
+          echo "$response"
+          HEALTH_JSON="$response" node -e 'const b=JSON.parse(process.env.HEALTH_JSON||"null"); if (b?.status!=="ok") throw new Error("production health is not ok")'
+
+      - name: Ask authoritative GitHub promoter to republish main
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/dispatches" \
+            -f ref=main
+          echo "Requested authoritative deploy.yml republish of main after Workers Builds trigger removal."
+
+      - name: Record R0 cutover evidence on control issue
+        if: always()
+        shell: bash
+        run: |
+          set -u -o pipefail
+          status="${{ job.status }}"
+          gh issue comment "${{ github.event.issue.number }}" \
+            --body "R0 Workers Builds cutover status=${status}; worker=${WORKER_NAME}; run=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

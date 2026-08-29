@@ -70,3 +70,5 @@ jobs:
           }
           console.log(`Dispatched GitHub-hosted candidate.reject for ${projectId} / ${candidateId}`);
           NODE
+
+# Retry after Project OS completed the GitHub-hosted runner cutover.

@@ -50,9 +50,9 @@ export class ProjectRepository extends CoreProjectRepository {
     const runtime = asProjectOsPersistence(input);
     super(runtime, repositoryMode);
     this.runtime = runtime;
-    const mutationRepository = new MutationGateRepository(runtime);
+    const mutationRepository = new MutationGateRepository(runtime, schemaWriterStage);
     this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
-    this.mutationGate = new MutationGateService(runtime, mutationGateMode);
+    this.mutationGate = new MutationGateService(runtime, mutationGateMode, schemaWriterStage);
   }
 
   override async readProjectState(projectId: string): Promise<ProjectState | null> {

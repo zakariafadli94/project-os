@@ -7,6 +7,10 @@ import {
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Env } from "../env";
+import {
+  machineDocumentRoot,
+  machineMutationGateRoot
+} from "../persistence/layout";
 import { ProviderOperationError } from "../persistence/provider/errors";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
 import {
@@ -58,6 +62,7 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
   private readonly schemaRollout: SchemaRolloutState;
   private readonly schemaWriterStage: SchemaWriterStage;
   private outerQueue: Promise<void> = Promise.resolve();
+  private schemaFrontierReconciled = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -268,6 +273,49 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
     );
   }
 
+  private async reconcileSchemaFrontierForMutation(): Promise<void> {
+    if (this.schemaFrontierReconciled || !this.boundProjectId) return;
+
+    // The active provider_v2 writer is already capable of preserving every
+    // lower frontier. It can reconstruct its local marker lazily as V2 records
+    // are naturally read/written without a cold-start scan.
+    if (this.schemaWriterStage === "provider_v2") {
+      this.schemaFrontierReconciled = true;
+      return;
+    }
+
+    // Reading canonical state is enough to recover the core_v2 frontier and
+    // will fail closed immediately if a v1_only binary encounters state 2.0.
+    await this.resolutionRepository.readProjectState(this.boundProjectId);
+
+    // A core_v2 rollback must additionally prove that provider_v2 was never
+    // crossed. Heads and MutationGate intents/candidates are the first durable
+    // provider-bearing records produced by their respective write paths, so a
+    // bounded scan of these flat namespaces is sufficient to recover R3.
+    if (this.schemaWriterStage === "core_v2" && this.schemaRollout.status().frontier !== "provider_v2") {
+      await this.observeSchemaEvidenceDirectory(`${machineDocumentRoot(this.boundProjectId)}/heads`);
+      if (this.schemaRollout.status().frontier !== "provider_v2") {
+        await this.observeSchemaEvidenceDirectory(`${machineMutationGateRoot(this.boundProjectId)}/intents/artifacts`);
+      }
+      if (this.schemaRollout.status().frontier !== "provider_v2") {
+        await this.observeSchemaEvidenceDirectory(`${machineMutationGateRoot(this.boundProjectId)}/candidates`);
+      }
+    }
+
+    this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
+    this.schemaFrontierReconciled = true;
+  }
+
+  private async observeSchemaEvidenceDirectory(root: string): Promise<void> {
+    const entries = await this.persistence.objects.listChildren(root);
+    for (const entry of entries) {
+      if (entry.kind !== "file") continue;
+      const path = entry.path ?? `${root}/${entry.name}`;
+      await this.persistence.objects.readText(path);
+      if (this.schemaRollout.status().frontier === "provider_v2") return;
+    }
+  }
+
   private async decorateResponse(request: Request, response: Response): Promise<Response> {
     const url = new URL(request.url);
 
@@ -303,6 +351,7 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
     this.outerQueue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
+      await this.reconcileSchemaFrontierForMutation();
       return await operation();
     } finally {
       release();

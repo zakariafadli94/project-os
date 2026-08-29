@@ -18,6 +18,15 @@ import {
   MutationGateService,
   parseMutationGateMode
 } from "../mutation-gate/service";
+import {
+  configureSchemaEvidenceObserver,
+  schemaWriterStageFor
+} from "../schema/runtime-policy";
+import {
+  initializeSchemaRolloutStorage,
+  SchemaRolloutState
+} from "../schema/rollout";
+import type { SchemaWriterStage } from "../schema/writer-stage";
 import { ProjectGuard as BaseProjectGuard } from "./project-guard";
 
 interface StateRow {
@@ -46,10 +55,23 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
   private readonly boundProjectId: string;
   private readonly resolutionService: MutationCandidateResolutionService;
   private readonly resolutionRepository: ProjectRepository;
+  private readonly schemaRollout: SchemaRolloutState;
+  private readonly schemaWriterStage: SchemaWriterStage;
   private outerQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.schemaWriterStage = schemaWriterStageFor(this.persistence);
+    initializeSchemaRolloutStorage(this.ctx.storage);
+    this.schemaRollout = new SchemaRolloutState(this.ctx.storage);
+    this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
+    configureSchemaEvidenceObserver(this.persistence, (stage) => {
+      // Evidence is durable reality. Record it first so even a rejected old
+      // binary restart cannot forget the rollback frontier it just observed.
+      this.schemaRollout.noteDurableWrite(stage);
+      this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
+    });
+
     this.boundProjectId = this.ctx.id.name ?? "";
     this.gateMode = parseMutationGateMode(env.PROJECT_OS_MUTATION_GATE_MODE);
     this.gate = new MutationGateService(this.persistence, this.gateMode);
@@ -63,6 +85,16 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/schema-status") {
+      const rollout = this.schemaRollout.status();
+      return Response.json({
+        project_id: this.boundProjectId || null,
+        active_writer_stage: this.schemaWriterStage,
+        frontier: rollout.frontier,
+        storage_version: rollout.storage_version
+      });
+    }
 
     if (request.method === "GET" && url.pathname === "/mutation-candidates") {
       if (!this.boundProjectId) return Response.json({ error: "project_not_initialized" }, { status: 404 });

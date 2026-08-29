@@ -267,7 +267,7 @@ jobs:
                 headers: {
                   authorization: `Bearer ${token}`,
                   "content-type": "application/json",
-                  "Cloudflare-Workers-Version-Overrides": `${workerName}=\"${operatorVersionId}\"`
+                  "Cloudflare-Workers-Version-Overrides": `${workerName}="${operatorVersionId}"`
                 },
                 body: payloadJson
               });

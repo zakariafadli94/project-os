@@ -56,10 +56,10 @@ describe("schema rollout frontier", () => {
       new SchemaRolloutState(state.storage).noteDurableWrite("core_v2");
       const second = new SchemaRolloutState(state.storage);
       expect(second.status()).toEqual({ storage_version: 1, frontier: "core_v2" });
-      const businessTables = state.storage.sql.exec<{ name: string }>(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'project_state'"
+      const businessRows = state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM project_state"
       ).toArray();
-      expect(businessTables).toEqual([]);
+      expect(businessRows).toEqual([{ count: 0 }]);
     });
   });
 

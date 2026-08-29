@@ -3,7 +3,6 @@ import type { ProjectionOutputEvidence } from "../domain/materialization";
 import type {
   ConstraintRecord,
   DecisionRecord,
-  DeliverableRecord,
   ProjectState,
   ResearchRecord,
   TaskRecord
@@ -11,7 +10,6 @@ import type {
 import { renderBrief } from "../render/brief";
 import { renderConstraint } from "../render/constraint";
 import { renderDecision } from "../render/decision";
-import { renderDeliverable } from "../render/deliverable";
 import { renderDiscovery } from "../render/discovery";
 import { renderHandoff, renderLegacyHandoff } from "../render/handoff";
 import { OPERATING_CONTRACT_VERSION, renderOperating } from "../render/operating";
@@ -44,6 +42,7 @@ export interface ProjectionPlan {
   changed_outputs: Map<string, PlannedProjectionOutput>;
   carried_forward: Map<string, ProjectionOutputEvidence>;
   removed_outputs: string[];
+  removed_output_evidence?: Map<string, ProjectionOutputEvidence>;
   expected_output_keys: string[];
 }
 
@@ -163,14 +162,6 @@ function entityPath(folder: string, id: string): string {
 
 function inputForEntity(state: ProjectState, record: ConstraintRecord | DecisionRecord | ResearchRecord | TaskRecord): unknown {
   return { ...identity(state), record };
-}
-
-function inputForDeliverable(state: ProjectState, record: DeliverableRecord): unknown {
-  return {
-    ...identity(state),
-    record,
-    decision_titles: record.decision_ids.map((id) => ({ id, title: state.decisions[id]?.title ?? id }))
-  };
 }
 
 function globalDescriptors(state: ProjectState, targetRevision: number, projectionVersion: number): OutputDescriptor[] {
@@ -302,17 +293,6 @@ function entityDescriptors(state: ProjectState): OutputDescriptor[] {
       entity: true
     });
   }
-  for (const id of Object.keys(state.deliverables).sort()) {
-    const record = state.deliverables[id];
-    descriptors.push({
-      key: `deliverable:${id}`,
-      relative_path: entityPath("DELIVERABLES", id),
-      critical: false,
-      semantic_input: inputForDeliverable(state, record),
-      render: () => renderDeliverable(state, record),
-      entity: true
-    });
-  }
   return descriptors;
 }
 
@@ -331,16 +311,6 @@ function affectedEntityKeys(record: CanonicalCommitRecord): Set<string> {
       return new Set([`constraint:${tx.payload.constraint_id}`]);
     case "research.add":
       return new Set([`research:${tx.payload.research_id}`]);
-    case "deliverable.create":
-    case "deliverable.start":
-    case "deliverable.revise":
-    case "deliverable.submit_review":
-    case "deliverable.accept":
-    case "deliverable.supersede":
-    case "deliverable.abandon":
-    case "deliverable.add":
-    case "deliverable.complete":
-      return new Set([`deliverable:${tx.payload.deliverable_id}`]);
     default:
       return new Set();
   }
@@ -405,6 +375,11 @@ export async function planProjection(
   const removed_outputs = baseline
     ? [...baseline.outputs.keys()].filter((key) => !expected.has(key)).sort()
     : [];
+  const removed_output_evidence = new Map<string, ProjectionOutputEvidence>();
+  for (const key of removed_outputs) {
+    const evidence = baseline?.outputs.get(key);
+    if (evidence) removed_output_evidence.set(key, evidence);
+  }
 
   return {
     project_id: record.project_id,
@@ -415,6 +390,7 @@ export async function planProjection(
     changed_outputs,
     carried_forward,
     removed_outputs,
+    removed_output_evidence,
     expected_output_keys: [...expected]
   };
 }

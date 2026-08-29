@@ -75,9 +75,9 @@ describe("Operational Activation Contract", () => {
     expect(handoff).toContain("Business facts → typed transactions");
   });
 
-  it("uses projection version 2 and includes OPERATING.md in a full projection", async () => {
+  it("uses projection version 3 and includes OPERATING.md in a full projection", async () => {
     const record = projectRecord();
-    expect(CURRENT_PROJECTION_VERSION).toBe(2);
+    expect(CURRENT_PROJECTION_VERSION).toBe(3);
 
     const plan = await planProjection(record, null, CURRENT_PROJECTION_VERSION);
     const operating = plan.changed_outputs.get("global:OPERATING");

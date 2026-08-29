@@ -93,6 +93,8 @@ When replaced:
 
 Never delete accepted history simply to reduce clutter.
 
+Historical availability does not require a technical registry card to remain in the human publication folder. Canonical lifecycle state, receipts and version evidence remain authoritative audit history.
+
 ## 10. Abandonment
 
 Use `abandoned` when work stops and the output is not intended to continue. Record the reason when useful: scope change, failed experiment, cancellation, or superior approach.
@@ -101,11 +103,21 @@ Use `abandoned` when work stops and the output is not intended to continue. Reco
 
 Not every working file deserves durable deliverable state. Track only outputs whose status matters to review, acceptance, external delivery, continuity, or future reference.
 
-## 12. Relationship to Roadmap and decisions
+## 12. Human publication surface vs canonical registry
 
-A deliverable SHOULD identify the decision/phase it implements. The Roadmap MAY link major deliverables but MUST NOT duplicate their full contents or become a deliverables database.
+`DELIVERABLES/` is the human publication/library surface. It contains the actual governed published documents or content trees that a human is expected to read or use.
 
-## 13. Quality gates
+Canonical deliverable records — IDs, statuses, versions, acceptance/supersession history, owners and references — remain durable machine/audit state. Project OS MUST NOT materialize a second technical `DEL-*.md` registry card into `DELIVERABLES/` merely because a canonical deliverable record exists.
+
+When an older Project OS generation already created such a technical card, materialization MAY remove it only when the current bytes still match the completed projection evidence. If the bytes diverged, preserve the unexpected content as recovery evidence and fail closed rather than deleting it.
+
+Superseded or abandoned registry records remain auditable canonically but do not stay visible in the human publication library solely for metadata/history purposes. A historical business document may remain accessible when intentionally retained as content.
+
+## 13. Relationship to Roadmap and decisions
+
+A deliverable SHOULD identify the decision/phase it implements. The Roadmap MAY list major deliverables and their lifecycle state but MUST NOT depend on technical registry-card files or duplicate their full contents.
+
+## 14. Quality gates
 
 Before `review`:
 - purpose clear;
@@ -119,6 +131,6 @@ Before `accepted`:
 - accepted version is unambiguous;
 - earlier versions are retained or correctly superseded.
 
-## 14. Portability
+## 15. Portability
 
 A deliverable needed to continue the project MUST be exportable or reconstructable from documented artifacts. If it depends on proprietary tooling, preserve enough specification/reference material for another platform to understand what it is, which version is current, how it was produced, and what remains editable.

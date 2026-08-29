@@ -1,0 +1,28 @@
+name: diag-prj3-reconcile-error-long
+
+on:
+  push:
+    branches: [diag/prj3-reconcile-tail-20260829]
+
+jobs:
+  tail:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Capture reconcile error event only
+        shell: bash
+        run: |
+          set +e
+          timeout 330s npx wrangler tail --format json --search "Project OS materialization reconcile failed"
+          tail_status=$?
+          if [ "$tail_status" -ne 0 ] && [ "$tail_status" -ne 124 ]; then
+            exit "$tail_status"
+          fi
+          exit 0

@@ -14,12 +14,30 @@ function env(overrides: Partial<Env> = {}): Env {
   } as Env;
 }
 
+const floorEnv = {
+  PROJECT_OS_SCHEMA_CANARY_PROJECT_ID: "PRJ-0006",
+  PROJECT_OS_SCHEMA_CORE_V2_FLOOR_PROJECT_IDS: "PRJ-0002,PRJ-0005,PRJ-0006"
+} as unknown as Partial<Env>;
+
 describe("production schema canary", () => {
-  it("applies the configured writer stage only to the selected canary project", () => {
-    const canaryEnv = env({ PROJECT_OS_SCHEMA_CANARY_PROJECT_ID: "PRJ-0006" } as Partial<Env>);
+  it("keeps crossed core-v2 projects monotonic while isolating the canary", () => {
+    const canaryEnv = env(floorEnv);
 
     expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0006"))).toBe("core_v2");
-    expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0002"))).toBe("v1_only");
+    expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0002"))).toBe("core_v2");
+    expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0005"))).toBe("core_v2");
+    expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0003"))).toBe("v1_only");
+  });
+
+  it("lets only the selected canary advance to provider-v2 before broad activation", () => {
+    const canaryEnv = env({
+      ...floorEnv,
+      PROJECT_OS_SCHEMA_WRITER_STAGE: "provider_v2"
+    });
+
+    expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0006"))).toBe("provider_v2");
+    expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0002"))).toBe("core_v2");
+    expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0005"))).toBe("core_v2");
     expect(schemaWriterStageFor(createProductionPersistence(canaryEnv, "PRJ-0003"))).toBe("v1_only");
   });
 

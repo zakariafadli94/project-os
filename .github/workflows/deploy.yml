@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, x64, project-os]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write

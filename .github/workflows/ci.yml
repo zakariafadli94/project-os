@@ -14,6 +14,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Enforce GitHub-hosted runners only
+        shell: bash
+        run: |
+          needle="self""-hosted"
+          if grep -R -n -F "$needle" .github/workflows; then
+            echo "Project OS workflows must use GitHub-hosted runners only."
+            exit 1
+          fi
       - run: npm install
       - run: npm run check
       - run: npm run test:persistence-high-risk

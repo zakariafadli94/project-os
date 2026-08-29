@@ -1,5 +1,6 @@
 import type { Env } from "../env";
 import { withSchemaRuntimePolicy } from "../schema/runtime-policy";
+import { resolveSchemaWriterStageForProject } from "../schema/writer-stage";
 import {
   requireProjectOsPersistence,
   type ProjectOsPersistenceRuntime
@@ -8,12 +9,20 @@ import { withProviderResilience } from "./provider/resilience";
 import { createDropboxPersistence } from "./providers/dropbox/adapter";
 import { DropboxClient } from "./providers/dropbox/client";
 
-export function createProductionPersistence(env: Env): ProjectOsPersistenceRuntime {
+export function createProductionPersistence(
+  env: Env,
+  projectId?: string | null
+): ProjectOsPersistenceRuntime {
   const raw = new DropboxClient({
     appKey: env.DROPBOX_APP_KEY,
     appSecret: env.DROPBOX_APP_SECRET,
     refreshToken: env.DROPBOX_REFRESH_TOKEN
   });
   const runtime = requireProjectOsPersistence(withProviderResilience(createDropboxPersistence(raw)));
-  return withSchemaRuntimePolicy(runtime, env.PROJECT_OS_SCHEMA_WRITER_STAGE);
+  const writerStage = resolveSchemaWriterStageForProject(
+    env.PROJECT_OS_SCHEMA_WRITER_STAGE,
+    env.PROJECT_OS_SCHEMA_CANARY_PROJECT_ID,
+    projectId
+  );
+  return withSchemaRuntimePolicy(runtime, writerStage);
 }

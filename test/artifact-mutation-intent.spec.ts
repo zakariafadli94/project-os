@@ -94,12 +94,12 @@ describe("ArtifactMutationIntentService", () => {
     expect(first.destination.path).toBe(
       "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/ARTIFACTS/REVENUE-OS/foo.md"
     );
-    expect(first.intent.provider_precondition).toEqual({ kind: "absent" });
+    expect(first.intent.provider_precondition).toEqual({ kind: "absent", provider_id: "dropbox" });
     await transport.upload(first.destination.path, artifact.content, "add");
 
     const replay = await service.prepare(stateAfterRoute(), artifact);
     expect(replay.destination.path).toBe(first.destination.path);
-    expect(replay.intent.provider_precondition).toEqual({ kind: "absent" });
+    expect(replay.intent.provider_precondition).toEqual({ kind: "absent", provider_id: "dropbox" });
 
     const repository = new ProjectRepository(runtime, "v2");
     expect(await repository.writeArtifact(stateAfterRoute(), artifact, replay.destination)).toBe("idempotent");

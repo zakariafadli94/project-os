@@ -145,7 +145,7 @@ describe("MutationGate status vocabulary", () => {
     expect(durable).toMatchObject({
       candidate_id: capture.record.candidate_id,
       source: "external_unverified",
-      provider_path: path
+      provider: { path }
     });
     expect(payload).toBe("# external candidate");
     expect(status).toMatchObject({

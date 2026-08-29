@@ -464,7 +464,6 @@ function sameCandidateEvidence(
   return left.candidate_id === right.candidate_id
     && left.project_id === right.project_id
     && left.source === right.source
-    && left.detection_source === right.detection_source
     && sameJson(left.provider, right.provider)
     && left.immutable_payload_path === right.immutable_payload_path;
 }

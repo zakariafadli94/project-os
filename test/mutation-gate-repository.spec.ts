@@ -158,6 +158,33 @@ describe("MutationGateRepository", () => {
     expect(transport.calls.filter((call) => call.kind === "copy" && call.path === first.record.immutable_payload_path)).toHaveLength(1);
   });
 
+  it("treats baseline-to-incremental rediscovery as the same immutable candidate evidence", async () => {
+    const transport = new FakeMutationGateDropbox();
+    const visible = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/direct.md";
+    const metadata = await transport.seed(visible, "direct bytes", "id:direct");
+    const repo = new MutationGateRepository(persistenceFromDropbox(transport));
+
+    const first = await repo.captureCandidate({
+      projectId: "PRJ-0002",
+      detectionSource: "baseline",
+      visiblePath: visible,
+      metadata,
+      detectedAt: "2026-08-25T16:10:00+01:00"
+    });
+    const replay = await repo.captureCandidate({
+      projectId: "PRJ-0002",
+      detectionSource: "incremental",
+      visiblePath: visible,
+      metadata,
+      detectedAt: "2026-08-25T16:20:00+01:00"
+    });
+
+    expect(replay.created).toBe(false);
+    expect(replay.record.candidate_id).toBe(first.record.candidate_id);
+    expect(replay.record.detection_source).toBe("baseline");
+    expect(transport.calls.filter((call) => call.kind === "copy" && call.path === first.record.immutable_payload_path)).toHaveLength(1);
+  });
+
   it("keeps artifact intent immutable and indexes it by exact destination", async () => {
     const transport = new FakeMutationGateDropbox();
     const repo = new MutationGateRepository(persistenceFromDropbox(transport));

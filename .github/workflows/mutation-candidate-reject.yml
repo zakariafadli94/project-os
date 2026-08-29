@@ -37,9 +37,10 @@ jobs:
       (github.event_name == 'issues' &&
        github.actor == github.repository_owner &&
        github.event.issue.title == '[operator] MutationGate PRJ-0003 reject repair')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, project-os]
     env:
       PROJECT_OS_URL: https://project-os-guard.zakaria-fadli-94.workers.dev
+      WORKER_NAME: project-os-guard
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       PROJECT_ID: ${{ github.event_name == 'issues' && 'PRJ-0003' || inputs.project_id }}
@@ -79,21 +80,54 @@ jobs:
           console.log(`Validated ${candidateIds.length} candidate reject request(s) for ${projectId}`);
           NODE
 
-      - name: Generate ephemeral operator token and version tags
+      - name: Capture active production deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          deployment_json=$(curl --fail --silent --show-error --max-time 30 \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME/deployments")
+          DEPLOYMENT_JSON="$deployment_json" node <<'NODE'
+          const fs = require("node:fs");
+          const body = JSON.parse(process.env.DEPLOYMENT_JSON ?? "null");
+          const deployments = body?.result?.deployments ?? body?.deployments;
+          if (!Array.isArray(deployments) || deployments.length === 0) throw new Error("Cloudflare returned no active Worker deployment");
+          const active = deployments[0];
+          if (!Array.isArray(active?.versions) || active.versions.length !== 1) {
+            throw new Error("MutationGate operator requires a single-version 100% base deployment");
+          }
+          const base = active.versions[0];
+          if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(base.version_id ?? ""))) throw new Error("Invalid active Worker version id");
+          if (Number(base.percentage) !== 100) throw new Error(`Active base Worker is not at 100% traffic: ${String(base.percentage)}`);
+          fs.appendFileSync(process.env.GITHUB_ENV, `BASE_VERSION_ID=${base.version_id}\n`);
+          console.log(`Captured authoritative base Worker version ${base.version_id}`);
+          NODE
+
+      - name: Verify base deployment is Git-attributed
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health")
+          echo "$response"
+          HEALTH_JSON="$response" node <<'NODE'
+          const body = JSON.parse(process.env.HEALTH_JSON ?? "null");
+          const base = process.env.BASE_VERSION_ID;
+          if (body?.status !== "ok" || body?.worker_version_id !== base) throw new Error("Health identity does not match captured base deployment");
+          if (!/^[a-f0-9]{40}$/.test(String(body?.git_sha ?? ""))) throw new Error("Base deployment is not attributable to an exact Git SHA");
+          if (body?.worker_version_tag !== `git-${body.git_sha}`) throw new Error("Base Worker version tag is not authoritative git-<sha>");
+          NODE
+
+      - name: Generate ephemeral operator token and version tag
         shell: bash
         run: |
           set -euo pipefail
           OPERATOR_TOKEN=$(node -e 'const { randomBytes } = require("node:crypto"); process.stdout.write(`${Date.now()}.${randomBytes(32).toString("hex")}`)')
           OPERATOR_VERSION_TAG="mg-op-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          CLEANUP_VERSION_TAG="mg-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "::add-mask::$OPERATOR_TOKEN"
           {
             echo "OPERATOR_TOKEN=$OPERATOR_TOKEN"
             echo "OPERATOR_VERSION_TAG=$OPERATOR_VERSION_TAG"
-            echo "CLEANUP_VERSION_TAG=$CLEANUP_VERSION_TAG"
             echo "TOKEN_VERSION_CREATED=false"
-            echo "CLEANUP_VERSION_CREATED=false"
-            echo "TOKEN_VERSION_DEPLOYED=false"
           } >> "$GITHUB_ENV"
 
       - name: Create ephemeral operator-token version
@@ -101,32 +135,83 @@ jobs:
         run: |
           set -euo pipefail
           secret_file="$RUNNER_TEMP/mutationgate-operator-secrets.json"
-          trap 'rm -f "$secret_file"' EXIT
+          upload_output="$RUNNER_TEMP/mutationgate-operator-upload.txt"
+          versions_json="$RUNNER_TEMP/mutationgate-operator-versions.json"
+          trap 'rm -f "$secret_file" "$upload_output" "$versions_json"' EXIT
           node -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({MUTATION_GATE_OPERATOR_TOKEN: process.env.OPERATOR_TOKEN}), { mode: 0o600 })' "$secret_file"
           npx wrangler versions upload \
             --secrets-file "$secret_file" \
             --tag "$OPERATOR_VERSION_TAG" \
-            --message "MutationGate ephemeral operator token for run $GITHUB_RUN_ID"
-          echo "TOKEN_VERSION_CREATED=true" >> "$GITHUB_ENV"
+            --message "MutationGate zero-traffic operator version for run $GITHUB_RUN_ID" | tee "$upload_output"
+          npx wrangler versions list --json > "$versions_json"
+          OPERATOR_VERSION_ID=$(UPLOAD_OUTPUT="$upload_output" VERSIONS_JSON="$versions_json" node <<'NODE'
+          const fs = require("node:fs");
+          const output = fs.readFileSync(process.env.UPLOAD_OUTPUT, "utf8");
+          const direct = output.match(/Worker Version ID:\s*([0-9a-f-]{36})/i)?.[1];
+          if (direct) { process.stdout.write(direct); process.exit(0); }
+          const data = JSON.parse(fs.readFileSync(process.env.VERSIONS_JSON, "utf8"));
+          const targetTag = process.env.OPERATOR_VERSION_TAG;
+          const candidates = Array.isArray(data) ? data : (Array.isArray(data?.versions) ? data.versions : []);
+          for (const item of candidates) {
+            const tag = item?.tag ?? item?.metadata?.tag ?? item?.annotations?.["workers/tag"];
+            const id = item?.id ?? item?.version_id;
+            if (tag === targetTag && /^[0-9a-f-]{36}$/i.test(String(id ?? ""))) {
+              process.stdout.write(id);
+              process.exit(0);
+            }
+          }
+          throw new Error(`Could not resolve Worker version id for tag ${targetTag}`);
+          NODE
+          )
+          if ! [[ "$OPERATOR_VERSION_ID" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+            echo "Invalid operator Worker version id: $OPERATOR_VERSION_ID"
+            exit 1
+          fi
+          {
+            echo "OPERATOR_VERSION_ID=$OPERATOR_VERSION_ID"
+            echo "TOKEN_VERSION_CREATED=true"
+          } >> "$GITHUB_ENV"
+          echo "Created zero-traffic operator Worker version $OPERATOR_VERSION_ID"
 
-      - name: Prebuild operator-token cleanup version
-        shell: bash
-        run: |
-          set -euo pipefail
-          npx wrangler versions secret delete MUTATION_GATE_OPERATOR_TOKEN \
-            --tag "$CLEANUP_VERSION_TAG" \
-            --message "MutationGate prebuilt operator-token cleanup for run $GITHUB_RUN_ID"
-          echo "CLEANUP_VERSION_CREATED=true" >> "$GITHUB_ENV"
-
-      - name: Deploy ephemeral operator-token version
+      - name: Attach operator version at zero percent traffic
         shell: bash
         run: |
           set -euo pipefail
           npx wrangler versions deploy \
-            --version-tag "$OPERATOR_VERSION_TAG@100%" \
-            --message "MutationGate operator window for run $GITHUB_RUN_ID" \
+            "$BASE_VERSION_ID@100%" \
+            "$OPERATOR_VERSION_ID@0%" \
+            --message "MutationGate zero-traffic operator window for run $GITHUB_RUN_ID" \
             --yes
-          echo "TOKEN_VERSION_DEPLOYED=true" >> "$GITHUB_ENV"
+
+      - name: Verify normal traffic remains on base version
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health")
+          echo "$response"
+          HEALTH_JSON="$response" node <<'NODE'
+          const body = JSON.parse(process.env.HEALTH_JSON ?? "null");
+          if (body?.status !== "ok" || body?.worker_version_id !== process.env.BASE_VERSION_ID) {
+            throw new Error(`Normal production traffic left base version ${process.env.BASE_VERSION_ID}`);
+          }
+          NODE
+
+      - name: Verify version override reaches operator version
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            response=$(curl --fail --silent --show-error --max-time 15 \
+              --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
+              "$PROJECT_OS_URL/health" || true)
+            if HEALTH_JSON="$response" node -e 'const b=JSON.parse(process.env.HEALTH_JSON||"null"); process.exit(b?.worker_version_id===process.env.OPERATOR_VERSION_ID ? 0 : 1)' 2>/dev/null; then
+              echo "Version override is pinned to the zero-traffic operator version."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Could not verify operator version override within the bounded retry window."
+          exit 1
 
       - name: Verify ephemeral operator token readiness
         shell: bash
@@ -138,16 +223,17 @@ jobs:
               --write-out '%{http_code}' \
               --request POST \
               --header "Authorization: Bearer $OPERATOR_TOKEN" \
+              --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
               --header 'Content-Type: application/json' \
               --data '{}' \
               "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
             if [ "$readiness_status" = "400" ] && grep -q '"error":"invalid_mutation_candidate_resolution"' /tmp/operator-readiness-body.json; then
-              echo "Ephemeral operator token is active on the serving Worker version."
+              echo "Ephemeral operator token is active only on the targeted zero-traffic Worker version."
               exit 0
             fi
             if [ "$readiness_status" = "401" ]; then
-              echo "readiness probe received HTTP 401 on attempt $attempt; waiting for the new Worker version."
-              sleep 3
+              echo "readiness probe received HTTP 401 on attempt $attempt; waiting for operator version propagation."
+              sleep 2
               continue
             fi
             echo "Unexpected operator-token readiness response: HTTP ${readiness_status:-curl-error}."
@@ -167,6 +253,8 @@ jobs:
           const candidateIds = JSON.parse(process.env.CANDIDATE_IDS_JSON);
           const baseUrl = process.env.PROJECT_OS_URL;
           const token = process.env.OPERATOR_TOKEN;
+          const operatorVersionId = process.env.OPERATOR_VERSION_ID;
+          const workerName = process.env.WORKER_NAME;
           const operation = "candidate.reject";
 
           async function rejectCandidate(candidateId) {
@@ -176,7 +264,11 @@ jobs:
             for (let attempt = 1; attempt <= 10; attempt += 1) {
               const response = await fetch(`${baseUrl}/v1/mutation-candidates/resolve`, {
                 method: "POST",
-                headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  "content-type": "application/json",
+                  "Cloudflare-Workers-Version-Overrides": `${workerName}="${operatorVersionId}"`
+                },
                 body: payloadJson
               });
               const raw = await response.text();
@@ -205,47 +297,55 @@ jobs:
           });
           NODE
 
-      - name: Revoke ephemeral operator token and verify cleanup
+      - name: Restore base production deployment and verify cleanup
         if: always()
         shell: bash
         run: |
           set -u -o pipefail
-          if [ -z "${OPERATOR_TOKEN:-}" ]; then
-            echo "No operator token was generated; no remote operator version could have been created."
+          if [ -z "${BASE_VERSION_ID:-}" ] || [ "${TOKEN_VERSION_CREATED:-false}" != "true" ]; then
+            echo "No operator Worker version was created; production deployment needs no cleanup."
             exit 0
           fi
 
           cleanup_failed=0
-          cleanup_deployed=0
-
-          if [ "${CLEANUP_VERSION_CREATED:-false}" = "true" ]; then
-            if npx wrangler versions deploy \
-              --version-tag "$CLEANUP_VERSION_TAG@100%" \
-              --message "MutationGate clean production after run $GITHUB_RUN_ID" \
-              --yes; then
-              cleanup_deployed=1
-            else
-              echo "Failed to deploy the prebuilt operator-token cleanup version."
-              cleanup_failed=1
-            fi
-          fi
-
-          if [ "${TOKEN_VERSION_CREATED:-false}" = "true" ] && [ "$cleanup_deployed" -ne 1 ]; then
-            echo "Operator-token version existed but no clean version could be restored."
+          if ! npx wrangler versions deploy \
+            "$BASE_VERSION_ID@100%" \
+            --message "MutationGate restore authoritative base after run $GITHUB_RUN_ID" \
+            --yes; then
+            echo "Failed to restore the authoritative base Worker deployment."
             cleanup_failed=1
           fi
 
           health_ok=0
           for attempt in 1 2 3 4 5 6 7 8 9 10; do
             if response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health"); then
-              echo "$response"
-              health_ok=1
-              break
+              if HEALTH_JSON="$response" node -e 'const b=JSON.parse(process.env.HEALTH_JSON||"null"); process.exit(b?.worker_version_id===process.env.BASE_VERSION_ID ? 0 : 1)' 2>/dev/null; then
+                echo "$response"
+                health_ok=1
+                break
+              fi
             fi
-            sleep 3
+            sleep 2
           done
           if [ "$health_ok" -ne 1 ]; then
-            echo "Production health check failed after operator-token cleanup."
+            echo "Production did not converge back to the authoritative base Worker version."
+            cleanup_failed=1
+          fi
+
+          override_removed=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            response=$(curl --fail --silent --show-error --max-time 15 \
+              --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
+              "$PROJECT_OS_URL/health" || true)
+            if HEALTH_JSON="$response" node -e 'const b=JSON.parse(process.env.HEALTH_JSON||"null"); process.exit(b?.worker_version_id===process.env.BASE_VERSION_ID ? 0 : 1)' 2>/dev/null; then
+              echo "Operator version is no longer present in the active deployment."
+              override_removed=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$override_removed" -ne 1 ]; then
+            echo "Operator version override still resolves after cleanup."
             cleanup_failed=1
           fi
 
@@ -260,16 +360,16 @@ jobs:
               --data '{}' \
               "$PROJECT_OS_URL/v1/mutation-candidates/resolve" || true)
             if [ "$revoke_status" = "401" ]; then
-              echo "Operator token revocation verified with HTTP 401."
+              echo "Operator token revocation verified with HTTP 401 on normal production traffic."
               revoked=1
               break
             fi
             echo "Operator token still not verified revoked on attempt $attempt; received ${revoke_status:-curl-error}."
             cat /tmp/operator-revoke-body.json 2>/dev/null || true
-            sleep 3
+            sleep 2
           done
           if [ "$revoked" -ne 1 ]; then
-            echo "Expected HTTP 401 after operator-token cleanup."
+            echo "Expected HTTP 401 after operator-version cleanup."
             cleanup_failed=1
           fi
 

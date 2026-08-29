@@ -1,12 +1,8 @@
 import {
-  parseExternalMutationCandidateRecord,
   parseExternalMutationResolutionRecord,
-  parseMutationIntentRecord,
   mutationCandidateIdFor,
-  type ExternalMutationCandidateRecord,
   type ExternalMutationResolutionRecord,
-  type MutationDetectionSource,
-  type MutationIntentRecord
+  type MutationDetectionSource
 } from "../domain/mutation-gate";
 import { requireDropboxV1Evidence } from "../persistence/compatibility/dropbox-v1-evidence";
 import {
@@ -27,6 +23,16 @@ import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabi
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderConflictError } from "../persistence/provider/errors";
 import { sha256Text } from "../documents/hash";
+import {
+  encodeExternalMutationCandidateRecord,
+  encodeMutationIntentRecord,
+  readExternalMutationCandidateRecord,
+  readMutationIntentRecord,
+  type CurrentExternalMutationCandidateRecord,
+  type CurrentMutationIntentRecord
+} from "../schema/mutation-gate";
+import { upcastDropboxV1Observation } from "../schema/provider-evidence";
+import type { SchemaWriterStage } from "../schema/writer-stage";
 
 interface MutationIntentDestinationBindingRecord {
   schema_version: "1.0";
@@ -55,7 +61,7 @@ export interface CaptureExternalMutationCandidateInput {
 
 export interface CaptureExternalMutationCandidateResult {
   created: boolean;
-  record: ExternalMutationCandidateRecord;
+  record: CurrentExternalMutationCandidateRecord;
 }
 
 export class MutationIntentConflictError extends Error {
@@ -82,17 +88,21 @@ export class MutationResolutionConflictError extends Error {
 export class MutationGateRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
 
-  constructor(input: PersistenceInput) {
+  constructor(
+    input: PersistenceInput,
+    private readonly schemaWriterStage: SchemaWriterStage = "v1_only"
+  ) {
     this.runtime = asProjectOsPersistence(input);
   }
 
-  async ensureArtifactIntent(record: MutationIntentRecord): Promise<MutationIntentRecord> {
-    const validated = parseMutationIntentRecord(record);
+  async ensureArtifactIntent(record: CurrentMutationIntentRecord): Promise<CurrentMutationIntentRecord> {
+    const serialized = encodeMutationIntentRecord(record, this.schemaWriterStage);
+    const validated = readMutationIntentRecord(serialized).record;
     const path = machineMutationIntentPath(validated.project_id, validated.request_id);
     let effective = validated;
 
     try {
-      await this.runtime.objects.createText(path, pretty(validated));
+      await this.runtime.objects.createText(path, pretty(serialized));
     } catch (error) {
       if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.readArtifactIntent(validated.project_id, validated.request_id);
@@ -106,22 +116,22 @@ export class MutationGateRepository {
     return effective;
   }
 
-  async readArtifactIntent(projectId: string, requestId: string): Promise<MutationIntentRecord | null> {
+  async readArtifactIntent(projectId: string, requestId: string): Promise<CurrentMutationIntentRecord | null> {
     const path = machineMutationIntentPath(projectId, requestId);
     const raw = await this.runtime.objects.readText(path);
     if (raw === null) return null;
-    const record = parseMutationIntentRecord(JSON.parse(raw));
+    const record = readMutationIntentRecord(JSON.parse(raw)).record;
     if (record.project_id !== projectId || record.request_id !== requestId) {
       throw new Error(`Mutation intent binding mismatch for ${projectId}/${requestId}`);
     }
     return record;
   }
 
-  async listArtifactIntentsForDestination(projectId: string, destinationPath: string): Promise<MutationIntentRecord[]> {
+  async listArtifactIntentsForDestination(projectId: string, destinationPath: string): Promise<CurrentMutationIntentRecord[]> {
     const pathHash = await sha256Text(destinationPath);
     const root = machineMutationIntentDestinationBindingRoot(projectId, pathHash);
     const entries = await this.runtime.objects.listChildren(root);
-    const records: MutationIntentRecord[] = [];
+    const records: CurrentMutationIntentRecord[] = [];
 
     for (const entry of entries) {
       if (entry.kind !== "file") continue;
@@ -149,39 +159,43 @@ export class MutationGateRepository {
       providerRev: evidence.rev
     });
     const immutablePayloadPath = machineMutationCandidatePayloadPath(input.projectId, candidateId);
-    const candidate = parseExternalMutationCandidateRecord({
+    const candidate: CurrentExternalMutationCandidateRecord = {
       schema_version: "1.0",
       candidate_id: candidateId,
       project_id: input.projectId,
       source: "external_unverified",
       detection_source: input.detectionSource,
-      provider_path: input.visiblePath,
-      provider_file_id: evidence.file_id,
-      provider_rev: evidence.rev,
-      provider_content_hash: evidence.content_hash,
-      size: evidence.size,
+      provider: upcastDropboxV1Observation({
+        provider_path: input.visiblePath,
+        provider_file_id: evidence.file_id,
+        provider_rev: evidence.rev,
+        provider_content_hash: evidence.content_hash,
+        size: evidence.size
+      }),
       immutable_payload_path: immutablePayloadPath,
       detected_at: input.detectedAt
-    });
+    };
+    const serialized = encodeExternalMutationCandidateRecord(candidate, this.schemaWriterStage);
+    const validated = readExternalMutationCandidateRecord(serialized).record;
 
     const existing = await this.readCandidate(input.projectId, candidateId);
     if (existing) {
-      if (!sameCandidateEvidence(existing, candidate)) {
+      if (!sameCandidateEvidence(existing, validated)) {
         throw new MutationCandidateEvidenceConflictError(candidateId);
       }
       await this.verifyCandidatePayload(existing);
       return { created: false, record: existing };
     }
 
-    await this.snapshotCandidatePayload(candidate);
+    await this.snapshotCandidatePayload(validated);
     const path = machineMutationCandidatePath(input.projectId, candidateId);
     try {
-      await this.runtime.objects.createText(path, pretty(candidate));
-      return { created: true, record: candidate };
+      await this.runtime.objects.createText(path, pretty(serialized));
+      return { created: true, record: validated };
     } catch (error) {
       if (!(error instanceof ProviderConflictError)) throw error;
       const raced = await this.readCandidate(input.projectId, candidateId);
-      if (!raced || !sameCandidateEvidence(raced, candidate)) {
+      if (!raced || !sameCandidateEvidence(raced, validated)) {
         throw new MutationCandidateEvidenceConflictError(candidateId);
       }
       await this.verifyCandidatePayload(raced);
@@ -189,20 +203,20 @@ export class MutationGateRepository {
     }
   }
 
-  async readCandidate(projectId: string, candidateId: string): Promise<ExternalMutationCandidateRecord | null> {
+  async readCandidate(projectId: string, candidateId: string): Promise<CurrentExternalMutationCandidateRecord | null> {
     const raw = await this.runtime.objects.readText(machineMutationCandidatePath(projectId, candidateId));
     if (raw === null) return null;
-    const record = parseExternalMutationCandidateRecord(JSON.parse(raw));
+    const record = readExternalMutationCandidateRecord(JSON.parse(raw)).record;
     if (record.project_id !== projectId || record.candidate_id !== candidateId) {
       throw new Error(`Mutation candidate binding mismatch for ${projectId}/${candidateId}`);
     }
     return record;
   }
 
-  async listCandidates(projectId: string): Promise<ExternalMutationCandidateRecord[]> {
+  async listCandidates(projectId: string): Promise<CurrentExternalMutationCandidateRecord[]> {
     const root = `${machineMutationGateRoot(projectId)}/candidates`;
     const entries = await this.runtime.objects.listChildren(root);
-    const records: ExternalMutationCandidateRecord[] = [];
+    const records: CurrentExternalMutationCandidateRecord[] = [];
     for (const entry of entries) {
       if (entry.kind !== "file") continue;
       const match = /^(MUTCAND-[A-F0-9]{24})\.json$/.exec(entry.name);
@@ -331,7 +345,7 @@ export class MutationGateRepository {
     return (await this.readTerminalResolutionRecord(projectId, candidateId)) !== null;
   }
 
-  private async ensureDestinationBinding(intent: MutationIntentRecord): Promise<void> {
+  private async ensureDestinationBinding(intent: CurrentMutationIntentRecord): Promise<void> {
     const binding: MutationIntentDestinationBindingRecord = {
       schema_version: "1.0",
       project_id: intent.project_id,
@@ -372,9 +386,9 @@ export class MutationGateRepository {
     return parsed as MutationIntentDestinationBindingRecord;
   }
 
-  private async snapshotCandidatePayload(candidate: ExternalMutationCandidateRecord): Promise<void> {
+  private async snapshotCandidatePayload(candidate: CurrentExternalMutationCandidateRecord): Promise<void> {
     try {
-      const copied = await this.runtime.serverSideCopy.copyObject(candidate.provider_path, candidate.immutable_payload_path);
+      const copied = await this.runtime.serverSideCopy.copyObject(candidate.provider.path, candidate.immutable_payload_path);
       assertPayloadMetadata(candidate, copied);
     } catch (error) {
       if (!(error instanceof ProviderConflictError)) throw error;
@@ -384,7 +398,7 @@ export class MutationGateRepository {
     }
   }
 
-  private async verifyCandidatePayload(candidate: ExternalMutationCandidateRecord): Promise<void> {
+  private async verifyCandidatePayload(candidate: CurrentExternalMutationCandidateRecord): Promise<void> {
     const metadata = await this.runtime.objects.getMetadata(candidate.immutable_payload_path);
     if (!metadata) {
       throw new MutationCandidateEvidenceConflictError(candidate.candidate_id);
@@ -431,23 +445,27 @@ function validateSourceMetadata(visiblePath: string, metadata: ProviderObjectMet
   requireDropboxV1Evidence(metadata);
 }
 
-function assertPayloadMetadata(candidate: ExternalMutationCandidateRecord, metadata: ProviderObjectMetadata): void {
+function assertPayloadMetadata(candidate: CurrentExternalMutationCandidateRecord, metadata: ProviderObjectMetadata): void {
   const evidence = requireDropboxV1Evidence(metadata);
-  if (evidence.content_hash !== candidate.provider_content_hash || evidence.size !== candidate.size) {
+  if (
+    candidate.provider.provider_id !== "dropbox"
+    || candidate.provider.integrity_hash.algorithm !== "dropbox-content-hash"
+    || evidence.content_hash !== candidate.provider.integrity_hash.value
+    || evidence.size !== candidate.provider.size
+  ) {
     throw new MutationCandidateEvidenceConflictError(candidate.candidate_id);
   }
 }
 
-function sameCandidateEvidence(left: ExternalMutationCandidateRecord, right: ExternalMutationCandidateRecord): boolean {
-  return left.schema_version === right.schema_version
-    && left.candidate_id === right.candidate_id
+function sameCandidateEvidence(
+  left: CurrentExternalMutationCandidateRecord,
+  right: CurrentExternalMutationCandidateRecord
+): boolean {
+  return left.candidate_id === right.candidate_id
     && left.project_id === right.project_id
     && left.source === right.source
-    && left.provider_path === right.provider_path
-    && left.provider_file_id === right.provider_file_id
-    && left.provider_rev === right.provider_rev
-    && left.provider_content_hash === right.provider_content_hash
-    && left.size === right.size
+    && left.detection_source === right.detection_source
+    && sameJson(left.provider, right.provider)
     && left.immutable_payload_path === right.immutable_payload_path;
 }
 

@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { createExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Env } from "../src/env";
-import worker from "../src/index-neutral";
+import worker from "../src/index-mutation-gate";
 
 const testEnv = env as unknown as Env;
 const gitSha = "a".repeat(40);

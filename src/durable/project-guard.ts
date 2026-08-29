@@ -10,12 +10,14 @@ export class ProjectGuard extends NeutralProjectGuard {
     const writerStage = resolveSchemaWriterStageForProject(
       env.PROJECT_OS_SCHEMA_WRITER_STAGE,
       env.PROJECT_OS_SCHEMA_CANARY_PROJECT_ID,
-      projectId
+      projectId,
+      env.PROJECT_OS_SCHEMA_CORE_V2_FLOOR_PROJECT_IDS
     );
     super(ctx, {
       ...env,
       PROJECT_OS_SCHEMA_WRITER_STAGE: writerStage,
-      PROJECT_OS_SCHEMA_CANARY_PROJECT_ID: undefined
+      PROJECT_OS_SCHEMA_CANARY_PROJECT_ID: undefined,
+      PROJECT_OS_SCHEMA_CORE_V2_FLOOR_PROJECT_IDS: undefined
     });
   }
 }

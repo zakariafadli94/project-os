@@ -22,7 +22,8 @@ export function createProductionPersistence(
   const writerStage = resolveSchemaWriterStageForProject(
     env.PROJECT_OS_SCHEMA_WRITER_STAGE,
     env.PROJECT_OS_SCHEMA_CANARY_PROJECT_ID,
-    projectId
+    projectId,
+    env.PROJECT_OS_SCHEMA_CORE_V2_FLOOR_PROJECT_IDS
   );
   return withSchemaRuntimePolicy(runtime, writerStage);
 }

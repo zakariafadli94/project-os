@@ -7,7 +7,7 @@ import { parseTransaction, type Transaction } from "../src/domain/transaction";
 import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
 import { sha256Text } from "../src/materialization/hash";
 import { planProjection, type ProjectionPlan } from "../src/materialization/planner";
-import { WorkspaceProjectionWriter } from "../src/materialization/writer";
+import { MaterializationOutputConflictError, WorkspaceProjectionWriter } from "../src/materialization/writer";
 import type { ObjectPersistence, ProviderEntry, ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { MANAGED_NOTICE } from "../src/render/shared";
 
@@ -119,8 +119,7 @@ describe("human deliverables view", () => {
 
     const plan = await planProjection(record, baseline, 2);
     expect(plan.removed_outputs).toContain("deliverable:DEL-HUMAN3901");
-    expect((plan as ProjectionPlan & { removed_output_evidence?: Map<string, ProjectionOutputEvidence> }).removed_output_evidence?.get("deliverable:DEL-HUMAN3901"))
-      .toEqual(legacyEvidence);
+    expect(plan.removed_output_evidence?.get("deliverable:DEL-HUMAN3901")).toEqual(legacyEvidence);
   });
 
   it("deletes a removed projection only when current bytes still match completed evidence", async () => {
@@ -134,7 +133,7 @@ describe("human deliverables view", () => {
       source_revision: 3
     };
     objects.files.set("/workspace/DELIVERABLES/DEL-HUMAN3901.md", legacyContent);
-    const plan = {
+    const plan: ProjectionPlan = {
       project_id: "PRJ-3901",
       target_revision: 4,
       projection_version: 2,
@@ -145,11 +144,48 @@ describe("human deliverables view", () => {
       removed_outputs: ["deliverable:DEL-HUMAN3901"],
       removed_output_evidence: new Map([["deliverable:DEL-HUMAN3901", legacyEvidence]]),
       expected_output_keys: []
-    } as ProjectionPlan & { removed_output_evidence: Map<string, ProjectionOutputEvidence> };
+    };
 
     await writer.materialize(plan, { workspaceRoot: "/workspace" });
 
     expect(objects.deleted).toEqual(["/workspace/DELIVERABLES/DEL-HUMAN3901.md"]);
     expect(objects.files.has("/workspace/DELIVERABLES/DEL-HUMAN3901.md")).toBe(false);
+  });
+
+  it("preserves and fails closed when an obsolete projection changed since completed evidence", async () => {
+    const objects = new MemoryObjects();
+    const writer = new WorkspaceProjectionWriter(objects, 1);
+    const baselineContent = `${MANAGED_NOTICE}\n# old registry card\n`;
+    const divergentContent = `${MANAGED_NOTICE}\n# manually changed registry card\n`;
+    const legacyEvidence: ProjectionOutputEvidence = {
+      relative_path: "DELIVERABLES/DEL-HUMAN3901.md",
+      input_hash: await sha256Text("legacy-input"),
+      content_hash: await sha256Text(baselineContent),
+      source_revision: 3
+    };
+    const path = "/workspace/DELIVERABLES/DEL-HUMAN3901.md";
+    objects.files.set(path, divergentContent);
+    const preserved: string[] = [];
+    const plan: ProjectionPlan = {
+      project_id: "PRJ-3901",
+      target_revision: 4,
+      projection_version: 2,
+      source_transaction_id: "TXN-DELIVVIEW-DIVERGED",
+      source_event_id: "EVT-000004",
+      changed_outputs: new Map(),
+      carried_forward: new Map(),
+      removed_outputs: ["deliverable:DEL-HUMAN3901"],
+      removed_output_evidence: new Map([["deliverable:DEL-HUMAN3901", legacyEvidence]]),
+      expected_output_keys: []
+    };
+
+    await expect(writer.materialize(plan, {
+      workspaceRoot: "/workspace",
+      onUnexpectedContent: (entry) => preserved.push(entry.currentContent)
+    })).rejects.toBeInstanceOf(MaterializationOutputConflictError);
+
+    expect(objects.deleted).toEqual([]);
+    expect(objects.files.get(path)).toBe(divergentContent);
+    expect(preserved).toEqual([divergentContent]);
   });
 });

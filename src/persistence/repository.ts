@@ -1,8 +1,9 @@
 export * from "./repository-core";
 
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
-import type { CanonicalCommitRecord } from "../domain/commit-record";
+import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../domain/commit-record";
 import type { ProjectState } from "../domain/project-state";
+import type { Receipt } from "../domain/receipt";
 import { ArtifactMutationIntentService } from "../mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../mutation-gate/repository";
 import {
@@ -11,9 +12,23 @@ import {
   type MutationGateMode
 } from "../mutation-gate/service";
 import { LegacyArtifactDocumentWriter } from "../documents/legacy-artifact";
+import { encodeManifest } from "../schema/manifest";
+import { encodeProjectState, readProjectState as readProjectStateRecord } from "../schema/project-state";
+import { readReceipt as readReceiptRecord } from "../schema/receipt";
+import { schemaWriterStageFor } from "../schema/runtime-policy";
+import type { SchemaWriterStage } from "../schema/writer-stage";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
-import { workspaceManagedZoneRoot, type LayoutMode } from "./layout";
+import {
+  machineCommitRecordPath,
+  machineManifestPath,
+  machineReceiptPath,
+  machineStatePath,
+  workspaceManagedZoneRoot,
+  type LayoutMode
+} from "./layout";
+import { receiptPath } from "./paths";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
+import { ProviderConflictError } from "./provider/errors";
 import {
   asProjectOsPersistence,
   type PersistenceInput
@@ -28,18 +43,77 @@ export class ProjectRepository extends CoreProjectRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;
+  private readonly requestedSchemaWriterStage?: SchemaWriterStage;
 
   constructor(
     input: PersistenceInput,
     private readonly repositoryMode: LayoutMode = "legacy",
-    mutationGateMode: MutationGateMode = "observe"
+    mutationGateMode: MutationGateMode = "observe",
+    schemaWriterStage?: SchemaWriterStage
   ) {
     const runtime = asProjectOsPersistence(input);
     super(runtime, repositoryMode);
     this.runtime = runtime;
-    const mutationRepository = new MutationGateRepository(runtime);
+    this.requestedSchemaWriterStage = schemaWriterStage;
+    const writerStage = this.writerStage();
+    const mutationRepository = new MutationGateRepository(runtime, writerStage);
     this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
-    this.mutationGate = new MutationGateService(runtime, mutationGateMode);
+    this.mutationGate = new MutationGateService(runtime, mutationGateMode, writerStage);
+  }
+
+  override async readProjectState(projectId: string): Promise<ProjectState | null> {
+    if (this.repositoryMode === "legacy") return null;
+    const raw = await this.runtime.objects.readText(machineStatePath(projectId));
+    if (raw === null) return null;
+    const state = readProjectStateRecord(JSON.parse(raw)).state;
+    if (state.project_id !== projectId) {
+      throw new Error(`Canonical project state binding mismatch: expected ${projectId}, got ${state.project_id}`);
+    }
+    return state;
+  }
+
+  override async readReceipt(transactionId: string): Promise<Receipt | null> {
+    const path = this.repositoryMode === "v2"
+      ? machineReceiptPath(transactionId)
+      : receiptPath(transactionId);
+    const raw = await this.runtime.objects.readText(path);
+    if (raw === null) return null;
+    const receipt = readReceiptRecord(JSON.parse(raw));
+    if (receipt.transaction_id !== transactionId) {
+      throw new Error(`Canonical receipt binding mismatch: expected ${transactionId}, got ${receipt.transaction_id}`);
+    }
+    return receipt;
+  }
+
+  override async writeCommitRecord(record: CanonicalCommitRecord): Promise<void> {
+    if (this.repositoryMode !== "v2") throw new Error("Canonical commit records require V2 layout mode");
+    const validated = parseCanonicalCommitRecord(record);
+    const durableRecord = {
+      ...validated,
+      state: encodeProjectState(validated.state, this.writerStage())
+    };
+    // Reparse before publication so the envelope and nested family binding are
+    // proven together while preserving the 1.0 commit envelope.
+    parseCanonicalCommitRecord(durableRecord);
+    const path = machineCommitRecordPath(validated.project_id, validated.new_revision);
+    const content = pretty(durableRecord);
+    try {
+      await this.runtime.objects.createText(path, content);
+    } catch (error) {
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.readText(path);
+      if (existing !== content) {
+        throw new Error(`Immutable persistence path conflict with different content: ${path}`);
+      }
+    }
+  }
+
+  override async writeMachineSnapshot(state: ProjectState): Promise<void> {
+    const writerStage = this.writerStage();
+    const encodedState = encodeProjectState(state, writerStage);
+    const encodedManifest = encodeManifest(state, writerStage);
+    await this.runtime.objects.upsertText(machineStatePath(state.project_id), pretty(encodedState));
+    await this.runtime.objects.upsertText(machineManifestPath(state.project_id), pretty(encodedManifest));
   }
 
   override async materializeCanonicalDerivatives(
@@ -94,6 +168,10 @@ export class ProjectRepository extends CoreProjectRepository {
     if (managed !== null) return managed;
     return super.writeArtifact(replayState, request);
   }
+
+  private writerStage(): SchemaWriterStage {
+    return schemaWriterStageFor(this.runtime, this.requestedSchemaWriterStage);
+  }
 }
 
 function stateForPreparedDestination(
@@ -126,4 +204,8 @@ function sameDestination(left: ResolvedArtifactDestination, right: ResolvedArtif
     && left.route?.source_prefix === right.route?.source_prefix
     && left.route?.target_prefix === right.route?.target_prefix
     && left.route?.archive_prefix === right.route?.archive_prefix;
+}
+
+function pretty(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
 }

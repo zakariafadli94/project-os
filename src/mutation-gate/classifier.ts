@@ -1,5 +1,4 @@
 import { documentIdFor, type ManagedProviderObservation } from "../domain/managed-document";
-import type { MutationIntentRecord } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import { DocumentLedgerRepository } from "../documents/repository";
 import { sha256Text } from "../documents/hash";
@@ -15,6 +14,7 @@ import {
   asProjectOsPersistence,
   type PersistenceInput
 } from "../persistence/provider/runtime";
+import type { CurrentMutationIntentRecord } from "../schema/mutation-gate";
 import { MutationGateRepository } from "./repository";
 
 export type MutationGateClassification =
@@ -75,7 +75,8 @@ export class MutationGateClassifier {
       if (visible !== null) {
         const contentSha256 = await sha256Text(visible);
         const exact = intents.find((intent) =>
-          intent.expected_content_sha256 === contentSha256 && intentExplainsProviderChange(intent, metadata)
+          intent.expected_content_sha256 === contentSha256
+          && intentExplainsProviderChange(intent, metadata, this.runtime.providerId)
         );
         if (exact) return { kind: "governed_inflight", requestId: exact.request_id };
       }
@@ -85,13 +86,29 @@ export class MutationGateClassifier {
   }
 }
 
-function intentExplainsProviderChange(intent: MutationIntentRecord, metadata: ProviderObjectMetadata): boolean {
-  if (intent.provider_precondition.kind === "absent") return true;
-  const evidence = requireDropboxV1Evidence(metadata);
-  return evidence.file_id !== intent.provider_precondition.file_id
-    || evidence.rev !== intent.provider_precondition.rev
-    || evidence.content_hash !== intent.provider_precondition.content_hash
-    || evidence.size !== intent.provider_precondition.size;
+function intentExplainsProviderChange(
+  intent: CurrentMutationIntentRecord,
+  metadata: ProviderObjectMetadata,
+  providerId: string
+): boolean {
+  const precondition = intent.provider_precondition;
+  if (precondition.provider_id !== providerId) return false;
+  if (precondition.kind === "absent") return true;
+
+  if (providerId === "dropbox") {
+    const evidence = requireDropboxV1Evidence(metadata);
+    return evidence.file_id !== precondition.object_id
+      || evidence.rev !== precondition.revision_token
+      || evidence.content_hash !== precondition.integrity_hash.value
+      || precondition.integrity_hash.algorithm !== "dropbox-content-hash"
+      || evidence.size !== precondition.size;
+  }
+
+  return metadata.objectId !== precondition.object_id
+    || metadata.revisionToken !== precondition.revision_token
+    || metadata.integrityHash?.algorithm !== precondition.integrity_hash.algorithm
+    || metadata.integrityHash?.value !== precondition.integrity_hash.value
+    || metadata.size !== precondition.size;
 }
 
 function strictZone(

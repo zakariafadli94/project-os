@@ -73,6 +73,11 @@ const identity = (state: ProjectState) => ({
   name: state.name
 });
 
+const semanticProjectState = (state: ProjectState) => {
+  const { schema_version: _durableSchemaVersion, ...semantic } = state;
+  return semantic;
+};
+
 const briefInput = (state: ProjectState) => ({
   ...identity(state),
   objective: state.objective,
@@ -227,12 +232,13 @@ function globalDescriptors(state: ProjectState, targetRevision: number, projecti
     });
   }
 
+  const semanticState = semanticProjectState(state);
   descriptors.push(
     {
       key: "global:STATE",
       relative_path: GLOBAL_PATHS.STATE,
       critical: true,
-      semantic_input: { target_revision: targetRevision, state },
+      semantic_input: { target_revision: targetRevision, state: semanticState },
       render: () => renderState(state),
       entity: false
     },
@@ -241,8 +247,8 @@ function globalDescriptors(state: ProjectState, targetRevision: number, projecti
       relative_path: GLOBAL_PATHS.HANDOFF,
       critical: true,
       semantic_input: projectionVersion >= 2
-        ? { target_revision: targetRevision, state, operating_contract_version: OPERATING_CONTRACT_VERSION }
-        : { target_revision: targetRevision, state },
+        ? { target_revision: targetRevision, state: semanticState, operating_contract_version: OPERATING_CONTRACT_VERSION }
+        : { target_revision: targetRevision, state: semanticState },
       render: () => projectionVersion >= 2 ? renderHandoff(state) : renderLegacyHandoff(state),
       entity: false
     }

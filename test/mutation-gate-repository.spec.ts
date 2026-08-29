@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DropboxConflictError, type DropboxEntry, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import type { ExternalMutationResolutionRecord, MutationIntentRecord } from "../src/domain/mutation-gate";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
+import { readMutationIntentRecord } from "../src/schema/mutation-gate";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeMutationGateDropbox implements DropboxTransport {
@@ -97,6 +98,10 @@ function intent(overrides: Partial<MutationIntentRecord> = {}): MutationIntentRe
   };
 }
 
+function currentIntent(overrides: Partial<MutationIntentRecord> = {}) {
+  return readMutationIntentRecord(intent(overrides)).record;
+}
+
 function resolution(candidateId: string, action: ExternalMutationResolutionRecord["action"], resolutionId: string): ExternalMutationResolutionRecord {
   return {
     schema_version: "1.0",
@@ -153,17 +158,44 @@ describe("MutationGateRepository", () => {
     expect(transport.calls.filter((call) => call.kind === "copy" && call.path === first.record.immutable_payload_path)).toHaveLength(1);
   });
 
+  it("treats baseline-to-incremental rediscovery as the same immutable candidate evidence", async () => {
+    const transport = new FakeMutationGateDropbox();
+    const visible = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/DELIVERABLES/direct.md";
+    const metadata = await transport.seed(visible, "direct bytes", "id:direct");
+    const repo = new MutationGateRepository(persistenceFromDropbox(transport));
+
+    const first = await repo.captureCandidate({
+      projectId: "PRJ-0002",
+      detectionSource: "baseline",
+      visiblePath: visible,
+      metadata,
+      detectedAt: "2026-08-25T16:10:00+01:00"
+    });
+    const replay = await repo.captureCandidate({
+      projectId: "PRJ-0002",
+      detectionSource: "incremental",
+      visiblePath: visible,
+      metadata,
+      detectedAt: "2026-08-25T16:20:00+01:00"
+    });
+
+    expect(replay.created).toBe(false);
+    expect(replay.record.candidate_id).toBe(first.record.candidate_id);
+    expect(replay.record.detection_source).toBe("baseline");
+    expect(transport.calls.filter((call) => call.kind === "copy" && call.path === first.record.immutable_payload_path)).toHaveLength(1);
+  });
+
   it("keeps artifact intent immutable and indexes it by exact destination", async () => {
     const transport = new FakeMutationGateDropbox();
     const repo = new MutationGateRepository(persistenceFromDropbox(transport));
-    const original = intent();
+    const original = currentIntent();
 
     expect(await repo.ensureArtifactIntent(original)).toEqual(original);
     expect(await repo.ensureArtifactIntent(original)).toEqual(original);
     expect(await repo.listArtifactIntentsForDestination(original.project_id, original.destination_path)).toEqual([original]);
     expect(await repo.listArtifactIntentsForDestination(original.project_id, `${original.destination_path}.other`)).toEqual([]);
 
-    await expect(repo.ensureArtifactIntent(intent({ destination_path: `${original.destination_path}.moved` })))
+    await expect(repo.ensureArtifactIntent(currentIntent({ destination_path: `${original.destination_path}.moved` })))
       .rejects.toThrow(/intent conflict/i);
   });
 

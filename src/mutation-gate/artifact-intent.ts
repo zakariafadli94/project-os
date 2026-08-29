@@ -1,9 +1,5 @@
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
-import {
-  mutationIntentIdFor,
-  type MutationIntentRecord,
-  type MutationProviderPrecondition
-} from "../domain/mutation-gate";
+import { mutationIntentIdFor } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import {
   resolveArtifactDestination,
@@ -15,11 +11,15 @@ import {
   asProjectOsPersistence,
   type PersistenceInput
 } from "../persistence/provider/runtime";
+import type {
+  CurrentMutationIntentRecord,
+  CurrentMutationProviderPrecondition
+} from "../schema/mutation-gate";
 import { sha256Text } from "../documents/hash";
 import { MutationGateRepository, MutationIntentConflictError } from "./repository";
 
 export interface PreparedArtifactMutation {
-  intent: MutationIntentRecord;
+  intent: CurrentMutationIntentRecord;
   destination: ResolvedArtifactDestination;
 }
 
@@ -54,7 +54,7 @@ export class ArtifactMutationIntentService {
 
     const destination = resolveArtifactDestination(state, request.relative_path);
     const providerPrecondition = await this.providerPrecondition(destination.path);
-    const intent: MutationIntentRecord = {
+    const intent: CurrentMutationIntentRecord = {
       schema_version: "1.0",
       intent_id: await mutationIntentIdFor(request.project_id, request.request_id),
       project_id: request.project_id,
@@ -87,21 +87,37 @@ export class ArtifactMutationIntentService {
     return { intent: persisted, destination: destinationFromIntent(persisted) };
   }
 
-  private async providerPrecondition(path: string): Promise<MutationProviderPrecondition> {
+  private async providerPrecondition(path: string): Promise<CurrentMutationProviderPrecondition> {
     const metadata = await this.runtime.objects.getMetadata(path);
-    if (!metadata) return { kind: "absent" };
-    const evidence = requireDropboxV1Evidence(metadata);
+    if (!metadata) return { kind: "absent", provider_id: this.runtime.providerId };
+
+    if (this.runtime.providerId === "dropbox") {
+      const evidence = requireDropboxV1Evidence(metadata);
+      return {
+        kind: "existing",
+        provider_id: "dropbox",
+        object_id: evidence.file_id,
+        revision_token: evidence.rev,
+        integrity_hash: { algorithm: "dropbox-content-hash", value: evidence.content_hash },
+        size: evidence.size
+      };
+    }
+
+    if (!metadata.objectId || !metadata.revisionToken || !metadata.integrityHash) {
+      throw new Error(`Provider ${this.runtime.providerId} did not supply complete mutation precondition evidence`);
+    }
     return {
       kind: "existing",
-      file_id: evidence.file_id,
-      rev: evidence.rev,
-      content_hash: evidence.content_hash,
-      size: evidence.size
+      provider_id: this.runtime.providerId,
+      object_id: metadata.objectId,
+      revision_token: metadata.revisionToken,
+      integrity_hash: metadata.integrityHash,
+      size: metadata.size
     };
   }
 }
 
-export function destinationFromIntent(intent: MutationIntentRecord): ResolvedArtifactDestination {
+export function destinationFromIntent(intent: CurrentMutationIntentRecord): ResolvedArtifactDestination {
   return {
     path: intent.destination_path,
     ...(intent.archive_path ? { archive_path: intent.archive_path } : {}),

@@ -1,3 +1,4 @@
+import { deploymentIdentity } from "../deployment/identity";
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
 import {
   parseMutationCandidateResolutionRequest,
@@ -6,7 +7,12 @@ import {
 } from "../domain/mutation-candidate-resolution";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
+import { AUTO_PROJECT_ID } from "../domain/transaction";
 import type { Env } from "../env";
+import {
+  machineDocumentRoot,
+  machineMutationGateRoot
+} from "../persistence/layout";
 import { ProviderOperationError } from "../persistence/provider/errors";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
 import {
@@ -18,6 +24,16 @@ import {
   MutationGateService,
   parseMutationGateMode
 } from "../mutation-gate/service";
+import {
+  configureSchemaEvidenceObserver,
+  schemaWriterStageFor
+} from "../schema/runtime-policy";
+import {
+  initializeSchemaRolloutStorage,
+  SchemaRolloutState,
+  schemaDiagnostic
+} from "../schema/rollout";
+import type { SchemaWriterStage } from "../schema/writer-stage";
 import { ProjectGuard as BaseProjectGuard } from "./project-guard";
 
 interface StateRow {
@@ -46,11 +62,30 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
   private readonly boundProjectId: string;
   private readonly resolutionService: MutationCandidateResolutionService;
   private readonly resolutionRepository: ProjectRepository;
+  private readonly schemaRollout: SchemaRolloutState;
+  private readonly schemaWriterStage: SchemaWriterStage;
+  private readonly schemaDeploymentIdentity: string;
   private outerQueue: Promise<void> = Promise.resolve();
+  private schemaFrontierReconciled = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.boundProjectId = this.ctx.id.name ?? "";
+    this.schemaDeploymentIdentity = formatSchemaDeploymentIdentity(env);
+    this.schemaWriterStage = schemaWriterStageFor(this.persistence);
+    initializeSchemaRolloutStorage(this.ctx.storage);
+    this.schemaRollout = new SchemaRolloutState(this.ctx.storage);
+    this.assertSchemaWriterStage("rollout_frontier", null);
+    configureSchemaEvidenceObserver(this.persistence, (stage) => {
+      // Evidence is durable reality. Record it first so even a rejected old
+      // binary restart cannot forget the rollback frontier it just observed.
+      this.schemaRollout.noteDurableWrite(stage);
+      this.assertSchemaWriterStage(
+        stage === "core_v2" ? "ProjectState" : "ProviderEvidence",
+        "2.0"
+      );
+    });
+
     this.gateMode = parseMutationGateMode(env.PROJECT_OS_MUTATION_GATE_MODE);
     this.gate = new MutationGateService(this.persistence, this.gateMode);
     this.resolutionService = new MutationCandidateResolutionService(this.persistence);
@@ -63,6 +98,16 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/schema-status") {
+      const rollout = this.schemaRollout.status();
+      return Response.json({
+        project_id: this.boundProjectId || null,
+        active_writer_stage: this.schemaWriterStage,
+        frontier: rollout.frontier,
+        storage_version: rollout.storage_version
+      });
+    }
 
     if (request.method === "GET" && url.pathname === "/mutation-candidates") {
       if (!this.boundProjectId) return Response.json({ error: "project_not_initialized" }, { status: 404 });
@@ -236,6 +281,114 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
     );
   }
 
+  private assertSchemaWriterStage(family: string, encounteredVersion: string | null): void {
+    try {
+      this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
+    } catch (error) {
+      let frontier: SchemaWriterStage = "v1_only";
+      let failureClass = "writer_stage_regression";
+      try {
+        frontier = this.schemaRollout.status().frontier;
+      } catch {
+        failureClass = "rollout_storage_version";
+      }
+      console.error(
+        "Project OS schema compatibility failure",
+        schemaDiagnostic({
+          projectId: this.boundProjectId || null,
+          family,
+          encounteredVersion,
+          semanticVersion: "2.0",
+          canonicalRevision: this.localResolutionState()?.revision ?? null,
+          deploymentIdentity: this.schemaDeploymentIdentity,
+          failureClass,
+          writerStage: this.schemaWriterStage,
+          frontier
+        })
+      );
+      throw error;
+    }
+  }
+
+  private async reconcileSchemaFrontierForMutation(): Promise<void> {
+    if (this.schemaFrontierReconciled || !this.boundProjectId) return;
+    if (this.boundProjectId === AUTO_PROJECT_ID) {
+      // The allocation sentinel is not a real project identity. Let the base
+      // guard reject it through the existing transaction validation path
+      // before any persistence path is materialized.
+      this.schemaFrontierReconciled = true;
+      return;
+    }
+
+    // provider_v2 is capable of preserving every lower frontier. It can
+    // reconstruct the local marker lazily as V2 records are naturally read or
+    // written, so no cold-start corpus scan is required at the highest stage.
+    if (this.schemaWriterStage === "provider_v2") {
+      this.schemaFrontierReconciled = true;
+      return;
+    }
+
+    // Reading canonical state recovers the core_v2 frontier and fails closed
+    // immediately if a v1_only binary encounters ProjectState 2.0.
+    await this.resolutionRepository.readProjectState(this.boundProjectId);
+
+    if (this.schemaWriterStage === "core_v2" && this.schemaRollout.status().frontier !== "provider_v2") {
+      const documentRoot = machineDocumentRoot(this.boundProjectId);
+      const mutationRoot = machineMutationGateRoot(this.boundProjectId);
+
+      // R3 can be crossed by a version write before the mutable head is
+      // published. It can also be crossed by an index write against an older
+      // V1 head. Recovery therefore checks every first-write namespace, not
+      // merely the steady-state head surface.
+      await this.observeSchemaEvidenceDirectory(`${documentRoot}/heads`);
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceNestedDirectory(`${documentRoot}/versions`);
+      }
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceDirectory(`${documentRoot}/provider-file-bindings/v2`);
+      }
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceDirectory(`${documentRoot}/reference-fingerprints/v2`);
+      }
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceDirectory(`${mutationRoot}/intents/artifacts`);
+      }
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceDirectory(`${mutationRoot}/candidates`);
+      }
+    }
+
+    this.assertSchemaWriterStage("rollout_frontier", null);
+    this.schemaFrontierReconciled = true;
+  }
+
+  private providerFrontierSeen(): boolean {
+    return this.schemaRollout.status().frontier === "provider_v2";
+  }
+
+  private async observeSchemaEvidenceDirectory(root: string): Promise<void> {
+    const entries = await this.persistence.objects.listChildren(root);
+    for (const entry of entries) {
+      if (entry.kind !== "file") continue;
+      const path = entry.path ?? `${root}/${entry.name}`;
+      await this.persistence.objects.readText(path);
+      if (this.providerFrontierSeen()) return;
+    }
+  }
+
+  private async observeSchemaEvidenceNestedDirectory(root: string): Promise<void> {
+    const entries = await this.persistence.objects.listChildren(root);
+    for (const entry of entries) {
+      if (entry.kind === "file") {
+        const path = entry.path ?? `${root}/${entry.name}`;
+        await this.persistence.objects.readText(path);
+      } else if (entry.kind === "folder") {
+        await this.observeSchemaEvidenceDirectory(entry.path ?? `${root}/${entry.name}`);
+      }
+      if (this.providerFrontierSeen()) return;
+    }
+  }
+
   private async decorateResponse(request: Request, response: Response): Promise<Response> {
     const url = new URL(request.url);
 
@@ -271,11 +424,22 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
     this.outerQueue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
+      await this.reconcileSchemaFrontierForMutation();
       return await operation();
     } finally {
       release();
     }
   }
+}
+
+function formatSchemaDeploymentIdentity(env: Env): string {
+  const identity = deploymentIdentity(env);
+  const parts = [
+    identity.git_sha ? `git:${identity.git_sha}` : null,
+    identity.worker_version_id ? `worker:${identity.worker_version_id}` : null,
+    identity.worker_version_tag ? `tag:${identity.worker_version_tag}` : null
+  ].filter((value): value is string => value !== null);
+  return parts.join("|") || "unattributed";
 }
 
 function providerUnavailableResponse(error: ProviderOperationError): Response {

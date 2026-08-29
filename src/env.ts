@@ -1,4 +1,12 @@
-export type Env = Omit<Cloudflare.Env, "PROJECT_OS_LAYOUT_MODE" | "PROJECT_OS_CONTINUITY_MODE" | "PROJECT_OS_MUTATION_GATE_MODE"> & {
+import type { SchemaWriterStage } from "./schema/writer-stage";
+
+export type Env = Omit<
+  Cloudflare.Env,
+  | "PROJECT_OS_LAYOUT_MODE"
+  | "PROJECT_OS_CONTINUITY_MODE"
+  | "PROJECT_OS_MUTATION_GATE_MODE"
+  | "PROJECT_OS_SCHEMA_WRITER_STAGE"
+> & {
   DROPBOX_APP_KEY: string;
   DROPBOX_APP_SECRET: string;
   DROPBOX_REFRESH_TOKEN: string;
@@ -7,5 +15,6 @@ export type Env = Omit<Cloudflare.Env, "PROJECT_OS_LAYOUT_MODE" | "PROJECT_OS_CO
   PROJECT_OS_LAYOUT_MODE?: "legacy" | "shadow" | "v2";
   PROJECT_OS_CONTINUITY_MODE?: "stable" | "automatic" | "rollback";
   PROJECT_OS_MUTATION_GATE_MODE?: "observe" | "enforce";
+  PROJECT_OS_SCHEMA_WRITER_STAGE?: SchemaWriterStage;
   PROJECT_OS_PROJECTION_CONCURRENCY?: string;
 };

@@ -149,10 +149,10 @@ export class MutationCandidateResolutionService {
     let downstream: CandidateResolutionDownstreamReceipt;
     if (request.operation === "candidate.adopt_artifact") {
       const destination = resolveArtifactDestination(state, request.artifact_request.relative_path);
-      if (destination.path !== candidate.provider_path) {
+      if (destination.path !== candidate.provider.path) {
         return terminal(request, "conflict", "CANDIDATE_DESTINATION_MISMATCH", "Artifact adoption destination does not match candidate provider path");
       }
-      downstream = await executors.artifact(request, state, candidate.provider_path);
+      downstream = await executors.artifact(request, state, candidate.provider.path);
     } else {
       downstream = await executors.working(request, state);
     }

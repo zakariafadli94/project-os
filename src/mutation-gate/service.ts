@@ -14,6 +14,7 @@ import {
 import { machineArtifactReceiptPath } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderChangeEntry, ProviderObjectMetadata } from "../persistence/provider/contract";
+import type { SchemaWriterStage } from "../schema/writer-stage";
 import { MutationGateClassifier } from "./classifier";
 import { MutationGateRepository } from "./repository";
 
@@ -98,11 +99,12 @@ export class MutationGateService {
 
   constructor(
     input: PersistenceInput,
-    private readonly mode: MutationGateMode = "observe"
+    private readonly mode: MutationGateMode = "observe",
+    schemaWriterStage: SchemaWriterStage = "v1_only"
   ) {
     this.runtime = asProjectOsPersistence(input);
     this.classifier = new MutationGateClassifier(this.runtime);
-    this.repository = new MutationGateRepository(this.runtime);
+    this.repository = new MutationGateRepository(this.runtime, schemaWriterStage);
   }
 
   async processChanges(
@@ -234,13 +236,13 @@ export class MutationGateService {
     const candidates = await this.repository.listCandidates(projectId);
     const result: MutationCandidateStatus[] = [];
     for (const candidate of candidates) {
-      if (filter.destinationPath && candidate.provider_path !== filter.destinationPath) continue;
+      if (filter.destinationPath && candidate.provider.path !== filter.destinationPath) continue;
       const terminal = await this.repository.readTerminalResolutionRecord(projectId, candidate.candidate_id);
       if (terminal) continue;
       result.push({
         candidate_id: candidate.candidate_id,
         project_id: candidate.project_id,
-        provider_path: candidate.provider_path,
+        provider_path: candidate.provider.path,
         detection_source: candidate.detection_source,
         detected_at: candidate.detected_at,
         gate_mode: this.mode,
@@ -265,7 +267,7 @@ export class MutationGateService {
     return {
       candidate_id: candidate.candidate_id,
       project_id: candidate.project_id,
-      provider_path: candidate.provider_path,
+      provider_path: candidate.provider.path,
       detection_source: candidate.detection_source,
       detected_at: candidate.detected_at,
       gate_mode: this.mode,

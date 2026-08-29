@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { DropboxConflictError, type DropboxEntry, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import type { ExternalMutationResolutionRecord, MutationIntentRecord } from "../src/domain/mutation-gate";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
+import { readMutationIntentRecord } from "../src/schema/mutation-gate";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeMutationGateDropbox implements DropboxTransport {
@@ -97,6 +98,10 @@ function intent(overrides: Partial<MutationIntentRecord> = {}): MutationIntentRe
   };
 }
 
+function currentIntent(overrides: Partial<MutationIntentRecord> = {}) {
+  return readMutationIntentRecord(intent(overrides)).record;
+}
+
 function resolution(candidateId: string, action: ExternalMutationResolutionRecord["action"], resolutionId: string): ExternalMutationResolutionRecord {
   return {
     schema_version: "1.0",
@@ -156,14 +161,14 @@ describe("MutationGateRepository", () => {
   it("keeps artifact intent immutable and indexes it by exact destination", async () => {
     const transport = new FakeMutationGateDropbox();
     const repo = new MutationGateRepository(persistenceFromDropbox(transport));
-    const original = intent();
+    const original = currentIntent();
 
     expect(await repo.ensureArtifactIntent(original)).toEqual(original);
     expect(await repo.ensureArtifactIntent(original)).toEqual(original);
     expect(await repo.listArtifactIntentsForDestination(original.project_id, original.destination_path)).toEqual([original]);
     expect(await repo.listArtifactIntentsForDestination(original.project_id, `${original.destination_path}.other`)).toEqual([]);
 
-    await expect(repo.ensureArtifactIntent(intent({ destination_path: `${original.destination_path}.moved` })))
+    await expect(repo.ensureArtifactIntent(currentIntent({ destination_path: `${original.destination_path}.moved` })))
       .rejects.toThrow(/intent conflict/i);
   });
 

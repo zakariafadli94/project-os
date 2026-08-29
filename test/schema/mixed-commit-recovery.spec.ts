@@ -2,7 +2,6 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CanonicalCommitRecord } from "../../src/domain/commit-record";
 import type { Env } from "../../src/env";
-import type { Receipt } from "../../src/domain/receipt";
 import { parseTransaction } from "../../src/domain/transaction";
 import { applyTransaction } from "../../src/domain/transitions";
 import { machineCommitRecordPath, machineStatePath } from "../../src/persistence/layout";
@@ -11,8 +10,8 @@ import { installDropboxMock } from "../helpers/mock-dropbox";
 const testEnv = env as unknown as Env;
 const at = "2026-08-28T17:00:00.000Z";
 
-async function submit(projectId: string, transaction: unknown): Promise<Receipt> {
-  const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
+async function submit(projectId: string, transaction: unknown): Promise<Response> {
+  return testEnv.PROJECT_GUARD.getByName(projectId).fetch(
     "https://project-guard.internal/transaction",
     {
       method: "POST",
@@ -20,8 +19,6 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
       body: JSON.stringify(transaction)
     }
   );
-  expect(response.status).toBe(200);
-  return response.json<Receipt>();
 }
 
 function committedRecord(
@@ -58,7 +55,7 @@ function committedRecord(
 describe("mixed canonical commit recovery", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("reconstructs identical business state from envelope 1.0 records crossing ProjectState V1 to V2", async () => {
+  it("fails closed when a v1_only ProjectGuard encounters durable ProjectState V2 history", async () => {
     const projectId = "PRJ-9005";
     const mock = installDropboxMock();
     const create = {
@@ -91,9 +88,12 @@ describe("mixed canonical commit recovery", () => {
     mock.files.set(machineCommitRecordPath(projectId, 2), `${JSON.stringify(rev2, null, 2)}\n`);
     expect(mock.files.has(machineStatePath(projectId))).toBe(false);
 
-    const replay = await submit(projectId, task);
+    await expect(submit(projectId, task)).rejects.toThrow(
+      /writer stage regression.*core_v2.*v1_only|durable frontier core_v2/i
+    );
 
-    expect(replay).toEqual(rev2.receipt);
+    // The old binary must not down-encode, append a new commit, or materialize
+    // a V1 snapshot after observing the core_v2 rollback frontier.
     expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
     expect(mock.files.has(machineStatePath(projectId))).toBe(false);
   });

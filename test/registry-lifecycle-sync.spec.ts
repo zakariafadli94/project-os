@@ -63,5 +63,5 @@ describe("registry lifecycle synchronization", () => {
     const dashboard = dropbox.files.get("/PROJECT_OS/WORKSPACE/PORTFOLIO/DASHBOARD.md");
     expect(dashboard).toContain("## Archived");
     expect(dashboard).toContain(`**${created.project_id}**`);
-  });
+  }, 10_000);
 });

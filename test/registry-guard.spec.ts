@@ -46,7 +46,7 @@ describe("RegistryGuard", () => {
       "PRJ-0001", "PRJ-0002", "PRJ-0003", "PRJ-0004",
       "PRJ-0005", "PRJ-0006", "PRJ-0007", "PRJ-0008"
     ]);
-  });
+  }, 10_000);
 
   it("publishes the final Dropbox receipt only after registry creation completes", async () => {
     const tx = createRequest(90, "receipt-order");

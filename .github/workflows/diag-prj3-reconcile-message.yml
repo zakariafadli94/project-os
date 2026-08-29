@@ -1,0 +1,29 @@
+name: diag-prj3-reconcile-message
+
+on:
+  push:
+    branches: [diag/prj3-reconcile-message-20260829]
+
+jobs:
+  tail:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Capture PRJ-0003 reconcile message only
+        shell: bash
+        run: |
+          set +e
+          timeout 330s npx wrangler tail --format json 2>/dev/null \
+            | jq -c '.logs[]? | select(.message[0] == "Project OS materialization reconcile failed") | select(.message[1].project_id == "PRJ-0003") | .message[1]'
+          tail_status=${PIPESTATUS[0]}
+          if [ "$tail_status" -ne 0 ] && [ "$tail_status" -ne 124 ]; then
+            exit "$tail_status"
+          fi
+          exit 0

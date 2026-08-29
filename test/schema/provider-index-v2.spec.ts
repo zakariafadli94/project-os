@@ -19,6 +19,7 @@ const projectId = "PRJ-9008";
 const documentId = "DOC-0123456789ABCDEF01234567";
 const otherDocumentId = "DOC-89ABCDEF0123456701234567";
 const versionId = "VER-REQ-AAAAAAAAAAAAAAAAAAAAAAAA";
+const secondVersionId = "VER-REQ-BBBBBBBBBBBBBBBBBBBBBBBB";
 const providerFileId = "id:AbC_123-x";
 const providerHash = "a".repeat(64);
 const providerPath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-9008/REFERENCES/UNCLASSIFIED/reference.md";
@@ -66,7 +67,7 @@ function memoryRuntime(): { runtime: ProjectOsPersistenceRuntime; files: Map<str
   return { runtime, files };
 }
 
-function rawV1Head() {
+function rawV1Head(activeVersionId = versionId, rev = "rev-a") {
   return {
     schema_version: "1.0",
     project_id: projectId,
@@ -74,12 +75,12 @@ function rawV1Head() {
     kind: "reference",
     logical_path: "reference.md",
     collection_path: "UNCLASSIFIED",
-    reference_version_id: versionId,
+    reference_version_id: activeVersionId,
     provider: {
       reference: {
         path: providerPath,
         file_id: providerFileId,
-        rev: "rev-a",
+        rev,
         content_hash: providerHash,
         size: 10
       }
@@ -88,12 +89,12 @@ function rawV1Head() {
   };
 }
 
-function rawV1Version() {
+function rawV1Version(activeVersionId = versionId, rev = "rev-a") {
   return {
     schema_version: "1.0",
     project_id: projectId,
     document_id: documentId,
-    version_id: versionId,
+    version_id: activeVersionId,
     kind: "reference",
     stage: "reference",
     logical_path: "reference.md",
@@ -103,7 +104,7 @@ function rawV1Version() {
     content_sha256: providerHash,
     provider_content_hash: providerHash,
     provider_file_id: providerFileId,
-    provider_rev: "rev-a",
+    provider_rev: rev,
     provider_path: providerPath,
     size: 10
   };
@@ -211,6 +212,51 @@ describe("provider-qualified document indexes", () => {
     }, null, 2)}\n`);
     expect(await repository.readProviderFileBinding(projectId, providerFileId)).toEqual(legacyBinding);
     expect(await repository.readReferenceFingerprint(projectId, providerHash)).toEqual(legacyFingerprint);
+  });
+
+  it("rebinds stale V1 reference evidence into synchronized V1/V2 current indexes", async () => {
+    const { runtime, files } = memoryRuntime();
+    const legacyRepository = new DocumentLedgerRepository(runtime, "v1_only");
+    const v2Repository = new DocumentLedgerRepository(runtime, "provider_v2");
+
+    files.set(machineDocumentHeadPath(projectId, documentId), `${JSON.stringify(rawV1Head(), null, 2)}\n`);
+    files.set(machineDocumentVersionPath(projectId, documentId, versionId), `${JSON.stringify(rawV1Version(), null, 2)}\n`);
+    await legacyRepository.writeReferenceFingerprint({
+      schema_version: "1.0",
+      project_id: projectId,
+      provider_content_hash: providerHash,
+      document_id: documentId,
+      version_id: versionId
+    });
+
+    files.set(machineDocumentVersionPath(projectId, documentId, secondVersionId), `${JSON.stringify(rawV1Version(secondVersionId, "rev-b"), null, 2)}\n`);
+    files.set(machineDocumentHeadPath(projectId, documentId), `${JSON.stringify(rawV1Head(secondVersionId, "rev-b"), null, 2)}\n`);
+
+    await v2Repository.writeReferenceFingerprint({
+      schema_version: "1.0",
+      project_id: projectId,
+      provider_content_hash: providerHash,
+      document_id: documentId,
+      version_id: secondVersionId
+    });
+
+    const expectedCurrent = {
+      schema_version: "1.0",
+      project_id: projectId,
+      provider_content_hash: providerHash,
+      document_id: documentId,
+      version_id: secondVersionId
+    };
+    expect(JSON.parse(files.get(legacyFingerprintPath()) ?? "null")).toEqual(expectedCurrent);
+    expect(JSON.parse(files.get(await referenceFingerprintV2Path(projectId, "dropbox", "dropbox-content-hash", providerHash)) ?? "null")).toEqual({
+      schema_version: "2.0",
+      project_id: projectId,
+      provider_id: "dropbox",
+      integrity_hash: { algorithm: "dropbox-content-hash", value: providerHash },
+      document_id: documentId,
+      version_id: secondVersionId
+    });
+    expect(await v2Repository.readReferenceFingerprint(projectId, providerHash)).toEqual(expectedCurrent);
   });
 
   it("fails closed when V1 and V2 evidence contradict each other", async () => {

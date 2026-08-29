@@ -17,6 +17,10 @@ const requireText = (text, needle, label = needle) => {
 const forbid = (text, pattern, label) => {
   if (pattern.test(text)) throw new Error(`Production promotion authority must not contain ${label}`);
 };
+const directPromotionLines = (text) => text
+  .split(/\r?\n/)
+  .filter((line) => /\bnpm\s+run\s+deploy\b|\bwrangler\s+deploy\b|\bwrangler\s+rollback\b|\bwrangler\s+versions\s+deploy\b/.test(line))
+  .filter((line) => !/\bwrangler\s+deploy\b.*--dry-run\b/.test(line));
 
 // GitHub deploy.yml is the sole positive-traffic production promoter.
 requireText(deploy, "branches: [main]", "main-only automatic production trigger");
@@ -49,14 +53,18 @@ requireText(disableBuilds, "--request DELETE", "Workers Builds trigger deletion"
 requireText(disableBuilds, "/builds/triggers/$trigger_id", "trigger-specific deletion endpoint");
 requireText(disableBuilds, "body.result.length !== 0", "zero-trigger verification");
 requireText(disableBuilds, "/actions/workflows/deploy.yml/dispatches", "authoritative promoter republish request");
-forbid(disableBuilds, /\bnpm\s+run\s+deploy\b|\bwrangler\s+deploy\b|\bwrangler\s+rollback\b|\bwrangler\s+versions\s+deploy\b/, "direct Worker promotion from R0 cutover workflow");
+if (directPromotionLines(disableBuilds).length > 0) {
+  throw new Error("Production promotion authority must not contain direct Worker promotion from R0 cutover workflow");
+}
 
-// No third workflow may mutate Worker production deployment state.
+// No third workflow may mutate Worker production deployment state. A Wrangler
+// dry-run in CI is explicitly non-promoting and remains allowed.
 for (const name of readdirSync(workflowsDir).filter((entry) => /\.ya?ml$/.test(entry))) {
   if (name === "deploy.yml" || name === "mutation-candidate-reject.yml" || name === "r0-disable-cloudflare-workers-builds.yml") continue;
   const content = readFileSync(join(workflowsDir, name), "utf8");
-  if (/\bnpm\s+run\s+deploy\b|\bwrangler\s+deploy\b|\bwrangler\s+rollback\b|\bwrangler\s+versions\s+deploy\b/.test(content)) {
-    throw new Error(`Workflow ${name} contains an unauthorized production deployment command`);
+  const offenders = directPromotionLines(content);
+  if (offenders.length > 0) {
+    throw new Error(`Workflow ${name} contains an unauthorized production deployment command: ${offenders[0].trim()}`);
   }
 }
 

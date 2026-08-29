@@ -15,6 +15,26 @@ Lifecycle:
 
 Before material work, resolve the project by exact ID, exact canonical name, exact alias, then unambiguous context. If multiple real projects remain plausible, ask one concise clarification. Never silently switch the bound project.
 
+A `PROJECT_SESSION` MUST NOT change its primary project unless the user explicitly asks to switch. Mentioning another project is context, not authorization to rebind. Elliptical acknowledgements such as `vas-y`, `ok`, `fais-le`, `continue`, `go ahead`, or `do it` MUST inherit the current project binding and MUST NOT authorize a project switch.
+
+### Cross-project referral without rebinding
+
+When the user asks to deposit, send, route, pass, or report information to another project, the conversation MUST remain bound to its current primary project unless the user separately and explicitly asks to switch.
+
+Project OS SHOULD route a compact referral to the target project's `INPUTS/` using only the target identity/path information required for delivery. It MUST NOT load the target project's `HANDOFF.md`, `STATE.md`, plan, decisions, research, or other business context merely to deliver the referral.
+
+A referral SHOULD preserve enough provenance to understand the transfer, including when relevant:
+- source project ID;
+- target project ID;
+- referral type such as anomaly, dependency, research, information, decision request, or deliverable reference;
+- concise title and body;
+- detection/creation timestamp;
+- source references or evidence.
+
+A routed input is evidence or a request to be instructed by the target project. It MUST NOT automatically become a target-project task, decision, accepted research record, constraint, deliverable, or other canonical truth. Those durable facts require the normal target-project workflow later.
+
+Delivery to another project's `INPUTS/` is therefore communication, not rebinding and not acceptance.
+
 ## 3. Context loading
 
 When state matters, refresh current project state before reasoning from it. Human reading order:
@@ -122,6 +142,8 @@ Before material mutation, check:
 - Am I putting micro-tasks in Roadmap?
 - Am I erasing history?
 - Am I treating a draft deliverable as accepted?
+- Am I changing the bound project without an explicit user request?
+- Am I loading another project's business context when a referral to its INPUTS/ would suffice?
 - Could a fresh LLM understand this without the chat?
 
 If any answer signals drift, correct structure first.

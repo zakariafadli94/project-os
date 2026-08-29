@@ -3,6 +3,7 @@ export * from "./repository-core";
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import type { ProjectState } from "../domain/project-state";
+import type { Receipt } from "../domain/receipt";
 import { ArtifactMutationIntentService } from "../mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../mutation-gate/repository";
 import {
@@ -11,8 +12,19 @@ import {
   type MutationGateMode
 } from "../mutation-gate/service";
 import { LegacyArtifactDocumentWriter } from "../documents/legacy-artifact";
+import { encodeManifest } from "../schema/manifest";
+import { encodeProjectState, readProjectState as readProjectStateRecord } from "../schema/project-state";
+import { readReceipt as readReceiptRecord } from "../schema/receipt";
+import type { SchemaWriterStage } from "../schema/writer-stage";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
-import { workspaceManagedZoneRoot, type LayoutMode } from "./layout";
+import {
+  machineManifestPath,
+  machineReceiptPath,
+  machineStatePath,
+  workspaceManagedZoneRoot,
+  type LayoutMode
+} from "./layout";
+import { receiptPath } from "./paths";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
 import {
   asProjectOsPersistence,
@@ -32,7 +44,8 @@ export class ProjectRepository extends CoreProjectRepository {
   constructor(
     input: PersistenceInput,
     private readonly repositoryMode: LayoutMode = "legacy",
-    mutationGateMode: MutationGateMode = "observe"
+    mutationGateMode: MutationGateMode = "observe",
+    private readonly schemaWriterStage: SchemaWriterStage = "v1_only"
   ) {
     const runtime = asProjectOsPersistence(input);
     super(runtime, repositoryMode);
@@ -40,6 +53,37 @@ export class ProjectRepository extends CoreProjectRepository {
     const mutationRepository = new MutationGateRepository(runtime);
     this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
     this.mutationGate = new MutationGateService(runtime, mutationGateMode);
+  }
+
+  override async readProjectState(projectId: string): Promise<ProjectState | null> {
+    if (this.repositoryMode === "legacy") return null;
+    const raw = await this.runtime.objects.readText(machineStatePath(projectId));
+    if (raw === null) return null;
+    const state = readProjectStateRecord(JSON.parse(raw)).state;
+    if (state.project_id !== projectId) {
+      throw new Error(`Canonical project state binding mismatch: expected ${projectId}, got ${state.project_id}`);
+    }
+    return state;
+  }
+
+  override async readReceipt(transactionId: string): Promise<Receipt | null> {
+    const path = this.repositoryMode === "v2"
+      ? machineReceiptPath(transactionId)
+      : receiptPath(transactionId);
+    const raw = await this.runtime.objects.readText(path);
+    if (raw === null) return null;
+    const receipt = readReceiptRecord(JSON.parse(raw));
+    if (receipt.transaction_id !== transactionId) {
+      throw new Error(`Canonical receipt binding mismatch: expected ${transactionId}, got ${receipt.transaction_id}`);
+    }
+    return receipt;
+  }
+
+  override async writeMachineSnapshot(state: ProjectState): Promise<void> {
+    const encodedState = encodeProjectState(state, this.schemaWriterStage);
+    const encodedManifest = encodeManifest(state, this.schemaWriterStage);
+    await this.runtime.objects.upsertText(machineStatePath(state.project_id), pretty(encodedState));
+    await this.runtime.objects.upsertText(machineManifestPath(state.project_id), pretty(encodedManifest));
   }
 
   override async materializeCanonicalDerivatives(
@@ -126,4 +170,8 @@ function sameDestination(left: ResolvedArtifactDestination, right: ResolvedArtif
     && left.route?.source_prefix === right.route?.source_prefix
     && left.route?.target_prefix === right.route?.target_prefix
     && left.route?.archive_prefix === right.route?.archive_prefix;
+}
+
+function pretty(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
 }

@@ -114,7 +114,7 @@ export interface DeliverableRecord {
 }
 
 export interface ProjectState {
-  schema_version: "1.0";
+  schema_version: "1.0" | "2.0";
   project_id: string;
   name: string;
   slug: string;

@@ -1,9 +1,11 @@
 import { mayRebaseStaleOperation } from "./concurrency-policy";
 import type { DomainEvent } from "./event";
 import type { ProjectState } from "./project-state";
-import { normalizeProjectState } from "./project-state-normalizer";
 import type { Receipt } from "./receipt";
 import { parseTransaction, type Transaction } from "./transaction";
+import { readDomainEvent } from "../schema/event";
+import { readProjectState } from "../schema/project-state";
+import { readCommittedReceipt } from "../schema/receipt";
 
 export interface CanonicalCommitRecord {
   schema_version: "1.0";
@@ -30,9 +32,9 @@ export function parseCanonicalCommitRecord(value: unknown): CanonicalCommitRecor
   }
 
   const transaction = parseTransaction(input.transaction);
-  const state = normalizeProjectState(input.state);
-  const event = parseEvent(input.event);
-  const receipt = parseCommittedReceipt(input.receipt);
+  const state = readProjectState(input.state).state;
+  const event = readDomainEvent(input.event);
+  const receipt = readCommittedReceipt(input.receipt);
 
   for (const [name, boundProjectId] of [
     ["transaction", transaction.project_id],
@@ -82,46 +84,6 @@ export function parseCanonicalCommitRecord(value: unknown): CanonicalCommitRecor
     state,
     event,
     receipt
-  };
-}
-
-function parseEvent(value: unknown): DomainEvent {
-  const input = requireRecord(value, "commit event");
-  if (input.schema_version !== "1.0") throw new Error("Unsupported commit event schema_version");
-  const eventId = requireString(input.event_id, "event_id");
-  if (!/^EVT-[0-9]{6,}$/.test(eventId)) throw new Error("Invalid event_id");
-  const projectId = requireString(input.project_id, "event project_id");
-  const revision = requireNonNegativeInteger(input.revision, "event revision");
-  const transactionId = requireString(input.transaction_id, "event transaction_id");
-  const type = requireString(input.type, "event type") as DomainEvent["type"];
-  const timestamp = requireString(input.timestamp, "event timestamp");
-  const payload = requireRecord(input.payload, "event payload");
-  return {
-    schema_version: "1.0",
-    event_id: eventId,
-    project_id: projectId,
-    revision,
-    transaction_id: transactionId,
-    type,
-    timestamp,
-    payload
-  };
-}
-
-function parseCommittedReceipt(value: unknown): Receipt & { status: "committed"; event_id: string } {
-  const input = requireRecord(value, "commit receipt");
-  if (input.schema_version !== "1.0") throw new Error("Unsupported commit receipt schema_version");
-  if (input.status !== "committed") throw new Error("Canonical commit record requires a committed receipt");
-  const eventId = requireString(input.event_id, "receipt event_id");
-  return {
-    schema_version: "1.0",
-    transaction_id: requireString(input.transaction_id, "receipt transaction_id"),
-    status: "committed",
-    project_id: requireString(input.project_id, "receipt project_id"),
-    previous_revision: requireNonNegativeInteger(input.previous_revision, "receipt previous_revision"),
-    new_revision: requireNonNegativeInteger(input.new_revision, "receipt new_revision"),
-    event_id: eventId,
-    ...(typeof input.committed_at === "string" ? { committed_at: input.committed_at } : {})
   };
 }
 

@@ -24,8 +24,12 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       HEALTH_URL: https://project-os-guard.zakaria-fadli-94.workers.dev/health
-      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Verify required credentials
         shell: bash
         run: |
@@ -118,18 +122,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/dispatches" \
-            -f ref=main
-          echo "Requested authoritative deploy.yml republish of main after Workers Builds trigger removal."
+          node <<'NODE'
+          const api = process.env.GITHUB_API_URL || "https://api.github.com";
+          const repo = process.env.GITHUB_REPOSITORY;
+          const token = process.env.GITHUB_TOKEN;
+          if (!repo || !token) throw new Error("GitHub workflow identity/token missing");
+          const response = await fetch(`${api}/repos/${repo}/actions/workflows/deploy.yml/dispatches`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "content-type": "application/json",
+              "x-github-api-version": "2022-11-28"
+            },
+            body: JSON.stringify({ ref: "main" })
+          });
+          const raw = await response.text();
+          if (response.status !== 204) throw new Error(`deploy.yml dispatch failed: HTTP ${response.status} ${raw}`);
+          console.log("Requested authoritative deploy.yml republish of main after Workers Builds trigger removal.");
+          NODE
 
       - name: Record R0 cutover evidence on control issue
         if: always()
         shell: bash
         run: |
           set -u -o pipefail
-          status="${{ job.status }}"
-          gh issue comment "${{ github.event.issue.number }}" \
-            --body "R0 Workers Builds cutover status=${status}; worker=${WORKER_NAME}; run=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          CUTOVER_STATUS="${{ job.status }}" node <<'NODE'
+          const api = process.env.GITHUB_API_URL || "https://api.github.com";
+          const repo = process.env.GITHUB_REPOSITORY;
+          const token = process.env.GITHUB_TOKEN;
+          const issue = process.env.ISSUE_NUMBER;
+          if (!repo || !token || !issue) throw new Error("GitHub issue identity/token missing");
+          const body = `R0 Workers Builds cutover status=${process.env.CUTOVER_STATUS}; worker=${process.env.WORKER_NAME}; run=https://github.com/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const response = await fetch(`${api}/repos/${repo}/issues/${issue}/comments`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              accept: "application/vnd.github+json",
+              "content-type": "application/json",
+              "x-github-api-version": "2022-11-28"
+            },
+            body: JSON.stringify({ body })
+          });
+          if (response.status !== 201) throw new Error(`control issue comment failed: HTTP ${response.status} ${await response.text()}`);
+          NODE
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}

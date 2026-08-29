@@ -134,7 +134,7 @@ describe("projection hashing and incremental planning", () => {
     await expect(sha256Canonical({ b: 2, a: 1 })).resolves.toBe(await sha256Canonical({ a: 1, b: 2 }));
   });
 
-  it("initial planning renders all current global and entity outputs and marks STATE/HANDOFF critical", async () => {
+  it("initial planning renders all current human-facing globals and supported entity outputs without deliverable registry cards", async () => {
     const { record, taskId, decisionId, researchId, deliverableId } = fixture();
     const plan = await planProjection(record, null, 1);
 
@@ -149,11 +149,11 @@ describe("projection hashing and incremental planning", () => {
       `task:${taskId}`,
       `decision:${decisionId}`,
       `research:${researchId}`,
-      `deliverable:${deliverableId}`,
       "constraint:CON-PLAN3201"
     ]) {
       expect(plan.changed_outputs.has(key), key).toBe(true);
     }
+    expect(plan.changed_outputs.has(`deliverable:${deliverableId}`)).toBe(false);
     expect(plan.changed_outputs.get("global:STATE")?.critical).toBe(true);
     expect(plan.changed_outputs.get("global:HANDOFF")?.critical).toBe(true);
     expect(plan.carried_forward.size).toBe(0);
@@ -168,10 +168,12 @@ describe("projection hashing and incremental planning", () => {
     for (const key of [`task:${taskId}`, "global:ROADMAP", "global:PLAN", "global:STATE", "global:HANDOFF"]) {
       expect(plan.changed_outputs.has(key), key).toBe(true);
     }
-    for (const key of ["global:BRIEF", `decision:${decisionId}`, `research:${researchId}`, `deliverable:${deliverableId}`]) {
+    for (const key of ["global:BRIEF", `decision:${decisionId}`, `research:${researchId}`]) {
       expect(plan.changed_outputs.has(key), key).toBe(false);
       expect(plan.carried_forward.has(key), key).toBe(true);
     }
+    expect(plan.changed_outputs.has(`deliverable:${deliverableId}`)).toBe(false);
+    expect(plan.carried_forward.has(`deliverable:${deliverableId}`)).toBe(false);
   });
 
   it("decision.accept changes its note and discovery, but not BRIEF", async () => {
@@ -222,13 +224,14 @@ describe("projection hashing and incremental planning", () => {
     expect(plan.carried_forward.has("global:DISCOVERY")).toBe(true);
   });
 
-  it("deliverable lifecycle changes its entity and ROADMAP among non-critical globals", async () => {
+  it("deliverable lifecycle changes ROADMAP without materializing a deliverable registry card", async () => {
     const { record, deliverableId } = fixture();
     const baselinePlan = await planProjection(record, null, 1);
     const next = commit(record.state, "deliverable.start", { deliverable_id: deliverableId });
     const plan = await planProjection(next, baselineFrom(baselinePlan), 1);
 
-    expect(plan.changed_outputs.has(`deliverable:${deliverableId}`)).toBe(true);
+    expect(plan.changed_outputs.has(`deliverable:${deliverableId}`)).toBe(false);
+    expect(plan.carried_forward.has(`deliverable:${deliverableId}`)).toBe(false);
     expect(plan.changed_outputs.has("global:ROADMAP")).toBe(true);
     expect(plan.changed_outputs.has("global:BRIEF")).toBe(false);
     expect(plan.changed_outputs.has("global:DISCOVERY")).toBe(false);

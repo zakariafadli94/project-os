@@ -1,3 +1,4 @@
+import { deploymentIdentity } from "./deployment/identity";
 import { parseMutationCandidateResolutionRequest } from "./domain/mutation-candidate-resolution";
 import type { Env } from "./env";
 import baseWorker from "./index";
@@ -12,6 +13,11 @@ const worker = {
   ...baseWorker,
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/health") {
+      return Response.json({ status: "ok", ...deploymentIdentity(env) });
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/mutation-candidates/resolve") {
       if (!authorizedResolution(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 

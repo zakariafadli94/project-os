@@ -1,4 +1,5 @@
 import type { Env } from "../env";
+import { withSchemaRuntimePolicy } from "../schema/runtime-policy";
 import {
   requireProjectOsPersistence,
   type ProjectOsPersistenceRuntime
@@ -13,5 +14,6 @@ export function createProductionPersistence(env: Env): ProjectOsPersistenceRunti
     appSecret: env.DROPBOX_APP_SECRET,
     refreshToken: env.DROPBOX_REFRESH_TOKEN
   });
-  return requireProjectOsPersistence(withProviderResilience(createDropboxPersistence(raw)));
+  const runtime = requireProjectOsPersistence(withProviderResilience(createDropboxPersistence(raw)));
+  return withSchemaRuntimePolicy(runtime, env.PROJECT_OS_SCHEMA_WRITER_STAGE);
 }

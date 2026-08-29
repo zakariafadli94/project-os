@@ -55,9 +55,10 @@ function committedRecord(
 describe("mixed canonical commit recovery", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("fails closed when a v1_only ProjectGuard encounters durable ProjectState V2 history", async () => {
+  it("fails closed with structured diagnostics when v1_only encounters durable ProjectState V2 history", async () => {
     const projectId = "PRJ-9005";
     const mock = installDropboxMock();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const create = {
       schema_version: "1.0",
       transaction_id: "TXN-SCHEMA-MIXED-9005-CREATE",
@@ -90,6 +91,21 @@ describe("mixed canonical commit recovery", () => {
 
     await expect(submit(projectId, task)).rejects.toThrow(
       /writer stage regression.*core_v2.*v1_only|durable frontier core_v2/i
+    );
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "Project OS schema compatibility failure",
+      expect.objectContaining({
+        project_id: projectId,
+        family: "ProjectState",
+        encountered_version: "2.0",
+        semantic_version: "2.0",
+        canonical_revision: 1,
+        deployment_identity: expect.any(String),
+        failure_class: "writer_stage_regression",
+        active_writer_stage: "v1_only",
+        frontier: "core_v2"
+      })
     );
 
     // The old binary must not down-encode, append a new commit, or materialize

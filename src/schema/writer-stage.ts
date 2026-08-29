@@ -6,6 +6,8 @@ const WRITER_STAGE_RANK: Record<SchemaWriterStage, number> = {
   provider_v2: 2
 };
 
+const PROJECT_ID_PATTERN = /^PRJ-[0-9]{4,}$/;
+
 export function parseSchemaWriterStage(value: string | undefined | null): SchemaWriterStage {
   if (value === undefined || value === null || value === "") {
     return "v1_only";
@@ -14,6 +16,53 @@ export function parseSchemaWriterStage(value: string | undefined | null): Schema
     return value;
   }
   throw new Error(`Unsupported schema writer stage: ${value}`);
+}
+
+function parseCoreV2FloorProjectIds(value: string | undefined | null): Set<string> {
+  if (value === undefined || value === null || value.trim() === "") return new Set();
+
+  const ids = value.split(",").map((item) => item.trim()).filter(Boolean);
+  for (const id of ids) {
+    if (!PROJECT_ID_PATTERN.test(id)) {
+      throw new Error(`Invalid schema core-v2 floor project id: ${id}`);
+    }
+  }
+  return new Set(ids);
+}
+
+export function resolveSchemaWriterStageForProject(
+  configuredValue: string | undefined | null,
+  canaryProjectId: string | undefined | null,
+  projectId: string | undefined | null,
+  coreV2FloorProjectIds?: string | undefined | null
+): SchemaWriterStage {
+  const configured = parseSchemaWriterStage(configuredValue);
+  const floorProjects = parseCoreV2FloorProjectIds(coreV2FloorProjectIds);
+
+  const hasCanary = canaryProjectId !== undefined && canaryProjectId !== null && canaryProjectId !== "";
+  if (hasCanary && !PROJECT_ID_PATTERN.test(canaryProjectId)) {
+    throw new Error(`Invalid schema canary project id: ${canaryProjectId}`);
+  }
+
+  let resolved: SchemaWriterStage;
+  if (!hasCanary) {
+    resolved = configured;
+  } else if (configured === "v1_only") {
+    resolved = "v1_only";
+  } else {
+    resolved = projectId === canaryProjectId ? configured : "v1_only";
+  }
+
+  if (
+    projectId !== undefined &&
+    projectId !== null &&
+    floorProjects.has(projectId) &&
+    WRITER_STAGE_RANK[resolved] < WRITER_STAGE_RANK.core_v2
+  ) {
+    return "core_v2";
+  }
+
+  return resolved;
 }
 
 export function assertWriterStageAtLeast(

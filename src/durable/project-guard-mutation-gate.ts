@@ -276,34 +276,50 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
   private async reconcileSchemaFrontierForMutation(): Promise<void> {
     if (this.schemaFrontierReconciled || !this.boundProjectId) return;
 
-    // The active provider_v2 writer is already capable of preserving every
-    // lower frontier. It can reconstruct its local marker lazily as V2 records
-    // are naturally read/written without a cold-start scan.
+    // provider_v2 is capable of preserving every lower frontier. It can
+    // reconstruct the local marker lazily as V2 records are naturally read or
+    // written, so no cold-start corpus scan is required at the highest stage.
     if (this.schemaWriterStage === "provider_v2") {
       this.schemaFrontierReconciled = true;
       return;
     }
 
-    // Reading canonical state is enough to recover the core_v2 frontier and
-    // will fail closed immediately if a v1_only binary encounters state 2.0.
+    // Reading canonical state recovers the core_v2 frontier and fails closed
+    // immediately if a v1_only binary encounters ProjectState 2.0.
     await this.resolutionRepository.readProjectState(this.boundProjectId);
 
-    // A core_v2 rollback must additionally prove that provider_v2 was never
-    // crossed. Heads and MutationGate intents/candidates are the first durable
-    // provider-bearing records produced by their respective write paths, so a
-    // bounded scan of these flat namespaces is sufficient to recover R3.
     if (this.schemaWriterStage === "core_v2" && this.schemaRollout.status().frontier !== "provider_v2") {
-      await this.observeSchemaEvidenceDirectory(`${machineDocumentRoot(this.boundProjectId)}/heads`);
-      if (this.schemaRollout.status().frontier !== "provider_v2") {
-        await this.observeSchemaEvidenceDirectory(`${machineMutationGateRoot(this.boundProjectId)}/intents/artifacts`);
+      const documentRoot = machineDocumentRoot(this.boundProjectId);
+      const mutationRoot = machineMutationGateRoot(this.boundProjectId);
+
+      // R3 can be crossed by a version write before the mutable head is
+      // published. It can also be crossed by an index write against an older
+      // V1 head. Recovery therefore checks every first-write namespace, not
+      // merely the steady-state head surface.
+      await this.observeSchemaEvidenceDirectory(`${documentRoot}/heads`);
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceNestedDirectory(`${documentRoot}/versions`);
       }
-      if (this.schemaRollout.status().frontier !== "provider_v2") {
-        await this.observeSchemaEvidenceDirectory(`${machineMutationGateRoot(this.boundProjectId)}/candidates`);
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceDirectory(`${documentRoot}/provider-file-bindings/v2`);
+      }
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceDirectory(`${documentRoot}/reference-fingerprints/v2`);
+      }
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceDirectory(`${mutationRoot}/intents/artifacts`);
+      }
+      if (!this.providerFrontierSeen()) {
+        await this.observeSchemaEvidenceDirectory(`${mutationRoot}/candidates`);
       }
     }
 
     this.schemaRollout.assertConfiguredStage(this.schemaWriterStage);
     this.schemaFrontierReconciled = true;
+  }
+
+  private providerFrontierSeen(): boolean {
+    return this.schemaRollout.status().frontier === "provider_v2";
   }
 
   private async observeSchemaEvidenceDirectory(root: string): Promise<void> {
@@ -312,7 +328,20 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
       if (entry.kind !== "file") continue;
       const path = entry.path ?? `${root}/${entry.name}`;
       await this.persistence.objects.readText(path);
-      if (this.schemaRollout.status().frontier === "provider_v2") return;
+      if (this.providerFrontierSeen()) return;
+    }
+  }
+
+  private async observeSchemaEvidenceNestedDirectory(root: string): Promise<void> {
+    const entries = await this.persistence.objects.listChildren(root);
+    for (const entry of entries) {
+      if (entry.kind === "file") {
+        const path = entry.path ?? `${root}/${entry.name}`;
+        await this.persistence.objects.readText(path);
+      } else if (entry.kind === "folder") {
+        await this.observeSchemaEvidenceDirectory(entry.path ?? `${root}/${entry.name}`);
+      }
+      if (this.providerFrontierSeen()) return;
     }
   }
 

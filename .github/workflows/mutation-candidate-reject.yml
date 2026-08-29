@@ -37,7 +37,7 @@ jobs:
       (github.event_name == 'issues' &&
        github.actor == github.repository_owner &&
        github.event.issue.title == '[operator] MutationGate PRJ-0003 reject repair')
-    runs-on: [self-hosted, linux, x64, project-os]
+    runs-on: ubuntu-latest
     env:
       PROJECT_OS_URL: https://project-os-guard.zakaria-fadli-94.workers.dev
       WORKER_NAME: project-os-guard
@@ -267,7 +267,7 @@ jobs:
                 headers: {
                   authorization: `Bearer ${token}`,
                   "content-type": "application/json",
-                  "Cloudflare-Workers-Version-Overrides": `${workerName}="${operatorVersionId}"`
+                  "Cloudflare-Workers-Version-Overrides": `${workerName}=\"${operatorVersionId}\"`
                 },
                 body: payloadJson
               });

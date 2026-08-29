@@ -1,0 +1,80 @@
+name: Complete hosted runner migration
+
+on:
+  push:
+    branches: [infra/remove-self-hosted]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: infra/remove-self-hosted
+
+      - name: Remove every self-hosted workflow dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          from pathlib import Path
+
+          workflows = Path('.github/workflows')
+          old = 'runs-on: [self-hosted, linux, x64, project-os]'
+          new = 'runs-on: ubuntu-latest'
+          for path in workflows.glob('*.yml'):
+              text = path.read_text()
+              if old in text:
+                  path.write_text(text.replace(old, new))
+
+          script = Path('scripts/check-no-self-hosted-runners.mjs')
+          script.write_text('''import { readdirSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\n\nconst workflowDir = ".github/workflows";\nconst forbidden = ["self", "hosted"].join("-");\nconst offenders = readdirSync(workflowDir)\n  .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))\n  .filter((name) => readFileSync(join(workflowDir, name), "utf8").includes(forbidden));\n\nif (offenders.length > 0) {\n  console.error(`Forbidden runner dependency found in: ${offenders.join(", ")}`);\n  process.exit(1);\n}\n\nconsole.log("All GitHub Actions workflows use GitHub-hosted runners.");\n''')
+
+          ci = workflows / 'ci.yml'
+          text = ci.read_text()
+          marker = '      - run: npm install\n'
+          guard = '      - run: node scripts/check-no-self-hosted-runners.mjs\n'
+          if guard not in text:
+              if marker not in text:
+                  raise SystemExit('Could not locate CI insertion point')
+              text = text.replace(marker, marker + guard, 1)
+              ci.write_text(text)
+          PY
+
+      - name: Cancel obsolete queued self-hosted runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run_id in 33271379067 33269546799; do
+            status=$(curl --silent --show-error --output /tmp/cancel-body --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/cancel")
+            if [ "$status" = "202" ] || [ "$status" = "409" ]; then
+              echo "run ${run_id}: cancel status ${status}"
+            else
+              echo "run ${run_id}: unexpected cancel HTTP ${status}"
+              cat /tmp/cancel-body || true
+              exit 1
+            fi
+          done
+
+      - name: Verify and commit migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/check-no-self-hosted-runners.mjs
+          git rm .github/workflows/remove-self-hosted-migration.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/workflows scripts/check-no-self-hosted-runners.mjs
+          git commit -m "infra: eliminate self-hosted runners"
+          git push origin HEAD:infra/remove-self-hosted

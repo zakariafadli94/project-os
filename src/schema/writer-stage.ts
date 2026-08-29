@@ -16,6 +16,22 @@ export function parseSchemaWriterStage(value: string | undefined | null): Schema
   throw new Error(`Unsupported schema writer stage: ${value}`);
 }
 
+export function resolveSchemaWriterStageForProject(
+  configuredValue: string | undefined | null,
+  canaryProjectId: string | undefined | null,
+  projectId: string | undefined | null
+): SchemaWriterStage {
+  const configured = parseSchemaWriterStage(configuredValue);
+  if (canaryProjectId === undefined || canaryProjectId === null || canaryProjectId === "") {
+    return configured;
+  }
+  if (!/^PRJ-[0-9]{4,}$/.test(canaryProjectId)) {
+    throw new Error(`Invalid schema canary project id: ${canaryProjectId}`);
+  }
+  if (configured === "v1_only") return "v1_only";
+  return projectId === canaryProjectId ? configured : "v1_only";
+}
+
 export function assertWriterStageAtLeast(
   actual: SchemaWriterStage,
   required: SchemaWriterStage

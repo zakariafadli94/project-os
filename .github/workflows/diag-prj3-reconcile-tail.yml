@@ -1,0 +1,30 @@
+name: diag-prj3-reconcile-tail
+
+on:
+  push:
+    branches: [diag/prj3-reconcile-tail-20260829]
+
+jobs:
+  tail:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Capture one production reconciliation cycle
+        shell: bash
+        run: |
+          set +e
+          timeout 360s npx wrangler tail --format json 2>&1 \
+            | grep --line-buffered -E 'PRJ-0003|Project OS scheduled maintenance|Project OS materialization reconcile failed|Project OS materialization blocked|Project OS materialization attempt'
+          tail_status=${PIPESTATUS[0]}
+          if [ "$tail_status" -ne 0 ] && [ "$tail_status" -ne 124 ]; then
+            echo "wrangler tail failed with status $tail_status"
+            exit "$tail_status"
+          fi
+          exit 0

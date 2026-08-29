@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   assertNoWriterStageRegression,
   assertWriterStageAtLeast,
-  parseSchemaWriterStage
+  parseSchemaWriterStage,
+  resolveSchemaWriterStageForProject
 } from "../../src/schema/writer-stage";
 
 describe("schema writer stage", () => {
@@ -26,5 +27,14 @@ describe("schema writer stage", () => {
     expect(parseSchemaWriterStage("")).toBe("v1_only");
     expect(parseSchemaWriterStage("core_v2")).toBe("core_v2");
     expect(() => parseSchemaWriterStage("future_v3")).toThrow(/future_v3/);
+  });
+
+  it("limits an activated writer stage to the configured production canary", () => {
+    expect(resolveSchemaWriterStageForProject("core_v2", "PRJ-0006", "PRJ-0006")).toBe("core_v2");
+    expect(resolveSchemaWriterStageForProject("core_v2", "PRJ-0006", "PRJ-0002")).toBe("v1_only");
+    expect(resolveSchemaWriterStageForProject("provider_v2", "PRJ-0006", "PRJ-0003")).toBe("v1_only");
+    expect(resolveSchemaWriterStageForProject("provider_v2", undefined, "PRJ-0003")).toBe("provider_v2");
+    expect(resolveSchemaWriterStageForProject("v1_only", "PRJ-0006", "PRJ-0003")).toBe("v1_only");
+    expect(() => resolveSchemaWriterStageForProject("core_v2", "not-a-project", "PRJ-0006")).toThrow(/canary/i);
   });
 });

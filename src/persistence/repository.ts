@@ -1,7 +1,7 @@
 export * from "./repository-core";
 
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
-import type { CanonicalCommitRecord } from "../domain/commit-record";
+import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../domain/commit-record";
 import type { ProjectState } from "../domain/project-state";
 import type { Receipt } from "../domain/receipt";
 import { ArtifactMutationIntentService } from "../mutation-gate/artifact-intent";
@@ -18,6 +18,7 @@ import { readReceipt as readReceiptRecord } from "../schema/receipt";
 import type { SchemaWriterStage } from "../schema/writer-stage";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
 import {
+  machineCommitRecordPath,
   machineManifestPath,
   machineReceiptPath,
   machineStatePath,
@@ -26,6 +27,7 @@ import {
 } from "./layout";
 import { receiptPath } from "./paths";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
+import { ProviderConflictError } from "./provider/errors";
 import {
   asProjectOsPersistence,
   type PersistenceInput
@@ -77,6 +79,29 @@ export class ProjectRepository extends CoreProjectRepository {
       throw new Error(`Canonical receipt binding mismatch: expected ${transactionId}, got ${receipt.transaction_id}`);
     }
     return receipt;
+  }
+
+  override async writeCommitRecord(record: CanonicalCommitRecord): Promise<void> {
+    if (this.repositoryMode !== "v2") throw new Error("Canonical commit records require V2 layout mode");
+    const validated = parseCanonicalCommitRecord(record);
+    const durableRecord = {
+      ...validated,
+      state: encodeProjectState(validated.state, this.schemaWriterStage)
+    };
+    // Reparse before publication so the envelope and nested family binding are
+    // proven together while preserving the 1.0 commit envelope.
+    parseCanonicalCommitRecord(durableRecord);
+    const path = machineCommitRecordPath(validated.project_id, validated.new_revision);
+    const content = pretty(durableRecord);
+    try {
+      await this.runtime.objects.createText(path, content);
+    } catch (error) {
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.runtime.objects.readText(path);
+      if (existing !== content) {
+        throw new Error(`Immutable persistence path conflict with different content: ${path}`);
+      }
+    }
   }
 
   override async writeMachineSnapshot(state: ProjectState): Promise<void> {

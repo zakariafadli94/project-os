@@ -7,6 +7,11 @@ import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "./doma
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
 import {
+  issueProjectCreateAuthorization,
+  ProjectCreateAuthorizationIdempotencyError
+} from "./governance/project-create-authorization";
+import { GovernanceRepository } from "./governance/repository";
+import {
   artifactInboxPath,
   inboxPath,
   processArtifactInbox,
@@ -17,6 +22,7 @@ import { mirrorLegacyEvents, mirrorLegacyLedger } from "./migration/workspace-v2
 import { parseLayoutMode } from "./persistence/layout";
 import { assertSafeProjectId } from "./persistence/paths";
 import { createProductionPersistence } from "./persistence/production-factory";
+import { parseProjectCreateAuthorizationRecord } from "./schema/project-governance";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
 export { ProjectGuard } from "./durable/project-guard";
@@ -92,6 +98,26 @@ const worker = {
           artifact_inbox: artifactInboxPath(mode),
           message: error instanceof Error ? error.message : String(error)
         }, { status: 502 });
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/operator/project-create-authorizations") {
+      if (!authorizedProjectCreateOperator(request, env)) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+
+      try {
+        const authorization = parseProjectCreateAuthorizationRecord(await request.json());
+        const repository = new GovernanceRepository(createProductionPersistence(env));
+        return Response.json(await issueProjectCreateAuthorization(repository, authorization));
+      } catch (error) {
+        if (error instanceof ProjectCreateAuthorizationIdempotencyError) {
+          return Response.json({ error: error.code, message: error.message }, { status: 409 });
+        }
+        return Response.json({
+          error: "invalid_project_create_authorization",
+          message: error instanceof Error ? error.message : "Invalid project-create authorization request"
+        }, { status: 400 });
       }
     }
 
@@ -457,6 +483,15 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
 function authorized(request: Request, env: Env): boolean {
   const authorization = request.headers.get("authorization");
   return Boolean(authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`));
+}
+
+function authorizedProjectCreateOperator(request: Request, env: Env): boolean {
+  const authorization = request.headers.get("authorization");
+  const operatorToken = env.PROJECT_CREATE_OPERATOR_TOKEN;
+  if (!authorization || !operatorToken) return false;
+  if (secureStringEqual(operatorToken, env.INGRESS_TOKEN)) return false;
+  if (env.MUTATION_GATE_OPERATOR_TOKEN && secureStringEqual(operatorToken, env.MUTATION_GATE_OPERATOR_TOKEN)) return false;
+  return secureStringEqual(authorization, `Bearer ${operatorToken}`);
 }
 
 function secureStringEqual(left: string, right: string): boolean {

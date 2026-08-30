@@ -24,6 +24,10 @@ import {
 } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderChangeEntry, ProviderObjectMetadata } from "../persistence/provider/contract";
+import {
+  ManagedDocumentIdentityConflictError,
+  assertManagedMarkdownIdentityIfPresent
+} from "./identity-frontmatter";
 import { DocumentLedgerRepository, type ReferenceFingerprintRecord } from "./repository";
 
 export interface ManagedDocumentReconcileSummary {
@@ -114,6 +118,15 @@ export class ManagedDocumentReconciler {
         continue;
       }
       if (classified.zone === "working" || classified.zone === "review") {
+        const identityConflict = await this.hasVisibleIdentityConflict(
+          state,
+          classified.relativePath,
+          change.path
+        );
+        if (identityConflict) {
+          summary.conflicts += 1;
+          continue;
+        }
         const captured = await this.captureWorkProductEdit(
           state,
           classified.zone,
@@ -165,6 +178,30 @@ export class ManagedDocumentReconciler {
       reconciliation_status: head.reconciliation_status
     });
     return true;
+  }
+
+  private async hasVisibleIdentityConflict(
+    state: ProjectState,
+    logicalPath: string,
+    visiblePath: string
+  ): Promise<boolean> {
+    const documentId = await documentIdFor(state.project_id, logicalPath);
+    const head = await this.ledger.readHead(state.project_id, documentId);
+    if (!head || head.kind !== "work_product") return false;
+
+    const content = await this.runtime.objects.readText(visiblePath);
+    if (content === null) return false;
+    try {
+      assertManagedMarkdownIdentityIfPresent(content, {
+        projectId: state.project_id,
+        documentId: head.document_id,
+        logicalPath: head.logical_path
+      });
+      return false;
+    } catch (error) {
+      if (error instanceof ManagedDocumentIdentityConflictError) return true;
+      throw error;
+    }
   }
 
   private async captureWorkProductEdit(

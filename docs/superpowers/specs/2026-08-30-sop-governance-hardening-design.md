@@ -64,7 +64,9 @@ Project allocation MUST therefore require a separate authorization object create
 
 The required flow is:
 
-`user approval -> project-create authorization -> committed authorization -> project.create -> RegistryGuard allocation`
+`user approval -> project-create authorization -> authorization receipt -> project.create -> RegistryGuard allocation`
+
+The authorization record/receipt is operational governance evidence. Issuing it MUST NOT advance a project business revision because the project does not yet exist.
 
 ### 5.2 Authorization object
 
@@ -80,9 +82,10 @@ Introduce a durable authorization record with at least:
 - optional `parent_project_id` or `improvement_package_id` for synthetic projects;
 - `issued_at`;
 - `expires_at`;
-- `consumed_at` when used.
+- `consumed_at` when used;
+- `allocated_project_id` after allocation when applicable.
 
-The record MUST be immutable after issue except for one-way consumption metadata.
+The record MUST be immutable after issue except for one-way consumption/allocation metadata.
 
 ### 5.3 Authorization issuance
 
@@ -90,11 +93,27 @@ Authorization issuance MUST NOT use the generic transaction inbox.
 
 It MUST require a dedicated authenticated operator surface or equivalent capability that represents an explicit interactive approval event.
 
+Generic transaction/referral/artifact/document writers MUST NOT possess this issuance capability.
+
 If the runtime cannot obtain such an independent capability, automated project creation MUST fail closed rather than simulate consent.
 
-### 5.4 Authorization matching
+### 5.4 Compatibility shape for `project.create`
 
-RegistryGuard MUST reject `project.create` unless a live, unconsumed authorization exists and matches the request exactly for all binding fields:
+Historical `project.create` transactions MUST remain readable exactly as historical evidence.
+
+The existing transaction family may therefore accept the following fields as optional for legacy parsing:
+
+- `authorization_id`;
+- `project_kind`;
+- optional synthetic parent/package binding.
+
+For every NEW project creation after enforcement cutover, RegistryGuard MUST require these fields. Missing fields are allowed only when reading/replaying an already-terminal historical transaction created before the enforcement frontier.
+
+This avoids inventing `project_kind` for old projects while making it mandatory for new allocations.
+
+### 5.5 Authorization matching
+
+RegistryGuard MUST reject a new `project.create` unless a live, unconsumed authorization exists and matches the request exactly for all binding fields:
 
 - name;
 - slug;
@@ -109,9 +128,9 @@ Missing authorization MUST return `PROJECT_CREATE_AUTHORIZATION_REQUIRED`.
 
 Expired authorization MUST return `PROJECT_CREATE_AUTHORIZATION_EXPIRED`.
 
-Consumed authorization replay MUST return `PROJECT_CREATE_AUTHORIZATION_CONSUMED`.
+Consumed authorization replay MUST return `PROJECT_CREATE_AUTHORIZATION_CONSUMED` unless it is the exact idempotent replay of the already-bound committed request, in which case the original receipt is returned.
 
-### 5.5 Atomic consumption
+### 5.6 Atomic consumption
 
 Authorization consumption and project-ID allocation MUST be serialized by RegistryGuard.
 
@@ -119,9 +138,11 @@ A committed project creation MUST consume the authorization exactly once.
 
 A failure before allocation MUST leave the authorization reusable if no irreversible project identity was allocated.
 
-A failure after allocation enters the existing resumable RegistryGuard create flow and MUST NOT release the authorization for a different project.
+After allocation, the authorization becomes permanently bound to the allocated project ID even if downstream completion requires recovery. It MUST NOT be released for another project.
 
-### 5.6 Project kinds
+The existing resumable RegistryGuard create flow remains responsible for finishing post-allocation recovery.
+
+### 5.7 Project kinds
 
 New projects MUST declare one of:
 
@@ -133,7 +154,7 @@ Synthetic projects MUST also carry an explicit parent or package reference when 
 
 Human project views MUST render synthetic projects as clearly fictitious/non-business. A user must not need to infer this from a name such as `Production Probe`.
 
-Historical projects retain their current schema and history. The runtime may infer a compatibility view for known historical probes, but MUST NOT rewrite history to pretend `project_kind` existed when it did not.
+Historical projects retain their current schema and history. Compatibility readers may expose `project_kind: unknown_legacy` where no durable kind exists, but MUST NOT rewrite history or silently classify a historical probe as real.
 
 ## 6. Cross-project referral contract
 
@@ -155,6 +176,8 @@ It MUST:
 4. write only to target `INPUTS/`;
 5. return a transport receipt;
 6. never load target business context merely to deliver the referral.
+
+The transport receipt is evidence of delivery to `INPUTS/`, not evidence of target ingestion or acceptance.
 
 ### 6.3 Referral envelope
 
@@ -181,6 +204,8 @@ Allowed `referral_type` values:
 - `improvement_request`;
 - `deliverable_reference`.
 
+The writer MUST reject unsupported referral types and source/target identity mismatches.
+
 ### 6.4 No lifecycle status in Markdown
 
 New referral Markdown MUST NOT include mutable workflow fields such as `referral_status: incoming`.
@@ -191,7 +216,7 @@ This avoids stale human metadata that appears authoritative after the runtime st
 
 ### 6.5 Provenance after ingestion
 
-When a referral becomes a governed reference, the resulting reference ledger MUST retain its `referral_id` or an equivalent provenance link.
+When a referral becomes a governed reference, the resulting reference ledger MUST retain its `referral_id` or an equivalent immutable provenance link.
 
 The referral MUST still not create target-project canonical facts automatically.
 
@@ -209,11 +234,26 @@ The current ingestion sequence can perform provider effects before the final ref
 
 The new design introduces an intake journal and a direct sweep safety net.
 
-### 7.2 Intake state machine
+### 7.2 Intake identity and state machine
 
-Each observed input has a durable intake record:
+Each observed provider revision in `INPUTS/` has one durable intake record.
+
+The intake identity MUST be deterministic from the bound project and immutable provider revision evidence, for example a hash over:
+
+`project_id + provider_id + object_id + revision_token`
+
+This prevents incremental processing and direct sweep from creating two intake workflows for the same provider revision.
+
+The state machine is:
 
 `observed -> processing -> ingested | duplicate | failed`
+
+`ingested` and `duplicate` are terminal.
+
+`failed` MUST carry `retryable: true|false`:
+
+- retryable failures are automatically retried by later cycles;
+- non-retryable failures remain visible for operator resolution and MUST preserve source bytes/evidence.
 
 Machine state MUST include at least:
 
@@ -225,6 +265,7 @@ Machine state MUST include at least:
 - `last_attempt_at`;
 - `attempt_count`;
 - current state;
+- retryability when failed;
 - step/effect evidence;
 - last error when present;
 - resulting document/version/reference path after success.
@@ -234,7 +275,7 @@ Machine state MUST include at least:
 The ingestion sequence MUST be:
 
 1. validate project is active/non-archived;
-2. establish durable intake intent;
+2. establish durable intake intent bound to exact provider revision evidence;
 3. snapshot provider input;
 4. establish destination plan;
 5. copy to `REFERENCES/UNCLASSIFIED/`;
@@ -242,10 +283,13 @@ The ingestion sequence MUST be:
 7. write immutable reference version;
 8. write/update reference head and indexes;
 9. verify governed reference is readable and coherent;
-10. delete original `INPUTS/` object;
-11. mark intake terminal `ingested` or `duplicate`.
+10. re-read source metadata and verify it still matches the intake's bound provider revision;
+11. delete original `INPUTS/` object only if that exact source revision is still current;
+12. mark intake terminal `ingested` or `duplicate`.
 
 The system MUST prefer a temporary duplicate over loss of source provenance.
+
+If the source changed during processing, the completed old revision MUST NOT delete the newer source revision. The newer revision becomes a separate intake record on the next observation/sweep.
 
 ### 7.4 Recovery
 
@@ -259,9 +303,13 @@ If destination exists with contradictory evidence, fail closed and preserve both
 
 If source has already disappeared but the governed destination and ledger are proven complete, finish the journal as terminal success.
 
+If source disappeared and governed completion cannot be proven, remain failed/non-terminal for operator investigation; never fabricate successful ingestion.
+
 ### 7.5 Duplicate handling
 
 An INPUT may be deleted as a duplicate only after Project OS proves that the matching reference fingerprint still points to a current, readable governed reference with matching provider evidence.
+
+Before deletion, source metadata MUST still match the intake-bound revision.
 
 A stale fingerprint is not sufficient proof.
 
@@ -283,9 +331,11 @@ Archived projects MUST be skipped by both incremental intake and direct sweep.
 
 ### 8.3 Stale threshold
 
-An input not terminal after 15 minutes, equivalent to three normal cron cycles, MUST be surfaced as stale.
+An input not terminal 15 minutes after `first_seen_at`, equivalent to three normal cron cycles, MUST be surfaced as stale.
 
 Stale is an operational health classification, not a new content lifecycle embedded in the input file.
+
+A stale intake remains eligible for retry if its failure is retryable.
 
 ### 8.4 Health state
 
@@ -294,12 +344,13 @@ Expose enough health data to answer:
 - number of pending INPUTs per project;
 - age of oldest pending INPUT;
 - count of stale INPUTs;
-- count of failed intake records;
+- count of failed intake records split by retryability;
 - last successful intake time;
-- last reconcile/sweep time;
+- last reconcile time;
+- last direct sweep time;
 - last error summary.
 
-The runtime SHOULD expose this through an admin/health surface and structured logs.
+The runtime SHOULD expose this through an authenticated admin/health surface and structured logs.
 
 The watchdog MUST not mutate project business state merely because an input is stale.
 
@@ -331,7 +382,7 @@ The SOP MUST state:
 
 PRJ-0006 was created without explicit user authorization and was later explicitly authorized for archival by the user.
 
-Its archive transaction committed at revision 2.
+Its archive transaction `TXN-PRJ0006-ARCHIVE-20260830-071900-A1F2` committed from revision 1 to revision 2 as `EVT-000002`.
 
 No historical probe evidence should be deleted or rewritten.
 
@@ -351,7 +402,7 @@ PR #93 and runtime implementation of IMP-DOCIDENTITY001 remain frozen until this
 
 The package MUST be reader-first and non-destructive.
 
-- Historical projects without `project_kind` remain readable.
+- Historical projects without `project_kind` remain readable as legacy/unknown rather than silently classified.
 - Historical `project.create` receipts remain valid historical evidence.
 - No authorization is retroactively invented.
 - Historical referrals remain readable.
@@ -365,20 +416,21 @@ The package MUST be reader-first and non-destructive.
 ### R0 — Reader and observability readiness
 
 - add compatibility readers for project kind/referral/intake state;
-- add intake health surfaces;
+- add authenticated intake health surfaces;
 - no new creation gate enforced yet;
 - no historical rewrite.
 
 ### R1 — Referral writer and synthetic typing
 
 - enable standard `referral.write` for new referrals;
-- require project kind in newly proposed creation authorization payloads;
-- render synthetic projects clearly in human views.
+- accept new project-kind/authorization fields without yet enforcing the authorization frontier;
+- render newly typed synthetic projects clearly in human views.
 
 ### R2 — Project creation authorization enforcement
 
 - enable dedicated authorization issuance capability;
-- RegistryGuard rejects unauthorized `project.create`;
+- establish an explicit enforcement frontier timestamp/version so historical replays remain compatible;
+- RegistryGuard rejects new unauthorized `project.create`;
 - verify replay, expiry, mismatch, concurrent allocation, and recovery behavior.
 
 ### R3 — Crash-safe intake
@@ -398,22 +450,22 @@ The package MUST be reader-first and non-destructive.
 ## 14. Invariants
 
 ### INV-GOV-001
-No new canonical project ID may be allocated without a matching, live, unconsumed project-create authorization.
+No new canonical project ID may be allocated after the enforcement frontier without a matching, live, unconsumed project-create authorization.
 
 ### INV-GOV-002
 A project-create authorization is single-use and cannot authorize a different project payload.
 
 ### INV-GOV-003
-Generic transaction writers cannot issue project-create authorization.
+Generic transaction/referral/artifact/document writers cannot issue project-create authorization.
 
 ### INV-GOV-004
-Every newly created project has an explicit project kind.
+Every newly created project after the enforcement frontier has an explicit project kind.
 
 ### INV-GOV-005
 Every newly created synthetic project is visibly marked fictitious/non-business in human projections.
 
 ### INV-REF-001
-Every new cross-project referral has a stable referral ID and standard referral type.
+Every new cross-project referral emitted by the standard writer has a stable referral ID and standard referral type.
 
 ### INV-REF-002
 A referral never implicitly creates target-project canonical business state.
@@ -434,45 +486,53 @@ A provider change cursor is not the sole discovery mechanism for INPUTS.
 Every active project's INPUTS are directly swept at least once per scheduled maintenance cycle.
 
 ### INV-INTAKE-005
-Inputs pending for 15 minutes or more are visible as stale operational health.
+Inputs pending for 15 minutes or more after first observation are visible as stale operational health.
 
 ### INV-INTAKE-006
 Archived projects are never processed by intake.
+
+### INV-INTAKE-007
+Completing ingestion of an older provider revision never deletes a newer source revision that appeared during processing.
 
 ## 15. Required tests
 
 The implementation plan MUST include tests proving at minimum:
 
-1. unauthorized `project.create` is rejected;
-2. expired authorization is rejected;
-3. consumed authorization replay is rejected;
-4. payload mismatch is rejected;
-5. concurrent project creation cannot double-consume one authorization;
-6. pre-allocation failure preserves valid authorization where safe;
-7. post-allocation recovery cannot reuse authorization for another project;
-8. synthetic project rendering is explicitly fictitious/non-business;
-9. legacy project without kind remains readable;
-10. new referral writer emits exact required envelope;
-11. unsupported referral type is rejected;
-12. referral delivery does not load target business context;
-13. referral delivery does not create task/decision/research/deliverable;
-14. legacy referral remains ingestible;
-15. normal incremental INPUT ingestion succeeds;
-16. INPUT missed by change cursor is discovered by direct sweep;
-17. crash after intake intent resumes safely;
-18. crash after snapshot resumes safely;
-19. crash after destination copy resumes safely;
-20. crash after version write resumes safely;
-21. crash after head/index write resumes safely;
-22. crash after source deletion but before terminal journal update recovers to success;
-23. contradictory destination evidence fails closed without deleting source;
-24. duplicate source is deleted only after current reference proof;
-25. stale fingerprint does not authorize deletion;
-26. archived project sweep is skipped;
-27. stale health appears after 15 minutes/three cron cycles;
-28. health clears after terminal intake;
-29. current PRJ-0002 DOCIDENTITY referral can be ingested through the corrected path without rewriting existing task history;
-30. no production validation step creates a new synthetic project without explicit user authorization.
+1. unauthorized new `project.create` is rejected after enforcement cutover;
+2. historical pre-frontier project-create replay remains readable/idempotent;
+3. expired authorization is rejected;
+4. consumed authorization replay for a different request is rejected;
+5. exact replay of the already-committed authorized request returns the original receipt;
+6. payload mismatch is rejected;
+7. concurrent project creation cannot double-consume one authorization;
+8. pre-allocation failure preserves valid authorization where safe;
+9. post-allocation recovery cannot reuse authorization for another project;
+10. synthetic project rendering is explicitly fictitious/non-business;
+11. legacy project without kind remains readable as legacy/unknown;
+12. new referral writer emits exact required envelope;
+13. unsupported referral type is rejected;
+14. referral delivery does not load target business context;
+15. referral delivery does not create task/decision/research/deliverable;
+16. legacy referral remains ingestible;
+17. normal incremental INPUT ingestion succeeds;
+18. INPUT missed by change cursor is discovered by direct sweep;
+19. incremental and sweep discovery of the same provider revision converge to one intake record;
+20. crash after intake intent resumes safely;
+21. crash after snapshot resumes safely;
+22. crash after destination copy resumes safely;
+23. crash after version write resumes safely;
+24. crash after head/index write resumes safely;
+25. crash after source deletion but before terminal journal update recovers to success;
+26. contradictory destination evidence fails closed without deleting source;
+27. duplicate source is deleted only after current reference proof;
+28. stale fingerprint does not authorize deletion;
+29. source revision changed during processing is not deleted by the older intake;
+30. archived project sweep is skipped;
+31. stale health appears 15 minutes after `first_seen_at`;
+32. retryable stale intake continues retrying;
+33. health clears after terminal intake;
+34. current PRJ-0002 DOCIDENTITY referral can be ingested through the corrected path without rewriting existing task history;
+35. no production validation step creates a new synthetic project without explicit user authorization.
 
 ## 16. Production proof constraints
 
@@ -492,7 +552,8 @@ The system MUST fail closed when it cannot prove:
 - authorization/payload identity;
 - governed reference completion;
 - duplicate validity;
-- safe provider destination state.
+- safe provider destination state;
+- exact source revision before deletion.
 
 Fail-closed MUST preserve evidence and source bytes whenever possible.
 
@@ -514,7 +575,7 @@ This package is complete only when:
 
 - the SOP documents the new rules;
 - RegistryGuard enforces independent authorization for new projects;
-- project kind is explicit for all newly created projects;
+- project kind is explicit for all newly created projects after cutover;
 - synthetic human views are unambiguous;
 - new referrals use the standard writer and envelope;
 - intake is journaled, resumable, directly swept, and health-monitored;

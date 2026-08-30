@@ -49,29 +49,33 @@ export class IntakeSweep {
 
     for (const entry of entries) {
       const path = this.safeChildPath(root, directory, entry);
-      if (entry.kind === "folder") {
-        await this.walk(state, root, path, observedAt, summary);
-        continue;
-      }
-      if (entry.kind !== "file") continue;
+      switch (entry.kind) {
+        case "folder":
+          await this.walk(state, root, path, observedAt, summary);
+          break;
+        case "file": {
+          const metadata = await this.runtime.objects.getMetadata(path);
+          if (!metadata) break;
+          summary.files_scanned += 1;
+          const logicalPath = path.slice(root.length + 1);
 
-      const metadata = await this.runtime.objects.getMetadata(path);
-      if (!metadata) continue;
-      summary.files_scanned += 1;
-      const logicalPath = path.slice(root.length + 1);
-
-      try {
-        const result = await this.intake.process(state, {
-          logicalPath,
-          inputPath: path,
-          metadata,
-          detectedAt: observedAt
-        });
-        if (result === "ingested") summary.ingested += 1;
-        else if (result === "duplicate") summary.duplicates += 1;
-        else if (result === "failed") summary.failed += 1;
-      } catch {
-        summary.failed += 1;
+          try {
+            const result = await this.intake.process(state, {
+              logicalPath,
+              inputPath: path,
+              metadata,
+              detectedAt: observedAt
+            });
+            if (result === "ingested") summary.ingested += 1;
+            else if (result === "duplicate") summary.duplicates += 1;
+            else if (result === "failed") summary.failed += 1;
+          } catch {
+            summary.failed += 1;
+          }
+          break;
+        }
+        case "deleted":
+          break;
       }
     }
   }

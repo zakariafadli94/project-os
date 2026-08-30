@@ -31,6 +31,25 @@ const worker = {
       return stub.fetch("https://project-guard.internal/schema-status", { method: "GET" });
     }
 
+    if (request.method === "GET" && url.pathname === "/v1/admin/intake-health") {
+      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const registryStub = env.REGISTRY_GUARD.getByName("global");
+      const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+      if (!registryResponse.ok) {
+        return Response.json({ error: "registry_unavailable" }, { status: 502 });
+      }
+      const registry = await registryResponse.json<{ projects: Array<{ project_id: string }> }>();
+      const projects = await Promise.all(registry.projects.map(async ({ project_id }) => {
+        const stub = env.PROJECT_GUARD.getByName(project_id);
+        const response = await stub.fetch("https://project-guard.internal/intake-health", { method: "GET" });
+        if (!response.ok) {
+          throw new Error(`ProjectGuard intake health returned ${response.status} for ${project_id}`);
+        }
+        return response.json<Record<string, unknown>>();
+      }));
+      return Response.json({ projects });
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/referrals") {
       if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 

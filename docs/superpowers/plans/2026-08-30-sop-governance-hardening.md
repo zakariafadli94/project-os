@@ -31,6 +31,7 @@
 - All new runtime work is TDD: failing focused test, minimal implementation, focused pass, regression pass, commit.
 - CI/deployment uses GitHub-hosted runners only; never add or restore self-hosted runners.
 - No production validation step may create a project implicitly. If a new synthetic project is genuinely required, stop and require the normal explicit project-create authorization flow.
+- Before activating any production stage that will create/copy/update/delete/move Dropbox objects as part of a controlled proof or incident repair, present the exact expected Dropbox effects and obtain immediate explicit confirmation for that activation.
 - Any later canonical PRJ-0002 mutation remains receipt-gated and follows the separate Dropbox confirmation rule; implementation commits themselves do not constitute canonical Project OS business-state updates.
 
 ---
@@ -42,7 +43,7 @@
 - `src/domain/project-governance.ts` — project kind, governance profile, project-create authorization record/consumption/receipt contracts.
 - `src/schema/project-governance.ts` — strict parsers for governance records; legacy absence maps to `unknown_legacy` in readers only.
 - `src/governance/project-create-authorization.ts` — issuance/matching/expiry/consumption policy functions.
-- `src/governance/repository.ts` — durable global authorization/frontier records and per-project governance profiles.
+- `src/governance/repository.ts` — durable global authorization/frontier records, exact historical create evidence lookup, and per-project governance profiles.
 
 ### New referral modules
 
@@ -63,15 +64,17 @@
 ### Existing integration points
 
 - `src/domain/transaction.ts` — optional governance fields on `project.create` for legacy-compatible parsing.
-- `src/durable/registry-guard-neutral.ts` — authorization issuance/consumption, allocation gate, governance profile binding, historical replay compatibility.
+- `src/durable/registry-guard-neutral.ts` — authorization issuance/consumption, allocation gate, governance profile binding, historical replay compatibility, governance-aware registry Markdown rendering.
 - `src/durable/project-guard-neutral.ts` — document maintenance orchestration and intake health/status endpoints.
 - `src/documents/reconciler.ts` — delegate `INPUTS/` changes to `IntakeService`; remove unsafe inline ingestion sequence.
 - `src/documents/change-coordinator.ts` — incremental path remains, but intake is no longer dependent on it.
 - `src/documents/repository.ts` — existing reference proof operations consumed by `IntakeService`; no ID algorithm changes.
 - `src/persistence/layout.ts` — safe global governance/referral paths and per-project intake/provenance paths.
-- `src/persistence/repository-core.ts` / `src/persistence/repository.ts` — governance profile and global record persistence hooks where appropriate.
-- `src/materialization/coordinator.ts` / `src/materialization/planner.ts` — pass optional project governance profile to human projection planning without adding fields to ProjectState.
-- `src/render/project.ts`, `src/render/operating.ts`, `src/render/handoff.ts`, `src/render/registry.ts` — synthetic visibility and updated operating contract.
+- `src/persistence/repository.ts` — expose project governance profile reads to materialization coordination; no new governance fields are added to `ProjectState`.
+- `src/materialization/coordinator.ts` / `src/materialization/planner.ts` — pass optional project governance profile to project human projection planning without adding fields to ProjectState.
+- `src/render/project.ts` — synthetic warning and project-kind display.
+- `src/render/registry.ts` — accepts a separate governance-kind map for Markdown only; canonical registry JSON shape remains backward-compatible.
+- `src/render/operating.ts`, `src/render/handoff.ts` — updated operating contract.
 - `src/index-neutral.ts` — dedicated operator authorization endpoint, referral endpoint, scheduled intake sweep/health summaries.
 - `src/env.ts` — dedicated operator credential and rollout mode/frontier configuration.
 - `docs/project-os/sop/01-PROJECT-MANAGEMENT-SOP.md` — normative project authorization/referral/intake rules.
@@ -154,18 +157,23 @@ expect(isIntakeStale("2026-08-30T07:00:00Z", "2026-08-30T07:15:00Z")).toBe(true)
 **Files:**
 - Create: `src/governance/repository.ts`
 - Modify: `src/persistence/layout.ts`
+- Modify: `src/persistence/repository.ts`
 - Modify: `src/materialization/coordinator.ts`
 - Modify: `src/materialization/planner.ts`
+- Modify: `src/durable/registry-guard-neutral.ts`
 - Modify: `src/render/project.ts`
 - Modify: `src/render/registry.ts`
 - Create: `test/project-governance-profile.spec.ts`
 - Modify: `test/materialization-coordinator.spec.ts`
+- Modify: `test/registry-guard.spec.ts`
 
 **Interfaces:**
 - Produces: `GovernanceRepository.readProjectProfile(projectId): Promise<ProjectGovernanceProfile | null>`.
 - Produces: `GovernanceRepository.writeProjectProfile(profile): Promise<void>` as immutable safe-add semantics.
+- `MaterializationRepositoryPort.readProjectGovernanceProfile(projectId)` returns the separate profile or null.
 - `planProjection(record, baseline, projectionVersion, governanceProfile?)` accepts profile separately from `ProjectState`.
-- Human rendering receives `ProjectKindView`; absent profile becomes `unknown_legacy` without any durable write.
+- `renderRegistry(entries, governanceByProject)` accepts a read-only map of `project_id -> ProjectKindView` for Markdown rendering only.
+- Absent profile becomes `unknown_legacy` in governance-aware views without any durable write or historical classification.
 
 - [ ] **Step 1: Write a failing legacy-read test proving a project with no governance profile still materializes with business state unchanged and is exposed only as `unknown_legacy` to governance-aware rendering.**
 - [ ] **Step 2: Write a failing synthetic render test requiring the exact visible warning text `Synthetic project — fictitious / non-business` in `PROJECT.md` and a `[synthetic]` marker in the registry human index.**
@@ -178,8 +186,8 @@ expect(rendered).toContain("Project kind: synthetic_probe");
 
 - [ ] **Step 3: Run the focused suites and confirm RED.**
 - [ ] **Step 4: Implement immutable profile persistence at `.project-os/projects/<PRJ>/governance/profile.json`; if absent, do not create or infer one.**
-- [ ] **Step 5: Thread the optional profile through materialization planning. Include `project_kind` in the semantic input hash for `PROJECT.md`/registry display so a newly written profile causes the next legitimate materialization to render the warning without changing ProjectState.**
-- [ ] **Step 6: Re-run focused suites plus materialization regression tests.**
+- [ ] **Step 5: Thread the optional profile through materialization planning and include `project_kind` in the semantic input hash for `PROJECT.md`, so a typed project renders correctly without changing ProjectState. Separately, when RegistryGuard publishes `PROJECT_INDEX.md`, load governance profiles for registry entries and pass the kind map to `renderRegistry`; do not add inferred kinds to canonical registry JSON.**
+- [ ] **Step 6: Re-run focused suites plus materialization and registry regression tests.**
 - [ ] **Step 7: Commit `feat(governance): render project kind outside business state`.**
 
 ### Task 3: Implement independent project-create authorization issuance
@@ -207,7 +215,7 @@ const allowed = await worker.fetch(operatorRequest(validAuth, testEnv.PROJECT_CR
 expect(allowed.status).toBe(200);
 ```
 
-- [ ] **Step 2: Add failing policy tests for `expires_at > issued_at`, maximum 30-minute validity, immutable replay with identical payload, and rejection of same `authorization_id` with different payload.**
+- [ ] **Step 2: Add failing policy tests for `expires_at > issued_at`, a maximum 30-minute authorization lifetime, immutable replay with identical payload, and rejection of the same `authorization_id` with different payload.**
 - [ ] **Step 3: Run the two suites and confirm RED.**
 - [ ] **Step 4: Implement `issueProjectCreateAuthorization()` with exact-payload idempotency and safe-add persistence under `.project-os/governance/project-create-authorizations/issued/`. Persist a separate immutable issuance receipt under `.../receipts/`.**
 - [ ] **Step 5: Ensure the generic `/v1/transactions`, inbox processor, referral and document routes have no code path that calls the issuance function. Add a structural test that only the operator route references the issuance entrypoint.**
@@ -230,6 +238,7 @@ expect(allowed.status).toBe(200);
 **Interfaces:**
 - Adds rollout env: `PROJECT_OS_PROJECT_CREATE_AUTH_MODE?: "observe" | "enforce"` defaulting to `observe` until R2.
 - Adds informational frontier label: `PROJECT_OS_PROJECT_CREATE_AUTH_FRONTIER?: string` for logs/status; security never trusts transaction `created_at` to bypass enforcement.
+- `GovernanceRepository.readCommittedCreateEvidence(transactionId)` returns both the committed terminal transaction and its canonical receipt, or null; historical bypass is permitted only when both exist and the transaction exactly matches the replay.
 - `RegistryGuard` consumes authorization only while serialized with allocation.
 - Consumption record binds `{ authorization_id, transaction_id, allocated_project_id, consumed_at }` immutably after allocation.
 
@@ -237,7 +246,7 @@ expect(allowed.status).toBe(200);
 - [ ] **Step 2: Add RED tests for exact authorized create, exact committed replay returning the original receipt, and a second different transaction attempting the consumed authorization.**
 - [ ] **Step 3: Add RED concurrency test sending two project creates against one authorization and assert exactly one allocation/commit.**
 - [ ] **Step 4: Add RED recovery tests: failure before `allocateProjectId()` leaves authorization usable; failure after allocation permanently binds it to that allocated PRJ and retry resumes the same request.**
-- [ ] **Step 5: Add RED historical compatibility test: in enforce mode, an already-terminal historical `project.create` with no governance fields replays from canonical receipt/request evidence; a previously unseen unauthenticated request is rejected even if it backdates `created_at`.**
+- [ ] **Step 5: Add RED historical compatibility test: in enforce mode, an already-terminal historical `project.create` with no governance fields replays only when the committed transaction bytes/parsed value and canonical receipt both match; a same-ID different-payload replay and any previously unseen unauthenticated request are rejected even if `created_at` is backdated.**
 - [ ] **Step 6: Implement matching over normalized name/slug/aliases/objective/project kind and synthetic binding. Consume/bind in RegistryGuard's existing serialized create flow; never release after project ID allocation.**
 - [ ] **Step 7: On authorized allocation, write the immutable `ProjectGovernanceProfile` before downstream materialization can render the new project.**
 - [ ] **Step 8: Introduce `authorizeAndCreateTestProject()` in `test/helpers/project-fixtures.ts`; use it for suites that intentionally exercise RegistryGuard create under enforce mode. Do not weaken production enforcement for tests.**
@@ -290,12 +299,13 @@ expect(markdown).not.toContain("referral_status:");
 - Journal path: `.project-os/projects/<PRJ>/documents/intake/records/<INTAKE-ID>.json`.
 - Health path: `.project-os/projects/<PRJ>/documents/intake/health.json`.
 - Referral provenance path: `.project-os/projects/<PRJ>/documents/provenance/referrals/<REF-ID>.json`.
+- Provenance record binds `referral_id`, `project_id`, `document_id`, `version_id`, `source_input_path`, `source_provider_id`, `source_object_id`, and `source_revision_token`; legacy derived IDs also carry `legacy_derived:true`.
 - `IntakeRepository.beginObservation(...)` is idempotent for exact provider revision evidence.
 - `IntakeRepository.write(record)` enforces monotone terminal semantics: terminal `ingested`/`duplicate` cannot return to processing; failed retryable may resume.
 
 - [ ] **Step 1: Write RED tests that two discoveries of the same provider revision converge on one record and a different revision creates a different intake ID.**
 - [ ] **Step 2: Write RED tests for forbidden transitions (`ingested -> processing`, `duplicate -> failed`) and allowed retry (`failed retryable -> processing`).**
-- [ ] **Step 3: Write RED provenance tests for a standard referral ID and for a legacy referral with no ID, where the sidecar uses a deterministic `REF-LEGACY-<24HEX>` derived from bound provider object identity without rewriting source Markdown.**
+- [ ] **Step 3: Write RED provenance tests for a standard referral ID and for a legacy referral with no ID, where the sidecar uses a deterministic `REF-LEGACY-<24HEX>` derived from bound provider object identity and records exact source path/object/revision without rewriting source Markdown.**
 - [ ] **Step 4: Implement strict read/write behavior and safe deterministic legacy referral provenance derivation.**
 - [ ] **Step 5: Run focused suites and `npm run typecheck`.**
 - [ ] **Step 6: Commit `feat(intake): add durable journal and referral provenance`.**
@@ -328,26 +338,14 @@ expect(markdown).not.toContain("referral_status:");
 
 **Files:**
 - Create: `test/intake-faults.spec.ts`
-- Modify: `test/helpers/mock-dropbox.ts` only to expose deterministic existing fault injection points; do not add production-only fault switches.
+- Modify: `test/helpers/mock-dropbox.ts` only to reuse its existing endpoint/path/occurrence fault model; do not add production-only fault switches.
 - Modify: `src/documents/intake-service.ts` only where tests expose missing replay logic.
 
 **Interfaces:**
 - Reuse `installDropboxMock({ faults })`.
 - Recovery decisions derive from durable journal step evidence plus current provider/ledger evidence.
 
-- [ ] **Step 1: Add parameterized RED tests for crashes after: intent, snapshot, destination copy, immutable version write, head/index write, source deletion, and before terminal journal update.**
-
-```ts
-it.each([
-  "after_intent",
-  "after_snapshot",
-  "after_destination_copy",
-  "after_version",
-  "after_head_indexes",
-  "after_source_delete"
-])("resumes intake after %s", async (point) => { /* fixture invokes provider fault mapped to this durable boundary */ });
-```
-
+- [ ] **Step 1: Add RED recovery cases for failure immediately after each durable boundary: intent, snapshot, destination copy, immutable version, head/index completion, source deletion, and terminal journal publication. Use the existing mock's endpoint/path fault injection so each failure occurs on the next concrete provider operation after the boundary being tested.**
 - [ ] **Step 2: Add RED contradiction test: destination path exists with different integrity evidence; intake becomes `failed` with `retryable:false`, source remains present, and both objects remain preserved.**
 - [ ] **Step 3: Add RED missing-source recovery tests: if governed reference proof is complete, finalize success; if proof is incomplete, remain failed and never fabricate success.**
 - [ ] **Step 4: Add RED provider retry classification test using `ProviderOperationError.retryable`; retryable failures remain eligible on later cycles, provider conflicts/evidence contradictions remain non-retryable.**
@@ -365,15 +363,15 @@ it.each([
 - Modify: `test/document-change-coordinator.spec.ts`
 
 **Interfaces:**
-- `IntakeSweep.sweep(state, observedAt): Promise<IntakeSweepSummary>` recursively enumerates files under the project's `INPUTS/` using `ObjectPersistence.listChildren`, not `changeFeed.listChanges`.
-- Nested traversal is bounded to 8 directory levels and 1000 files per project per maintenance call; exceeding bounds fails visibly rather than silently skipping.
+- `IntakeSweep.sweep(state, observedAt): Promise<IntakeSweepSummary>` recursively enumerates the complete file subtree under the project's `INPUTS/` using `ObjectPersistence.listChildren`, not `changeFeed.listChanges`.
+- Traversal is deterministic and lexical, rejects/ignores any returned child path outside the bound `INPUTS/` root, and relies on the provider adapter's existing folder pagination rather than introducing an arbitrary depth/file-count cutoff.
 - Every discovered file metadata is sent to the same `IntakeService.process()` and therefore converges by `intake_id` with incremental discovery.
 
 - [ ] **Step 1: Write RED test where the managed-document cursor is already advanced past an externally inserted INPUT, but direct sweep still discovers and ingests it.**
 - [ ] **Step 2: Add RED convergence test where incremental change and sweep see the same provider revision in one maintenance cycle and only one intake journal/reference version is created.**
 - [ ] **Step 3: Add RED archived-project test proving zero INPUT listing and zero intake journal writes.**
-- [ ] **Step 4: Add RED nested INPUT test and explicit bound-exceeded error tests.**
-- [ ] **Step 5: Implement recursive sweep with deterministic lexical traversal and the same service.**
+- [ ] **Step 4: Add RED nested INPUT test and a provider-path safety test proving a child outside the bound `INPUTS/` root is never processed.**
+- [ ] **Step 5: Implement complete recursive sweep with deterministic lexical traversal and the same service.**
 - [ ] **Step 6: Integrate ProjectGuard document maintenance so change-feed failure does not prevent the direct sweep from running; return summary fields for both paths and surface change-feed failure separately.**
 - [ ] **Step 7: Re-run focused tests plus MutationGate baseline/cursor-reset suites to prove INPUT sweep does not create final-zone candidates.**
 - [ ] **Step 8: Commit `feat(intake): sweep inputs independently of provider cursor`.**
@@ -429,7 +427,7 @@ it.each([
 - Modify: `package.json`
 - Create: `test/governance-rollout.spec.ts`
 - Create: `test/governance-acceptance.spec.ts`
-- Modify production configuration docs / `wrangler.jsonc` only with safe default stages.
+- Modify: `wrangler.jsonc` and deployment docs with safe R0 defaults only.
 
 **Interfaces:**
 - Rollout stages: `r0_reader_observe`, `r1_referrals_typing`, `r2_creation_enforce`, `r3_intake_enforce`, `r4_steady`.
@@ -448,19 +446,20 @@ it.each([
 
 **Files:**
 - Create: `docs/superpowers/plans/2026-08-30-sop-governance-hardening-execution-notes.md` during execution with exact deployment evidence only.
-- No new project files are created for validation unless separately authorized through the new gate.
+- No new project files are created for validation unless separately authorized through the new gate and, where Dropbox effects are involved, immediately confirmed before activation.
 
 **Interfaces:**
-- Production proof uses existing PRJ-0002 and read-only/controlled operational surfaces; PRJ-0003 is never mutated.
+- Production proof uses existing PRJ-0002 and read-only/non-writing operational surfaces whenever possible; PRJ-0003 is never mutated.
 - GitHub-hosted Actions only.
 
 - [ ] **Step 1: Before deployment, run the full check/high-risk/dry-run gate and record exact commit SHA and green workflow run in execution notes.**
 - [ ] **Step 2: Deploy R0 and verify authenticated intake health is readable, legacy projects remain readable, no project profile is invented for historical projects, and no business revision changes from observability alone.**
-- [ ] **Step 3: Promote R1 and verify the standard referral renderer/writer in a test fixture or PRJ-0002 self-contained controlled input that does not touch PRJ-0003; verify synthetic rendering using unit/integration evidence rather than creating a new production project.**
+- [ ] **Step 3: Promote R1 and verify route/auth/schema readiness with non-writing rejected requests plus unit/integration evidence. Do not create a fake production referral solely for validation. A positive production referral proof waits for a real user-requested referral or a separately confirmed controlled Dropbox mutation.**
 - [ ] **Step 4: Promote R2 and prove an unauthorized new create request is rejected before allocation. Do not prove the positive path by creating a synthetic project unless the user separately authorizes such a project through the new operator flow.**
-- [ ] **Step 5: Promote R3 and verify scheduled maintenance reports direct sweep and health timestamps every five-minute cycle; verify cursor-independent discovery using controlled PRJ-0002 input evidence.**
-- [ ] **Step 6: If any production gate fails, stop promotion at that stage, preserve evidence, and do not advance to R4.**
-- [ ] **Step 7: Commit execution notes containing only observed evidence, not inferred success.**
+- [ ] **Step 5: Before activating R3 for PRJ-0002, present the exact automatic Dropbox effects expected for the existing stuck referral: intake journal/provenance writes, immutable snapshot, copy to `REFERENCES/UNCLASSIFIED/`, reference ledger/index writes, final source deletion only after proof. Obtain immediate explicit confirmation for that activation.**
+- [ ] **Step 6: After confirmed R3 activation, verify scheduled maintenance reports direct sweep and health timestamps every five-minute cycle and let the existing stuck referral provide the cursor-independent production proof; do not create an additional synthetic INPUT.**
+- [ ] **Step 7: If any production gate fails, stop promotion at that stage, preserve evidence, and do not advance to R4.**
+- [ ] **Step 8: Commit execution notes containing only observed evidence, not inferred success.**
 
 ### Task 14: Repair the historical incidents and define the DOCIDENTITY unfreeze gate
 
@@ -474,7 +473,7 @@ it.each([
 - Existing task history remains untouched: `TASK-IMPDOCIDENTITY001` is not recreated or rewritten.
 - R4 requires PRJ-0006 registry status `archived` and no unauthorized synthetic project active in the portfolio.
 
-- [ ] **Step 1: At R3, let the corrected direct sweep discover the existing stuck referral naturally; do not manually move/delete it.**
+- [ ] **Step 1: After the explicitly confirmed R3 activation, let the corrected direct sweep discover the existing stuck referral naturally; do not manually move/delete it.**
 - [ ] **Step 2: Verify terminal intake journal, immutable snapshot, reference version/head/indexes, `REFERENCES/UNCLASSIFIED/` destination, source removal, and referral provenance sidecar.**
 - [ ] **Step 3: Verify the legacy referral provenance links to the existing DOCIDENTITY work as evidence only; do not rewrite the historical task create/start events and do not create a second task.**
 - [ ] **Step 4: Read the fresh registry and prove PRJ-0006 is still archived and no active synthetic project lacks explicit post-cutover authorization evidence.**
@@ -517,7 +516,7 @@ npx vitest run \
 npx wrangler deploy --dry-run
 ```
 
-Expected result: every command exits 0; no self-hosted runner label exists in changed workflows; no production proof creates a project without the dedicated authorization flow; no PRJ-0003 business mutation occurs; PRJ-0006 remains archived; the existing stuck referral is repaired only by the R3 intake path.
+Expected result: every command exits 0; no self-hosted runner label exists in changed workflows; no production proof creates a project without the dedicated authorization flow; no PRJ-0003 business mutation occurs; PRJ-0006 remains archived; the existing stuck referral is repaired only by the R3 intake path after its Dropbox effects were explicitly confirmed.
 
 ## Execution gate
 

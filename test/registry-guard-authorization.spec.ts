@@ -167,11 +167,12 @@ describe("RegistryGuard project-create authorization", () => {
     const original = createRequest(20);
     const id = await issueMatchingAuthorization(20, original);
     const authorized = createRequest(20, { authorization_id: id });
-    const reservedProjectId = "PRJ-0001";
+
+    // After authorization issuance, the create path writes consumption first and
+    // project governance profile second. Fail that second concrete provider write.
     faults.push({
       endpoint: "/2/files/upload",
-      path: machineProjectGovernanceProfilePath(reservedProjectId),
-      occurrence: 1,
+      occurrence: 2,
       status: 409,
       error_summary: "path/conflict/file/injected_profile_failure"
     });
@@ -184,7 +185,11 @@ describe("RegistryGuard project-create authorization", () => {
       failed = true;
     }
     expect(failed).toBe(true);
-    expect(dropbox.files.has(machineProjectCreateAuthorizationConsumptionPath(id))).toBe(true);
+
+    const consumptionPath = machineProjectCreateAuthorizationConsumptionPath(id);
+    const consumptionRaw = dropbox.files.get(consumptionPath);
+    expect(consumptionRaw).toBeDefined();
+    const reservedProjectId = (JSON.parse(consumptionRaw!) as { allocated_project_id: string }).allocated_project_id;
     expect(dropbox.files.has(machineProjectGovernanceProfilePath(reservedProjectId))).toBe(false);
 
     const competing = await createProject({

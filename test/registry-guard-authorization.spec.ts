@@ -4,8 +4,12 @@ import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import { issueProjectCreateAuthorization } from "../src/governance/project-create-authorization";
 import { GovernanceRepository } from "../src/governance/repository";
+import {
+  machineProjectCreateAuthorizationConsumptionPath,
+  machineProjectGovernanceProfilePath
+} from "../src/persistence/layout";
 import { createProductionPersistence } from "../src/persistence/production-factory";
-import { installDropboxMock } from "./helpers/mock-dropbox";
+import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 const mutableEnv = testEnv as Env & {
@@ -73,19 +77,27 @@ async function issueMatchingAuthorization(
   return id;
 }
 
-async function createProject(transaction: unknown): Promise<Receipt> {
-  const response = await testEnv.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/create", {
+async function createProjectResponse(transaction: unknown): Promise<Response> {
+  return testEnv.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/create", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(transaction)
   });
+}
+
+async function createProject(transaction: unknown): Promise<Receipt> {
+  const response = await createProjectResponse(transaction);
   expect(response.status).toBe(200);
   return response.json<Receipt>();
 }
 
 describe("RegistryGuard project-create authorization", () => {
+  let faults: DropboxMockFault[];
+  let dropbox: ReturnType<typeof installDropboxMock>;
+
   beforeEach(() => {
-    installDropboxMock();
+    faults = [];
+    dropbox = installDropboxMock({ faults });
     mutableEnv.PROJECT_OS_PROJECT_CREATE_AUTH_MODE = "enforce";
     mutableEnv.PROJECT_OS_PROJECT_CREATE_AUTH_FRONTIER = "task4-test";
   });
@@ -149,5 +161,42 @@ describe("RegistryGuard project-create authorization", () => {
     });
     expect(second.status).toBe("rejected");
     expect(second.code).toBe("PROJECT_CREATE_AUTHORIZATION_CONSUMED");
+  });
+
+  it("recovers the same allocated project and governance profile after a post-allocation failure", async () => {
+    const original = createRequest(20);
+    const id = await issueMatchingAuthorization(20, original);
+    const authorized = createRequest(20, { authorization_id: id });
+    const reservedProjectId = "PRJ-0001";
+    faults.push({
+      endpoint: "/2/files/upload",
+      path: machineProjectGovernanceProfilePath(reservedProjectId),
+      occurrence: 1,
+      status: 409,
+      error_summary: "path/conflict/file/injected_profile_failure"
+    });
+
+    let failed = false;
+    try {
+      const response = await createProjectResponse(authorized);
+      failed = !response.ok;
+    } catch {
+      failed = true;
+    }
+    expect(failed).toBe(true);
+    expect(dropbox.files.has(machineProjectCreateAuthorizationConsumptionPath(id))).toBe(true);
+    expect(dropbox.files.has(machineProjectGovernanceProfilePath(reservedProjectId))).toBe(false);
+
+    const competing = await createProject({
+      ...authorized,
+      transaction_id: "TXN-REGAUTH-000020-COMPETING"
+    });
+    expect(competing.status).toBe("rejected");
+    expect(competing.code).toBe("PROJECT_CREATE_AUTHORIZATION_CONSUMED");
+
+    const replay = await createProject(authorized);
+    expect(replay.status).toBe("committed");
+    expect(replay.project_id).toBe(reservedProjectId);
+    expect(dropbox.files.has(machineProjectGovernanceProfilePath(reservedProjectId))).toBe(true);
   });
 });

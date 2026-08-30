@@ -113,6 +113,22 @@ export class LegacyArtifactDocumentWriter {
       return "idempotent";
     }
 
+    // Crash-compatible lazy migration: an interrupted first governed legacy create may
+    // have written the exact raw request bytes before ledger evidence existed. Once the
+    // original governed request is replayed, CAS-upgrade only those exact bytes with the
+    // authoritative visible identity instead of treating the metadata-only enrichment as
+    // a competing publication.
+    if (metadata && currentContent === request.content && currentContent !== managedContent) {
+      await this.assertPublishedBaseline(head, metadata, destination.path);
+      metadata = await this.conditionalReplace(
+        destination.path,
+        managedContent,
+        requireDropboxV1Evidence(metadata).rev
+      );
+      await this.persistPublishedVersion(request, destination, payloadPath, managedContentSha256, documentId, versionId, head, metadata);
+      return "idempotent";
+    }
+
     if (metadata && request.mode === "create") throw new ArtifactContentConflictError(destination.path);
     if (!metadata && head?.published_version_id) throw new ArtifactContentConflictError(destination.path);
 

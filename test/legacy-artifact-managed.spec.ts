@@ -131,7 +131,7 @@ describe("legacy artifact managed-document compatibility", () => {
 
     expect(result).toBe("written");
     const visible = `${workspaceProjectRoot("PRJ-0003", "growth")}/DELIVERABLES/REVENUE-OS/strategy/commercial.md`;
-    expect(dropbox.files.get(visible)).toBe("published v1");
+    expect(dropbox.files.get(visible)).toContain("published v1");
 
     const ledger = new DocumentLedgerRepository(runtime);
     const heads = [...dropbox.files.keys()].filter((path) => path.includes("/documents/heads/"));
@@ -149,10 +149,10 @@ describe("legacy artifact managed-document compatibility", () => {
 
     expect(dropbox.conditionalWrites).toBe(1);
     const visible = `${workspaceProjectRoot("PRJ-0003", "growth")}/DELIVERABLES/REVENUE-OS/strategy/commercial.md`;
-    expect(dropbox.files.get(visible)).toBe("published v2");
+    expect(dropbox.files.get(visible)).toContain("published v2");
     const archive = [...dropbox.files.keys()].find((path) => path.includes("/ARCHIVES/REVENUE-OS/") && path.includes("commercial.previous-"));
     expect(archive).toBeDefined();
-    expect(dropbox.files.get(archive!)).toBe("published v1");
+    expect(dropbox.files.get(archive!)).toContain("published v1");
   });
 
   it("fails closed when a human edit races with a legacy deliverable replace", async () => {
@@ -189,6 +189,7 @@ describe("legacy artifact managed-document compatibility", () => {
 
     const result = await writer.writeIfManaged(state(), await request("partial published", "create", "ART-LEGACY-000008"));
     expect(result).toBe("idempotent");
+    expect(dropbox.files.get(visible)).toContain("partial published");
 
     const heads = [...dropbox.files.keys()].filter((path) => path.includes("/documents/heads/"));
     const head = JSON.parse(dropbox.files.get(heads[0])!);

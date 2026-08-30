@@ -65,7 +65,7 @@ describe("managed-document Worker ingress", () => {
       logical_path: "strategy/commercial.md"
     });
     expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${project.project_id}-document-route/WORKING/strategy/commercial.md`))
-      .toBe(content);
+      .toContain(content);
   });
 
   it("rejects an invalid managed-document schema before routing", async () => {

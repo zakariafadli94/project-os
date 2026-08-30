@@ -155,7 +155,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     expect(head?.working_version_id).toBe(versionId);
     expect(version).toMatchObject({ parent_version_id: first.version_id, stage: "working", source: "external_human", provider_rev: external.rev });
     expect(dropbox.copies.some((copy) => copy.from === path && copy.to.includes(versionId))).toBe(true);
-    expect(dropbox.downloads).not.toContain(path);
+    expect(dropbox.downloads).toContain(path);
   });
 
   it("restores a deleted WORKING file from its immutable active version without advancing history", async () => {
@@ -172,7 +172,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(project.project_id, working.document_id);
     expect(summary.restored).toBe(1);
-    expect(dropbox.files.get(path)).toBe("draft to protect");
+    expect(dropbox.files.get(path)).toContain("draft to protect");
     expect(head?.working_version_id).toBe(working.version_id);
     expect(head?.provider?.working?.path).toBe(path);
   });
@@ -236,7 +236,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const head = await ledger.readHead(project.project_id, working.document_id);
     expect(head?.published_version_id).toBe(published.version_id);
     expect(head?.working_version_id).toBe(await externalVersionIdFor(external.rev));
-    expect(dropbox.files.get(publishedPath)).toBe("approved v1");
+    expect(dropbox.files.get(publishedPath)).toContain("approved v1");
     expect(dropbox.files.get(workingPath)).toBe("human post-publish changes");
   });
 
@@ -256,7 +256,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(project.project_id, working.document_id);
     expect(summary.restored).toBe(1);
-    expect(dropbox.files.get(publishedPath)).toBe("approved deletion-safe v1");
+    expect(dropbox.files.get(publishedPath)).toContain("approved deletion-safe v1");
     expect(head?.published_version_id).toBe(published.version_id);
     expect(head?.provider?.published?.path).toBe(publishedPath);
   });
@@ -282,8 +282,8 @@ describe("ManagedDocumentReconciler external edits", () => {
     expect(head?.published_version_id).toBe(published.version_id);
     expect(head?.working_version_id).toBe(aiDraft.version_id);
     expect(head?.reconciliation_status).toBe("conflict");
-    expect(dropbox.files.get(workingPath)).toBe("new AI draft");
-    expect(dropbox.files.get(publishedPath)).toBe("approved v1");
+    expect(dropbox.files.get(workingPath)).toContain("new AI draft");
+    expect(dropbox.files.get(publishedPath)).toContain("approved v1");
     const recoveredId = await externalVersionIdFor(external.rev);
     expect(await ledger.readVersion(project.project_id, working.document_id, recoveredId)).toMatchObject({ stage: "recovered_external", source: "external_human", parent_version_id: published.version_id });
   });

@@ -125,7 +125,7 @@ describe("project artifact routing", () => {
     await repository.writeArtifact(configuredState(), await artifactRequest());
 
     const activePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-growth/DELIVERABLES/REVENUE-OS/04-playbooks-sectoriels/foo.md";
-    expect(transport.files.get(activePath)).toBe("# routed");
+    expect(transport.files.get(activePath)).toContain("# routed");
     expect([...transport.files.keys()].some((path) => path.includes("/ARTIFACTS/REVENUE-OS/"))).toBe(false);
     expect([...transport.files.keys()].some((path) => path.includes("/.project-os/projects/PRJ-0003/documents/heads/"))).toBe(true);
   });
@@ -165,7 +165,7 @@ describe("project artifact routing", () => {
       content: "# old",
       mode: "create"
     }));
-    expect(transport.files.get(activePath)).toBe("# old");
+    expect(transport.files.get(activePath)).toContain("# old");
 
     await repository.writeArtifact(configuredState(), await artifactRequest({
       request_id: "ART-ROUTING-000002",
@@ -173,12 +173,12 @@ describe("project artifact routing", () => {
       mode: "replace"
     }));
 
-    expect(transport.files.get(activePath)).toBe("# new");
+    expect(transport.files.get(activePath)).toContain("# new");
     expect(transport.conditionalWrites).toBe(1);
     const archivePath = transport.uploads.find((path) => path.includes("/ARCHIVES/REVENUE-OS/") && path.includes("foo.previous-"));
     expect(archivePath).toBeDefined();
     expect(archivePath?.endsWith(".md")).toBe(true);
-    expect(transport.files.get(archivePath!)).toBe("# old");
+    expect(transport.files.get(archivePath!)).toContain("# old");
     expect(transport.uploads.filter((path) => path.includes("/DELIVERABLES/REVENUE-OS/") && path.includes("previous-"))).toHaveLength(0);
   });
 

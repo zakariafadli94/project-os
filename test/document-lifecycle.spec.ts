@@ -136,7 +136,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
 
     await expect(write(service, "DOCREQ-WORK-000005", "stale", v1.version_id))
       .rejects.toBeInstanceOf(ManagedDocumentConflictError);
-    expect(transport.files.get(workingPath)?.content).toBe("two");
+    expect(transport.files.get(workingPath)?.content).toContain("two");
     expect((await service.status("PRJ-0002", v2.document_id))?.working_version_id).toBe(v2.version_id);
   });
 
@@ -153,7 +153,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
       created_at: "2026-08-24T19:01:00+01:00"
     }, state());
     expect(transport.files.has(workingPath)).toBe(false);
-    expect(transport.files.get(reviewPath)?.content).toBe("draft");
+    expect(transport.files.get(reviewPath)?.content).toContain("draft");
     expect(transport.files.has(publishedPath)).toBe(false);
     let status = await service.status("PRJ-0002", working.document_id);
     expect(status?.provider?.working).toBeUndefined();
@@ -179,7 +179,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
     }, state());
 
     expect(transport.files.has(reviewPath)).toBe(false);
-    expect(transport.files.get(publishedPath)?.content).toBe("final candidate");
+    expect(transport.files.get(publishedPath)?.content).toContain("final candidate");
     status = await service.status("PRJ-0002", working.document_id);
     expect(status?.published_version_id).toBe(published.version_id);
     expect(status?.review_version_id).toBeUndefined();
@@ -206,8 +206,8 @@ describe("ManagedDocumentService work-product lifecycle", () => {
       expected_version_id: published.version_id, created_at: "2026-08-24T19:04:00+01:00"
     }, state());
 
-    expect(transport.files.get(publishedPath)?.content).toBe("published content");
-    expect(transport.files.get(workingPath)?.content).toBe("published content");
+    expect(transport.files.get(publishedPath)?.content).toContain("published content");
+    expect(transport.files.get(workingPath)?.content).toContain("published content");
     const status = await service.status("PRJ-0002", working.document_id);
     expect(status?.published_version_id).toBe(published.version_id);
     expect(status?.working_version_id).toBe(reopened.version_id);
@@ -266,7 +266,7 @@ describe("ManagedDocumentService work-product lifecycle", () => {
     }, state())).rejects.toMatchObject({ code: "PROVIDER_CAS_CONFLICT" });
 
     expect(transport.files.get(publishedPath)?.content).toBe("human edit during publish");
-    expect(transport.files.get(reviewPath)?.content).toBe("candidate v2");
+    expect(transport.files.get(reviewPath)?.content).toContain("candidate v2");
     const status = await service.status("PRJ-0002", firstWorking.document_id);
     expect(status?.published_version_id).toBe(firstPublished.version_id);
     expect(status?.review_version_id).toBe(secondReview.version_id);

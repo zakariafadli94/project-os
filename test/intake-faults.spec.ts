@@ -24,7 +24,10 @@ async function fixture(faults: DropboxMockFault[]) {
     appKey: "key",
     appSecret: "secret",
     refreshToken: "refresh"
-  }));
+  }), {
+    sleep: async () => undefined,
+    random: () => 0
+  });
   const state = emptyProjectState("PRJ-9011", "Intake faults", "intake-faults", "Recover intake crashes");
   const source = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-9011-intake-faults/INPUTS/report.pdf";
   await mock.writeExternal(source, "%PDF fault recovery");
@@ -42,16 +45,6 @@ async function fixture(faults: DropboxMockFault[]) {
     head: machineDocumentHeadPath(state.project_id, documentId),
     journal: machineIntakeRecordPath(state.project_id, intakeId)
   };
-}
-
-async function attempt(value: ReturnType<typeof fixture>) {
-  const f = await value;
-  return new IntakeService(f.runtime).process(f.state, {
-    logicalPath: "report.pdf",
-    inputPath: f.source,
-    metadata: f.metadata,
-    detectedAt: at
-  });
 }
 
 describe("IntakeService crash recovery", () => {

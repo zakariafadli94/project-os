@@ -1,11 +1,12 @@
 import type { ProjectGovernanceProfile } from "../domain/project-governance";
 import { machineProjectGovernanceProfilePath } from "../persistence/layout";
-import { asProjectOsPersistence, type PersistenceInput } from "../persistence/provider/runtime";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ProviderConflictError } from "../persistence/provider/errors";
+import { asProjectOsPersistence, type PersistenceInput } from "../persistence/provider/runtime";
 import { parseProjectGovernanceProfile } from "../schema/project-governance";
 
 export class GovernanceRepository {
-  private readonly runtime;
+  private readonly runtime: ProjectOsPersistenceRuntime;
 
   constructor(input: PersistenceInput) {
     this.runtime = asProjectOsPersistence(input);

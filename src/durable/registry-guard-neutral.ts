@@ -121,6 +121,7 @@ export class RegistryGuard extends DurableObject<Env> {
       }
       if (existing.receipt_json) return Response.json(JSON.parse(existing.receipt_json) as Receipt);
       if (!existing.project_id) throw new Error("Registry request has no allocated project ID");
+      await this.restoreAllocatedGovernance(tx, existing.project_id);
       return this.finishAllocatedCreate(tx, existing.project_id);
     }
 
@@ -305,6 +306,28 @@ export class RegistryGuard extends DurableObject<Env> {
       ...(authorization.improvement_package_id ? { improvement_package_id: authorization.improvement_package_id } : {}),
       created_at: tx.created_at
     });
+  }
+
+  private async restoreAllocatedGovernance(tx: ProjectCreateTransaction, projectId: string): Promise<void> {
+    if (this.projectCreateAuthMode !== "enforce") return;
+    const authorizationId = tx.payload.authorization_id;
+    if (!authorizationId || !tx.payload.project_kind) return;
+
+    const [authorization, consumption] = await Promise.all([
+      this.governance.readProjectCreateAuthorization(authorizationId),
+      this.governance.readProjectCreateAuthorizationConsumption(authorizationId)
+    ]);
+    if (!authorization || !consumption) {
+      throw new Error(`Allocated project create is missing governance evidence: ${tx.transaction_id}`);
+    }
+    if (
+      consumption.transaction_id !== tx.transaction_id
+      || consumption.allocated_project_id !== projectId
+      || !authorizationMatchesTransaction(authorization, tx)
+    ) {
+      throw new Error(`Allocated project create governance binding mismatch: ${tx.transaction_id}`);
+    }
+    await this.writeAuthorizedProjectProfile(tx, authorization, projectId);
   }
 
   private async finishAllocatedCreate(original: ProjectCreateTransaction, projectId: string): Promise<Response> {

@@ -1,0 +1,74 @@
+name: apply-docidentity-patch
+
+on:
+  push:
+    branches: [imp/docidentity001-visible-managed-id]
+    paths: [.github/workflows/apply-docidentity-patch.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: imp/docidentity001-visible-managed-id
+      - name: Apply asserted service patch
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+
+          path = Path('src/documents/service.ts')
+          text = path.read_text()
+
+          replacements = [
+            (
+              'import { sha256Text } from "./hash";\nimport { DocumentLedgerRepository } from "./repository";',
+              'import { sha256Text } from "./hash";\nimport { enforceManagedMarkdownIdentity } from "./identity-frontmatter";\nimport { DocumentLedgerRepository } from "./repository";'
+            ),
+            (
+              '    const documentId = await documentIdFor(request.project_id, logicalPath);\n    const versionId = await requestVersionIdFor(request.request_id, "working");',
+              '    const documentId = await documentIdFor(request.project_id, logicalPath);\n    const managedContent = enforceManagedMarkdownIdentity(request.content, {\n      projectId: request.project_id,\n      documentId,\n      logicalPath\n    });\n    const managedContentSha256 = await sha256Text(managedContent);\n    const versionId = await requestVersionIdFor(request.request_id, "working");'
+            ),
+            (
+              '    const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      request.content,',
+              '    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      managedContent,'
+            ),
+            (
+              '      content_sha256: request.content_sha256,\n      ...providerVersionFields(metadata, visiblePath),',
+              '      content_sha256: managedContentSha256,\n      ...providerVersionFields(metadata, visiblePath),'
+            ),
+            (
+              '    const parent = await this.requireVersion(request.project_id, request.document_id, currentVersionId);\n    const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);\n    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      request.content,',
+              '    const parent = await this.requireVersion(request.project_id, request.document_id, currentVersionId);\n    const managedContent = enforceManagedMarkdownIdentity(request.content, {\n      projectId: request.project_id,\n      documentId: request.document_id,\n      logicalPath: head.logical_path\n    });\n    const managedContentSha256 = await sha256Text(managedContent);\n    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);\n    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      managedContent,'
+            )
+          ]
+
+          for old, new in replacements:
+            count = text.count(old)
+            if count != 1:
+              raise SystemExit(f'Expected exactly one service patch anchor, found {count}: {old[:80]!r}')
+            text = text.replace(old, new, 1)
+
+          # The working replacement above changes the first content_sha256 occurrence;
+          # updateReview has a second matching field that must now use its managed hash.
+          review_old = '      content_sha256: request.content_sha256,\n      ...providerVersionFields(metadata, visiblePath),'
+          if text.count(review_old) != 1:
+            raise SystemExit(f'Expected exactly one review content hash anchor, found {text.count(review_old)}')
+          text = text.replace(review_old, '      content_sha256: managedContentSha256,\n      ...providerVersionFields(metadata, visiblePath),', 1)
+
+          path.write_text(text)
+          PY
+      - name: Commit bounded patch
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/documents/service.ts
+          git diff --cached --check
+          git commit -m "feat: enrich managed lifecycle Markdown identity"
+          git push origin HEAD:imp/docidentity001-visible-managed-id

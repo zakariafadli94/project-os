@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import type { ProjectKindView } from "../domain/project-governance";
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { parseLayoutMode } from "../persistence/layout";
@@ -175,7 +176,7 @@ export class RegistryGuard extends DurableObject<Env> {
     });
 
     const entries = this.registryEntries();
-    await this.repository.writeRegistry({ schema_version: "1.0", projects: entries }, renderRegistry(entries));
+    await this.publishRegistry(entries);
     await this.repository.writeReceipt(receipt);
 
     this.ctx.storage.sql.exec(
@@ -207,7 +208,7 @@ export class RegistryGuard extends DurableObject<Env> {
       body.project_id
     );
     const entries = this.registryEntries();
-    await this.repository.writeRegistry({ schema_version: "1.0", projects: entries }, renderRegistry(entries));
+    await this.publishRegistry(entries);
     return Response.json({ status: "ok" });
   }
 
@@ -322,6 +323,18 @@ export class RegistryGuard extends DurableObject<Env> {
       created_at: row.created_at,
       updated_at: row.updated_at
     }));
+  }
+
+  private async publishRegistry(entries: RegistryEntry[]): Promise<void> {
+    const governanceByProject: Record<string, ProjectKindView> = {};
+    for (const entry of entries) {
+      const profile = await this.repository.readProjectGovernanceProfile(entry.project_id);
+      governanceByProject[entry.project_id] = profile?.project_kind ?? "unknown_legacy";
+    }
+    await this.repository.writeRegistry(
+      { schema_version: "1.0", projects: entries },
+      renderRegistry(entries, governanceByProject)
+    );
   }
 
   private persistTerminalRequest(tx: Extract<Transaction, { operation: "project.create" }>, receipt: Receipt, projectId: string | null): void {

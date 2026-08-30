@@ -1,5 +1,6 @@
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import type { ProjectionOutputEvidence } from "../domain/materialization";
+import type { ProjectGovernanceProfile, ProjectKindView } from "../domain/project-governance";
 import type {
   ConstraintRecord,
   DecisionRecord,
@@ -130,11 +131,15 @@ const roadmapInput = (state: ProjectState) => ({
     .map(({ deliverable_id, title, status }) => ({ deliverable_id, title, status }))
 });
 
-const projectInput = (state: ProjectState) => ({
+const projectKindView = (profile?: ProjectGovernanceProfile | null): ProjectKindView =>
+  profile?.project_kind ?? "unknown_legacy";
+
+const projectInput = (state: ProjectState, profile?: ProjectGovernanceProfile | null) => ({
   ...identity(state),
   status: state.status,
   objective: state.objective,
   aliases: state.aliases,
+  project_kind: projectKindView(profile),
   constraints: Object.values(state.constraints)
     .sort((a, b) => a.constraint_id.localeCompare(b.constraint_id))
     .map(({ constraint_id, title, description }) => ({ constraint_id, title, description }))
@@ -164,7 +169,13 @@ function inputForEntity(state: ProjectState, record: ConstraintRecord | Decision
   return { ...identity(state), record };
 }
 
-function globalDescriptors(state: ProjectState, targetRevision: number, projectionVersion: number): OutputDescriptor[] {
+function globalDescriptors(
+  state: ProjectState,
+  targetRevision: number,
+  projectionVersion: number,
+  governanceProfile?: ProjectGovernanceProfile | null
+): OutputDescriptor[] {
+  const projectKind = projectKindView(governanceProfile);
   const descriptors: OutputDescriptor[] = [
     {
       key: "global:BRIEF",
@@ -194,8 +205,8 @@ function globalDescriptors(state: ProjectState, targetRevision: number, projecti
       key: "global:PROJECT",
       relative_path: GLOBAL_PATHS.PROJECT,
       critical: false,
-      semantic_input: projectInput(state),
-      render: () => renderProject(state),
+      semantic_input: projectInput(state, governanceProfile),
+      render: () => renderProject(state, { project_kind: projectKind }),
       entity: false
     },
     {
@@ -323,7 +334,8 @@ async function semanticHash(value: unknown, projectionVersion: number): Promise<
 export async function planProjection(
   record: CanonicalCommitRecord,
   baseline: ProjectionBaseline | null,
-  projectionVersion: number
+  projectionVersion: number,
+  governanceProfile?: ProjectGovernanceProfile | null
 ): Promise<ProjectionPlan> {
   if (!Number.isSafeInteger(projectionVersion) || projectionVersion < 1) {
     throw new Error(`Invalid projection version: ${projectionVersion}`);
@@ -332,7 +344,7 @@ export async function planProjection(
   const state = record.state;
   const changed_outputs = new Map<string, PlannedProjectionOutput>();
   const carried_forward = new Map<string, ProjectionOutputEvidence>();
-  const globals = globalDescriptors(state, record.new_revision, projectionVersion);
+  const globals = globalDescriptors(state, record.new_revision, projectionVersion, governanceProfile);
   const entities = entityDescriptors(state);
   const descriptors = [...globals, ...entities];
   const expected = new Set(descriptors.map((item) => item.key));

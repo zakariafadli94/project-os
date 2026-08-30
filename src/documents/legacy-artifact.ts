@@ -30,6 +30,7 @@ import {
 } from "../persistence/provider/errors";
 import { ManagedDocumentBootstrapper } from "./bootstrap";
 import { sha256Text } from "./hash";
+import { enforceManagedMarkdownIdentity } from "./identity-frontmatter";
 import { DocumentLedgerRepository } from "./repository";
 
 export type LegacyManagedArtifactWriteResult = "written" | "idempotent";
@@ -60,22 +61,29 @@ export class LegacyArtifactDocumentWriter {
     const managed = classifyManagedDestination(state, request, destination);
     if (!managed) return null;
 
+    if (managed.zone === "deliverables") {
+      return this.writePublished(state, request, managed);
+    }
     const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);
-    return managed.zone === "deliverables"
-      ? this.writePublished(state, request, managed, payloadPath)
-      : this.writeReference(state, request, managed, payloadPath);
+    return this.writeReference(state, request, managed, payloadPath);
   }
 
   private async writePublished(
     state: ProjectState,
     request: ArtifactWriteRequest,
-    destination: Extract<ManagedArtifactDestination, { zone: "deliverables" }>,
-    payloadPath: string
+    destination: Extract<ManagedArtifactDestination, { zone: "deliverables" }>
   ): Promise<LegacyManagedArtifactWriteResult> {
     const documentId = await documentIdFor(request.project_id, destination.logicalPath);
+    const managedContent = enforceManagedMarkdownIdentity(request.content, {
+      projectId: request.project_id,
+      documentId,
+      logicalPath: destination.logicalPath
+    });
+    const managedContentSha256 = await sha256Text(managedContent);
+    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);
     const versionId = await legacyVersionIdFor(request.request_id, "published");
     const replay = await this.ledger.readVersion(request.project_id, documentId, versionId);
-    if (replay) return this.validateReplay(replay, request, destination.path);
+    if (replay) return this.validateReplay(replay, request, destination.path, managedContentSha256);
 
     let metadata = await this.metadataMaybe(destination.path);
     let head = await this.readOrRestoreHead(request.project_id, documentId);
@@ -96,12 +104,12 @@ export class LegacyArtifactDocumentWriter {
     const currentContent = metadata ? await this.runtime.objects.readText(destination.path) : null;
     if (metadata && currentContent === null) throw new ArtifactContentConflictError(destination.path);
 
-    if (metadata && currentContent === request.content) {
+    if (metadata && currentContent === managedContent) {
       if (
         sameObservation(head?.provider?.published, metadata)
-        && await this.activeVersionProvesLegacyContent(head, "published", request.content_sha256)
+        && await this.activeVersionProvesLegacyContent(head, "published", managedContentSha256)
       ) return "idempotent";
-      await this.persistPublishedVersion(request, destination, payloadPath, documentId, versionId, head, metadata);
+      await this.persistPublishedVersion(request, destination, payloadPath, managedContentSha256, documentId, versionId, head, metadata);
       return "idempotent";
     }
 
@@ -115,14 +123,14 @@ export class LegacyArtifactDocumentWriter {
       }
       metadata = await this.conditionalReplace(
         destination.path,
-        request.content,
+        managedContent,
         requireDropboxV1Evidence(metadata).rev
       );
     } else {
-      metadata = await this.createVisible(destination.path, request.content);
+      metadata = await this.createVisible(destination.path, managedContent);
     }
 
-    await this.persistPublishedVersion(request, destination, payloadPath, documentId, versionId, head, metadata);
+    await this.persistPublishedVersion(request, destination, payloadPath, managedContentSha256, documentId, versionId, head, metadata);
     return "written";
   }
 
@@ -268,6 +276,7 @@ export class LegacyArtifactDocumentWriter {
     request: ArtifactWriteRequest,
     destination: Extract<ManagedArtifactDestination, { zone: "deliverables" }>,
     payloadPath: string,
+    contentSha256: string,
     documentId: string,
     versionId: string,
     head: ManagedDocumentHead | null,
@@ -286,7 +295,7 @@ export class LegacyArtifactDocumentWriter {
       source: "legacy_artifact_api",
       created_at: metadata.modifiedAt ?? new Date().toISOString(),
       immutable_payload_path: payloadPath,
-      content_sha256: request.content_sha256,
+      content_sha256: contentSha256,
       provider_content_hash: evidence.content_hash,
       provider_file_id: evidence.file_id,
       provider_rev: evidence.rev,
@@ -450,9 +459,10 @@ export class LegacyArtifactDocumentWriter {
   private validateReplay(
     record: DocumentVersionRecord,
     request: ArtifactWriteRequest,
-    path: string
+    path: string,
+    expectedContentSha256 = request.content_sha256
   ): LegacyManagedArtifactWriteResult {
-    if (record.source !== "legacy_artifact_api" || record.content_sha256 !== request.content_sha256 || record.request_id !== request.request_id) {
+    if (record.source !== "legacy_artifact_api" || record.content_sha256 !== expectedContentSha256 || record.request_id !== request.request_id) {
       throw new ArtifactContentConflictError(path);
     }
     return "idempotent";

@@ -1,14 +1,7 @@
 import { deploymentIdentity } from "./deployment/identity";
 import { parseMutationCandidateResolutionRequest } from "./domain/mutation-candidate-resolution";
 import type { Env } from "./env";
-import {
-  issueProjectCreateAuthorization,
-  ProjectCreateAuthorizationIdempotencyError
-} from "./governance/project-create-authorization";
-import { GovernanceRepository } from "./governance/repository";
 import baseWorker from "./index";
-import { createProductionPersistence } from "./persistence/production-factory";
-import { parseProjectCreateAuthorizationRecord } from "./schema/project-governance";
 
 export { MutationGateProjectGuard as ProjectGuard } from "./durable/project-guard-mutation-gate";
 export { RegistryGuard } from "./durable/registry-guard";
@@ -33,26 +26,6 @@ const worker = {
       }
       const stub = env.PROJECT_GUARD.getByName(projectId);
       return stub.fetch("https://project-guard.internal/schema-status", { method: "GET" });
-    }
-
-    if (request.method === "POST" && url.pathname === "/v1/operator/project-create-authorizations") {
-      if (!authorizedProjectCreateOperator(request, env)) {
-        return Response.json({ error: "unauthorized" }, { status: 401 });
-      }
-
-      try {
-        const authorization = parseProjectCreateAuthorizationRecord(await request.json());
-        const repository = new GovernanceRepository(createProductionPersistence(env));
-        return Response.json(await issueProjectCreateAuthorization(repository, authorization));
-      } catch (error) {
-        if (error instanceof ProjectCreateAuthorizationIdempotencyError) {
-          return Response.json({ error: error.code, message: error.message }, { status: 409 });
-        }
-        return Response.json({
-          error: "invalid_project_create_authorization",
-          message: error instanceof Error ? error.message : "Invalid project-create authorization request"
-        }, { status: 400 });
-      }
     }
 
     if (request.method === "POST" && url.pathname === "/v1/mutation-candidates/resolve") {
@@ -85,15 +58,6 @@ export default worker;
 function authorizedIngress(request: Request, env: Env): boolean {
   const authorization = request.headers.get("authorization");
   return !!authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`);
-}
-
-function authorizedProjectCreateOperator(request: Request, env: Env): boolean {
-  const authorization = request.headers.get("authorization");
-  const operatorToken = env.PROJECT_CREATE_OPERATOR_TOKEN;
-  if (!authorization || !operatorToken) return false;
-  if (secureStringEqual(operatorToken, env.INGRESS_TOKEN)) return false;
-  if (env.MUTATION_GATE_OPERATOR_TOKEN && secureStringEqual(operatorToken, env.MUTATION_GATE_OPERATOR_TOKEN)) return false;
-  return secureStringEqual(authorization, `Bearer ${operatorToken}`);
 }
 
 function authorizedResolution(request: Request, env: Env, now = Date.now()): boolean {

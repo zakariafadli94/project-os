@@ -1,9 +1,11 @@
 import type {
+  ProjectCreateAuthorizationConsumption,
   ProjectCreateAuthorizationReceipt,
   ProjectCreateAuthorizationRecord,
   ProjectGovernanceProfile
 } from "../domain/project-governance";
 import {
+  machineProjectCreateAuthorizationConsumptionPath,
   machineProjectCreateAuthorizationIssuedPath,
   machineProjectCreateAuthorizationReceiptPath,
   machineProjectGovernanceProfilePath
@@ -12,6 +14,7 @@ import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabi
 import { ProviderConflictError } from "../persistence/provider/errors";
 import { asProjectOsPersistence, type PersistenceInput } from "../persistence/provider/runtime";
 import {
+  parseProjectCreateAuthorizationConsumption,
   parseProjectCreateAuthorizationReceipt,
   parseProjectCreateAuthorizationRecord,
   parseProjectGovernanceProfile
@@ -61,6 +64,28 @@ export class GovernanceRepository {
       pretty(record),
       (raw) => pretty(parseProjectCreateAuthorizationRecord(JSON.parse(raw))),
       "project-create authorization"
+    );
+  }
+
+  async readProjectCreateAuthorizationConsumption(
+    authorizationId: string
+  ): Promise<ProjectCreateAuthorizationConsumption | null> {
+    const raw = await this.runtime.objects.readText(machineProjectCreateAuthorizationConsumptionPath(authorizationId));
+    if (raw === null) return null;
+    const record = parseProjectCreateAuthorizationConsumption(JSON.parse(raw));
+    if (record.authorization_id !== authorizationId) {
+      throw new Error(`Project-create authorization consumption binding mismatch: expected ${authorizationId}, got ${record.authorization_id}`);
+    }
+    return record;
+  }
+
+  async writeProjectCreateAuthorizationConsumption(input: ProjectCreateAuthorizationConsumption): Promise<void> {
+    const record = parseProjectCreateAuthorizationConsumption(input);
+    await this.writeImmutable(
+      machineProjectCreateAuthorizationConsumptionPath(record.authorization_id),
+      pretty(record),
+      (raw) => pretty(parseProjectCreateAuthorizationConsumption(JSON.parse(raw))),
+      "project-create authorization consumption"
     );
   }
 

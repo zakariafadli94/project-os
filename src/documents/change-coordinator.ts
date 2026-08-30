@@ -14,10 +14,8 @@ import type {
 } from "../persistence/provider/contract";
 import { ProviderCursorResetError } from "../persistence/provider/errors";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
-import {
-  ManagedDocumentReconciler,
-  type ManagedDocumentReconcileSummary
-} from "./reconciler";
+import { ManagedDocumentReconciler } from "./reconciler-intake";
+import type { ManagedDocumentReconcileSummary } from "./reconciler";
 
 const CURSOR_KEY = "managed-document-change-cursor-v1";
 

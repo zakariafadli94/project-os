@@ -1,13 +1,15 @@
 import { z } from "zod";
-import { intakeIdFor, type IntakeRecord } from "../domain/intake";
+import { intakeIdFor, type IntakeHealthRecord, type IntakeRecord } from "../domain/intake";
 import {
+  machineIntakeHealthPath,
   machineIntakeRecordPath,
+  machineIntakeRoot,
   machineReferralProvenancePath
 } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ProviderConflictError } from "../persistence/provider/errors";
 import { asProjectOsPersistence, type PersistenceInput } from "../persistence/provider/runtime";
-import { parseIntakeRecord } from "../schema/intake";
+import { parseIntakeHealthRecord, parseIntakeRecord } from "../schema/intake";
 
 export interface IntakeObservation {
   project_id: string;
@@ -105,6 +107,19 @@ export class IntakeRepository {
     return record;
   }
 
+  async list(projectId: string): Promise<IntakeRecord[]> {
+    const entries = await this.runtime.objects.listChildren(`${machineIntakeRoot(projectId)}/records`);
+    const records: IntakeRecord[] = [];
+    for (const entry of entries) {
+      if (entry.kind !== "file") continue;
+      const match = /^(INTAKE-[A-F0-9]{24})\.json$/.exec(entry.name);
+      if (!match) continue;
+      const record = await this.read(projectId, match[1]);
+      if (record) records.push(record);
+    }
+    return records.sort((left, right) => left.intake_id.localeCompare(right.intake_id));
+  }
+
   async write(input: IntakeRecord): Promise<IntakeRecord> {
     const next = parseIntakeRecord(input);
     const current = await this.read(next.project_id, next.intake_id);
@@ -116,6 +131,22 @@ export class IntakeRepository {
       pretty(next)
     );
     return next;
+  }
+
+  async readHealth(projectId: string): Promise<IntakeHealthRecord | null> {
+    const raw = await this.runtime.objects.readText(machineIntakeHealthPath(projectId));
+    if (raw === null) return null;
+    const health = parseIntakeHealthRecord(JSON.parse(raw));
+    if (health.project_id !== projectId) {
+      throw new Error(`Intake health binding mismatch: expected ${projectId}, got ${health.project_id}`);
+    }
+    return health;
+  }
+
+  async writeHealth(input: IntakeHealthRecord): Promise<IntakeHealthRecord> {
+    const health = parseIntakeHealthRecord(input);
+    await this.runtime.objects.upsertText(machineIntakeHealthPath(health.project_id), pretty(health));
+    return health;
   }
 
   async readReferralProvenance(projectId: string, referralId: string): Promise<ReferralProvenanceRecord | null> {

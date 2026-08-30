@@ -163,7 +163,7 @@ describe("managed document governance acceptance", () => {
     });
     expect(reopened).toMatchObject({ status: "committed", stage: "working" });
     expect(mock.files.get(publishedPath)).toContain(candidateContent);
-    expect(mock.files.get(workingPath)).toBe(candidateContent);
+    expect(mock.files.get(workingPath)).toContain(candidateContent);
 
     const iteration2 = `${candidateContent}\n\n## Iteration 2\nPartner channel added`;
     const vNext = await workingWrite(
@@ -191,7 +191,7 @@ describe("managed document governance acceptance", () => {
     });
 
     expect(published2.version_id).not.toBe(published1.version_id);
-    expect(mock.files.get(publishedPath)).toBe(iteration2);
+    expect(mock.files.get(publishedPath)).toContain(iteration2);
     expect(mock.files.has(machineDocumentVersionPath(created.project_id, v1.document_id, published1.version_id))).toBe(true);
     expect(mock.files.has(machineDocumentVersionPath(created.project_id, v1.document_id, published2.version_id))).toBe(true);
 

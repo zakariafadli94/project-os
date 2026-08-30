@@ -47,24 +47,13 @@ export function enforceManagedMarkdownIdentity(
     ].join(newline);
   }
 
-  const project = findScalar(frontmatter.lines, "project_id");
-  const document = findScalar(frontmatter.lines, "document_id");
-  if (project !== null && project !== identity.projectId) {
-    throw new ManagedDocumentIdentityConflictError(
-      "PROJECT_IDENTITY_MISMATCH",
-      "project_id",
-      identity.projectId,
-      project
-    );
-  }
-  if (document !== null && document !== identity.documentId) {
-    throw new ManagedDocumentIdentityConflictError(
-      "DOCUMENT_IDENTITY_MISMATCH",
-      "document_id",
-      identity.documentId,
-      document
-    );
-  }
+  const projects = findScalars(frontmatter.lines, "project_id");
+  const documents = findScalars(frontmatter.lines, "document_id");
+  assertAllIdentityValues(projects, "PROJECT_IDENTITY_MISMATCH", "project_id", identity.projectId);
+  assertAllIdentityValues(documents, "DOCUMENT_IDENTITY_MISMATCH", "document_id", identity.documentId);
+
+  const project = projects[0] ?? null;
+  const document = documents[0] ?? null;
   if (project !== null && document !== null) return content;
 
   const additions: string[] = [];
@@ -83,24 +72,18 @@ export function assertManagedMarkdownIdentityIfPresent(
   const frontmatter = readFrontmatter(content, newline);
   if (!frontmatter) return;
 
-  const project = findScalar(frontmatter.lines, "project_id");
-  const document = findScalar(frontmatter.lines, "document_id");
-  if (project !== null && project !== identity.projectId) {
-    throw new ManagedDocumentIdentityConflictError(
-      "PROJECT_IDENTITY_MISMATCH",
-      "project_id",
-      identity.projectId,
-      project
-    );
-  }
-  if (document !== null && document !== identity.documentId) {
-    throw new ManagedDocumentIdentityConflictError(
-      "DOCUMENT_IDENTITY_MISMATCH",
-      "document_id",
-      identity.documentId,
-      document
-    );
-  }
+  assertAllIdentityValues(
+    findScalars(frontmatter.lines, "project_id"),
+    "PROJECT_IDENTITY_MISMATCH",
+    "project_id",
+    identity.projectId
+  );
+  assertAllIdentityValues(
+    findScalars(frontmatter.lines, "document_id"),
+    "DOCUMENT_IDENTITY_MISMATCH",
+    "document_id",
+    identity.documentId
+  );
 }
 
 function isMarkdownPath(logicalPath: string): boolean {
@@ -122,14 +105,26 @@ function readFrontmatter(
   };
 }
 
-function findScalar(lines: string[], key: string): string | null {
+function findScalars(lines: string[], key: string): string[] {
   const prefix = `${key}:`;
+  const values: string[] = [];
   for (const line of lines.slice(1, -1)) {
     if (!line.startsWith(prefix)) continue;
     const raw = line.slice(prefix.length).trim();
-    return decodeScalar(raw);
+    values.push(decodeScalar(raw));
   }
-  return null;
+  return values;
+}
+
+function assertAllIdentityValues(
+  values: string[],
+  code: ManagedDocumentIdentityConflictCode,
+  field: "project_id" | "document_id",
+  expected: string
+): void {
+  const conflicting = values.find((value) => value !== expected);
+  if (conflicting === undefined) return;
+  throw new ManagedDocumentIdentityConflictError(code, field, expected, conflicting);
 }
 
 function decodeScalar(raw: string): string {

@@ -326,10 +326,10 @@ export class RegistryGuard extends DurableObject<Env> {
   }
 
   private async publishRegistry(entries: RegistryEntry[]): Promise<void> {
-    const governanceByProject: Record<string, ProjectKindView> = {};
+    const governanceByProject = new Map<string, ProjectKindView>();
     for (const entry of entries) {
       const profile = await this.repository.readProjectGovernanceProfile(entry.project_id);
-      governanceByProject[entry.project_id] = profile?.project_kind ?? "unknown_legacy";
+      governanceByProject.set(entry.project_id, profile?.project_kind ?? "unknown_legacy");
     }
     await this.repository.writeRegistry(
       { schema_version: "1.0", projects: entries },

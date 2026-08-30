@@ -79,6 +79,24 @@ describe("managed Markdown identity frontmatter", () => {
     );
   });
 
+  it("rejects a conflicting duplicate document_id even when the first value is authoritative", () => {
+    const source = [
+      "---",
+      "project_id: PRJ-0003",
+      "document_id: DOC-08B3524AC1CB4D6AE7079816",
+      "document_id: DOC-AAAAAAAAAAAAAAAAAAAAAAAA",
+      "---",
+      "# Strategy",
+      ""
+    ].join("\n");
+
+    expect(() => enforceManagedMarkdownIdentity(source, identity)).toThrowError(
+      expect.objectContaining<Partial<ManagedDocumentIdentityConflictError>>({
+        code: "DOCUMENT_IDENTITY_MISMATCH"
+      })
+    );
+  });
+
   it("leaves non-Markdown content byte-identical", () => {
     const source = "project_id: user-data\nraw payload\n";
 

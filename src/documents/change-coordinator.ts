@@ -12,7 +12,7 @@ import type {
   ProviderChangePage,
   ProviderObjectMetadata
 } from "../persistence/provider/contract";
-import { ProviderCursorResetError } from "../persistence/provider/errors";
+import { ProviderCursorResetError, ProviderOperationError } from "../persistence/provider/errors";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
 import { IntakeSweep, type IntakeSweepSummary } from "./intake-sweep";
 import { ManagedDocumentReconciler } from "./reconciler-intake";
@@ -33,6 +33,7 @@ export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSu
   cursor_advanced: boolean;
   archived: boolean;
   sweep: IntakeSweepSummary;
+  change_feed_error?: string;
 }
 
 interface BootstrapCandidate {
@@ -71,18 +72,43 @@ export class ManagedDocumentChangeCoordinator {
     const existingCursor = await this.cursorStore.get<string>(CURSOR_KEY);
     let cursorReset = false;
     let baseline = !existingCursor;
-    let page: ProviderChangePage;
+    let page: ProviderChangePage | null = null;
+    let changeFeedError: string | undefined;
 
     try {
       page = existingCursor
         ? await this.runtime.changeFeed.listChanges({ cursor: existingCursor })
         : await this.runtime.changeFeed.listChanges({ root });
     } catch (error) {
-      if (!(error instanceof ProviderCursorResetError)) throw error;
-      cursorReset = true;
-      baseline = true;
-      await this.cursorStore.delete(CURSOR_KEY);
-      page = await this.runtime.changeFeed.listChanges({ root });
+      if (error instanceof ProviderCursorResetError) {
+        cursorReset = true;
+        baseline = true;
+        await this.cursorStore.delete(CURSOR_KEY);
+        try {
+          page = await this.runtime.changeFeed.listChanges({ root });
+        } catch (rebuildError) {
+          if (!isChangeFeedFailure(rebuildError)) throw rebuildError;
+          changeFeedError = rebuildError.message;
+        }
+      } else if (isChangeFeedFailure(error)) {
+        changeFeedError = error.message;
+      } else {
+        throw error;
+      }
+    }
+
+    if (page === null) {
+      // A transient/exhausted change-feed failure must not disable the independent
+      // INPUT safety net. Do not advance or fabricate a cursor; only run the
+      // direct sweep. Errors from the sweep itself still propagate fail-closed.
+      const sweep = await this.intakeSweep.sweep(state, new Date().toISOString());
+      return {
+        ...emptySummary({ archived: false }, this.mutationGateMode()),
+        cursor_reset: cursorReset,
+        baseline,
+        sweep,
+        ...(changeFeedError ? { change_feed_error: changeFeedError } : {})
+      };
     }
 
     const detectionSource = cursorReset ? "cursor_reset" : baseline ? "baseline" : "incremental";
@@ -174,6 +200,10 @@ export class ManagedDocumentChangeCoordinator {
   private mutationGateMode(): MutationGateMode {
     return this.gateMode;
   }
+}
+
+function isChangeFeedFailure(error: unknown): error is ProviderOperationError {
+  return error instanceof ProviderOperationError && error.diagnostics?.operation === "changes";
 }
 
 function isProjectedDeliverableMetadata(state: ProjectState, relativePath: string): boolean {

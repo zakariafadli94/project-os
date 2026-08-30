@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
+import { ProviderConflictError } from "../src/persistence/provider/errors";
 import { ReferralService } from "../src/referrals/service";
 
 const request = {
@@ -21,7 +22,7 @@ function runtime() {
   const objects = {
     readText: async (path: string) => { reads.push(path); return files.get(path) ?? null; },
     createText: async (path: string, content: string) => {
-      if (files.has(path)) throw new Error(`exists ${path}`);
+      if (files.has(path)) throw new ProviderConflictError(`exists ${path}`);
       creates.push(path);
       files.set(path, content);
     },
@@ -44,6 +45,14 @@ function runtime() {
     }
   } satisfies ProjectOsPersistenceRuntime;
   return { value, files, reads, creates };
+}
+
+function directory(status: "active" | "archived" = "active") {
+  return {
+    resolveProject: async (projectId: string) => projectId === "PRJ-0002"
+      ? { project_id: "PRJ-0002", slug: "project-os", status }
+      : null
+  };
 }
 
 describe("ReferralService", () => {
@@ -71,5 +80,32 @@ describe("ReferralService", () => {
     expect(receipt.input_path).toBe("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/INPUTS/REFERRAL-REF-GOV-000000000002.md");
     expect(storage.files.get(receipt.input_path!)).toContain("canonical: false");
     expect(storage.reads.some((path) => /HANDOFF\.md|STATE\.md|PLAN\.md|DECISIONS|RESEARCH/.test(path))).toBe(false);
+  });
+
+  it("returns the original receipt for an exact replay without creating a second input", async () => {
+    const storage = runtime();
+    const service = new ReferralService(storage.value, directory(), () => "2026-08-30T10:06:00.000Z");
+    const first = await service.deliver(request);
+    const createsAfterFirst = storage.creates.length;
+    const replay = await service.deliver(request);
+    expect(replay).toEqual(first);
+    expect(storage.creates.length).toBe(createsAfterFirst);
+  });
+
+  it("rejects an archived target without writing into its INPUTS", async () => {
+    const storage = runtime();
+    const service = new ReferralService(storage.value, directory("archived"));
+    const receipt = await service.deliver(request);
+    expect(receipt).toMatchObject({ status: "rejected", code: "REFERRAL_TARGET_ARCHIVED" });
+    expect([...storage.files.keys()].some((path) => path.includes("/INPUTS/"))).toBe(false);
+  });
+
+  it("fails closed when the deterministic destination already contains different bytes", async () => {
+    const storage = runtime();
+    const inputPath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/INPUTS/REFERRAL-REF-GOV-000000000002.md";
+    storage.files.set(inputPath, "different bytes");
+    const service = new ReferralService(storage.value, directory());
+    await expect(service.deliver(request)).rejects.toThrow(/destination conflict/i);
+    expect(storage.files.get(inputPath)).toBe("different bytes");
   });
 });

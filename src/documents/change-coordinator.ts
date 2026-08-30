@@ -14,6 +14,7 @@ import type {
 } from "../persistence/provider/contract";
 import { ProviderCursorResetError } from "../persistence/provider/errors";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
+import { IntakeSweep, type IntakeSweepSummary } from "./intake-sweep";
 import { ManagedDocumentReconciler } from "./reconciler-intake";
 import type { ManagedDocumentReconcileSummary } from "./reconciler";
 
@@ -31,6 +32,7 @@ export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSu
   baseline: boolean;
   cursor_advanced: boolean;
   archived: boolean;
+  sweep: IntakeSweepSummary;
 }
 
 interface BootstrapCandidate {
@@ -45,6 +47,7 @@ export class ManagedDocumentChangeCoordinator {
   private readonly bootstrapper: ManagedDocumentBootstrapper;
   private readonly mutationClassifier: MutationGateClassifier;
   private readonly mutationGate: MutationGateService;
+  private readonly intakeSweep: IntakeSweep;
 
   constructor(
     input: PersistenceInput,
@@ -56,6 +59,7 @@ export class ManagedDocumentChangeCoordinator {
     this.bootstrapper = new ManagedDocumentBootstrapper(this.runtime);
     this.mutationClassifier = new MutationGateClassifier(this.runtime);
     this.mutationGate = new MutationGateService(this.runtime, gateMode);
+    this.intakeSweep = new IntakeSweep(this.runtime);
   }
 
   async reconcile(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
@@ -95,6 +99,11 @@ export class ManagedDocumentChangeCoordinator {
     const cursorAdvanced = page.cursor.length > 0 && page.cursor !== existingCursor;
     if (page.cursor.length > 0) await this.cursorStore.put(CURSOR_KEY, page.cursor);
 
+    // The provider change cursor is the fast path, not the sole discovery
+    // mechanism for INPUTS. Every document maintenance call directly sweeps the
+    // bound INPUTS subtree through the same crash-safe intake engine.
+    const sweep = await this.intakeSweep.sweep(state, new Date().toISOString());
+
     return {
       ...summary,
       ...gateSummary,
@@ -102,7 +111,8 @@ export class ManagedDocumentChangeCoordinator {
       cursor_reset: cursorReset,
       baseline,
       cursor_advanced: cursorAdvanced,
-      archived: false
+      archived: false,
+      sweep
     };
   }
 
@@ -187,6 +197,13 @@ function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): Man
     cursor_reset: false,
     baseline: false,
     cursor_advanced: false,
-    archived: flags.archived
+    archived: flags.archived,
+    sweep: {
+      archived: flags.archived,
+      files_scanned: 0,
+      ingested: 0,
+      duplicates: 0,
+      failed: 0
+    }
   };
 }

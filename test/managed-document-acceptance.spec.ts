@@ -150,7 +150,7 @@ describe("managed document governance acceptance", () => {
     expect(published1).toMatchObject({ status: "committed", stage: "published" });
 
     const publishedPath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-managed-acceptance/DELIVERABLES/strategy/commercial.md`;
-    expect(mock.files.get(publishedPath)).toBe(candidateContent);
+    expect(mock.files.get(publishedPath)).toContain(candidateContent);
     expect(mock.files.has(machineDocumentVersionPath(created.project_id, v1.document_id, published1.version_id))).toBe(true);
 
     const reopened = await postDocument(guard, {
@@ -162,8 +162,8 @@ describe("managed document governance acceptance", () => {
       created_at: at
     });
     expect(reopened).toMatchObject({ status: "committed", stage: "working" });
-    expect(mock.files.get(publishedPath)).toBe(candidateContent);
-    expect(mock.files.get(workingPath)).toBe(candidateContent);
+    expect(mock.files.get(publishedPath)).toContain(candidateContent);
+    expect(mock.files.get(workingPath)).toContain(candidateContent);
 
     const iteration2 = `${candidateContent}\n\n## Iteration 2\nPartner channel added`;
     const vNext = await workingWrite(
@@ -191,7 +191,7 @@ describe("managed document governance acceptance", () => {
     });
 
     expect(published2.version_id).not.toBe(published1.version_id);
-    expect(mock.files.get(publishedPath)).toBe(iteration2);
+    expect(mock.files.get(publishedPath)).toContain(iteration2);
     expect(mock.files.has(machineDocumentVersionPath(created.project_id, v1.document_id, published1.version_id))).toBe(true);
     expect(mock.files.has(machineDocumentVersionPath(created.project_id, v1.document_id, published2.version_id))).toBe(true);
 

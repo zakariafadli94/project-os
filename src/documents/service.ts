@@ -21,6 +21,7 @@ import {
   ProviderPreconditionFailedError
 } from "../persistence/provider/errors";
 import { sha256Text } from "./hash";
+import { enforceManagedMarkdownIdentity } from "./identity-frontmatter";
 import { DocumentLedgerRepository } from "./repository";
 
 export interface ManagedTextWriteRequest {
@@ -95,6 +96,12 @@ export class ManagedDocumentService {
     const logicalPath = assertManagedRelativePath(request.logical_path);
     await this.assertContentHash(request.content, request.content_sha256);
     const documentId = await documentIdFor(request.project_id, logicalPath);
+    const managedContent = enforceManagedMarkdownIdentity(request.content, {
+      projectId: request.project_id,
+      documentId,
+      logicalPath
+    });
+    const managedContentSha256 = await sha256Text(managedContent);
     const versionId = await requestVersionIdFor(request.request_id, "working");
     const replay = await this.ledger.readVersion(request.project_id, documentId, versionId);
     if (replay) return receiptFor(request.request_id, replay);
@@ -114,10 +121,10 @@ export class ManagedDocumentService {
     const currentVersionId = head?.working_version_id ?? head?.published_version_id;
     this.assertExpectedVersion(request.expected_version_id, currentVersionId, documentId);
     const parent = currentVersionId ? await this.requireVersion(request.project_id, documentId, currentVersionId) : null;
-    const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);
+    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);
     const metadata = await this.writeTextAtStage(
       visiblePath,
-      request.content,
+      managedContent,
       head?.working_version_id ? parent : null,
       head?.provider?.working,
       documentId
@@ -135,7 +142,7 @@ export class ManagedDocumentService {
       source: "project_os",
       created_at: request.created_at,
       immutable_payload_path: payloadPath,
-      content_sha256: request.content_sha256,
+      content_sha256: managedContentSha256,
       ...providerVersionFields(metadata, visiblePath),
       request_id: request.request_id
     };
@@ -171,11 +178,17 @@ export class ManagedDocumentService {
     }
     this.assertExpectedVersion(request.expected_version_id, currentVersionId, request.document_id);
     const parent = await this.requireVersion(request.project_id, request.document_id, currentVersionId);
-    const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);
+    const managedContent = enforceManagedMarkdownIdentity(request.content, {
+      projectId: request.project_id,
+      documentId: request.document_id,
+      logicalPath: head.logical_path
+    });
+    const managedContentSha256 = await sha256Text(managedContent);
+    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);
     const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);
     const metadata = await this.writeTextAtStage(
       visiblePath,
-      request.content,
+      managedContent,
       parent,
       head.provider?.review,
       request.document_id
@@ -188,7 +201,7 @@ export class ManagedDocumentService {
       source: "project_os",
       created_at: request.created_at,
       immutable_payload_path: payloadPath,
-      content_sha256: request.content_sha256,
+      content_sha256: managedContentSha256,
       ...providerVersionFields(metadata, visiblePath),
       request_id: request.request_id
     });

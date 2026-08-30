@@ -144,7 +144,7 @@ describe("ManagedDocumentBootstrapper", () => {
 
     expect(receipt.status).toBe("committed");
     expect(receipt.version_id).not.toBe(adopted.version.version_id);
-    expect(transport.files.get(workingPath)?.content).toBe(next);
+    expect(transport.files.get(workingPath)?.content).toContain(next);
     expect(transport.visibleUploads).toEqual([workingPath]);
   });
 

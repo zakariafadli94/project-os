@@ -151,7 +151,7 @@ describe("managed document crash recovery", () => {
     }
 
     const publishedPath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-managed-fault/DELIVERABLES/strategy/commercial.md`;
-    expect(mock.files.get(publishedPath)).toBe("published v2 after crash");
+    expect(mock.files.get(publishedPath)).toContain("published v2 after crash");
     expect(mock.files.has(versionPath)).toBe(false);
 
     const replayResponse = await documentCall(guard, publishBody);

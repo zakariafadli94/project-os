@@ -149,6 +149,25 @@ Rules:
 
 The Durable Object SQLite tables are hot acceleration only. Loss of the local `document_requests` cache must not allow the same `request_id` to be rebound to a different document operation.
 
+## Visible logical document identity
+
+Project-OS-authored Markdown work products expose their authoritative logical identity directly in YAML frontmatter:
+
+```yaml
+---
+project_id: PRJ-0003
+document_id: DOC-08B3524AC1CB4D6AE7079816
+---
+```
+
+The hidden Managed Documents ledger remains authoritative. `document_id` identifies the logical document; it is not a task ID, decision ID, provider file ID or immutable version ID. Existing metadata such as `task_id` may coexist with it. A visible `project_id` or `document_id` that disagrees with the governed head is treated as an identity conflict and is never silently adopted. Reconciliation permits missing identity only for historical/pre-feature Markdown so deployment does not trigger a bulk rewrite.
+
+For a Project-OS-authored Markdown write, ordering is deliberate: validate the caller-supplied SHA-256 against the caller bytes, resolve the authoritative logical identity, enrich the Markdown, compute SHA-256 of the enriched bytes, then store and materialize those exact enriched bytes. The immutable version record therefore hashes the same bytes that recovery can later replay. Non-Markdown content and managed REFERENCES remain byte-preserving.
+
+WORKING → REVIEW → DELIVERABLES promotion does not change `document_id`; new immutable versions change `version_id`. Initial compatibility allocation may still derive a `DOC-...` value from `project_id + initial logical_path`, but after the head exists the stored `document_id` is authoritative. A future governed rename must mutate `logical_path` while preserving that identity; IMP-DOCIDENTITY001 does not introduce a rename API.
+
+The legacy artifact API follows the same rule for governed Markdown routed to `DELIVERABLES/`: visible bytes and immutable payload evidence contain the authoritative identity. Historical documents are enriched lazily on a governed rewrite/republication rather than mass-rewritten during deployment. REVIEW active-head/supersession cleanup is a separate lifecycle concern.
+
 ## Concurrency and idempotency model
 
 Managed document writes use independent protections.

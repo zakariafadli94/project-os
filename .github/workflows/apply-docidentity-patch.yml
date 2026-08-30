@@ -25,41 +25,48 @@ jobs:
           path = Path('src/documents/service.ts')
           text = path.read_text()
 
-          replacements = [
-            (
-              'import { sha256Text } from "./hash";\nimport { DocumentLedgerRepository } from "./repository";',
-              'import { sha256Text } from "./hash";\nimport { enforceManagedMarkdownIdentity } from "./identity-frontmatter";\nimport { DocumentLedgerRepository } from "./repository";'
-            ),
-            (
-              '    const documentId = await documentIdFor(request.project_id, logicalPath);\n    const versionId = await requestVersionIdFor(request.request_id, "working");',
-              '    const documentId = await documentIdFor(request.project_id, logicalPath);\n    const managedContent = enforceManagedMarkdownIdentity(request.content, {\n      projectId: request.project_id,\n      documentId,\n      logicalPath\n    });\n    const managedContentSha256 = await sha256Text(managedContent);\n    const versionId = await requestVersionIdFor(request.request_id, "working");'
-            ),
-            (
-              '    const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      request.content,',
-              '    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      managedContent,'
-            ),
-            (
-              '      content_sha256: request.content_sha256,\n      ...providerVersionFields(metadata, visiblePath),',
-              '      content_sha256: managedContentSha256,\n      ...providerVersionFields(metadata, visiblePath),'
-            ),
-            (
-              '    const parent = await this.requireVersion(request.project_id, request.document_id, currentVersionId);\n    const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);\n    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      request.content,',
-              '    const parent = await this.requireVersion(request.project_id, request.document_id, currentVersionId);\n    const managedContent = enforceManagedMarkdownIdentity(request.content, {\n      projectId: request.project_id,\n      documentId: request.document_id,\n      logicalPath: head.logical_path\n    });\n    const managedContentSha256 = await sha256Text(managedContent);\n    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);\n    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      managedContent,'
-            )
-          ]
-
-          for old, new in replacements:
+          def replace_once(old: str, new: str, label: str) -> None:
+            global text
             count = text.count(old)
             if count != 1:
-              raise SystemExit(f'Expected exactly one service patch anchor, found {count}: {old[:80]!r}')
+              raise SystemExit(f'Expected exactly one {label} anchor, found {count}: {old[:100]!r}')
             text = text.replace(old, new, 1)
 
-          # The working replacement above changes the first content_sha256 occurrence;
-          # updateReview has a second matching field that must now use its managed hash.
-          review_old = '      content_sha256: request.content_sha256,\n      ...providerVersionFields(metadata, visiblePath),'
-          if text.count(review_old) != 1:
-            raise SystemExit(f'Expected exactly one review content hash anchor, found {text.count(review_old)}')
-          text = text.replace(review_old, '      content_sha256: managedContentSha256,\n      ...providerVersionFields(metadata, visiblePath),', 1)
+          replace_once(
+            'import { sha256Text } from "./hash";\nimport { DocumentLedgerRepository } from "./repository";',
+            'import { sha256Text } from "./hash";\nimport { enforceManagedMarkdownIdentity } from "./identity-frontmatter";\nimport { DocumentLedgerRepository } from "./repository";',
+            'identity import'
+          )
+
+          replace_once(
+            '    const documentId = await documentIdFor(request.project_id, logicalPath);\n    const versionId = await requestVersionIdFor(request.request_id, "working");',
+            '    const documentId = await documentIdFor(request.project_id, logicalPath);\n    const managedContent = enforceManagedMarkdownIdentity(request.content, {\n      projectId: request.project_id,\n      documentId,\n      logicalPath\n    });\n    const managedContentSha256 = await sha256Text(managedContent);\n    const versionId = await requestVersionIdFor(request.request_id, "working");',
+            'working identity enrichment'
+          )
+
+          replace_once(
+            '    const parent = currentVersionId ? await this.requireVersion(request.project_id, documentId, currentVersionId) : null;\n    const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      request.content,',
+            '    const parent = currentVersionId ? await this.requireVersion(request.project_id, documentId, currentVersionId) : null;\n    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      managedContent,',
+            'working payload/write'
+          )
+
+          replace_once(
+            '      immutable_payload_path: payloadPath,\n      content_sha256: request.content_sha256,\n      ...providerVersionFields(metadata, visiblePath),\n      request_id: request.request_id\n    };\n    await this.ledger.writeVersion(record);',
+            '      immutable_payload_path: payloadPath,\n      content_sha256: managedContentSha256,\n      ...providerVersionFields(metadata, visiblePath),\n      request_id: request.request_id\n    };\n    await this.ledger.writeVersion(record);',
+            'working version hash'
+          )
+
+          replace_once(
+            '    const parent = await this.requireVersion(request.project_id, request.document_id, currentVersionId);\n    const payloadPath = await this.ledger.storeTextPayload(request.project_id, request.content_sha256, request.content);\n    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      request.content,',
+            '    const parent = await this.requireVersion(request.project_id, request.document_id, currentVersionId);\n    const managedContent = enforceManagedMarkdownIdentity(request.content, {\n      projectId: request.project_id,\n      documentId: request.document_id,\n      logicalPath: head.logical_path\n    });\n    const managedContentSha256 = await sha256Text(managedContent);\n    const payloadPath = await this.ledger.storeTextPayload(request.project_id, managedContentSha256, managedContent);\n    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, "review", head.logical_path);\n    const metadata = await this.writeTextAtStage(\n      visiblePath,\n      managedContent,',
+            'review identity/payload/write'
+          )
+
+          replace_once(
+            '      immutable_payload_path: payloadPath,\n      content_sha256: request.content_sha256,\n      ...providerVersionFields(metadata, visiblePath),\n      request_id: request.request_id\n    });\n    await this.ledger.writeVersion(record);',
+            '      immutable_payload_path: payloadPath,\n      content_sha256: managedContentSha256,\n      ...providerVersionFields(metadata, visiblePath),\n      request_id: request.request_id\n    });\n    await this.ledger.writeVersion(record);',
+            'review version hash'
+          )
 
           path.write_text(text)
           PY

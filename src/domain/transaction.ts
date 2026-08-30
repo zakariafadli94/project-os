@@ -6,6 +6,8 @@ const stableId = (prefix: string) => z.string().regex(new RegExp(`^${prefix}-[A-
 const slug = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 const nonEmpty = z.string().trim().min(1);
 const timestamp = z.string().datetime({ offset: true });
+const projectCreateAuthorizationId = z.string().regex(/^PCAUTH-[A-Z0-9-]{12,}$/);
+const projectKind = z.enum(["real", "synthetic_probe", "synthetic_stress_test"]);
 const safeRelativePrefix = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/).refine(
   (value) => !value.startsWith("/") && !value.endsWith("/") && !value.includes("//") && !value.split("/").some((segment) => segment === "." || segment === ".."),
   { message: "unsafe relative prefix" }
@@ -64,7 +66,11 @@ const projectCreate = z.strictObject({
     name: nonEmpty,
     slug,
     aliases: z.array(nonEmpty).default([]),
-    objective: nonEmpty
+    objective: nonEmpty,
+    authorization_id: projectCreateAuthorizationId.optional(),
+    project_kind: projectKind.optional(),
+    parent_project_id: projectId.optional(),
+    improvement_package_id: stableId("IMP").optional()
   })
 });
 

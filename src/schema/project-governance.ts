@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   PROJECT_KIND_VALUES,
+  type ProjectCreateAuthorizationConsumption,
   type ProjectCreateAuthorizationReceipt,
   type ProjectCreateAuthorizationRecord,
   type ProjectGovernanceProfile
@@ -8,6 +9,7 @@ import {
 
 const projectIdSchema = z.string().regex(/^PRJ-[0-9]{4,}$/);
 const authorizationIdSchema = z.string().regex(/^PCAUTH-[A-Z0-9-]{12,}$/);
+const transactionIdSchema = z.string().regex(/^TXN-[A-Z0-9-]{10,}$/);
 const improvementPackageIdSchema = z.string().regex(/^IMP-[A-Z0-9-]{4,}$/);
 const timestampSchema = z.string().datetime({ offset: true });
 const slugSchema = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
@@ -39,6 +41,14 @@ export const projectCreateAuthorizationRecordSchema = z.strictObject({
   allocated_project_id: projectIdSchema.optional()
 }).superRefine(requireSyntheticBinding);
 
+export const projectCreateAuthorizationConsumptionSchema = z.strictObject({
+  schema_version: z.literal("1.0"),
+  authorization_id: authorizationIdSchema,
+  transaction_id: transactionIdSchema,
+  allocated_project_id: projectIdSchema,
+  consumed_at: timestampSchema
+});
+
 export const projectCreateAuthorizationReceiptSchema = z.strictObject({
   schema_version: z.literal("1.0"),
   authorization_id: authorizationIdSchema,
@@ -55,6 +65,10 @@ export function parseProjectGovernanceProfile(input: unknown): ProjectGovernance
 
 export function parseProjectCreateAuthorizationRecord(input: unknown): ProjectCreateAuthorizationRecord {
   return projectCreateAuthorizationRecordSchema.parse(input);
+}
+
+export function parseProjectCreateAuthorizationConsumption(input: unknown): ProjectCreateAuthorizationConsumption {
+  return projectCreateAuthorizationConsumptionSchema.parse(input);
 }
 
 export function parseProjectCreateAuthorizationReceipt(input: unknown): ProjectCreateAuthorizationReceipt {

@@ -1,3 +1,4 @@
+import type { IntakeRecord } from "../domain/intake";
 import { documentIdForProviderFile, externalVersionIdFor } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
 import {
@@ -10,6 +11,7 @@ import {
 } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import { ProviderOperationError } from "../persistence/provider/errors";
 import { asProjectOsPersistence, type PersistenceInput } from "../persistence/provider/runtime";
 import { DocumentLedgerRepository, type ReferenceFingerprintRecord } from "./repository";
 import {
@@ -26,6 +28,13 @@ export interface IntakeProcessInput {
 }
 
 export type IntakeProcessResult = "ingested" | "duplicate" | "pending" | "failed";
+
+class IntakeEvidenceConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IntakeEvidenceConflictError";
+  }
+}
 
 export class IntakeService {
   private readonly runtime: ProjectOsPersistenceRuntime;
@@ -63,49 +72,9 @@ export class IntakeService {
       step_evidence: { ...(journal.step_evidence ?? {}), intent: true }
     });
 
-    const duplicate = await this.proveCurrentDuplicate(state.project_id, sourceEvidence.content_hash);
-    if (duplicate) {
-      const provenance = await this.referralProvenanceIfApplicable(
-        state,
-        input,
-        duplicate.document_id,
-        duplicate.version_id,
-        sourceEvidence.file_id,
-        sourceEvidence.rev
-      );
-      if (provenance) await this.intake.writeReferralProvenance(provenance);
-      const sourceCleanup = await this.deleteSourceIfUnchanged(input.inputPath, sourceEvidence);
-      await this.intake.write({
-        ...journal,
-        state: "duplicate",
-        document_id: duplicate.document_id,
-        version_id: duplicate.version_id,
-        reference_path: duplicate.reference_path,
-        step_evidence: {
-          ...(journal.step_evidence ?? {}),
-          duplicate_verified: true,
-          source_cleanup: sourceCleanup
-        }
-      });
-      return "duplicate";
-    }
-
     const documentId = await documentIdForProviderFile(state.project_id, sourceEvidence.file_id);
     const versionId = await externalVersionIdFor(sourceEvidence.rev);
     const immutablePayloadPath = machineDocumentProviderPayloadPath(state.project_id, documentId, versionId);
-
-    await this.ledger.snapshotProviderFile(
-      state.project_id,
-      documentId,
-      versionId,
-      input.inputPath,
-      input.metadata
-    );
-    journal = await this.intake.write({
-      ...journal,
-      step_evidence: { ...(journal.step_evidence ?? {}), snapshot_path: immutablePayloadPath }
-    });
-
     const relativeReferencePath = `UNCLASSIFIED/${input.logicalPath}`;
     const targetPath = workspaceManagedDocumentPath(
       state.project_id,
@@ -113,97 +82,192 @@ export class IntakeService {
       "references",
       relativeReferencePath
     );
-    await this.ensureDestinationCopy(input.inputPath, targetPath, sourceEvidence.content_hash, sourceEvidence.size);
-    const targetMetadata = await this.requireMatchingMetadata(targetPath, sourceEvidence.content_hash, sourceEvidence.size);
-    const targetEvidence = requireDropboxV1Evidence(targetMetadata);
-    journal = await this.intake.write({
-      ...journal,
-      step_evidence: {
-        ...(journal.step_evidence ?? {}),
-        destination_path: targetPath,
-        destination_verified: true
+
+    try {
+      if (this.isOwnGovernedReferenceReplay(journal, documentId, versionId)) {
+        await this.requireGovernedReference(
+          state.project_id,
+          documentId,
+          versionId,
+          targetPath,
+          sourceEvidence.content_hash,
+          sourceEvidence.size
+        );
+        const provenance = await this.referralProvenanceIfApplicable(
+          state,
+          input,
+          documentId,
+          versionId,
+          sourceEvidence.file_id,
+          sourceEvidence.rev
+        );
+        if (provenance) await this.intake.writeReferralProvenance(provenance);
+        const sourceCleanup = await this.deleteSourceIfUnchanged(input.inputPath, sourceEvidence);
+        await this.intake.write({
+          ...journal,
+          state: "ingested",
+          document_id: documentId,
+          version_id: versionId,
+          reference_path: relativeReferencePath,
+          step_evidence: { ...(journal.step_evidence ?? {}), source_cleanup: sourceCleanup }
+        });
+        return "ingested";
       }
-    });
 
-    await this.ledger.writeVersion({
-      schema_version: "1.0",
-      project_id: state.project_id,
-      document_id: documentId,
-      version_id: versionId,
-      kind: "reference",
-      stage: "reference",
-      logical_path: input.logicalPath,
-      source: "input_ingest",
-      created_at: input.metadata.modifiedAt ?? input.detectedAt,
-      immutable_payload_path: immutablePayloadPath,
-      provider_content_hash: targetEvidence.content_hash,
-      provider_file_id: targetEvidence.file_id,
-      provider_rev: targetEvidence.rev,
-      provider_path: targetPath,
-      size: targetEvidence.size
-    });
-    await this.ledger.writeHead({
-      schema_version: "1.0",
-      project_id: state.project_id,
-      document_id: documentId,
-      kind: "reference",
-      logical_path: input.logicalPath,
-      collection_path: "UNCLASSIFIED",
-      reference_version_id: versionId,
-      provider: { reference: toManagedProviderObservation({ ...targetMetadata, path: targetPath }) },
-      reconciliation_status: "clean"
-    });
-    await this.ledger.writeProviderFileBinding({
-      schema_version: "1.0",
-      project_id: state.project_id,
-      provider_file_id: targetEvidence.file_id,
-      document_id: documentId
-    });
-    await this.ledger.writeReferenceFingerprint({
-      schema_version: "1.0",
-      project_id: state.project_id,
-      provider_content_hash: targetEvidence.content_hash,
-      document_id: documentId,
-      version_id: versionId
-    });
-    await this.requireGovernedReference(
-      state.project_id,
-      documentId,
-      versionId,
-      targetPath,
-      targetEvidence.content_hash,
-      targetEvidence.size
-    );
-    journal = await this.intake.write({
-      ...journal,
-      document_id: documentId,
-      version_id: versionId,
-      reference_path: relativeReferencePath,
-      step_evidence: {
-        ...(journal.step_evidence ?? {}),
-        version_written: true,
-        head_indexes_written: true,
-        governed_reference_verified: true
+      const duplicate = await this.proveCurrentDuplicate(state.project_id, sourceEvidence.content_hash);
+      if (duplicate) {
+        const provenance = await this.referralProvenanceIfApplicable(
+          state,
+          input,
+          duplicate.document_id,
+          duplicate.version_id,
+          sourceEvidence.file_id,
+          sourceEvidence.rev
+        );
+        if (provenance) await this.intake.writeReferralProvenance(provenance);
+        const sourceCleanup = await this.deleteSourceIfUnchanged(input.inputPath, sourceEvidence);
+        await this.intake.write({
+          ...journal,
+          state: "duplicate",
+          document_id: duplicate.document_id,
+          version_id: duplicate.version_id,
+          reference_path: duplicate.reference_path,
+          step_evidence: {
+            ...(journal.step_evidence ?? {}),
+            duplicate_verified: true,
+            source_cleanup: sourceCleanup
+          }
+        });
+        return "duplicate";
       }
-    });
 
-    const provenance = await this.referralProvenanceIfApplicable(
-      state,
-      input,
-      documentId,
-      versionId,
-      sourceEvidence.file_id,
-      sourceEvidence.rev
-    );
-    if (provenance) await this.intake.writeReferralProvenance(provenance);
+      await this.ledger.snapshotProviderFile(
+        state.project_id,
+        documentId,
+        versionId,
+        input.inputPath,
+        input.metadata
+      );
+      journal = await this.intake.write({
+        ...journal,
+        step_evidence: { ...(journal.step_evidence ?? {}), snapshot_path: immutablePayloadPath }
+      });
 
-    const sourceCleanup = await this.deleteSourceIfUnchanged(input.inputPath, sourceEvidence);
+      await this.ensureDestinationCopy(input.inputPath, targetPath, sourceEvidence.content_hash, sourceEvidence.size);
+      const targetMetadata = await this.requireMatchingMetadata(targetPath, sourceEvidence.content_hash, sourceEvidence.size);
+      const targetEvidence = requireDropboxV1Evidence(targetMetadata);
+      journal = await this.intake.write({
+        ...journal,
+        step_evidence: {
+          ...(journal.step_evidence ?? {}),
+          destination_path: targetPath,
+          destination_verified: true
+        }
+      });
+
+      await this.ledger.writeVersion({
+        schema_version: "1.0",
+        project_id: state.project_id,
+        document_id: documentId,
+        version_id: versionId,
+        kind: "reference",
+        stage: "reference",
+        logical_path: input.logicalPath,
+        source: "input_ingest",
+        created_at: input.metadata.modifiedAt ?? input.detectedAt,
+        immutable_payload_path: immutablePayloadPath,
+        provider_content_hash: targetEvidence.content_hash,
+        provider_file_id: targetEvidence.file_id,
+        provider_rev: targetEvidence.rev,
+        provider_path: targetPath,
+        size: targetEvidence.size
+      });
+      await this.ledger.writeHead({
+        schema_version: "1.0",
+        project_id: state.project_id,
+        document_id: documentId,
+        kind: "reference",
+        logical_path: input.logicalPath,
+        collection_path: "UNCLASSIFIED",
+        reference_version_id: versionId,
+        provider: { reference: toManagedProviderObservation({ ...targetMetadata, path: targetPath }) },
+        reconciliation_status: "clean"
+      });
+      await this.ledger.writeProviderFileBinding({
+        schema_version: "1.0",
+        project_id: state.project_id,
+        provider_file_id: targetEvidence.file_id,
+        document_id: documentId
+      });
+      await this.ledger.writeReferenceFingerprint({
+        schema_version: "1.0",
+        project_id: state.project_id,
+        provider_content_hash: targetEvidence.content_hash,
+        document_id: documentId,
+        version_id: versionId
+      });
+      await this.requireGovernedReference(
+        state.project_id,
+        documentId,
+        versionId,
+        targetPath,
+        targetEvidence.content_hash,
+        targetEvidence.size
+      );
+      journal = await this.intake.write({
+        ...journal,
+        document_id: documentId,
+        version_id: versionId,
+        reference_path: relativeReferencePath,
+        step_evidence: {
+          ...(journal.step_evidence ?? {}),
+          version_written: true,
+          head_indexes_written: true,
+          governed_reference_verified: true
+        }
+      });
+
+      const provenance = await this.referralProvenanceIfApplicable(
+        state,
+        input,
+        documentId,
+        versionId,
+        sourceEvidence.file_id,
+        sourceEvidence.rev
+      );
+      if (provenance) await this.intake.writeReferralProvenance(provenance);
+
+      const sourceCleanup = await this.deleteSourceIfUnchanged(input.inputPath, sourceEvidence);
+      await this.intake.write({
+        ...journal,
+        state: "ingested",
+        step_evidence: { ...(journal.step_evidence ?? {}), source_cleanup: sourceCleanup }
+      });
+      return "ingested";
+    } catch (error) {
+      if (journal.step_evidence?.governed_reference_verified === true) throw error;
+      if (error instanceof IntakeEvidenceConflictError) {
+        await this.markFailed(journal, error, false);
+      } else if (error instanceof ProviderOperationError && error.retryable) {
+        await this.markFailed(journal, error, true);
+      }
+      throw error;
+    }
+  }
+
+  private isOwnGovernedReferenceReplay(journal: IntakeRecord, documentId: string, versionId: string): boolean {
+    return journal.document_id === documentId
+      && journal.version_id === versionId
+      && journal.step_evidence?.governed_reference_verified === true;
+  }
+
+  private async markFailed(journal: IntakeRecord, error: unknown, retryable: boolean): Promise<void> {
     await this.intake.write({
       ...journal,
-      state: "ingested",
-      step_evidence: { ...(journal.step_evidence ?? {}), source_cleanup: sourceCleanup }
+      state: "failed",
+      retryable,
+      last_error: error instanceof Error ? error.message : String(error)
     });
-    return "ingested";
   }
 
   private async proveCurrentDuplicate(
@@ -262,7 +326,9 @@ export class IntakeService {
       const existing = await this.runtime.objects.getMetadata(targetPath);
       if (!existing) throw error;
       const evidence = requireDropboxV1Evidence(existing);
-      if (evidence.content_hash !== contentHash || evidence.size !== size) throw error;
+      if (evidence.content_hash !== contentHash || evidence.size !== size) {
+        throw new IntakeEvidenceConflictError(`Intake destination evidence mismatch: ${targetPath}`);
+      }
     }
   }
 
@@ -275,7 +341,7 @@ export class IntakeService {
     if (!metadata) throw new Error(`Intake destination missing after copy: ${path}`);
     const evidence = requireDropboxV1Evidence(metadata);
     if (evidence.content_hash !== contentHash || evidence.size !== size) {
-      throw new Error(`Intake destination evidence mismatch: ${path}`);
+      throw new IntakeEvidenceConflictError(`Intake destination evidence mismatch: ${path}`);
     }
     return metadata;
   }
@@ -309,7 +375,7 @@ export class IntakeService {
       || head.provider.reference.content_hash !== evidence.content_hash
       || head.provider.reference.size !== evidence.size
     ) {
-      throw new Error(`Governed reference provider proof mismatch: ${documentId}/${versionId}`);
+      throw new IntakeEvidenceConflictError(`Governed reference provider proof mismatch: ${documentId}/${versionId}`);
     }
   }
 

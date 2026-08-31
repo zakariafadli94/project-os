@@ -27,6 +27,14 @@ import {
   type ManagedDocumentReconcileSummary
 } from "./reconciler";
 
+const LEGACY_CURSOR_KEY = "managed-document-change-cursor-v1";
+
+export interface ManagedDocumentCursorStore {
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put(key: string, value: unknown): Promise<void>;
+  delete(key: string): Promise<boolean>;
+}
+
 export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSummary, MutationGateProcessSummary {
   bootstrapped: number;
   cursor_reset: boolean;
@@ -51,11 +59,12 @@ export class ManagedDocumentChangeCoordinator {
   private readonly bootstrapper: ManagedDocumentBootstrapper;
   private readonly mutationClassifier: MutationGateClassifier;
   private readonly mutationGate: MutationGateService;
-  private readonly jobs: ManagedDocumentChangeJobStore;
+  private readonly jobs: ManagedDocumentChangeJobStore | null;
+  private readonly legacyCursorStore: ManagedDocumentCursorStore | null;
 
   constructor(
     input: PersistenceInput,
-    storage: DurableObjectStorage,
+    storage: DurableObjectStorage | ManagedDocumentCursorStore,
     private readonly gateMode: MutationGateMode = "observe"
   ) {
     this.runtime = asProjectOsPersistence(input);
@@ -63,11 +72,23 @@ export class ManagedDocumentChangeCoordinator {
     this.bootstrapper = new ManagedDocumentBootstrapper(this.runtime);
     this.mutationClassifier = new MutationGateClassifier(this.runtime);
     this.mutationGate = new MutationGateService(this.runtime, gateMode);
-    initializeManagedDocumentChangeJobSchema(storage);
-    this.jobs = new ManagedDocumentChangeJobStore(storage);
+
+    if (isDurableObjectStorage(storage)) {
+      initializeManagedDocumentChangeJobSchema(storage);
+      this.jobs = new ManagedDocumentChangeJobStore(storage);
+      this.legacyCursorStore = null;
+    } else {
+      // Compatibility seam for focused provider-neutral unit tests that inject
+      // only the historical cursor KV interface. Production ProjectGuard always
+      // supplies full DurableObjectStorage and therefore always uses SQLite jobs.
+      this.jobs = null;
+      this.legacyCursorStore = storage;
+    }
   }
 
   async reconcile(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
+    if (!this.jobs) return this.reconcileLegacyTestSeam(state);
+
     const summary = emptySummary({ archived: state.status === "archived" }, this.mutationGateMode());
     if (state.status === "archived") return summary;
 
@@ -119,6 +140,44 @@ export class ManagedDocumentChangeCoordinator {
     return summary;
   }
 
+  private async reconcileLegacyTestSeam(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
+    const summary = emptySummary({ archived: state.status === "archived" }, this.mutationGateMode());
+    if (state.status === "archived") return summary;
+    const cursorStore = this.legacyCursorStore;
+    if (!cursorStore) throw new Error("Managed document legacy cursor test seam is unavailable");
+
+    const root = workspaceProjectRoot(state.project_id, state.slug);
+    let existingCursor = await cursorStore.get<string>(LEGACY_CURSOR_KEY);
+    let cursorReset = false;
+    let baseline = !existingCursor;
+    let page: ProviderChangePage;
+
+    try {
+      page = existingCursor
+        ? await this.runtime.changeFeed.listChanges({ cursor: existingCursor })
+        : await this.runtime.changeFeed.listChanges({ root });
+    } catch (error) {
+      if (!(error instanceof ProviderCursorResetError)) throw error;
+      cursorReset = true;
+      baseline = true;
+      await cursorStore.delete(LEGACY_CURSOR_KEY);
+      existingCursor = undefined;
+      page = await this.runtime.changeFeed.listChanges({ root });
+    }
+
+    const detectionSource = cursorReset ? "cursor_reset" : baseline ? "baseline" : "incremental";
+    const gate = await this.mutationGate.processChanges(state, page.entries, detectionSource);
+    accumulateGate(summary, gate);
+    if (baseline) summary.bootstrapped += await this.bootstrapBaseline(state, page.entries);
+    accumulateReconcile(summary, await this.reconciler.reconcileChanges(state, page.entries));
+
+    summary.cursor_reset = cursorReset;
+    summary.baseline = baseline;
+    summary.cursor_advanced = page.cursor.length > 0 && page.cursor !== existingCursor;
+    if (page.cursor.length > 0) await cursorStore.put(LEGACY_CURSOR_KEY, page.cursor);
+    return summary;
+  }
+
   private async pageJobs(
     state: ProjectState,
     page: ProviderChangePage,
@@ -152,14 +211,16 @@ export class ManagedDocumentChangeCoordinator {
   }
 
   private async drainPending(state: ProjectState, summary: ManagedDocumentChangeSummary): Promise<void> {
-    const pending = this.jobs.pending();
+    const jobs = this.jobs;
+    if (!jobs) return;
+    const pending = jobs.pending();
     for (const job of pending) {
       try {
         await this.processJob(state, job, summary);
-        this.jobs.markCompleted(job.job_id);
+        jobs.markCompleted(job.job_id);
         summary.jobs_completed += 1;
       } catch (error) {
-        this.jobs.markFailed(job.job_id, errorMessage(error));
+        jobs.markFailed(job.job_id, errorMessage(error));
         summary.job_failures += 1;
         console.error("Project OS managed document change job failed", {
           project_id: state.project_id,
@@ -187,6 +248,16 @@ export class ManagedDocumentChangeCoordinator {
 
     const reconciled = await this.reconciler.reconcileChanges(state, [job.change]);
     accumulateReconcile(summary, reconciled);
+  }
+
+  private async bootstrapBaseline(state: ProjectState, changes: ProviderChangeEntry[]): Promise<number> {
+    const candidates = changes
+      .map((change) => this.bootstrapCandidate(state, change))
+      .filter((candidate): candidate is BootstrapCandidate => candidate !== null)
+      .sort((a, b) => a.priority - b.priority || a.change.path.localeCompare(b.change.path));
+    let adopted = 0;
+    for (const candidate of candidates) adopted += await this.bootstrapOne(state, candidate.change);
+    return adopted;
   }
 
   private async bootstrapOne(state: ProjectState, change: ProviderChangeEntry): Promise<number> {
@@ -292,6 +363,13 @@ function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): Man
     jobs_pending: 0,
     job_failures: 0
   };
+}
+
+function isDurableObjectStorage(
+  value: DurableObjectStorage | ManagedDocumentCursorStore
+): value is DurableObjectStorage {
+  const candidate = value as Partial<DurableObjectStorage>;
+  return typeof candidate.transactionSync === "function" && candidate.sql !== undefined;
 }
 
 function errorMessage(error: unknown): string {

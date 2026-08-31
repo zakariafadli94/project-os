@@ -52,6 +52,7 @@ const OUTER_MUTATION_PATHS = new Set([
   "/artifact",
   "/document",
   "/reconcile-documents",
+  "/recover-inputs",
   "/materialize",
   "/reconcile-materialization"
 ]);

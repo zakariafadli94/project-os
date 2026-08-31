@@ -135,7 +135,7 @@ describe("DropboxChangeGuard", () => {
     });
   });
 
-  it("does not consume a newer notification that arrives while an older generation is processing", async () => {
+  it("does not let an older processing generation consume a notification queued during its run", async () => {
     const mock = installDropboxMock();
     await createProject("TXN-CHANGE-GUARD-0003", "change-guard-three");
     const stub = guard();
@@ -156,9 +156,10 @@ describe("DropboxChangeGuard", () => {
     const firstAlarm = runDurableObjectAlarm(stub);
     await enteredGate;
 
-    expect((await notify(stub)).status).toBe(200);
+    const secondNotify = notify(stub);
     release();
     expect(await firstAlarm).toBe(true);
+    expect((await secondNotify).status).toBe(200);
     expect(await status(stub)).toMatchObject({
       requested_generation: 2,
       completed_generation: 1,

@@ -11,11 +11,17 @@ import {
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderConflictError } from "../persistence/provider/errors";
+import { sha256Text } from "./hash";
 import {
   inputIntakeIdFor,
   type InputIntakeRecord
 } from "./input-intake";
 import { InputIntakeRepository } from "./input-intake-repository";
+import {
+  ReferralProvenanceConflictError,
+  ReferralProvenanceRepository,
+  referralIntentPath
+} from "./referral-provenance";
 import { DocumentLedgerRepository, type ReferenceFingerprintRecord } from "./repository";
 
 export interface InputIntakeServiceOptions {
@@ -43,9 +49,15 @@ interface PortableEvidence {
   size: number;
 }
 
+interface ReferenceRoute {
+  collectionPath: string;
+  targetPath: string;
+}
+
 export class InputIntakeService {
   private readonly intakeRepository: InputIntakeRepository;
   private readonly ledger: DocumentLedgerRepository;
+  private readonly referrals: ReferralProvenanceRepository;
   private readonly now: () => string;
 
   constructor(
@@ -54,6 +66,7 @@ export class InputIntakeService {
   ) {
     this.intakeRepository = new InputIntakeRepository(runtime.objects);
     this.ledger = new DocumentLedgerRepository(runtime);
+    this.referrals = new ReferralProvenanceRepository(runtime.objects);
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -125,12 +138,21 @@ export class InputIntakeService {
       intake = await this.intakeRepository.advance(state.project_id, intakeId, "SNAPSHOTTED", this.now());
     }
 
+    let route: ReferenceRoute;
+    try {
+      route = await this.resolveReferenceRoute(state, request, documentId, versionId);
+    } catch (error) {
+      if (!(error instanceof ReferralProvenanceConflictError)) throw error;
+      intake = await this.intakeRepository.advance(state.project_id, intakeId, "CONFLICT", this.now());
+      return { status: "conflict", intake_id: intakeId, resumed, document_id: documentId, version_id: versionId };
+    }
+
     if (intake.phase === "SNAPSHOTTED") {
       const fingerprint = await this.ledger.readReferenceFingerprint(
         state.project_id,
         intake.source.integrity_hash.value
       );
-      if (fingerprint && await this.isCurrentReferenceFingerprint(fingerprint, intake)) {
+      if (fingerprint && await this.isCurrentReferenceFingerprint(fingerprint, intake, route.collectionPath)) {
         const source = await this.runtime.objects.getMetadata(request.sourcePath);
         if (source && !samePortableEvidence(source, evidence)) {
           intake = await this.intakeRepository.advance(state.project_id, intakeId, "CONFLICT", this.now());
@@ -141,13 +163,7 @@ export class InputIntakeService {
         return { status: "duplicate_cleaned", intake_id: intakeId, resumed };
       }
 
-      const targetPath = workspaceManagedDocumentPath(
-        state.project_id,
-        state.slug,
-        "references",
-        `UNCLASSIFIED/${request.relativeInputPath}`
-      );
-      const targetMetadata = await this.ensureReferenceCopy(request.sourcePath, targetPath, evidence);
+      const targetMetadata = await this.ensureReferenceCopy(request.sourcePath, route.targetPath, evidence);
       if (!targetMetadata) {
         intake = await this.intakeRepository.advance(state.project_id, intakeId, "CONFLICT", this.now());
         return { status: "conflict", intake_id: intakeId, resumed, document_id: documentId, version_id: versionId };
@@ -168,7 +184,7 @@ export class InputIntakeService {
         provider_content_hash: targetEvidence.integrityHash.value,
         provider_file_id: targetEvidence.objectId,
         provider_rev: targetEvidence.revisionToken,
-        provider_path: targetPath,
+        provider_path: route.targetPath,
         size: targetEvidence.size
       });
       await this.ledger.writeHead({
@@ -177,7 +193,7 @@ export class InputIntakeService {
         document_id: documentId,
         kind: "reference",
         logical_path: request.relativeInputPath,
-        collection_path: "UNCLASSIFIED",
+        collection_path: route.collectionPath,
         reference_version_id: versionId,
         provider: { reference: toLegacyObservation(targetMetadata) },
         reconciliation_status: "clean"
@@ -199,17 +215,12 @@ export class InputIntakeService {
     }
 
     if (intake.phase === "REFERENCE_COMMITTED") {
-      const targetPath = workspaceManagedDocumentPath(
-        state.project_id,
-        state.slug,
-        "references",
-        `UNCLASSIFIED/${request.relativeInputPath}`
-      );
       const durable = await this.verifyGovernedReference(
         state.project_id,
         documentId,
         versionId,
-        targetPath,
+        route.targetPath,
+        route.collectionPath,
         intake
       );
       if (!durable) {
@@ -227,15 +238,16 @@ export class InputIntakeService {
     }
 
     if (intake.phase === "SOURCE_REMOVED") {
-      const targetPath = workspaceManagedDocumentPath(
-        state.project_id,
-        state.slug,
-        "references",
-        `UNCLASSIFIED/${request.relativeInputPath}`
-      );
       if (
         await this.runtime.objects.getMetadata(request.sourcePath)
-        || !await this.verifyGovernedReference(state.project_id, documentId, versionId, targetPath, intake)
+        || !await this.verifyGovernedReference(
+          state.project_id,
+          documentId,
+          versionId,
+          route.targetPath,
+          route.collectionPath,
+          intake
+        )
       ) {
         intake = await this.intakeRepository.advance(state.project_id, intakeId, "CONFLICT", this.now());
         return { status: "conflict", intake_id: intakeId, resumed, document_id: documentId, version_id: versionId };
@@ -252,6 +264,86 @@ export class InputIntakeService {
       resumed,
       document_id: documentId,
       version_id: versionId
+    };
+  }
+
+  private async resolveReferenceRoute(
+    state: ProjectState,
+    request: InputIntakeRequest,
+    documentId: string,
+    versionId: string
+  ): Promise<ReferenceRoute> {
+    let binding;
+    try {
+      binding = await this.referrals.readBinding(state.project_id, request.sourcePath);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new ReferralProvenanceConflictError(`Malformed referral input binding for ${request.sourcePath}`);
+      }
+      throw error;
+    }
+
+    if (!binding) {
+      return {
+        collectionPath: "UNCLASSIFIED",
+        targetPath: workspaceManagedDocumentPath(
+          state.project_id,
+          state.slug,
+          "references",
+          `UNCLASSIFIED/${request.relativeInputPath}`
+        )
+      };
+    }
+
+    let intent;
+    try {
+      intent = await this.referrals.readIntent(state.project_id, binding.request_id);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new ReferralProvenanceConflictError(`Malformed referral intent for ${state.project_id}/${binding.request_id}`);
+      }
+      throw error;
+    }
+    if (!intent) {
+      throw new ReferralProvenanceConflictError(`Missing referral intent for ${state.project_id}/${binding.request_id}`);
+    }
+
+    const expectedInputPath = workspaceManagedDocumentPath(
+      state.project_id,
+      state.slug,
+      "inputs",
+      intent.relative_path
+    );
+    if (
+      binding.request_id !== intent.request_id
+      || binding.source_project_id !== intent.source_project_id
+      || binding.target_project_id !== intent.target_project_id
+      || binding.content_sha256 !== intent.content_sha256
+      || binding.intent_path !== referralIntentPath(state.project_id, binding.request_id)
+      || binding.input_path !== request.sourcePath
+      || intent.input_path !== request.sourcePath
+      || intent.target_project_id !== state.project_id
+      || intent.relative_path !== request.relativeInputPath
+      || expectedInputPath !== request.sourcePath
+    ) {
+      throw new ReferralProvenanceConflictError(`Referral provenance mismatch for ${request.sourcePath}`);
+    }
+
+    const snapshotPath = machineDocumentProviderPayloadPath(state.project_id, documentId, versionId);
+    const snapshot = await this.runtime.objects.readText(snapshotPath);
+    if (snapshot === null || await sha256Text(snapshot) !== intent.content_sha256) {
+      throw new ReferralProvenanceConflictError(`Referral snapshot content mismatch for ${request.sourcePath}`);
+    }
+
+    const collectionPath = `REFERRALS/${intent.source_project_id}`;
+    return {
+      collectionPath,
+      targetPath: workspaceManagedDocumentPath(
+        state.project_id,
+        state.slug,
+        "references",
+        `${collectionPath}/${request.relativeInputPath}`
+      )
     };
   }
 
@@ -279,6 +371,7 @@ export class InputIntakeService {
     documentId: string,
     versionId: string,
     targetPath: string,
+    collectionPath: string,
     intake: InputIntakeRecord
   ): Promise<boolean> {
     const [target, version, head, fingerprint] = await Promise.all([
@@ -300,7 +393,7 @@ export class InputIntakeService {
       !head
       || head.kind !== "reference"
       || head.logical_path !== intake.source.relative_input_path
-      || head.collection_path !== "UNCLASSIFIED"
+      || head.collection_path !== collectionPath
       || head.reference_version_id !== versionId
       || head.provider?.reference?.path !== targetPath
       || head.provider.reference.content_hash !== intake.source.integrity_hash.value
@@ -310,13 +403,15 @@ export class InputIntakeService {
 
   private async isCurrentReferenceFingerprint(
     fingerprint: ReferenceFingerprintRecord,
-    intake: InputIntakeRecord
+    intake: InputIntakeRecord,
+    collectionPath: string
   ): Promise<boolean> {
     const [head, version] = await Promise.all([
       this.ledger.readHead(fingerprint.project_id, fingerprint.document_id),
       this.ledger.readVersion(fingerprint.project_id, fingerprint.document_id, fingerprint.version_id)
     ]);
     return head?.kind === "reference"
+      && head.collection_path === collectionPath
       && head.reference_version_id === fingerprint.version_id
       && head.provider?.reference?.content_hash === intake.source.integrity_hash.value
       && version?.kind === "reference"

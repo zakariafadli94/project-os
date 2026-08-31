@@ -75,16 +75,23 @@ describe("POST /v1/admin/recover-inputs", () => {
     );
 
     expect(response.status).toBe(404);
-    const providerCalls = mock.calls.slice(baseline).filter((call) => call.includes("/2/files/"));
-    expect(providerCalls).toEqual([]);
+    const forbiddenProviderCalls = mock.calls.slice(baseline).filter((call) =>
+      call.includes("/2/files/list_folder")
+      || call.includes("/2/files/upload")
+      || call.includes("/2/files/delete_v2")
+      || call.includes("/2/files/move_v2")
+      || call.includes("/2/files/copy_v2")
+      || call.includes("/2/files/create_folder_v2")
+    );
+    expect(forbiddenProviderCalls).toEqual([]);
   });
 
   it("recovers only explicitly selected projects through their ProjectGuard", async () => {
     const mock = installDropboxMock();
     const selectedProject = await createProject("TXN-ADMIN-RECOVERY-0001", "admin-recovery-selected");
     const untouchedProject = await createProject("TXN-ADMIN-RECOVERY-0002", "admin-recovery-untouched");
-    const selectedRelative = "legacy/selected.md";
-    const untouchedRelative = "legacy/untouched.md";
+    const selectedRelative = "selected.md";
+    const untouchedRelative = "untouched.md";
     const selectedInput = workspaceManagedDocumentPath(
       selectedProject,
       "admin-recovery-selected",

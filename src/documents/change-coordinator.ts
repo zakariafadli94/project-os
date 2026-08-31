@@ -110,8 +110,6 @@ export class ManagedDocumentChangeCoordinator {
       if (!(error instanceof ProviderCursorResetError)) throw error;
       cursorReset = true;
       baseline = true;
-      this.jobs.resetCursor();
-      existingCursor = null;
       page = await this.runtime.changeFeed.listChanges({ root });
     }
 

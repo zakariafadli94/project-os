@@ -130,8 +130,9 @@ describe("deleted INPUTS reconciliation", () => {
     await dropbox.delete(sourcePath);
 
     const result = await new ManagedDocumentReconciler(runtime).reconcileChanges(state, [deleted(sourcePath)]);
+    const metrics = result as unknown as Record<string, number>;
 
-    expect(result).toMatchObject({ withdrawn: 1, intake_resumed: 1, ignored: 0 });
+    expect(metrics).toMatchObject({ withdrawn: 1, intake_resumed: 1, ignored: 0 });
     expect((await repository.read(state.project_id, intakeId))?.phase).toBe("WITHDRAWN");
   });
 
@@ -162,8 +163,9 @@ describe("deleted INPUTS reconciliation", () => {
     expect((await repository.read(state.project_id, intakeId))?.phase).toBe("REFERENCE_COMMITTED");
 
     const result = await new ManagedDocumentReconciler(runtime).reconcileChanges(state, [deleted(sourcePath)]);
+    const metrics = result as unknown as Record<string, number>;
 
-    expect(result).toMatchObject({ intake_completed: 1, intake_resumed: 1, ignored: 0 });
+    expect(metrics).toMatchObject({ intake_completed: 1, intake_resumed: 1, ignored: 0 });
     expect((await repository.read(state.project_id, intakeId))?.phase).toBe("COMPLETE");
   });
 });

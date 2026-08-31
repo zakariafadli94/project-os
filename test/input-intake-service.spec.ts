@@ -3,10 +3,12 @@ import { documentIdForProviderFile } from "../src/domain/managed-document";
 import { emptyProjectState } from "../src/domain/transitions";
 import type { DropboxEntry, DropboxFileMetadata, DropboxTransport } from "../src/dropbox/client";
 import { DropboxConflictError } from "../src/dropbox/client";
+import { inputIntakeIdFor } from "../src/documents/input-intake";
 import { InputIntakeRepository } from "../src/documents/input-intake-repository";
 import { InputIntakeService } from "../src/documents/input-intake-service";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
+import { machineDocumentProviderPayloadPath } from "../src/persistence/layout";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
@@ -111,6 +113,11 @@ describe("postcondition-driven input intake", () => {
     );
     expect(dropbox.files.get(targetPath)).toBe("report bytes");
     expect(dropbox.deleteCalls).toEqual([inputPath]);
+    expect(dropbox.files.get(machineDocumentProviderPayloadPath(
+      project.project_id,
+      result.document_id!,
+      result.version_id!
+    ))).toBe("report bytes");
 
     const intake = await new InputIntakeRepository(runtime.objects).read(project.project_id, result.intake_id);
     expect(intake?.phase).toBe("COMPLETE");
@@ -121,6 +128,78 @@ describe("postcondition-driven input intake", () => {
       collection_path: "UNCLASSIFIED",
       reference_version_id: result.version_id
     });
+  });
+
+  it("replays an already COMPLETE intake without repeating cleanup or creating new reference identity", async () => {
+    const dropbox = new IntakeDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
+    const project = state();
+    const relative = "market/replay.pdf";
+    const inputPath = workspaceManagedDocumentPath(project.project_id, project.slug, "inputs", relative);
+    const source = await dropbox.externalAdd(inputPath, "replay bytes");
+    const request = { sourcePath: inputPath, relativeInputPath: relative, metadata: providerMetadata(source) };
+    const service = new InputIntakeService(runtime, { now });
+
+    const first = await service.ingest(project, request);
+    const replay = await service.ingest(project, request);
+
+    expect(first).toMatchObject({ status: "completed", resumed: false });
+    expect(replay).toMatchObject({
+      status: "completed",
+      resumed: true,
+      intake_id: first.intake_id,
+      document_id: first.document_id,
+      version_id: first.version_id
+    });
+    expect(dropbox.deleteCalls).toEqual([inputPath]);
+  });
+
+  it("records WITHDRAWN without resurrecting a source that disappeared before governed capture", async () => {
+    const dropbox = new IntakeDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
+    const project = state();
+    const relative = "withdrawn/report.pdf";
+    const inputPath = workspaceManagedDocumentPath(project.project_id, project.slug, "inputs", relative);
+    const source = await dropbox.externalAdd(inputPath, "withdrawn bytes");
+    const metadata = providerMetadata(source);
+    const intakeId = await inputIntakeIdFor({
+      projectId: project.project_id,
+      providerId: runtime.providerId,
+      objectId: source.id,
+      revisionToken: source.rev
+    });
+    const repository = new InputIntakeRepository(runtime.objects);
+    const detected = await repository.create({
+      schema_version: "1.0",
+      intake_id: intakeId,
+      project_id: project.project_id,
+      phase: "DETECTED",
+      source: {
+        provider_id: runtime.providerId,
+        object_id: source.id,
+        revision_token: source.rev,
+        integrity_hash: { algorithm: "dropbox-content-hash", value: source.content_hash },
+        size: source.size,
+        provider_path: inputPath,
+        relative_input_path: relative
+      },
+      detected_at: now(),
+      updated_at: now()
+    });
+    await repository.bindSourcePath(detected);
+    await dropbox.delete(inputPath);
+
+    const result = await new InputIntakeService(runtime, { now }).ingest(project, {
+      sourcePath: inputPath,
+      relativeInputPath: relative,
+      metadata
+    });
+
+    expect(result).toMatchObject({ status: "withdrawn", resumed: true, intake_id: intakeId });
+    expect((await repository.read(project.project_id, intakeId))?.phase).toBe("WITHDRAWN");
+    const targetPath = workspaceManagedDocumentPath(project.project_id, project.slug, "references", `UNCLASSIFIED/${relative}`);
+    expect(dropbox.files.has(targetPath)).toBe(false);
+    expect(dropbox.files.has(inputPath)).toBe(false);
   });
 
   it("cleans an exact duplicate INPUT without creating a second reference document", async () => {

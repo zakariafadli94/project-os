@@ -3,6 +3,11 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
+import {
+  initializeManagedDocumentChangeJobSchema,
+  ManagedDocumentChangeJobStore,
+  type ManagedDocumentChangeJobInput
+} from "../src/documents/change-job-store";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -150,6 +155,76 @@ describe("durable managed-document change jobs", () => {
       cursor_reset: true,
       baseline: true,
       cursor_advanced: true
+    });
+  });
+
+  it("deduplicates a replayed page and preserves global pending order across later pages", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-0003", "change-job-store-order");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+
+    await runInDurableObject(guard, async (_instance, state) => {
+      initializeManagedDocumentChangeJobSchema(state.storage);
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-change-job-store-order/INPUTS`;
+      const firstPage: ManagedDocumentChangeJobInput[] = [
+        {
+          job_id: "CHGJOB-AAAAAAAAAAAAAAAAAAAAAAAA",
+          change: { kind: "deleted", name: "first.md", path: `${root}/first.md` },
+          detection_source: "incremental",
+          priority: 10
+        },
+        {
+          job_id: "CHGJOB-BBBBBBBBBBBBBBBBBBBBBBBB",
+          change: { kind: "deleted", name: "second.md", path: `${root}/second.md` },
+          detection_source: "incremental",
+          priority: 10
+        }
+      ];
+
+      const initialCursor = store.cursor();
+      expect(store.registerPage({
+        expected_cursor: initialCursor,
+        next_cursor: "store-cursor-1",
+        jobs: firstPage
+      })).toEqual({ inserted: 2, cursor_advanced: true });
+
+      expect(store.registerPage({
+        expected_cursor: "store-cursor-1",
+        next_cursor: "store-cursor-1",
+        jobs: firstPage
+      })).toEqual({ inserted: 0, cursor_advanced: false });
+      expect(store.pending().map((job) => job.job_id)).toEqual([
+        "CHGJOB-AAAAAAAAAAAAAAAAAAAAAAAA",
+        "CHGJOB-BBBBBBBBBBBBBBBBBBBBBBBB"
+      ]);
+
+      store.markFailed("CHGJOB-AAAAAAAAAAAAAAAAAAAAAAAA", "retry me");
+      store.markCompleted("CHGJOB-BBBBBBBBBBBBBBBBBBBBBBBB");
+      expect(store.registerPage({
+        expected_cursor: "store-cursor-1",
+        next_cursor: "store-cursor-2",
+        jobs: [
+          {
+            job_id: "CHGJOB-CCCCCCCCCCCCCCCCCCCCCCCC",
+            change: { kind: "deleted", name: "third.md", path: `${root}/third.md` },
+            detection_source: "incremental",
+            priority: 10
+          },
+          {
+            job_id: "CHGJOB-DDDDDDDDDDDDDDDDDDDDDDDD",
+            change: { kind: "deleted", name: "fourth.md", path: `${root}/fourth.md` },
+            detection_source: "incremental",
+            priority: 10
+          }
+        ]
+      })).toEqual({ inserted: 2, cursor_advanced: true });
+
+      expect(store.pending().map((job) => job.job_id)).toEqual([
+        "CHGJOB-AAAAAAAAAAAAAAAAAAAAAAAA",
+        "CHGJOB-CCCCCCCCCCCCCCCCCCCCCCCC",
+        "CHGJOB-DDDDDDDDDDDDDDDDDDDDDDDD"
+      ]);
     });
   });
 });

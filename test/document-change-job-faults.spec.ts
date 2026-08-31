@@ -67,7 +67,8 @@ describe("durable managed-document change jobs", () => {
       jobs_registered: 2,
       jobs_completed: 1,
       jobs_pending: 1,
-      job_failures: 1
+      job_failures: 1,
+      ignored: 0
     });
 
     expect(mock.files.has(badInput)).toBe(true);

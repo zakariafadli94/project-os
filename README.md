@@ -32,6 +32,32 @@ Cloudflare Worker
                 Obsidian
 ```
 
+Managed source changes use a separate trigger-first path:
+
+```text
+Dropbox file change
+      |
+      v
+Dropbox webhook
+      |
+      | signature verified
+      | durable notification handoff
+      v
+DropboxChangeGuard
+      |
+      v
+Dropbox change feed
+      |
+      | durable per-change jobs
+      v
+ProjectGuard
+      |
+      +--> INPUTS intake state machine
+      +--> managed-document reconciliation
+```
+
+The webhook is a trigger, not the changed-file payload. Exact paths come from the provider change feed. The cursor may advance after the page's relevant changes are durably journaled; individual jobs can safely finish afterward or retry from durable state.
+
 ## Safety invariants
 
 - ChatGPT never submits arbitrary canonical file paths or file patches.
@@ -57,6 +83,11 @@ Cloudflare Worker
 - Connector-level `WRITE_CONFLICT` is treated as transient infrastructure only after target-state verification: retry the exact same path, ID and content when absent; accept an identical existing target idempotently; surface different content as a real conflict.
 - Generated Markdown is rebuildable from structured state.
 - Project deletion is intentionally absent from V1; archive is terminal.
+- A visible file in a project's `INPUTS/` means its technical source ingestion has not reached a verified terminal state.
+- INPUT source bytes are durably preserved and governed as references before the active inbox copy is removed.
+- Source/referral ingestion never implies business acceptance and does not create a canonical project revision by itself.
+- Managed provider changes are trigger-first; scheduled maintenance is not a hidden periodic `INPUTS/` scanner.
+- Dropbox empty `INPUTS/` directories may remain because recursive folder deletion is not a race-safe empty-directory cleanup primitive.
 
 ## Artifact publication contract
 
@@ -136,10 +167,41 @@ If the connector reports `WRITE_CONFLICT` while creating an incoming message:
 
 The Worker-side inbox scanner follows the same principle for terminal archival: exact terminal replays clean the duplicate source, and a file move conflict with an absent destination falls back to idempotent publish plus retryable source deletion. Different terminal content remains a semantic conflict.
 
+## Managed INPUTS lifecycle
+
+`INPUTS/` is an active source inbox, not an archive. Ordinary files converge through:
+
+```text
+DETECTED
+  -> SNAPSHOTTED
+  -> REFERENCE_COMMITTED
+  -> SOURCE_REMOVED
+  -> COMPLETE
+```
+
+Terminal alternatives are `DUPLICATE_CLEANED`, `WITHDRAWN`, and `CONFLICT`.
+
+Normal sources route to `REFERENCES/UNCLASSIFIED/`. Machine-verifiable governed cross-project referrals may route structurally to `REFERENCES/REFERRALS/<source_project_id>/`; a referral-looking file without trusted delivery provenance remains ordinary unclassified evidence.
+
+Replay verifies the complete intended postcondition rather than treating an intermediate ledger record as success. If a governed reference already exists but the stale INPUT source remains, replay safely finishes source cleanup. If destination/source evidence diverges, Project OS preserves the source and fails closed as a conflict.
+
+Historical stale inputs are repaired only through the authenticated, explicitly project-scoped route:
+
+```text
+POST /v1/admin/recover-inputs
+Authorization: Bearer <INGRESS_TOKEN>
+
+{"project_ids":["PRJ-0002","PRJ-0003"]}
+```
+
+The route validates the whole project list before dispatch, recovers only the selected projects through the same intake engine, and is never invoked by scheduled maintenance.
+
 ## Current write-coordination design
 
 - Design: `docs/superpowers/specs/2026-08-23-dropbox-write-coordination-design.md`
 - Implementation plan: `docs/superpowers/plans/2026-08-23-dropbox-write-coordination.md`
+- Trigger-first INPUTS design: `docs/superpowers/specs/2026-08-31-input-lifecycle-triggered-ingestion-design.md`
+- Trigger-first INPUTS implementation plan: `docs/superpowers/plans/2026-08-31-input-lifecycle-triggered-ingestion.md`
 - Deployment: `docs/deployment.md`
 
 ## Persistence provider boundary

@@ -8,6 +8,11 @@ import { ProjectGuard as NeutralProjectGuard } from "./project-guard-neutral";
 
 export * from "./project-guard-neutral";
 
+interface StateRow {
+  [key: string]: SqlStorageValue;
+  state_json: string;
+}
+
 export class ProjectGuard extends NeutralProjectGuard {
   private readonly referralProvenance: ReferralProvenanceRepository;
 
@@ -61,7 +66,10 @@ export class ProjectGuard extends NeutralProjectGuard {
       });
     }
 
-    const rawState = await this.persistence.objects.readText(machineStatePath(boundProjectId));
+    const row = this.ctx.storage.sql.exec<StateRow>(
+      "SELECT state_json FROM project_state WHERE singleton = 1"
+    ).toArray()[0];
+    const rawState = row?.state_json ?? await this.persistence.objects.readText(machineStatePath(boundProjectId));
     if (rawState === null) {
       return Response.json({
         request_id: referral.request_id,

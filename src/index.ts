@@ -1,10 +1,7 @@
 import type { Env } from "./env";
 import { processReferralInbox } from "./inbox/referral-processor";
 import { artifactInboxPath, inboxPath, type InboxProcessSummary } from "./inbox/processor";
-import neutralWorker, {
-  reconcileManagedDocuments,
-  reconcileMaterializations
-} from "./index-neutral";
+import neutralWorker, { reconcileMaterializations } from "./index-neutral";
 import { parseLayoutMode } from "./persistence/layout";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
@@ -23,10 +20,18 @@ const worker = {
       );
       if (!valid) return new Response("invalid signature", { status: 401 });
 
-      ctx.waitUntil((async () => {
-        await processInboxFirst(env, ctx);
-        await reconcileManagedDocuments(env);
-      })());
+      const changeGuard = env.DROPBOX_CHANGE_GUARD.getByName("global");
+      const handoff = await changeGuard.fetch("https://dropbox-change-guard.internal/notify", { method: "POST" });
+      if (!handoff.ok) {
+        console.error("Project OS Dropbox webhook durable handoff failed", { status: handoff.status });
+        return Response.json({ error: "durable_change_handoff_failed" }, { status: 503 });
+      }
+
+      ctx.waitUntil(processInboxFirst(env, ctx).catch((error) => {
+        console.error("Project OS webhook inbox processing failed", {
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }));
       return new Response("", { status: 200 });
     }
 
@@ -49,11 +54,8 @@ const worker = {
     ctx.waitUntil((async () => {
       try {
         const inbox = await processInboxFirst(env, ctx);
-        const [materialization, documents] = await Promise.all([
-          reconcileMaterializations(env),
-          reconcileManagedDocuments(env)
-        ]);
-        console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents });
+        const materialization = await reconcileMaterializations(env);
+        console.info("Project OS scheduled maintenance completed", { inbox, materialization });
       } catch (error) {
         console.error("Project OS scheduled maintenance failed", {
           message: error instanceof Error ? error.message : String(error),

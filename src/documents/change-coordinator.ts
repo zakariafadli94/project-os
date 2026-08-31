@@ -316,6 +316,9 @@ export class ManagedDocumentChangeCoordinator {
 function accumulateGate(target: ManagedDocumentChangeSummary, source: MutationGateProcessSummary): void {
   target.candidates += source.candidates;
   target.policy_violations += source.policy_violations;
+  if (source.last_candidate_detection_source) {
+    target.last_candidate_detection_source = source.last_candidate_detection_source;
+  }
 }
 
 function accumulateReconcile(target: ManagedDocumentChangeSummary, source: ManagedDocumentReconcileSummary): void {

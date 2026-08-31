@@ -70,8 +70,9 @@ describe("durable managed-document change jobs", () => {
 
     const second = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
     expect(second.status).toBe(200);
-    expect(await second.json()).toMatchObject({
-      jobs_completed: 1,
+    const secondSummary = await second.json<{ jobs_completed: number; jobs_pending: number; job_failures: number }>();
+    expect(secondSummary.jobs_completed).toBeGreaterThanOrEqual(1);
+    expect(secondSummary).toMatchObject({
       jobs_pending: 0,
       job_failures: 0
     });

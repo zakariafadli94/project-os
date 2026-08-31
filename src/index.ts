@@ -1,4 +1,5 @@
 import type { Env } from "./env";
+import { processReferralInbox } from "./inbox/referral-processor";
 import { artifactInboxPath, inboxPath, type InboxProcessSummary } from "./inbox/processor";
 import neutralWorker, {
   reconcileManagedDocuments,
@@ -27,6 +28,10 @@ const worker = {
         await reconcileManagedDocuments(env);
       })());
       return new Response("", { status: 200 });
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/admin/process-inbox") {
+      return processInboxRequest(request, env, ctx);
     }
 
     return neutralWorker.fetch(request, env, ctx);
@@ -62,8 +67,22 @@ const worker = {
 
 export default worker;
 
+async function processInboxRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const base = await neutralWorker.fetch(request, env, ctx);
+  if (!base.ok) return base;
+
+  const existing = await base.json<InboxProcessSummary & Record<string, unknown>>();
+  const referral = await processReferralInbox(env);
+  return Response.json({
+    ...existing,
+    scanned: existing.scanned + referral.scanned,
+    processed: existing.processed + referral.processed,
+    failed: existing.failed + referral.failed
+  });
+}
+
 async function processInboxFirst(env: Env, ctx: ExecutionContext): Promise<InboxProcessSummary> {
-  const response = await neutralWorker.fetch(new Request("https://project-os.internal/v1/admin/process-inbox", {
+  const response = await processInboxRequest(new Request("https://project-os.internal/v1/admin/process-inbox", {
     method: "POST",
     headers: { authorization: `Bearer ${env.INGRESS_TOKEN}` }
   }), env, ctx);

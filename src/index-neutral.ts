@@ -141,7 +141,7 @@ const worker = {
       } catch (error) {
         return Response.json({
           error: "invalid_document_request",
-          message: error instanceof Error ? error.message : "Invalid document request"
+          message: error instanceof Error ? error.message : "Invalid managed document request"
         }, { status: 400 });
       }
 

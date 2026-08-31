@@ -12,6 +12,8 @@ import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 class FaultyIntakeDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
   readonly metadata = new Map<string, DropboxFileMetadata>();
+  failSnapshotCopyOnce = false;
+  failVisibleCopyOnce = false;
   failVersionCreateOnce = false;
   failSourceDeleteOnce: string | null = null;
   failSourceRemovedMarkerOnce = false;
@@ -46,6 +48,14 @@ class FaultyIntakeDropbox implements DropboxTransport {
     this.files.delete(from); this.metadata.delete(from); await this.set(to, content, meta.id);
   }
   async copy(from: string, to: string): Promise<DropboxFileMetadata> {
+    if (this.failSnapshotCopyOnce && /\/documents\/payloads\/provider\//.test(to)) {
+      this.failSnapshotCopyOnce = false;
+      throw new Error("injected crash before immutable source snapshot");
+    }
+    if (this.failVisibleCopyOnce && /\/REFERENCES\/UNCLASSIFIED\//.test(to)) {
+      this.failVisibleCopyOnce = false;
+      throw new Error("injected crash after snapshot before visible reference copy");
+    }
     const content = this.files.get(from);
     if (content === undefined) throw new DropboxConflictError("missing", "req-copy", "from_lookup/not_found");
     if (this.files.has(to)) throw new DropboxConflictError("exists", "req-copy", "to/conflict/file");
@@ -109,6 +119,36 @@ async function fixture(relative = "market/report.pdf") {
 }
 
 describe("input intake crash recovery", () => {
+  it("replays after DETECTED was durable but the immutable source snapshot crashed", async () => {
+    const f = await fixture("crash/detected-before-snapshot.pdf");
+    f.dropbox.failSnapshotCopyOnce = true;
+    const request = { sourcePath: f.sourcePath, relativeInputPath: f.relative, metadata: providerMetadata(f.source) };
+
+    await expect(f.service.ingest(f.state, request)).rejects.toThrow(/injected crash/i);
+    const intakeId = (await f.runtime.objects.listChildren(`/PROJECT_OS/.project-os/projects/${f.state.project_id}/documents/intakes`))[0]?.name.replace(/\.json$/, "");
+    expect(intakeId).toMatch(/^INTAKE-/);
+    expect((await new InputIntakeRepository(f.runtime.objects).read(f.state.project_id, intakeId!))?.phase).toBe("DETECTED");
+
+    const replay = await f.service.ingest(f.state, request);
+    expect(replay).toMatchObject({ status: "completed", resumed: true });
+    expect(f.dropbox.files.has(f.sourcePath)).toBe(false);
+  });
+
+  it("replays after immutable snapshot succeeded but visible reference copy crashed", async () => {
+    const f = await fixture("crash/snapshot-before-visible-copy.pdf");
+    f.dropbox.failVisibleCopyOnce = true;
+    const request = { sourcePath: f.sourcePath, relativeInputPath: f.relative, metadata: providerMetadata(f.source) };
+
+    await expect(f.service.ingest(f.state, request)).rejects.toThrow(/injected crash/i);
+    const entries = await f.runtime.objects.listChildren(`/PROJECT_OS/.project-os/projects/${f.state.project_id}/documents/intakes`);
+    const intakeId = entries[0]?.name.replace(/\.json$/, "");
+    expect((await new InputIntakeRepository(f.runtime.objects).read(f.state.project_id, intakeId!))?.phase).toBe("SNAPSHOTTED");
+
+    const replay = await f.service.ingest(f.state, request);
+    expect(replay).toMatchObject({ status: "completed", resumed: true });
+    expect(f.dropbox.files.has(f.sourcePath)).toBe(false);
+  });
+
   it("reuses a visible reference copy after crashing before the immutable version write", async () => {
     const f = await fixture("crash/copy-before-version.pdf");
     f.dropbox.failVersionCreateOnce = true;
@@ -138,6 +178,20 @@ describe("input intake crash recovery", () => {
     expect(await new DocumentLedgerRepository(f.runtime).readHead(f.state.project_id, replay.document_id!)).toMatchObject({
       reference_version_id: replay.version_id
     });
+  });
+
+  it("preserves a newer source revision instead of deleting it during stale cleanup", async () => {
+    const f = await fixture("crash/newer-source-before-cleanup.pdf");
+    f.dropbox.failSourceDeleteOnce = f.sourcePath;
+    const request = { sourcePath: f.sourcePath, relativeInputPath: f.relative, metadata: providerMetadata(f.source) };
+
+    await expect(f.service.ingest(f.state, request)).rejects.toThrow(/injected crash/i);
+    await f.dropbox.upload(f.sourcePath, "newer human bytes", "overwrite");
+
+    const replay = await f.service.ingest(f.state, request);
+    expect(replay).toMatchObject({ status: "conflict", resumed: true });
+    expect(f.dropbox.files.get(f.sourcePath)).toBe("newer human bytes");
+    expect((await new InputIntakeRepository(f.runtime.objects).read(f.state.project_id, replay.intake_id))?.phase).toBe("CONFLICT");
   });
 
   it("closes the intake when source deletion succeeded but SOURCE_REMOVED persistence crashed", async () => {

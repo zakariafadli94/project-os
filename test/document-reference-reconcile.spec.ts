@@ -137,8 +137,9 @@ describe("reference reconciliation", () => {
     expect(dropbox.files.has(inputPath)).toBe(true);
 
     const result = await new ManagedDocumentReconciler(runtime).reconcileChanges(state, [sourceChange]);
+    const metrics = result as unknown as Record<string, number>;
 
-    expect(result).toMatchObject({
+    expect(metrics).toMatchObject({
       ingested: 1,
       ignored: 0,
       intake_completed: 1,
@@ -159,12 +160,13 @@ describe("reference reconciliation", () => {
     const secondPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "duplicates/report-copy.pdf");
     const duplicate = await dropbox.externalAdd(secondPath, "same-report-bytes");
     const result = await reconciler.reconcileChanges(state, [change(duplicate)]);
+    const metrics = result as unknown as Record<string, number>;
 
     const ledger = new DocumentLedgerRepository(runtime);
     const fingerprint = await ledger.readReferenceFingerprint(state.project_id, duplicate.content_hash);
     const originalDocumentId = await documentIdForProviderFile(state.project_id, first.id);
     const duplicateDocumentId = await documentIdForProviderFile(state.project_id, duplicate.id);
-    expect(result).toMatchObject({ duplicates: 1, duplicate_cleaned: 1 });
+    expect(metrics).toMatchObject({ duplicates: 1, duplicate_cleaned: 1 });
     expect(dropbox.files.has(secondPath)).toBe(false);
     expect(fingerprint?.document_id).toBe(originalDocumentId);
     expect(await ledger.readHead(state.project_id, duplicateDocumentId)).toBeNull();
@@ -186,10 +188,11 @@ describe("reference reconciliation", () => {
     const newInputPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "historical/old-report.pdf");
     const historicalCopy = await dropbox.externalAdd(newInputPath, "old-report-bytes");
     const result = await reconciler.reconcileChanges(state, [change(historicalCopy)]);
+    const metrics = result as unknown as Record<string, number>;
 
     const secondDocumentId = await documentIdForProviderFile(state.project_id, historicalCopy.id);
     const ledger = new DocumentLedgerRepository(runtime);
-    expect(result).toMatchObject({ ingested: 1, intake_completed: 1, duplicates: 0 });
+    expect(metrics).toMatchObject({ ingested: 1, intake_completed: 1, duplicates: 0 });
     expect(await ledger.readHead(state.project_id, secondDocumentId)).toMatchObject({
       kind: "reference",
       logical_path: "historical/old-report.pdf",

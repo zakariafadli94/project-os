@@ -28,6 +28,8 @@ import {
   ManagedDocumentIdentityConflictError,
   assertManagedMarkdownIdentityIfPresent
 } from "./identity-frontmatter";
+import { InputIntakeRepository } from "./input-intake-repository";
+import { InputIntakeService, type InputIntakeResult } from "./input-intake-service";
 import { DocumentLedgerRepository, type ReferenceFingerprintRecord } from "./repository";
 
 export interface ManagedDocumentReconcileSummary {
@@ -38,15 +40,23 @@ export interface ManagedDocumentReconcileSummary {
   duplicates: number;
   restored: number;
   conflicts: number;
+  intake_completed: number;
+  duplicate_cleaned: number;
+  withdrawn: number;
+  intake_resumed: number;
 }
 
 export class ManagedDocumentReconciler {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly ledger: DocumentLedgerRepository;
+  private readonly intakeRepository: InputIntakeRepository;
+  private readonly intakeService: InputIntakeService;
 
   constructor(input: PersistenceInput) {
     this.runtime = asProjectOsPersistence(input);
     this.ledger = new DocumentLedgerRepository(this.runtime);
+    this.intakeRepository = new InputIntakeRepository(this.runtime.objects);
+    this.intakeService = new InputIntakeService(this.runtime);
   }
 
   async reconcileChanges(
@@ -60,7 +70,11 @@ export class ManagedDocumentReconciler {
       ingested: 0,
       duplicates: 0,
       restored: 0,
-      conflicts: 0
+      conflicts: 0,
+      intake_completed: 0,
+      duplicate_cleaned: 0,
+      withdrawn: 0,
+      intake_resumed: 0
     };
     if (state.status === "archived") {
       summary.ignored = changes.length;
@@ -89,10 +103,16 @@ export class ManagedDocumentReconciler {
           );
           summary.restored += restored ? 1 : 0;
           summary.ignored += restored ? 0 : 1;
+        } else if (classified.zone === "inputs") {
+          const result = await this.reconcileDeletedInput(state, change.path);
+          if (!result) {
+            summary.ignored += 1;
+          } else {
+            this.applyInputIntakeResult(summary, result);
+          }
         } else {
-          // INPUTS deletion is a legitimate withdrawal. Deleted change entries do
-          // not carry a stable object id, so REFERENCES deletion remains visible
-          // to higher-level recovery instead of guessing an identity from its path.
+          // REFERENCES deletion remains visible to higher-level recovery instead
+          // of guessing document identity from the path alone.
           summary.ignored += 1;
         }
         continue;
@@ -105,10 +125,12 @@ export class ManagedDocumentReconciler {
       }
 
       if (classified.zone === "inputs") {
-        const result = await this.ingestInput(state, classified.relativePath, change.path, metadata);
-        summary.ingested += result === "ingested" ? 1 : 0;
-        summary.duplicates += result === "duplicate" ? 1 : 0;
-        summary.ignored += result === "ignored" ? 1 : 0;
+        const result = await this.intakeService.ingest(state, {
+          sourcePath: change.path,
+          relativeInputPath: classified.relativePath,
+          metadata
+        });
+        this.applyInputIntakeResult(summary, result);
         continue;
       }
       if (classified.zone === "references") {
@@ -145,6 +167,69 @@ export class ManagedDocumentReconciler {
       else summary.ignored += 1;
     }
     return summary;
+  }
+
+  private applyInputIntakeResult(summary: ManagedDocumentReconcileSummary, result: InputIntakeResult): void {
+    if (result.status === "completed") {
+      summary.ingested += 1;
+      summary.intake_completed += 1;
+    } else if (result.status === "duplicate_cleaned") {
+      summary.duplicates += 1;
+      summary.duplicate_cleaned += 1;
+    } else if (result.status === "withdrawn") {
+      summary.withdrawn += 1;
+    } else {
+      summary.conflicts += 1;
+    }
+    if (result.resumed) summary.intake_resumed += 1;
+  }
+
+  private async reconcileDeletedInput(state: ProjectState, sourcePath: string): Promise<InputIntakeResult | null> {
+    // A deleted event can be stale if a human already placed a new object at the
+    // same path. Never apply the old binding to a new provider reality.
+    if (await this.metadataMaybe(sourcePath)) return null;
+
+    const binding = await this.intakeRepository.readSourcePathBinding(
+      state.project_id,
+      this.runtime.providerId,
+      sourcePath
+    );
+    if (!binding) return null;
+
+    let intake = await this.intakeRepository.read(state.project_id, binding.intake_id);
+    if (!intake || intake.source.provider_path !== sourcePath || intake.source.revision_token !== binding.revision_token) {
+      return {
+        status: "conflict",
+        intake_id: binding.intake_id,
+        resumed: true
+      };
+    }
+
+    if (intake.phase === "COMPLETE") {
+      return { status: "completed", intake_id: intake.intake_id, resumed: true };
+    }
+    if (intake.phase === "DUPLICATE_CLEANED") {
+      return { status: "duplicate_cleaned", intake_id: intake.intake_id, resumed: true };
+    }
+    if (intake.phase === "WITHDRAWN") {
+      return { status: "withdrawn", intake_id: intake.intake_id, resumed: true };
+    }
+    if (intake.phase === "CONFLICT") {
+      return { status: "conflict", intake_id: intake.intake_id, resumed: true };
+    }
+
+    if (intake.phase === "DETECTED" || intake.phase === "SNAPSHOTTED") {
+      intake = await this.intakeRepository.advance(state.project_id, intake.intake_id, "WITHDRAWN", new Date().toISOString());
+      return { status: "withdrawn", intake_id: intake.intake_id, resumed: true };
+    }
+
+    if (intake.phase === "REFERENCE_COMMITTED") {
+      intake = await this.intakeRepository.advance(state.project_id, intake.intake_id, "SOURCE_REMOVED", new Date().toISOString());
+    }
+    if (intake.phase === "SOURCE_REMOVED") {
+      intake = await this.intakeRepository.advance(state.project_id, intake.intake_id, "COMPLETE", new Date().toISOString());
+    }
+    return { status: "completed", intake_id: intake.intake_id, resumed: true };
   }
 
   private async restoreDeletedWorkProduct(

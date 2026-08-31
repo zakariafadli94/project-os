@@ -175,6 +175,14 @@ export function machineDocumentProviderPayloadPath(projectId: string, documentId
   return `${machineDocumentRoot(projectId)}/payloads/provider/${assertSafeDocumentId(documentId)}/${assertSafeDocumentVersionId(versionId)}/payload`;
 }
 
+export function machineInputIntakePath(projectId: string, intakeId: string): string {
+  return `${machineDocumentRoot(projectId)}/intakes/${assertSafeInputIntakeId(intakeId)}.json`;
+}
+
+export function machineInputIntakeSourceBindingPath(projectId: string, sourcePathHash: string): string {
+  return `${machineDocumentRoot(projectId)}/intake-bindings/source-path/${assertSafeSha256(sourcePathHash)}.json`;
+}
+
 export function machineMutationGateRoot(projectId: string): string {
   return `${machineProjectRoot(projectId)}/mutation-gate`;
 }
@@ -258,6 +266,8 @@ export const v2Paths = {
   machineDocumentVersionPath,
   machineDocumentTextPayloadPath,
   machineDocumentProviderPayloadPath,
+  machineInputIntakePath,
+  machineInputIntakeSourceBindingPath,
   machineMutationGateRoot,
   machineMutationIntentPath,
   machineMutationIntentDestinationBindingRoot,
@@ -300,6 +310,11 @@ function assertSafeDocumentId(value: string): string {
 
 function assertSafeDocumentVersionId(value: string): string {
   if (!/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/.test(value)) throw new Error(`Unsafe document version id: ${value}`);
+  return value;
+}
+
+function assertSafeInputIntakeId(value: string): string {
+  if (!/^INTAKE-[A-F0-9]{24}$/.test(value)) throw new Error(`Unsafe input intake id: ${value}`);
   return value;
 }
 

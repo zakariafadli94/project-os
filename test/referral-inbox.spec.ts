@@ -77,10 +77,12 @@ describe("governed referral inbox", () => {
     expect(mock.files.has(incomingPath)).toBe(false);
     const receiptRaw = mock.files.get(receiptPath);
     expect(receiptRaw).toBeDefined();
-    expect(JSON.parse(receiptRaw!)).toMatchObject({
+    expect(JSON.parse(receiptRaw!)).toEqual({
       request_id: requestId,
       source_project_id: source.project_id,
       target_project_id: target.project_id,
+      relative_path: relativePath,
+      content_sha256: contentSha256,
       status: "committed"
     });
     expect(mock.files.get(inputPath)).toBe(content);

@@ -1,7 +1,10 @@
 import { deploymentIdentity } from "./deployment/identity";
 import { parseMutationCandidateResolutionRequest } from "./domain/mutation-candidate-resolution";
+import { parseReferralWriteRequest } from "./domain/referral";
 import type { Env } from "./env";
 import baseWorker from "./index";
+import { createProductionPersistence } from "./persistence/production-factory";
+import { ReferralService } from "./referrals/service";
 
 export { MutationGateProjectGuard as ProjectGuard } from "./durable/project-guard-mutation-gate";
 export { RegistryGuard } from "./durable/registry-guard";
@@ -26,6 +29,54 @@ const worker = {
       }
       const stub = env.PROJECT_GUARD.getByName(projectId);
       return stub.fetch("https://project-guard.internal/schema-status", { method: "GET" });
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/admin/intake-health") {
+      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const registryStub = env.REGISTRY_GUARD.getByName("global");
+      const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+      if (!registryResponse.ok) {
+        return Response.json({ error: "registry_unavailable" }, { status: 502 });
+      }
+      const registry = await registryResponse.json<{ projects: Array<{ project_id: string }> }>();
+      const projects = await Promise.all(registry.projects.map(async ({ project_id }) => {
+        const stub = env.PROJECT_GUARD.getByName(project_id);
+        const response = await stub.fetch("https://project-guard.internal/intake-health", { method: "GET" });
+        if (!response.ok) {
+          throw new Error(`ProjectGuard intake health returned ${response.status} for ${project_id}`);
+        }
+        return response.json<Record<string, unknown>>();
+      }));
+      return Response.json({ projects });
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/referrals") {
+      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+      let referral;
+      try {
+        referral = parseReferralWriteRequest(await request.json());
+      } catch (error) {
+        return Response.json({
+          error: "invalid_referral_request",
+          message: error instanceof Error ? error.message : "Invalid referral request"
+        }, { status: 400 });
+      }
+
+      const registryStub = env.REGISTRY_GUARD.getByName("global");
+      const service = new ReferralService(createProductionPersistence(env), {
+        resolveProject: async (projectId) => {
+          const response = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+          if (!response.ok) throw new Error(`RegistryGuard referral lookup returned ${response.status}`);
+          const registry = await response.json<{ projects: Array<{
+            project_id: string;
+            slug: string;
+            status: "active" | "paused" | "completed" | "archived";
+          }> }>();
+          return registry.projects.find((project) => project.project_id === projectId) ?? null;
+        }
+      });
+      return Response.json(await service.deliver(referral));
     }
 
     if (request.method === "POST" && url.pathname === "/v1/mutation-candidates/resolve") {

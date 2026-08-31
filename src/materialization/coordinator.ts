@@ -7,6 +7,7 @@ import {
   type MaterializationHead,
   type ProjectionOutputEvidence
 } from "../domain/materialization";
+import type { ProjectGovernanceProfile } from "../domain/project-governance";
 import type { ProjectState } from "../domain/project-state";
 import { archiveProjectRoot, machineMaterializationRecordPath, workspaceProjectRoot } from "../persistence/layout";
 import { projectionIndexRootHash } from "./hash";
@@ -20,6 +21,7 @@ import { MaterializationOutputConflictError, type ProjectionWriteOutcome } from 
 
 export interface MaterializationRepositoryPort {
   readCommitRecord(projectId: string, revision: number): Promise<CanonicalCommitRecord | null>;
+  readProjectGovernanceProfile?(projectId: string): Promise<ProjectGovernanceProfile | null>;
   readMaterializationHead(projectId: string): Promise<MaterializationHead | null>;
   readMaterializationRecord(
     projectId: string,
@@ -233,7 +235,10 @@ export class MaterializationCoordinator {
       const plannerBaseline: PlannerBaseline | null = baseline
         ? { projection_version: baseline.head.projection_version, outputs: baseline.outputs }
         : null;
-      plan = await planProjection(record, plannerBaseline, target.projection_version);
+      const governanceProfile = this.repository.readProjectGovernanceProfile
+        ? await this.repository.readProjectGovernanceProfile(this.projectId)
+        : null;
+      plan = await planProjection(record, plannerBaseline, target.projection_version, governanceProfile);
       const attempts = this.ledger.attemptOutputs();
       const archived = record.state.status === "archived";
       const activeRoot = this.workspaceRootFor(record.state);

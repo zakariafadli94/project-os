@@ -1,7 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import type {
+  ProjectCreateAuthorizationConsumption,
+  ProjectCreateAuthorizationRecord,
+  ProjectKindView
+} from "../domain/project-governance";
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
+import { GovernanceRepository } from "../governance/repository";
 import { parseLayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import { ProjectRepository } from "../persistence/repository";
@@ -36,8 +42,13 @@ interface CountRow {
   count: number;
 }
 
+type ProjectCreateAuthMode = "observe" | "enforce";
+type ProjectCreateTransaction = Extract<Transaction, { operation: "project.create" }>;
+
 export class RegistryGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
+  private readonly governance: GovernanceRepository;
+  private readonly projectCreateAuthMode: ProjectCreateAuthMode;
   private queue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -67,6 +78,8 @@ export class RegistryGuard extends DurableObject<Env> {
     `);
     const persistence = createProductionPersistence(env);
     this.repository = new ProjectRepository(persistence, parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
+    this.governance = new GovernanceRepository(persistence);
+    this.projectCreateAuthMode = parseProjectCreateAuthMode(env.PROJECT_OS_PROJECT_CREATE_AUTH_MODE);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -108,29 +121,217 @@ export class RegistryGuard extends DurableObject<Env> {
       }
       if (existing.receipt_json) return Response.json(JSON.parse(existing.receipt_json) as Receipt);
       if (!existing.project_id) throw new Error("Registry request has no allocated project ID");
+      await this.restoreAllocatedGovernance(tx, existing.project_id);
       return this.finishAllocatedCreate(tx, existing.project_id);
     }
 
     if (tx.project_id !== AUTO_PROJECT_ID) {
-      const receipt = this.rejectedReceipt(tx, "PROJECT_ID_MUST_BE_AUTO", "External project.create must use PRJ-AUTO", tx.project_id);
-      this.persistTerminalRequest(tx, receipt, null);
-      await this.repository.writeTerminalTransaction(tx, receipt);
-      return Response.json(receipt);
+      return this.rejectCreate(
+        tx,
+        "PROJECT_ID_MUST_BE_AUTO",
+        "External project.create must use PRJ-AUTO",
+        tx.project_id
+      );
+    }
+
+    if (this.projectCreateAuthMode === "enforce") {
+      const authorized = await this.requireProjectCreateAuthorization(tx);
+      if (authorized instanceof Response) return authorized;
+
+      if (this.hasDuplicateProjectIdentity(tx)) {
+        return this.rejectCreate(
+          tx,
+          "DUPLICATE_PROJECT",
+          "Project name, slug, or alias conflicts with an existing or in-flight project",
+          AUTO_PROJECT_ID
+        );
+      }
+
+      const projectId = await this.reserveAuthorizedProjectId(tx, authorized.authorization, authorized.consumption);
+      await this.writeAuthorizedProjectProfile(tx, authorized.authorization, projectId);
+      return this.finishAllocatedCreate(tx, projectId);
     }
 
     if (this.hasDuplicateProjectIdentity(tx)) {
-      const receipt = this.rejectedReceipt(tx, "DUPLICATE_PROJECT", "Project name, slug, or alias conflicts with an existing or in-flight project", AUTO_PROJECT_ID);
-      this.persistTerminalRequest(tx, receipt, null);
-      await this.repository.writeTerminalTransaction(tx, receipt);
-      return Response.json(receipt);
+      return this.rejectCreate(
+        tx,
+        "DUPLICATE_PROJECT",
+        "Project name, slug, or alias conflicts with an existing or in-flight project",
+        AUTO_PROJECT_ID
+      );
     }
 
     const projectId = this.allocateProjectId(tx);
     return this.finishAllocatedCreate(tx, projectId);
   }
 
-  private async finishAllocatedCreate(original: Extract<Transaction, { operation: "project.create" }>, projectId: string): Promise<Response> {
-    const normalized: Extract<Transaction, { operation: "project.create" }> = {
+  private async requireProjectCreateAuthorization(
+    tx: ProjectCreateTransaction
+  ): Promise<{
+    authorization: ProjectCreateAuthorizationRecord;
+    consumption: ProjectCreateAuthorizationConsumption | null;
+  } | Response> {
+    const authorizationId = tx.payload.authorization_id;
+    if (!authorizationId || !tx.payload.project_kind) {
+      return this.rejectCreate(
+        tx,
+        "PROJECT_CREATE_AUTHORIZATION_REQUIRED",
+        "New project allocation requires an independent project-create authorization",
+        AUTO_PROJECT_ID
+      );
+    }
+
+    const authorization = await this.governance.readProjectCreateAuthorization(authorizationId);
+    if (!authorization) {
+      return this.rejectCreate(
+        tx,
+        "PROJECT_CREATE_AUTHORIZATION_REQUIRED",
+        `Project-create authorization ${authorizationId} does not exist`,
+        AUTO_PROJECT_ID
+      );
+    }
+
+    const consumption = await this.governance.readProjectCreateAuthorizationConsumption(authorizationId);
+    if (consumption && consumption.transaction_id !== tx.transaction_id) {
+      return this.rejectCreate(
+        tx,
+        "PROJECT_CREATE_AUTHORIZATION_CONSUMED",
+        `Project-create authorization ${authorizationId} was already consumed`,
+        AUTO_PROJECT_ID
+      );
+    }
+
+    if (Date.parse(authorization.expires_at) <= Date.now()) {
+      return this.rejectCreate(
+        tx,
+        "PROJECT_CREATE_AUTHORIZATION_EXPIRED",
+        `Project-create authorization ${authorizationId} has expired`,
+        AUTO_PROJECT_ID
+      );
+    }
+
+    if (!authorizationMatchesTransaction(authorization, tx)) {
+      return this.rejectCreate(
+        tx,
+        "PROJECT_CREATE_AUTHORIZATION_MISMATCH",
+        `Project-create authorization ${authorizationId} does not match the requested project`,
+        AUTO_PROJECT_ID
+      );
+    }
+
+    return { authorization, consumption };
+  }
+
+  private async reserveAuthorizedProjectId(
+    tx: ProjectCreateTransaction,
+    authorization: ProjectCreateAuthorizationRecord,
+    existingConsumption: ProjectCreateAuthorizationConsumption | null
+  ): Promise<string> {
+    if (existingConsumption) {
+      this.ensureAllocatedRequest(tx, existingConsumption.allocated_project_id);
+      return existingConsumption.allocated_project_id;
+    }
+
+    const row = this.ctx.storage.sql.exec<MetaRow>(
+      "SELECT value FROM meta WHERE key = 'next_project_number'"
+    ).one();
+    const next = Number.parseInt(row.value, 10);
+    if (!Number.isSafeInteger(next) || next < 1) throw new Error("Invalid project allocator state");
+    const projectId = `PRJ-${next.toString().padStart(4, "0")}`;
+    const consumption: ProjectCreateAuthorizationConsumption = {
+      schema_version: "1.0",
+      authorization_id: authorization.authorization_id,
+      transaction_id: tx.transaction_id,
+      allocated_project_id: projectId,
+      consumed_at: new Date().toISOString()
+    };
+
+    // The immutable consumption record is the irreversible project-ID reservation.
+    // Provider failure before this write leaves the authorization reusable. Once it
+    // exists, retries are permanently bound to the same transaction and project ID.
+    await this.governance.writeProjectCreateAuthorizationConsumption(consumption);
+    this.ensureAllocatedRequest(tx, projectId);
+    return projectId;
+  }
+
+  private ensureAllocatedRequest(tx: ProjectCreateTransaction, projectId: string): void {
+    const numericId = Number.parseInt(projectId.slice(4), 10);
+    if (!Number.isSafeInteger(numericId) || numericId < 1) {
+      throw new Error(`Invalid reserved project ID: ${projectId}`);
+    }
+
+    this.ctx.storage.transactionSync(() => {
+      const existing = this.requestRow(tx.transaction_id);
+      if (existing) {
+        if (existing.transaction_json !== JSON.stringify(tx) || existing.project_id !== projectId) {
+          throw new Error(`Reserved project-create request mismatch for ${tx.transaction_id}`);
+        }
+        return;
+      }
+
+      const row = this.ctx.storage.sql.exec<MetaRow>(
+        "SELECT value FROM meta WHERE key = 'next_project_number'"
+      ).one();
+      const currentNext = Number.parseInt(row.value, 10);
+      if (!Number.isSafeInteger(currentNext) || currentNext < 1) throw new Error("Invalid project allocator state");
+      if (currentNext <= numericId) {
+        this.ctx.storage.sql.exec(
+          "UPDATE meta SET value = ? WHERE key = 'next_project_number'",
+          String(numericId + 1)
+        );
+      }
+      this.ctx.storage.sql.exec(
+        "INSERT INTO requests (transaction_id, transaction_json, project_id, status, receipt_json) VALUES (?, ?, ?, 'allocated', NULL)",
+        tx.transaction_id,
+        JSON.stringify(tx),
+        projectId
+      );
+    });
+  }
+
+  private async writeAuthorizedProjectProfile(
+    tx: ProjectCreateTransaction,
+    authorization: ProjectCreateAuthorizationRecord,
+    projectId: string
+  ): Promise<void> {
+    if (!tx.payload.project_kind || !tx.payload.authorization_id) {
+      throw new Error("Authorized project create lost required governance fields");
+    }
+    await this.governance.writeProjectProfile({
+      schema_version: "1.0",
+      project_id: projectId,
+      project_kind: tx.payload.project_kind,
+      authorization_id: tx.payload.authorization_id,
+      ...(authorization.parent_project_id ? { parent_project_id: authorization.parent_project_id } : {}),
+      ...(authorization.improvement_package_id ? { improvement_package_id: authorization.improvement_package_id } : {}),
+      created_at: tx.created_at
+    });
+  }
+
+  private async restoreAllocatedGovernance(tx: ProjectCreateTransaction, projectId: string): Promise<void> {
+    if (this.projectCreateAuthMode !== "enforce") return;
+    const authorizationId = tx.payload.authorization_id;
+    if (!authorizationId || !tx.payload.project_kind) return;
+
+    const [authorization, consumption] = await Promise.all([
+      this.governance.readProjectCreateAuthorization(authorizationId),
+      this.governance.readProjectCreateAuthorizationConsumption(authorizationId)
+    ]);
+    if (!authorization || !consumption) {
+      throw new Error(`Allocated project create is missing governance evidence: ${tx.transaction_id}`);
+    }
+    if (
+      consumption.transaction_id !== tx.transaction_id
+      || consumption.allocated_project_id !== projectId
+      || !authorizationMatchesTransaction(authorization, tx)
+    ) {
+      throw new Error(`Allocated project create governance binding mismatch: ${tx.transaction_id}`);
+    }
+    await this.writeAuthorizedProjectProfile(tx, authorization, projectId);
+  }
+
+  private async finishAllocatedCreate(original: ProjectCreateTransaction, projectId: string): Promise<Response> {
+    const normalized: ProjectCreateTransaction = {
       ...original,
       project_id: projectId,
       base_revision: 0
@@ -175,7 +376,7 @@ export class RegistryGuard extends DurableObject<Env> {
     });
 
     const entries = this.registryEntries();
-    await this.repository.writeRegistry({ schema_version: "1.0", projects: entries }, renderRegistry(entries));
+    await this.publishRegistry(entries);
     await this.repository.writeReceipt(receipt);
 
     this.ctx.storage.sql.exec(
@@ -207,7 +408,7 @@ export class RegistryGuard extends DurableObject<Env> {
       body.project_id
     );
     const entries = this.registryEntries();
-    await this.repository.writeRegistry({ schema_version: "1.0", projects: entries }, renderRegistry(entries));
+    await this.publishRegistry(entries);
     return Response.json({ status: "ok" });
   }
 
@@ -274,7 +475,7 @@ export class RegistryGuard extends DurableObject<Env> {
     ).toArray()[0] ?? null;
   }
 
-  private allocateProjectId(tx: Extract<Transaction, { operation: "project.create" }>): string {
+  private allocateProjectId(tx: ProjectCreateTransaction): string {
     return this.ctx.storage.transactionSync(() => {
       const row = this.ctx.storage.sql.exec<MetaRow>(
         "SELECT value FROM meta WHERE key = 'next_project_number'"
@@ -296,7 +497,7 @@ export class RegistryGuard extends DurableObject<Env> {
     });
   }
 
-  private hasDuplicateProjectIdentity(tx: Extract<Transaction, { operation: "project.create" }>): boolean {
+  private hasDuplicateProjectIdentity(tx: ProjectCreateTransaction): boolean {
     const candidates = new Set([tx.payload.name, tx.payload.slug, ...tx.payload.aliases].map(normalizeIdentity));
     for (const project of this.ctx.storage.sql.exec<ProjectRow>("SELECT * FROM projects").toArray()) {
       const identities = [project.name, project.slug, ...(JSON.parse(project.aliases_json) as string[])].map(normalizeIdentity);
@@ -305,7 +506,7 @@ export class RegistryGuard extends DurableObject<Env> {
     for (const request of this.ctx.storage.sql.exec<RequestRow>(
       "SELECT transaction_json, project_id, status, receipt_json FROM requests WHERE status IN ('allocated', 'guard_committed')"
     ).toArray()) {
-      const pending = JSON.parse(request.transaction_json) as Extract<Transaction, { operation: "project.create" }>;
+      const pending = JSON.parse(request.transaction_json) as ProjectCreateTransaction;
       const identities = [pending.payload.name, pending.payload.slug, ...pending.payload.aliases].map(normalizeIdentity);
       if (identities.some((identity) => candidates.has(identity))) return true;
     }
@@ -324,7 +525,31 @@ export class RegistryGuard extends DurableObject<Env> {
     }));
   }
 
-  private persistTerminalRequest(tx: Extract<Transaction, { operation: "project.create" }>, receipt: Receipt, projectId: string | null): void {
+  private async publishRegistry(entries: RegistryEntry[]): Promise<void> {
+    const governanceByProject = new Map<string, ProjectKindView>();
+    for (const entry of entries) {
+      const profile = await this.repository.readProjectGovernanceProfile(entry.project_id);
+      governanceByProject.set(entry.project_id, profile?.project_kind ?? "unknown_legacy");
+    }
+    await this.repository.writeRegistry(
+      { schema_version: "1.0", projects: entries },
+      renderRegistry(entries, governanceByProject)
+    );
+  }
+
+  private async rejectCreate(
+    tx: ProjectCreateTransaction,
+    code: string,
+    message: string,
+    projectId: string
+  ): Promise<Response> {
+    const receipt = this.rejectedReceipt(tx, code, message, projectId);
+    this.persistTerminalRequest(tx, receipt, null);
+    await this.repository.writeTerminalTransaction(tx, receipt);
+    return Response.json(receipt);
+  }
+
+  private persistTerminalRequest(tx: ProjectCreateTransaction, receipt: Receipt, projectId: string | null): void {
     this.ctx.storage.sql.exec(
       `INSERT INTO requests (transaction_id, transaction_json, project_id, status, receipt_json)
        VALUES (?, ?, ?, ?, ?)
@@ -337,7 +562,7 @@ export class RegistryGuard extends DurableObject<Env> {
     );
   }
 
-  private rejectedReceipt(tx: Extract<Transaction, { operation: "project.create" }>, code: string, message: string, projectId: string): Receipt {
+  private rejectedReceipt(tx: ProjectCreateTransaction, code: string, message: string, projectId: string): Receipt {
     return {
       schema_version: "1.0",
       transaction_id: tx.transaction_id,
@@ -361,6 +586,33 @@ export class RegistryGuard extends DurableObject<Env> {
       release();
     }
   }
+}
+
+function parseProjectCreateAuthMode(value?: "observe" | "enforce"): ProjectCreateAuthMode {
+  if (value === undefined || value === "observe") return "observe";
+  if (value === "enforce") return "enforce";
+  throw new Error(`Invalid PROJECT_OS_PROJECT_CREATE_AUTH_MODE: ${String(value)}`);
+}
+
+function authorizationMatchesTransaction(
+  authorization: ProjectCreateAuthorizationRecord,
+  tx: ProjectCreateTransaction
+): boolean {
+  return authorization.name === tx.payload.name
+    && authorization.slug === tx.payload.slug
+    && authorization.objective === tx.payload.objective
+    && authorization.project_kind === tx.payload.project_kind
+    && optionalEqual(authorization.parent_project_id, tx.payload.parent_project_id)
+    && optionalEqual(authorization.improvement_package_id, tx.payload.improvement_package_id)
+    && canonicalAliases(authorization.aliases) === canonicalAliases(tx.payload.aliases);
+}
+
+function canonicalAliases(values: readonly string[]): string {
+  return JSON.stringify([...new Set(values.map(normalizeIdentity))].sort());
+}
+
+function optionalEqual(left: string | undefined, right: string | undefined): boolean {
+  return (left ?? undefined) === (right ?? undefined);
 }
 
 function parseCanonicalRegistry(value: unknown): RegistryEntry[] | null {

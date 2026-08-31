@@ -1,12 +1,15 @@
 import type { ProjectOsPersistenceRuntime } from "../../src/persistence/provider/capabilities";
 import { ProviderCapabilityError } from "../../src/persistence/provider/errors";
-import { withProviderResilience } from "../../src/persistence/provider/resilience";
+import { withProviderResilience, type ProviderResilienceOptions } from "../../src/persistence/provider/resilience";
 import { createDropboxPersistence } from "../../src/persistence/providers/dropbox/adapter";
 import type { DropboxTransport } from "../../src/persistence/providers/dropbox/client";
 
-export function persistenceFromDropbox(input: DropboxTransport): ProjectOsPersistenceRuntime {
+export function persistenceFromDropbox(
+  input: DropboxTransport,
+  resilienceOptions: ProviderResilienceOptions = {}
+): ProjectOsPersistenceRuntime {
   const raw = forwardTransport(input);
-  const runtime = withProviderResilience(createDropboxPersistence(raw));
+  const runtime = withProviderResilience(createDropboxPersistence(raw), resilienceOptions);
   return {
     providerId: runtime.providerId,
     objects: runtime.objects,

@@ -12,12 +12,11 @@ import type {
   ProviderChangePage,
   ProviderObjectMetadata
 } from "../persistence/provider/contract";
-import { ProviderCursorResetError } from "../persistence/provider/errors";
+import { ProviderCursorResetError, ProviderOperationError } from "../persistence/provider/errors";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
-import {
-  ManagedDocumentReconciler,
-  type ManagedDocumentReconcileSummary
-} from "./reconciler";
+import { IntakeSweep, type IntakeSweepSummary } from "./intake-sweep";
+import { ManagedDocumentReconciler } from "./reconciler-intake";
+import type { ManagedDocumentReconcileSummary } from "./reconciler";
 
 const CURSOR_KEY = "managed-document-change-cursor-v1";
 
@@ -33,6 +32,8 @@ export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSu
   baseline: boolean;
   cursor_advanced: boolean;
   archived: boolean;
+  sweep: IntakeSweepSummary;
+  change_feed_error?: string;
 }
 
 interface BootstrapCandidate {
@@ -47,6 +48,7 @@ export class ManagedDocumentChangeCoordinator {
   private readonly bootstrapper: ManagedDocumentBootstrapper;
   private readonly mutationClassifier: MutationGateClassifier;
   private readonly mutationGate: MutationGateService;
+  private readonly intakeSweep: IntakeSweep;
 
   constructor(
     input: PersistenceInput,
@@ -58,6 +60,7 @@ export class ManagedDocumentChangeCoordinator {
     this.bootstrapper = new ManagedDocumentBootstrapper(this.runtime);
     this.mutationClassifier = new MutationGateClassifier(this.runtime);
     this.mutationGate = new MutationGateService(this.runtime, gateMode);
+    this.intakeSweep = new IntakeSweep(this.runtime);
   }
 
   async reconcile(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
@@ -69,18 +72,43 @@ export class ManagedDocumentChangeCoordinator {
     const existingCursor = await this.cursorStore.get<string>(CURSOR_KEY);
     let cursorReset = false;
     let baseline = !existingCursor;
-    let page: ProviderChangePage;
+    let page: ProviderChangePage | null = null;
+    let changeFeedError: string | undefined;
 
     try {
       page = existingCursor
         ? await this.runtime.changeFeed.listChanges({ cursor: existingCursor })
         : await this.runtime.changeFeed.listChanges({ root });
     } catch (error) {
-      if (!(error instanceof ProviderCursorResetError)) throw error;
-      cursorReset = true;
-      baseline = true;
-      await this.cursorStore.delete(CURSOR_KEY);
-      page = await this.runtime.changeFeed.listChanges({ root });
+      if (error instanceof ProviderCursorResetError) {
+        cursorReset = true;
+        baseline = true;
+        await this.cursorStore.delete(CURSOR_KEY);
+        try {
+          page = await this.runtime.changeFeed.listChanges({ root });
+        } catch (rebuildError) {
+          if (!isChangeFeedFailure(rebuildError)) throw rebuildError;
+          changeFeedError = rebuildError.message;
+        }
+      } else if (isChangeFeedFailure(error)) {
+        changeFeedError = error.message;
+      } else {
+        throw error;
+      }
+    }
+
+    if (page === null) {
+      // A transient/exhausted change-feed failure must not disable the independent
+      // INPUT safety net. Do not advance or fabricate a cursor; only run the
+      // direct sweep. Errors from the sweep itself still propagate fail-closed.
+      const sweep = await this.intakeSweep.sweep(state, new Date().toISOString());
+      return {
+        ...emptySummary({ archived: false }, this.mutationGateMode()),
+        cursor_reset: cursorReset,
+        baseline,
+        sweep,
+        ...(changeFeedError ? { change_feed_error: changeFeedError } : {})
+      };
     }
 
     const detectionSource = cursorReset ? "cursor_reset" : baseline ? "baseline" : "incremental";
@@ -97,6 +125,11 @@ export class ManagedDocumentChangeCoordinator {
     const cursorAdvanced = page.cursor.length > 0 && page.cursor !== existingCursor;
     if (page.cursor.length > 0) await this.cursorStore.put(CURSOR_KEY, page.cursor);
 
+    // The provider change cursor is the fast path, not the sole discovery
+    // mechanism for INPUTS. Every document maintenance call directly sweeps the
+    // bound INPUTS subtree through the same crash-safe intake engine.
+    const sweep = await this.intakeSweep.sweep(state, new Date().toISOString());
+
     return {
       ...summary,
       ...gateSummary,
@@ -104,7 +137,8 @@ export class ManagedDocumentChangeCoordinator {
       cursor_reset: cursorReset,
       baseline,
       cursor_advanced: cursorAdvanced,
-      archived: false
+      archived: false,
+      sweep
     };
   }
 
@@ -168,6 +202,10 @@ export class ManagedDocumentChangeCoordinator {
   }
 }
 
+function isChangeFeedFailure(error: unknown): error is ProviderOperationError {
+  return error instanceof ProviderOperationError && error.diagnostics?.operation === "changes";
+}
+
 function isProjectedDeliverableMetadata(state: ProjectState, relativePath: string): boolean {
   if (relativePath.includes("/") || !relativePath.endsWith(".md")) return false;
   return Object.prototype.hasOwnProperty.call(state.deliverables, relativePath.slice(0, -3));
@@ -189,6 +227,13 @@ function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): Man
     cursor_reset: false,
     baseline: false,
     cursor_advanced: false,
-    archived: flags.archived
+    archived: flags.archived,
+    sweep: {
+      archived: flags.archived,
+      files_scanned: 0,
+      ingested: 0,
+      duplicates: 0,
+      failed: 0
+    }
   };
 }

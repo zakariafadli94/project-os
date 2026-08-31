@@ -2,8 +2,10 @@ export * from "./repository-core";
 
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
 import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../domain/commit-record";
+import type { ProjectGovernanceProfile } from "../domain/project-governance";
 import type { ProjectState } from "../domain/project-state";
 import type { Receipt } from "../domain/receipt";
+import { GovernanceRepository } from "../governance/repository";
 import { ArtifactMutationIntentService } from "../mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../mutation-gate/repository";
 import {
@@ -41,6 +43,7 @@ type ActivationDerivativeOptions = CommitWriteOptions & {
 
 export class ProjectRepository extends CoreProjectRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
+  private readonly governance: GovernanceRepository;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;
   private readonly requestedSchemaWriterStage?: SchemaWriterStage;
@@ -54,6 +57,7 @@ export class ProjectRepository extends CoreProjectRepository {
     const runtime = asProjectOsPersistence(input);
     super(runtime, repositoryMode);
     this.runtime = runtime;
+    this.governance = new GovernanceRepository(runtime);
     this.requestedSchemaWriterStage = schemaWriterStage;
     const writerStage = this.writerStage();
     const mutationRepository = new MutationGateRepository(runtime, writerStage);
@@ -70,6 +74,11 @@ export class ProjectRepository extends CoreProjectRepository {
       throw new Error(`Canonical project state binding mismatch: expected ${projectId}, got ${state.project_id}`);
     }
     return state;
+  }
+
+  async readProjectGovernanceProfile(projectId: string): Promise<ProjectGovernanceProfile | null> {
+    if (this.repositoryMode === "legacy") return null;
+    return this.governance.readProjectProfile(projectId);
   }
 
   override async readReceipt(transactionId: string): Promise<Receipt | null> {
@@ -92,8 +101,6 @@ export class ProjectRepository extends CoreProjectRepository {
       ...validated,
       state: encodeProjectState(validated.state, this.writerStage())
     };
-    // Reparse before publication so the envelope and nested family binding are
-    // proven together while preserving the 1.0 commit envelope.
     parseCanonicalCommitRecord(durableRecord);
     const path = machineCommitRecordPath(validated.project_id, validated.new_revision);
     const content = pretty(durableRecord);

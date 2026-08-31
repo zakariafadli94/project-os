@@ -309,11 +309,37 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder") {
       const body = JSON.parse(await request.text()) as { path: string; recursive?: boolean; include_deleted?: boolean };
       const prefix = `${body.path}/`;
-      const entries = (await Promise.all([...files.keys()]
-        .filter((path) => path.startsWith(prefix) && (body.recursive || !path.slice(prefix.length).includes("/")))
-        .sort()
-        .map((path) => metadataFor(path))))
-        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+      const matchingPaths = [...files.keys()].filter((path) => path.startsWith(prefix)).sort();
+      const entries: Array<Record<string, unknown>> = [];
+
+      if (body.recursive) {
+        for (const path of matchingPaths) {
+          const metadata = await metadataFor(path);
+          if (metadata) entries.push(metadata);
+        }
+      } else {
+        const childFolders = new Set<string>();
+        for (const path of matchingPaths) {
+          const relative = path.slice(prefix.length);
+          const slash = relative.indexOf("/");
+          if (slash === -1) {
+            const metadata = await metadataFor(path);
+            if (metadata) entries.push(metadata);
+            continue;
+          }
+          childFolders.add(`${body.path}/${relative.slice(0, slash)}`);
+        }
+        for (const path of [...childFolders].sort()) {
+          entries.push({
+            ".tag": "folder",
+            name: path.split("/").at(-1) ?? path,
+            path_display: path,
+            path_lower: path.toLowerCase()
+          });
+        }
+        entries.sort((left, right) => String(left.path_display).localeCompare(String(right.path_display)));
+      }
+
       return Response.json({ entries, cursor: `cursor-${changeJournal.length}`, has_more: false });
     }
 

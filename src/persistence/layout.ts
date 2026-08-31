@@ -175,6 +175,26 @@ export function machineDocumentProviderPayloadPath(projectId: string, documentId
   return `${machineDocumentRoot(projectId)}/payloads/provider/${assertSafeDocumentId(documentId)}/${assertSafeDocumentVersionId(versionId)}/payload`;
 }
 
+export function machineProjectGovernanceProfilePath(projectId: string): string {
+  return `${machineProjectRoot(projectId)}/governance/profile.json`;
+}
+
+export function machineIntakeRoot(projectId: string): string {
+  return `${machineDocumentRoot(projectId)}/intake`;
+}
+
+export function machineIntakeRecordPath(projectId: string, intakeId: string): string {
+  return `${machineIntakeRoot(projectId)}/records/${assertSafeIntakeId(intakeId)}.json`;
+}
+
+export function machineIntakeHealthPath(projectId: string): string {
+  return `${machineIntakeRoot(projectId)}/health.json`;
+}
+
+export function machineReferralProvenancePath(projectId: string, referralId: string): string {
+  return `${machineDocumentRoot(projectId)}/provenance/referrals/${assertSafeReferralId(referralId)}.json`;
+}
+
 export function machineMutationGateRoot(projectId: string): string {
   return `${machineProjectRoot(projectId)}/mutation-gate`;
 }
@@ -205,6 +225,26 @@ export function machineTransactionPath(status: MachineTransactionStatus, transac
 
 export function machineReceiptPath(transactionId: string): string {
   return `${MACHINE_ROOT}/receipts/${assertSafeTransactionId(transactionId)}.json`;
+}
+
+export function machineGovernanceRoot(): string {
+  return `${MACHINE_ROOT}/governance`;
+}
+
+export function machineProjectCreateAuthorizationIssuedPath(authorizationId: string): string {
+  return `${machineGovernanceRoot()}/project-create-authorizations/issued/${assertSafeProjectCreateAuthorizationId(authorizationId)}.json`;
+}
+
+export function machineProjectCreateAuthorizationReceiptPath(authorizationId: string): string {
+  return `${machineGovernanceRoot()}/project-create-authorizations/receipts/${assertSafeProjectCreateAuthorizationId(authorizationId)}.json`;
+}
+
+export function machineProjectCreateAuthorizationConsumptionPath(authorizationId: string): string {
+  return `${machineGovernanceRoot()}/project-create-authorizations/consumed/${assertSafeProjectCreateAuthorizationId(authorizationId)}.json`;
+}
+
+export function machineReferralReceiptPath(referralId: string): string {
+  return `${MACHINE_ROOT}/referrals/receipts/${assertSafeReferralId(referralId)}.json`;
 }
 
 export function machineArtifactRequestPath(status: MachineArtifactStatus, requestId: string): string {
@@ -258,6 +298,11 @@ export const v2Paths = {
   machineDocumentVersionPath,
   machineDocumentTextPayloadPath,
   machineDocumentProviderPayloadPath,
+  machineProjectGovernanceProfilePath,
+  machineIntakeRoot,
+  machineIntakeRecordPath,
+  machineIntakeHealthPath,
+  machineReferralProvenancePath,
   machineMutationGateRoot,
   machineMutationIntentPath,
   machineMutationIntentDestinationBindingRoot,
@@ -266,6 +311,11 @@ export const v2Paths = {
   machineMutationResolutionPath,
   machineTransactionPath,
   machineReceiptPath,
+  machineGovernanceRoot,
+  machineProjectCreateAuthorizationIssuedPath,
+  machineProjectCreateAuthorizationReceiptPath,
+  machineProjectCreateAuthorizationConsumptionPath,
+  machineReferralReceiptPath,
   machineArtifactRequestPath,
   machineArtifactReceiptPath,
   machineRegistryJsonPath,
@@ -289,6 +339,27 @@ function assertSafeArtifactRelativePath(value: string): string {
 function assertSafeArtifactRequestId(value: string): string {
   if (!/^ART-[A-Z0-9-]{10,}$/.test(value)) {
     throw new Error(`Unsafe artifact request id: ${value}`);
+  }
+  return value;
+}
+
+function assertSafeProjectCreateAuthorizationId(value: string): string {
+  if (!/^PCAUTH-[A-Z0-9-]{12,}$/.test(value)) {
+    throw new Error(`Unsafe project-create authorization id: ${value}`);
+  }
+  return value;
+}
+
+function assertSafeReferralId(value: string): string {
+  if (!/^REF-[A-Z0-9-]{8,}$/.test(value)) {
+    throw new Error(`Unsafe referral id: ${value}`);
+  }
+  return value;
+}
+
+function assertSafeIntakeId(value: string): string {
+  if (!/^INTAKE-[A-F0-9]{24}$/.test(value)) {
+    throw new Error(`Unsafe intake id: ${value}`);
   }
   return value;
 }

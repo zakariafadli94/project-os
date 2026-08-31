@@ -1,3 +1,4 @@
+import type { ProjectKindView } from "../domain/project-governance";
 import { MANAGED_NOTICE } from "./shared";
 
 export interface RegistryEntry {
@@ -10,13 +11,21 @@ export interface RegistryEntry {
   updated_at: string;
 }
 
-export function renderRegistry(entries: RegistryEntry[]): string {
+export function renderRegistry(
+  entries: RegistryEntry[],
+  governanceByProject: ReadonlyMap<string, ProjectKindView> = new Map()
+): string {
   const groups: RegistryEntry["status"][] = ["active", "paused", "completed", "archived"];
   const sections = groups.map((status) => {
     const items = entries
       .filter((entry) => entry.status === status)
       .sort((a, b) => a.project_id.localeCompare(b.project_id))
-      .map((entry) => `- **${entry.project_id}** — [[PROJECTS/${entry.project_id}-${entry.slug}/PROJECT|${entry.name}]]`)
+      .map((entry) => {
+        const kind = governanceByProject.get(entry.project_id) ?? "unknown_legacy";
+        const synthetic = kind === "synthetic_probe" || kind === "synthetic_stress_test";
+        const marker = synthetic ? " [synthetic]" : "";
+        return `- **${entry.project_id}**${marker} — [[PROJECTS/${entry.project_id}-${entry.slug}/PROJECT|${entry.name}]]`;
+      })
       .join("\n") || "- None";
     return `## ${status[0].toUpperCase()}${status.slice(1)}\n\n${items}`;
   }).join("\n\n");

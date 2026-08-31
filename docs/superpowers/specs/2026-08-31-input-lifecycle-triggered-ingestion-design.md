@@ -1,6 +1,6 @@
 # IMP-INPUTLIFECYCLE001 — Trigger-first INPUTS lifecycle
 
-Status: founder-approved design
+Status: founder-approved design; safety amendment approved
 Date: 2026-08-31
 Project: PRJ-0002 — Project OS
 
@@ -139,13 +139,16 @@ This removes an inbox copy, not evidence: immutable evidence and the governed re
 
 ### 6.5 COMPLETE
 
-All mandatory postconditions are true:
+All mandatory file-level postconditions are true:
 
 - immutable source evidence exists;
 - governed reference version/head exists;
 - visible reference provider object exists with matching evidence;
-- original `INPUTS/` object no longer exists;
-- eligible empty ancestor directories below `INPUTS/` have been removed.
+- original `INPUTS/` object no longer exists.
+
+Empty-directory cleanup is **not** part of the mandatory terminal postcondition. It may be performed only when the active provider exposes a race-safe capability equivalent to “delete this directory only if it is still empty.”
+
+With the current Dropbox contract, Project OS must leave harmless empty `INPUTS/` directories in place rather than use recursive folder deletion that could remove a concurrently added human file.
 
 `COMPLETE` means technical ingestion completed. It never implies research acceptance, decision acceptance or any other canonical business acceptance.
 
@@ -155,7 +158,7 @@ The current shortcut `existing version -> ignored` is invalid for a multi-effect
 
 The replacement rule is:
 
-> Every replay checks the complete intended postcondition and converges missing safe effects. An intermediate ledger record never proves intake completion by itself.
+> Every replay checks the complete intended file-level postcondition and converges missing safe effects. An intermediate ledger record never proves intake completion by itself.
 
 ### Crash after snapshot
 
@@ -220,11 +223,13 @@ Later explicit reclassification must preserve governed reference identity accord
 
 Input directories are organizational containers, not durable evidence objects.
 
-After a successful file intake removes its source, Project OS removes any now-empty ancestor directories below `INPUTS/`, stopping at the `INPUTS/` root.
+File-level intake correctness never depends on deleting empty directories. Directory cleanup is a provider capability, not a core lifecycle requirement.
 
-Directory cleanup must be idempotent and conditional on the directory being empty. It must never remove a non-empty directory or race by overwriting newer human state.
+A provider may clean empty ancestors below `INPUTS/` only if it supports a race-safe, non-recursive or conditional empty-only deletion primitive whose semantics prevent deletion of content added concurrently after an emptiness check.
 
-A crash during directory cleanup is replayable. File-level evidence/reference correctness remains the primary safety condition.
+The current Dropbox API path used by Project OS does not provide that safety contract. Dropbox `delete_v2` recursively deletes folders; therefore Project OS must **not** automatically delete `INPUTS/` directories after ingestion. Empty directories may remain harmlessly.
+
+A future provider capability may enable safe cleanup without changing the file-level intake state machine.
 
 ## 11. Provider-neutral boundary
 
@@ -235,8 +240,9 @@ The core intake lifecycle operates on provider capabilities/evidence such as:
 - integrity hash;
 - immutable snapshot/copy;
 - metadata lookup;
-- delete;
-- provider change notification/change feed.
+- delete of the exact source object;
+- provider change notification/change feed;
+- optional race-safe empty-directory deletion capability.
 
 Dropbox-specific webhook and cursor mechanics remain inside the Dropbox/provider integration layer.
 
@@ -268,7 +274,7 @@ The implementation must verify at least these boundaries:
 5. crash after provider reference copy: replay verifies/reuses it;
 6. crash after reference ledger write but before source deletion: replay performs cleanup;
 7. crash after source deletion but before terminal intake record: replay verifies postconditions and closes the intake;
-8. crash during empty-directory cleanup: replay finishes cleanup without affecting reference integrity.
+8. optional directory-cleanup failure or absence of a safe capability never blocks `COMPLETE` and never permits recursive deletion of a concurrently populated `INPUTS/` directory.
 
 ## 14. Historical recovery / one-time remediation
 
@@ -320,6 +326,8 @@ Project OS never deletes an `INPUTS/` object merely because:
 
 Deletion requires machine-verifiable evidence that the intended governed source representation exists with compatible content, or that the input is an exact duplicate of a proven current reference.
 
+Project OS also never recursively deletes an `INPUTS/` directory merely because a preceding list operation observed it as empty.
+
 ## 18. Acceptance criteria
 
 ### AC-01 — Triggered ingestion
@@ -328,7 +336,7 @@ Adding a file under a project's `INPUTS/` and delivering the provider trigger in
 
 ### AC-02 — Active inbox invariant
 
-After successful ingestion, the source is absent from `INPUTS/` and present as a governed reference.
+After successful ingestion, the source file is absent from `INPUTS/` and present as a governed reference.
 
 ### AC-03 — Durable webhook handoff
 
@@ -378,9 +386,9 @@ The explicit recovery operation converges stale legacy inputs safely without a p
 
 Input changes affect only their owning project.
 
-### AC-15 — Empty-directory cleanup
+### AC-15 — Fail-safe directory semantics
 
-After the final successfully ingested child leaves a nested input directory, empty ancestors below the `INPUTS/` root are removed safely.
+Successful file-level intake reaches `COMPLETE` even when empty ancestor directories remain. With the current Dropbox capability set, Project OS does not recursively delete `INPUTS/` directories as cleanup and therefore cannot delete a concurrently added file through a list-then-folder-delete race.
 
 ## 19. Required tests
 
@@ -400,7 +408,8 @@ Implementation planning must include TDD coverage for:
 - cursor replay and durable-job deduplication;
 - project isolation;
 - one-time legacy remediation;
-- empty-directory cleanup;
+- Dropbox leaves empty INPUTS directories rather than risking recursive deletion;
+- absence/failure of optional safe directory cleanup does not block `COMPLETE`;
 - archived-project behavior;
 - provider-neutral core tests and Dropbox adapter/integration tests.
 
@@ -412,6 +421,7 @@ Implementation planning must include TDD coverage for:
 - Any durable intake ledger/job representation must have an explicit idempotency and recovery contract.
 - Existing production source evidence must never be destructively migrated without machine-verifiable content/evidence checks.
 - The production webhook may use `waitUntil()` for execution scheduling only after a durable continuation path exists; `waitUntil()` alone is not the correctness boundary.
+- Directory cleanup must remain capability-gated; Dropbox production must not recursively delete INPUTS directories as empty-folder cleanup under the current provider contract.
 
 ## 21. Out-of-scope follow-up
 

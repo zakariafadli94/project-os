@@ -19,7 +19,8 @@
   "durable_objects": {
     "bindings": [
       { "name": "PROJECT_GUARD", "class_name": "ProjectGuard" },
-      { "name": "REGISTRY_GUARD", "class_name": "RegistryGuard" }
+      { "name": "REGISTRY_GUARD", "class_name": "RegistryGuard" },
+      { "name": "DROPBOX_CHANGE_GUARD", "class_name": "DropboxChangeGuard" }
     ]
   },
   "exports": {
@@ -29,6 +30,11 @@
       "storage": "sqlite"
     },
     "RegistryGuard": {
+      "type": "durable-object",
+      "state": "created",
+      "storage": "sqlite"
+    },
+    "DropboxChangeGuard": {
       "type": "durable-object",
       "state": "created",
       "storage": "sqlite"

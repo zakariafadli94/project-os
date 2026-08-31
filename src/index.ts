@@ -1,9 +1,7 @@
 import type { Env } from "./env";
+import { processReferralInbox } from "./inbox/referral-processor";
 import { artifactInboxPath, inboxPath, type InboxProcessSummary } from "./inbox/processor";
-import neutralWorker, {
-  reconcileManagedDocuments,
-  reconcileMaterializations
-} from "./index-neutral";
+import neutralWorker, { reconcileMaterializations } from "./index-neutral";
 import { parseLayoutMode } from "./persistence/layout";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
@@ -22,11 +20,23 @@ const worker = {
       );
       if (!valid) return new Response("invalid signature", { status: 401 });
 
-      ctx.waitUntil((async () => {
-        await processInboxFirst(env, ctx);
-        await reconcileManagedDocuments(env);
-      })());
+      const changeGuard = env.DROPBOX_CHANGE_GUARD.getByName("global");
+      const handoff = await changeGuard.fetch("https://dropbox-change-guard.internal/notify", { method: "POST" });
+      if (!handoff.ok) {
+        console.error("Project OS Dropbox webhook durable handoff failed", { status: handoff.status });
+        return Response.json({ error: "durable_change_handoff_failed" }, { status: 503 });
+      }
+
+      ctx.waitUntil(processInboxFirst(env, ctx).catch((error) => {
+        console.error("Project OS webhook inbox processing failed", {
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }));
       return new Response("", { status: 200 });
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/admin/process-inbox") {
+      return processInboxRequest(request, env, ctx);
     }
 
     return neutralWorker.fetch(request, env, ctx);
@@ -44,11 +54,8 @@ const worker = {
     ctx.waitUntil((async () => {
       try {
         const inbox = await processInboxFirst(env, ctx);
-        const [materialization, documents] = await Promise.all([
-          reconcileMaterializations(env),
-          reconcileManagedDocuments(env)
-        ]);
-        console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents });
+        const materialization = await reconcileMaterializations(env);
+        console.info("Project OS scheduled maintenance completed", { inbox, materialization });
       } catch (error) {
         console.error("Project OS scheduled maintenance failed", {
           message: error instanceof Error ? error.message : String(error),
@@ -62,8 +69,22 @@ const worker = {
 
 export default worker;
 
+async function processInboxRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const base = await neutralWorker.fetch(request, env, ctx);
+  if (!base.ok) return base;
+
+  const existing = await base.json<InboxProcessSummary & Record<string, unknown>>();
+  const referral = await processReferralInbox(env);
+  return Response.json({
+    ...existing,
+    scanned: existing.scanned + referral.scanned,
+    processed: existing.processed + referral.processed,
+    failed: existing.failed + referral.failed
+  });
+}
+
 async function processInboxFirst(env: Env, ctx: ExecutionContext): Promise<InboxProcessSummary> {
-  const response = await neutralWorker.fetch(new Request("https://project-os.internal/v1/admin/process-inbox", {
+  const response = await processInboxRequest(new Request("https://project-os.internal/v1/admin/process-inbox", {
     method: "POST",
     headers: { authorization: `Bearer ${env.INGRESS_TOKEN}` }
   }), env, ctx);

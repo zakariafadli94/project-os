@@ -95,6 +95,11 @@ const worker = {
       }
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/admin/recover-inputs") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      return recoverInputs(request, env);
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/transactions") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 
@@ -181,6 +186,16 @@ interface RegistryProject {
   slug: string;
 }
 
+interface InputRecoveryProjectSummary {
+  project_id: string;
+  scanned: number;
+  completed: number;
+  duplicate_cleaned: number;
+  conflicts: number;
+  withdrawn: number;
+  failed: number;
+}
+
 export interface MaterializationReconcileSummary {
   scanned: number;
   scheduled: number;
@@ -263,6 +278,54 @@ async function materializeExistingProjects(request: Request, env: Env): Promise<
       return Response.json({ error: "materialization_failed", project_id: projectId }, { status: 502 });
     }
     results.push({ project_id: projectId, status: "materialized", revision: materialized.revision });
+  }
+
+  return Response.json({ results });
+}
+
+async function recoverInputs(request: Request, env: Env): Promise<Response> {
+  let projectIds: string[];
+  try {
+    const body = await request.json() as { project_ids?: unknown };
+    if (
+      !Array.isArray(body.project_ids)
+      || body.project_ids.length === 0
+      || body.project_ids.some((item) => typeof item !== "string")
+    ) {
+      throw new Error("project_ids must be a non-empty string array");
+    }
+    projectIds = [...new Set(body.project_ids.map((item) => assertSafeProjectId(item as string)))];
+  } catch (error) {
+    return Response.json({
+      error: "invalid_request",
+      message: error instanceof Error ? error.message : "Invalid INPUTS recovery request"
+    }, { status: 400 });
+  }
+
+  const registryStub = env.REGISTRY_GUARD.getByName("global");
+  const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+  if (!registryResponse.ok) return Response.json({ error: "registry_unavailable" }, { status: 502 });
+  const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const knownProjectIds = new Set(registry.projects.map((project) => project.project_id));
+
+  for (const projectId of projectIds) {
+    if (!knownProjectIds.has(projectId)) {
+      return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
+    }
+  }
+
+  const results: InputRecoveryProjectSummary[] = [];
+  for (const projectId of projectIds) {
+    const guard = env.PROJECT_GUARD.getByName(projectId);
+    const response = await guard.fetch("https://project-guard.internal/recover-inputs", { method: "POST" });
+    if (!response.ok) {
+      return Response.json({
+        error: "input_recovery_failed",
+        project_id: projectId,
+        status: response.status
+      }, { status: 502 });
+    }
+    results.push(await response.json<InputRecoveryProjectSummary>());
   }
 
   return Response.json({ results });

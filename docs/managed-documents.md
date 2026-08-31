@@ -31,13 +31,41 @@ Normal human filenames may contain spaces and Unicode characters. Project OS sti
 
 ### `INPUTS/`
 
-Temporary intake area for documents given to Project OS for analysis or R&D.
+Temporary active intake area for documents given to Project OS for analysis or R&D.
+
+The operating invariant is:
+
+> If a file is visible in `INPUTS/`, its source ingestion has not yet reached a verified terminal state.
 
 - Human may drop files here through Dropbox/Obsidian/Desktop sync.
-- Project OS ingests new files and moves them to `REFERENCES/UNCLASSIFIED/` unless an explicit later classification is supplied.
-- Duplicate provider fingerprints are reused only after the current reference head is revalidated.
+- Normal ingestion is trigger-first: a valid Dropbox webhook durably hands off provider-change work, then the Dropbox change feed identifies the actual changed paths.
+- Project OS ingests ordinary files into `REFERENCES/UNCLASSIFIED/` unless machine-verifiable governed provenance supplies a structural route.
+- A machine-verifiable cross-project referral is routed under `REFERENCES/REFERRALS/<source_project_id>/`; a referral-looking Markdown file without governed provenance remains ordinary `UNCLASSIFIED` evidence.
+- Duplicate provider fingerprints are reused only after the current reference head and complete intake postcondition are revalidated.
 - Arbitrary provider files are handled as opaque bytes; binary content is snapshotted server-side and is not decoded as UTF-8.
-- Deleting an INPUT before ingestion is treated as a legitimate withdrawal.
+- Deleting an INPUT before governed capture completes is treated as a legitimate withdrawal and is not automatically resurrected.
+- Successful technical ingestion removes the source file from `INPUTS/`, but it does **not** accept research, a decision, a task, a referral claim or any other canonical business fact.
+- Empty input directories may remain. Current Dropbox deletion semantics are recursive, so Project OS does not perform a list-then-folder-delete cleanup that could remove a concurrently added human file.
+
+Each input has a durable technical lifecycle:
+
+```text
+DETECTED
+  -> SNAPSHOTTED
+  -> REFERENCE_COMMITTED
+  -> SOURCE_REMOVED
+  -> COMPLETE
+```
+
+Terminal alternatives are:
+
+```text
+DUPLICATE_CLEANED
+WITHDRAWN
+CONFLICT
+```
+
+An intermediate version/head is never sufficient proof of completion. Replay verifies the whole file-level postcondition and safely converges missing effects. In particular, an already-proven reference plus a stale source copy resumes source cleanup rather than returning a generic `ignored` result. Divergent or ambiguous evidence fails closed as `CONFLICT` and preserves the source.
 
 ### `REFERENCES/`
 
@@ -46,13 +74,17 @@ Durable source library used for R&D and retrieval.
 ```text
 REFERENCES/
 ├── UNCLASSIFIED/
+├── REFERRALS/
+│   └── <source_project_id>/
 ├── CLIENT/
 ├── MARKET/
 ├── COMPETITORS/
 └── ... project-specific collections
 ```
 
-Project OS does not invent semantic taxonomy during low-level ingestion. New material lands in `UNCLASSIFIED` and can later be classified into an explicit collection while retaining the same logical `document_id` and immutable history.
+Project OS does not invent semantic taxonomy during low-level ingestion. New ordinary material lands in `UNCLASSIFIED` and can later be classified into an explicit collection while retaining the same logical `document_id` and immutable history.
+
+Structural `REFERRALS` routing is allowed only when source/target provenance is machine-verifiable through governed Project OS delivery evidence. Routing a referral is source capture, not acceptance of its recommendation.
 
 Human edits to a managed reference are captured as a new reference version rather than silently overwritten. Provider-file bindings preserve reference identity even when a Dropbox copy/move assigns a new provider file ID.
 
@@ -131,6 +163,8 @@ Managed-document durable evidence lives outside the Obsidian workspace:
 │   └── <REQUEST>/
 │       ├── intent.json
 │       └── receipt.json
+├── intakes/
+│   └── <INTAKE>.json
 ├── reference-fingerprints/
 └── provider-file-bindings/
 ```
@@ -145,9 +179,11 @@ Rules:
 - heads/indexes are reconstructible from durable version evidence;
 - head reconstruction follows the active causal tip and does not resurrect consumed WORKING/REVIEW stages after publication;
 - provider observations are rebuilt from selected immutable versions when complete evidence exists;
-- each accepted managed-document request writes an immutable durable intent before provider/business effect and an immutable receipt after completion.
+- each accepted managed-document request writes an immutable durable intent before provider/business effect and an immutable receipt after completion;
+- each INPUT intake record tracks its technical source-ingestion phase independently from canonical business revision;
+- a terminal intake state proves technical source handling only; it never implies business acceptance.
 
-The Durable Object SQLite tables are hot acceleration only. Loss of the local `document_requests` cache must not allow the same `request_id` to be rebound to a different document operation.
+The Durable Object SQLite tables are hot coordination/acceleration state. The managed-document change-job store is intentionally durable SQLite state so a provider cursor may advance only after every relevant change on that page has an idempotent continuation job. Loss of the local `document_requests` cache must not allow the same `request_id` to be rebound to a different document operation.
 
 ## Visible logical document identity
 
@@ -215,25 +251,74 @@ If `HEAD.json` is lost while immutable history and visible managed content remai
 
 The same principle applies throughout the ledger: ambiguous/partial provider state is verified before an operation is considered committed.
 
-## External change feed
+### INPUTS crash recovery
 
-Each `ProjectGuard` keeps only a hot Dropbox change cursor. Durable document truth remains in Dropbox ledger records.
+INPUT ingestion is a multi-effect operation and is replayed from durable intake evidence:
 
-Processing rules:
+- crash after `DETECTED`: preserve/reuse the deterministic intake and create the immutable source snapshot;
+- crash after `SNAPSHOTTED`: reuse the snapshot and finish governed reference creation;
+- crash after visible reference creation: verify/reuse the exact destination rather than duplicating it;
+- crash after `REFERENCE_COMMITTED`: verify source identity/revision and remove the stale source;
+- crash after source deletion but before the terminal marker: verify absence plus durable reference evidence and close the intake;
+- if a newer source revision appears during cleanup, preserve it and surface `CONFLICT`.
 
-- MutationGate classifies strict final-zone files **before** bootstrap/reconciliation and before cursor advancement;
-- cursor is advanced only after every observed change is reconciled;
-- a crash replays the same page safely;
-- an expired/reset cursor triggers a bounded fresh baseline scan;
+The terminal invariant is the complete provider/ledger postcondition, not the existence of one intermediate record.
+
+## External change feed and trigger handoff
+
+Dropbox webhooks are the primary production trigger for provider changes. The webhook payload is only a notification that changes exist; Project OS resolves exact changes from the Dropbox change feed.
+
+After signature verification, the production webhook synchronously awaits a durable notification handoff to `DropboxChangeGuard` before returning HTTP 200. Duplicate webhook notifications are coalesced into durable generations. A failed generation stays pending, records its failure and re-arms for retry.
+
+Each `ProjectGuard` owns its managed-document cursor and durable per-change job store. Processing rules are:
+
+- MutationGate classification remains the first semantic observer of every stored change;
+- each fetched change-feed page is converted into deterministic per-change jobs;
+- the page cursor advances only after all relevant page entries are durably registered as idempotent jobs;
+- individual jobs may complete after cursor advancement because their continuation is already durable;
+- a failed job remains pending and visible through `jobs_pending` / `job_failures`; it is not collapsed into generic `ignored`;
+- replayed pages deduplicate already-registered jobs;
+- an expired/reset cursor rebuilds a bounded baseline and atomically registers that page before replacing the old cursor;
 - baseline adoption may record collaborative legacy files without classifying them as new human edits;
 - baseline/reset may bootstrap final published content only when durable governed provenance proves it;
 - unknown `DELIVERABLES/**` files become external mutation candidates and are never implicitly published;
 - durable provider-file bindings are honored during baseline rebuild so copied references do not become duplicate logical documents;
 - archived projects do not reconcile into active workspaces.
 
+Scheduled maintenance still handles transaction/artifact inbox work and materialization reconciliation, but it does **not** invoke managed-document provider-root reconciliation as a hidden periodic INPUTS scanner. Provider-change ingestion correctness is trigger-first.
+
+## Explicit historical INPUTS recovery
+
+Historical stale `INPUTS/` content is repaired through an authenticated, explicitly scoped administrative operation. It is not a recurring correctness mechanism.
+
+The public admin route is:
+
+```text
+POST /v1/admin/recover-inputs
+Authorization: Bearer <INGRESS_TOKEN>
+Content-Type: application/json
+
+{"project_ids":["PRJ-0002","PRJ-0003"]}
+```
+
+Rules:
+
+- `project_ids` must be a non-empty explicit list;
+- every requested ID is validated against RegistryGuard before any selected project recovery begins;
+- only selected projects are dispatched;
+- each selected ProjectGuard recursively enumerates only its own `INPUTS/` root;
+- discovered files use the same `InputIntakeService` as normal trigger-driven ingestion;
+- already-proven partial intake converges missing safe cleanup;
+- divergent/ambiguous evidence stays visible and reports `CONFLICT`;
+- archived projects are not resurrected;
+- the operation returns structured per-project counts for `scanned`, `completed`, `duplicate_cleaned`, `conflicts`, `withdrawn` and `failed`;
+- the route is never called by scheduled maintenance.
+
+A referral-looking historical Markdown file without governed referral provenance is ordinary `UNCLASSIFIED` evidence. Technical recovery does not create a task, decision, accepted research record or other canonical business fact.
+
 ## Eager zone skeleton / lazy content adoption / legacy compatibility
 
-Existing project content is not bulk-rewritten. Projection v2 only ensures the empty managed-zone skeleton and exposes the current operating contract. Historical files remain in place unless a governed Managed Documents operation or reconciliation rule adopts them.
+Existing project content is not bulk-rewritten. Projection v2 only ensures the empty managed-zone skeleton and exposes the current operating contract. Historical files remain in place unless a governed Managed Documents operation or explicit recovery rule adopts them.
 
 When a pre-ledger file is first encountered:
 
@@ -255,12 +340,20 @@ ProjectGuard exposes internal managed-document operations through:
 POST /document
 GET  /document-status?document_id=<DOC-...>
 POST /reconcile-documents
+POST /recover-inputs
 ```
 
 The public authenticated worker route for lifecycle mutations is:
 
 ```text
 POST /v1/documents
+Authorization: Bearer <INGRESS_TOKEN>
+```
+
+The explicit historical recovery route is:
+
+```text
+POST /v1/admin/recover-inputs
 Authorization: Bearer <INGRESS_TOKEN>
 ```
 
@@ -273,6 +366,11 @@ Mutation candidate list/status/resolution routes are documented in `docs/mutatio
 - No direct PC/filesystem access is part of correctness.
 - Dropbox Desktop/Obsidian are optional human interfaces over Dropbox files.
 - The PV2 managed-zone skeleton is eager for non-archived projects; historical content adoption remains lazy.
+- A visible INPUT file means its technical ingestion has not reached a verified terminal state.
+- Normal INPUT ingestion is provider-triggered; periodic full-project INPUTS scanning is not a correctness path.
+- Successful INPUT ingestion preserves immutable/governed reference evidence before deleting the active inbox copy.
+- Technical source ingestion never implies canonical business acceptance.
+- Harmless empty INPUTS directories may remain because current Dropbox folder deletion is recursively destructive rather than atomic empty-only cleanup.
 - An already governed `DELIVERABLES` edit never auto-publishes a new version.
 - An unknown `DELIVERABLES` file never becomes an initial published version from path presence alone.
 - Generated projection edits never auto-become canonical facts.

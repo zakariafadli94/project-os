@@ -162,6 +162,8 @@ Persist canonically when operationally real or explicitly accepted:
 
 Working/review document versions may still be durably versioned without being canonical project decisions. Versioning a draft is not equivalent to accepting its content as a canonical fact.
 
+Capturing an INPUT or cross-project referral as a governed reference is likewise technical source persistence, not acceptance of its claims. A source may be fully ingested while producing no canonical transaction at all.
+
 Never turn an AI recommendation into a canonical decision without user acceptance.
 
 ## 9. Transaction-only canonical writes and governed mutation routes
@@ -231,9 +233,11 @@ SUBMITTED -> COMMITTED -> CANONICAL VERIFIED -> ACCEPTED
 
 For artifacts, a committed receipt alone is `COMMITTED`. `CANONICAL VERIFIED` additionally requires the final provider bytes to match the durable intent. File presence, upload success, candidate capture or technical resolution never imply `ACCEPTED`.
 
+For INPUT ingestion, `COMPLETE` is a technical terminal state meaning the source evidence/reference postcondition has converged and the active inbox copy is gone. `COMPLETE` is not a canonical business `COMMITTED`/`ACCEPTED` event and does not increment project revision by itself.
+
 ### MutationGate candidate rule
 
-Unknown strict final-zone files are preserved as external mutation candidates before bootstrap/reconciliation and before Dropbox cursor advancement.
+Unknown strict final-zone files are preserved as external mutation candidates before bootstrap/reconciliation and before their provider-change job can complete.
 
 Candidate capture:
 
@@ -298,7 +302,7 @@ Managed-document concurrency has two protections:
 
 A provider CAS conflict is not a transient overwrite opportunity. Preserve the newer external reality and reconcile it.
 
-Candidate resolution is same-project serialized through ProjectGuard. Its internal unresolved-path capability is bound to the exact candidate and destination and must never be exposed as a public `skipGuard` option.
+Candidate resolution and explicit INPUT recovery are same-project serialized through ProjectGuard. Candidate resolution's internal unresolved-path capability is bound to the exact candidate and destination and must never be exposed as a public `skipGuard` option.
 
 Detailed canonical lifecycle/concurrency contract: `docs/domain-model.md`.
 
@@ -343,7 +347,7 @@ MODEL001 write-time invariants do not rewrite or reject structurally valid schem
 
 Archive workspace movement is asynchronous projection work after the archived business state commits.
 
-Archived projects do not accept new managed working/reference mutations and managed-document reconciliation must not resurrect an active workspace.
+Archived projects do not accept new managed working/reference mutations, normal managed-document reconciliation does not resurrect an active workspace, and explicit INPUT recovery returns without reactivating archived project content.
 
 Detailed domain contract: `docs/domain-model.md`.
 
@@ -356,6 +360,8 @@ For portfolio work:
 3. keep project states separate;
 4. emit separate typed transactions per project when several change;
 5. represent intentional cross-project knowledge under `WORKSPACE/PORTFOLIO/` rather than implicit links.
+
+Cross-project referral delivery may place source material into the target project's managed intake path without rebinding the source session. Capturing that referral as a reference does not accept the referral's recommendation or create target canonical business truth.
 
 ## 17. Human workspace architecture
 
@@ -394,17 +400,15 @@ WORKSPACE/
         └── ASSETS/
 ```
 
-Folders are lazy.
-
 Generated canonical notes and managed collaborative documents are different classes of content.
 
 ### Managed document zones
 
 `INPUTS/`
-: temporary human drop zone. Project OS ingests documents for R&D and moves them to `REFERENCES/UNCLASSIFIED/` unless an explicit classification exists.
+: temporary **active** human drop zone. If a file remains visible here, its technical source ingestion is not yet in a verified terminal state. Normal processing is trigger-first from Dropbox webhook → durable notification handoff → change-feed page → durable project-scoped jobs. Ordinary sources go to `REFERENCES/UNCLASSIFIED/`; verified governed referrals may route to `REFERENCES/REFERRALS/<source_project_id>/`. Successful source ingestion removes the file but may leave harmless empty directories. Source ingestion is not business acceptance.
 
 `REFERENCES/`
-: durable source library. Reference collections are project-specific. Low-level ingestion must not guess taxonomy.
+: durable source library. Reference collections are project-specific. Low-level ingestion must not guess taxonomy. A referral-looking file without machine-verifiable governed provenance remains ordinary `UNCLASSIFIED` evidence.
 
 `WORKING/`
 : collaborative human + AI authoring. Human Obsidian edits are legitimate new versions.
@@ -448,6 +452,8 @@ V2 machine state is outside the Obsidian Vault:
             ├── heads/
             ├── versions/
             ├── payloads/
+            ├── requests/
+            ├── intakes/
             ├── reference-fingerprints/
             └── provider-file-bindings/
 ```
@@ -457,7 +463,7 @@ Never expose these machine files as ordinary project notes.
 Never write human generated Markdown below `.project-os/`.
 Never write events, receipts, transaction queues, commits or structured machine state below `WORKSPACE/`.
 
-Managed document version records and MutationGate intents/candidates/resolutions are durable evidence. Mutable heads/indexes are reconstructible and may advance only after referenced immutable evidence exists.
+Managed document version records, INPUT intake records and MutationGate intents/candidates/resolutions are durable technical evidence. Mutable heads/indexes are reconstructible and may advance only after referenced immutable evidence exists. ProjectGuard also keeps durable per-change coordination jobs in its Durable Object storage so a provider cursor never advances past a relevant unregistered change.
 
 ## 19. Generated-note metadata
 
@@ -501,9 +507,9 @@ Generated entity links should be folder-qualified where ambiguity is possible. D
 
 Intentional cross-project relationships belong under `PORTFOLIO/RELATIONSHIPS/`.
 
-## 21. Existing-project/admin materialization
+## 21. Existing-project/admin materialization and INPUTS recovery
 
-The authenticated route:
+The authenticated materialization route:
 
 ```text
 POST /v1/admin/workspace-v2/materialize
@@ -514,9 +520,30 @@ is an administrative migration/recovery mechanism, not a user workflow.
 
 For modern V2 projects it can synchronously drive the projection coordinator to current head without a business revision. Older historical snapshots retain compatibility materialization behavior.
 
-Never ask a normal user to invoke it.
+Historical stale `INPUTS/` files use a separate explicit operation:
 
-Managed documents use bounded lazy adoption rather than bulk workspace rewrite. Pre-ledger `WORKING`, `REVIEW`, and `REFERENCES` files may be adopted when encountered/needed, preserving their visible bytes. Pre-ledger `DELIVERABLES` files require durable governed provenance before published bootstrap; unknown final files become MutationGate candidates instead.
+```text
+POST /v1/admin/recover-inputs
+Authorization: Bearer <INGRESS_TOKEN>
+Content-Type: application/json
+
+{"project_ids":["PRJ-0002","PRJ-0003"]}
+```
+
+Rules for INPUT recovery:
+
+- require a non-empty explicit project ID list;
+- validate all requested projects against RegistryGuard before any selected project recovery begins;
+- dispatch only the requested projects;
+- recursively enumerate only each selected project's `INPUTS/` root;
+- feed discovered files through the same `InputIntakeService` as normal triggered ingestion;
+- converge safe partial intake state, but preserve divergent/ambiguous evidence as `CONFLICT`;
+- never reactivate archived projects;
+- never run this route from scheduled maintenance.
+
+Never ask a normal user to invoke either admin route.
+
+Managed documents otherwise use bounded lazy adoption rather than bulk workspace rewrite. Pre-ledger `WORKING`, `REVIEW`, and `REFERENCES` files may be adopted when encountered/needed, preserving their visible bytes. Pre-ledger `DELIVERABLES` files require durable governed provenance before published bootstrap; unknown final files become MutationGate candidates instead.
 
 ## 22. Projection version and completed evidence
 
@@ -540,9 +567,23 @@ Managed-document provider actions may span several Dropbox operations and theref
 
 If a visible managed file changed but ledger/head/receipt completion was interrupted, recover only after verifying visible provider evidence against the expected immutable version. Otherwise fail closed.
 
-Artifact recovery follows the same rule: a durable pre-effect mutation intent may explain an interrupted provider write and freezes its resolved destination. Provider bytes that predate any matching governed intent remain external candidates and cannot be retroactively sanitized by creating a new request.
+INPUT ingestion has its own durable state machine:
 
-The Dropbox change cursor advances only after MutationGate classification and document reconciliation of the observed page. Cursor reset triggers a bounded fresh baseline pass. Unknown strict final files discovered by a baseline/reset remain candidates; they are never promoted merely because the cursor was rebuilt.
+```text
+DETECTED -> SNAPSHOTTED -> REFERENCE_COMMITTED -> SOURCE_REMOVED -> COMPLETE
+```
+
+with terminal alternatives `DUPLICATE_CLEANED`, `WITHDRAWN`, and `CONFLICT`. Replay verifies the complete intended file-level postcondition. An intermediate version/head must never cause generic `ignored` while safe source cleanup remains incomplete.
+
+Artifact recovery follows the same fail-closed principle: a durable pre-effect mutation intent may explain an interrupted provider write and freezes its resolved destination. Provider bytes that predate any matching governed intent remain external candidates and cannot be retroactively sanitized by creating a new request.
+
+Dropbox webhook handling is trigger-first. After signature verification, the worker awaits durable registration in `DropboxChangeGuard` before HTTP 200. The guard coalesces duplicate notifications and retries failed generations.
+
+The provider change cursor is synchronization state, not semantic completion evidence. For each page, ProjectGuard first durably registers deterministic per-change jobs and only then advances the page cursor. Individual jobs may finish afterward because their continuation is already durable. Failed jobs stay pending and observable; they are not hidden as `ignored`. A cursor reset rebuilds a bounded baseline and replaces the old cursor only after the reset page is durably registered.
+
+Normal scheduled maintenance does not perform managed-document provider-root reconciliation and does not scan every project's `INPUTS/`. Explicit `/v1/admin/recover-inputs` is exceptional historical remediation, not polling.
+
+Do not recursively delete INPUTS directories as cleanup with the current Dropbox capability set. Dropbox folder deletion is recursive and there is no atomic “delete only if still empty” capability in this contract; harmless empty directories may remain rather than risk deleting a concurrently added human file.
 
 Do not delete legacy or canonical history as part of normal recovery/materialization.
 
@@ -575,7 +616,7 @@ If a business commit is already canonical but materialization is delayed:
 
 If generated Markdown is inconsistent, preserve unexpected external bytes where applicable and repair/rebuild it from canonical truth rather than treating the Markdown discrepancy as a new business fact.
 
-If a managed document conflicts, preserve both realities and fail closed rather than blind-overwrite. Human/external bytes must survive conflict handling.
+If a managed document or INPUT intake conflicts, preserve both realities and fail closed rather than blind-overwrite. Human/external bytes must survive conflict handling.
 
 If MutationGate finds an unknown final-zone file, preserve it as external candidate evidence and use explicit typed resolution. Do not describe the file as published/accepted, do not overwrite it with an ordinary artifact write, and do not manufacture hidden evidence to bypass the conflict.
 
@@ -622,6 +663,24 @@ DELIVERABLES frozen version
       ↓
 optional reopen for the next iteration
 ```
+
+Normal source intake is also command-free:
+
+```text
+Human/system drops source in INPUTS
+      ↓
+Dropbox webhook
+      ↓
+durable trigger handoff
+      ↓
+change-feed entry durably journaled for its ProjectGuard
+      ↓
+source snapshotted + governed reference committed
+      ↓
+INPUT source removed
+```
+
+The resulting reference is evidence, not automatic business acceptance. Historical anomalies use explicit admin recovery internally; users should not need to run recovery commands.
 
 When an unexpected final-zone provider write occurs, the normal user experience remains natural-language: Project OS identifies it as an unresolved external candidate and the user may choose to adopt it through the appropriate governed flow or reject it. Users should not need to manipulate candidate IDs, hidden records or provider files manually.
 

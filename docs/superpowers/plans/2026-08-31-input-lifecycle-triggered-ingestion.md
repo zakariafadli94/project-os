@@ -1,0 +1,450 @@
+# IMP-INPUTLIFECYCLE001 — Trigger-first INPUTS lifecycle Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: use `superpowers:subagent-driven-development` or `superpowers:executing-plans`. Execute task-by-task with strict TDD and verification-before-completion.
+
+**Goal:** Make `INPUTS/` a trustworthy trigger-driven active inbox whose ingestion is durable, replayable to a verified terminal file-level postcondition, and safe across provider/webhook/cursor crashes without relying on periodic INPUTS scans.
+
+**Architecture:** Keep ProjectGuard as the per-project serialization boundary. Add a narrow durable Dropbox change-signal guard for webhook handoff, durable per-change jobs plus cursor state inside each ProjectGuard, and a portable machine-layer intake ledger under each project's Managed Documents state. Intake converges source evidence → governed reference → verified source-file cleanup. Verified cross-project referrals use governed referral provenance; unverified referral-looking files fall back to `REFERENCES/UNCLASSIFIED/`. Historical cleanup is an explicit admin recovery operation using the same intake engine.
+
+**Tech Stack:** TypeScript, Cloudflare Workers + Durable Objects/SQLite, Dropbox API through the existing provider-neutral persistence runtime, Vitest with `@cloudflare/vitest-pool-workers`, GitHub Actions.
+
+**Spec:** `docs/superpowers/specs/2026-08-31-input-lifecycle-triggered-ingestion-design.md`, founder-approved with the safe-directory amendment committed on the design branch.
+
+## Current execution status
+
+- Founder-approved architecture: yes.
+- Safe-directory amendment: approved and incorporated into the spec.
+- `TASK-IMPINPUTLIFECYCLE001`: still `pending` in canonical Project OS state.
+- Implementation has **not** started.
+- Start implementation only after explicit execution authorization; use a dedicated implementation branch, not `main` and not the design branch.
+
+## Global constraints
+
+- Create implementation branch `imp/inputlifecycle001-trigger-first` from the final approved design/plan head.
+- Strict TDD: establish RED evidence before each semantic production change.
+- Preserve ProjectGuard as the per-project correctness/serialization boundary; do not introduce a broad event bus.
+- Preserve the provider-neutral Core boundary. Dropbox-specific webhook/cursor/API behavior stays in provider/integration code.
+- Never trust user-authored Markdown/frontmatter alone as cross-project referral provenance.
+- Source ingestion is technical document state and must not increment canonical project revision by itself.
+- No periodic or scheduled scan of project `INPUTS/` may be added as nominal correctness machinery.
+- Unknown/divergent provider realities fail closed; never overwrite or delete newer human/provider content to force convergence.
+- Preserve existing reference `document_id`, version, provider-binding and fingerprint semantics unless tests prove a necessary incompatibility.
+- File-level cleanup is mandatory; directory cleanup is capability-gated and optional.
+- With the current Dropbox contract, never recursively delete `INPUTS/` directories as empty-folder cleanup.
+
+---
+
+## Task 1 — Add the durable provider-neutral input-intake domain and ledger
+
+**Files**
+- Create: `src/documents/input-intake.ts`
+- Create: `src/documents/input-intake-repository.ts`
+- Modify: `src/persistence/layout.ts`
+- Create: `test/input-intake-repository.spec.ts`
+
+### RED
+
+- [ ] Add tests for a deterministic intake ID derived from project ID + provider ID + stable object identity + provider revision token.
+- [ ] Add tests for immutable source evidence fields: source path, relative input path, provider identity, revision token, integrity hash, size and detected timestamp.
+- [ ] Add tests for lifecycle phases:
+  `DETECTED`, `SNAPSHOTTED`, `REFERENCE_COMMITTED`, `SOURCE_REMOVED`, `COMPLETE`, `DUPLICATE_CLEANED`, `WITHDRAWN`, `CONFLICT`.
+- [ ] Add tests that legal forward transitions are accepted and terminal-state rewrites/downgrades are rejected.
+- [ ] Add a durable source-path binding so a later deleted change can resolve the active/latest intake without guessing identity from the path.
+- [ ] Add replay tests proving exact duplicate writes are idempotent while incompatible reuse of the same intake ID/path binding fails closed.
+- [ ] Prove the new tests fail because the domain/repository does not yet exist.
+
+```bash
+npx vitest run test/input-intake-repository.spec.ts
+```
+
+### GREEN
+
+- [ ] Implement `InputIntakePhase` and `InputIntakeRecord` with schema version `1.0`.
+- [ ] Implement deterministic `inputIntakeIdFor(...)` using Project OS SHA-256 and `INTAKE-<24 uppercase hex>`.
+- [ ] Add safe machine paths under `.project-os/projects/<PRJ>/documents/intakes/` and `.../intake-bindings/source-path/`.
+- [ ] Implement repository read/create/advance/bind using create-once/idempotent conflict verification patterns already used by Managed Document request and MutationGate ledgers.
+- [ ] Keep the record provider-neutral; no Dropbox transport classes/types in the domain model.
+- [ ] Run targeted tests and persistence-boundary check.
+
+```bash
+npx vitest run test/input-intake-repository.spec.ts
+npm run check:persistence-boundary
+```
+
+**Commit:** `feat: add durable input intake ledger`
+
+---
+
+## Task 2 — Implement postcondition-driven InputIntakeService and crash recovery
+
+**Files**
+- Create: `src/documents/input-intake-service.ts`
+- Modify: `src/documents/repository.ts` only for small reusable reference-ledger helpers if required
+- Modify: `src/persistence/layout.ts` only if Task 1 did not cover every path
+- Create: `test/input-intake-service.spec.ts`
+- Create: `test/input-intake-faults.spec.ts`
+- Reuse helpers from: `test/helpers/persistence-runtime.ts`
+
+### RED
+
+- [ ] Test normal nested input ingestion reaches `COMPLETE`, preserves immutable provider payload, creates the governed reference and removes only the source file.
+- [ ] Test exact replay after `COMPLETE` is idempotent.
+- [ ] Test crash after `DETECTED`/before snapshot.
+- [ ] Test crash after immutable snapshot and before visible reference copy.
+- [ ] Test crash after visible reference copy and before ledger version/head write.
+- [ ] Test crash after ledger reference write and before source deletion.
+- [ ] Test crash after source deletion but before terminal intake marker.
+- [ ] Test an already-existing version/head with the source still present converges cleanup instead of returning `ignored`.
+- [ ] Test exact current-reference duplicate reaches `DUPLICATE_CLEANED` and no second document head is created.
+- [ ] Test divergent destination content reaches `CONFLICT` and the input remains.
+- [ ] Test source metadata changes to a newer revision before cleanup: preserve the source/newer reality and do not delete it.
+- [ ] Test source disappears before governed capture: `WITHDRAWN`, no resurrection.
+- [ ] Test source disappears after a fully verified governed reference: replay may converge to `COMPLETE`.
+- [ ] Test ordinary source routing to `REFERENCES/UNCLASSIFIED/<relative-input-path>`.
+- [ ] Test Dropbox-safe directory behavior: source file disappears but empty ancestor folders are left untouched.
+- [ ] Test absence of safe directory cleanup never blocks `COMPLETE`.
+- [ ] Prove new tests fail against existing reconciler-only behavior.
+
+```bash
+npx vitest run test/input-intake-service.spec.ts test/input-intake-faults.spec.ts
+```
+
+### GREEN
+
+- [ ] Implement `InputIntakeService` accepting project state + one provider file change + optional trusted referral provenance.
+- [ ] Order effects strictly:
+  1. ensure `DETECTED` record,
+  2. snapshot exact source bytes to immutable evidence,
+  3. persist `SNAPSHOTTED`,
+  4. resolve safe reference destination,
+  5. handle exact current-reference duplicate if applicable,
+  6. copy/reuse visible reference only when content evidence is compatible,
+  7. write/reuse immutable version + head + provider-file binding + current fingerprint,
+  8. re-read/verify governed reference postcondition,
+  9. persist `REFERENCE_COMMITTED`,
+  10. re-read source metadata and verify the exact recorded revision,
+  11. delete the exact source file only,
+  12. verify source absence,
+  13. persist `SOURCE_REMOVED` then terminal outcome.
+- [ ] Reuse immutable snapshot/version/reference on replay rather than creating semantic duplicates.
+- [ ] Return structured result: `completed | duplicate_cleaned | withdrawn | conflict`, plus `resumed` and intake/reference identity.
+- [ ] Do not perform automatic folder deletion on Dropbox.
+- [ ] Run targeted tests and persistence-boundary check.
+
+```bash
+npx vitest run test/input-intake-service.spec.ts test/input-intake-faults.spec.ts
+npm run check:persistence-boundary
+```
+
+**Commit:** `feat: make input intake postcondition driven`
+
+---
+
+## Task 3 — Route INPUTS reconciliation through the intake engine and expose terminal outcomes
+
+**Files**
+- Modify: `src/documents/reconciler.ts`
+- Modify: `test/document-reference-reconcile.spec.ts`
+- Create: `test/input-intake-withdrawal.spec.ts`
+- Modify: `test/document-change-coordinator.spec.ts` for compatibility assertions only
+
+### RED
+
+- [ ] Prove `existing version + stale INPUTS source` resumes cleanup and is not counted as generic ignored work.
+- [ ] Test deleted INPUT change resolves through durable source-path binding and records `WITHDRAWN` when capture was incomplete.
+- [ ] Test completed/ref-committed intake plus a deleted-source event converges terminal completion rather than resurrecting the source.
+- [ ] Add summary assertions distinguishing `intake_completed`, `duplicate_cleaned`, `withdrawn`, `intake_resumed`, `conflicts`.
+- [ ] Preserve compatibility counters `ingested`/`duplicates` if externally consumed, but forbid known partial intake from disappearing under `ignored`.
+- [ ] Prove targeted tests fail before integration.
+
+```bash
+npx vitest run test/document-reference-reconcile.spec.ts test/input-intake-withdrawal.spec.ts
+```
+
+### GREEN
+
+- [ ] Replace private multi-effect `ingestInput()` with delegation to `InputIntakeService`.
+- [ ] Route INPUT deleted changes to intake withdrawal/convergence when a path binding exists; unrelated historical deleted entries remain conservative.
+- [ ] Map structured intake outcomes into explicit reconciliation summary fields.
+- [ ] Preserve WORKING/REVIEW/DELIVERABLES behavior unchanged.
+
+```bash
+npx vitest run test/document-reference-reconcile.spec.ts test/input-intake-withdrawal.spec.ts test/document-change-coordinator.spec.ts
+```
+
+**Commit:** `refactor: reconcile INPUTS through durable intake`
+
+---
+
+## Task 4 — Make provider change pages durable before cursor advancement
+
+**Files**
+- Create: `src/documents/change-job-store.ts`
+- Modify: `src/documents/change-coordinator.ts`
+- Modify: `src/durable/project-guard-neutral.ts`
+- Modify: `test/document-change-coordinator.spec.ts`
+- Create: `test/document-change-job-faults.spec.ts`
+
+### RED
+
+- [ ] Add per-project Durable Object job-store tests using SQLite storage.
+- [ ] Crash before atomic job registration/cursor commit: cursor remains old and page replays.
+- [ ] Crash after jobs registered and cursor advanced but before execution: pending job survives and executes later.
+- [ ] Replay of the same page deduplicates deterministic job IDs.
+- [ ] Jobs preserve ordering where successive revisions require it.
+- [ ] One failing/transient job remains pending while completed jobs are not semantically rerun.
+- [ ] MutationGate still classifies each final-zone change before normal document reconciliation for that job.
+- [ ] Cursor-reset baseline is registered into durable jobs before new cursor persistence.
+- [ ] Archived projects do not create active intake work.
+- [ ] Prove current `cursorStore.put()` architecture cannot satisfy the durable-job boundary.
+
+```bash
+npx vitest run test/document-change-coordinator.spec.ts test/document-change-job-faults.spec.ts
+```
+
+### GREEN
+
+- [ ] Store managed-document cursor and change jobs in ProjectGuard SQLite through `ChangeJobStore`.
+- [ ] Use deterministic job IDs from provider change identity/evidence, including deleted-path identity where metadata is absent.
+- [ ] Add one SQLite transaction that inserts all relevant page jobs idempotently and updates cursor only after registration succeeds.
+- [ ] Reconcile order:
+  1. drain existing pending jobs,
+  2. fetch page from durable cursor/baseline,
+  3. atomically register page + cursor,
+  4. drain registered jobs,
+  5. leave failed jobs durable for retry.
+- [ ] Ensure job processing invokes MutationGate/bootstrap/reconciler for the stored single change and detection source.
+- [ ] Keep provider cursor as hot technical synchronization state; portable document/intake truth remains in Dropbox ledgers.
+
+```bash
+npx vitest run test/document-change-coordinator.spec.ts test/document-change-job-faults.spec.ts
+```
+
+**Commit:** `feat: persist document change jobs before cursor advance`
+
+---
+
+## Task 5 — Add governed cross-project referral delivery and machine-verifiable provenance
+
+**Files**
+- Create: `src/domain/referral-write.ts`
+- Create: `src/documents/referral-provenance.ts`
+- Modify: `src/persistence/layout.ts`
+- Modify: `src/inbox/processor.ts`
+- Modify: `src/index-neutral.ts`
+- Modify: `src/durable/project-guard-neutral.ts`
+- Modify: `src/documents/input-intake-service.ts`
+- Create: `test/referral-write.spec.ts`
+- Create: `test/referral-inbox.spec.ts`
+- Create: `test/referral-intake-routing.spec.ts`
+- Modify: `test/admin-process-inbox.spec.ts`
+
+### RED
+
+- [ ] Define typed referral request tests: request ID, source project, target project, relative path, exact content/hash, created time and optional type/topic.
+- [ ] Reject invalid/unsafe project IDs, paths, hashes and request IDs.
+- [ ] Source and target projects must resolve in RegistryGuard before delivery.
+- [ ] Target ProjectGuard writes immutable referral provenance **before** the visible target `INPUTS/` source exists as a governed delivery effect.
+- [ ] Exact request replay is idempotent; changed content/source/target with same request ID conflicts.
+- [ ] Verified referral routes to `REFERENCES/REFERRALS/<source_project_id>/<relative_path>`.
+- [ ] Provenance/content/source/target mismatch fails closed.
+- [ ] Referral-looking Markdown without machine provenance routes to UNCLASSIFIED.
+- [ ] Referral ingestion creates no canonical task/decision/research revision.
+- [ ] Target delivery does not change current session/project binding semantics.
+
+```bash
+npx vitest run test/referral-write.spec.ts test/referral-inbox.spec.ts test/referral-intake-routing.spec.ts
+```
+
+### GREEN
+
+- [ ] Implement parser/schema for typed referral request.
+- [ ] Add V2 machine queue/receipt paths for referrals following transaction/artifact inbox conventions.
+- [ ] Extend `processInbox` with deliberate transaction → artifact/referral ordering while preserving existing dependencies.
+- [ ] Route referral requests to target ProjectGuard `/referral` endpoint.
+- [ ] In ProjectGuard, verify request hash/project binding, create immutable provenance intent/binding, then create/reuse target INPUTS file idempotently.
+- [ ] Add durable provenance lookup consumed by `InputIntakeService`; only matching machine evidence authorizes `REFERRALS/<source_project_id>` routing.
+- [ ] Keep raw/unverified referral-like files in UNCLASSIFIED.
+
+```bash
+npx vitest run test/referral-write.spec.ts test/referral-inbox.spec.ts test/referral-intake-routing.spec.ts test/admin-process-inbox.spec.ts
+```
+
+**Commit:** `feat: govern cross-project referral provenance`
+
+---
+
+## Task 6 — Add a durable Dropbox webhook handoff and remove cron reconciliation as a correctness fallback
+
+**Files**
+- Create: `src/durable/dropbox-change-guard.ts`
+- Create or extract: `src/documents/change-fleet.ts`
+- Modify: `src/index.ts`
+- Modify: `src/index-neutral.ts`
+- Modify: `src/index-mutation-gate.ts`
+- Modify: `src/env.ts` only if generated binding typing requires a hand-written overlay
+- Modify: `wrangler.jsonc`
+- Modify: `test/webhook.spec.ts`
+- Create: `test/dropbox-change-guard.spec.ts`
+- Modify: `vitest.config.ts` only as needed for the new DO binding
+
+### RED
+
+- [ ] Valid webhook must not return success if durable handoff fails.
+- [ ] Duplicate webhook notifications coalesce safely and do not lose work.
+- [ ] Durable handoff exists before HTTP 200.
+- [ ] `DropboxChangeGuard` retains pending generation/work after simulated reconcile failure and schedules retry.
+- [ ] Notification during active processing advances requested generation and triggers another run afterward.
+- [ ] Successful fleet reconciliation marks only the processed generation complete.
+- [ ] Scheduled cron no longer invokes managed-document reconciliation; transaction/artifact/referral inbox processing and materialization maintenance may remain scheduled.
+- [ ] `waitUntil()` is optional execution scheduling after durable handoff, never the correctness boundary.
+
+```bash
+npx vitest run test/webhook.spec.ts test/dropbox-change-guard.spec.ts
+```
+
+### GREEN
+
+- [ ] Implement narrow global `DropboxChangeGuard` Durable Object keyed `global`, with durable requested/completed generation counters and alarms.
+- [ ] `/notify` persists/increments pending generation and ensures an alarm before returning success.
+- [ ] Alarm execution runs project fleet reconciliation, retries on failure, and re-arms when newer generation arrived during processing.
+- [ ] Extract `reconcileManagedDocuments` fleet logic to a reusable module if needed to avoid circular worker dependencies.
+- [ ] Change webhook route to synchronously await durable `/notify`; return 200 only after success.
+- [ ] Remove managed-document reconciliation from recurring cron.
+- [ ] Add Wrangler binding/export for `DROPBOX_CHANGE_GUARD`; add only the minimal required Durable Object migration if Wrangler requires it.
+- [ ] Export the DO from effective `src/index-mutation-gate.ts` entrypoint.
+- [ ] Regenerate Worker types and prove dry-run.
+
+```bash
+npm run types
+npx vitest run test/webhook.spec.ts test/dropbox-change-guard.spec.ts
+npx wrangler deploy --dry-run
+```
+
+**Commit:** `feat: durably hand off Dropbox change triggers`
+
+---
+
+## Task 7 — Add explicit legacy INPUTS recovery using the same intake engine
+
+**Files**
+- Create: `src/documents/input-recovery.ts`
+- Modify: `src/durable/project-guard-neutral.ts`
+- Modify: `src/index-neutral.ts`
+- Modify: `src/index-mutation-gate.ts` only if authenticated admin routing lives there
+- Create: `test/input-recovery.spec.ts`
+- Create: `test/admin-recover-inputs.spec.ts`
+
+### RED
+
+- [ ] Authenticated `POST /v1/admin/recover-inputs` requires explicit non-empty project ID list; no “scan everything forever” mode.
+- [ ] Unknown project IDs rejected before provider mutation.
+- [ ] Target ProjectGuard recursively enumerates only selected project's `INPUTS/` root for this explicit request.
+- [ ] Discovered files use the exact same `InputIntakeService`, not a separate migration implementation.
+- [ ] Already-proven reference + stale source converges safe cleanup.
+- [ ] Never-ingested source performs normal intake.
+- [ ] Divergent/ambiguous evidence produces `CONFLICT` and preserves source.
+- [ ] Historical referral-looking Markdown without governed provenance falls back to UNCLASSIFIED.
+- [ ] Archived-project recovery does not resurrect active workspace state.
+- [ ] Endpoint is never called by scheduled maintenance.
+
+```bash
+npx vitest run test/input-recovery.spec.ts test/admin-recover-inputs.spec.ts
+```
+
+### GREEN
+
+- [ ] Implement explicit project-scoped recovery enumeration and structured summary (`scanned`, `completed`, `duplicate_cleaned`, `conflicts`, `withdrawn`, `failed`).
+- [ ] Add internal ProjectGuard `/recover-inputs` route serialized with other project work.
+- [ ] Add authenticated top-level admin route validating requested projects against RegistryGuard and dispatching only those projects.
+- [ ] Do not add scheduled call or hidden automatic global scan.
+
+```bash
+npx vitest run test/input-recovery.spec.ts test/admin-recover-inputs.spec.ts
+```
+
+**Commit:** `feat: add explicit INPUTS recovery operation`
+
+---
+
+## Task 8 — Documentation, observability, high-risk regression gate and release procedure
+
+**Files**
+- Modify: `docs/managed-documents.md`
+- Modify: `docs/project-os-sop.md`
+- Modify: `README.md` only where architecture/trigger behavior is user-facing
+- Modify: `package.json`
+- Modify existing tests as needed for final observability assertions
+
+### Contract verification
+
+- [ ] Final tests prove summary output never hides known partial intake under generic `ignored`.
+- [ ] Add `test/input-intake-faults.spec.ts`, `test/document-change-job-faults.spec.ts`, `test/dropbox-change-guard.spec.ts`, `test/input-recovery.spec.ts` to `test:persistence-high-risk`.
+- [ ] Document machine intake ledger, terminal outcomes and that source ingestion does not equal business acceptance.
+- [ ] Document typed referral delivery as the supported machine-verifiable cross-project provenance path.
+- [ ] Document raw referral-looking files as ordinary unclassified evidence.
+- [ ] Document webhook durable handoff + per-project durable jobs + cursor semantics.
+- [ ] Document that Dropbox empty directories may remain because recursive folder deletion is unsafe without atomic empty-only capability.
+- [ ] Document explicit admin recovery and that it is not scheduled.
+- [ ] Update obsolete statements that cursor advancement waits for full semantic reconciliation; it now waits for durable per-change registration.
+
+### Full verification
+
+```bash
+npm run check
+npm run test:persistence-high-risk
+npx wrangler deploy --dry-run
+git diff --check
+```
+
+- [ ] Inspect `git diff main...HEAD` and reject unrelated changes.
+- [ ] Verify no periodic INPUTS scan was introduced.
+- [ ] Verify no raw Markdown/frontmatter parser can establish trusted referral provenance.
+- [ ] Verify no Dropbox-specific transport classes leaked above provider boundary.
+- [ ] Verify no code path recursively deletes INPUTS directories as empty cleanup.
+- [ ] Open PR against `main` with exact spec/plan, crash matrix and verification evidence.
+- [ ] Do not merge until CI is fully green and founder explicitly authorizes merge.
+
+**Commit:** `docs: finalize trigger-first INPUTS lifecycle`
+
+---
+
+## Required release / production verification after merge
+
+Do not mark `TASK-IMPINPUTLIFECYCLE001` complete merely because code merged.
+
+- [ ] Deploy exact merged commit through normal Project OS deployment path and verify deployment identity/evidence.
+- [ ] Verify production webhook hands off to `DropboxChangeGuard` and recurring cron is not managed-document reconciliation fallback correctness.
+- [ ] Create a controlled INPUTS file in a disposable/approved project and verify trigger-only ingestion reaches governed reference and removes source file.
+- [ ] Invoke explicit recovery for observed legacy projects **PRJ-0002 and PRJ-0003**; code must contain no project-specific hard-coding.
+- [ ] PRJ-0002: verify historical resolved referral no longer remains as stale active INPUTS item after evidence-based recovery.
+- [ ] PRJ-0003: verify BCOS corpus converges safely; already-governed/duplicate evidence is cleaned only when machine-verifiable, unresolved/divergent items remain visible as conflicts.
+- [ ] Verify resulting `REFERENCES/` paths and Managed Document heads/fingerprints; do not infer successful recovery from source absence alone.
+- [ ] Empty Dropbox INPUTS directories may remain and are not a failure condition.
+- [ ] Record exact GitHub PR/merge/deployment/recovery evidence in PRJ-0002 only after operationally real.
+- [ ] Refresh canonical PRJ-0002 revision and complete task through typed transaction only after all verification passes and receipt is `committed`.
+
+## Required evidence before claiming complete
+
+- Founder-approved safety amendment is committed into the spec.
+- RED evidence exists for each new semantic boundary.
+- Intake replay proves crash boundaries converge without source loss or duplicate semantic reference creation.
+- Existing-version partial-state regression is covered.
+- Cursor advancement cannot orphan unregistered changes.
+- Webhook acknowledgement cannot leave only volatile continuation state.
+- Verified referral routing depends on machine provenance; frontmatter alone cannot claim it.
+- No scheduled INPUTS scanner exists.
+- Dropbox never recursively deletes an INPUTS directory as empty cleanup.
+- Explicit legacy recovery preserves conflicts and proves before cleanup.
+- `npm run check`, `npm run test:persistence-high-risk`, and `npx wrangler deploy --dry-run` are green on final PR head.
+- GitHub PR is merged only after explicit founder authorization.
+- Production recovery is verified before canonical task completion.
+
+## Canonical Project OS update after implementation
+
+Only after merge, deployment and recovery verification:
+
+1. Refresh PRJ-0002 `HANDOFF.md`, `STATE.md`, `OPERATING.md` and current canonical revision.
+2. Persist only operationally real implementation/deployment/recovery outcomes through supported typed transactions.
+3. Include exact authoritative GitHub PR, merge commit and deployment/recovery evidence.
+4. Mark `TASK-IMPINPUTLIFECYCLE001` complete only with a committed task-completion receipt.

@@ -3,6 +3,7 @@ import { documentIdForProviderFile, externalVersionIdFor } from "../src/domain/m
 import { emptyProjectState } from "../src/domain/transitions";
 import type { DropboxFileMetadata, DropboxTransport } from "../src/dropbox/client";
 import { DropboxConflictError } from "../src/dropbox/client";
+import { InputIntakeService } from "../src/documents/input-intake-service";
 import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
 import { DocumentLedgerRepository } from "../src/documents/repository";
@@ -12,6 +13,7 @@ import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 class ReferenceDropbox implements DropboxTransport {
   files = new Map<string, string>();
   metadata = new Map<string, DropboxFileMetadata>();
+  failDeleteOnce: string | null = null;
   private nextId = 1;
   private nextRev = 1;
 
@@ -40,7 +42,14 @@ class ReferenceDropbox implements DropboxTransport {
     if (content === undefined) throw new DropboxConflictError("missing", "req-copy", "from_lookup/not_found");
     return this.setFile(to, content);
   }
-  async delete(path: string): Promise<void> { this.files.delete(path); this.metadata.delete(path); }
+  async delete(path: string): Promise<void> {
+    if (this.failDeleteOnce === path) {
+      this.failDeleteOnce = null;
+      throw new Error("injected stale INPUTS cleanup crash");
+    }
+    this.files.delete(path);
+    this.metadata.delete(path);
+  }
   async listFolder(path: string) {
     const prefix = `${path}/`;
     return [...this.files.keys()]
@@ -111,6 +120,33 @@ describe("reference reconciliation", () => {
     expect(await ledger.readVersion(state.project_id, documentId, versionId)).toMatchObject({ stage: "reference", source: "external_human" });
   });
 
+  it("resumes a reference-committed intake instead of hiding stale INPUTS cleanup under ignored", async () => {
+    const dropbox = new ReferenceDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
+    const state = project();
+    const inputPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "stale/report.pdf");
+    const source = await dropbox.externalAdd(inputPath, "stale-source-bytes");
+    const sourceChange = change(source);
+    dropbox.failDeleteOnce = inputPath;
+
+    await expect(new InputIntakeService(runtime).ingest(state, {
+      sourcePath: inputPath,
+      relativeInputPath: "stale/report.pdf",
+      metadata: sourceChange.metadata!
+    })).rejects.toThrow(/cleanup crash/i);
+    expect(dropbox.files.has(inputPath)).toBe(true);
+
+    const result = await new ManagedDocumentReconciler(runtime).reconcileChanges(state, [sourceChange]);
+
+    expect(result).toMatchObject({
+      ingested: 1,
+      ignored: 0,
+      intake_completed: 1,
+      intake_resumed: 1
+    });
+    expect(dropbox.files.has(inputPath)).toBe(false);
+  });
+
   it("removes a duplicate INPUTS file when identical content is already the current managed reference", async () => {
     const dropbox = new ReferenceDropbox();
     const runtime = persistenceFromDropbox(dropbox);
@@ -128,7 +164,7 @@ describe("reference reconciliation", () => {
     const fingerprint = await ledger.readReferenceFingerprint(state.project_id, duplicate.content_hash);
     const originalDocumentId = await documentIdForProviderFile(state.project_id, first.id);
     const duplicateDocumentId = await documentIdForProviderFile(state.project_id, duplicate.id);
-    expect(result).toMatchObject({ duplicates: 1 });
+    expect(result).toMatchObject({ duplicates: 1, duplicate_cleaned: 1 });
     expect(dropbox.files.has(secondPath)).toBe(false);
     expect(fingerprint?.document_id).toBe(originalDocumentId);
     expect(await ledger.readHead(state.project_id, duplicateDocumentId)).toBeNull();
@@ -153,7 +189,7 @@ describe("reference reconciliation", () => {
 
     const secondDocumentId = await documentIdForProviderFile(state.project_id, historicalCopy.id);
     const ledger = new DocumentLedgerRepository(runtime);
-    expect(result).toMatchObject({ ingested: 1, duplicates: 0 });
+    expect(result).toMatchObject({ ingested: 1, intake_completed: 1, duplicates: 0 });
     expect(await ledger.readHead(state.project_id, secondDocumentId)).toMatchObject({
       kind: "reference",
       logical_path: "historical/old-report.pdf",

@@ -4,7 +4,10 @@ import type { DropboxEntry, DropboxFileMetadata, DropboxTransport } from "../src
 import { DropboxConflictError } from "../src/dropbox/client";
 import { sha256Text } from "../src/documents/hash";
 import { InputIntakeService } from "../src/documents/input-intake-service";
-import { ReferralProvenanceRepository } from "../src/documents/referral-provenance";
+import {
+  ReferralProvenanceRepository,
+  referralIntentPath
+} from "../src/documents/referral-provenance";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
@@ -55,7 +58,8 @@ class ReferralDropbox implements DropboxTransport {
       id: id ?? `id:R${String(this.nextId++).padStart(6, "0")}`,
       path,
       rev: `rev-${String(this.nextRev++).padStart(6, "0")}`,
-      content_hash: await sha256Text(content),
+      // Provider integrity evidence is deliberately distinct from referral content_sha256.
+      content_hash: await sha256Text(`provider-integrity:${content}`),
       size: new TextEncoder().encode(content).byteLength,
       server_modified: "2026-08-31T15:05:00.000Z"
     };
@@ -67,12 +71,16 @@ class ReferralDropbox implements DropboxTransport {
 
 const now = () => "2026-08-31T15:06:00+01:00";
 
+function targetState() {
+  return emptyProjectState("PRJ-5202", "Referral target", "referral-target", "Referral routing test");
+}
+
 describe("referral intake routing", () => {
   it("routes a machine-verified referral to the source-project REFERRALS collection", async () => {
     const dropbox = new ReferralDropbox();
     const runtime = persistenceFromDropbox(dropbox);
     const sourceProjectId = "PRJ-5201";
-    const target = emptyProjectState("PRJ-5202", "Referral target", "referral-target", "Referral routing test");
+    const target = targetState();
     const relativePath = "improvements/input-lifecycle.md";
     const content = "# Referral\n\nInvestigate the INPUTS lifecycle.";
     const inputPath = workspaceManagedDocumentPath(target.project_id, target.slug, "inputs", relativePath);
@@ -94,6 +102,7 @@ describe("referral intake routing", () => {
     });
     const metadata = await runtime.objects.getMetadata(inputPath);
     expect(metadata).not.toBeNull();
+    expect(metadata!.integrityHash?.value).not.toBe(request.content_sha256);
 
     const result = await new InputIntakeService(runtime, { now }).ingest(target, {
       sourcePath: inputPath,
@@ -118,5 +127,81 @@ describe("referral intake routing", () => {
       collection_path: `REFERRALS/${sourceProjectId}`,
       reference_version_id: result.version_id
     });
+  });
+
+  it("fails closed when durable referral intent and input binding disagree", async () => {
+    const dropbox = new ReferralDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
+    const target = targetState();
+    const relativePath = "anomalies/provenance-mismatch.md";
+    const content = "# Referral\n\nMachine provenance must match.";
+    const inputPath = workspaceManagedDocumentPath(target.project_id, target.slug, "inputs", relativePath);
+    const request = {
+      schema_version: "1.0" as const,
+      request_id: "REF-PROVENANCE-MISMATCH-0002",
+      source_project_id: "PRJ-5201",
+      target_project_id: target.project_id,
+      relative_path: relativePath,
+      content,
+      content_sha256: await sha256Text(content),
+      created_at: now()
+    };
+
+    expect(await new ReferralProvenanceRepository(runtime.objects).deliver(target, request)).toMatchObject({
+      status: "committed"
+    });
+    const intentPath = referralIntentPath(target.project_id, request.request_id);
+    const intent = JSON.parse(dropbox.files.get(intentPath)!);
+    intent.content_sha256 = await sha256Text("different content");
+    dropbox.files.set(intentPath, `${JSON.stringify(intent, null, 2)}\n`);
+
+    const metadata = await runtime.objects.getMetadata(inputPath);
+    expect(metadata).not.toBeNull();
+    const result = await new InputIntakeService(runtime, { now }).ingest(target, {
+      sourcePath: inputPath,
+      relativeInputPath: relativePath,
+      metadata: metadata!
+    });
+
+    expect(result.status).toBe("conflict");
+    expect(dropbox.files.get(inputPath)).toBe(content);
+    expect(dropbox.files.has(workspaceManagedDocumentPath(
+      target.project_id,
+      target.slug,
+      "references",
+      `REFERRALS/${request.source_project_id}/${relativePath}`
+    ))).toBe(false);
+  });
+
+  it("keeps referral-looking Markdown without machine provenance in UNCLASSIFIED", async () => {
+    const dropbox = new ReferralDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
+    const target = targetState();
+    const relativePath = "manual/referral-looking.md";
+    const content = "# Cross-project referral\n\nsource_project_id: PRJ-5201";
+    const inputPath = workspaceManagedDocumentPath(target.project_id, target.slug, "inputs", relativePath);
+
+    await runtime.objects.createText(inputPath, content);
+    const metadata = await runtime.objects.getMetadata(inputPath);
+    expect(metadata).not.toBeNull();
+    const result = await new InputIntakeService(runtime, { now }).ingest(target, {
+      sourcePath: inputPath,
+      relativeInputPath: relativePath,
+      metadata: metadata!
+    });
+
+    expect(result.status).toBe("completed");
+    expect(dropbox.files.get(workspaceManagedDocumentPath(
+      target.project_id,
+      target.slug,
+      "references",
+      `UNCLASSIFIED/${relativePath}`
+    ))).toBe(content);
+    expect(dropbox.files.has(workspaceManagedDocumentPath(
+      target.project_id,
+      target.slug,
+      "references",
+      `REFERRALS/PRJ-5201/${relativePath}`
+    ))).toBe(false);
   });
 });

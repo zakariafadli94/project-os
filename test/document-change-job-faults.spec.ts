@@ -1,8 +1,8 @@
 import { env } from "cloudflare:workers";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
-import { installDropboxMock } from "./helpers/mock-dropbox";
+import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-31T14:20:00+01:00";
@@ -27,10 +27,11 @@ async function createProject(transactionId: string, slug: string): Promise<Recei
 }
 
 describe("durable managed-document change jobs", () => {
-  beforeEach(() => installDropboxMock());
   afterEach(() => vi.restoreAllMocks());
 
   it("advances the provider cursor after durable registration while isolating a failed job from a healthy sibling", async () => {
+    const faults: DropboxMockFault[] = [];
+    const mock = installDropboxMock({ faults });
     const slug = "change-job-isolation";
     const created = await createProject("TXN-CHANGEJOB-PROJECT-0001", slug);
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
@@ -42,19 +43,14 @@ describe("durable managed-document change jobs", () => {
     const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
     const badInput = `${root}/INPUTS/bad.pdf`;
     const goodInput = `${root}/INPUTS/good.pdf`;
-
-    // Replace the mock after baseline so the first copy of the bad input fails
-    // permanently for that attempt while the healthy sibling remains processable.
-    vi.restoreAllMocks();
-    const mock = installDropboxMock({
-      faults: [{
-        endpoint: "/2/files/copy_v2",
-        occurrence: 1,
-        status: 409,
-        error_summary: "to/conflict/file/...",
-        path: badInput
-      }]
+    faults.push({
+      endpoint: "/2/files/copy_v2",
+      occurrence: 1,
+      status: 409,
+      error_summary: "to/conflict/file/...",
+      path: badInput
     });
+
     await mock.writeExternal(badInput, "%PDF poison job");
     await mock.writeExternal(goodInput, "%PDF healthy job");
 

@@ -18,7 +18,7 @@ Make `INPUTS/` a trustworthy active inbox:
 
 > If an object is visible in `INPUTS/`, its ingestion has not reached a verified terminal state.
 
-Normal operation must be trigger-first. Project OS must not depend on periodic scans of every project's `INPUTS/` to achieve correctness.
+Normal operation is trigger-first. Project OS must not depend on periodic scans of every project's `INPUTS/` to achieve correctness.
 
 The solution must preserve provider neutrality above the Dropbox adapter, remain crash-safe and idempotent, preserve source evidence before cleanup, and never convert source ingestion into business acceptance.
 
@@ -29,42 +29,43 @@ This improvement does not:
 - solve the separate `REVIEW/` active-candidate lifecycle anomaly;
 - classify arbitrary sources into business taxonomies using AI or heuristics;
 - automatically create tasks, decisions, research records or deliverables from an input;
-- introduce periodic full-project scans as the normal ingestion mechanism;
+- introduce periodic full-project scans as normal ingestion machinery;
 - bulk-delete historical `INPUTS/` content without evidence verification;
 - make Dropbox file IDs into business identities;
-- change canonical project revision merely because a source file was ingested.
+- change canonical project revision merely because a source file was ingested;
+- introduce a broad event-bus abstraction unless implementation evidence proves it necessary.
 
 ## 4. Core principle: active zones represent active state
-
-Project OS human zones must express operational state rather than become accidental archives.
 
 For this increment:
 
 - `INPUTS/` means awaiting completed source ingestion.
 - `REFERENCES/` means durable governed source material.
 
-The broader principle is intentionally not implemented for `REVIEW/` in this change.
+An active zone must not become an archive by accident. The same principle may later inform `REVIEW/`, but REVIEW lifecycle is explicitly out of scope here.
 
 ## 5. Trigger-first architecture
 
-### 5.1 Existing trigger remains the entry point
+### 5.1 Dropbox webhook remains the external trigger
 
-Dropbox webhooks remain the primary external trigger. A webhook is a notification that provider changes exist; exact file changes are still resolved through the Dropbox change-feed cursor.
+Dropbox webhooks remain the primary trigger. A webhook means provider changes exist; exact file changes are resolved through the Dropbox change-feed cursor.
 
-Project OS must not interpret receipt of the webhook as proof that all semantic processing succeeded.
+Webhook acknowledgement is not semantic completion evidence.
 
-### 5.2 Durable trigger handoff
+### 5.2 Durable trigger handoff is mandatory
 
-The webhook path must durably record or signal pending change-feed work before acknowledging the webhook whenever the runtime requires such durability for reliable retry.
+The production webhook path must not rely solely on an in-memory or `waitUntil()` continuation whose loss could leave an acknowledged provider notification without a durable continuation path.
 
-The durable handoff may be implemented with the existing Cloudflare Durable Object architecture rather than a new general-purpose event platform. The design requirement is behavioral:
+After signature verification, Project OS must durably register pending provider-change consumption before treating the notification as safely handed off. The implementation should reuse the existing Cloudflare Durable Object architecture unless a simpler equally durable primitive is proven sufficient.
 
-1. webhook signature verified;
-2. pending provider-change work is durably represented;
-3. webhook may return success;
-4. provider-change work is retried independently until it reaches its own terminal state.
+Required behavior:
 
-No business truth is created by this trigger record.
+1. verify webhook signature;
+2. durably register pending provider-change work;
+3. acknowledge the webhook;
+4. consume provider changes independently and retry until the durable work reaches a terminal state.
+
+The trigger record is technical synchronization state. It creates no business truth.
 
 ### 5.3 Change-feed cursor semantics
 
@@ -74,23 +75,23 @@ For each change-feed page:
 
 1. fetch the page from the current cursor;
 2. normalize provider entries;
-3. route relevant entries to the owning project;
-4. durably register idempotent per-change work before advancing the cursor;
-5. advance the cursor only after all relevant page entries have a durable continuation path.
+3. identify the owning project from the canonical workspace path;
+4. durably register idempotent per-change work for every relevant entry;
+5. only then persist advancement to the page cursor.
 
-The cursor does not need to wait for every input ingestion to finish if each ingestion job is durably recoverable. It must never advance in a way that can permanently orphan an unrecorded change.
+The cursor may advance before each intake job finishes only because every relevant entry already has a durable continuation path. It must never advance past an unregistered relevant change.
 
 ### 5.4 Project isolation
 
-Provider changes must be routed by canonical project workspace path to the matching `ProjectGuard`. A trigger concerning PRJ-0003 must not rebind or mutate PRJ-0002.
+Each project change is routed to that project's `ProjectGuard` or equivalent project-scoped coordination boundary. Processing PRJ-0003 provider changes cannot mutate PRJ-0002 document state.
 
-Cross-project referrals remain ordinary source material in the target project after delivery.
+Cross-project delivery into a target project's `INPUTS/` does not rebind the source chat/project and does not automatically create target business truth.
 
 ## 6. Durable input-intake lifecycle
 
-Each input file ingestion is represented by a technical intake record. This record is Managed Document / provider operational state, not canonical business state.
+Each input file ingestion has a durable technical intake record. This belongs to provider/Managed Document operational state, not canonical business state.
 
-Recommended states:
+Lifecycle states are:
 
 ```text
 DETECTED
@@ -100,7 +101,7 @@ DETECTED
   -> COMPLETE
 ```
 
-Terminal alternatives:
+Terminal alternatives are:
 
 ```text
 DUPLICATE_CLEANED
@@ -110,104 +111,102 @@ CONFLICT
 
 ### 6.1 DETECTED
 
-Project OS has durable knowledge of the provider object identity/revision/path that entered `INPUTS/`.
+Project OS durably knows the provider object identity, revision, path and evidence needed to process the input.
 
-The intake identity must be deterministic or otherwise idempotently recoverable from provider evidence so the same change cannot create competing intake operations.
+The intake identity must be deterministic or otherwise idempotently recoverable so duplicate trigger/change delivery cannot create competing intake operations.
 
 ### 6.2 SNAPSHOTTED
 
-The exact provider bytes have been copied into immutable hidden evidence before destructive cleanup.
+The exact source bytes are preserved in immutable hidden evidence before destructive cleanup.
 
-No deletion from `INPUTS/` may occur before this point.
+No deletion from `INPUTS/` may occur before evidence has been safely preserved.
 
 ### 6.3 REFERENCE_COMMITTED
 
-A governed reference version/head exists and points to visible material under `REFERENCES/`.
+A governed reference version/head exists and a visible reference provider object exists under `REFERENCES/` with evidence matching the snapshotted source.
 
-For ordinary sources the default destination is:
+Ordinary sources default to:
 
 ```text
 REFERENCES/UNCLASSIFIED/<relative-input-path>
 ```
 
-The reference's provider bytes and immutable payload must correspond to the snapshotted source bytes.
-
 ### 6.4 SOURCE_REMOVED
 
-The original provider object has been removed from `INPUTS/` after reference integrity was verified.
+The original provider object has been removed from `INPUTS/` only after the durable reference representation is verified.
 
-Deletion is a cleanup consequence of successful ingestion, not deletion of evidence: immutable evidence and the governed reference remain.
+This removes an inbox copy, not evidence: immutable evidence and the governed reference remain.
 
 ### 6.5 COMPLETE
 
-All required postconditions are true:
+All mandatory postconditions are true:
 
 - immutable source evidence exists;
-- governed reference ledger state exists;
-- visible reference provider object exists with matching bytes/evidence;
-- original `INPUTS/` provider object no longer exists;
-- any now-empty input directories eligible for cleanup are removed.
+- governed reference version/head exists;
+- visible reference provider object exists with matching evidence;
+- original `INPUTS/` object no longer exists;
+- eligible empty ancestor directories below `INPUTS/` have been removed.
 
-`COMPLETE` is technical ingestion completion. It does not imply business acceptance.
+`COMPLETE` means technical ingestion completed. It never implies research acceptance, decision acceptance or any other canonical business acceptance.
 
-## 7. Idempotence and postcondition-based recovery
+## 7. Idempotence is based on the terminal postcondition
 
-The current shortcut `existing version -> ignored` is insufficient for an operation with multiple provider effects.
+The current shortcut `existing version -> ignored` is invalid for a multi-effect intake operation.
 
-The new rule is:
+The replacement rule is:
 
-> Replaying an intake checks and converges the complete postcondition; it does not stop merely because one intermediate ledger record already exists.
+> Every replay checks the complete intended postcondition and converges missing safe effects. An intermediate ledger record never proves intake completion by itself.
 
-Examples:
+### Crash after snapshot
 
-### Case A — crash after snapshot
+Reuse the immutable snapshot, finish reference creation/verification, then clean the source.
 
-On replay, reuse the existing immutable snapshot, finish the reference write, verify it, then clean `INPUTS/`.
+### Crash after visible/reference creation but before source deletion
 
-### Case B — crash after reference creation but before input deletion
+Verify the existing governed reference and remove the stale `INPUTS/` copy. Finish `COMPLETE`.
 
-On replay, verify the existing reference bytes/head and remove the stale input. Finish as `COMPLETE`.
+### Exact duplicate already governed
 
-### Case C — identical reference already exists
+If machine evidence proves byte-identical content is already represented by a current governed reference, remove the duplicate input and finish `DUPLICATE_CLEANED`.
 
-If current governed reference evidence proves the same content is already represented, remove the duplicate input and finish as `DUPLICATE_CLEANED`.
+### Divergent destination
 
-### Case D — target path contains divergent content
+If the intended reference destination contains different content that cannot be proven compatible, preserve both realities, leave the input visible, and enter `CONFLICT`.
 
-Do not overwrite or delete the input. Preserve both realities and finish/hold as `CONFLICT` with enough evidence for explicit resolution.
+### Human withdrawal
 
-### Case E — input was manually removed before capture completed
+If the source disappears before governed capture succeeds and no committed reference exists, finish `WITHDRAWN`. Project OS must not resurrect it.
 
-Treat this as `WITHDRAWN` when no governed reference was committed. Do not restore the input automatically.
-
-If a governed reference was already safely committed before the source disappeared, recovery may converge to `COMPLETE` because the durable destination and evidence already exist.
+If a governed reference had already safely committed before source disappearance, replay may converge to `COMPLETE` after verifying the durable destination/evidence.
 
 ## 8. Referral routing
 
-Cross-project referrals are structurally known source types and should not be dumped into generic `UNCLASSIFIED` when Project OS has trustworthy provenance.
+Cross-project referrals may use a dedicated structural reference collection only when referral provenance is machine-verifiable.
 
-Recommended visible destination:
+Verified referrals route to:
 
 ```text
 REFERENCES/REFERRALS/<source_project_id>/<referral-filename>
 ```
 
-Required preserved provenance includes, when available:
+Machine-verifiable provenance may come from governed Project OS referral delivery evidence or another implementation mechanism that proves the registered source and target projects. Arbitrary user-authored frontmatter is not sufficient by itself to claim trusted cross-project provenance.
+
+If referral provenance cannot be verified, ingest the file as an ordinary source under `REFERENCES/UNCLASSIFIED/` rather than inventing trusted provenance.
+
+For verified referrals preserve, when available:
 
 - source project ID;
 - target project ID;
 - referral type/topic;
 - creation timestamp;
-- original source/provider evidence;
-- referral body/content hash.
+- original delivery/provider evidence;
+- content hash.
 
-This structural routing does not constitute acceptance of the referral's claims.
-
-An ingested referral may remain unacted on indefinitely without staying in `INPUTS/`.
+Structural routing does not accept the referral's claims. A referral can remain unacted on indefinitely without remaining in `INPUTS/`.
 
 ## 9. Ordinary source routing
 
-Unknown or ordinary source documents continue to use:
+Unknown or ordinary source documents use:
 
 ```text
 REFERENCES/UNCLASSIFIED/<relative-input-path>
@@ -215,21 +214,21 @@ REFERENCES/UNCLASSIFIED/<relative-input-path>
 
 Low-level intake must not infer business taxonomy from filenames or content.
 
-Any later reclassification is an explicit governed reference operation and must preserve the same logical reference identity according to the reference identity contract.
+Later explicit reclassification must preserve governed reference identity according to the reference identity contract.
 
 ## 10. Directory behavior
 
-Input directories are organizational containers, not durable evidence objects by themselves.
+Input directories are organizational containers, not durable evidence objects.
 
-After successful removal of an input file, Project OS may remove ancestor directories under `INPUTS/` that are proven empty, stopping at the `INPUTS/` root.
+After a successful file intake removes its source, Project OS removes any now-empty ancestor directories below `INPUTS/`, stopping at the `INPUTS/` root.
 
-Directory cleanup must be idempotent and must never delete a non-empty folder.
+Directory cleanup must be idempotent and conditional on the directory being empty. It must never remove a non-empty directory or race by overwriting newer human state.
 
-An empty directory left by a concurrent human operation is harmless; absence of empty-folder cleanup must not compromise source correctness. File-level terminal correctness is mandatory.
+A crash during directory cleanup is replayable. File-level evidence/reference correctness remains the primary safety condition.
 
 ## 11. Provider-neutral boundary
 
-The core lifecycle operates on provider capabilities/evidence:
+The core intake lifecycle operates on provider capabilities/evidence such as:
 
 - stable object identity where available;
 - revision token;
@@ -237,172 +236,183 @@ The core lifecycle operates on provider capabilities/evidence:
 - immutable snapshot/copy;
 - metadata lookup;
 - delete;
-- change feed.
+- provider change notification/change feed.
 
-Dropbox-specific cursor and webhook behavior remains inside the Dropbox/provider integration layer.
+Dropbox-specific webhook and cursor mechanics remain inside the Dropbox/provider integration layer.
 
-Core input-intake logic must not depend on Dropbox-specific file IDs as logical reference IDs.
+Core logical reference identity must never be a Dropbox file ID.
 
 ## 12. Concurrency
 
-Input intake for one project is serialized through the project's existing coordination boundary or an equivalently deterministic per-project intake coordinator.
+Project-scoped intake is serialized through the existing ProjectGuard coordination boundary or an equivalently deterministic project-scoped coordinator.
 
-The design must tolerate:
+The implementation must tolerate:
 
 - duplicate webhook notifications;
 - duplicate provider change entries;
 - replay of a change-feed page;
-- two events for successive revisions of the same provider object;
-- human modification/removal while intake is in progress;
-- provider CAS/path conflicts.
+- successive revisions of the same provider object;
+- human modification/removal during intake;
+- provider path/CAS conflicts.
 
-The system must never silently overwrite a newer provider reality to force an intake to succeed.
+Project OS never silently overwrites a newer provider reality merely to force intake completion.
 
-## 13. Cursor and job crash matrix
+## 13. Cursor and intake crash matrix
 
-The implementation must test at least these boundaries:
+The implementation must verify at least these boundaries:
 
-1. crash before durable job registration: cursor must not irreversibly advance past the change;
-2. crash after durable job registration but before cursor advancement: page replay deduplicates jobs;
+1. crash before durable per-change registration: cursor cannot irreversibly advance past the change;
+2. crash after job registration but before cursor advancement: page replay deduplicates jobs;
 3. crash after cursor advancement but before job execution: durable job still executes;
-4. crash after immutable snapshot: replay resumes without second semantic source;
-5. crash after reference provider copy: replay verifies/reuses it;
-6. crash after ledger reference write but before source deletion: replay performs cleanup;
-7. crash after source deletion but before terminal intake marker: replay verifies postconditions and finishes;
-8. crash during empty-directory cleanup: file intake remains complete and directory cleanup can replay.
+4. crash after immutable snapshot: replay resumes from evidence;
+5. crash after provider reference copy: replay verifies/reuses it;
+6. crash after reference ledger write but before source deletion: replay performs cleanup;
+7. crash after source deletion but before terminal intake record: replay verifies postconditions and closes the intake;
+8. crash during empty-directory cleanup: replay finishes cleanup without affecting reference integrity.
 
 ## 14. Historical recovery / one-time remediation
 
-Production already contains legacy inputs that predate or escaped the intended intake lifecycle. They must be repaired without introducing a permanent polling scanner.
+Existing stale inputs are repaired through an explicit administrative recovery operation, not through permanent polling.
 
-Provide an explicit administrative recovery operation that enumerates selected projects or selected `INPUTS/` roots and feeds discovered files into the same intake engine.
+The recovery operation enumerates only explicitly selected projects or `INPUTS/` roots and feeds discovered files into the same intake engine used by normal triggered processing.
 
-Recovery classification:
+Recovery outcomes:
 
-- exact governed reference already proven -> finish cleanup;
-- no governed reference -> execute normal intake;
-- conflicting visible/reference bytes -> `CONFLICT`, preserve source;
-- ambiguous evidence -> preserve source and report conflict.
+- exact governed reference proven -> complete safe source cleanup;
+- no governed reference -> run normal intake;
+- divergent provider/reference bytes -> `CONFLICT`, preserve source;
+- ambiguous evidence -> `CONFLICT`, preserve source.
 
-The initial remediation should include at least the observed PRJ-0002 stale referral and PRJ-0003 BCOS corpus, but the repair mechanism must be general rather than hard-coded to those projects.
+The initial remediation must cover the observed stale PRJ-0002 referral and PRJ-0003 BCOS corpus, while the recovery mechanism remains general and contains no project-specific hard-coding.
 
-This recovery operation is exceptional/manual/admin-triggered. It is not scheduled recurring correctness machinery.
+Recovery is explicit/admin-triggered and exceptional. It is never scheduled recurring correctness machinery.
 
-## 15. Canonical-state semantics
+## 15. Canonical business-state semantics
 
-Source ingestion does not increment project business revision solely because a reference file moved from `INPUTS` to `REFERENCES`.
+Source ingestion alone does not increment project business revision.
 
 Canonical transactions remain required for accepted research, decisions, constraints, task lifecycle, project lifecycle and other business facts.
 
-A referral or source can therefore be technically `COMPLETE` while producing no canonical mutation at all.
+A source/referral may therefore be technically `COMPLETE` while producing no canonical mutation.
 
 ## 16. Observability
 
-Managed-document reconciliation summaries should distinguish intake outcomes clearly enough to diagnose production behavior. At minimum expose counts or structured events for:
+Reconciliation/intake observability must distinguish at least:
 
 - detected/queued;
-- completed ingestion;
-- duplicate cleanup;
+- completed;
+- duplicate-cleaned;
 - withdrawn;
 - conflicts;
-- resumed partial operations;
-- recovery-admin repairs.
+- resumed partial intakes;
+- explicit recovery repairs.
 
-A generic `ignored` outcome must not hide a partially satisfied intake postcondition.
+A generic `ignored` outcome must not conceal a partially satisfied intake postcondition.
 
-## 17. Security and fail-closed behavior
+## 17. Fail-closed cleanup rules
 
-Project OS must fail closed when provider evidence cannot prove safe cleanup.
+Project OS never deletes an `INPUTS/` object merely because:
 
-Never delete an `INPUTS/` object merely because:
-
-- a filename matches a reference filename;
+- its filename resembles a reference;
 - a research/decision record mentions it;
-- an LLM says the source was already processed;
-- a ledger record exists without verifying the current governed reference/provider representation.
+- an LLM says it has been processed;
+- an intermediate ledger/version record exists.
 
-Deletion requires sufficient machine-verifiable evidence that the intended durable source representation exists or that the input is an exact duplicate of it.
+Deletion requires machine-verifiable evidence that the intended governed source representation exists with compatible content, or that the input is an exact duplicate of a proven current reference.
 
 ## 18. Acceptance criteria
 
 ### AC-01 — Triggered ingestion
 
-Adding a new file under a project's `INPUTS/` and delivering the Dropbox trigger causes it to be ingested without a periodic input scan.
+Adding a file under a project's `INPUTS/` and delivering the provider trigger ingests it without a periodic input scan.
 
 ### AC-02 — Active inbox invariant
 
 After successful ingestion, the source is absent from `INPUTS/` and present as a governed reference.
 
-### AC-03 — Crash after reference creation
+### AC-03 — Durable webhook handoff
 
-If execution stops after reference creation but before source deletion, replay removes the stale input and reaches terminal completion without duplicating the reference.
+A successfully acknowledged webhook cannot be the sole volatile record of pending input work; pending change-feed consumption has a durable continuation path.
 
-### AC-04 — Existing-version partial state
+### AC-04 — Crash after reference creation
 
-An existing version/head does not cause `ignored` when the source still requires cleanup. The engine checks the terminal postcondition and converges it.
+If execution stops after reference creation but before source deletion, replay removes the stale input and reaches `COMPLETE` without duplicating the reference.
 
-### AC-05 — Duplicate source
+### AC-05 — Existing-version partial state
 
-Dropping byte-identical content already represented by a current governed reference removes the duplicate input safely and records a duplicate-cleaned outcome.
+An existing version/head does not cause `ignored` while source cleanup remains incomplete. Replay checks and converges the terminal postcondition.
 
-### AC-06 — Divergent destination
+### AC-06 — Duplicate source
 
-If the intended visible reference path contains different content that cannot be proven compatible, Project OS preserves the input and reports conflict.
+Byte-identical content already represented by a proven current governed reference is safely removed from `INPUTS/` and terminates as `DUPLICATE_CLEANED`.
 
-### AC-07 — Referral routing
+### AC-07 — Divergent destination
 
-A PRJ-0003 -> PRJ-0002 referral is ingested under `REFERENCES/REFERRALS/PRJ-0003/` with provenance preserved, while creating no automatic task/decision/research acceptance.
+A divergent destination preserves the input and reports `CONFLICT`.
 
-### AC-08 — Ordinary routing
+### AC-08 — Verified referral routing
 
-An ordinary unclassified source is ingested under `REFERENCES/UNCLASSIFIED/` without semantic taxonomy guessing.
+A machine-verifiable PRJ-0003 -> PRJ-0002 referral is ingested under `REFERENCES/REFERRALS/PRJ-0003/` with provenance preserved and creates no automatic business acceptance.
 
-### AC-09 — Withdrawal
+### AC-09 — Unverified referral-like file
 
-Deleting an input before successful governed capture does not cause Project OS to resurrect it automatically.
+A referral-looking file without machine-verifiable provenance is ingested as `UNCLASSIFIED`, not treated as trusted cross-project provenance.
 
-### AC-10 — Cursor crash safety
+### AC-10 — Ordinary routing
 
-Advancing the provider cursor cannot permanently lose an input change because every relevant change has a durable continuation path first.
+An ordinary source is ingested under `REFERENCES/UNCLASSIFIED/` without taxonomy guessing.
 
-### AC-11 — Historical remediation
+### AC-11 — Withdrawal
 
-The explicit recovery operation safely converges stale legacy inputs and preserves conflicts without requiring a permanent periodic scanner.
+Deleting an input before successful governed capture does not cause automatic resurrection.
 
-### AC-12 — Project isolation
+### AC-12 — Cursor crash safety
 
-Input changes for one project are routed to that project only and cannot mutate another project's document ledger or canonical state.
+The provider cursor cannot permanently lose a relevant input change because every advanced-past relevant change has a durable continuation path.
+
+### AC-13 — Historical remediation
+
+The explicit recovery operation converges stale legacy inputs safely without a permanent periodic scanner.
+
+### AC-14 — Project isolation
+
+Input changes affect only their owning project.
+
+### AC-15 — Empty-directory cleanup
+
+After the final successfully ingested child leaves a nested input directory, empty ancestors below the `INPUTS/` root are removed safely.
 
 ## 19. Required tests
 
-The implementation plan must include TDD coverage for:
+Implementation planning must include TDD coverage for:
 
 - normal INPUTS -> REFERENCES ingestion;
 - nested input directories;
-- referral structural routing;
+- verified referral structural routing;
+- unverified referral-like fallback to UNCLASSIFIED;
 - identical duplicate cleanup;
-- target-path divergent conflict;
-- replay after each crash boundary in Section 13;
+- divergent target conflict;
+- every crash boundary in Section 13;
 - existing-version-but-source-still-present regression;
-- source withdrawn before completion;
-- successive revisions of the same provider object;
+- source withdrawal;
+- successive source revisions;
 - duplicate webhook/change delivery;
 - cursor replay and durable-job deduplication;
 - project isolation;
 - one-time legacy remediation;
-- empty directory cleanup;
-- archived project behavior;
-- provider-neutral unit tests plus Dropbox adapter/integration tests.
+- empty-directory cleanup;
+- archived-project behavior;
+- provider-neutral core tests and Dropbox adapter/integration tests.
 
 ## 20. Implementation constraints
 
-- Preserve existing Managed Document reference identity and fingerprint semantics unless the implementation plan identifies a proven incompatibility.
+- Preserve existing Managed Document reference identity and fingerprint semantics unless a proven incompatibility is found during implementation planning.
 - Reuse existing ProjectGuard serialization and provider capability boundaries where possible.
-- Do not introduce a broad event-bus abstraction unless required by verified implementation constraints.
-- Do not add periodic full scans as a fallback hidden inside normal scheduled maintenance.
-- Any durable technical intake ledger must have an explicit idempotency and recovery contract.
-- Existing production source evidence must never be destructively migrated without content/evidence verification.
+- Do not add periodic full scans as a hidden fallback inside normal scheduled maintenance.
+- Any durable intake ledger/job representation must have an explicit idempotency and recovery contract.
+- Existing production source evidence must never be destructively migrated without machine-verifiable content/evidence checks.
+- The production webhook may use `waitUntil()` for execution scheduling only after a durable continuation path exists; `waitUntil()` alone is not the correctness boundary.
 
 ## 21. Out-of-scope follow-up
 
-The separate referral `REVIEW candidate lifecycle and accumulation` should be handled as a later improvement. It may reuse the general principle that active zones should expose only active state, but it has different lifecycle semantics and must not be coupled into IMP-INPUTLIFECYCLE001.
+The separate `REVIEW candidate lifecycle and accumulation` referral remains a later improvement. It may reuse the general active-zone principle but has different business lifecycle semantics and must not be coupled into IMP-INPUTLIFECYCLE001.

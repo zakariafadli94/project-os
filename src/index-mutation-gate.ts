@@ -3,6 +3,7 @@ import { parseMutationCandidateResolutionRequest } from "./domain/mutation-candi
 import type { Env } from "./env";
 import baseWorker from "./index";
 
+export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
 export { MutationGateProjectGuard as ProjectGuard } from "./durable/project-guard-mutation-gate";
 export { RegistryGuard } from "./durable/registry-guard";
 

@@ -9,16 +9,39 @@ import {
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ObjectPersistence } from "../persistence/provider/contract";
 import { ProviderConflictError } from "../persistence/provider/errors";
-import type { InboxProcessSummary } from "./processor";
+import { MAX_RETRYABLE_INBOX_ATTEMPTS, type InboxProcessSummary } from "./processor";
 
 interface RegistryProject {
   project_id: string;
   slug: string;
 }
 
+interface ReferralFailureDiagnostic {
+  schema_version: "1.0";
+  request_id: string;
+  source_project_id: string;
+  target_project_id: string;
+  status: "retryable_failure";
+  attempt_count: number;
+  first_failed_at: string;
+  last_failed_at: string;
+  message: string;
+}
+
+export type ExecuteReferral = (request: ReferralWriteRequest) => Promise<ReferralWriteReceipt>;
+
 export async function processReferralInbox(env: Env): Promise<InboxProcessSummary> {
   const persistence = createProductionPersistence(env);
-  const objects = persistence.objects;
+  return processReferralInboxEntries(
+    persistence.objects,
+    (referral) => routeReferral(env, referral)
+  );
+}
+
+export async function processReferralInboxEntries(
+  objects: ObjectPersistence,
+  executeReferral: ExecuteReferral
+): Promise<InboxProcessSummary> {
   const entries = (await objects.listChildren(referralInboxPath()))
     .filter((entry) => entry.kind === "file" && entry.name.endsWith(".json"))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -47,7 +70,7 @@ export async function processReferralInbox(env: Env): Promise<InboxProcessSummar
         if (!filenameRequestId || filenameRequestId !== referral.request_id) {
           throw new Error("Referral filename must exactly match request_id");
         }
-      } catch (error) {
+      } catch {
         const fallbackId = filenameRequestId ?? await syntheticReferralId(entry.name, raw);
         await safeAdd(objects, referralRequestPath("rejected", fallbackId), raw);
         await archiveSource(objects, sourcePath, referralRequestPath("rejected", fallbackId));
@@ -57,19 +80,33 @@ export async function processReferralInbox(env: Env): Promise<InboxProcessSummar
 
       let receipt: ReferralWriteReceipt;
       try {
-        receipt = await routeReferral(env, referral);
+        receipt = await executeReferral(referral);
       } catch (error) {
         summary.failed += 1;
         console.error("Project OS referral processing failed", {
           request_id: referral.request_id,
           message: error instanceof Error ? error.message : String(error)
         });
+        try {
+          const diagnostic = await recordReferralFailure(objects, referral, error);
+          if (diagnostic.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
+            await archiveSource(objects, sourcePath, referralQuarantinePath(referral.request_id));
+          }
+        } catch (diagnosticError) {
+          console.error("Project OS referral failure diagnostic could not be persisted", {
+            request_id: referral.request_id,
+            source_project_id: referral.source_project_id,
+            target_project_id: referral.target_project_id,
+            message: diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError)
+          });
+        }
         continue;
       }
 
       await safeAdd(objects, referralReceiptPath(referral.request_id), pretty(receipt));
       const terminal = receipt.status === "conflict" ? "conflicts" : receipt.status;
       await archiveSource(objects, sourcePath, referralRequestPath(terminal, referral.request_id));
+      await clearReferralFailureBestEffort(objects, referral.request_id);
       summary.processed += 1;
     } catch (error) {
       summary.failed += 1;
@@ -129,6 +166,80 @@ function terminalReceipt(
 
 function requestIdFromFilename(filename: string): string | null {
   return /^(REF-[A-Z0-9-]{10,})\.json$/.exec(filename)?.[1] ?? null;
+}
+
+function referralFailurePath(requestId: string): string {
+  return `${referralRoot()}/failures/${requestId}.json`;
+}
+
+function referralQuarantinePath(requestId: string): string {
+  return `${referralRoot()}/quarantine/${requestId}.json`;
+}
+
+function referralRoot(): string {
+  return referralInboxPath().replace(/\/incoming$/, "");
+}
+
+async function recordReferralFailure(
+  objects: ObjectPersistence,
+  referral: ReferralWriteRequest,
+  error: unknown
+): Promise<ReferralFailureDiagnostic> {
+  const path = referralFailurePath(referral.request_id);
+  const previous = await readReferralFailure(objects, path, referral);
+  const now = new Date().toISOString();
+  const diagnostic: ReferralFailureDiagnostic = {
+    schema_version: "1.0",
+    request_id: referral.request_id,
+    source_project_id: referral.source_project_id,
+    target_project_id: referral.target_project_id,
+    status: "retryable_failure",
+    attempt_count: (previous?.attempt_count ?? 0) + 1,
+    first_failed_at: previous?.first_failed_at ?? now,
+    last_failed_at: now,
+    message: error instanceof Error ? error.message : String(error)
+  };
+  await objects.upsertText(path, pretty(diagnostic));
+  return diagnostic;
+}
+
+async function readReferralFailure(
+  objects: ObjectPersistence,
+  path: string,
+  referral: ReferralWriteRequest
+): Promise<ReferralFailureDiagnostic | null> {
+  const raw = await objects.readText(path);
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<ReferralFailureDiagnostic>;
+    if (
+      parsed.schema_version !== "1.0"
+      || parsed.request_id !== referral.request_id
+      || parsed.source_project_id !== referral.source_project_id
+      || parsed.target_project_id !== referral.target_project_id
+      || parsed.status !== "retryable_failure"
+      || !Number.isSafeInteger(parsed.attempt_count)
+      || (parsed.attempt_count ?? 0) < 1
+      || typeof parsed.first_failed_at !== "string"
+      || typeof parsed.last_failed_at !== "string"
+      || typeof parsed.message !== "string"
+    ) return null;
+    return parsed as ReferralFailureDiagnostic;
+  } catch {
+    return null;
+  }
+}
+
+async function clearReferralFailureBestEffort(objects: ObjectPersistence, requestId: string): Promise<void> {
+  const path = referralFailurePath(requestId);
+  try {
+    if (await objects.readText(path) !== null) await objects.delete(path);
+  } catch (error) {
+    console.error("Project OS referral failure diagnostic cleanup failed", {
+      request_id: requestId,
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 async function syntheticReferralId(filename: string, raw: string): Promise<string> {

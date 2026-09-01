@@ -253,7 +253,7 @@ function normalizeOptionalRecordMap<T>(
 
 export function normalizeProjectState(input: unknown): ProjectState {
   const raw = requireRecord(input, "project state");
-  if (raw.schema_version !== "1.0") throw new Error("Unsupported project state schema_version");
+  const schemaVersion = requireEnum(raw.schema_version, ["1.0", "2.0"] as const, "schema_version");
 
   const projectId = requireString(raw.project_id, "project_id");
   if (!/^PRJ-[0-9]{4,}$/.test(projectId)) throw new Error("Invalid project_id");
@@ -268,7 +268,7 @@ export function normalizeProjectState(input: unknown): ProjectState {
   }
 
   return {
-    schema_version: "1.0",
+    schema_version: schemaVersion,
     project_id: projectId,
     name: requireString(raw.name, "name"),
     slug: requireString(raw.slug, "slug"),

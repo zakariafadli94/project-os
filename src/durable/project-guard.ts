@@ -6,6 +6,7 @@ import { ReferralProvenanceRepository } from "../documents/referral-provenance";
 import { DocumentLedgerRepository } from "../documents/repository";
 import { machineStatePath } from "../persistence/layout";
 import { resolveSchemaWriterStageForProject } from "../schema/writer-stage";
+import { restartSearchDocumentEpoch } from "../search/project-sync-recovery";
 import {
   initializeProjectSearchSyncSchema,
   ProjectSearchSyncStore
@@ -135,7 +136,7 @@ export class ProjectGuard extends NeutralProjectGuard {
     this.searchSyncStore.requestCanonical(state.revision);
     if (forceFull) {
       this.forceCanonicalSearchReplay(state.revision);
-      this.searchSyncStore.requestFullDocumentSnapshot();
+      restartSearchDocumentEpoch(this.ctx.storage);
     }
     await this.ensureSearchAlarm();
     return Response.json({

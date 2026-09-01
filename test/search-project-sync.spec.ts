@@ -1,12 +1,17 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Env } from "../src/env";
+import type { Receipt } from "../src/domain/receipt";
 import {
   initializeProjectSearchSyncSchema,
   ProjectSearchSyncStore,
   type DocumentSyncBatch,
   type SearchSyncStatus
 } from "../src/search/project-sync-store";
+import { installDropboxMock } from "./helpers/mock-dropbox";
+
+const testEnv = env as unknown as Env;
 
 async function withStore<T>(
   projectId: string,
@@ -202,6 +207,84 @@ describe("ProjectSearchSyncStore", () => {
     await withStore("PRJ-7110", (store) => {
       expect(store.status().document_epoch).not.toBe(firstEpoch);
       expectInitialStatus(store.status());
+    });
+  });
+});
+
+describe("ProjectGuard search synchronization", () => {
+  beforeEach(() => installDropboxMock());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("keeps canonical authority committed when search synchronization conflicts and still materializes", async () => {
+    const projectId = "PRJ-7120";
+    const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const searchStub = testEnv.SEARCH_INDEX_GUARD.getByName("global");
+
+    const seeded = await searchStub.fetch("https://search-index.internal/apply-canonical", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId,
+        canonical_revision: 1,
+        snapshot_hash: "f".repeat(64),
+        records: []
+      })
+    });
+    expect(seeded.status).toBe(200);
+
+    const transaction = {
+      schema_version: "1.0",
+      transaction_id: "TXN-SEARCH-SYNC-7120-CREATE",
+      project_id: projectId,
+      base_revision: 0,
+      operation: "project.create",
+      created_at: "2026-09-01T11:55:00+01:00",
+      payload: {
+        name: "Search sync conflict proof",
+        slug: "search-sync-conflict-proof",
+        aliases: [],
+        objective: "Canonical authority must survive derived search failure"
+      }
+    };
+    const response = await projectStub.fetch("https://project-guard.internal/transaction", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(transaction)
+    });
+    expect(response.status).toBe(200);
+    const receipt = await response.json<Receipt>();
+    expect(receipt).toMatchObject({ status: "committed", new_revision: 1 });
+
+    const beforeResponse = await projectStub.fetch("https://project-guard.internal/search-sync-status");
+    expect(beforeResponse.status).toBe(200);
+    expect(await beforeResponse.json()).toMatchObject({
+      project_id: projectId,
+      canonical_revision: 1,
+      canonical_revision_requested: 1,
+      canonical_revision_indexed: 0,
+      document_generation_requested: 1,
+      document_generation_indexed: 0,
+      last_error: null
+    });
+
+    expect(await runDurableObjectAlarm(projectStub)).toBe(true);
+
+    const afterResponse = await projectStub.fetch("https://project-guard.internal/search-sync-status");
+    expect(afterResponse.status).toBe(200);
+    expect(await afterResponse.json()).toMatchObject({
+      project_id: projectId,
+      canonical_revision: 1,
+      canonical_revision_requested: 1,
+      canonical_revision_indexed: 0
+    });
+    const after = await afterResponse.clone().json().catch(() => null);
+    void after;
+
+    const materialization = await projectStub.fetch("https://project-guard.internal/materialization-status");
+    expect(materialization.status).toBe(200);
+    expect(await materialization.json()).toMatchObject({
+      canonical_revision: 1,
+      materialized_head: { revision: 1 }
     });
   });
 });

@@ -27,6 +27,17 @@ interface PreparedTransactionInboxEntry {
   loadError?: unknown;
 }
 
+interface TransactionFailureDiagnostic {
+  schema_version: "1.0";
+  transaction_id: string;
+  project_id: string;
+  status: "retryable_failure";
+  attempt_count: number;
+  first_failed_at: string;
+  last_failed_at: string;
+  message: string;
+}
+
 export function inboxPath(mode: LayoutMode): string {
   return mode === "v2"
     ? `${PROJECT_OS_ROOT}/.project-os/transactions/incoming`
@@ -107,6 +118,15 @@ export async function processTransactionInbox(
       } catch (error) {
         summary.failed += 1;
         console.error("Project OS transaction processing failed", transaction.transaction_id, error);
+        try {
+          await recordTransactionFailure(objects, mode, transaction, error);
+        } catch (diagnosticError) {
+          console.error("Project OS transaction failure diagnostic could not be persisted", {
+            transaction_id: transaction.transaction_id,
+            project_id: transaction.project_id,
+            message: diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError)
+          });
+        }
         continue;
       }
 
@@ -116,6 +136,7 @@ export async function processTransactionInbox(
         ? canonicalTerminalPath
         : canonicalTerminalPath.replace(/\.json$/, ".source.json");
       await archiveSource(objects, sourcePath, archivePath);
+      await clearTransactionFailureBestEffort(objects, mode, transaction.transaction_id);
       summary.processed += 1;
     } catch (error) {
       summary.failed += 1;
@@ -266,6 +287,12 @@ function terminalTransactionPath(
     : transactionPath(status, transactionId);
 }
 
+function transactionFailurePath(mode: LayoutMode, transactionId: string): string {
+  return mode === "v2"
+    ? `${PROJECT_OS_ROOT}/.project-os/transactions/failures/${transactionId}.json`
+    : `${PROJECT_OS_ROOT}/TRANSACTIONS/failures/${transactionId}.json`;
+}
+
 function terminalArtifactRequestPath(
   mode: LayoutMode,
   status: "committed" | "rejected" | "conflicts",
@@ -291,6 +318,70 @@ async function syntheticInboxId(prefix: "TXN-INVALID" | "ART-INVALID", filename:
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   const hex = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
   return `${prefix}-${hex.slice(0, 24)}`;
+}
+
+async function recordTransactionFailure(
+  objects: ObjectPersistence,
+  mode: LayoutMode,
+  transaction: Transaction,
+  error: unknown
+): Promise<void> {
+  const path = transactionFailurePath(mode, transaction.transaction_id);
+  const now = new Date().toISOString();
+  const previous = await readTransactionFailure(objects, path, transaction);
+  const diagnostic: TransactionFailureDiagnostic = {
+    schema_version: "1.0",
+    transaction_id: transaction.transaction_id,
+    project_id: transaction.project_id,
+    status: "retryable_failure",
+    attempt_count: (previous?.attempt_count ?? 0) + 1,
+    first_failed_at: previous?.first_failed_at ?? now,
+    last_failed_at: now,
+    message: error instanceof Error ? error.message : String(error)
+  };
+  await objects.upsertText(path, `${JSON.stringify(diagnostic, null, 2)}\n`);
+}
+
+async function readTransactionFailure(
+  objects: ObjectPersistence,
+  path: string,
+  transaction: Transaction
+): Promise<TransactionFailureDiagnostic | null> {
+  const raw = await objects.readText(path);
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<TransactionFailureDiagnostic>;
+    if (
+      parsed.schema_version !== "1.0"
+      || parsed.transaction_id !== transaction.transaction_id
+      || parsed.project_id !== transaction.project_id
+      || parsed.status !== "retryable_failure"
+      || !Number.isSafeInteger(parsed.attempt_count)
+      || (parsed.attempt_count ?? 0) < 1
+      || typeof parsed.first_failed_at !== "string"
+    ) {
+      return null;
+    }
+    return parsed as TransactionFailureDiagnostic;
+  } catch {
+    return null;
+  }
+}
+
+async function clearTransactionFailureBestEffort(
+  objects: ObjectPersistence,
+  mode: LayoutMode,
+  transactionId: string
+): Promise<void> {
+  const path = transactionFailurePath(mode, transactionId);
+  try {
+    if (await objects.readText(path) !== null) await objects.delete(path);
+  } catch (error) {
+    console.error("Project OS transaction failure diagnostic cleanup failed", {
+      transaction_id: transactionId,
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 async function safeAdd(objects: ObjectPersistence, path: string, content: string): Promise<void> {

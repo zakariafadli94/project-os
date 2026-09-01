@@ -17,6 +17,8 @@ export interface InboxProcessSummary {
   failed: number;
 }
 
+export const MAX_RETRYABLE_INBOX_ATTEMPTS = 8;
+
 export type ExecuteTransaction = (transaction: Transaction) => Promise<Receipt>;
 export type ExecuteArtifact = (artifact: ArtifactWriteRequest) => Promise<ArtifactWriteReceipt>;
 
@@ -27,15 +29,23 @@ interface PreparedTransactionInboxEntry {
   loadError?: unknown;
 }
 
-interface TransactionFailureDiagnostic {
+interface RetryableFailureDiagnostic {
   schema_version: "1.0";
-  transaction_id: string;
-  project_id: string;
   status: "retryable_failure";
   attempt_count: number;
   first_failed_at: string;
   last_failed_at: string;
   message: string;
+}
+
+interface TransactionFailureDiagnostic extends RetryableFailureDiagnostic {
+  transaction_id: string;
+  project_id: string;
+}
+
+interface ArtifactFailureDiagnostic extends RetryableFailureDiagnostic {
+  request_id: string;
+  project_id: string;
 }
 
 export function inboxPath(mode: LayoutMode): string {
@@ -119,7 +129,10 @@ export async function processTransactionInbox(
         summary.failed += 1;
         console.error("Project OS transaction processing failed", transaction.transaction_id, error);
         try {
-          await recordTransactionFailure(objects, mode, transaction, error);
+          const diagnostic = await recordTransactionFailure(objects, mode, transaction, error);
+          if (diagnostic.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
+            await archiveSource(objects, sourcePath, transactionQuarantinePath(mode, transaction.transaction_id));
+          }
         } catch (diagnosticError) {
           console.error("Project OS transaction failure diagnostic could not be persisted", {
             transaction_id: transaction.transaction_id,
@@ -136,7 +149,12 @@ export async function processTransactionInbox(
         ? canonicalTerminalPath
         : canonicalTerminalPath.replace(/\.json$/, ".source.json");
       await archiveSource(objects, sourcePath, archivePath);
-      await clearTransactionFailureBestEffort(objects, mode, transaction.transaction_id);
+      await clearFailureBestEffort(
+        objects,
+        transactionFailurePath(mode, transaction.transaction_id),
+        "transaction",
+        transaction.transaction_id
+      );
       summary.processed += 1;
     } catch (error) {
       summary.failed += 1;
@@ -207,12 +225,30 @@ export async function processArtifactInbox(
       } catch (error) {
         summary.failed += 1;
         console.error("Project OS artifact processing failed", artifact.request_id, error);
+        try {
+          const diagnostic = await recordArtifactFailure(objects, mode, artifact, error);
+          if (diagnostic.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
+            await archiveSource(objects, sourcePath, artifactQuarantinePath(mode, artifact.request_id));
+          }
+        } catch (diagnosticError) {
+          console.error("Project OS artifact failure diagnostic could not be persisted", {
+            request_id: artifact.request_id,
+            project_id: artifact.project_id,
+            message: diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError)
+          });
+        }
         continue;
       }
 
       const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
       const terminalPath = terminalArtifactRequestPath(mode, statusFolder, artifact.request_id);
       await archiveSource(objects, sourcePath, terminalPath);
+      await clearFailureBestEffort(
+        objects,
+        artifactFailurePath(mode, artifact.request_id),
+        "artifact",
+        artifact.request_id
+      );
       summary.processed += 1;
     } catch (error) {
       summary.failed += 1;
@@ -293,6 +329,12 @@ function transactionFailurePath(mode: LayoutMode, transactionId: string): string
     : `${PROJECT_OS_ROOT}/TRANSACTIONS/failures/${transactionId}.json`;
 }
 
+function transactionQuarantinePath(mode: LayoutMode, transactionId: string): string {
+  return mode === "v2"
+    ? `${PROJECT_OS_ROOT}/.project-os/transactions/quarantine/${transactionId}.json`
+    : `${PROJECT_OS_ROOT}/TRANSACTIONS/quarantine/${transactionId}.json`;
+}
+
 function terminalArtifactRequestPath(
   mode: LayoutMode,
   status: "committed" | "rejected" | "conflicts",
@@ -301,6 +343,18 @@ function terminalArtifactRequestPath(
   return mode === "v2"
     ? machineArtifactRequestPath(status, requestId)
     : `${PROJECT_OS_ROOT}/ARTIFACTS/${status}/${requestId}.json`;
+}
+
+function artifactFailurePath(mode: LayoutMode, requestId: string): string {
+  return mode === "v2"
+    ? `${PROJECT_OS_ROOT}/.project-os/artifacts/failures/${requestId}.json`
+    : `${PROJECT_OS_ROOT}/ARTIFACTS/failures/${requestId}.json`;
+}
+
+function artifactQuarantinePath(mode: LayoutMode, requestId: string): string {
+  return mode === "v2"
+    ? `${PROJECT_OS_ROOT}/.project-os/artifacts/quarantine/${requestId}.json`
+    : `${PROJECT_OS_ROOT}/ARTIFACTS/quarantine/${requestId}.json`;
 }
 
 function transactionIdFromFilename(filename: string): string | null {
@@ -325,21 +379,17 @@ async function recordTransactionFailure(
   mode: LayoutMode,
   transaction: Transaction,
   error: unknown
-): Promise<void> {
+): Promise<TransactionFailureDiagnostic> {
   const path = transactionFailurePath(mode, transaction.transaction_id);
-  const now = new Date().toISOString();
   const previous = await readTransactionFailure(objects, path, transaction);
+  const common = retryableFailure(previous, error);
   const diagnostic: TransactionFailureDiagnostic = {
-    schema_version: "1.0",
+    ...common,
     transaction_id: transaction.transaction_id,
-    project_id: transaction.project_id,
-    status: "retryable_failure",
-    attempt_count: (previous?.attempt_count ?? 0) + 1,
-    first_failed_at: previous?.first_failed_at ?? now,
-    last_failed_at: now,
-    message: error instanceof Error ? error.message : String(error)
+    project_id: transaction.project_id
   };
   await objects.upsertText(path, `${JSON.stringify(diagnostic, null, 2)}\n`);
+  return diagnostic;
 }
 
 async function readTransactionFailure(
@@ -352,33 +402,90 @@ async function readTransactionFailure(
   try {
     const parsed = JSON.parse(raw) as Partial<TransactionFailureDiagnostic>;
     if (
-      parsed.schema_version !== "1.0"
+      !validRetryableFailure(parsed)
       || parsed.transaction_id !== transaction.transaction_id
       || parsed.project_id !== transaction.project_id
-      || parsed.status !== "retryable_failure"
-      || !Number.isSafeInteger(parsed.attempt_count)
-      || (parsed.attempt_count ?? 0) < 1
-      || typeof parsed.first_failed_at !== "string"
-    ) {
-      return null;
-    }
+    ) return null;
     return parsed as TransactionFailureDiagnostic;
   } catch {
     return null;
   }
 }
 
-async function clearTransactionFailureBestEffort(
+async function recordArtifactFailure(
   objects: ObjectPersistence,
   mode: LayoutMode,
-  transactionId: string
+  artifact: ArtifactWriteRequest,
+  error: unknown
+): Promise<ArtifactFailureDiagnostic> {
+  const path = artifactFailurePath(mode, artifact.request_id);
+  const previous = await readArtifactFailure(objects, path, artifact);
+  const common = retryableFailure(previous, error);
+  const diagnostic: ArtifactFailureDiagnostic = {
+    ...common,
+    request_id: artifact.request_id,
+    project_id: artifact.project_id
+  };
+  await objects.upsertText(path, `${JSON.stringify(diagnostic, null, 2)}\n`);
+  return diagnostic;
+}
+
+async function readArtifactFailure(
+  objects: ObjectPersistence,
+  path: string,
+  artifact: ArtifactWriteRequest
+): Promise<ArtifactFailureDiagnostic | null> {
+  const raw = await objects.readText(path);
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<ArtifactFailureDiagnostic>;
+    if (
+      !validRetryableFailure(parsed)
+      || parsed.request_id !== artifact.request_id
+      || parsed.project_id !== artifact.project_id
+    ) return null;
+    return parsed as ArtifactFailureDiagnostic;
+  } catch {
+    return null;
+  }
+}
+
+function retryableFailure(
+  previous: RetryableFailureDiagnostic | null,
+  error: unknown
+): RetryableFailureDiagnostic {
+  const now = new Date().toISOString();
+  return {
+    schema_version: "1.0",
+    status: "retryable_failure",
+    attempt_count: (previous?.attempt_count ?? 0) + 1,
+    first_failed_at: previous?.first_failed_at ?? now,
+    last_failed_at: now,
+    message: error instanceof Error ? error.message : String(error)
+  };
+}
+
+function validRetryableFailure(parsed: Partial<RetryableFailureDiagnostic>): boolean {
+  return parsed.schema_version === "1.0"
+    && parsed.status === "retryable_failure"
+    && Number.isSafeInteger(parsed.attempt_count)
+    && (parsed.attempt_count ?? 0) >= 1
+    && typeof parsed.first_failed_at === "string"
+    && typeof parsed.last_failed_at === "string"
+    && typeof parsed.message === "string";
+}
+
+async function clearFailureBestEffort(
+  objects: ObjectPersistence,
+  path: string,
+  kind: "transaction" | "artifact",
+  id: string
 ): Promise<void> {
-  const path = transactionFailurePath(mode, transactionId);
   try {
     if (await objects.readText(path) !== null) await objects.delete(path);
   } catch (error) {
-    console.error("Project OS transaction failure diagnostic cleanup failed", {
-      transaction_id: transactionId,
+    console.error(`Project OS ${kind} failure diagnostic cleanup failed`, {
+      id,
       message: error instanceof Error ? error.message : String(error)
     });
   }

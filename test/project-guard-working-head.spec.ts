@@ -21,7 +21,7 @@ async function createProject(transactionId: string, slug: string): Promise<Recei
       operation: "project.create",
       created_at: at,
       payload: {
-        name: "Working Head Integration",
+        name: `Working Head Integration ${slug}`,
         slug,
         aliases: [],
         objective: "Prove one active working head"

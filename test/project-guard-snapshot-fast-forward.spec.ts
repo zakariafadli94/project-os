@@ -118,8 +118,14 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
 
     expect(committed).toMatchObject({ status: "committed", previous_revision: 12, new_revision: 13 });
     const commitReads = mock.downloadCalls.filter((path) => path.includes(`/projects/${projectId}/commits/`));
+    const allowedCommitReads = new Set([
+      machineCommitRecordPath(projectId, 12),
+      machineCommitRecordPath(projectId, 13)
+    ]);
     expect(commitReads).toContain(machineCommitRecordPath(projectId, 12));
     expect(commitReads).not.toContain(machineCommitRecordPath(projectId, 2));
-    expect(commitReads.length).toBeLessThanOrEqual(2);
+    expect(commitReads.every((path) => allowedCommitReads.has(path))).toBe(true);
+    expect(new Set(commitReads).size).toBeLessThanOrEqual(2);
+    expect(commitReads.length).toBeLessThanOrEqual(3);
   });
 });

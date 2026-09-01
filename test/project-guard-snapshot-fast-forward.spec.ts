@@ -31,7 +31,10 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("fast-forwards a stale local cache from the verified machine snapshot instead of replaying every commit", async () => {
-    const projectId = "PRJ-1799";
+    // PRJ-0005 is intentionally part of the configured core-v2 floor in the
+    // test environment. The scenario exercises V2 snapshot recovery and must
+    // not weaken the fail-closed writer-stage regression guard.
+    const projectId = "PRJ-0005";
     const mock = installDropboxMock();
     const stub = testEnv.PROJECT_GUARD.getByName(projectId);
 

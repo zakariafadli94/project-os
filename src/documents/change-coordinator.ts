@@ -331,6 +331,10 @@ function accumulateReconcile(target: ManagedDocumentChangeSummary, source: Manag
   target.duplicate_cleaned += source.duplicate_cleaned;
   target.withdrawn += source.withdrawn;
   target.intake_resumed += source.intake_resumed;
+  target.changed_document_ids = [...new Set([
+    ...target.changed_document_ids,
+    ...source.changed_document_ids
+  ])].sort();
 }
 
 function isProjectedDeliverableMetadata(state: ProjectState, relativePath: string): boolean {
@@ -351,6 +355,7 @@ function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): Man
     duplicate_cleaned: 0,
     withdrawn: 0,
     intake_resumed: 0,
+    changed_document_ids: [],
     candidates: 0,
     mutation_gate_mode: mode,
     policy_violations: 0,

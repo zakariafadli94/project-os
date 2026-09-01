@@ -143,13 +143,13 @@ describe("MutationGateClassifier", () => {
       .resolves.toEqual({ kind: "external_candidate" });
   });
 
-  it("leaves collaborative zones outside strict final-zone classification", async () => {
+  it("classifies an unknown WORKING file as an external candidate", async () => {
     const transport = new FakeClassifierDropbox();
     const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/WORKING/strategy/draft.md";
     const metadata = await transport.seed(path, "# draft");
 
     await expect(new MutationGateClassifier(persistenceFromDropbox(transport)).classify(state(), path, metadata))
-      .resolves.toEqual({ kind: "not_final_zone" });
+      .resolves.toEqual({ kind: "external_candidate" });
   });
 
   it("classifies an unknown DELIVERABLE as an external candidate", async () => {

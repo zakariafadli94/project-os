@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -121,6 +121,21 @@ async function drainProjectSearch(guard: DurableObjectStub, alarms: number): Pro
   for (let index = 0; index < alarms; index += 1) {
     expect(await runDurableObjectAlarm(guard)).toBe(true);
   }
+}
+
+async function generationRecordCount(
+  searchGuard: DurableObjectStub,
+  projectId: string,
+  generation: number
+): Promise<number> {
+  return runInDurableObject(searchGuard, async (_instance, state) => state.storage.sql.exec<{
+    [key: string]: SqlStorageValue;
+    count: number;
+  }>(
+    `SELECT COUNT(*) AS count FROM search_records WHERE project_id = ? AND generation = ?`,
+    projectId,
+    generation
+  ).one().count);
 }
 
 describe("SearchIndex generation-safe rebuild", () => {
@@ -276,5 +291,186 @@ describe("SearchIndex generation-safe rebuild", () => {
     expect(await indexStatus.json()).toMatchObject({ active_generation: 2, document_generation_indexed: 5 });
     expect((await search(projectId, "fresh-alpha-rebuild")).hits.length).toBeGreaterThan(0);
     expect((await search(projectId, "fresh-beta-rebuild")).hits.length).toBeGreaterThan(0);
+  });
+
+  it("processes at most 32 rebuild documents per alarm", async () => {
+    const projectId = "PRJ-7162";
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const searchGuard = testEnv.SEARCH_INDEX_GUARD.getByName("global");
+    await createProject(projectId, "search-rebuild-bounded");
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+
+    for (let index = 0; index < 33; index += 1) {
+      await writeWorking(
+        guard,
+        projectId,
+        `DOCREQ-SEARCH-REBUILD-7162-${index.toString().padStart(2, "0")}`,
+        `bounded/doc-${index.toString().padStart(2, "0")}.md`,
+        `# Bounded ${index}\n\nbounded-rebuild-${index}`
+      );
+    }
+
+    const started = await startRebuild(projectId);
+    expect(started.status).toBe(202);
+    expect(await started.json<RebuildStatus>()).toMatchObject({
+      active_generation: 1,
+      staging_generation: 2,
+      pending_items: 33,
+      completed_items: 0
+    });
+
+    expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
+    expect(await rebuildStatus(projectId)).toMatchObject({
+      active_generation: 1,
+      staging_generation: 2,
+      phase: "indexing",
+      pending_items: 1,
+      completed_items: 32
+    });
+
+    expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
+    const status = await searchGuard.fetch(`https://search-index.internal/status?project_id=${projectId}`);
+    expect(await status.json()).toMatchObject({ active_generation: 2, document_generation_indexed: 33 });
+  });
+
+  it("fails closed when source watermarks move before promotion", async () => {
+    const projectId = "PRJ-7163";
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const searchGuard = testEnv.SEARCH_INDEX_GUARD.getByName("global");
+    await createProject(projectId, "search-rebuild-source-drift");
+
+    const oldContent = "# Drift\n\nold-drift-generation";
+    const first = await writeWorking(
+      guard,
+      projectId,
+      "DOCREQ-SEARCH-REBUILD-7163-A",
+      "drift/proof.md",
+      oldContent
+    );
+    await drainProjectSearch(guard, 3);
+
+    const targetContent = "# Drift\n\ntarget-drift-generation";
+    const target = await writeWorking(
+      guard,
+      projectId,
+      "DOCREQ-SEARCH-REBUILD-7163-B",
+      "drift/proof.md",
+      targetContent,
+      first.version_id
+    );
+    expect((await startRebuild(projectId)).status).toBe(202);
+
+    await writeWorking(
+      guard,
+      projectId,
+      "DOCREQ-SEARCH-REBUILD-7163-C",
+      "drift/proof.md",
+      "# Drift\n\nnewer-source-after-rebuild-start",
+      target.version_id
+    );
+
+    expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
+    expect(await rebuildStatus(projectId)).toMatchObject({
+      active_generation: 1,
+      staging_generation: 2,
+      phase: "failed",
+      last_error: "SOURCE_CHANGED_DURING_REBUILD"
+    });
+    expect((await search(projectId, "old-drift-generation")).hits.length).toBeGreaterThan(0);
+    expect((await search(projectId, "target-drift-generation")).hits).toEqual([]);
+  });
+
+  it("rebuilds directly from authority after complete SearchIndex project loss", async () => {
+    const projectId = "PRJ-7164";
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const searchGuard = testEnv.SEARCH_INDEX_GUARD.getByName("global");
+    await createProject(projectId, "search-rebuild-total-loss");
+    const document = await writeWorking(
+      guard,
+      projectId,
+      "DOCREQ-SEARCH-REBUILD-7164-A",
+      "loss/proof.md",
+      "# Loss recovery\n\ndirect-rebuild-authority-proof"
+    );
+    await drainProjectSearch(guard, 3);
+    expect((await search(projectId, "direct-rebuild-authority-proof")).hits.some((hit) => hit.document_id === document.document_id)).toBe(true);
+
+    await runInDurableObject(searchGuard, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM search_fts WHERE project_id = ?", projectId);
+      state.storage.sql.exec("DELETE FROM search_records WHERE project_id = ?", projectId);
+      state.storage.sql.exec("DELETE FROM search_project_heads WHERE project_id = ?", projectId);
+    });
+    expect((await search(projectId, "direct-rebuild-authority-proof")).hits).toEqual([]);
+
+    const started = await startRebuild(projectId);
+    expect(started.status).toBe(202);
+    expect(await started.json<RebuildStatus>()).toMatchObject({
+      active_generation: null,
+      staging_generation: 1,
+      phase: "indexing",
+      pending_items: 1
+    });
+    expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
+
+    const status = await searchGuard.fetch(`https://search-index.internal/status?project_id=${projectId}`);
+    expect(await status.json()).toMatchObject({ active_generation: 1, rebuild_state: "ready" });
+    expect((await search(projectId, "direct-rebuild-authority-proof")).hits.some((hit) => hit.document_id === document.document_id)).toBe(true);
+  });
+
+  it("cleans old generations only after promotion and in bounded alarm batches", async () => {
+    const projectId = "PRJ-7165";
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const searchGuard = testEnv.SEARCH_INDEX_GUARD.getByName("global");
+    await createProject(projectId, "search-rebuild-cleanup");
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+
+    await runInDurableObject(searchGuard, async (_instance, state) => {
+      for (let index = 0; index < 40; index += 1) {
+        const recordId = `seed:cleanup:${index.toString().padStart(2, "0")}`;
+        state.storage.sql.exec(
+          `INSERT INTO search_records (
+             project_id, generation, record_id, record_kind, entity_type, entity_id, title,
+             content_hash, canonical_revision, body_text, authority_ref_json
+           ) VALUES (?, 1, ?, 'canonical_entity', 'task', ?, ?, ?, 1, ?, ?)`,
+          projectId,
+          recordId,
+          `TASK-CLEANUP-${index.toString().padStart(2, "0")}`,
+          `Cleanup ${index}`,
+          `hash-${index}`,
+          `cleanup-body-${index}`,
+          JSON.stringify({
+            kind: "canonical_entity",
+            project_id: projectId,
+            entity_type: "task",
+            entity_id: `TASK-CLEANUP-${index.toString().padStart(2, "0")}`,
+            canonical_revision: 1
+          })
+        );
+        state.storage.sql.exec(
+          `INSERT INTO search_fts (project_id, generation, record_id, title, body_text)
+           VALUES (?, 1, ?, ?, ?)`,
+          projectId,
+          recordId,
+          `Cleanup ${index}`,
+          `cleanup-body-${index}`
+        );
+      }
+    });
+    const oldCount = await generationRecordCount(searchGuard, projectId, 1);
+    expect(oldCount).toBeGreaterThan(32);
+
+    expect((await startRebuild(projectId)).status).toBe(202);
+    expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
+    const promoted = await searchGuard.fetch(`https://search-index.internal/status?project_id=${projectId}`);
+    expect(await promoted.json()).toMatchObject({ active_generation: 2, rebuild_state: "ready" });
+    expect(await generationRecordCount(searchGuard, projectId, 1)).toBe(oldCount);
+
+    expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
+    const afterFirstCleanup = await generationRecordCount(searchGuard, projectId, 1);
+    expect(afterFirstCleanup).toBeGreaterThan(0);
+    expect(afterFirstCleanup).toBeLessThan(oldCount);
+
+    expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
+    expect(await generationRecordCount(searchGuard, projectId, 1)).toBe(0);
   });
 });

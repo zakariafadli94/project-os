@@ -271,14 +271,14 @@ describe("ProjectGuard search synchronization", () => {
 
     const afterResponse = await projectStub.fetch("https://project-guard.internal/search-sync-status");
     expect(afterResponse.status).toBe(200);
-    expect(await afterResponse.json()).toMatchObject({
+    const after = await afterResponse.json<SearchSyncStatus & { project_id: string; canonical_revision: number }>();
+    expect(after).toMatchObject({
       project_id: projectId,
       canonical_revision: 1,
       canonical_revision_requested: 1,
       canonical_revision_indexed: 0
     });
-    const after = await afterResponse.clone().json().catch(() => null);
-    void after;
+    expect(after.last_error).toMatch(/CANONICAL_SNAPSHOT_HASH_MISMATCH/);
 
     const materialization = await projectStub.fetch("https://project-guard.internal/materialization-status");
     expect(materialization.status).toBe(200);

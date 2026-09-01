@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import { sha256Text } from "../src/documents/hash";
@@ -79,8 +79,16 @@ async function supersede(
   });
 }
 
+async function deleteExternal(path: string): Promise<void> {
+  const response = await fetch("https://api.dropboxapi.com/2/files/delete_v2", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path })
+  });
+  expect(response.ok).toBe(true);
+}
+
 describe("ProjectGuard one active working head", () => {
-  beforeEach(() => installDropboxMock());
   afterEach(() => vi.restoreAllMocks());
 
   it("supersedes across paths, archives the old head and replays idempotently", async () => {
@@ -179,7 +187,7 @@ describe("ProjectGuard one active working head", () => {
     expect(capture.status).toBe(200);
     expect(await capture.json()).toMatchObject({ captured: 1, conflicts: 0 });
 
-    await mock.deleteExternal(visible);
+    await deleteExternal(visible);
     const restore = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
     expect(restore.status).toBe(200);
     expect(await restore.json()).toMatchObject({ restored: 1, conflicts: 0 });

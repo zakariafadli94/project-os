@@ -20,7 +20,8 @@
     "bindings": [
       { "name": "PROJECT_GUARD", "class_name": "ProjectGuard" },
       { "name": "REGISTRY_GUARD", "class_name": "RegistryGuard" },
-      { "name": "DROPBOX_CHANGE_GUARD", "class_name": "DropboxChangeGuard" }
+      { "name": "DROPBOX_CHANGE_GUARD", "class_name": "DropboxChangeGuard" },
+      { "name": "SEARCH_INDEX_GUARD", "class_name": "SearchIndexGuard" }
     ]
   },
   "exports": {
@@ -35,6 +36,11 @@
       "storage": "sqlite"
     },
     "DropboxChangeGuard": {
+      "type": "durable-object",
+      "state": "created",
+      "storage": "sqlite"
+    },
+    "SearchIndexGuard": {
       "type": "durable-object",
       "state": "created",
       "storage": "sqlite"

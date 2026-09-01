@@ -92,6 +92,7 @@ interface RawDropboxMetadata {
 
 export class DropboxClient implements DropboxTransport {
   private cachedToken: { value: string; expiresAt: number } | null = null;
+  private requestIndex = 0;
 
   constructor(private readonly credentials: DropboxCredentials) {}
 
@@ -104,7 +105,7 @@ export class DropboxClient implements DropboxTransport {
       refresh_token: this.credentials.refreshToken
     });
     const basic = btoa(`${this.credentials.appKey}:${this.credentials.appSecret}`);
-    const response = await fetch("https://api.dropboxapi.com/oauth2/token", {
+    const response = await this.runtimeFetch("oauth2/token", "https://api.dropboxapi.com/oauth2/token", {
       method: "POST",
       headers: {
         Authorization: `Basic ${basic}`,
@@ -159,14 +160,15 @@ export class DropboxClient implements DropboxTransport {
   }
 
   async download(path: string): Promise<string | null> {
+    this.requestIndex = 0;
     const token = await this.accessToken();
-    const response = await fetch("https://content.dropboxapi.com/2/files/download", {
+    const response = await this.runtimeFetch("files/download", "https://content.dropboxapi.com/2/files/download", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Dropbox-API-Arg": JSON.stringify({ path })
       }
-    });
+    }, path);
     if (response.ok) return response.text();
     const text = await response.text();
     if (response.status === 409 && text.includes("not_found")) return null;
@@ -476,6 +478,22 @@ export class DropboxClient implements DropboxTransport {
       );
     }
     throw this.errorFromResponse(`Dropbox create_folder failed for ${path}`, response, text);
+  }
+
+  private async runtimeFetch(
+    endpoint: string,
+    input: RequestInfo | URL,
+    init?: RequestInit,
+    path?: string
+  ): Promise<Response> {
+    const requestIndex = ++this.requestIndex;
+    try {
+      return await fetch(input, init);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const pathContext = path ? ` for ${path}` : "";
+      throw new Error(`Dropbox HTTP ${endpoint} request #${requestIndex}${pathContext} failed: ${message}`);
+    }
   }
 
   private errorFromResponse(message: string, response: Response, responseBody: string): DropboxApiError {

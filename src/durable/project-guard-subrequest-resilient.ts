@@ -268,7 +268,11 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
   }
 }
 
-async function inspectWorkingHeadRequest(request: Request): Promise<
+interface JsonReadableRequest {
+  json(): Promise<unknown>;
+}
+
+async function inspectWorkingHeadRequest(request: JsonReadableRequest): Promise<
   | { kind: "other" }
   | { kind: "invalid"; message: string }
   | { kind: "working_head"; request: WorkingHeadRequest }

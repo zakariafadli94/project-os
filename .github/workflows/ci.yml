@@ -23,6 +23,8 @@ jobs:
             exit 1
           fi
       - run: npm install
+      - name: Diagnostic — IMP-INDEX001 search index store
+        run: npx vitest run test/search-index-store.spec.ts --reporter=verbose
       - run: npm run check
       - run: npm run test:persistence-high-risk
       - run: npx wrangler deploy --dry-run

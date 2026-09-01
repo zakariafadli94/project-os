@@ -1,5 +1,14 @@
 import type { ProjectState } from "../domain/project-state";
+import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
+import {
+  isWorkingHeadOperation,
+  parseWorkingHeadRequest,
+  type WorkingHeadRequest
+} from "../domain/working-head-request";
+import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
+import { ManagedDocumentConflictError, type ManagedDocumentReceipt } from "../documents/service";
+import { ManagedWorkingHeadService } from "../documents/working-head-service";
 import type { Env } from "../env";
 import { ProjectRepository } from "../persistence/repository";
 import { MutationGateProjectGuard } from "./project-guard-mutation-gate";
@@ -8,6 +17,17 @@ interface StateRow {
   [key: string]: SqlStorageValue;
   state_json: string;
 }
+
+interface WorkingHeadTerminalReceipt {
+  request_id: string;
+  project_id: string;
+  status: "rejected" | "conflict";
+  code: string;
+  message: string;
+  document_id?: string;
+}
+
+type WorkingHeadOperationReceipt = ManagedDocumentReceipt | WorkingHeadTerminalReceipt;
 
 const FAST_FORWARD_PATHS = new Set([
   "/transaction",
@@ -32,18 +52,43 @@ const FAST_FORWARD_PATHS = new Set([
  * revision is backed by the immutable commit record for that revision. If that
  * proof is unavailable, the base guard's conservative sequential recovery path
  * remains authoritative.
+ *
+ * This layer also owns path-changing WORKING-head transitions. They are kept
+ * outside the legacy managed-document parser so old clients remain compatible,
+ * while new clients must explicitly choose supersede or fork semantics.
  */
 export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
   private readonly recoveryRepository: ProjectRepository;
+  private readonly workingHeads: ManagedWorkingHeadService;
+  private readonly workingHeadRequests: ManagedDocumentRequestLedger;
   private recoveryQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.recoveryRepository = new ProjectRepository(this.persistence, this.layoutMode);
+    this.workingHeads = new ManagedWorkingHeadService(this.persistence);
+    this.workingHeadRequests = new ManagedDocumentRequestLedger(this.persistence.objects);
   }
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/document") {
+      const inspected = await inspectWorkingHeadRequest(request.clone());
+      if (inspected.kind === "invalid") {
+        return Response.json({
+          error: "invalid_document_request",
+          message: inspected.message
+        }, { status: 400 });
+      }
+      if (inspected.kind === "working_head") {
+        return this.serializeRecovery(async () => {
+          await this.fastForwardFromVerifiedMachineSnapshot();
+          return this.handleWorkingHead(inspected.request);
+        });
+      }
+    }
+
     if (request.method === "POST" && FAST_FORWARD_PATHS.has(url.pathname)) {
       return this.serializeRecovery(async () => {
         await this.fastForwardFromVerifiedMachineSnapshot();
@@ -51,6 +96,85 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       });
     }
     return super.fetch(request);
+  }
+
+  private async handleWorkingHead(operation: WorkingHeadRequest): Promise<Response> {
+    if (this.ctx.id.name && this.ctx.id.name !== operation.project_id) {
+      return Response.json(workingHeadTerminalReceipt(
+        operation,
+        "rejected",
+        "PROJECT_BINDING_MISMATCH",
+        "Durable Object binding does not match managed document project_id"
+      ));
+    }
+
+    let state = this.localState();
+    if (!state) {
+      await super.fetch(new Request("https://project-guard.internal/materialization-status", { method: "GET" }));
+      state = this.localState();
+    }
+    if (!state) {
+      return Response.json(workingHeadTerminalReceipt(
+        operation,
+        "rejected",
+        "PROJECT_NOT_INITIALIZED",
+        "Project state is not initialized"
+      ));
+    }
+
+    const serialized = JSON.stringify(operation);
+    try {
+      await this.workingHeadRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
+    } catch (error) {
+      if (error instanceof ManagedDocumentRequestIntentConflictError) {
+        return Response.json(workingHeadTerminalReceipt(
+          operation,
+          "rejected",
+          "IDEMPOTENCY_PAYLOAD_MISMATCH",
+          "The same request_id was reused with a different managed-document payload"
+        ));
+      }
+      throw error;
+    }
+
+    const durableReceipt = await this.workingHeadRequests.readReceipt(operation.project_id, operation.request_id);
+    if (durableReceipt) {
+      return Response.json(JSON.parse(durableReceipt.receipt_json) as WorkingHeadOperationReceipt);
+    }
+
+    let receipt: WorkingHeadOperationReceipt;
+    try {
+      receipt = operation.operation === "working.supersede"
+        ? await this.workingHeads.supersedeWorking(operation, state)
+        : await this.workingHeads.forkWorking(operation, state);
+    } catch (error) {
+      if (error instanceof ManagedDocumentConflictError) {
+        receipt = workingHeadTerminalReceipt(
+          operation,
+          "conflict",
+          error.code,
+          error.message,
+          error.documentId
+        );
+      } else if (error instanceof Error && error.message.startsWith("Managed document content SHA-256 mismatch:")) {
+        receipt = workingHeadTerminalReceipt(
+          operation,
+          "rejected",
+          "CONTENT_HASH_MISMATCH",
+          error.message
+        );
+      } else {
+        throw error;
+      }
+    }
+
+    await this.workingHeadRequests.writeReceipt(
+      operation.project_id,
+      operation.request_id,
+      serialized,
+      JSON.stringify(receipt)
+    );
+    return Response.json(receipt);
   }
 
   private async fastForwardFromVerifiedMachineSnapshot(): Promise<void> {
@@ -101,6 +225,18 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
     }
   }
 
+  private localState(): ProjectState | null {
+    const row = this.ctx.storage.sql.exec<StateRow>(
+      "SELECT state_json FROM project_state WHERE singleton = 1"
+    ).toArray()[0];
+    if (!row) return null;
+    try {
+      return normalizeProjectState(JSON.parse(row.state_json));
+    } catch {
+      return null;
+    }
+  }
+
   private persistVerifiedSnapshot(state: ProjectState, receipt: Receipt | null): void {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
@@ -130,4 +266,43 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       release();
     }
   }
+}
+
+async function inspectWorkingHeadRequest(request: Request): Promise<
+  | { kind: "other" }
+  | { kind: "invalid"; message: string }
+  | { kind: "working_head"; request: WorkingHeadRequest }
+> {
+  let raw: unknown;
+  try {
+    raw = await request.json();
+  } catch {
+    return { kind: "other" };
+  }
+  if (!isWorkingHeadOperation(raw)) return { kind: "other" };
+  try {
+    return { kind: "working_head", request: parseWorkingHeadRequest(raw) };
+  } catch (error) {
+    return {
+      kind: "invalid",
+      message: error instanceof Error ? error.message : "Invalid working-head request"
+    };
+  }
+}
+
+function workingHeadTerminalReceipt(
+  operation: WorkingHeadRequest,
+  status: "rejected" | "conflict",
+  code: string,
+  message: string,
+  documentId?: string
+): WorkingHeadTerminalReceipt {
+  return {
+    request_id: operation.request_id,
+    project_id: operation.project_id,
+    status,
+    code,
+    message,
+    ...(documentId ? { document_id: documentId } : {})
+  };
 }

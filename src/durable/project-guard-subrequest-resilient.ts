@@ -55,6 +55,10 @@ const FAST_FORWARD_PATHS = new Set([
  * proof is unavailable, the base guard's conservative sequential recovery path
  * remains authoritative.
  *
+ * The recovery queue also serializes materialization alarms so provider I/O
+ * cannot overlap the snapshot proof/fast-forward phase before the parent
+ * MutationGate queue is entered.
+ *
  * This layer also owns path-changing WORKING-head transitions. They are kept
  * outside the legacy managed-document parser so old clients remain compatible,
  * while new clients must explicitly choose supersede or fork semantics.
@@ -102,6 +106,10 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       });
     }
     return super.fetch(request);
+  }
+
+  override async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
+    return this.serializeRecovery(() => super.alarm(alarmInfo));
   }
 
   private async handleWorkingHead(operation: WorkingHeadRequest): Promise<Response> {

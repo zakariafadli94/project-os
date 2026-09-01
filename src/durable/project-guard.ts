@@ -157,8 +157,11 @@ export class ProjectGuard extends NeutralProjectGuard {
           this.searchSyncStore.requestCanonical(body.new_revision as number);
         }
       } else if (pathname === "/document") {
-        if (body.status === "committed" && isDocumentId(body.document_id)) {
-          this.searchSyncStore.requestDocuments([body.document_id]);
+        if (body.status === "committed" && isDocumentId(body.document_id) && isSourceRequestId(body.request_id)) {
+          this.searchSyncStore.requestDocumentsOnce(
+            `document:${body.request_id}`,
+            [body.document_id]
+          );
         }
       } else if (pathname === "/reconcile-documents") {
         const changed = Array.isArray(body.changed_document_ids)
@@ -166,7 +169,9 @@ export class ProjectGuard extends NeutralProjectGuard {
           : [];
         if (changed.length > 0) this.searchSyncStore.requestDocuments(changed);
       } else if (pathname === "/artifact") {
-        if (body.status === "committed") this.searchSyncStore.requestFullDocumentSnapshot();
+        if (body.status === "committed" && isSourceRequestId(body.request_id)) {
+          this.searchSyncStore.requestFullDocumentSnapshotOnce(`artifact:${body.request_id}`);
+        }
       }
       await this.ensureSearchAlarm();
     } catch (error) {
@@ -298,4 +303,11 @@ export class ProjectGuard extends NeutralProjectGuard {
 
 function isDocumentId(value: unknown): value is string {
   return typeof value === "string" && /^DOC-[A-F0-9]{24}$/.test(value);
+}
+
+function isSourceRequestId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 1
+    && value.length <= 200
+    && !/[\u0000-\u001F\u007F]/.test(value);
 }

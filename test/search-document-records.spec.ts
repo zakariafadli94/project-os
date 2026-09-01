@@ -348,7 +348,7 @@ describe("managed document search projection", () => {
       reconciliation_status: "conflict",
       body_text: "# Vendor report\n\nGoverned reference"
     });
-    expect(await ledger.listHeadIds(projectId)).toEqual([binaryDocumentId, referenceDocumentId]);
+    expect(await ledger.listHeadIds(projectId)).toEqual([referenceDocumentId, binaryDocumentId]);
   });
 
   it("fails closed when immutable Project OS text no longer matches its declared SHA-256", async () => {

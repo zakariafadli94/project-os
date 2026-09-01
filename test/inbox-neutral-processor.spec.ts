@@ -101,3 +101,29 @@ it("preserves exact replay cleanup when committed terminal bytes already match",
   expect(objects.files.has(incoming)).toBe(false);
   expect(objects.files.get(committed)).toBe(raw);
 });
+
+it("persists a retryable diagnostic when transaction execution throws", async () => {
+  const objects = new FakeObjects();
+  const transaction = tx("TXN-INBOX-NEUTRAL-FAILURE-0001", 7, "2026-09-01T11:06:00+01:00");
+  const incoming = `/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`;
+  const failure = `/PROJECT_OS/.project-os/transactions/failures/${transaction.transaction_id}.json`;
+  objects.files.set(incoming, JSON.stringify(transaction));
+
+  const summary = await processTransactionInbox(objects, "v2", async () => {
+    throw new Error("ProjectGuard returned 500: canonical write failed");
+  });
+
+  expect(summary).toEqual({ scanned: 1, processed: 0, failed: 1 });
+  expect(objects.files.has(incoming)).toBe(true);
+  const diagnostic = JSON.parse(objects.files.get(failure) ?? "null") as Record<string, unknown>;
+  expect(diagnostic).toMatchObject({
+    schema_version: "1.0",
+    transaction_id: transaction.transaction_id,
+    project_id: transaction.project_id,
+    status: "retryable_failure",
+    attempt_count: 1,
+    message: "ProjectGuard returned 500: canonical write failed"
+  });
+  expect(typeof diagnostic.first_failed_at).toBe("string");
+  expect(typeof diagnostic.last_failed_at).toBe("string");
+});

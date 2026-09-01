@@ -35,6 +35,7 @@ const FAST_FORWARD_PATHS = new Set([
  */
 export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
   private readonly recoveryRepository: ProjectRepository;
+  private recoveryQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -44,7 +45,10 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "POST" && FAST_FORWARD_PATHS.has(url.pathname)) {
-      await this.fastForwardFromVerifiedMachineSnapshot();
+      return this.serializeRecovery(async () => {
+        await this.fastForwardFromVerifiedMachineSnapshot();
+        return super.fetch(request);
+      });
     }
     return super.fetch(request);
   }
@@ -113,5 +117,17 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
         );
       }
     });
+  }
+
+  private async serializeRecovery<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.recoveryQueue;
+    let release!: () => void;
+    this.recoveryQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 }

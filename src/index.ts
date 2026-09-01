@@ -6,6 +6,7 @@ import { parseLayoutMode } from "./persistence/layout";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
 export * from "./index-neutral";
+export { reconcileSearchIndexes } from "./search/fleet-reconciler";
 
 const worker = {
   ...neutralWorker,

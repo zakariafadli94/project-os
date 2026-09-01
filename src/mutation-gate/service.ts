@@ -156,34 +156,31 @@ export class MutationGateService {
       throw new Error("Candidate resolution capability does not match artifact destination");
     }
 
+    // A missing destination cannot contain an unresolved external mutation. Do
+    // not scan historical candidates: that makes every new write grow with the
+    // lifetime history of the project and can exhaust a Worker subrequest budget.
     const metadata = await this.runtime.objects.getMetadata(destinationPath);
-    if (metadata) {
-      const classification = await this.classifier.classify(state, destinationPath, metadata);
-      if (classification.kind === "external_candidate") {
-        await this.captureExternalCandidate(state, destinationPath, metadata, "incremental");
-      }
-    }
+    if (!metadata) return;
 
-    const unresolved = await this.listUnresolved(state.project_id, { destinationPath });
+    const classification = await this.classifier.classify(state, destinationPath, metadata);
+    if (classification.kind !== "external_candidate") return;
+
+    // The visible provider revision deterministically identifies the only
+    // candidate that can block this destination now. Historical candidates at
+    // the same path are irrelevant once their provider revision is no longer
+    // visible, so inspect only this current candidate.
+    const captured = await this.captureExternalCandidate(state, destinationPath, metadata, "incremental");
+    const candidateId = captured.record.candidate_id;
+
     if (resolutionContext) {
-      const authorized = unresolved.some((item) => item.candidate_id === resolutionContext.candidateId);
-      if (!authorized) {
-        throw new Error("Candidate resolution capability does not reference the unresolved destination candidate");
-      }
-      const remaining = unresolved.filter((item) => item.candidate_id !== resolutionContext.candidateId);
-      if (remaining.length === 0) return;
-      throw new UnresolvedExternalMutationCandidateError(
-        destinationPath,
-        remaining.map((item) => item.candidate_id)
-      );
+      if (resolutionContext.candidateId === candidateId) return;
+      throw new Error("Candidate resolution capability does not reference the unresolved destination candidate");
     }
 
-    if (unresolved.length > 0) {
-      throw new UnresolvedExternalMutationCandidateError(
-        destinationPath,
-        unresolved.map((item) => item.candidate_id)
-      );
-    }
+    const terminal = await this.repository.readTerminalResolutionRecord(state.project_id, candidateId);
+    if (terminal) return;
+
+    throw new UnresolvedExternalMutationCandidateError(destinationPath, [candidateId]);
   }
 
   async artifactStatus(projectId: string, requestId: string): Promise<MutationArtifactStatus | null> {

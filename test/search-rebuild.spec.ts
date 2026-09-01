@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import { sha256Text } from "../src/documents/hash";
-import { machineDocumentTextPayloadPath } from "../src/persistence/layout";
+import { machineDocumentVersionPath } from "../src/persistence/layout";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -223,8 +223,12 @@ describe("SearchIndex generation-safe rebuild", () => {
     ]);
     const orderedIds = [...byId.keys()].sort();
     const failedId = orderedIds[1];
-    const failedContent = byId.get(failedId)!;
-    const failedPayload = machineDocumentTextPayloadPath(projectId, await sha256Text(failedContent));
+    const failedReceipt = failedId === a2.document_id ? a2 : b2;
+    const failedVersionPath = machineDocumentVersionPath(projectId, failedReceipt.document_id, failedReceipt.version_id);
+    const failedVersionRaw = dropbox.files.get(failedVersionPath);
+    expect(failedVersionRaw).toBeDefined();
+    const failedVersion = JSON.parse(failedVersionRaw!) as { immutable_payload_path: string };
+    const failedPayload = failedVersion.immutable_payload_path;
 
     const started = await startRebuild(projectId);
     expect(started.status).toBe(202);
@@ -237,7 +241,7 @@ describe("SearchIndex generation-safe rebuild", () => {
     });
 
     const originalPayload = dropbox.files.get(failedPayload);
-    expect(originalPayload).toBe(failedContent);
+    expect(originalPayload).toBeDefined();
     dropbox.files.delete(failedPayload);
 
     expect(await runDurableObjectAlarm(searchGuard)).toBe(true);

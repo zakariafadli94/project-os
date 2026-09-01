@@ -63,6 +63,22 @@ async function search(body: unknown, authenticated = true): Promise<Response> {
   }), testEnv, createExecutionContext());
 }
 
+async function adminSearchRequest(
+  path: string,
+  method: "GET" | "POST",
+  body?: unknown,
+  authenticated = true
+): Promise<Response> {
+  const headers = authenticated
+    ? { ...authHeaders }
+    : { "content-type": "application/json" };
+  return worker.fetch(new Request(`https://project-os.test${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body)
+  }), testEnv, createExecutionContext());
+}
+
 describe("Project OS search worker API", () => {
   beforeEach(() => installDropboxMock());
   afterEach(() => vi.restoreAllMocks());
@@ -143,5 +159,83 @@ describe("Project OS search worker API", () => {
 
     const implicitAll = await search({ text: "portfolio-worker-needle" });
     expect(implicitAll.status).toBe(400);
+  });
+
+  it("requires auth and a unique non-empty scope for search rebuild administration", async () => {
+    const unauthorized = await adminSearchRequest(
+      "/v1/admin/search/rebuild",
+      "POST",
+      { project_ids: ["PRJ-0002"] },
+      false
+    );
+    expect(unauthorized.status).toBe(401);
+
+    const empty = await adminSearchRequest("/v1/admin/search/rebuild", "POST", { project_ids: [] });
+    expect(empty.status).toBe(400);
+    await expect(empty.json()).resolves.toMatchObject({ error: "invalid_request" });
+
+    const duplicate = await adminSearchRequest(
+      "/v1/admin/search/rebuild",
+      "POST",
+      { project_ids: ["PRJ-0002", "PRJ-0002"] }
+    );
+    expect(duplicate.status).toBe(400);
+  });
+
+  it("starts rebuilds only for registered projects and exposes source plus index status", async () => {
+    const projectId = await createProject(
+      "Worker Admin Search",
+      "worker-admin-search",
+      "worker admin search rebuild authority"
+    );
+    await drainSearch(projectId);
+
+    const missing = await adminSearchRequest(
+      "/v1/admin/search/rebuild",
+      "POST",
+      { project_ids: ["PRJ-9999"] }
+    );
+    expect(missing.status).toBe(404);
+    await expect(missing.json()).resolves.toEqual({ error: "project_not_found", project_id: "PRJ-9999" });
+
+    const rebuild = await adminSearchRequest(
+      "/v1/admin/search/rebuild",
+      "POST",
+      { project_ids: [projectId] }
+    );
+    expect(rebuild.status).toBe(202);
+    await expect(rebuild.json()).resolves.toMatchObject({
+      projects: [expect.objectContaining({ project_id: projectId })]
+    });
+
+    const unauthorizedStatus = await adminSearchRequest(
+      `/v1/admin/search/status?project_id=${encodeURIComponent(projectId)}`,
+      "GET",
+      undefined,
+      false
+    );
+    expect(unauthorizedStatus.status).toBe(401);
+
+    const status = await adminSearchRequest(
+      `/v1/admin/search/status?project_id=${encodeURIComponent(projectId)}`,
+      "GET"
+    );
+    expect(status.status).toBe(200);
+    await expect(status.json()).resolves.toMatchObject({
+      project_id: projectId,
+      source: {
+        project_id: projectId,
+        canonical_revision_requested: 1,
+        document_generation_requested: 1
+      },
+      index: {
+        project_id: projectId,
+        active_generation: 1
+      },
+      rebuild: {
+        project_id: projectId,
+        staging_generation: 2
+      }
+    });
   });
 });

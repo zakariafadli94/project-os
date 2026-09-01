@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
 import { sha256Text } from "../src/documents/hash";
 import { ManagedDocumentService } from "../src/documents/service";
+import { ManagedWorkingHeadService } from "../src/documents/working-head-service";
 import { workspaceManagedDocumentPath } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
@@ -94,11 +95,12 @@ const createdAt = "2026-09-01T15:05:00+01:00";
 describe("one active working head", () => {
   it("supersedes a working document onto a new path while preserving document identity and archiving the prior head", async () => {
     const { runtime, files } = runtimeHarness();
-    const service = new ManagedDocumentService(runtime);
+    const documents = new ManagedDocumentService(runtime);
+    const workingHeads = new ManagedWorkingHeadService(runtime);
     const v1LogicalPath = "strategy/commercial-v0.1.md";
     const v2LogicalPath = "strategy/commercial-v0.2.md";
     const v1Content = "# Commercial V0.1\n\nInitial";
-    const v1 = await service.writeWorking({
+    const v1 = await documents.writeWorking({
       request_id: "DOCREQ-WORKHEAD-WRITE-0001",
       project_id: "PRJ-0002",
       logical_path: v1LogicalPath,
@@ -108,7 +110,7 @@ describe("one active working head", () => {
     }, state());
 
     const v2Content = "# Commercial V0.2\n\nReplacement";
-    const v2 = await service.supersedeWorking({
+    const v2 = await workingHeads.supersedeWorking({
       request_id: "DOCREQ-WORKHEAD-SUPERSEDE-0001",
       project_id: "PRJ-0002",
       document_id: v1.document_id,
@@ -116,7 +118,8 @@ describe("one active working head", () => {
       new_logical_path: v2LogicalPath,
       content: v2Content,
       content_sha256: await sha256Text(v2Content),
-      created_at: createdAt
+      created_at: createdAt,
+      operation: "working.supersede"
     }, state());
 
     const oldVisible = workspaceManagedDocumentPath("PRJ-0002", "project-os", "working", v1LogicalPath);
@@ -130,7 +133,7 @@ describe("one active working head", () => {
     expect(files.get(newVisible)?.content).toContain(`document_id: ${v1.document_id}`);
     expect(files.get(newVisible)?.content).toContain("Commercial V0.2");
 
-    const head = await service.status("PRJ-0002", v1.document_id);
+    const head = await documents.status("PRJ-0002", v1.document_id);
     expect(head).toMatchObject({
       document_id: v1.document_id,
       logical_path: v2LogicalPath,
@@ -141,10 +144,11 @@ describe("one active working head", () => {
 
   it("creates an explicit parallel fork as a distinct document without archiving the source head", async () => {
     const { runtime, files } = runtimeHarness();
-    const service = new ManagedDocumentService(runtime);
+    const documents = new ManagedDocumentService(runtime);
+    const workingHeads = new ManagedWorkingHeadService(runtime);
     const sourceLogicalPath = "strategy/commercial.md";
     const sourceContent = "# Commercial\n\nBase";
-    const source = await service.writeWorking({
+    const source = await documents.writeWorking({
       request_id: "DOCREQ-WORKHEAD-WRITE-0002",
       project_id: "PRJ-0002",
       logical_path: sourceLogicalPath,
@@ -154,7 +158,7 @@ describe("one active working head", () => {
     }, state());
 
     const forkContent = "# Commercial Option B\n\nParallel";
-    const fork = await service.forkWorking({
+    const fork = await workingHeads.forkWorking({
       request_id: "DOCREQ-WORKHEAD-FORK-0001",
       project_id: "PRJ-0002",
       source_document_id: source.document_id,
@@ -162,12 +166,13 @@ describe("one active working head", () => {
       new_logical_path: "strategy/commercial-option-b.md",
       content: forkContent,
       content_sha256: await sha256Text(forkContent),
-      created_at: createdAt
+      created_at: createdAt,
+      operation: "working.fork"
     }, state());
 
     expect(fork.document_id).not.toBe(source.document_id);
     expect(files.has(workspaceManagedDocumentPath("PRJ-0002", "project-os", "working", sourceLogicalPath))).toBe(true);
     expect(files.has(workspaceManagedDocumentPath("PRJ-0002", "project-os", "working", "strategy/commercial-option-b.md"))).toBe(true);
-    expect((await service.status("PRJ-0002", source.document_id))?.working_version_id).toBe(source.version_id);
+    expect((await documents.status("PRJ-0002", source.document_id))?.working_version_id).toBe(source.version_id);
   });
 });

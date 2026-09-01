@@ -203,6 +203,13 @@ describe("Project OS search worker API", () => {
       "POST",
       { project_ids: [projectId] }
     );
+    if (rebuild.status !== 202) {
+      console.error("Search rebuild diagnostic", {
+        project_id: projectId,
+        status: rebuild.status,
+        body: await rebuild.clone().text()
+      });
+    }
     expect(rebuild.status).toBe(202);
     await expect(rebuild.json()).resolves.toMatchObject({
       projects: [expect.objectContaining({ project_id: projectId })]

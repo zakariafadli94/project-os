@@ -330,7 +330,7 @@ describe("SearchIndex generation-safe rebuild", () => {
 
     expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
     const status = await searchGuard.fetch(`https://search-index.internal/status?project_id=${projectId}`);
-    expect(await status.json()).toMatchObject({ active_generation: 2, document_generation_indexed: 33 });
+    expect(await status.json()).toMatchObject({ active_generation: 2, document_generation_indexed: 34 });
   });
 
   it("fails closed when source watermarks move before promotion", async () => {

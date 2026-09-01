@@ -1,3 +1,5 @@
+import type { ProjectState } from "../domain/project-state";
+import type { Receipt } from "../domain/receipt";
 import type { Env } from "../env";
 import { ProjectRepository } from "../persistence/repository";
 import { MutationGateProjectGuard } from "./project-guard-mutation-gate";
@@ -77,6 +79,8 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       throw new Error(`Verified machine snapshot binding mismatch for ${projectId} revision ${snapshot.revision}`);
     }
 
+    // Persist the immutable commit's state, not the mutable snapshot bytes. The
+    // snapshot is used only to discover a newer proven revision.
     this.persistVerifiedSnapshot(record.state, record.receipt);
   }
 
@@ -93,10 +97,7 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
     }
   }
 
-  private persistVerifiedSnapshot(
-    state: Awaited<ReturnType<ProjectRepository["readProjectState"]>> extends infer T ? Exclude<T, null> : never,
-    receipt: Awaited<ReturnType<ProjectRepository["readReceipt"]>>
-  ): void {
+  private persistVerifiedSnapshot(state: ProjectState, receipt: Receipt | null): void {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
         "INSERT INTO project_state (singleton, state_json) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",

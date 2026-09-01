@@ -4,7 +4,7 @@
 
 **Goal:** Add a fast, project-isolated, structured + lexical full-text Project OS read model that is asynchronously synchronized from canonical/Managed Document authority, exposes explicit freshness, and remains fully reconstructible from durable truth.
 
-**Architecture:** Add an installation-scoped SQLite-backed `SearchIndexGuard` Durable Object with FTS5 behind Project OS search contracts. ProjectGuard remains the per-project source coordination boundary and records durable search-sync work after canonical and governed-document changes. Canonical synchronization sends a complete structured project snapshot for the newest requested revision; Managed Document synchronization sends ordered document batches identified by stable `document_id`, with a full-document snapshot only for initialization/recovery. Search queries always carry explicit project scope, hit the active search generation only, and return authoritative Project OS references. Rebuilds stage a new per-project generation and promote it only after source watermarks remain unchanged and the staged generation passes validation.
+**Architecture:** Add an installation-scoped SQLite-backed `SearchIndexGuard` Durable Object with FTS5 behind Project OS search contracts. ProjectGuard remains the per-project source coordination boundary and records durable search-sync work after canonical and governed-document changes. Canonical synchronization sends a complete structured project snapshot for the newest requested revision; Managed Document synchronization sends ordered document batches identified by stable `document_id`, with a full-document snapshot only for initialization/recovery. Search queries always carry explicit project scope, hit the active search generation only, and return authoritative Project OS references. Rebuilds read authoritative state through the existing provider-neutral repositories, stage a new per-project generation, and promote it only after source watermarks remain unchanged and the staged generation passes validation.
 
 **Tech Stack:** TypeScript 5.9, Cloudflare Workers, SQLite-backed Durable Objects, SQLite FTS5, existing provider-neutral Project OS persistence runtime, Zod 4, Vitest 4 with `@cloudflare/vitest-pool-workers`, GitHub Actions.
 
@@ -63,7 +63,7 @@
 
 ### Existing source files modified
 
-- `src/documents/repository.ts` — list governed document heads/IDs and verify/read immutable text payloads.
+- `src/documents/repository.ts` — list governed document heads/IDs and read verified immutable text payloads.
 - `src/documents/reconciler.ts` — report exact changed `document_id` values after governed reconciliation.
 - `src/documents/change-coordinator.ts` — preserve changed-document IDs in coordinator summary.
 - `src/durable/project-guard-neutral.ts` — initialize/request/drain search sync, multiplex alarm work, expose sync status/reconciliation.
@@ -71,6 +71,8 @@
 - `src/index.ts` — include search reconciliation in production scheduled maintenance.
 - `src/index-mutation-gate.ts` — export `SearchIndexGuard` from the production Worker module.
 - `wrangler.jsonc` — bind/export the new SQLite Durable Object.
+- `scripts/check-persistence-boundary.mjs` — add a search-specific static import-path guard in addition to its existing all-`src/**/*.ts` token scan.
+- `package.json` — add the highest-risk search synchronization/rebuild/boundary tests to `test:persistence-high-risk`.
 - `docs/project-os-improvement-roadmap.md` — only after production proof, mark INDEX001 complete and preserve remaining sequence.
 - `README.md` — add the search/read-model component to the current architecture/code map after implementation is proven.
 
@@ -85,6 +87,16 @@
 - `test/search-rebuild.spec.ts`
 - `test/search-worker.spec.ts`
 - `test/search-provider-neutral.spec.ts`
+
+### Existing tests modified
+
+- `test/document-reference-reconcile.spec.ts`
+- `test/document-external-edits.spec.ts`
+- `test/input-intake-service.spec.ts`
+- `test/project-guard-commit-recovery.spec.ts`
+- `test/managed-document-acceptance.spec.ts`
+- `test/document-change-coordinator.spec.ts`
+- `test/project-guard-artifact.spec.ts`
 
 ---
 
@@ -277,8 +289,8 @@ git commit -m "feat: define structured search read model"
 - Modify: `test/input-intake-service.spec.ts`
 
 **Interfaces:**
-- Consumes: `DocumentLedgerRepository`, `ManagedDocumentHead`, `DocumentVersionRecord`.
-- Produces: `DocumentLedgerRepository.listHeadIds(projectId)`, `DocumentLedgerRepository.readVerifiedTextPayload(record)`, `buildManagedDocumentSearchRecord(ledger, projectId, documentId)`, `buildManagedDocumentSearchRecords(ledger, projectId, documentIds)`, and reconciliation `changed_document_ids`.
+- Consumes: `DocumentLedgerRepository`, `ManagedDocumentHead`, `CurrentDocumentVersionRecord`.
+- Produces: `DocumentLedgerRepository.listHeadIds(projectId)`, `DocumentLedgerRepository.readSearchableTextPayload(record)`, `buildManagedDocumentSearchRecord(ledger, projectId, documentId)`, `buildManagedDocumentSearchRecords(ledger, projectId, documentIds)`, and reconciliation `changed_document_ids`.
 
 - [ ] **Step 1: Write failing document projection tests**
 
@@ -294,7 +306,7 @@ it("indexes a governed binary as metadata only", async () => {
 });
 ```
 
-Also test reference collection routing, stable `document_id`, exact `version_id`, `reconciliation_status`, and text payload hash verification.
+Also test reference collection routing, stable `document_id`, exact `version_id`, `reconciliation_status`, Project-OS-authored Markdown payload verification, and externally captured Markdown text from immutable provider snapshots.
 
 - [ ] **Step 2: Run RED tests**
 
@@ -302,16 +314,23 @@ Also test reference collection routing, stable `document_id`, exact `version_id`
 npx vitest run test/search-document-records.spec.ts test/document-reference-reconcile.spec.ts test/document-external-edits.spec.ts
 ```
 
-- [ ] **Step 3: Add ledger enumeration/payload helpers**
+- [ ] **Step 3: Add ledger enumeration and verified-text helpers**
 
 Add to `DocumentLedgerRepository`:
 
 ```ts
 async listHeadIds(projectId: string): Promise<string[]>;
-async readVerifiedTextPayload(record: CurrentDocumentVersionRecord): Promise<string | null>;
+async readSearchableTextPayload(record: CurrentDocumentVersionRecord): Promise<string | null>;
 ```
 
-`listHeadIds` lists only `${machineDocumentRoot(projectId)}/heads`, accepts filenames matching `DOC-[A-F0-9]{24}.json`, sorts IDs, and does not inspect workspace file presence. `readVerifiedTextPayload` returns `null` when `content_sha256` is absent; otherwise it reads `record.immutable_payload_path`, recomputes Project OS SHA-256, and fails closed on missing/mismatching content.
+`listHeadIds` lists only `${machineDocumentRoot(projectId)}/heads`, accepts filenames matching `DOC-[A-F0-9]{24}.json`, sorts IDs, and does not inspect workspace file presence.
+
+`readSearchableTextPayload` has two accepted evidence paths:
+
+1. when `record.content_sha256` exists, read `record.immutable_payload_path` as text, recompute Project OS SHA-256, and fail closed on absence/mismatch;
+2. when the version is text-like Markdown/plain text but stores an immutable provider snapshot instead of Project OS text payload, verify the immutable snapshot metadata/content-integrity evidence through the existing compatibility/provider-neutral repository boundary before reading it as text.
+
+Return `null` for opaque/binary media. Search code must not interpret Dropbox hash algorithms or provider object IDs; evidence verification stays encapsulated in `DocumentLedgerRepository`.
 
 - [ ] **Step 4: Implement current document record selection**
 
@@ -332,9 +351,9 @@ published -> deliverables
 reference -> references
 ```
 
-Derive `title` from the final logical-path filename with the final extension removed. Use full verified text payload as `body_text` only when Project OS has canonical SHA-256 text payload evidence. Provider snapshot-only/binary versions remain metadata-only.
+Derive `title` from the final logical-path filename with the final extension removed. Use verified current-version text as `body_text`; verified text captured from an external human edit remains full-text searchable. Opaque/binary versions remain metadata-only.
 
-Use `record_id = document:${document_id}` and authority refs containing `project_id`, `document_id`, `version_id`, `logical_path`, and `content_sha256` when present.
+Use `record_id = document:${document_id}` and authority refs containing `project_id`, `document_id`, `version_id`, `logical_path`, and `content_sha256` when present. Compute the index `content_hash` from the resulting searchable record semantics, independent from provider-native hash format.
 
 - [ ] **Step 5: Make reconciliation report exact changed document IDs**
 
@@ -385,13 +404,13 @@ git commit -m "feat: project governed documents for search"
 - Produces: `initializeProjectSearchSyncSchema(storage)`, `ProjectSearchSyncStore`, `SearchSyncStatus`, `DocumentSyncBatch`.
 - Later tasks consume `requestCanonical`, `requestDocuments`, `requestFullDocumentSnapshot`, `nextDocumentBatch`, `markCanonicalIndexed`, `markDocumentIndexed`, `markFailure`, `clearFailure`, `status`, `needsWork`.
 
-- [ ] **Step 1: Write RED integration tests around durable requested/indexed state**
+- [ ] **Step 1: Write RED tests around durable requested/indexed state**
 
-Use a ProjectGuard test stub and assert:
+Use Durable Object storage in the Cloudflare test runtime and assert first initialization:
 
 ```ts
-expect(status).toMatchObject({
-  canonical_revision_requested: 1,
+expect(store.status()).toMatchObject({
+  canonical_revision_requested: 0,
   canonical_revision_indexed: 0,
   document_generation_requested: 1,
   document_generation_indexed: 0,
@@ -469,7 +488,7 @@ git commit -m "feat: add durable search sync outbox"
 - Create: `src/search/search-index-guard.ts`
 - Modify: `wrangler.jsonc`
 - Modify: `src/index-mutation-gate.ts`
-- Modify: `src/index-neutral.ts` exports only
+- Modify: `src/index-neutral.ts`
 - Create: `test/search-index-store.spec.ts`
 
 **Interfaces:**
@@ -504,9 +523,7 @@ Add export:
 }
 ```
 
-Export `SearchIndexGuard` from the production module `src/index-mutation-gate.ts` and from `src/index-neutral.ts` for tests/alternate composition.
-
-Run generated types before typecheck:
+Export `SearchIndexGuard` from the production module `src/index-mutation-gate.ts` and from `src/index-neutral.ts` for tests/alternate composition. Run generated types before typecheck:
 
 ```bash
 npm run types
@@ -517,47 +534,43 @@ npm run types
 Use one installation-scoped database with:
 
 ```sql
-search_project_heads(
-  project_id PRIMARY KEY,
-  active_generation,
-  canonical_revision_indexed,
-  canonical_snapshot_hash,
-  document_epoch,
-  document_epoch_started_at,
-  document_generation_indexed,
-  document_snapshot_hash,
-  rebuild_state,
-  last_error,
-  updated_at
-)
+CREATE TABLE IF NOT EXISTS search_project_heads (
+  project_id TEXT PRIMARY KEY,
+  active_generation INTEGER NOT NULL,
+  canonical_revision_indexed INTEGER NOT NULL,
+  canonical_snapshot_hash TEXT NOT NULL,
+  document_epoch TEXT,
+  document_epoch_started_at TEXT,
+  document_generation_indexed INTEGER NOT NULL,
+  document_snapshot_hash TEXT,
+  rebuild_state TEXT NOT NULL,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
 
-search_records(
-  project_id,
-  generation,
-  record_id,
-  record_kind,
-  entity_type,
-  entity_id,
-  document_id,
-  version_id,
-  title,
-  status,
-  zone,
-  logical_path,
-  stage_or_collection,
-  reconciliation_status,
-  content_hash,
-  canonical_revision,
-  body_text,
-  authority_ref_json,
-  updated_at,
+CREATE TABLE IF NOT EXISTS search_records (
+  project_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  record_id TEXT NOT NULL,
+  record_kind TEXT NOT NULL,
+  entity_type TEXT,
+  entity_id TEXT,
+  document_id TEXT,
+  version_id TEXT,
+  title TEXT NOT NULL,
+  status TEXT,
+  zone TEXT,
+  logical_path TEXT,
+  stage_or_collection TEXT,
+  reconciliation_status TEXT,
+  content_hash TEXT NOT NULL,
+  canonical_revision INTEGER,
+  body_text TEXT,
+  authority_ref_json TEXT NOT NULL,
+  updated_at TEXT,
   PRIMARY KEY(project_id, generation, record_id)
-)
-```
+);
 
-Create FTS5:
-
-```sql
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   project_id UNINDEXED,
   generation UNINDEXED,
@@ -586,7 +599,7 @@ Rules:
 Rules:
 
 - Same epoch requires `document_generation = indexed + 1`; already-indexed equal hash is idempotent, forward gaps reject.
-- New epoch requires `full_snapshot=true` and an `document_epoch_started_at` later than the stored epoch start; switch epoch only inside the full replacement transaction.
+- New epoch requires `full_snapshot=true` and `document_epoch_started_at` later than the stored epoch start; switch epoch only inside the full replacement transaction.
 - `full_snapshot=true` replaces all `managed_document` rows/FTS rows for the active generation.
 - Partial batches upsert provided document records and delete `record_id=document:<document_id>` for `removed_document_ids`.
 - Advance document epoch/generation/hash only after row + FTS changes succeed.
@@ -616,8 +629,8 @@ git commit -m "feat: add sqlite search index guard"
 
 **Files:**
 - Create: `src/search/query-compiler.ts`
-- Extend: `src/search/sqlite-store.ts`
-- Extend: `src/search/search-index-guard.ts`
+- Modify: `src/search/sqlite-store.ts`
+- Modify: `src/search/search-index-guard.ts`
 - Create: `test/search-query.spec.ts`
 
 **Interfaces:**
@@ -625,15 +638,10 @@ git commit -m "feat: add sqlite search index guard"
 
 - [ ] **Step 1: Write RED query safety tests**
 
-Cover:
+Cover these exact inputs:
 
 ```ts
-"pricing"
-"pricing strategy"
-"' OR 1=1 --"
-"NEAR(foo bar)"
-"a:b*"
-"   "
+["pricing", "pricing strategy", "' OR 1=1 --", "NEAR(foo bar)", "a:b*", "   "]
 ```
 
 Assert raw FTS syntax/SQL injection never changes query structure, project scope cannot be omitted, and special punctuation is treated as data/token separators.
@@ -646,7 +654,7 @@ Assert raw FTS syntax/SQL injection never changes query structure, project scope
 2. reject text over 512 characters through the contract parser;
 3. tokenize Unicode letters/numbers plus `_`/`-` using application code, not raw FTS syntax;
 4. cap at 32 terms;
-5. escape internal `"` if any tokenization path retains it;
+5. escape any retained `"` character before FTS assembly;
 6. produce a quoted `AND` expression such as `"pricing" AND "strategy"`;
 7. return `null` when no lexical token remains.
 
@@ -692,11 +700,11 @@ git commit -m "feat: add scoped lexical search queries"
 **Files:**
 - Create: `src/search/project-synchronizer.ts`
 - Modify: `src/durable/project-guard-neutral.ts`
-- Extend: `test/search-project-sync.spec.ts`
+- Modify: `test/search-project-sync.spec.ts`
 - Modify: `test/project-guard-commit-recovery.spec.ts`
 - Modify: `test/managed-document-acceptance.spec.ts`
 - Modify: `test/document-change-coordinator.spec.ts`
-- Modify: `test/artifact-repository.spec.ts` only for legacy managed-artifact sync evidence if needed
+- Modify: `test/project-guard-artifact.spec.ts`
 
 **Interfaces:**
 - Consumes: Task 1/2 record builders, Task 3 sync store, `env.SEARCH_INDEX_GUARD`.
@@ -727,7 +735,7 @@ After a committed direct managed-document receipt, request a document batch cont
 
 After `/reconcile-documents`, request one batch containing `summary.changed_document_ids` when non-empty.
 
-After a committed legacy artifact write, request a conservative full-document snapshot batch because the legacy artifact route may create/update a managed work-product head without returning `document_id` in the artifact receipt.
+After a committed legacy artifact write, always request a conservative full-document snapshot batch because the legacy artifact route can create/update a managed work-product head without returning `document_id` in the artifact receipt. Add the regression assertion to `test/project-guard-artifact.spec.ts`.
 
 - [ ] **Step 4: Implement document delivery**
 
@@ -774,7 +782,7 @@ Preserve the existing materialization retry count/defer behavior exactly; do not
 
 - ensure canonical requested >= current state revision;
 - preserve existing pending document batches;
-- optionally accept internal body `{ force_full: true }` to enqueue a full document snapshot and force a canonical snapshot resend after SearchIndex loss;
+- accept internal body `{ force_full: true }` to enqueue a full document snapshot and force a canonical snapshot resend after SearchIndex loss;
 - ensure the shared derived-work alarm is armed.
 
 - [ ] **Step 7: Test crash/replay boundaries**
@@ -786,6 +794,7 @@ Cover:
 - RPC applied but local indexed mark is lost: duplicate RPC is idempotent;
 - direct managed document update produces one document generation;
 - change-feed reconciliation reports and queues exact changed IDs;
+- legacy managed artifact queues a full-document generation;
 - full-document initial generation indexes pre-existing heads;
 - search failure cannot block materialization alarm progress;
 - materialization failure cannot mark search work complete.
@@ -793,14 +802,14 @@ Cover:
 - [ ] **Step 8: Run GREEN verification**
 
 ```bash
-npx vitest run test/search-project-sync.spec.ts test/project-guard-commit-recovery.spec.ts test/managed-document-acceptance.spec.ts test/document-change-coordinator.spec.ts test/materialization-coordinator.spec.ts
+npx vitest run test/search-project-sync.spec.ts test/project-guard-commit-recovery.spec.ts test/managed-document-acceptance.spec.ts test/document-change-coordinator.spec.ts test/project-guard-artifact.spec.ts test/materialization-coordinator.spec.ts
 npm run check:persistence-boundary
 ```
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/search/project-synchronizer.ts src/durable/project-guard-neutral.ts test/search-project-sync.spec.ts test/project-guard-commit-recovery.spec.ts test/managed-document-acceptance.spec.ts test/document-change-coordinator.spec.ts
+git add src/search/project-synchronizer.ts src/durable/project-guard-neutral.ts test/search-project-sync.spec.ts test/project-guard-commit-recovery.spec.ts test/managed-document-acceptance.spec.ts test/document-change-coordinator.spec.ts test/project-guard-artifact.spec.ts
 git commit -m "feat: synchronize project search read model"
 ```
 
@@ -810,11 +819,12 @@ git commit -m "feat: synchronize project search read model"
 
 **Files:**
 - Create: `src/search/rebuild.ts`
-- Extend: `src/search/sqlite-store.ts`
-- Extend: `src/search/search-index-guard.ts`
+- Modify: `src/search/sqlite-store.ts`
+- Modify: `src/search/search-index-guard.ts`
 - Create: `test/search-rebuild.spec.ts`
 
 **Interfaces:**
+- Consumes: `createProductionPersistence(env)`, `ProjectRepository`, `DocumentLedgerRepository`, canonical/document record builders.
 - Produces: `SearchRebuildCoordinator`, SearchIndexGuard `POST /rebuild-project`, `GET /rebuild-status`, and its Durable Object `alarm()`.
 
 - [ ] **Step 1: Write RED rebuild generation tests**
@@ -847,15 +857,21 @@ CREATE TABLE IF NOT EXISTS search_rebuild_items (
 );
 ```
 
-- [ ] **Step 3: Capture source watermarks before staging**
+- [ ] **Step 3: Capture source watermarks and authoritative snapshots before staging**
 
-`POST /rebuild-project` receives `{ project_id }`. `SearchRebuildCoordinator` calls that project's internal `GET /search-sync-status`, captures canonical/document source watermarks, allocates `staging_generation = active_generation + 1` (or `1` if none), writes canonical records into the staging generation, and enumerates only machine Managed Document head IDs through `DocumentLedgerRepository.listHeadIds` into rebuild items.
+`POST /rebuild-project` receives `{ project_id }`. `SearchRebuildCoordinator` must:
 
-Do not infer documents from `WORKSPACE/` presence.
+1. call that project's internal `GET /search-sync-status` and capture canonical/document source watermarks;
+2. use `ProjectRepository.readProjectState(projectId)` through `createProductionPersistence(env)` to load authoritative current canonical state and require its revision to equal the captured canonical requested revision;
+3. allocate `staging_generation = active_generation + 1` (or `1` if none);
+4. build/write canonical records for that exact captured revision into staging;
+5. use `DocumentLedgerRepository.listHeadIds(projectId)` through the same provider-neutral persistence runtime and insert those document IDs into `search_rebuild_items`.
+
+Do not infer documents from `WORKSPACE/` presence and do not use Dropbox-native search/list semantics outside the provider-neutral repository boundary.
 
 - [ ] **Step 4: Process document rebuild in bounded chunks**
 
-`SearchIndexGuard.alarm()` processes at most `32` pending document IDs per invocation. For each ID, build the current governed record and upsert it into the staging generation; mark each rebuild item completed transactionally after its record write. Re-arm while pending items remain.
+`SearchIndexGuard.alarm()` processes at most `32` pending document IDs per invocation. For each ID, build the current governed record from authoritative head/version/payload state and upsert it into the staging generation; mark each rebuild item completed transactionally after its record write. Re-arm while pending items remain.
 
 A restart repeats only pending/failed items; completed items remain verified in staging.
 
@@ -870,7 +886,7 @@ document_epoch_started_at
 document_generation_requested
 ```
 
-If changed, mark the rebuild job failed with `SOURCE_CHANGED_DURING_REBUILD`, keep the old active generation, and require a fresh rebuild/retry.
+Also re-read authoritative `ProjectState` and require its revision to equal `target_canonical_revision`. If any source changed, mark the rebuild job failed with `SOURCE_CHANGED_DURING_REBUILD`, keep the old active generation, and require a fresh rebuild/retry.
 
 - [ ] **Step 6: Validate staged generation and promote atomically**
 
@@ -891,12 +907,13 @@ After promotion, alarm cleanup deletes old `search_fts`/`search_records` rows in
 
 - [ ] **Step 8: Test deletion/loss recovery path**
 
-Simulate an empty SearchIndex project head while ProjectGuard still has current authority. `POST /rebuild-project` must rebuild from canonical state + managed heads/payloads, not from previous index storage.
+Simulate an empty SearchIndex project head while ProjectGuard and provider-neutral canonical/document repositories still hold current authority. `POST /rebuild-project` must rebuild from canonical state + managed heads/payloads, not from previous index storage or arbitrary workspace file presence.
 
 - [ ] **Step 9: Run GREEN verification**
 
 ```bash
 npx vitest run test/search-rebuild.spec.ts test/search-index-store.spec.ts test/search-query.spec.ts
+npm run check:persistence-boundary
 npm run typecheck
 ```
 
@@ -1001,27 +1018,32 @@ git commit -m "feat: expose project os search api"
 
 **Files:**
 - Create: `test/search-provider-neutral.spec.ts`
-- Modify: `package.json` only if the high-risk test command must include new search tests
-- Modify: `scripts/check-persistence-boundary.mjs` only if its existing import rules do not automatically cover `src/search/**`
+- Modify: `scripts/check-persistence-boundary.mjs`
+- Modify: `package.json`
 
 **Interfaces:**
 - No new runtime API; this is a boundary/verification gate.
 
-- [ ] **Step 1: Add static provider-neutrality assertions**
+- [ ] **Step 1: Strengthen the existing static boundary check for the search namespace**
 
-Fail if any `src/search/**` core file imports:
+The existing script already scans every `src/**/*.ts`. Add this exact search-specific rule after the current forbidden-token checks:
 
-```text
-src/persistence/providers/dropbox/**
-DropboxClient
-DropboxApiError
-DropboxConflictError
-DropboxCursorResetError
+```js
+if (
+  rel.startsWith("src/search/")
+  && /persistence\/providers\/dropbox|webhook\/dropbox/.test(text)
+) {
+  violations.push(`${rel}: search core imports Dropbox integration code`);
+}
 ```
 
-Allow the existing provider-neutral `ProjectOsPersistenceRuntime`, `ObjectPersistence`, `ProjectRepository`, and `DocumentLedgerRepository`.
+Keep the existing forbidden runtime tokens unchanged so `DropboxClient`, `DropboxConflictError`, `DropboxCursorResetError`, and related runtime types remain prohibited outside their accepted seams.
 
-- [ ] **Step 2: Add authority negative tests**
+- [ ] **Step 2: Add provider-neutrality test assertions**
+
+`test/search-provider-neutral.spec.ts` must prove the public search contracts and record builders can operate with Project OS logical records/repositories without any provider ID in their result identity. It must also exercise `npm run check:persistence-boundary` as the authoritative static source-tree boundary gate rather than duplicating a weaker partial scanner in test code.
+
+- [ ] **Step 3: Add authority negative tests**
 
 Prove:
 
@@ -1032,11 +1054,24 @@ Prove:
 - a canonical search hit includes canonical revision/entity identity;
 - an archived project can be queried when explicitly scoped but search cannot mutate it.
 
-- [ ] **Step 3: Add fail-closed search outage tests**
+- [ ] **Step 4: Add fail-closed search outage tests**
 
 When SearchIndexGuard is unavailable/rebuilding, `POST /v1/search` returns explicit unavailable/unknown/lagging semantics. It must not call Dropbox/provider recursive listing as a fallback.
 
-- [ ] **Step 4: Run full high-risk verification**
+- [ ] **Step 5: Make search regressions part of the persistent high-risk suite**
+
+Append these exact files to the existing `test:persistence-high-risk` script in `package.json`:
+
+```text
+test/search-project-sync.spec.ts
+test/search-rebuild.spec.ts
+test/search-worker.spec.ts
+test/search-provider-neutral.spec.ts
+```
+
+Do not alter unrelated scripts or dependency versions.
+
+- [ ] **Step 6: Run full high-risk verification**
 
 ```bash
 npm run types
@@ -1048,7 +1083,7 @@ npm run test:persistence-high-risk
 npx vitest run test/search-contract.spec.ts test/search-canonical-records.spec.ts test/search-document-records.spec.ts test/search-project-sync.spec.ts test/search-index-store.spec.ts test/search-query.spec.ts test/search-rebuild.spec.ts test/search-worker.spec.ts test/search-provider-neutral.spec.ts
 ```
 
-- [ ] **Step 5: Run the complete suite**
+- [ ] **Step 7: Run the complete suite**
 
 ```bash
 npm test
@@ -1057,14 +1092,12 @@ npm run check
 
 Expected: all green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add test/search-provider-neutral.spec.ts package.json scripts/check-persistence-boundary.mjs
+git add test/search-provider-neutral.spec.ts scripts/check-persistence-boundary.mjs package.json
 git commit -m "test: prove search authority boundaries"
 ```
-
-Only include `package.json`/script files in the commit when their content actually changed.
 
 ---
 
@@ -1073,7 +1106,7 @@ Only include `package.json`/script files in the commit when their content actual
 **Files:**
 - Create: `docs/search.md`
 - Modify: `README.md`
-- Modify: `docs/project-os-improvement-roadmap.md` only after production proof and canonical completion is ready
+- Modify: `docs/project-os-improvement-roadmap.md` only after production proof and canonical completion is ready.
 - Canonical Project OS changes: typed transactions only after the corresponding user approvals; never edit generated PRJ-0002 Markdown directly.
 
 **Interfaces:**
@@ -1181,7 +1214,7 @@ git add docs/search.md README.md docs/project-os-improvement-roadmap.md
 git commit -m "docs: document project os search model"
 ```
 
-Do not include the roadmap file until the production/canonical completion gate is actually satisfied.
+Do not include the roadmap file before the production/canonical completion gate is satisfied.
 
 ---
 
@@ -1200,7 +1233,7 @@ Do not include the roadmap file until the production/canonical completion gate i
 - Canonical/document separate freshness: Tasks 3, 6, 8.
 - Rebuild from authoritative truth: Task 7.
 - Active/staging generation safety and resumability: Task 7.
-- Provider neutrality: Tasks 2, 6, 9.
+- Provider neutrality: Tasks 2, 6, 7, 9.
 - No vector/OCR/external search complexity: Global constraints + Task 9.
 - Observability without content leakage: Tasks 8, 10.
 - Production proof and canonical closure: Task 10.
@@ -1212,10 +1245,14 @@ Do not include the roadmap file until the production/canonical completion gate i
 - Document synchronization uses ordered `DocumentBatchRequest`; partial batches are contiguous within one epoch, new epochs require full snapshots.
 - ProjectGuard is source authority for requested/indexed synchronization acknowledgement; SearchIndexGuard owns derived index watermarks/generations.
 - SearchIndex active generation is per-project even though the Durable Object is installation-scoped.
+- Rebuild reads authority through `ProjectRepository` and `DocumentLedgerRepository`, not arbitrary workspace inference.
 
-### Placeholder scan
+### Placeholder and ambiguity review
 
-This plan intentionally contains no `TBD`, no `TODO`, no unspecified “handle errors” steps, and no implementation step that depends on an undefined function/type. Any implementation discovery that contradicts these locked interfaces requires stopping and revalidating the plan before changing architecture.
+- Every conditional file modification has been resolved to a specific file and expected change.
+- Every new public/internal interface used by a later task is named in an earlier task.
+- Error and replay behavior is explicit at canonical, document-batch, query, and rebuild boundaries.
+- Any implementation discovery that contradicts these locked interfaces requires stopping and revalidating the plan before changing architecture.
 
 ## Execution gate
 

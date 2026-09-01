@@ -30,6 +30,7 @@ export async function reconcileSearchIndexes(env: Env): Promise<SearchFleetRecon
   }
 
   const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const searchIndex = env.SEARCH_INDEX_GUARD.getByName("global");
   const summary: SearchFleetReconcileSummary = {
     scanned: registry.projects.length,
     scheduled: 0,
@@ -48,7 +49,6 @@ export async function reconcileSearchIndexes(env: Env): Promise<SearchFleetRecon
 
       const projectId = registry.projects[index].project_id;
       try {
-        const searchIndex = env.SEARCH_INDEX_GUARD.getByName("global");
         const indexResponse = await searchIndex.fetch(
           `https://search-index.internal/status?project_id=${encodeURIComponent(projectId)}`,
           { method: "GET" }

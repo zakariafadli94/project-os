@@ -6,6 +6,8 @@ import {
   parseWorkingHeadRequest,
   type WorkingHeadRequest
 } from "../domain/working-head-request";
+import { ManagedDocumentActivePathIndex } from "../documents/active-path-index";
+import { DocumentLedgerRepository } from "../documents/repository";
 import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
 import { ManagedDocumentConflictError, type ManagedDocumentReceipt } from "../documents/service";
 import { ManagedWorkingHeadService } from "../documents/working-head-service";
@@ -61,6 +63,8 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
   private readonly recoveryRepository: ProjectRepository;
   private readonly workingHeads: ManagedWorkingHeadService;
   private readonly workingHeadRequests: ManagedDocumentRequestLedger;
+  private readonly documentLedger: DocumentLedgerRepository;
+  private readonly activePaths: ManagedDocumentActivePathIndex;
   private recoveryQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -68,6 +72,8 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
     this.recoveryRepository = new ProjectRepository(this.persistence, this.layoutMode);
     this.workingHeads = new ManagedWorkingHeadService(this.persistence);
     this.workingHeadRequests = new ManagedDocumentRequestLedger(this.persistence.objects);
+    this.documentLedger = new DocumentLedgerRepository(this.persistence);
+    this.activePaths = new ManagedDocumentActivePathIndex(this.persistence);
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -139,7 +145,9 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
 
     const durableReceipt = await this.workingHeadRequests.readReceipt(operation.project_id, operation.request_id);
     if (durableReceipt) {
-      return Response.json(JSON.parse(durableReceipt.receipt_json) as WorkingHeadOperationReceipt);
+      const replay = JSON.parse(durableReceipt.receipt_json) as WorkingHeadOperationReceipt;
+      await this.syncWorkingHeadIndexes(operation, replay);
+      return Response.json(replay);
     }
 
     let receipt: WorkingHeadOperationReceipt;
@@ -168,6 +176,7 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       }
     }
 
+    await this.syncWorkingHeadIndexes(operation, receipt);
     await this.workingHeadRequests.writeReceipt(
       operation.project_id,
       operation.request_id,
@@ -175,6 +184,35 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       JSON.stringify(receipt)
     );
     return Response.json(receipt);
+  }
+
+  private async syncWorkingHeadIndexes(
+    operation: WorkingHeadRequest,
+    receipt: WorkingHeadOperationReceipt
+  ): Promise<void> {
+    if (receipt.status !== "committed") return;
+    const version = await this.documentLedger.readVersion(receipt.project_id, receipt.document_id, receipt.version_id);
+    if (!version || version.stage !== "working") {
+      throw new Error(`Committed working-head receipt references missing working version: ${receipt.request_id}`);
+    }
+
+    await this.activePaths.bind(receipt.project_id, version.logical_path, receipt.document_id);
+    const head = await this.documentLedger.readHead(receipt.project_id, receipt.document_id);
+    const providerFileId = head?.provider?.working?.file_id;
+    if (providerFileId) {
+      await this.documentLedger.writeProviderFileBinding({
+        schema_version: "1.0",
+        project_id: receipt.project_id,
+        provider_file_id: providerFileId,
+        document_id: receipt.document_id
+      });
+    }
+
+    if (operation.operation !== "working.supersede" || !version.parent_version_id) return;
+    const parent = await this.documentLedger.readVersion(receipt.project_id, receipt.document_id, version.parent_version_id);
+    if (parent && parent.logical_path !== version.logical_path) {
+      await this.activePaths.unbind(receipt.project_id, parent.logical_path, receipt.document_id);
+    }
   }
 
   private async fastForwardFromVerifiedMachineSnapshot(): Promise<void> {

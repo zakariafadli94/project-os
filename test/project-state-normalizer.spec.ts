@@ -102,10 +102,27 @@ describe("project state normalization", () => {
     expect(normalized.plan_phases["PHASE-4402"].status).toBe("pending");
   });
 
+  it("accepts and preserves a V2 canonical state cached by ProjectGuard", () => {
+    const v2 = {
+      ...normalizeProjectState(legacyState()),
+      schema_version: "2.0" as const
+    };
+
+    const normalized = normalizeProjectState(v2);
+
+    expect(normalized.schema_version).toBe("2.0");
+    expect(normalized.project_id).toBe("PRJ-3001");
+    expect(normalized.revision).toBe(7);
+  });
+
   it("is idempotent", () => {
     const once = normalizeProjectState(legacyState());
     const twice = normalizeProjectState(once);
     expect(twice).toEqual(once);
+  });
+
+  it("rejects unsupported schema versions", () => {
+    expect(() => normalizeProjectState({ ...legacyState(), schema_version: "3.0" })).toThrow(/schema_version/i);
   });
 
   it("rejects malformed state rather than permissively casting it", () => {

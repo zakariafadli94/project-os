@@ -24,19 +24,19 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
   const runtime: PersistenceRuntime = {
     providerId: DROPBOX_PROVIDER_ID,
     objects: {
-      readText: (path) => call("read", () => raw.download(path)),
-      createText: (path, content) => call("create", () => raw.upload(path, content, "add")),
-      upsertText: (path, content) => call("upsert", () => raw.upload(path, content, "overwrite")),
+      readText: (path) => call("read", path, () => raw.download(path)),
+      createText: (path, content) => call("create", path, () => raw.upload(path, content, "add")),
+      upsertText: (path, content) => call("upsert", path, () => raw.upload(path, content, "overwrite")),
       getMetadata: async (path) => {
-        const metadata = await call("metadata", () => raw.getMetadata!(path));
+        const metadata = await call("metadata", path, () => raw.getMetadata!(path));
         return metadata ? mapMetadata(metadata) : null;
       },
       listChildren: async (path) => {
-        const entries = await call("list", () => raw.listFolder!(path));
+        const entries = await call("list", path, () => raw.listFolder!(path));
         return entries.map(mapEntry);
       },
-      move: (from, to) => call("move", () => raw.move(from, to)),
-      delete: (path) => call("delete", () => raw.delete!(path))
+      move: (from, to) => call("move", `${from} -> ${to}`, () => raw.move(from, to)),
+      delete: (path) => call("delete", path, () => raw.delete!(path))
     },
     evidence: {
       stableObjectId: { semantics: "stable-through-move" },
@@ -50,6 +50,7 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
       writeTextConditional: async (path, content, expectedRevisionToken) => mapMetadata(
         await call(
           "conditional-write",
+          path,
           () => raw.uploadConditional!(path, content, expectedRevisionToken)
         )
       )
@@ -59,7 +60,7 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
   if (raw.copy) {
     runtime.serverSideCopy = {
       copyObject: async (from, to) => mapMetadata(
-        await call("copy", () => raw.copy!(from, to))
+        await call("copy", `${from} -> ${to}`, () => raw.copy!(from, to))
       )
     };
   }
@@ -67,8 +68,10 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
   if (raw.listFolderChanges) {
     runtime.changeFeed = {
       listChanges: async (input) => {
+        const target = input.root ?? "<cursor>";
         const page = await call(
           "changes",
+          target,
           () => raw.listFolderChanges!(input.root, input.cursor)
         );
         return {
@@ -81,18 +84,22 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
 
   if (raw.ensureDirectory) {
     runtime.directoryProvisioning = {
-      ensureDirectory: (path) => call("ensure-directory", () => raw.ensureDirectory!(path))
+      ensureDirectory: (path) => call("ensure-directory", path, () => raw.ensureDirectory!(path))
     };
   }
 
   return runtime;
 }
 
-async function call<T>(operation: DropboxOperation, fn: () => Promise<T>): Promise<T> {
+async function call<T>(operation: DropboxOperation, target: string, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } catch (error) {
-    throw mapDropboxError(error, operation);
+    const mapped = mapDropboxError(error, operation);
+    if (mapped === error && error instanceof Error) {
+      throw new Error(`Dropbox ${operation} failed for ${target}: ${error.message}`);
+    }
+    throw mapped;
   }
 }
 

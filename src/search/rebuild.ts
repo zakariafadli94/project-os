@@ -8,6 +8,7 @@ import { buildManagedDocumentSearchRecord } from "./document-records";
 import { hashSearchRecords, hashSearchValue } from "./hash";
 
 const MAX_DOCUMENTS_PER_ALARM = 32;
+const MAX_CLEANUP_RECORDS_PER_ALARM = 32;
 
 type RebuildPhase = "enumerating" | "indexing" | "validating" | "failed";
 
@@ -50,6 +51,13 @@ interface RebuildItemRow {
 interface HeadGenerationRow {
   [key: string]: SqlStorageValue;
   active_generation: number;
+}
+
+interface CleanupRecordRow {
+  [key: string]: SqlStorageValue;
+  project_id: string;
+  generation: number;
+  record_id: string;
 }
 
 interface CountRow {
@@ -215,9 +223,19 @@ export class SearchRebuildCoordinator {
   }
 
   hasRunnableWork(): boolean {
-    return this.storage.sql.exec<CountRow>(
+    const rebuildCount = this.storage.sql.exec<CountRow>(
       `SELECT COUNT(*) AS count FROM search_rebuild_jobs WHERE phase IN ('indexing', 'validating')`
-    ).one().count > 0;
+    ).one().count;
+    if (rebuildCount > 0) return true;
+
+    return this.storage.sql.exec<CleanupRecordRow>(
+      `SELECT records.project_id, records.generation, records.record_id
+       FROM search_records records
+       JOIN search_project_heads heads ON heads.project_id = records.project_id
+       WHERE records.generation < heads.active_generation
+       ORDER BY records.project_id, records.generation, records.record_id
+       LIMIT 1`
+    ).toArray().length > 0;
   }
 
   async runNext(): Promise<void> {
@@ -230,7 +248,10 @@ export class SearchRebuildCoordinator {
        ORDER BY started_at, project_id
        LIMIT 1`
     ).toArray()[0];
-    if (!job) return;
+    if (!job) {
+      this.cleanupOldGenerationBatch();
+      return;
+    }
 
     if (job.phase === "indexing") {
       const pending = this.storage.sql.exec<RebuildItemRow>(
@@ -484,6 +505,25 @@ export class SearchRebuildCoordinator {
       new Date().toISOString(),
       projectId
     );
+  }
+
+  private cleanupOldGenerationBatch(): void {
+    const staleRecords = this.storage.sql.exec<CleanupRecordRow>(
+      `SELECT records.project_id, records.generation, records.record_id
+       FROM search_records records
+       JOIN search_project_heads heads ON heads.project_id = records.project_id
+       WHERE records.generation < heads.active_generation
+       ORDER BY records.project_id, records.generation, records.record_id
+       LIMIT ?`,
+      MAX_CLEANUP_RECORDS_PER_ALARM
+    ).toArray();
+    if (staleRecords.length === 0) return;
+
+    this.storage.transactionSync(() => {
+      for (const record of staleRecords) {
+        this.deleteRecord(record.project_id, record.generation, record.record_id);
+      }
+    });
   }
 
   private discardStaging(job: RebuildJobRow): void {

@@ -4,7 +4,7 @@ import type { Env } from "./env";
 import baseWorker from "./index";
 
 export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
-export { MutationGateProjectGuard as ProjectGuard } from "./durable/project-guard-mutation-gate";
+export { SubrequestResilientProjectGuard as ProjectGuard } from "./durable/project-guard-subrequest-resilient";
 export { RegistryGuard } from "./durable/registry-guard";
 export { SearchIndexGuard } from "./search/search-index-guard";
 

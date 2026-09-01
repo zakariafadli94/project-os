@@ -72,6 +72,11 @@ export function initializeProjectSearchSyncSchema(storage: DurableObjectStorage)
       attempts INTEGER NOT NULL DEFAULT 0,
       last_error TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS search_sync_sources (
+      source_key TEXT PRIMARY KEY,
+      registered_at TEXT NOT NULL
+    );
   `);
 
   storage.transactionSync(() => {
@@ -125,8 +130,18 @@ export class ProjectSearchSyncStore {
     this.enqueueDocumentBatch(false, ids);
   }
 
+  requestDocumentsOnce(sourceKey: string, documentIds: readonly string[]): boolean {
+    const ids = normalizeDocumentIds(documentIds);
+    if (ids.length === 0) return false;
+    return this.registerSourceOnce(sourceKey, () => this.enqueueDocumentBatchInTransaction(false, ids));
+  }
+
   requestFullDocumentSnapshot(): void {
     this.enqueueDocumentBatch(true, []);
+  }
+
+  requestFullDocumentSnapshotOnce(sourceKey: string): boolean {
+    return this.registerSourceOnce(sourceKey, () => this.enqueueDocumentBatchInTransaction(true, []));
   }
 
   nextDocumentBatch(): DocumentSyncBatch | null {
@@ -269,28 +284,49 @@ export class ProjectSearchSyncStore {
     return this.nextDocumentBatch() !== null;
   }
 
-  private enqueueDocumentBatch(fullSnapshot: boolean, documentIds: readonly string[]): void {
-    this.storage.transactionSync(() => {
-      const control = this.control();
-      if (control.document_generation_requested < control.document_generation_indexed) {
-        throw new Error("Search document synchronization watermarks are invalid");
-      }
-      const generation = control.document_generation_requested + 1;
+  private registerSourceOnce(sourceKey: string, enqueue: () => void): boolean {
+    const key = assertSourceKey(sourceKey);
+    return this.storage.transactionSync(() => {
+      const existing = this.storage.sql.exec<CountRow>(
+        "SELECT COUNT(*) AS count FROM search_sync_sources WHERE source_key = ?",
+        key
+      ).one().count;
+      if (existing > 0) return false;
+
+      enqueue();
       this.storage.sql.exec(
-        `INSERT INTO search_document_batches (
-           generation, full_snapshot, document_ids_json, status, attempts, last_error
-         ) VALUES (?, ?, ?, 'pending', 0, NULL)`,
-        generation,
-        fullSnapshot ? 1 : 0,
-        JSON.stringify(documentIds)
+        "INSERT INTO search_sync_sources (source_key, registered_at) VALUES (?, ?)",
+        key,
+        new Date().toISOString()
       );
-      this.storage.sql.exec(
-        `UPDATE search_sync_control
-         SET document_generation_requested = ?
-         WHERE singleton = 1`,
-        generation
-      );
+      return true;
     });
+  }
+
+  private enqueueDocumentBatch(fullSnapshot: boolean, documentIds: readonly string[]): void {
+    this.storage.transactionSync(() => this.enqueueDocumentBatchInTransaction(fullSnapshot, documentIds));
+  }
+
+  private enqueueDocumentBatchInTransaction(fullSnapshot: boolean, documentIds: readonly string[]): void {
+    const control = this.control();
+    if (control.document_generation_requested < control.document_generation_indexed) {
+      throw new Error("Search document synchronization watermarks are invalid");
+    }
+    const generation = control.document_generation_requested + 1;
+    this.storage.sql.exec(
+      `INSERT INTO search_document_batches (
+         generation, full_snapshot, document_ids_json, status, attempts, last_error
+       ) VALUES (?, ?, ?, 'pending', 0, NULL)`,
+      generation,
+      fullSnapshot ? 1 : 0,
+      JSON.stringify(documentIds)
+    );
+    this.storage.sql.exec(
+      `UPDATE search_sync_control
+       SET document_generation_requested = ?
+       WHERE singleton = 1`,
+      generation
+    );
   }
 
   private pendingFullSnapshotCount(indexedGeneration: number): number {
@@ -379,6 +415,14 @@ function normalizeDocumentIds(values: readonly string[]): string[] {
 function assertDocumentId(value: string): string {
   if (!/^DOC-[A-F0-9]{24}$/.test(value)) throw new Error(`Unsafe managed document id for search sync: ${value}`);
   return value;
+}
+
+function assertSourceKey(value: string): string {
+  const key = String(value);
+  if (key.length < 1 || key.length > 256 || /[\u0000-\u001F\u007F]/.test(key)) {
+    throw new Error("Unsafe search synchronization source key");
+  }
+  return key;
 }
 
 function assertRevision(value: number, label: string): void {

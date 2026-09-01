@@ -44,6 +44,7 @@ export interface ManagedDocumentReconcileSummary {
   duplicate_cleaned: number;
   withdrawn: number;
   intake_resumed: number;
+  changed_document_ids: string[];
 }
 
 export class ManagedDocumentReconciler {
@@ -74,12 +75,15 @@ export class ManagedDocumentReconciler {
       intake_completed: 0,
       duplicate_cleaned: 0,
       withdrawn: 0,
-      intake_resumed: 0
+      intake_resumed: 0,
+      changed_document_ids: []
     };
     if (state.status === "archived") {
       summary.ignored = changes.length;
       return summary;
     }
+
+    const changedDocumentIds = new Set<string>();
 
     for (const changeInput of changes) {
       const change = toProviderChangeEntry(changeInput);
@@ -95,14 +99,15 @@ export class ManagedDocumentReconciler {
 
       if (change.kind === "deleted") {
         if (classified.zone === "working" || classified.zone === "review" || classified.zone === "deliverables") {
-          const restored = await this.restoreDeletedWorkProduct(
+          const restoredDocumentId = await this.restoreDeletedWorkProduct(
             state,
             classified.zone,
             classified.relativePath,
             change.path
           );
-          summary.restored += restored ? 1 : 0;
-          summary.ignored += restored ? 0 : 1;
+          summary.restored += restoredDocumentId ? 1 : 0;
+          summary.ignored += restoredDocumentId ? 0 : 1;
+          if (restoredDocumentId) changedDocumentIds.add(restoredDocumentId);
         } else if (classified.zone === "inputs") {
           const result = await this.reconcileDeletedInput(state, change.path);
           if (!result) {
@@ -125,18 +130,33 @@ export class ManagedDocumentReconciler {
       }
 
       if (classified.zone === "inputs") {
+        const evidence = requireDropboxV1Evidence(metadata);
+        const expectedDocumentId = await documentIdForProviderFile(state.project_id, evidence.file_id);
+        const beforeHead = await this.ledger.readHead(state.project_id, expectedDocumentId);
+        const beforeReferenceVersionId = beforeHead?.kind === "reference" ? beforeHead.reference_version_id : undefined;
         const result = await this.intakeService.ingest(state, {
           sourcePath: change.path,
           relativeInputPath: classified.relativePath,
           metadata
         });
         this.applyInputIntakeResult(summary, result);
+        if (result.status === "completed" && result.document_id) {
+          const afterHead = await this.ledger.readHead(state.project_id, result.document_id);
+          if (
+            afterHead?.kind === "reference"
+            && afterHead.reference_version_id
+            && (beforeHead?.document_id !== result.document_id || beforeReferenceVersionId !== afterHead.reference_version_id)
+          ) {
+            changedDocumentIds.add(result.document_id);
+          }
+        }
         continue;
       }
       if (classified.zone === "references") {
-        const captured = await this.captureReferenceEdit(state, classified.relativePath, change.path, metadata);
-        summary.captured += captured ? 1 : 0;
-        summary.ignored += captured ? 0 : 1;
+        const capturedDocumentId = await this.captureReferenceEdit(state, classified.relativePath, change.path, metadata);
+        summary.captured += capturedDocumentId ? 1 : 0;
+        summary.ignored += capturedDocumentId ? 0 : 1;
+        if (capturedDocumentId) changedDocumentIds.add(capturedDocumentId);
         continue;
       }
       if (classified.zone === "working" || classified.zone === "review") {
@@ -149,23 +169,27 @@ export class ManagedDocumentReconciler {
           summary.conflicts += 1;
           continue;
         }
-        const captured = await this.captureWorkProductEdit(
+        const capturedDocumentId = await this.captureWorkProductEdit(
           state,
           classified.zone,
           classified.relativePath,
           change.path,
           metadata
         );
-        summary.captured += captured ? 1 : 0;
-        summary.ignored += captured ? 0 : 1;
+        summary.captured += capturedDocumentId ? 1 : 0;
+        summary.ignored += capturedDocumentId ? 0 : 1;
+        if (capturedDocumentId) changedDocumentIds.add(capturedDocumentId);
         continue;
       }
       const result = await this.reconcilePublishedEdit(state, classified.relativePath, change.path, metadata);
-      if (result === "working") summary.captured += 1;
-      if (result === "conflict") summary.conflicts += 1;
-      if (result !== "ignored") summary.restored += 1;
+      if (result.outcome === "working") summary.captured += 1;
+      if (result.outcome === "conflict") summary.conflicts += 1;
+      if (result.outcome !== "ignored") summary.restored += 1;
       else summary.ignored += 1;
+      if (result.document_id) changedDocumentIds.add(result.document_id);
     }
+
+    summary.changed_document_ids = [...changedDocumentIds].sort();
     return summary;
   }
 
@@ -237,19 +261,19 @@ export class ManagedDocumentReconciler {
     zone: "working" | "review" | "deliverables",
     logicalPath: string,
     visiblePath: string
-  ): Promise<boolean> {
+  ): Promise<string | null> {
     const current = await this.metadataMaybe(visiblePath);
-    if (current) return false;
+    if (current) return null;
 
     const documentId = await documentIdFor(state.project_id, logicalPath);
     const head = await this.ledger.readHead(state.project_id, documentId);
-    if (!head || head.kind !== "work_product") return false;
+    if (!head || head.kind !== "work_product") return null;
     const versionId = zone === "working"
       ? head.working_version_id
       : zone === "review"
         ? head.review_version_id
         : head.published_version_id;
-    if (!versionId) return false;
+    if (!versionId) return null;
 
     const version = await this.requireVersion(state.project_id, documentId, versionId);
     const restored = await this.runtime.serverSideCopy.copyObject(version.immutable_payload_path, visiblePath);
@@ -262,7 +286,7 @@ export class ManagedDocumentReconciler {
       provider,
       reconciliation_status: head.reconciliation_status
     });
-    return true;
+    return documentId;
   }
 
   private async hasVisibleIdentityConflict(
@@ -295,15 +319,15 @@ export class ManagedDocumentReconciler {
     logicalPath: string,
     visiblePath: string,
     metadata: ProviderObjectMetadata
-  ): Promise<boolean> {
+  ): Promise<string | null> {
     const documentId = await documentIdFor(state.project_id, logicalPath);
     const head = await this.ledger.readHead(state.project_id, documentId);
-    if (!head || head.kind !== "work_product") return false;
+    if (!head || head.kind !== "work_product") return null;
     const currentObservation = zone === "working" ? head.provider?.working : head.provider?.review;
-    if (sameObservation(currentObservation, metadata)) return false;
+    if (sameObservation(currentObservation, metadata)) return null;
 
     const parentVersionId = zone === "working" ? head.working_version_id : head.review_version_id;
-    if (!parentVersionId) return false;
+    if (!parentVersionId) return null;
     const parent = await this.requireVersion(state.project_id, documentId, parentVersionId);
     const evidence = requireDropboxV1Evidence(metadata);
     const versionId = await externalVersionIdFor(evidence.rev);
@@ -320,7 +344,7 @@ export class ManagedDocumentReconciler {
       }));
     }
     await this.ledger.writeHead(updateWorkHead(head, zone, versionId, visiblePath, metadata, "clean"));
-    return true;
+    return documentId;
   }
 
   private async captureReferenceEdit(
@@ -328,14 +352,14 @@ export class ManagedDocumentReconciler {
     relativePath: string,
     visiblePath: string,
     metadata: ProviderObjectMetadata
-  ): Promise<boolean> {
+  ): Promise<string | null> {
     const evidence = requireDropboxV1Evidence(metadata);
     const binding = await this.ledger.readProviderFileBinding(state.project_id, evidence.file_id);
     const directDocumentId = await documentIdForProviderFile(state.project_id, evidence.file_id);
     const documentId = binding?.document_id ?? directDocumentId;
     const head = await this.ledger.readHead(state.project_id, documentId);
-    if (!head || head.kind !== "reference" || !head.reference_version_id) return false;
-    if (sameObservation(head.provider?.reference, metadata)) return false;
+    if (!head || head.kind !== "reference" || !head.reference_version_id) return null;
+    if (sameObservation(head.provider?.reference, metadata)) return null;
     const parent = await this.requireVersion(state.project_id, documentId, head.reference_version_id);
 
     const versionId = await externalVersionIdFor(evidence.rev);
@@ -372,7 +396,7 @@ export class ManagedDocumentReconciler {
       document_id: documentId,
       version_id: versionId
     });
-    return true;
+    return documentId;
   }
 
   private async ingestInput(
@@ -479,13 +503,13 @@ export class ManagedDocumentReconciler {
     logicalPath: string,
     publishedPath: string,
     eventMetadata: ProviderObjectMetadata
-  ): Promise<"working" | "conflict" | "ignored"> {
+  ): Promise<{ outcome: "working" | "conflict" | "ignored"; document_id?: string }> {
     const documentId = await documentIdFor(state.project_id, logicalPath);
     const head = await this.ledger.readHead(state.project_id, documentId);
-    if (!head || head.kind !== "work_product" || !head.published_version_id) return "ignored";
+    if (!head || head.kind !== "work_product" || !head.published_version_id) return { outcome: "ignored" };
 
     const currentPublished = await this.metadataMaybe(publishedPath);
-    if (currentPublished && sameObservation(head.provider?.published, currentPublished)) return "ignored";
+    if (currentPublished && sameObservation(head.provider?.published, currentPublished)) return { outcome: "ignored" };
     const metadata = currentPublished ?? eventMetadata;
     const evidence = requireDropboxV1Evidence(metadata);
     const published = await this.requireVersion(state.project_id, documentId, head.published_version_id);
@@ -524,7 +548,7 @@ export class ManagedDocumentReconciler {
         },
         reconciliation_status: "clean"
       });
-      return "working";
+      return { outcome: "working", document_id: documentId };
     }
 
     if (!existing) {
@@ -544,7 +568,7 @@ export class ManagedDocumentReconciler {
       provider: { ...(head.provider ?? {}), published: observation(publishedPath, restoredMetadata) },
       reconciliation_status: "conflict"
     });
-    return "conflict";
+    return { outcome: "conflict", document_id: documentId };
   }
 
   private restorePublished(version: DocumentVersionRecord, publishedPath: string): Promise<ProviderObjectMetadata> {

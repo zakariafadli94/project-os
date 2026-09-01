@@ -6,6 +6,7 @@ import baseWorker from "./index";
 export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
 export { MutationGateProjectGuard as ProjectGuard } from "./durable/project-guard-mutation-gate";
 export { RegistryGuard } from "./durable/registry-guard";
+export { SearchIndexGuard } from "./search/search-index-guard";
 
 const OPERATOR_TOKEN_TTL_MS = 15 * 60_000;
 const OPERATOR_TOKEN_FUTURE_SKEW_MS = 60_000;

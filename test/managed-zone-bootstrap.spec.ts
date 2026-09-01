@@ -1,33 +1,82 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm } from "cloudflare:test";
-import { testEnv } from "./support/runtime-env";
-import { mock, resetMock, createProject, submit, at } from "./support/dropbox-mock";
-import { machineMaterializationHeadPath } from "../src/persistence/layout";
-import { CURRENT_PROJECTION_VERSION } from "../src/materialization/version";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Env } from "../src/env";
+import type { Receipt } from "../src/domain/receipt";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
+import {
+  machineMaterializationHeadPath,
+  workspaceManagedZoneRoot
+} from "../src/persistence/layout";
+import { installDropboxMock } from "./helpers/mock-dropbox";
+
+const testEnv = env as unknown as Env;
+const at = "2026-08-28T22:15:00+01:00";
+
+async function submit(projectId: string, transaction: unknown): Promise<Receipt> {
+  const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
+    "https://project-guard.internal/transaction",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(transaction)
+    }
+  );
+  expect(response.status).toBe(200);
+  return response.json<Receipt>();
+}
+
+async function createProject(slug: string): Promise<Receipt> {
+  const response = await testEnv.REGISTRY_GUARD.getByName("global").fetch(
+    "https://registry-guard.internal/create",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: "1.0",
+        transaction_id: "TXN-ACTIVATION-BOOTSTRAP-CREATE",
+        project_id: "PRJ-AUTO",
+        base_revision: 0,
+        operation: "project.create",
+        created_at: at,
+        payload: {
+          name: "Managed Zone Bootstrap",
+          slug,
+          aliases: [],
+          objective: "Prove managed workspace activation"
+        }
+      })
+    }
+  );
+  expect(response.status).toBe(200);
+  return response.json<Receipt>();
+}
 
 function expectedManagedDirectories(projectId: string, slug: string): string[] {
-  const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-${slug}`;
+  const references = workspaceManagedZoneRoot(projectId, slug, "references");
   return [
-    `${root}/INPUTS`,
-    `${root}/REFERENCES`,
-    `${root}/WORKING`,
-    `${root}/REVIEW`,
-    `${root}/DELIVERABLES`
+    workspaceManagedZoneRoot(projectId, slug, "inputs"),
+    references,
+    `${references}/UNCLASSIFIED`,
+    workspaceManagedZoneRoot(projectId, slug, "working"),
+    workspaceManagedZoneRoot(projectId, slug, "review"),
+    workspaceManagedZoneRoot(projectId, slug, "deliverables")
   ];
 }
 
 describe("projection-v2 managed-zone bootstrap", () => {
-  beforeEach(() => {
-    resetMock();
-  });
+  afterEach(() => vi.restoreAllMocks());
 
   it("provisions active managed zones before projection and does not reprovision during archive materialization", async () => {
+    const mock = installDropboxMock();
+    const baseImplementation = mock.spy.getMockImplementation();
+    if (!baseImplementation) throw new Error("Dropbox mock implementation missing");
     const directoryCalls: string[] = [];
-    const baseImplementation = mock.fetch.getMockImplementation();
-    if (!baseImplementation) throw new Error("Dropbox mock is not initialized");
-    mock.fetch.mockImplementation(async (input, init) => {
-      const request = input instanceof Request ? input : new Request(input, init);
-      if (request.url.endsWith("/files/create_folder_v2")) {
+
+    mock.spy.mockImplementation(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      const url = new URL(request.url);
+      if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/create_folder_v2") {
         const body = JSON.parse(await request.clone().text()) as { path?: string };
         if (body.path) directoryCalls.push(body.path);
       }

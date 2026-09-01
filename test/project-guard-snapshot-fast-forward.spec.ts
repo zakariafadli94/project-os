@@ -67,7 +67,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
         operation: "task.create",
         created_at: at,
         payload: {
-          task_id: `TASK-FASTFORWARD-${String(revision).padStart(3, "0")}`,
+          task_id: `TASK-FASTFORWARD${String(revision).padStart(3, "0")}`,
           title: `Synthetic canonical task ${revision}`
         }
       };
@@ -113,7 +113,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       base_revision: 12,
       operation: "task.create",
       created_at: at,
-      payload: { task_id: "TASK-FASTFORWARD-AFTER", title: "Continue from verified snapshot" }
+      payload: { task_id: "TASK-FASTFORWARDAFTER", title: "Continue from verified snapshot" }
     });
 
     expect(committed).toMatchObject({ status: "committed", previous_revision: 12, new_revision: 13 });

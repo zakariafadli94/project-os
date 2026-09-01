@@ -1,7 +1,8 @@
-import { documentIdFor, type ManagedProviderObservation } from "../domain/managed-document";
+import type { ManagedProviderObservation } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
 import { DocumentLedgerRepository } from "../documents/repository";
 import { sha256Text } from "../documents/hash";
+import { WorkProductIdentityResolver } from "../documents/work-product-identity";
 import { requireDropboxV1Evidence } from "../persistence/compatibility/dropbox-v1-evidence";
 import {
   toProviderObjectMetadata,
@@ -23,14 +24,20 @@ export type MutationGateClassification =
   | { kind: "governed_inflight"; requestId: string }
   | { kind: "external_candidate" };
 
+type StrictZone =
+  | { kind: "working" | "review" | "deliverables"; logicalPath: string }
+  | { kind: "artifacts" };
+
 export class MutationGateClassifier {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly documents: DocumentLedgerRepository;
+  private readonly workProducts: WorkProductIdentityResolver;
   private readonly mutations: MutationGateRepository;
 
   constructor(input: PersistenceInput) {
     this.runtime = asProjectOsPersistence(input);
     this.documents = new DocumentLedgerRepository(this.runtime);
+    this.workProducts = new WorkProductIdentityResolver(this.runtime);
     this.mutations = new MutationGateRepository(this.runtime);
   }
 
@@ -48,25 +55,54 @@ export class MutationGateClassifier {
     }
     const evidence = requireDropboxV1Evidence(metadata);
 
-    if (zone.kind === "deliverables") {
-      const documentId = await documentIdFor(state.project_id, zone.logicalPath);
-      const head = await this.documents.readHead(state.project_id, documentId);
-      if (head?.kind === "work_product" && head.published_version_id) {
-        if (sameObservation(head.provider?.published, metadata)) {
-          return { kind: "governed_current", documentId };
-        }
-        const version = await this.documents.readVersion(state.project_id, documentId, head.published_version_id);
-        if (
-          version
-          && version.provider_path === path
-          && version.provider_file_id === evidence.file_id
-          && version.provider_rev === evidence.rev
-          && version.provider_content_hash === evidence.content_hash
-          && version.size === evidence.size
-        ) {
-          return { kind: "governed_current", documentId };
+    if (zone.kind === "working" || zone.kind === "review" || zone.kind === "deliverables") {
+      const resolution = await this.workProducts.resolveVisible(
+        state.project_id,
+        zone.logicalPath,
+        path,
+        metadata
+      );
+      if (resolution.kind === "resolved" && resolution.head?.kind === "work_product") {
+        const head = resolution.head;
+        const versionId = zone.kind === "working"
+          ? head.working_version_id
+          : zone.kind === "review"
+            ? head.review_version_id
+            : head.published_version_id;
+        const observation = zone.kind === "working"
+          ? head.provider?.working
+          : zone.kind === "review"
+            ? head.provider?.review
+            : head.provider?.published;
+
+        if (versionId && observation) {
+          if (zone.kind !== "deliverables" && observation.file_id === evidence.file_id) {
+            // WORKING/REVIEW are editable collaboration zones. A new provider
+            // revision of the same governed object is captured by the document
+            // reconciler as a new immutable version rather than treated as an
+            // ungoverned competing head.
+            return { kind: "governed_current", documentId: resolution.documentId };
+          }
+          if (sameObservation(observation, metadata)) {
+            return { kind: "governed_current", documentId: resolution.documentId };
+          }
+          const version = await this.documents.readVersion(state.project_id, resolution.documentId, versionId);
+          if (
+            version
+            && version.provider_path === path
+            && version.provider_file_id === evidence.file_id
+            && version.provider_rev === evidence.rev
+            && version.provider_content_hash === evidence.content_hash
+            && version.size === evidence.size
+          ) {
+            return { kind: "governed_current", documentId: resolution.documentId };
+          }
         }
       }
+      // Unknown files, orphaned identities and a second visible path carrying an
+      // existing document_id are all deterministic external candidates. We do
+      // not infer lineage from filenames such as v0.1/v0.2.
+      return { kind: "external_candidate" };
     }
 
     const intents = await this.mutations.listArtifactIntentsForDestination(state.project_id, path);
@@ -111,13 +147,16 @@ function intentExplainsProviderChange(
     || metadata.size !== precondition.size;
 }
 
-function strictZone(
-  state: ProjectState,
-  path: string
-): { kind: "deliverables"; logicalPath: string } | { kind: "artifacts" } | null {
+function strictZone(state: ProjectState, path: string): StrictZone | null {
   const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
   if (!path.startsWith(root)) return null;
   const relative = path.slice(root.length);
+  if (relative.startsWith("WORKING/") && relative.length > "WORKING/".length) {
+    return { kind: "working", logicalPath: relative.slice("WORKING/".length) };
+  }
+  if (relative.startsWith("REVIEW/") && relative.length > "REVIEW/".length) {
+    return { kind: "review", logicalPath: relative.slice("REVIEW/".length) };
+  }
   if (relative.startsWith("DELIVERABLES/") && relative.length > "DELIVERABLES/".length) {
     return { kind: "deliverables", logicalPath: relative.slice("DELIVERABLES/".length) };
   }

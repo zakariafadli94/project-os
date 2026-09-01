@@ -21,6 +21,7 @@ import { verifyDropboxSignature } from "./webhook/dropbox";
 
 export { ProjectGuard } from "./durable/project-guard";
 export { RegistryGuard } from "./durable/registry-guard";
+export { SearchIndexGuard } from "./search/search-index-guard";
 export { inboxPath, artifactInboxPath } from "./inbox/processor";
 
 const worker = {

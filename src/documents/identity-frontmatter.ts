@@ -29,6 +29,11 @@ export interface ManagedMarkdownIdentity {
   logicalPath: string;
 }
 
+export interface VisibleManagedMarkdownIdentity {
+  projectId?: string;
+  documentId?: string;
+}
+
 export function enforceManagedMarkdownIdentity(
   content: string,
   identity: ManagedMarkdownIdentity
@@ -61,6 +66,26 @@ export function enforceManagedMarkdownIdentity(
   if (document === null) additions.push(`document_id: ${identity.documentId}`);
   const enrichedLines = [frontmatter.lines[0], ...additions, ...frontmatter.lines.slice(1)];
   return `${enrichedLines.join(newline)}${frontmatter.rest}`;
+}
+
+export function readManagedMarkdownIdentity(
+  content: string,
+  logicalPath: string
+): VisibleManagedMarkdownIdentity | null {
+  if (!isMarkdownPath(logicalPath)) return null;
+  const newline = content.includes("\r\n") ? "\r\n" : "\n";
+  const frontmatter = readFrontmatter(content, newline);
+  if (!frontmatter) return null;
+
+  const projects = findScalars(frontmatter.lines, "project_id");
+  const documents = findScalars(frontmatter.lines, "document_id");
+  const projectId = uniqueScalar(projects, "project_id");
+  const documentId = uniqueScalar(documents, "document_id");
+  if (projectId === undefined && documentId === undefined) return null;
+  return {
+    ...(projectId !== undefined ? { projectId } : {}),
+    ...(documentId !== undefined ? { documentId } : {})
+  };
 }
 
 export function assertManagedMarkdownIdentityIfPresent(
@@ -114,6 +139,15 @@ function findScalars(lines: string[], key: string): string[] {
     values.push(decodeScalar(raw));
   }
   return values;
+}
+
+function uniqueScalar(values: string[], field: string): string | undefined {
+  if (values.length === 0) return undefined;
+  const first = values[0];
+  if (values.some((value) => value !== first)) {
+    throw new Error(`Managed document ${field} frontmatter contains contradictory values`);
+  }
+  return first;
 }
 
 function assertAllIdentityValues(

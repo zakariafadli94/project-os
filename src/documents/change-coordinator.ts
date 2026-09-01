@@ -26,6 +26,10 @@ import {
   ManagedDocumentReconciler,
   type ManagedDocumentReconcileSummary
 } from "./reconciler";
+import {
+  StableWorkProductReconciler,
+  type StableWorkProductReconcileResult
+} from "./stable-work-product-reconciler";
 
 const LEGACY_CURSOR_KEY = "managed-document-change-cursor-v1";
 
@@ -56,6 +60,7 @@ interface BootstrapCandidate {
 export class ManagedDocumentChangeCoordinator {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly reconciler: ManagedDocumentReconciler;
+  private readonly stableWorkProducts: StableWorkProductReconciler;
   private readonly bootstrapper: ManagedDocumentBootstrapper;
   private readonly mutationClassifier: MutationGateClassifier;
   private readonly mutationGate: MutationGateService;
@@ -69,6 +74,7 @@ export class ManagedDocumentChangeCoordinator {
   ) {
     this.runtime = asProjectOsPersistence(input);
     this.reconciler = new ManagedDocumentReconciler(this.runtime);
+    this.stableWorkProducts = new StableWorkProductReconciler(this.runtime);
     this.bootstrapper = new ManagedDocumentBootstrapper(this.runtime);
     this.mutationClassifier = new MutationGateClassifier(this.runtime);
     this.mutationGate = new MutationGateService(this.runtime, gateMode);
@@ -166,8 +172,9 @@ export class ManagedDocumentChangeCoordinator {
     const detectionSource = cursorReset ? "cursor_reset" : baseline ? "baseline" : "incremental";
     const gate = await this.mutationGate.processChanges(state, page.entries, detectionSource);
     accumulateGate(summary, gate);
-    if (baseline) summary.bootstrapped += await this.bootstrapBaseline(state, page.entries);
-    accumulateReconcile(summary, await this.reconciler.reconcileChanges(state, page.entries));
+    const unhandled = await this.reconcileStableChanges(state, page.entries, summary);
+    if (baseline) summary.bootstrapped += await this.bootstrapBaseline(state, unhandled);
+    accumulateReconcile(summary, await this.reconciler.reconcileChanges(state, unhandled));
 
     summary.cursor_reset = cursorReset;
     summary.baseline = baseline;
@@ -240,12 +247,32 @@ export class ManagedDocumentChangeCoordinator {
     const gate = await this.mutationGate.processChanges(state, [job.change], job.detection_source);
     accumulateGate(summary, gate);
 
+    const stable = await this.stableWorkProducts.reconcile(state, job.change);
+    if (stable.handled) {
+      accumulateStable(summary, stable);
+      return;
+    }
+
     if (job.detection_source !== "incremental") {
       summary.bootstrapped += await this.bootstrapOne(state, job.change);
     }
 
     const reconciled = await this.reconciler.reconcileChanges(state, [job.change]);
     accumulateReconcile(summary, reconciled);
+  }
+
+  private async reconcileStableChanges(
+    state: ProjectState,
+    changes: ProviderChangeEntry[],
+    summary: ManagedDocumentChangeSummary
+  ): Promise<ProviderChangeEntry[]> {
+    const unhandled: ProviderChangeEntry[] = [];
+    for (const change of changes) {
+      const stable = await this.stableWorkProducts.reconcile(state, change);
+      if (stable.handled) accumulateStable(summary, stable);
+      else unhandled.push(change);
+    }
+    return unhandled;
   }
 
   private async bootstrapBaseline(state: ProjectState, changes: ProviderChangeEntry[]): Promise<number> {
@@ -317,6 +344,14 @@ function accumulateGate(target: ManagedDocumentChangeSummary, source: MutationGa
   if (source.last_candidate_detection_source) {
     target.last_candidate_detection_source = source.last_candidate_detection_source;
   }
+}
+
+function accumulateStable(target: ManagedDocumentChangeSummary, source: StableWorkProductReconcileResult): void {
+  target.scanned += 1;
+  target.captured += source.captured;
+  target.restored += source.restored;
+  target.conflicts += source.conflicts;
+  if (source.captured === 0 && source.restored === 0 && source.conflicts === 0) target.ignored += 1;
 }
 
 function accumulateReconcile(target: ManagedDocumentChangeSummary, source: ManagedDocumentReconcileSummary): void {

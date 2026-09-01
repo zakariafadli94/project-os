@@ -1,6 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import type { CanonicalSnapshotRequest, DocumentBatchRequest } from "./contract";
+import {
+  parseSearchQuery,
+  type CanonicalSnapshotRequest,
+  type DocumentBatchRequest
+} from "./contract";
 import { initializeSearchIndexSchema, SearchIndexStore } from "./sqlite-store";
 
 export class SearchIndexGuard extends DurableObject<Env> {
@@ -31,6 +35,11 @@ export class SearchIndexGuard extends DurableObject<Env> {
         const body = await request.json() as DocumentBatchRequest;
         const result = this.store.applyDocuments(body);
         return Response.json({ ...result, project: this.store.status(body.project_id) });
+      }
+
+      if (request.method === "POST" && url.pathname === "/search") {
+        const query = parseSearchQuery(await request.json());
+        return Response.json({ hits: this.store.search(query) });
       }
 
       return Response.json({ error: "not_found" }, { status: 404 });

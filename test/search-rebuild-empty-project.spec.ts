@@ -11,20 +11,21 @@ const authHeaders = {
   "content-type": "application/json"
 };
 
-async function createEmptyProject(): Promise<string> {
+async function createProject(label: string): Promise<string> {
+  const suffix = label.toLowerCase();
   const response = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
     method: "POST",
     headers: authHeaders,
     body: JSON.stringify({
       schema_version: "1.0",
-      transaction_id: "TXN-SEARCH-REBUILD-EMPTY-PROJECT",
+      transaction_id: `TXN-SEARCH-REBUILD-EMPTY-${label}`,
       project_id: "PRJ-AUTO",
       base_revision: 0,
       operation: "project.create",
       created_at: "2026-09-01T15:00:00+01:00",
       payload: {
-        name: "Search Rebuild Empty Project",
-        slug: "search-rebuild-empty-project",
+        name: `Search Rebuild Empty ${label}`,
+        slug: `search-rebuild-empty-${suffix}`,
         aliases: [],
         objective: "Rebuild search without managed documents"
       }
@@ -37,16 +38,24 @@ async function createEmptyProject(): Promise<string> {
   return receipt.project_id;
 }
 
-describe("SearchIndex rebuild for an empty project", () => {
+describe("SearchIndex rebuild for an empty core_v2-floor project", () => {
   beforeEach(() => installDropboxMock());
   afterEach(() => vi.restoreAllMocks());
 
-  it("starts a generation-safe rebuild after the initial empty-document search generation", async () => {
-    const projectId = await createEmptyProject();
+  it("starts a generation-safe rebuild for empty PRJ-0005 after initial search convergence", async () => {
+    for (let index = 1; index <= 4; index += 1) {
+      await createProject(`SEED-${index}`);
+    }
+    const projectId = await createProject("TARGET");
+    expect(projectId).toBe("PRJ-0005");
+
     const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
       if (!await runDurableObjectAlarm(projectGuard)) break;
     }
+
+    const sourceResponse = await projectGuard.fetch("https://project-guard.internal/search-sync-status");
+    const sourceDiagnostic = await sourceResponse.clone().text();
 
     const searchGuard = testEnv.SEARCH_INDEX_GUARD.getByName("global");
     const response = await searchGuard.fetch("https://search-index.internal/rebuild-project", {
@@ -54,9 +63,14 @@ describe("SearchIndex rebuild for an empty project", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ project_id: projectId })
     });
-    const diagnostic = await response.clone().text();
+    const rebuildDiagnostic = await response.clone().text();
 
-    expect(response.status, diagnostic).toBe(202);
+    if (response.status !== 202) {
+      throw new Error(
+        `EMPTY_PRJ0005_REBUILD status=${response.status} source=${sourceDiagnostic} rebuild=${rebuildDiagnostic}`
+      );
+    }
+
     await expect(response.json()).resolves.toMatchObject({
       project_id: projectId,
       active_generation: 1,

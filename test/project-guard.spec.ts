@@ -1,8 +1,9 @@
 import { env } from "cloudflare:workers";
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { evictDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
+import { machineStatePath } from "../src/persistence/layout";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -89,7 +90,6 @@ describe("ProjectGuard", () => {
 
   it("normalizes legacy stored state on read without changing revision or inventing deliverable acceptance", async () => {
     const projectId = "PRJ-1097";
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
     const legacyState = {
       schema_version: "1.0",
       project_id: projectId,
@@ -119,12 +119,7 @@ describe("ProjectGuard", () => {
       updated_at: at
     };
 
-    await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec(
-        "INSERT INTO project_state (singleton, state_json) VALUES (1, ?)",
-        JSON.stringify(legacyState)
-      );
-    });
+    dropbox.files.set(machineStatePath(projectId), `${JSON.stringify(legacyState, null, 2)}\n`);
 
     const result = await materialize(projectId);
     expect(result).toEqual({ project_id: projectId, revision: 7, materialized: true });

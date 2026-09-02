@@ -87,8 +87,9 @@ describe("projection-v2 managed-zone bootstrap", () => {
     const created = await createProject(slug);
     expect(created).toMatchObject({ status: "committed", previous_revision: 0, new_revision: 1 });
     const projectId = created.project_id;
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
 
     expect(directoryCalls).toEqual(expectedManagedDirectories(projectId, slug));
     const activeHead = JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}");
@@ -99,9 +100,9 @@ describe("projection-v2 managed-zone bootstrap", () => {
     });
 
     directoryCalls.length = 0;
-    const reconcile = await stub.fetch("https://project-guard.internal/reconcile-materialization", { method: "POST" });
+    const reconcile = await projectStub.fetch("https://project-guard.internal/reconcile-materialization", { method: "POST" });
     expect(reconcile.status).toBe(200);
-    expect(await runDurableObjectAlarm(stub)).toBe(false);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(false);
     expect(directoryCalls).toEqual([]);
 
     const archived = await submit(projectId, {
@@ -114,7 +115,7 @@ describe("projection-v2 managed-zone bootstrap", () => {
       payload: { reason: "Verify archived projection does not provision active zones" }
     });
     expect(archived).toMatchObject({ status: "committed", previous_revision: 1, new_revision: 2 });
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
     expect(directoryCalls).toEqual([]);
   });
 });

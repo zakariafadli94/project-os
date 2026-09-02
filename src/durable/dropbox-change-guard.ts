@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { processDurableInbox } from "../inbox/runtime";
 import { reconcileManagedDocuments } from "../index-neutral";
 
 const REQUESTED_GENERATION_KEY = "dropbox-change-requested-generation-v1";
@@ -17,6 +18,8 @@ export interface DropboxChangeGuardStatus {
 }
 
 export class DropboxChangeGuard extends DurableObject<Env> {
+  private workQueue: Promise<void> = Promise.resolve();
+
   constructor(ctx: DurableObjectState, private readonly runtimeEnv: Env) {
     super(ctx, runtimeEnv);
   }
@@ -39,6 +42,10 @@ export class DropboxChangeGuard extends DurableObject<Env> {
       });
     }
 
+    if (request.method === "POST" && url.pathname === "/process-inbox") {
+      return this.serializeWork(async () => Response.json(await processDurableInbox(this.runtimeEnv)));
+    }
+
     if (request.method === "GET" && url.pathname === "/status") {
       return Response.json(await this.status());
     }
@@ -47,6 +54,10 @@ export class DropboxChangeGuard extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    return this.serializeWork(() => this.reconcileChanges());
+  }
+
+  private async reconcileChanges(): Promise<void> {
     const requestedGeneration = await this.ctx.storage.get<number>(REQUESTED_GENERATION_KEY) ?? 0;
     const completedGeneration = await this.ctx.storage.get<number>(COMPLETED_GENERATION_KEY) ?? 0;
     if (requestedGeneration <= completedGeneration) {
@@ -99,6 +110,18 @@ export class DropboxChangeGuard extends DurableObject<Env> {
   private async ensureAlarm(): Promise<void> {
     if (await this.ctx.storage.getAlarm() === null) {
       await this.ctx.storage.setAlarm(Date.now() + CHANGE_ALARM_DELAY_MS);
+    }
+  }
+
+  private async serializeWork<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.workQueue;
+    let release!: () => void;
+    this.workQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 }

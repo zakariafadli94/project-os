@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Env } from "../src/env";
@@ -187,6 +187,23 @@ describe("MaterializationGuard isolation boundary", () => {
       project_id: projectId,
       canonical_revision: 1,
       requested: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION }
+    });
+  });
+
+  it("keeps projection hot state out of ProjectGuard", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3908";
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+
+    const receipt = await createProject(projectId, "project-guard-canonical-only", "TXN-MATISO-3908-CREATE");
+    expect(receipt).toMatchObject({ status: "committed", new_revision: 1 });
+
+    await runInDurableObject(projectGuard, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).toBeNull();
+      const materializationTables = state.storage.sql.exec<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'materialization_%' ORDER BY name"
+      ).toArray();
+      expect(materializationTables).toEqual([]);
     });
   });
 

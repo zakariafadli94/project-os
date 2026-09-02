@@ -5,6 +5,7 @@ import worker, {
   type MaterializationReconcileSummary
 } from "../src/index";
 import type { Env } from "../src/env";
+import { processDurableInbox } from "../src/inbox/runtime";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 interface FakeProjectBehavior {
@@ -92,7 +93,20 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
     PROJECT_OS_CONTINUITY_MODE: "stable",
     REGISTRY_GUARD: { getByName: () => registryStub },
     PROJECT_GUARD: projectNamespace,
-    MATERIALIZATION_GUARD: materializationNamespace
+    MATERIALIZATION_GUARD: materializationNamespace,
+    DROPBOX_CHANGE_GUARD: {
+      getByName() {
+        return {
+          fetch: vi.fn(async (input: RequestInfo | URL) => {
+            const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+            if (url.pathname === "/process-inbox") {
+              return Response.json(await processDurableInbox(env));
+            }
+            return Response.json({ error: "not_found" }, { status: 404 });
+          })
+        };
+      }
+    }
   } as unknown as Env;
 
   return { env, calls, maxInFlight: () => maxInFlight };

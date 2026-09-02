@@ -1,6 +1,6 @@
 import type { Env } from "./env";
-import { processReferralInbox } from "./inbox/referral-processor";
-import { artifactInboxPath, inboxPath, type InboxProcessSummary } from "./inbox/processor";
+import type { DurableInboxProcessSummary } from "./inbox/runtime";
+import { artifactInboxPath, inboxPath } from "./inbox/processor";
 import neutralWorker, { reconcileMaterializations } from "./index-neutral";
 import { parseLayoutMode } from "./persistence/layout";
 import { verifyDropboxSignature } from "./webhook/dropbox";
@@ -22,12 +22,14 @@ const worker = {
 
       const changeGuard = env.DROPBOX_CHANGE_GUARD.getByName("global");
       const handoff = await changeGuard.fetch("https://dropbox-change-guard.internal/notify", { method: "POST" });
+      const handoffStatus = handoff.status;
+      await handoff.text();
       if (!handoff.ok) {
-        console.error("Project OS Dropbox webhook durable handoff failed", { status: handoff.status });
+        console.error("Project OS Dropbox webhook durable handoff failed", { status: handoffStatus });
         return Response.json({ error: "durable_change_handoff_failed" }, { status: 503 });
       }
 
-      ctx.waitUntil(processInboxFirst(env, ctx).catch((error) => {
+      ctx.waitUntil(processInboxThroughGuard(env).catch((error) => {
         console.error("Project OS webhook inbox processing failed", {
           message: error instanceof Error ? error.message : String(error)
         });
@@ -36,7 +38,19 @@ const worker = {
     }
 
     if (request.method === "POST" && url.pathname === "/v1/admin/process-inbox") {
-      return processInboxRequest(request, env, ctx);
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const mode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
+      try {
+        return Response.json(await processInboxThroughGuard(env));
+      } catch (error) {
+        return Response.json({
+          error: "inbox_processing_failed",
+          mode,
+          inbox: inboxPath(mode),
+          artifact_inbox: artifactInboxPath(mode),
+          message: error instanceof Error ? error.message : String(error)
+        }, { status: 502 });
+      }
     }
 
     return neutralWorker.fetch(request, env, ctx);
@@ -53,7 +67,7 @@ const worker = {
 
     ctx.waitUntil((async () => {
       try {
-        const inbox = await processInboxFirst(env, ctx);
+        const inbox = await processInboxThroughGuard(env);
         const materialization = await reconcileMaterializations(env);
         console.info("Project OS scheduled maintenance completed", { inbox, materialization });
       } catch (error) {
@@ -69,34 +83,31 @@ const worker = {
 
 export default worker;
 
-async function processInboxRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const base = await neutralWorker.fetch(request, env, ctx);
-  if (!base.ok) return base;
-
-  const existing = await base.json<InboxProcessSummary & Record<string, unknown>>();
-  const referral = await processReferralInbox(env);
-  return Response.json({
-    ...existing,
-    scanned: existing.scanned + referral.scanned,
-    processed: existing.processed + referral.processed,
-    failed: existing.failed + referral.failed
-  });
+async function processInboxThroughGuard(env: Env): Promise<DurableInboxProcessSummary> {
+  const response = await env.DROPBOX_CHANGE_GUARD.getByName("global").fetch(
+    "https://dropbox-change-guard.internal/process-inbox",
+    { method: "POST" }
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`DropboxChangeGuard inbox processing returned ${response.status}: ${body.slice(0, 500)}`);
+  }
+  return JSON.parse(body) as DurableInboxProcessSummary;
 }
 
-async function processInboxFirst(env: Env, ctx: ExecutionContext): Promise<InboxProcessSummary> {
-  const response = await processInboxRequest(new Request("https://project-os.internal/v1/admin/process-inbox", {
-    method: "POST",
-    headers: { authorization: `Bearer ${env.INGRESS_TOKEN}` }
-  }), env, ctx);
+function authorized(request: Request, env: Env): boolean {
+  const authorization = request.headers.get("authorization");
+  return Boolean(authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`));
+}
 
-  if (!response.ok) {
-    throw new Error(`Project OS inbox processing returned ${response.status}`);
+function secureStringEqual(left: string, right: string): boolean {
+  const encoder = new TextEncoder();
+  const a = encoder.encode(left);
+  const b = encoder.encode(right);
+  const length = Math.max(a.length, b.length);
+  let difference = a.length ^ b.length;
+  for (let index = 0; index < length; index += 1) {
+    difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
   }
-
-  const summary = await response.json<InboxProcessSummary>();
-  return {
-    scanned: summary.scanned,
-    processed: summary.processed,
-    failed: summary.failed
-  };
+  return difference === 0;
 }

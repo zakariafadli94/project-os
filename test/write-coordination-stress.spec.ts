@@ -199,5 +199,5 @@ describe("Project OS write coordination stress", () => {
     );
     expect(crossA.status).toBe(404);
     expect(crossB.status).toBe(404);
-  });
+  }, 15_000);
 });

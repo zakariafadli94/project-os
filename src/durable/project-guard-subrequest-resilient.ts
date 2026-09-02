@@ -1,6 +1,7 @@
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
+import { parseTransaction, type Transaction } from "../domain/transaction";
 import {
   isWorkingHeadOperation,
   parseWorkingHeadRequest,
@@ -32,7 +33,6 @@ interface WorkingHeadTerminalReceipt {
 type WorkingHeadOperationReceipt = ManagedDocumentReceipt | WorkingHeadTerminalReceipt;
 
 const FAST_FORWARD_PATHS = new Set([
-  "/transaction",
   "/artifact",
   "/document",
   "/referral",
@@ -80,6 +80,16 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === "POST" && url.pathname === "/transaction") {
+      const transaction = await inspectTransaction(request.clone());
+      return this.serializeRecovery(async () => {
+        if (transaction && this.shouldFastForwardTransaction(transaction)) {
+          await this.fastForwardFromVerifiedMachineSnapshot();
+        }
+        return super.fetch(request);
+      });
+    }
+
     if (request.method === "POST" && url.pathname === "/document") {
       const inspected = await inspectWorkingHeadRequest(request.clone());
       if (inspected.kind === "invalid") {
@@ -103,6 +113,21 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       });
     }
     return super.fetch(request);
+  }
+
+  private shouldFastForwardTransaction(transaction: Transaction): boolean {
+    if (this.layoutMode !== "v2") return false;
+    const projectId = this.ctx.id.name;
+    if (!projectId || projectId === "PRJ-AUTO" || transaction.project_id !== projectId) return false;
+
+    const localRevision = this.localRevision();
+    if (localRevision < 0) {
+      // Cold caches with a non-zero client base can jump directly to a verified
+      // snapshot. project.create/base=0 stays on the base guard's normal cold
+      // initialization path and avoids a redundant snapshot read.
+      return transaction.base_revision > 0;
+    }
+    return transaction.base_revision > localRevision;
   }
 
   private async handleWorkingHead(operation: WorkingHeadRequest): Promise<Response> {
@@ -306,6 +331,20 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
 
 interface JsonReadableRequest {
   json(): Promise<unknown>;
+}
+
+async function inspectTransaction(request: JsonReadableRequest): Promise<Transaction | null> {
+  let raw: unknown;
+  try {
+    raw = await request.json();
+  } catch {
+    return null;
+  }
+  try {
+    return parseTransaction(raw);
+  } catch {
+    return null;
+  }
 }
 
 async function inspectWorkingHeadRequest(request: JsonReadableRequest): Promise<

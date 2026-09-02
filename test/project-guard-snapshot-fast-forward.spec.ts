@@ -128,4 +128,74 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
     expect(new Set(commitReads).size).toBeLessThanOrEqual(2);
     expect(commitReads.length).toBeLessThanOrEqual(3);
   });
+
+  it("keeps a current-revision real commit minimal and preserves stale conflicts", async () => {
+    const projectId = "PRJ-0006";
+    const mock = installDropboxMock();
+    const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+
+    const created = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-HOTPATH-0001-CREATE",
+      project_id: projectId,
+      base_revision: 0,
+      operation: "project.create",
+      created_at: at,
+      payload: {
+        name: "Commit Hot Path",
+        slug: "commit-hot-path",
+        aliases: [],
+        objective: "Bound provider I/O for current-revision commits"
+      }
+    });
+    expect(created).toMatchObject({ status: "committed", new_revision: 1 });
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+
+    mock.calls.length = 0;
+    mock.downloadCalls.length = 0;
+    mock.uploadCalls.length = 0;
+
+    const committed = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-HOTPATH-0002-COMMIT",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "task.create",
+      created_at: at,
+      payload: {
+        task_id: "TASK-HOTPATH001",
+        title: "Current revision commit"
+      }
+    });
+
+    expect(committed).toMatchObject({ status: "committed", previous_revision: 1, new_revision: 2 });
+    expect(mock.downloadCalls).not.toContain(machineStatePath(projectId));
+
+    const nextCommitPath = machineCommitRecordPath(projectId, 2);
+    expect(mock.downloadCalls.filter((path) => path === nextCommitPath)).toHaveLength(1);
+
+    const providerCalls = mock.calls.filter((call) => call.startsWith("POST /2/files/"));
+    expect(providerCalls).toHaveLength(3);
+
+    mock.uploadCalls.length = 0;
+    const stale = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-HOTPATH-0003-STALE",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "task.complete",
+      created_at: at,
+      payload: {
+        task_id: "TASK-HOTPATH001"
+      }
+    });
+
+    expect(stale).toMatchObject({
+      status: "conflict",
+      code: "STALE_REVISION",
+      previous_revision: 2,
+      new_revision: 2
+    });
+    expect(mock.uploadCalls).not.toContain(machineCommitRecordPath(projectId, 3));
+  });
 });

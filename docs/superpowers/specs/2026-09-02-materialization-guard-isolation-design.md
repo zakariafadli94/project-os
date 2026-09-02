@@ -2,22 +2,20 @@
 
 ## Status
 
-Architecture approved in chat on 2026-09-02. This written specification is the review gate before implementation planning. It does not itself authorize runtime changes, production deployment, or canonical Project OS state mutation.
+Architecture accepted in chat on 2026-09-02 for staged R0 implementation and verification. This specification documents the corrective boundary; it does not itself authorize production deployment or canonical Project OS state mutation.
 
 ## Incident context
 
-PRJ-0003 repeatedly hit Cloudflare's external subrequest ceiling while ProjectGuard attempted to process otherwise ordinary typed transactions. Successive production-safe diagnostics proved that the failure occurs on the **first Dropbox `files/download` request inside ProjectGuard**, before the transaction performs any meaningful canonical work.
-
-The critical observed signal is:
+PRJ-0003 repeatedly hit Cloudflare's external subrequest ceiling while ProjectGuard attempted to process otherwise ordinary typed transactions. Production diagnostics repeatedly surfaced the failure while attempting Dropbox `files/download` for the project machine state, with messages shaped like:
 
 ```text
 Dropbox HTTP files/download request #1 for .../PRJ-0003/state.json failed:
 Too many subrequests by single Worker invocation.
 ```
 
-This rules out a transaction-local 50-call loop. It also rules out canonical commit replay as the primary cause: PRJ-0003's machine snapshot and immutable commit ledger were current and contiguous. A prior correction serialized ProjectGuard's materialization alarm with transaction fast-forward work, but production still reproduced the same request-#1 exhaustion.
+The `request #1` portion was initially over-interpreted. The old diagnostic counter reset inside every `download()` call, and several other Dropbox methods used raw `fetch()` rather than the instrumented wrapper. Therefore that message did **not** establish that the failing download was the first outbound request of the Worker/Durable Object invocation, and it did not by itself rule out transaction-local or shared-context fan-out.
 
-The remaining root cause is architectural coupling: canonical mutation and potentially heavy projection/materialization work share one ProjectGuard Durable Object instance and therefore one Cloudflare I/O context across concurrent requests. Promise queues prevent application-level overlap, but they do not create an independent runtime I/O context.
+R0 first corrects that observability defect: all Dropbox outbound HTTP calls are counted through one wrapper, the counter is reset only at an explicit serialized top-level ProjectGuard request boundary, and failures include operation/path context. MaterializationGuard isolation is then the bounded architectural correction under test because projection/materialization is a plausible source of shared I/O-context pressure. If production evidence after isolation still shows exhaustion inside the canonical path, the corrected diagnostics are intended to locate that path rather than forcing the projection hypothesis.
 
 ## Relationship to the accepted roadmap
 
@@ -34,7 +32,7 @@ The only material change is the Cloudflare execution boundary used for projectio
 
 ## Goal
 
-Separate canonical Project OS mutation work from projection/materialization work so that heavy Dropbox projection I/O cannot exhaust the external-subrequest budget available to ProjectGuard transaction processing.
+Separate canonical Project OS mutation work from projection/materialization work so that heavy Dropbox projection I/O cannot consume the same execution context as ProjectGuard transaction processing, while retaining corrected diagnostics for any remaining canonical-path exhaustion.
 
 After the change:
 
@@ -69,6 +67,7 @@ ProjectGuard and MaterializationGuard are separate Durable Object classes and se
 9. **Fail closed on binding mismatch.** A MaterializationGuard request naming a different project than its Durable Object name is rejected.
 10. **The current `IMP-INDEX001` work is not implicitly modified or completed by this corrective change.**
 11. **Provider-I/O routes inside MaterializationGuard are serialized within that guard.** Projection/status/reconcile requests may contend with each other, but that contention is isolated from ProjectGuard's canonical I/O context.
+12. **Dropbox request diagnostics must be operation-scoped, complete across Dropbox endpoints, and must not add external provider I/O.**
 
 ## Chosen architecture
 
@@ -144,6 +143,8 @@ If the handoff fails **after** the immutable canonical commit is durable:
 
 ProjectGuard no longer creates/runs a local materialization coordinator and no longer owns a projection alarm.
 
+The internal handoff response must be consumed or cancelled before returning so it cannot leave an in-flight Durable Object response that interferes with eviction/cold-start recovery.
+
 ### 4. MaterializationGuard target handling
 
 `POST /request-target` must be idempotent and monotonic for a projection version:
@@ -169,7 +170,7 @@ Its `alarm()` executes bounded materialization work through the existing coordin
 - retry/defer behavior;
 - coalescing of newer revisions.
 
-No ProjectGuard alarm should perform projection Dropbox I/O after cutover.
+No ProjectGuard alarm should perform projection Dropbox I/O after cutover. A legacy ProjectGuard alarm that was persisted before cutover is drained without projection provider I/O.
 
 ### 6. Status and reconciliation routing
 
@@ -195,7 +196,7 @@ POST /request-target
 - blocked_error;
 - output counts.
 
-To report `canonical_revision`, MaterializationGuard reads canonical machine state using its **own** persistence/I/O context. That read is deliberately outside ProjectGuard.
+To report `canonical_revision`, MaterializationGuard reads canonical machine state/immutable commit truth using its **own** persistence/I/O context. That read is deliberately outside ProjectGuard.
 
 All MaterializationGuard routes that can perform provider I/O, including status reconstruction/reconciliation and `alarm()`, pass through the same guard-local serialization queue. This protects its own projection consistency without coupling its budget to ProjectGuard.
 
@@ -289,16 +290,16 @@ Structured logs for projection handoff/execution should include when available:
 - materialization generation/head revision;
 - provider failure message.
 
-The existing Dropbox runtime request diagnostic remains in place during rollout because it is useful evidence that canonical ProjectGuard I/O no longer begins with an already exhausted context.
+Dropbox runtime request diagnostics remain in place during rollout. Their request index is meaningful only within the explicit traced top-level ProjectGuard operation, and the endpoint/path/operation context—not an isolated `#1` value—is the evidence used to diagnose any remaining provider exhaustion.
 
 ## TDD and verification plan
 
-Implementation begins with failing tests demonstrating the new boundary.
+Implementation begins with failing tests demonstrating the new boundary and preserves existing failing regressions as RED evidence while fixing them.
 
 Required regression tests:
 
 1. **separate DO binding** — projection target scheduling from a canonical commit calls `MATERIALIZATION_GUARD`, not ProjectGuard's local materialization coordinator;
-2. **no ProjectGuard projection alarm** — running the ProjectGuard alarm cannot perform projection Dropbox reads/writes;
+2. **no ProjectGuard projection alarm** — running a ProjectGuard legacy alarm cannot perform projection Dropbox reads/writes;
 3. **MaterializationGuard alarm owns projection I/O** — its alarm advances/resumes a generation and writes normal projection evidence;
 4. **canonical commit independent of projection handoff failure** — forced MaterializationGuard scheduling failure leaves the canonical transaction receipt committed;
 5. **reconciliation repairs missed handoff** — current canonical revision with stale projection head is re-requested by MaterializationGuard reconciliation;
@@ -307,9 +308,11 @@ Required regression tests:
 8. **binding mismatch** — wrong project ID is rejected without provider mutation;
 9. **guard-local serialization** — a MaterializationGuard alarm and a provider-I/O status/reconcile request do not overlap provider operations inside that guard;
 10. **compatibility forwarding** — legacy ProjectGuard projection routes, if retained, forward to MaterializationGuard without local Dropbox projection I/O;
-11. **existing Projection Engine fault tests remain green**;
-12. **existing canonical crash/recovery/high-risk tests remain green**;
-13. **production canary** — after deploy, a stale/rejected PRJ-0003 transaction can reach ProjectGuard and return its expected business conflict/rejection instead of `files/download request #1` subrequest exhaustion.
+11. **handoff drainage** — eviction/cold-start tests do not stall on an unread internal MaterializationGuard response body;
+12. **complete Dropbox diagnostics** — multiple provider endpoints share a monotonic request sequence inside a traced ProjectGuard operation and report endpoint/path/operation context;
+13. **existing Projection Engine fault tests remain green**;
+14. **existing canonical crash/recovery/high-risk tests remain green**;
+15. **production canary** — after deploy, a stale/rejected PRJ-0003 transaction reaches normal ProjectGuard business validation instead of subrequest exhaustion during the Dropbox canonical read path.
 
 Repository verification gates remain:
 
@@ -323,17 +326,18 @@ Production gate additionally requires exact Git SHA deployment identity + `/heal
 
 ## Rollout sequence
 
-1. Add tests that fail on the current single-DO architecture.
-2. Add `MaterializationGuard` class/binding using the repository's existing `state: created` / SQLite DO declaration pattern and move coordinator/alarm ownership.
-3. Change ProjectGuard commit scheduling to internal target handoff.
-4. Reroute worker materialization reconcile/materialize/status calls.
-5. Preserve compatibility forwarding where required.
-6. Run full CI/high-risk/dry-run gates.
-7. Merge with exact head SHA protection.
-8. Deploy exact Git release and verify health/identity.
-9. Run a **non-mutating/stale PRJ-0003 canary first**. Expected result: normal ProjectGuard business conflict/rejection, not subrequest exhaustion.
-10. Only after that proof, refresh PRJ-0003 revision and reconstruct any still-valid quarantined business intents with new transaction IDs/base revisions as required by concurrency rules.
-11. Record the material architecture/infrastructure change canonically in PRJ-0002 with exact PR/SHA/CI/deployment evidence.
+1. Correct Dropbox request instrumentation and establish operation-scoped diagnostics.
+2. Add tests that fail on the current single-DO architecture.
+3. Add `MaterializationGuard` class/binding using the repository's existing `state: created` / SQLite DO declaration pattern and move coordinator/alarm ownership.
+4. Change ProjectGuard commit scheduling to internal target handoff.
+5. Reroute worker materialization reconcile/materialize/status calls.
+6. Preserve compatibility forwarding and legacy-alarm drainage where required.
+7. Run full CI/high-risk/dry-run gates on the exact head.
+8. Merge with exact head SHA protection.
+9. Deploy exact Git release and verify health/identity.
+10. Run a **non-mutating/stale PRJ-0003 canary first**. Expected result: normal ProjectGuard business conflict/rejection, not subrequest exhaustion.
+11. Only after that proof, refresh PRJ-0003 revision and reconstruct any still-valid quarantined business intents with new transaction IDs/base revisions as required by concurrency rules.
+12. Record the material architecture/infrastructure change canonically in PRJ-0002 with exact PR/SHA/CI/deployment evidence.
 
 ## Non-goals
 
@@ -352,9 +356,10 @@ The correction is complete only when all of the following are true:
 
 - ProjectGuard canonical transaction processing no longer shares projection execution state/alarm ownership;
 - materialization runs in a separately bound Durable Object;
-- full repository verification is green;
+- Dropbox diagnostics report a complete operation-scoped outbound sequence rather than resetting per download;
+- full repository verification is green on the exact merge head;
 - production serves the exact merged SHA and health is green;
-- a PRJ-0003 canary reaches normal revision/business validation instead of failing on Dropbox request #1;
+- a PRJ-0003 canary reaches normal revision/business validation instead of subrequest exhaustion on the canonical read path;
 - no unintended PRJ-0003 business revision is created during canary validation;
 - projection lag/recovery still works after cold-start/restart tests;
 - PRJ-0002 contains a committed governance record with authoritative source evidence.

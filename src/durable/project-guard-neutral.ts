@@ -174,8 +174,9 @@ export class ProjectGuard extends DurableObject<Env> {
         return Response.json(receipt);
       }
 
+      let reconciledState: ProjectState | null = null;
       if (this.layoutMode === "v2") {
-        await this.reconcileCanonicalCommits();
+        reconciledState = await this.reconcileCanonicalCommits();
         const reconciled = this.findReceipt(tx.transaction_id);
         if (reconciled) {
           await this.replayStatusSideEffects(tx, reconciled);
@@ -193,7 +194,9 @@ export class ProjectGuard extends DurableObject<Env> {
         return Response.json(canonicalReceipt);
       }
 
-      const state = await this.loadOrRecoverState();
+      const state = this.layoutMode === "v2"
+        ? reconciledState
+        : await this.loadOrRecoverState();
       const result = applyTransaction(state, tx);
 
       if (result.kind === "rejected" || result.kind === "conflict") {

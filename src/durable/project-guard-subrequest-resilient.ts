@@ -37,9 +37,7 @@ const FAST_FORWARD_PATHS = new Set([
   "/document",
   "/referral",
   "/recover-inputs",
-  "/reconcile-documents",
-  "/reconcile-materialization",
-  "/materialize"
+  "/reconcile-documents"
 ]);
 
 /**
@@ -55,9 +53,8 @@ const FAST_FORWARD_PATHS = new Set([
  * proof is unavailable, the base guard's conservative sequential recovery path
  * remains authoritative.
  *
- * The recovery queue also serializes materialization alarms so provider I/O
- * cannot overlap the snapshot proof/fast-forward phase before the parent
- * MutationGate queue is entered.
+ * The recovery queue serializes canonical recovery and mutation work only.
+ * Projection alarms and projection provider I/O belong to MaterializationGuard.
  *
  * This layer also owns path-changing WORKING-head transitions. They are kept
  * outside the legacy managed-document parser so old clients remain compatible,
@@ -108,10 +105,6 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
     return super.fetch(request);
   }
 
-  override async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
-    return this.serializeRecovery(() => super.alarm(alarmInfo));
-  }
-
   private async handleWorkingHead(operation: WorkingHeadRequest): Promise<Response> {
     if (this.ctx.id.name && this.ctx.id.name !== operation.project_id) {
       return Response.json(workingHeadTerminalReceipt(
@@ -123,10 +116,7 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
     }
 
     let state = this.localState();
-    if (!state) {
-      await super.fetch(new Request("https://project-guard.internal/materialization-status", { method: "GET" }));
-      state = this.localState();
-    }
+    if (!state) state = await this.loadOrRecoverState();
     if (!state) {
       return Response.json(workingHeadTerminalReceipt(
         operation,

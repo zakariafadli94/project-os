@@ -9,6 +9,7 @@ export interface DropboxTransport {
   copy?(from: string, to: string): Promise<DropboxFileMetadata>;
   listFolderChanges?(root?: string, cursor?: string): Promise<DropboxChangePage>;
   ensureDirectory?(path: string): Promise<void>;
+  beginRequestTrace?(operation: string): void;
 }
 
 export interface DropboxEntry {
@@ -93,8 +94,16 @@ interface RawDropboxMetadata {
 export class DropboxClient implements DropboxTransport {
   private cachedToken: { value: string; expiresAt: number } | null = null;
   private requestIndex = 0;
+  private requestOperation: string | null = null;
 
   constructor(private readonly credentials: DropboxCredentials) {}
+
+  beginRequestTrace(operation: string): void {
+    const normalized = operation.trim();
+    if (!normalized) throw new Error("Dropbox request trace operation must not be empty");
+    this.requestIndex = 0;
+    this.requestOperation = normalized;
+  }
 
   private async accessToken(): Promise<string> {
     const now = Date.now();
@@ -160,7 +169,6 @@ export class DropboxClient implements DropboxTransport {
   }
 
   async download(path: string): Promise<string | null> {
-    this.requestIndex = 0;
     const token = await this.accessToken();
     const response = await this.runtimeFetch("files/download", "https://content.dropboxapi.com/2/files/download", {
       method: "POST",
@@ -177,14 +185,14 @@ export class DropboxClient implements DropboxTransport {
 
   async getMetadata(path: string): Promise<DropboxFileMetadata | null> {
     const token = await this.accessToken();
-    const response = await fetch("https://api.dropboxapi.com/2/files/get_metadata", {
+    const response = await this.runtimeFetch("files/get_metadata", "https://api.dropboxapi.com/2/files/get_metadata", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ path })
-    });
+    }, path);
     const text = await response.text();
     if (response.ok) return parseFileMetadata(JSON.parse(text) as RawDropboxMetadata, path);
     if (response.status === 409 && text.includes("not_found")) return null;
@@ -233,14 +241,14 @@ export class DropboxClient implements DropboxTransport {
 
   async delete(path: string): Promise<void> {
     const token = await this.accessToken();
-    const response = await fetch("https://api.dropboxapi.com/2/files/delete_v2", {
+    const response = await this.runtimeFetch("files/delete_v2", "https://api.dropboxapi.com/2/files/delete_v2", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ path })
-    });
+    }, path);
     if (response.ok) return;
     const text = await response.text();
     if (response.status === 409 && text.includes("not_found")) return;
@@ -281,14 +289,14 @@ export class DropboxClient implements DropboxTransport {
   async listFolder(path: string): Promise<DropboxEntry[]> {
     const token = await this.accessToken();
     const entries: DropboxEntry[] = [];
-    let response = await fetch("https://api.dropboxapi.com/2/files/list_folder", {
+    let response = await this.runtimeFetch("files/list_folder", "https://api.dropboxapi.com/2/files/list_folder", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ path, recursive: false, include_deleted: false })
-    });
+    }, path);
 
     for (;;) {
       const text = await response.text();
@@ -305,14 +313,14 @@ export class DropboxClient implements DropboxTransport {
         entries.push({ tag: entry[".tag"], name: entry.name, path_lower: entry.path_lower, path_display: entry.path_display });
       }
       if (!parsed.has_more) return entries;
-      response = await fetch("https://api.dropboxapi.com/2/files/list_folder/continue", {
+      response = await this.runtimeFetch("files/list_folder/continue", "https://api.dropboxapi.com/2/files/list_folder/continue", {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({ cursor: parsed.cursor })
-      });
+      }, path);
     }
   }
 
@@ -362,7 +370,7 @@ export class DropboxClient implements DropboxTransport {
     mode: DropboxUploadMode,
     strictConflict: boolean
   ): Promise<Response> {
-    return fetch("https://content.dropboxapi.com/2/files/upload", {
+    return this.runtimeFetch("files/upload", "https://content.dropboxapi.com/2/files/upload", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -376,22 +384,22 @@ export class DropboxClient implements DropboxTransport {
         })
       },
       body: content
-    });
+    }, path);
   }
 
   private async moveRequest(token: string, from: string, to: string): Promise<Response> {
-    return fetch("https://api.dropboxapi.com/2/files/move_v2", {
+    return this.runtimeFetch("files/move_v2", "https://api.dropboxapi.com/2/files/move_v2", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ from_path: from, to_path: to, autorename: false, allow_ownership_transfer: false })
-    });
+    }, `${from} -> ${to}`);
   }
 
   private async copyRequest(token: string, from: string, to: string): Promise<Response> {
-    return fetch("https://api.dropboxapi.com/2/files/copy_v2", {
+    return this.runtimeFetch("files/copy_v2", "https://api.dropboxapi.com/2/files/copy_v2", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -404,22 +412,22 @@ export class DropboxClient implements DropboxTransport {
         allow_shared_folder: false,
         allow_ownership_transfer: false
       })
-    });
+    }, `${from} -> ${to}`);
   }
 
   private async listFolderChangeRequest(token: string, root: string): Promise<Response> {
-    return fetch("https://api.dropboxapi.com/2/files/list_folder", {
+    return this.runtimeFetch("files/list_folder", "https://api.dropboxapi.com/2/files/list_folder", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ path: root, recursive: true, include_deleted: true })
-    });
+    }, root);
   }
 
   private async listFolderContinueRequest(token: string, cursor: string): Promise<Response> {
-    return fetch("https://api.dropboxapi.com/2/files/list_folder/continue", {
+    return this.runtimeFetch("files/list_folder/continue", "https://api.dropboxapi.com/2/files/list_folder/continue", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -457,14 +465,14 @@ export class DropboxClient implements DropboxTransport {
   }
 
   private async createFolder(token: string, path: string): Promise<DropboxFolderCreateResult> {
-    const response = await fetch("https://api.dropboxapi.com/2/files/create_folder_v2", {
+    const response = await this.runtimeFetch("files/create_folder_v2", "https://api.dropboxapi.com/2/files/create_folder_v2", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ path, autorename: false })
-    });
+    }, path);
     if (response.ok) return "created";
 
     const text = await response.text();
@@ -492,7 +500,8 @@ export class DropboxClient implements DropboxTransport {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const pathContext = path ? ` for ${path}` : "";
-      throw new Error(`Dropbox HTTP ${endpoint} request #${requestIndex}${pathContext} failed: ${message}`);
+      const operationContext = this.requestOperation ? ` during ${this.requestOperation}` : "";
+      throw new Error(`Dropbox HTTP ${endpoint} request #${requestIndex}${pathContext}${operationContext} failed: ${message}`);
     }
   }
 

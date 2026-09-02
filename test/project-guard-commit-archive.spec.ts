@@ -54,9 +54,9 @@ describe("ProjectGuard crash-safe archive commits", () => {
     expect(created.status).toBe("committed");
     expect(created.new_revision).toBe(1);
     const projectId = created.project_id;
-    const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 
-    expect(await runDurableObjectAlarm(projectStub)).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
     expect(mock.files.has(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(true);
     expect(mock.files.has(`${archiveProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(false);
 

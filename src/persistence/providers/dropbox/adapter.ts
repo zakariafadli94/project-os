@@ -45,6 +45,12 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
     }
   };
 
+  if (raw.beginRequestTrace) {
+    runtime.diagnostics = {
+      beginOperation: (operation) => raw.beginRequestTrace!(operation)
+    };
+  }
+
   if (raw.uploadConditional) {
     runtime.conditionalWrite = {
       writeTextConditional: async (path, content, expectedRevisionToken) => mapMetadata(

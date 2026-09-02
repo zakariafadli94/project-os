@@ -36,7 +36,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
     // not weaken the fail-closed writer-stage regression guard.
     const projectId = "PRJ-0005";
     const mock = installDropboxMock();
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 
     const created = await submit(projectId, {
       schema_version: "1.0",
@@ -53,7 +53,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       }
     });
     expect(created).toMatchObject({ status: "committed", new_revision: 1 });
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
 
     let state = normalizeProjectState(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}"));
     expect(state.revision).toBe(1);

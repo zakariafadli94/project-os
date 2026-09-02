@@ -13,6 +13,10 @@ export interface ProviderEvidenceCapabilities {
   integrityHash: { semantics: "identified-algorithm" };
 }
 
+export interface ProviderRequestDiagnosticsPort {
+  beginOperation(operation: string): void;
+}
+
 export interface PersistenceRuntime {
   providerId: string;
   objects: ObjectPersistence;
@@ -20,6 +24,7 @@ export interface PersistenceRuntime {
   serverSideCopy?: ServerSideCopyPort;
   changeFeed?: IncrementalChangeFeedPort;
   directoryProvisioning?: DirectoryProvisioningPort;
+  diagnostics?: ProviderRequestDiagnosticsPort;
   evidence?: Partial<ProviderEvidenceCapabilities>;
 }
 
@@ -30,6 +35,7 @@ export interface ProjectOsPersistenceRuntime {
   serverSideCopy: ServerSideCopyPort;
   changeFeed: IncrementalChangeFeedPort;
   directoryProvisioning?: DirectoryProvisioningPort;
+  diagnostics?: ProviderRequestDiagnosticsPort;
   evidence: ProviderEvidenceCapabilities;
 }
 

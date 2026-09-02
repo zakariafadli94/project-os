@@ -4,7 +4,8 @@ import type { Env } from "./env";
 import baseWorker from "./index";
 
 export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
-export { SubrequestResilientProjectGuard as ProjectGuard } from "./durable/project-guard-subrequest-resilient";
+export { MaterializationGuard } from "./durable/materialization-guard";
+export { DiagnosticProjectGuard as ProjectGuard } from "./durable/project-guard-diagnostics";
 export { RegistryGuard } from "./durable/registry-guard";
 
 const OPERATOR_TOKEN_TTL_MS = 15 * 60_000;

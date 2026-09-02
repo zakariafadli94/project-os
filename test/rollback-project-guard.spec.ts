@@ -50,6 +50,10 @@ function taskTx(projectId: string, id: string): Transaction {
   };
 }
 
+function projectionStub(projectId: string) {
+  return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+}
+
 describe("ProjectGuard data-preserving rollback", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -57,7 +61,7 @@ describe("ProjectGuard data-preserving rollback", () => {
     const projectId = "PRJ-2020";
     const mock = installDropboxMock();
     await createProject(projectId);
-    expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub(projectId))).toBe(true);
     const tx = taskTx(projectId, "TASK-ROLLBACK2020");
 
     const execution = await executeWithRollback({
@@ -79,7 +83,7 @@ describe("ProjectGuard data-preserving rollback", () => {
 
     const replay = await submit(projectId, tx);
     expect(replay).toEqual(execution.receipt);
-    expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub(projectId))).toBe(true);
     const state = JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}");
     expect(state.revision).toBe(2);
     expect(state.tasks).toHaveProperty("TASK-ROLLBACK2020");
@@ -99,7 +103,7 @@ describe("ProjectGuard data-preserving rollback", () => {
       }]
     });
     await createProject(projectId);
-    expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub(projectId))).toBe(true);
     const tx = taskTx(projectId, "TASK-ROLLBACK2021");
     const stable = vi.fn((transaction: Transaction) => submit(projectId, transaction));
 
@@ -158,8 +162,8 @@ describe("ProjectGuard data-preserving rollback", () => {
     expect(mock.files.has(machineCommitRecordPath(projectA, 3))).toBe(false);
     expect(mock.files.has(machineCommitRecordPath(projectB, 3))).toBe(false);
 
-    expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectA))).toBe(true);
-    expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectB))).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub(projectA))).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub(projectB))).toBe(true);
     const stateA = JSON.parse(mock.files.get(machineStatePath(projectA)) ?? "{}");
     const stateB = JSON.parse(mock.files.get(machineStatePath(projectB)) ?? "{}");
     expect(stateA.revision).toBe(2);

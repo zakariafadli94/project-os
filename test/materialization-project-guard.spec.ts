@@ -37,6 +37,10 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   return response.json<Receipt>();
 }
 
+function materializationStub(projectId: string) {
+  return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+}
+
 async function status(projectId: string) {
   const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
     "https://project-guard.internal/materialization-status",
@@ -80,7 +84,8 @@ describe("ProjectGuard asynchronous materialization", () => {
         path: taskPath
       }]
     });
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectionStub = materializationStub(projectId);
 
     const create = await submit(projectId, createTx(projectId, slug, "TXN-MATERIAL-PG-3601-CREATE"));
     expect(create.status).toBe("committed");
@@ -88,7 +93,7 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(dropbox.files.has(machineCommitRecordPath(projectId, 1))).toBe(true);
     expect(dropbox.files.has(machineMaterializationHeadPath(projectId))).toBe(false);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
     expect(JSON.parse(dropbox.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
 
     const taskTx = {
@@ -108,15 +113,15 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(dropbox.files.has(taskPath)).toBe(false);
     expect(JSON.parse(dropbox.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
 
-    await runInDurableObject(stub, async (_instance, state) => {
+    await runInDurableObject(projectStub, async (_instance, state) => {
       const row = state.storage.sql.exec<{ state_json: string }>(
         "SELECT state_json FROM project_state WHERE singleton = 1"
       ).one();
       expect(JSON.parse(row.state_json).revision).toBe(2);
     });
 
-    await evictDurableObject(stub);
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await evictDurableObject(projectionStub);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
 
     expect(dropbox.files.has(taskPath)).toBe(true);
     expect(JSON.parse(dropbox.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(2);
@@ -129,11 +134,11 @@ describe("ProjectGuard asynchronous materialization", () => {
   it("keeps canonical revision committed when a permanent workspace conflict blocks projection", async () => {
     const projectId = "PRJ-3602";
     const slug = "blocked-projection";
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectionStub = materializationStub(projectId);
     const root = workspaceProjectRoot(projectId, slug);
 
     await submit(projectId, createTx(projectId, slug, "TXN-MATERIAL-PG-3602-CREATE"));
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
     expect(JSON.parse(dropbox.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
 
     dropbox.files.set(`${root}/BRIEF.md`, "human edit outside Project OS");
@@ -149,7 +154,7 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(receipt.status).toBe("committed");
     expect(receipt.new_revision).toBe(2);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
     expect(JSON.parse(dropbox.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
     expect(dropbox.files.has(machineCommitRecordPath(projectId, 2))).toBe(true);
     expect(dropbox.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
@@ -174,7 +179,7 @@ describe("ProjectGuard asynchronous materialization", () => {
     });
     expect(JSON.stringify(before)).not.toContain("# Brief");
 
-    expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);
+    expect(await runDurableObjectAlarm(materializationStub(projectId))).toBe(true);
     const after = await status(projectId);
     expect(after.materialized_head).toEqual({ revision: 1, projection_version: CURRENT_PROJECTION_VERSION });
     expect(after.output_count).toBeGreaterThan(0);
@@ -210,6 +215,6 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(body.canonical_revision).toBe(1);
     expect(body.requested?.revision).toBe(1);
     expect(dropbox.files.has(machineCommitRecordPath(projectId, 2))).toBe(false);
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runDurableObjectAlarm(materializationStub(projectId))).toBe(true);
   });
 });

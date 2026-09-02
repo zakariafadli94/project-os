@@ -40,8 +40,12 @@ function createTx(projectId: string, slug: string, transactionId: string) {
   };
 }
 
+function materializationStub(projectId: string) {
+  return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+}
+
 async function materialize(projectId: string): Promise<void> {
-  expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);
+  expect(await runDurableObjectAlarm(materializationStub(projectId))).toBe(true);
 }
 
 describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
@@ -56,7 +60,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     const projectId = "PRJ-3801";
     const slug = "projection-efficiency";
     const root = workspaceProjectRoot(projectId, slug);
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = materializationStub(projectId);
 
     await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3801-CREATE"));
     await materialize(projectId);
@@ -122,7 +126,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     mock.uploadCalls.length = 0;
     const replay = await submit(projectId, startTx);
     expect(replay).toEqual(committed);
-    const reconcile = await stub.fetch("https://project-guard.internal/reconcile-materialization", { method: "POST" });
+    const reconcile = await stub.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
     expect(reconcile.status).toBe(200);
     expect(mock.uploadCalls.filter((path) => path.startsWith(`${root}/`))).toEqual([]);
     expect(mock.files.has(machineCommitRecordPath(projectId, 7))).toBe(false);
@@ -135,7 +139,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     const projectId = "PRJ-3802";
     const slug = "head-repair";
     const root = workspaceProjectRoot(projectId, slug);
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = materializationStub(projectId);
 
     await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3802-CREATE"));
     await materialize(projectId);
@@ -166,7 +170,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
   it("rebuilds lost hot materialization baseline from external completed evidence", async () => {
     const projectId = "PRJ-3803";
     const slug = "hot-state-rebuild";
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = materializationStub(projectId);
     await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3803-CREATE"));
     await materialize(projectId);
 
@@ -190,7 +194,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     await evictDurableObject(stub);
     mock.uploadCalls.length = 0;
 
-    const response = await stub.fetch("https://project-guard.internal/reconcile-materialization", { method: "POST" });
+    const response = await stub.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
     expect(response.status).toBe(200);
     const body = await response.json<{ materialized_head: { revision: number } | null; output_count: number }>();
     expect(body.materialized_head?.revision).toBe(1);
@@ -201,7 +205,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
   it("coalesces four rapid canonical revisions to the newest projection while preserving every commit", async () => {
     const projectId = "PRJ-3804";
     const slug = "burst-coalescing";
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = materializationStub(projectId);
     await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3804-CREATE"));
     await materialize(projectId);
 

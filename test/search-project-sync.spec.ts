@@ -218,6 +218,7 @@ describe("ProjectGuard search synchronization", () => {
   it("keeps canonical authority committed when search synchronization conflicts and materialization remains isolated", async () => {
     const projectId = "PRJ-7120";
     const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const searchSyncStub = testEnv.SEARCH_SYNC_GUARD.getByName(projectId);
     const searchStub = testEnv.SEARCH_INDEX_GUARD.getByName("global");
 
     const seeded = await searchStub.fetch("https://search-index.internal/apply-canonical", {
@@ -267,7 +268,10 @@ describe("ProjectGuard search synchronization", () => {
       last_error: null
     });
 
-    expect(await runDurableObjectAlarm(projectStub)).toBe(true);
+    await runInDurableObject(projectStub, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+    expect(await runDurableObjectAlarm(searchSyncStub)).toBe(true);
 
     const afterResponse = await projectStub.fetch("https://project-guard.internal/search-sync-status");
     expect(afterResponse.status).toBe(200);

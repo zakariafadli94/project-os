@@ -54,12 +54,9 @@ describe("search rebuild admin diagnostic", () => {
     });
     const rebuildBody = await rebuild.clone().text();
     if (rebuild.status !== 202) {
-      console.error("Direct search rebuild diagnostic", {
-        project_id: receipt.project_id,
-        source: sourceBody,
-        status: rebuild.status,
-        body: rebuildBody
-      });
+      throw new Error(
+        `DIRECT_SEARCH_REBUILD status=${rebuild.status} source=${sourceBody} rebuild=${rebuildBody}`
+      );
     }
     expect(rebuild.status).toBe(202);
   });

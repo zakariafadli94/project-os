@@ -1,5 +1,5 @@
 import type { Env } from "../env";
-import { SubrequestResilientProjectGuard } from "./project-guard-subrequest-resilient";
+import { SearchSyncProjectGuard } from "./project-guard-search-sync";
 
 /**
  * Production ProjectGuard request boundary for provider diagnostics.
@@ -10,7 +10,7 @@ import { SubrequestResilientProjectGuard } from "./project-guard-subrequest-resi
  * thin boundary also prevents a concurrent request from resetting another
  * request's diagnostic counter while it is performing provider I/O.
  */
-export class DiagnosticProjectGuard extends SubrequestResilientProjectGuard {
+export class DiagnosticProjectGuard extends SearchSyncProjectGuard {
   private diagnosticsQueue: Promise<void> = Promise.resolve();
 
   override async fetch(request: Request): Promise<Response> {

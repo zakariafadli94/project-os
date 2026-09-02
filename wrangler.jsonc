@@ -22,6 +22,7 @@
       { "name": "REGISTRY_GUARD", "class_name": "RegistryGuard" },
       { "name": "DROPBOX_CHANGE_GUARD", "class_name": "DropboxChangeGuard" },
       { "name": "MATERIALIZATION_GUARD", "class_name": "MaterializationGuard" },
+      { "name": "SEARCH_SYNC_GUARD", "class_name": "SearchSyncGuard" },
       { "name": "SEARCH_INDEX_GUARD", "class_name": "SearchIndexGuard" }
     ]
   },
@@ -42,6 +43,11 @@
       "storage": "sqlite"
     },
     "MaterializationGuard": {
+      "type": "durable-object",
+      "state": "created",
+      "storage": "sqlite"
+    },
+    "SearchSyncGuard": {
       "type": "durable-object",
       "state": "created",
       "storage": "sqlite"

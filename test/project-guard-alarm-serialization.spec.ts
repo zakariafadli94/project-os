@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Receipt } from "../src/domain/receipt";
@@ -43,6 +43,10 @@ describe("ProjectGuard legacy alarm boundary", () => {
       }
     });
     expect(created).toMatchObject({ status: "committed", new_revision: 1 });
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
 
     const callsBeforeAlarm = mock.calls.length;
     expect(await runDurableObjectAlarm(stub)).toBe(true);

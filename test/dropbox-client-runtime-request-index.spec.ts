@@ -59,4 +59,20 @@ describe("DropboxClient runtime request diagnostics", () => {
         "Dropbox HTTP files/get_metadata request #2 for /PROJECT_OS/.project-os/projects/PRJ-0003/state.json failed: Too many subrequests by single Worker invocation."
       );
   });
+
+  it("resets exactly once at an explicit top-level operation boundary and names that operation", async () => {
+    const transport = client();
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(Response.json({ access_token: "token", expires_in: 3600 }))
+      .mockResolvedValueOnce(new Response("warmup"))
+      .mockRejectedValueOnce(new Error("Too many subrequests by single Worker invocation."));
+
+    await expect(transport.download("/warmup.txt")).resolves.toBe("warmup");
+    transport.beginRequestTrace("ProjectGuard POST /transaction");
+
+    await expect(transport.download("/PROJECT_OS/.project-os/projects/PRJ-0003/state.json"))
+      .rejects.toThrow(
+        "Dropbox HTTP files/download request #1 for /PROJECT_OS/.project-os/projects/PRJ-0003/state.json during ProjectGuard POST /transaction failed: Too many subrequests by single Worker invocation."
+      );
+  });
 });

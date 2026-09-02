@@ -137,6 +137,7 @@ export function withProviderResilience(
         )
       }
     } : {}),
+    ...(runtime.diagnostics ? { diagnostics: runtime.diagnostics } : {}),
     ...(runtime.evidence ? { evidence: runtime.evidence } : {})
   };
 }

@@ -135,7 +135,7 @@ describe("inbox entry isolation", () => {
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${createTask.transaction_id}.json`)).toBe(true);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${startTask.transaction_id}.json`)).toBe(true);
 
-    expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);
+    expect(await runDurableObjectAlarm(testEnv.MATERIALIZATION_GUARD.getByName(projectId))).toBe(true);
     expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`)).toContain("Status: active");
   });
 });

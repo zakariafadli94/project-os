@@ -5,7 +5,7 @@ import baseWorker from "./index";
 
 export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
 export { MaterializationGuard } from "./durable/materialization-guard";
-export { CanonicalOnlyProjectGuard as ProjectGuard } from "./durable/project-guard-canonical-only";
+export { SubrequestResilientProjectGuard as ProjectGuard } from "./durable/project-guard-subrequest-resilient";
 export { RegistryGuard } from "./durable/registry-guard";
 
 const OPERATOR_TOKEN_TTL_MS = 15 * 60_000;

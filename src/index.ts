@@ -124,6 +124,11 @@ async function rebuildSearchIndexes(request: Request, env: Env): Promise<Respons
       body: JSON.stringify({ project_id: projectId })
     });
     if (!response.ok) {
+      console.error("Project OS search rebuild guard failed", {
+        project_id: projectId,
+        status: response.status,
+        body: await response.clone().text()
+      });
       return Response.json({ error: "search_rebuild_failed", project_id: projectId, status: response.status }, { status: 502 });
     }
     projects.push(await response.json<unknown>());

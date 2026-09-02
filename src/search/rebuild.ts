@@ -131,7 +131,7 @@ export class SearchRebuildCoordinator {
   async start(projectId: string): Promise<SearchRebuildStatus> {
     assertProjectId(projectId);
     const source = await this.sourceStatus(projectId);
-    const state = await this.authoritativeState(projectId);
+    const state = await this.authoritativeState(projectId, source.canonical_revision_requested);
     if (state.revision !== source.canonical_revision_requested) {
       throw new Error("SOURCE_CHANGED_DURING_REBUILD");
     }
@@ -318,7 +318,7 @@ export class SearchRebuildCoordinator {
       this.failJob(job.project_id, "SOURCE_CHANGED_DURING_REBUILD");
       return;
     }
-    const state = await this.authoritativeState(job.project_id);
+    const state = await this.authoritativeState(job.project_id, job.target_canonical_revision);
     if (state.revision !== job.target_canonical_revision) {
       this.failJob(job.project_id, "SOURCE_CHANGED_DURING_REBUILD");
       return;
@@ -434,12 +434,12 @@ export class SearchRebuildCoordinator {
     return status;
   }
 
-  private async authoritativeState(projectId: string) {
+  private async authoritativeState(projectId: string, revision: number) {
     const runtime = createProductionPersistence(this.env, projectId);
     const repository = new ProjectRepository(runtime, "v2");
-    const state = await repository.readProjectState(projectId);
-    if (!state) throw new Error("SEARCH_REBUILD_CANONICAL_STATE_MISSING");
-    return state;
+    const record = await repository.readCommitRecord(projectId, revision);
+    if (!record) throw new Error("SEARCH_REBUILD_CANONICAL_COMMIT_MISSING");
+    return record.state;
   }
 
   private job(projectId: string): RebuildJobRow | null {

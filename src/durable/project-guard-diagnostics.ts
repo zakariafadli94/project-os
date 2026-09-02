@@ -4,7 +4,7 @@ import { SubrequestResilientProjectGuard } from "./project-guard-subrequest-resi
 /**
  * Production ProjectGuard request boundary for provider diagnostics.
  *
- * DropboxClient instances live for the Durable Object lifetime, so the request
+ * Provider client instances live for the Durable Object lifetime, so the request
  * counter must be reset at a top-level serialized ProjectGuard request, never
  * inside an individual provider operation such as download(). Serializing this
  * thin boundary also prevents a concurrent request from resetting another

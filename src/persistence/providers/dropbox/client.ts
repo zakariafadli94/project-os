@@ -9,6 +9,7 @@ export interface DropboxTransport {
   copy?(from: string, to: string): Promise<DropboxFileMetadata>;
   listFolderChanges?(root?: string, cursor?: string): Promise<DropboxChangePage>;
   ensureDirectory?(path: string): Promise<void>;
+  beginRequestTrace?(operation: string): void;
 }
 
 export interface DropboxEntry {
@@ -93,8 +94,16 @@ interface RawDropboxMetadata {
 export class DropboxClient implements DropboxTransport {
   private cachedToken: { value: string; expiresAt: number } | null = null;
   private requestIndex = 0;
+  private requestOperation: string | null = null;
 
   constructor(private readonly credentials: DropboxCredentials) {}
+
+  beginRequestTrace(operation: string): void {
+    const normalized = operation.trim();
+    if (!normalized) throw new Error("Dropbox request trace operation must not be empty");
+    this.requestIndex = 0;
+    this.requestOperation = normalized;
+  }
 
   private async accessToken(): Promise<string> {
     const now = Date.now();
@@ -491,7 +500,8 @@ export class DropboxClient implements DropboxTransport {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const pathContext = path ? ` for ${path}` : "";
-      throw new Error(`Dropbox HTTP ${endpoint} request #${requestIndex}${pathContext} failed: ${message}`);
+      const operationContext = this.requestOperation ? ` during ${this.requestOperation}` : "";
+      throw new Error(`Dropbox HTTP ${endpoint} request #${requestIndex}${pathContext}${operationContext} failed: ${message}`);
     }
   }
 

@@ -59,6 +59,10 @@ async function archiveProject(projectId: string, transactionId: string): Promise
   return response.json<Receipt>();
 }
 
+function projectionStub(projectId: string) {
+  return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+}
+
 describe("archive-safe materialization", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -67,7 +71,7 @@ describe("archive-safe materialization", () => {
     const slug = "materialization-archive-main";
     const created = await createRegisteredProject(slug);
     const projectId = created.project_id;
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = projectionStub(projectId);
     const activeRoot = workspaceProjectRoot(projectId, slug);
     const archiveRoot = archiveProjectRoot(projectId, slug);
 
@@ -106,7 +110,7 @@ describe("archive-safe materialization", () => {
     const slug = "materialization-archive-resume";
     const created = await createRegisteredProject(slug);
     const projectId = created.project_id;
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = projectionStub(projectId);
     const activeRoot = workspaceProjectRoot(projectId, slug);
     const archiveRoot = archiveProjectRoot(projectId, slug);
 
@@ -142,7 +146,7 @@ describe("archive-safe materialization", () => {
     const slug = "materialization-archive-conflict";
     const created = await createRegisteredProject(slug);
     const projectId = created.project_id;
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = projectionStub(projectId);
     const activeRoot = workspaceProjectRoot(projectId, slug);
     const archiveRoot = archiveProjectRoot(projectId, slug);
 
@@ -156,7 +160,10 @@ describe("archive-safe materialization", () => {
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
 
-    const statusResponse = await stub.fetch("https://project-guard.internal/materialization-status", { method: "GET" });
+    const statusResponse = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
+      "https://project-guard.internal/materialization-status",
+      { method: "GET" }
+    );
     const status = await statusResponse.json<{ canonical_revision: number; blocked_error: string | null }>();
     expect(status.canonical_revision).toBe(2);
     expect(status.blocked_error).toMatch(/archive|workspace|inconsistent/i);

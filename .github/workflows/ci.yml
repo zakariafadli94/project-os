@@ -23,6 +23,17 @@ jobs:
             exit 1
           fi
       - run: npm install
-      - run: npm run check
+      - name: Run project checks
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run check 2>&1 | tee ci-check.log
+      - name: Upload check diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-check-log-${{ github.sha }}
+          path: ci-check.log
+          if-no-files-found: ignore
       - run: npm run test:persistence-high-risk
       - run: npx wrangler deploy --dry-run

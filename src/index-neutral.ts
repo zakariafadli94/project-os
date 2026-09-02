@@ -17,6 +17,7 @@ import { mirrorLegacyEvents, mirrorLegacyLedger } from "./migration/workspace-v2
 import { parseLayoutMode } from "./persistence/layout";
 import { assertSafeProjectId } from "./persistence/paths";
 import { createProductionPersistence } from "./persistence/production-factory";
+import { parseSearchQuery, type SearchFreshness, type SearchIndexProjectStatus } from "./search/contract";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
 export { ProjectGuard } from "./durable/project-guard";
@@ -100,6 +101,11 @@ const worker = {
       return recoverInputs(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/search") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      return searchProjectOs(request, env);
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/transactions") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 
@@ -163,10 +169,11 @@ const worker = {
       Promise.all([
         processInbox(env),
         reconcileMaterializations(env),
-        reconcileManagedDocuments(env)
+        reconcileManagedDocuments(env),
+        reconcileSearchIndexes(env)
       ])
-        .then(([inbox, materialization, documents]) => {
-          console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents });
+        .then(([inbox, materialization, documents, search]) => {
+          console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents, search });
         })
         .catch((error) => {
           console.error("Project OS scheduled maintenance failed", {
@@ -215,6 +222,14 @@ export interface ManagedDocumentReconcileAllSummary {
   cursor_resets: number;
 }
 
+export interface SearchFleetReconcileSummary {
+  scanned: number;
+  scheduled: number;
+  current: number;
+  rebuilding: number;
+  failed: number;
+}
+
 interface ManagedDocumentProjectSummary {
   scanned: number;
   captured: number;
@@ -233,6 +248,127 @@ interface MaterializationStatusResponse {
   requested: { revision: number; projection_version: number } | null;
   active: { revision: number; projection_version: number } | null;
   blocked_error: string | null;
+}
+
+interface SearchSyncStatusResponse {
+  project_id: string;
+  canonical_revision: number;
+  canonical_revision_requested: number;
+  canonical_revision_indexed: number;
+  document_epoch: string;
+  document_epoch_started_at: string;
+  document_generation_requested: number;
+  document_generation_indexed: number;
+  document_full_rebuild_required: boolean;
+  last_error: string | null;
+}
+
+interface SearchFreshnessResponse {
+  project_id: string;
+  state: SearchFreshness;
+  canonical_revision_requested: number;
+  canonical_revision_indexed: number;
+  document_generation_requested: number;
+  document_generation_indexed: number;
+  active_generation: number | null;
+}
+
+async function searchProjectOs(request: Request, env: Env): Promise<Response> {
+  let query;
+  try {
+    query = parseSearchQuery(await request.json());
+  } catch {
+    return Response.json({ error: "invalid_search_query" }, { status: 400 });
+  }
+
+  const registryStub = env.REGISTRY_GUARD.getByName("global");
+  const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+  if (!registryResponse.ok) return Response.json({ error: "registry_unavailable" }, { status: 502 });
+  const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const knownProjectIds = new Set(registry.projects.map((project) => project.project_id));
+
+  for (const projectId of query.project_ids) {
+    if (!knownProjectIds.has(projectId)) {
+      return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
+    }
+  }
+
+  const freshness = await mapWithConcurrency(query.project_ids, 8, (projectId) => readSearchFreshness(env, projectId));
+  const searchIndex = env.SEARCH_INDEX_GUARD.getByName("global");
+  const searchResponse = await searchIndex.fetch("https://search-index.internal/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(query)
+  });
+  if (!searchResponse.ok) {
+    return Response.json({ error: "search_unavailable", status: searchResponse.status }, { status: 503 });
+  }
+
+  const result = await searchResponse.json<{ hits: unknown[] }>();
+  return Response.json({ hits: result.hits, freshness });
+}
+
+async function readSearchFreshness(env: Env, projectId: string): Promise<SearchFreshnessResponse> {
+  const projectGuard = env.PROJECT_GUARD.getByName(projectId);
+  const searchIndex = env.SEARCH_INDEX_GUARD.getByName("global");
+  const [sourceResponse, indexResponse] = await Promise.all([
+    projectGuard.fetch("https://project-guard.internal/search-sync-status", { method: "GET" }),
+    searchIndex.fetch(`https://search-index.internal/status?project_id=${encodeURIComponent(projectId)}`, { method: "GET" })
+  ]);
+
+  const source = sourceResponse.ok ? await sourceResponse.json<SearchSyncStatusResponse>() : null;
+  const indexed = indexResponse.ok ? await indexResponse.json<SearchIndexProjectStatus>() : null;
+  if (!source || !indexed || indexed.active_generation === null) {
+    return {
+      project_id: projectId,
+      state: "unknown",
+      canonical_revision_requested: source?.canonical_revision_requested ?? 0,
+      canonical_revision_indexed: source?.canonical_revision_indexed ?? 0,
+      document_generation_requested: source?.document_generation_requested ?? 0,
+      document_generation_indexed: source?.document_generation_indexed ?? 0,
+      active_generation: indexed?.active_generation ?? null
+    };
+  }
+
+  const canonicalLag = source.canonical_revision_requested > source.canonical_revision_indexed
+    || indexed.canonical_revision_indexed < source.canonical_revision_requested;
+  const documentLag = source.document_generation_requested > source.document_generation_indexed
+    || indexed.document_generation_indexed < source.document_generation_requested
+    || indexed.document_epoch !== source.document_epoch
+    || indexed.document_epoch_started_at !== source.document_epoch_started_at;
+  const lagging = canonicalLag || documentLag;
+  const rebuilding = indexed.rebuild_state === "rebuilding" || indexed.freshness === "rebuilding";
+  const failed = lagging && Boolean(source.last_error || indexed.last_error || indexed.freshness === "failed");
+
+  return {
+    project_id: projectId,
+    state: rebuilding ? "rebuilding" : failed ? "failed" : lagging ? "lagging" : "current",
+    canonical_revision_requested: source.canonical_revision_requested,
+    canonical_revision_indexed: source.canonical_revision_indexed,
+    document_generation_requested: source.document_generation_requested,
+    document_generation_indexed: source.document_generation_indexed,
+    active_generation: indexed.active_generation
+  };
+}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  operation: (value: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+  const workerCount = Math.min(concurrency, values.length);
+  const worker = async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= values.length) return;
+      results[index] = await operation(values[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
 }
 
 async function materializeExistingProjects(request: Request, env: Env): Promise<Response> {
@@ -456,6 +592,81 @@ export async function reconcileMaterializations(env: Env): Promise<Materializati
         summary.failed += 1;
         console.error("Project OS materialization reconcile failed", {
           project_id: project.project_id,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return summary;
+}
+
+export async function reconcileSearchIndexes(env: Env): Promise<SearchFleetReconcileSummary> {
+  const registryStub = env.REGISTRY_GUARD.getByName("global");
+  const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
+  if (!registryResponse.ok) {
+    throw new Error(`RegistryGuard search reconcile returned ${registryResponse.status}`);
+  }
+
+  const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const searchIndex = env.SEARCH_INDEX_GUARD.getByName("global");
+  const summary: SearchFleetReconcileSummary = {
+    scanned: registry.projects.length,
+    scheduled: 0,
+    current: 0,
+    rebuilding: 0,
+    failed: 0
+  };
+
+  let cursor = 0;
+  const workerCount = Math.min(4, registry.projects.length);
+  const worker = async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= registry.projects.length) return;
+
+      const projectId = registry.projects[index].project_id;
+      try {
+        const indexResponse = await searchIndex.fetch(
+          `https://search-index.internal/status?project_id=${encodeURIComponent(projectId)}`,
+          { method: "GET" }
+        );
+        if (!indexResponse.ok) throw new Error(`SearchIndexGuard returned ${indexResponse.status}`);
+        const indexed = await indexResponse.json<SearchIndexProjectStatus>();
+        const missingHead = indexed.active_generation === null;
+
+        const projectGuard = env.PROJECT_GUARD.getByName(projectId);
+        const reconcileResponse = await projectGuard.fetch(
+          "https://project-guard.internal/reconcile-search",
+          missingHead
+            ? {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ force_full: true })
+              }
+            : { method: "POST" }
+        );
+        if (!reconcileResponse.ok) throw new Error(`ProjectGuard returned ${reconcileResponse.status}`);
+        const source = await reconcileResponse.json<SearchSyncStatusResponse>();
+
+        const rebuilding = indexed.rebuild_state === "rebuilding" || indexed.freshness === "rebuilding";
+        const canonicalLag = source.canonical_revision_requested > source.canonical_revision_indexed
+          || indexed.canonical_revision_indexed < source.canonical_revision_requested;
+        const documentLag = source.document_generation_requested > source.document_generation_indexed
+          || indexed.document_generation_indexed < source.document_generation_requested;
+        const lagging = missingHead || canonicalLag || documentLag;
+        const failed = lagging && Boolean(source.last_error || indexed.last_error || indexed.freshness === "failed");
+
+        if (rebuilding) summary.rebuilding += 1;
+        else if (failed) summary.failed += 1;
+        else if (lagging) summary.scheduled += 1;
+        else summary.current += 1;
+      } catch (error) {
+        summary.failed += 1;
+        console.error("Project OS search reconcile failed", {
+          project_id: projectId,
           message: error instanceof Error ? error.message : String(error)
         });
       }

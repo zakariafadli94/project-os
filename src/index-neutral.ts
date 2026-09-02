@@ -264,8 +264,8 @@ async function materializeExistingProjects(request: Request, env: Env): Promise<
 
     await mirrorLegacyEvents(persistence.objects, projectId, project.slug);
 
-    const guard = env.PROJECT_GUARD.getByName(projectId);
-    const response = await guard.fetch("https://project-guard.internal/materialize", {
+    const guard = env.MATERIALIZATION_GUARD.getByName(projectId);
+    const response = await guard.fetch("https://materialization-guard.internal/materialize", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ target: "workspace-v2" })
@@ -440,11 +440,11 @@ export async function reconcileMaterializations(env: Env): Promise<Materializati
       if (index >= registry.projects.length) return;
       const project = registry.projects[index];
       try {
-        const stub = env.PROJECT_GUARD.getByName(project.project_id);
-        const response = await stub.fetch("https://project-guard.internal/reconcile-materialization", {
+        const stub = env.MATERIALIZATION_GUARD.getByName(project.project_id);
+        const response = await stub.fetch("https://materialization-guard.internal/reconcile", {
           method: "POST"
         });
-        if (!response.ok) throw new Error(`ProjectGuard returned ${response.status}`);
+        if (!response.ok) throw new Error(`MaterializationGuard returned ${response.status}`);
         const status = await response.json<MaterializationStatusResponse>();
         const headCurrent = status.materialized_head !== null
           && status.materialized_head.revision === status.canonical_revision

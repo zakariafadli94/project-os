@@ -68,6 +68,7 @@ ProjectGuard and MaterializationGuard are separate Durable Object classes and se
 8. **Project isolation is preserved.** A `PRJ-xxxx` ProjectGuard hands off only to the same-named `PRJ-xxxx` MaterializationGuard.
 9. **Fail closed on binding mismatch.** A MaterializationGuard request naming a different project than its Durable Object name is rejected.
 10. **The current `IMP-INDEX001` work is not implicitly modified or completed by this corrective change.**
+11. **Provider-I/O routes inside MaterializationGuard are serialized within that guard.** Projection/status/reconcile requests may contend with each other, but that contention is isolated from ProjectGuard's canonical I/O context.
 
 ## Chosen architecture
 
@@ -82,7 +83,8 @@ It owns:
 - `WorkspaceProjectionWriter`;
 - projection alarms;
 - projection status/reconcile/materialize routes;
-- reconstruction of projection hot state from durable canonical/materialization evidence.
+- reconstruction of projection hot state from durable canonical/materialization evidence;
+- one internal serialization queue covering provider-I/O routes and alarms.
 
 It does **not** own:
 
@@ -102,6 +104,19 @@ MATERIALIZATION_GUARD -> MaterializationGuard
 ```
 
 with SQLite Durable Object storage.
+
+The repository already uses Wrangler's current Durable Object declaration pattern for `DropboxChangeGuard`. `MaterializationGuard` must follow that same non-destructive pattern:
+
+```text
+durable_objects.bindings += MATERIALIZATION_GUARD / MaterializationGuard
+exports.MaterializationGuard = {
+  type: durable-object,
+  state: created,
+  storage: sqlite
+}
+```
+
+No migration of existing ProjectGuard SQLite storage is required by this design.
 
 `Env` gains the generated binding through Cloudflare types; handwritten environment augmentation should remain limited to optional scalar configuration.
 
@@ -181,6 +196,8 @@ POST /request-target
 - output counts.
 
 To report `canonical_revision`, MaterializationGuard reads canonical machine state using its **own** persistence/I/O context. That read is deliberately outside ProjectGuard.
+
+All MaterializationGuard routes that can perform provider I/O, including status reconstruction/reconciliation and `alarm()`, pass through the same guard-local serialization queue. This protects its own projection consistency without coupling its budget to ProjectGuard.
 
 `/reconcile` compares canonical state and durable projection evidence, repairs/coalesces target intent, and arms work if projection is behind.
 
@@ -288,10 +305,11 @@ Required regression tests:
 6. **cold-start reconstruction** — fresh MaterializationGuard SQLite reconstructs status from durable materialization evidence and canonical state;
 7. **coalescing** — targets N then N+1 converge to N+1 without regressing;
 8. **binding mismatch** — wrong project ID is rejected without provider mutation;
-9. **compatibility forwarding** — legacy ProjectGuard projection routes, if retained, forward to MaterializationGuard without local Dropbox projection I/O;
-10. **existing Projection Engine fault tests remain green**;
-11. **existing canonical crash/recovery/high-risk tests remain green**;
-12. **production canary** — after deploy, a stale/rejected PRJ-0003 transaction can reach ProjectGuard and return its expected business conflict/rejection instead of `files/download request #1` subrequest exhaustion.
+9. **guard-local serialization** — a MaterializationGuard alarm and a provider-I/O status/reconcile request do not overlap provider operations inside that guard;
+10. **compatibility forwarding** — legacy ProjectGuard projection routes, if retained, forward to MaterializationGuard without local Dropbox projection I/O;
+11. **existing Projection Engine fault tests remain green**;
+12. **existing canonical crash/recovery/high-risk tests remain green**;
+13. **production canary** — after deploy, a stale/rejected PRJ-0003 transaction can reach ProjectGuard and return its expected business conflict/rejection instead of `files/download request #1` subrequest exhaustion.
 
 Repository verification gates remain:
 
@@ -306,7 +324,7 @@ Production gate additionally requires exact Git SHA deployment identity + `/heal
 ## Rollout sequence
 
 1. Add tests that fail on the current single-DO architecture.
-2. Add `MaterializationGuard` class/binding and move coordinator/alarm ownership.
+2. Add `MaterializationGuard` class/binding using the repository's existing `state: created` / SQLite DO declaration pattern and move coordinator/alarm ownership.
 3. Change ProjectGuard commit scheduling to internal target handoff.
 4. Reroute worker materialization reconcile/materialize/status calls.
 5. Preserve compatibility forwarding where required.

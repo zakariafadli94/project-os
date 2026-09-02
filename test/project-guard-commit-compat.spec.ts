@@ -51,7 +51,8 @@ describe("ProjectGuard commit-record compatibility", () => {
   it("recovers a brand-new project from revision-1 commit record when no snapshot was materialized", async () => {
     const projectId = "PRJ-1802";
     const mock = installDropboxMock();
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
     const transaction = {
       schema_version: "1.0",
       transaction_id: "TXN-COMMIT-1802-CREATE",
@@ -72,18 +73,18 @@ describe("ProjectGuard commit-record compatibility", () => {
     expect(mock.files.has(machineCommitRecordPath(projectId, 1))).toBe(true);
     expect(mock.files.has(machineStatePath(projectId))).toBe(false);
 
-    await runInDurableObject(stub, async (_instance, state) => {
+    await runInDurableObject(projectStub, async (_instance, state) => {
       state.storage.sql.exec("DELETE FROM project_state");
       state.storage.sql.exec("DELETE FROM transactions");
     });
-    await evictDurableObject(stub);
+    await evictDurableObject(projectStub);
 
     const replay = await submit(projectId, transaction);
     expect(replay).toEqual(committed);
     expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(false);
     expect(mock.files.has(machineStatePath(projectId))).toBe(false);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
     expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(1);
   });
 });

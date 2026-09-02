@@ -41,13 +41,17 @@ function createTransaction(projectId: string) {
   };
 }
 
+function projectionStub(projectId: string) {
+  return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+}
+
 describe("ProjectGuard crash-safe canonical commits", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("keeps an immutable committed record authoritative while derived materialization is pending", async () => {
     const projectId = "PRJ-1701";
     const mock = installDropboxMock();
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = projectionStub(projectId);
 
     const created = await submit(projectId, createTransaction(projectId));
     expect(created.new_revision).toBe(1);
@@ -91,7 +95,7 @@ describe("ProjectGuard crash-safe canonical commits", () => {
   it("accepts later canonical work before projection catches up and converges to the newest revision", async () => {
     const projectId = "PRJ-1702";
     const mock = installDropboxMock();
-    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = projectionStub(projectId);
 
     await submit(projectId, createTransaction(projectId));
     expect(await runDurableObjectAlarm(stub)).toBe(true);

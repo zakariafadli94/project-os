@@ -4,7 +4,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
-import { machineMaterializationRecordPath, workspaceProjectRoot } from "../src/persistence/layout";
+import {
+  machineMaterializationHeadPath,
+  machineMaterializationRecordPath,
+  workspaceProjectRoot
+} from "../src/persistence/layout";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -29,6 +33,38 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   );
   expect(response.status).toBe(200);
   return response.json<Receipt>();
+}
+
+async function createProject(projectId: string, slug: string, transactionId: string): Promise<Receipt> {
+  return submit(projectId, {
+    schema_version: "1.0",
+    transaction_id: transactionId,
+    project_id: projectId,
+    base_revision: 0,
+    operation: "project.create",
+    created_at: at,
+    payload: {
+      name: `Materialization Isolation ${projectId}`,
+      slug,
+      aliases: [],
+      objective: "Separate canonical and projection Durable Object I/O contexts"
+    }
+  });
+}
+
+async function requestTarget(projectId: string, revision: number): Promise<Response> {
+  return materializationNamespace().getByName(projectId).fetch(
+    "https://materialization-guard.internal/request-target",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId,
+        revision,
+        projection_version: CURRENT_PROJECTION_VERSION
+      })
+    }
+  );
 }
 
 describe("MaterializationGuard isolation boundary", () => {
@@ -77,18 +113,7 @@ describe("MaterializationGuard isolation boundary", () => {
   it("accepts a target without synchronously writing human workspace output", async () => {
     const mock = installDropboxMock();
     const projectId = "PRJ-3904";
-    const response = await materializationNamespace().getByName(projectId).fetch(
-      "https://materialization-guard.internal/request-target",
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          project_id: projectId,
-          revision: 7,
-          projection_version: CURRENT_PROJECTION_VERSION
-        })
-      }
-    );
+    const response = await requestTarget(projectId, 7);
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
@@ -99,24 +124,59 @@ describe("MaterializationGuard isolation boundary", () => {
     expect(mock.uploadCalls.some((path) => path.startsWith(`${workspaceRoot}/`))).toBe(false);
   });
 
+  it("owns projection execution in the separate MaterializationGuard alarm", async () => {
+    const mock = installDropboxMock();
+    const projectId = "PRJ-3905";
+    const receipt = await createProject(projectId, "materialization-guard-owner", "TXN-MATISO-3905-CREATE");
+    expect(receipt).toMatchObject({ status: "committed", new_revision: 1 });
+
+    expect((await requestTarget(projectId, 1)).status).toBe(200);
+    expect(await runDurableObjectAlarm(materializationNamespace().getByName(projectId))).toBe(true);
+
+    expect(
+      mock.files.has(machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION))
+    ).toBe(true);
+    expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}")).toMatchObject({
+      project_id: projectId,
+      target_revision: 1,
+      projection_version: CURRENT_PROJECTION_VERSION
+    });
+  });
+
+  it("reconciles and reports projection status from canonical machine state", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3906";
+    const receipt = await createProject(projectId, "materialization-status-owner", "TXN-MATISO-3906-CREATE");
+    expect(receipt).toMatchObject({ status: "committed", new_revision: 1 });
+
+    const reconcile = await materializationNamespace().getByName(projectId).fetch(
+      "https://materialization-guard.internal/reconcile",
+      { method: "POST" }
+    );
+    expect(reconcile.status).toBe(200);
+    expect(await reconcile.json()).toMatchObject({
+      project_id: projectId,
+      canonical_revision: 1,
+      requested: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION }
+    });
+
+    const status = await materializationNamespace().getByName(projectId).fetch(
+      "https://materialization-guard.internal/status",
+      { method: "GET" }
+    );
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({
+      project_id: projectId,
+      canonical_revision: 1,
+      projection_version: CURRENT_PROJECTION_VERSION
+    });
+  });
+
   it("does not let ProjectGuard own projection alarms", async () => {
     const mock = installDropboxMock();
     const projectId = "PRJ-3901";
 
-    const receipt = await submit(projectId, {
-      schema_version: "1.0",
-      transaction_id: "TXN-MATISO-3901-CREATE",
-      project_id: projectId,
-      base_revision: 0,
-      operation: "project.create",
-      created_at: at,
-      payload: {
-        name: "Materialization Isolation",
-        slug: "materialization-isolation",
-        aliases: [],
-        objective: "Separate canonical and projection Durable Object I/O contexts"
-      }
-    });
+    const receipt = await createProject(projectId, "materialization-isolation", "TXN-MATISO-3901-CREATE");
     expect(receipt).toMatchObject({ status: "committed", new_revision: 1 });
 
     expect(await runDurableObjectAlarm(testEnv.PROJECT_GUARD.getByName(projectId))).toBe(true);

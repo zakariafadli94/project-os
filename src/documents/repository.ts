@@ -98,6 +98,53 @@ export class DocumentLedgerRepository {
     return record;
   }
 
+  async listHeadIds(projectId: string): Promise<string[]> {
+    const entries = await this.runtime.objects.listChildren(`${machineDocumentRoot(projectId)}/heads`);
+    return entries
+      .filter((entry) => entry.kind === "file")
+      .map((entry) => /^((?:DOC-)[A-F0-9]{24})\.json$/.exec(entry.name)?.[1] ?? null)
+      .filter((value): value is string => value !== null)
+      .sort();
+  }
+
+  async readSearchableTextPayload(record: CurrentDocumentVersionRecord): Promise<string | null> {
+    if (record.content_sha256) {
+      const content = await this.runtime.objects.readText(record.immutable_payload_path);
+      if (content === null) {
+        throw new Error(`Managed document immutable text payload missing: ${record.document_id}/${record.version_id}`);
+      }
+      const actual = await sha256Text(content);
+      if (actual !== record.content_sha256) {
+        throw new Error(
+          `Managed document immutable text payload SHA-256 mismatch for ${record.document_id}/${record.version_id}`
+        );
+      }
+      return content;
+    }
+
+    if (!isSearchableTextVersion(record)) return null;
+    const expected = record.provider_evidence;
+    if (!expected) {
+      throw new Error(`Managed document searchable provider payload has no integrity evidence: ${record.document_id}/${record.version_id}`);
+    }
+    const metadata = await this.runtime.objects.getMetadata(record.immutable_payload_path);
+    if (!metadata || !metadata.integrityHash) {
+      throw new Error(`Managed document immutable provider payload evidence missing: ${record.document_id}/${record.version_id}`);
+    }
+    if (
+      metadata.size !== expected.size
+      || metadata.integrityHash.algorithm !== expected.integrity_hash.algorithm
+      || metadata.integrityHash.value !== expected.integrity_hash.value
+    ) {
+      throw new Error(`Managed document immutable provider payload integrity mismatch: ${record.document_id}/${record.version_id}`);
+    }
+    const content = await this.runtime.objects.readText(record.immutable_payload_path);
+    if (content === null) {
+      throw new Error(`Managed document immutable provider text payload missing: ${record.document_id}/${record.version_id}`);
+    }
+    return content;
+  }
+
   async writeVersion(record: DocumentVersionWriteInput): Promise<void> {
     const serialized = encodeDocumentVersionRecord(record, this.schemaWriterStage);
     const validated = readDocumentVersionRecord(serialized).record;
@@ -580,6 +627,14 @@ function pointerAcceptsStage(field: keyof ManagedDocumentHead, stage: DocumentVe
   if (field === "review_version_id") return stage === "review";
   if (field === "published_version_id") return stage === "published";
   return false;
+}
+
+function isSearchableTextVersion(record: CurrentDocumentVersionRecord): boolean {
+  const mediaType = record.media_type?.toLowerCase();
+  if (mediaType) {
+    return mediaType.startsWith("text/") || mediaType === "application/markdown";
+  }
+  return /\.(?:md|markdown|mdown|mkdn|txt)$/i.test(record.logical_path);
 }
 
 function isCausallyComplete(

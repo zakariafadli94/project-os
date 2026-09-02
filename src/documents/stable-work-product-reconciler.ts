@@ -14,6 +14,7 @@ export interface StableWorkProductReconcileResult {
   captured: number;
   restored: number;
   conflicts: number;
+  document_id?: string;
 }
 
 type WorkZone = "working" | "review";
@@ -103,7 +104,13 @@ export class StableWorkProductReconciler {
 
     await this.ledger.writeHead(updateHead(head, classified.zone, versionId, change.path, metadata));
     await this.ensureIndexes(state.project_id, classified.logicalPath, resolution.documentId, metadata);
-    return { handled: true, captured: 1, restored: 0, conflicts: 0 };
+    return {
+      handled: true,
+      captured: 1,
+      restored: 0,
+      conflicts: 0,
+      document_id: resolution.documentId
+    };
   }
 
   private async restoreDeleted(

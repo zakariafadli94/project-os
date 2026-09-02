@@ -7,6 +7,7 @@ export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
 export { MaterializationGuard } from "./durable/materialization-guard";
 export { DiagnosticProjectGuard as ProjectGuard } from "./durable/project-guard-diagnostics";
 export { RegistryGuard } from "./durable/registry-guard";
+export { SearchSyncGuard } from "./durable/search-sync-guard";
 export { SearchIndexGuard } from "./search/search-index-guard";
 
 const OPERATOR_TOKEN_TTL_MS = 15 * 60_000;

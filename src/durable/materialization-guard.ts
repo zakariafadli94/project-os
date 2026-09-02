@@ -39,7 +39,7 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
     this.projectId = projectId;
     initializeMaterializationSchema(ctx.storage);
-    this.persistence = createProductionPersistence(env);
+    this.persistence = createProductionPersistence(env, projectId);
     this.repository = new ProjectRepository(this.persistence, parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
     this.ledger = new MaterializationLedger(ctx.storage);
     this.coordinator = new MaterializationCoordinator({

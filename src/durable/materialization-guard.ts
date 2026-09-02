@@ -172,14 +172,50 @@ export class MaterializationGuard extends DurableObject<Env> {
     });
   }
 
+  /**
+   * Discover the newest canonical ProjectState without depending on projection.
+   *
+   * The machine state snapshot is a projection-time accelerator and can lag a
+   * newly committed immutable record. Start from that snapshot when available,
+   * then walk the contiguous immutable commit chain forward until the first
+   * missing revision. This keeps MaterializationGuard independent from
+   * ProjectGuard while preserving immutable commit truth as the authority.
+   */
   private async canonicalState(): Promise<ProjectState | null> {
-    const state = await this.repository.readProjectState(this.projectId);
+    let state = await this.repository.readProjectState(this.projectId);
     if (state && state.project_id !== this.projectId) {
       throw new Error(
         `MaterializationGuard state binding mismatch: expected ${this.projectId}, got ${state.project_id}`
       );
     }
-    return state;
+
+    let nextRevision = (state?.revision ?? 0) + 1;
+    while (true) {
+      const record = await this.repository.readCommitRecord(this.projectId, nextRevision);
+      if (!record) return state;
+
+      const expectedPreviousRevision = state?.revision ?? 0;
+      if (
+        record.project_id !== this.projectId
+        || record.previous_revision !== expectedPreviousRevision
+        || record.new_revision !== nextRevision
+        || record.state.project_id !== this.projectId
+        || record.state.revision !== nextRevision
+        || record.state.last_event_id !== record.event.event_id
+        || record.receipt.status !== "committed"
+        || record.receipt.project_id !== this.projectId
+        || record.receipt.previous_revision !== expectedPreviousRevision
+        || record.receipt.new_revision !== nextRevision
+        || record.receipt.event_id !== record.event.event_id
+      ) {
+        throw new Error(
+          `MaterializationGuard canonical commit binding mismatch for ${this.projectId} revision ${nextRevision}`
+        );
+      }
+
+      state = record.state;
+      nextRevision += 1;
+    }
   }
 
   private statusResponse(state: ProjectState) {

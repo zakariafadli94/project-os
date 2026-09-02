@@ -8,7 +8,6 @@ import {
 import { ProjectSearchSynchronizer } from "../search/project-synchronizer";
 import { SubrequestResilientProjectGuard } from "./project-guard-subrequest-resilient";
 
-const SEARCH_SYNC_ALARM_DELAY_MS = 1_000;
 const SEARCH_SIDE_EFFECT_PATHS = new Set([
   "/transaction",
   "/document",
@@ -19,12 +18,14 @@ const SEARCH_SIDE_EFFECT_PATHS = new Set([
 /**
  * Adds the derived INDEX001 search synchronization boundary without changing
  * canonical ProjectGuard authority or pulling projection work back from the
- * isolated MaterializationGuard.
+ * isolated MaterializationGuard. Search wake/retry alarms live in SearchSyncGuard.
  */
 export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
   private readonly searchSyncStore: ProjectSearchSyncStore | null;
   private readonly searchSynchronizer: ProjectSearchSynchronizer | null;
   private searchQueue: Promise<void> = Promise.resolve();
+  private searchWakeKnownArmed = false;
+  private searchWakeInFlight: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -53,6 +54,9 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
     if (request.method === "POST" && url.pathname === "/reconcile-search") {
       return this.serializeSearch(() => this.handleSearchReconcile(request));
     }
+    if (request.method === "POST" && url.pathname === "/drain-search") {
+      return this.serializeSearch(() => this.handleSearchDrain());
+    }
 
     return this.serializeSearch(async () => {
       const response = await super.fetch(request);
@@ -63,20 +67,6 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
     });
   }
 
-  override async alarm(): Promise<void> {
-    await this.serializeSearch(async () => {
-      const state = await this.loadSearchState();
-      if (state && this.searchSynchronizer) {
-        await this.searchSynchronizer.runNext(state);
-      }
-    });
-
-    // Base ProjectGuard owns no projection execution. Its alarm cleanup remains
-    // separate from MaterializationGuard and we re-arm only derived search work.
-    await super.alarm();
-    await this.serializeSearch(() => this.ensureSearchAlarm());
-  }
-
   private async handleSearchSyncStatus(): Promise<Response> {
     const state = await this.loadSearchState();
     if (!state || !this.searchSyncStore) {
@@ -84,7 +74,7 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
     }
 
     this.searchSyncStore.requestCanonical(state.revision);
-    await this.ensureSearchAlarm();
+    await this.ensureSearchWakeupSafely();
     return Response.json({
       project_id: state.project_id,
       canonical_revision: state.revision,
@@ -121,11 +111,28 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
       this.forceCanonicalSearchReplay(state.revision);
       restartSearchDocumentEpoch(this.ctx.storage);
     }
-    await this.ensureSearchAlarm();
+    await this.ensureSearchWakeupSafely();
     return Response.json({
       project_id: state.project_id,
       canonical_revision: state.revision,
       ...this.searchSyncStore.status()
+    });
+  }
+
+  private async handleSearchDrain(): Promise<Response> {
+    this.searchWakeKnownArmed = false;
+    const state = await this.loadSearchState();
+    if (!state || !this.searchSyncStore || !this.searchSynchronizer) {
+      return Response.json({ error: "project_not_initialized" }, { status: 404 });
+    }
+
+    const result = await this.searchSynchronizer.runNext(state);
+    return Response.json({
+      project_id: state.project_id,
+      canonical_revision: state.revision,
+      ...result,
+      ...this.searchSyncStore.status(),
+      more_work: this.searchSyncStore.needsWork()
     });
   }
 
@@ -151,7 +158,9 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
           this.searchSyncStore.requestFullDocumentSnapshotOnce(`artifact:${body.request_id}`);
         }
       }
-      await this.ensureSearchAlarm();
+      if (this.searchSyncStore.needsWork()) {
+        this.ctx.waitUntil(this.startSearchWakeup());
+      }
     } catch (error) {
       console.error("Project OS search synchronization scheduling failed", {
         project_id: this.ctx.id.name ?? null,
@@ -184,12 +193,40 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
     );
   }
 
-  private async ensureSearchAlarm(): Promise<void> {
+  private async ensureSearchWakeupSafely(): Promise<void> {
     if (!this.searchSyncStore?.needsWork()) return;
-    const existing = await this.ctx.storage.getAlarm();
-    if (existing === null) {
-      await this.ctx.storage.setAlarm(Date.now() + SEARCH_SYNC_ALARM_DELAY_MS);
+    await this.startSearchWakeup();
+  }
+
+  private startSearchWakeup(): Promise<void> {
+    if (!this.searchSyncStore?.needsWork() || this.searchWakeKnownArmed) {
+      return Promise.resolve();
     }
+    if (this.searchWakeInFlight) return this.searchWakeInFlight;
+
+    const attempt = (async () => {
+      try {
+        const projectId = this.ctx.id.name;
+        if (!projectId || projectId === "PRJ-AUTO") return;
+        const response = await this.env.SEARCH_SYNC_GUARD.getByName(projectId).fetch(
+          "https://search-sync.internal/wake",
+          { method: "POST" }
+        );
+        if (!response.ok) throw new Error(`SearchSyncGuard wake returned ${response.status}`);
+        this.searchWakeKnownArmed = true;
+      } catch (error) {
+        this.searchWakeKnownArmed = false;
+        console.error("Project OS search synchronization wake failed", {
+          project_id: this.ctx.id.name ?? null,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    })();
+
+    this.searchWakeInFlight = attempt.then(() => {
+      if (this.searchWakeInFlight) this.searchWakeInFlight = null;
+    });
+    return this.searchWakeInFlight;
   }
 
   private async serializeSearch<T>(operation: () => Promise<T>): Promise<T> {

@@ -29,7 +29,7 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
     })
   };
 
-  const projectNamespace = {
+  const materializationNamespace = {
     getByName(projectId: string) {
       return {
         fetch: vi.fn(async (input: RequestInfo | URL) => {
@@ -61,6 +61,28 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
     }
   };
 
+  const projectNamespace = {
+    getByName() {
+      return {
+        fetch: vi.fn(async (input: RequestInfo | URL) => {
+          const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+          if (url.pathname === "/reconcile-documents") {
+            return Response.json({
+              scanned: 0,
+              captured: 0,
+              ingested: 0,
+              duplicates: 0,
+              restored: 0,
+              conflicts: 0,
+              cursor_reset: false
+            });
+          }
+          return Response.json({ error: "not_found" }, { status: 404 });
+        })
+      };
+    }
+  };
+
   const env = {
     DROPBOX_APP_KEY: "test-app-key",
     DROPBOX_APP_SECRET: "test-app-secret",
@@ -69,7 +91,8 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
     PROJECT_OS_LAYOUT_MODE: "v2",
     PROJECT_OS_CONTINUITY_MODE: "stable",
     REGISTRY_GUARD: { getByName: () => registryStub },
-    PROJECT_GUARD: projectNamespace
+    PROJECT_GUARD: projectNamespace,
+    MATERIALIZATION_GUARD: materializationNamespace
   } as unknown as Env;
 
   return { env, calls, maxInFlight: () => maxInFlight };
@@ -97,9 +120,9 @@ describe("fleet materialization reconciliation", () => {
 
     expect(summary).toEqual<MaterializationReconcileSummary>({ scanned: 3, scheduled: 1, current: 2, failed: 0 });
     expect(calls.sort()).toEqual([
-      "PRJ-4101:/reconcile-materialization",
-      "PRJ-4102:/reconcile-materialization",
-      "PRJ-4103:/reconcile-materialization"
+      "PRJ-4101:/reconcile",
+      "PRJ-4102:/reconcile",
+      "PRJ-4103:/reconcile"
     ]);
   });
 
@@ -144,7 +167,7 @@ describe("fleet materialization reconciliation", () => {
 
     expect(dropbox.files.has(incoming)).toBe(false);
     expect(dropbox.files.has(rejected)).toBe(true);
-    expect(calls).toContain("PRJ-4131:/reconcile-materialization");
+    expect(calls).toContain("PRJ-4131:/reconcile");
     expect(info).toHaveBeenCalledWith("Project OS scheduled maintenance completed", expect.objectContaining({
       inbox: expect.any(Object),
       materialization: expect.any(Object)

@@ -19,6 +19,10 @@ export async function requestMaterializationTargetSafely(
         })
       }
     );
+    // Fully consume the internal DO response before returning. Leaving the
+    // body unread can keep the MaterializationGuard request in flight, which
+    // prevents a clean eviction and delays cold-start recovery tests.
+    await response.text();
     if (!response.ok) {
       throw new Error(`MaterializationGuard returned ${response.status}`);
     }

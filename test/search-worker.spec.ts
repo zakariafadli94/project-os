@@ -204,10 +204,20 @@ describe("Project OS search worker API", () => {
       { project_ids: [projectId] }
     );
     if (rebuild.status !== 202) {
+      const direct = await testEnv.SEARCH_INDEX_GUARD.getByName("global").fetch(
+        "https://search-index.internal/rebuild-project",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ project_id: projectId })
+        }
+      );
       console.error("Search rebuild diagnostic", {
         project_id: projectId,
         status: rebuild.status,
-        body: await rebuild.clone().text()
+        body: await rebuild.clone().text(),
+        direct_status: direct.status,
+        direct_body: await direct.clone().text()
       });
     }
     expect(rebuild.status).toBe(202);

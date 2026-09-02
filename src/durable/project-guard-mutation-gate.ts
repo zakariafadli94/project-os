@@ -52,9 +52,7 @@ const OUTER_MUTATION_PATHS = new Set([
   "/artifact",
   "/document",
   "/reconcile-documents",
-  "/recover-inputs",
-  "/materialize",
-  "/reconcile-materialization"
+  "/recover-inputs"
 ]);
 
 export class MutationGateProjectGuard extends BaseProjectGuard {
@@ -139,10 +137,6 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
     }
 
     return this.decorateResponse(request, await super.fetch(request));
-  }
-
-  override async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
-    return this.serializeMutation(() => super.alarm(alarmInfo));
   }
 
   private async handleCandidateResolution(request: Request): Promise<Response> {
@@ -248,14 +242,9 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
   }
 
   private async loadResolutionState(): Promise<ProjectState | null> {
-    let state = this.localResolutionState();
-    if (state) return state;
-
-    // Force the base guard through its canonical recovery path without making
-    // any business mutation, then read the recovered durable-object snapshot.
-    await super.fetch(new Request("https://project-guard.internal/materialization-status", { method: "GET" }));
-    state = this.localResolutionState();
-    return state;
+    const local = this.localResolutionState();
+    if (local) return local;
+    return this.loadOrRecoverState();
   }
 
   private localResolutionState(): ProjectState | null {

@@ -129,7 +129,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
     expect(commitReads.length).toBeLessThanOrEqual(3);
   });
 
-  it("keeps a current-revision real commit on a minimal provider-I/O hot path", async () => {
+  it("keeps a current-revision real commit minimal and preserves stale conflicts", async () => {
     const projectId = "PRJ-0006";
     const mock = installDropboxMock();
     const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
@@ -176,5 +176,26 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
 
     const providerCalls = mock.calls.filter((call) => call.startsWith("POST /2/files/"));
     expect(providerCalls).toHaveLength(3);
+
+    mock.uploadCalls.length = 0;
+    const stale = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-HOTPATH-0003-STALE",
+      project_id: projectId,
+      base_revision: 1,
+      operation: "task.complete",
+      created_at: at,
+      payload: {
+        task_id: "TASK-HOTPATH001"
+      }
+    });
+
+    expect(stale).toMatchObject({
+      status: "conflict",
+      code: "STALE_REVISION",
+      previous_revision: 2,
+      new_revision: 2
+    });
+    expect(mock.uploadCalls).not.toContain(machineCommitRecordPath(projectId, 3));
   });
 });

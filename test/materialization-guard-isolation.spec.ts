@@ -172,6 +172,24 @@ describe("MaterializationGuard isolation boundary", () => {
     });
   });
 
+  it("hands a committed canonical revision to MaterializationGuard automatically", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3907";
+    const receipt = await createProject(projectId, "automatic-materialization-handoff", "TXN-MATISO-3907-CREATE");
+    expect(receipt).toMatchObject({ status: "committed", new_revision: 1 });
+
+    const status = await materializationNamespace().getByName(projectId).fetch(
+      "https://materialization-guard.internal/status",
+      { method: "GET" }
+    );
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({
+      project_id: projectId,
+      canonical_revision: 1,
+      requested: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION }
+    });
+  });
+
   it("does not let ProjectGuard own projection alarms", async () => {
     const mock = installDropboxMock();
     const projectId = "PRJ-3901";

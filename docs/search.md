@@ -6,7 +6,7 @@
 
 Search is a **derived, reconstructible, non-canonical read model**. It never becomes a second source of truth and never authorizes a business mutation. Canonical project state, immutable events, receipts, managed-document ledgers and governed artifacts remain authoritative in their existing stores.
 
-Every public search query is explicitly project-scoped. `project_ids` is required and validated before query execution; callers cannot obtain an account-wide implicit search by omitting project scope.
+Every public search query is explicitly project-scoped. `project_ids` is required and validated before query execution; callers cannot obtain an account-wide implicit search by omitting project scope. Project filtering is applied inside the search query before ranking.
 
 Search records carry logical authority references. Canonical entities use project/entity/revision identity. Managed documents use `document_id` and `version_id`; provider file IDs are not public document identity.
 
@@ -16,10 +16,12 @@ The normal corpus is assembled from authoritative structured records and governe
 
 - active `INPUTS/` files, which are source-ingestion work rather than accepted knowledge;
 - unresolved MutationGate candidates;
-- generated Markdown duplicates when the same fact is already represented by structured canonical state;
+- generated Markdown duplicates such as `STATE.md`, `HANDOFF.md`, roadmap/entity projections when the same fact is already represented by structured canonical state;
 - provider transport metadata as semantic identity.
 
-There is no recursive Dropbox scan fallback. If the derived index is missing or stale, the supported response is repair/rebuild from authoritative records, not a broad provider crawl.
+Governed `REFERENCES/`, `WORKING/`, `REVIEW/` and `DELIVERABLES/` current heads are eligible according to their lifecycle state. Binary or opaque governed content is metadata-only in INDEX001; no OCR or generalized extraction is added.
+
+There is **no recursive Dropbox/provider scan fallback**. If the derived index is missing or unavailable, search fails closed and operators repair/rebuild from authoritative records instead of crawling the provider.
 
 ## Components
 
@@ -27,39 +29,97 @@ There is no recursive Dropbox scan fallback. If the derived index is missing or 
 - `src/search/canonical-records.ts` — canonical structured entities → search records.
 - `src/search/document-records.ts` — governed managed-document versions → search records.
 - `src/search/project-sync-store.ts` — per-project derived synchronization state.
-- `src/search/sqlite-store.ts` — SQLite/FTS5 index storage.
-- `src/search/query-compiler.ts` — deterministic query compilation and ranking inputs.
-- `src/search/search-index-guard.ts` — index mutation/query boundary.
-- `src/search/rebuild.ts` — reconstructible rebuild path from authoritative inputs.
+- `src/search/project-synchronizer.ts` — source snapshot delivery to the index.
+- `src/search/sqlite-store.ts` — SQLite/FTS5 index storage and project-scoped query execution.
+- `src/search/query-compiler.ts` — deterministic bounded lexical query compilation.
+- `src/search/search-index-guard.ts` — installation-scoped `SearchIndexGuard` mutation/query/rebuild boundary.
+- `src/search/rebuild.ts` — reconstructible staged rebuild from authoritative inputs.
 - `src/durable/project-guard-search-sync.ts` — ProjectGuard-side delta scheduling after canonical/document changes.
 - `src/durable/search-sync-guard.ts` — isolated retry/serialization for derived synchronization.
 
 `ProjectGuard` remains the per-project coordination boundary. Search synchronization is downstream derived work: a search-sync failure must not roll back or reinterpret an already committed canonical business revision.
 
+## Public search
+
+Authenticated search uses:
+
+```text
+POST /v1/search
+Authorization: Bearer <INGRESS_TOKEN>
+```
+
+The request must include a non-empty explicit `project_ids` set. The implementation bounds scope, query text, lexical terms and result count. Unknown scoped projects are rejected before the index query.
+
+The response contains `hits` plus one freshness record per explicitly scoped project. Search results are references to authority; callers that need authoritative content should resolve the returned canonical entity or governed document identity rather than treating the index row itself as truth.
+
 ## Freshness
 
-Canonical freshness and document freshness are separate dimensions.
+Canonical freshness and document freshness are separate dimensions and use separate requested/indexed watermarks:
 
-- Canonical records are keyed to canonical project revision/event progress.
-- Managed-document records are keyed to governed document/version progress.
+- `canonical_revision_requested` / `canonical_revision_indexed`;
+- `document_generation_requested` / `document_generation_indexed`;
+- managed-document epoch identity (`document_epoch`, `document_epoch_started_at`) where applicable.
 
-A result must not imply that one freshness clock proves the other. Rebuild/synchronization state records these frontiers independently so operators can diagnose whether canonical state, document state, or both need catch-up.
+Public freshness state is one of:
 
-## Rebuild and activation
+- `current` — canonical and document frontiers have caught up to requested source state;
+- `lagging` — at least one frontier is behind but no failure is currently recorded;
+- `rebuilding` — a staged rebuild is active while the last proven active generation remains queryable;
+- `failed` — requested state is behind and source/index error evidence exists;
+- `unknown` — source/index state or an active generation is unavailable, so freshness cannot be asserted.
 
-Rebuild creates a new derived generation from authoritative sources, verifies it, then makes that generation eligible for activation. A failed/incomplete generation cannot silently replace the current usable generation.
+A canonical watermark never proves document freshness, and a document watermark never proves canonical freshness.
 
-Production rebuild/backfill and production read-path activation are separate operational gates. This implementation branch contains the mechanisms and tests but this pre-merge mandate does not execute those production actions.
+## Rebuild and generations
+
+Rebuild is reconstructible from authoritative canonical state and current governed document heads. It stages a new per-project generation while keeping the last proven active generation queryable. Promotion occurs only after the staged generation completes and source watermarks remain valid; a failed or incomplete staging generation cannot silently replace the active generation.
+
+Search-index loss does not rewrite canonical history or Managed Document state. Recovery is a derived-state rebuild, not a business-state migration.
+
+## Admin operations
+
+Authenticated rebuild request:
+
+```text
+POST /v1/admin/search/rebuild
+Authorization: Bearer <INGRESS_TOKEN>
+Content-Type: application/json
+
+{"project_ids":["PRJ-0002"]}
+```
+
+The project list must be explicit, valid, unique and registered. The route starts project-scoped rebuild work and returns `202` when accepted.
+
+Authenticated status read:
+
+```text
+GET /v1/admin/search/status?project_id=PRJ-0002
+Authorization: Bearer <INGRESS_TOKEN>
+```
+
+The status response exposes source synchronization state, index state and rebuild state for the requested project. These endpoints are operational controls only; they do not mutate canonical business state.
+
+## Failure semantics
+
+- Canonical commits and governed document authority remain valid when search synchronization fails.
+- Search lag/failure is surfaced through explicit freshness/status state.
+- Query failure does not trigger a recursive provider scan fallback.
+- Rebuild failure leaves the previous proven active generation in place.
+- Derived sync/rebuild retries remain isolated from ProjectGuard canonical correctness.
 
 ## Provider boundary
 
-Search code depends on provider-neutral persistence interfaces. `scripts/check-persistence-boundary.mjs` explicitly fails if `src/search/**` imports provider implementations under `persistence/providers/**`.
+Search code depends on provider-neutral persistence interfaces. `scripts/check-persistence-boundary.mjs` explicitly fails if `src/search/**` imports Dropbox integration code from `persistence/providers/dropbox` or `webhook/dropbox`.
 
-The search subsystem does not use embeddings, vector search, OCR, or an external search service. The accepted implementation is deterministic SQLite FTS5 plus structured authority metadata.
+The search subsystem does not use embeddings, vector search, OCR, an external search service, or provider-native search APIs. The accepted implementation is deterministic SQLite FTS5 plus structured authority metadata.
 
-## Logging and sensitive data
+## Logging and privacy
 
-Operational logs should identify project/generation/revision/version and safe counters/statuses, not search content, document bodies, secrets, provider tokens, or raw sensitive payloads.
+Operational logs may include safe project/generation/revision/version identifiers, counters, statuses and bounded error metadata. They must not emit raw search query text, document bodies/snippets, secrets, provider tokens or sensitive payload content.
+
+## Rollback rule
+
+Disabling or removing the search read path does **not** rewind, delete or reinterpret canonical state. Search/index state is disposable derived state. A rollback may stop query/sync/rebuild use and later reconstruct the index from durable truth without changing business revisions or governed-document authority.
 
 ## Verification
 
@@ -75,7 +135,7 @@ Provider boundary:
 npm run check:persistence-boundary
 ```
 
-Persistence high-risk suite (includes the INDEX001 authority/rebuild/worker regressions):
+Persistence high-risk suite (runs the persistence boundary and includes INDEX001 synchronization/rebuild/worker/provider-neutral regressions):
 
 ```bash
 npm run test:persistence-high-risk

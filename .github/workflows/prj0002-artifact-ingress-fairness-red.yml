@@ -1,0 +1,17 @@
+name: prj0002-artifact-ingress-fairness-red
+
+on:
+  push:
+    branches:
+      - fix/prj0002-artifact-ingress-fairness-red
+
+jobs:
+  red-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npx vitest run test/inbox-artifact-ingress-fairness.spec.ts

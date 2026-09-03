@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import worker from "../src/index";
+import worker from "../src/index-mutation-gate";
 import type { Env } from "../src/env";
 
 const testEnv = env as unknown as Env;
@@ -40,7 +40,7 @@ describe("PROJECT_OS_SEARCH_READ_MODE ingress gate", () => {
   it.each(["ON", "true", "1", " on", "on ", "enabled", ""]) (
     "does not accept bypass value %j",
     async (mode) => {
-      expect((await requestSearch(mode)).status).toBe(404);
+      expect((await requestSearch(mode as string)).status).toBe(404);
     }
   );
 

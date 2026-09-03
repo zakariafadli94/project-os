@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ProjectState } from "../src/domain/project-state";
 import { buildCanonicalSearchRecords } from "../src/search/canonical-records";
-import { parseSearchQuery } from "../src/search/contract";
+import { parseSearchQuery, type ManagedDocumentSearchRecord } from "../src/search/contract";
 
 function minimalState(): ProjectState {
   return {
@@ -49,9 +49,44 @@ describe("search provider neutrality and authority boundaries", () => {
     expect(parseSearchQuery({ text: "quota", project_ids: ["PRJ-0002"] }).project_ids).toEqual(["PRJ-0002"]);
   });
 
-  it("does not manufacture generated Markdown records from canonical state", async () => {
+  it("does not manufacture generated Markdown, INPUTS, or MutationGate candidate rows from canonical state", async () => {
     const records = await buildCanonicalSearchRecords(minimalState());
     expect(records.map((record) => record.record_id)).toEqual(["project:PRJ-0002"]);
-    expect(records.some((record) => /STATE\.md|HANDOFF\.md/i.test(record.record_id))).toBe(false);
+    const serialized = JSON.stringify(records);
+    expect(serialized).not.toMatch(/STATE\.md|HANDOFF\.md|ROADMAP\.md/i);
+    expect(serialized).not.toMatch(/INPUTS\//i);
+    expect(serialized).not.toMatch(/MUTCAND-|mutation.?gate.?candidate/i);
+  });
+
+  it("uses document_id/version_id as managed-document result identity, never provider file ID", () => {
+    const record: ManagedDocumentSearchRecord = {
+      project_id: "PRJ-0002",
+      record_id: "document:DOC-AAAAAAAAAAAAAAAAAAAAAAAA",
+      record_kind: "managed_document",
+      document_id: "DOC-AAAAAAAAAAAAAAAAAAAAAAAA",
+      version_id: "VER-REQ-BBBBBBBBBBBBBBBBBBBBBBBB",
+      title: "Search authority",
+      logical_path: "notes/search-authority.md",
+      zone: "working",
+      stage_or_collection: "working",
+      reconciliation_status: "clean",
+      body_text: "Derived searchable content",
+      media_type: "text/markdown",
+      content_hash: "a".repeat(64),
+      authority_ref: {
+        kind: "managed_document",
+        project_id: "PRJ-0002",
+        document_id: "DOC-AAAAAAAAAAAAAAAAAAAAAAAA",
+        version_id: "VER-REQ-BBBBBBBBBBBBBBBBBBBBBBBB",
+        logical_path: "notes/search-authority.md",
+        content_sha256: "a".repeat(64)
+      }
+    };
+
+    expect(record.authority_ref).toMatchObject({
+      document_id: record.document_id,
+      version_id: record.version_id
+    });
+    expect(JSON.stringify(record)).not.toMatch(/provider[_-]?file[_-]?id/i);
   });
 });

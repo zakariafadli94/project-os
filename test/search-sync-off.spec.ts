@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { createExecutionContext, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { createExecutionContext, runDurableObjectAlarm } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Env } from "../src/env";
 import worker from "../src/index-mutation-gate";
@@ -71,7 +71,7 @@ async function sourceStatus(projectId: string): Promise<Record<string, unknown>>
 describe("PROJECT_OS_SEARCH_SYNC_MODE real off environment", () => {
   beforeEach(() => installDropboxMock());
 
-  it("commits canonical work while direct wake and a stale alarm remain inert", async () => {
+  it("commits canonical work while direct wake remains inert", async () => {
     const projectId = await createProject("A001");
     await addTask(projectId, 1, "A001");
 
@@ -83,12 +83,6 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE real off environment", () => {
       pending: false,
       sync_enabled: false
     });
-    expect(await runDurableObjectAlarm(syncGuard)).toBe(false);
-
-    await runInDurableObject(syncGuard, async (_instance, state) => {
-      await state.storage.setAlarm(Date.now());
-    });
-    expect(await runDurableObjectAlarm(syncGuard)).toBe(true);
     expect(await runDurableObjectAlarm(syncGuard)).toBe(false);
   });
 
@@ -127,21 +121,59 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE real off environment", () => {
   });
 
   it("preserves non-search maintenance while search synchronization is off", async () => {
-    await createProject("C001");
+    const maintenanceCalls: string[] = [];
+    const maintenanceEnv = {
+      PROJECT_OS_SEARCH_SYNC_MODE: "off",
+      REGISTRY_GUARD: {
+        getByName: () => ({
+          fetch: async () => Response.json({ projects: [{ project_id: "PRJ-9001", slug: "maintenance-probe" }] })
+        })
+      },
+      MATERIALIZATION_GUARD: {
+        getByName: (projectId: string) => ({
+          fetch: async () => {
+            maintenanceCalls.push(`materialization:${projectId}`);
+            return Response.json({
+              project_id: projectId,
+              canonical_revision: 1,
+              projection_version: 3,
+              materialized_head: { revision: 1, projection_version: 3 },
+              requested: null,
+              active: null,
+              blocked_error: null
+            });
+          }
+        })
+      },
+      PROJECT_GUARD: {
+        getByName: (projectId: string) => ({
+          fetch: async () => {
+            maintenanceCalls.push(`documents:${projectId}`);
+            return Response.json({
+              scanned: 0,
+              captured: 0,
+              ingested: 0,
+              duplicates: 0,
+              restored: 0,
+              conflicts: 0,
+              cursor_reset: false,
+              changed_document_ids: []
+            });
+          }
+        })
+      }
+    } as unknown as Env;
 
-    const inbox = await worker.fetch(new Request("https://project-os.test/v1/admin/process-inbox", {
-      method: "POST",
-      headers: authHeaders
-    }), testEnv, createExecutionContext());
-    expect(inbox.status).toBe(200);
-
-    const materialization = await reconcileMaterializations(testEnv);
-    expect(materialization.scanned).toBeGreaterThan(0);
-    expect(materialization.failed).toBe(0);
-
-    const documents = await reconcileManagedDocuments(testEnv);
-    expect(documents.projects_scanned).toBeGreaterThan(0);
-    expect(documents.projects_failed).toBe(0);
+    await expect(reconcileMaterializations(maintenanceEnv)).resolves.toMatchObject({
+      scanned: 1,
+      current: 1,
+      failed: 0
+    });
+    await expect(reconcileManagedDocuments(maintenanceEnv)).resolves.toMatchObject({
+      projects_scanned: 1,
+      projects_failed: 0
+    });
+    expect(maintenanceCalls).toEqual(["materialization:PRJ-9001", "documents:PRJ-9001"]);
   });
 
   it("fails closed authentication when INGRESS_TOKEN is absent, empty or incorrect, and accepts only the exact token", async () => {

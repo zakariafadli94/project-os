@@ -5,6 +5,7 @@ import type { Env } from "../src/env";
 import worker from "../src/index-mutation-gate";
 import { reconcileSearchIndexes } from "../src/index-neutral";
 import { searchSyncEnabled } from "../src/search/sync-mode";
+import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 const authHeaders = {
@@ -52,6 +53,7 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
   });
 
   it("keeps direct wake and canonical side-effect scheduling inert when off", async () => {
+    installDropboxMock();
     const offEnv = envWithSyncMode("off");
     const createResponse = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
       method: "POST",

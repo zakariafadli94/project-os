@@ -32,8 +32,18 @@ requireMatch(projectSearchSync, /captureSearchSideEffects[\s\S]*?!searchSyncEnab
 requireMatch(projectSearchSync, /handleSearchDrain[\s\S]*?!searchSyncEnabled\(this\.env\)/, "ProjectGuard search drain must be inert when sync mode is off");
 requireMatch(searchSyncGuard, /\/wake[\s\S]*?!searchSyncEnabled\(this\.env\)/, "SearchSyncGuard wake must be inert when sync mode is off");
 requireMatch(searchSyncGuard, /async alarm\(\)[\s\S]*?!searchSyncEnabled\(this\.env\)/, "SearchSyncGuard alarm must be inert when sync mode is off");
+rejectMatch(projectSearchSync, /searchWakeKnownArmed/, "ProjectGuard must not cache cross-DO alarm state across sync mode transitions");
+
+const statusMethod = projectSearchSync.match(/private async handleSearchSyncStatus\(\): Promise<Response> \{([\s\S]*?)\n  \}\n\n  private async handleSearchReconcile/);
+if (!statusMethod) {
+  failures.push("ProjectGuard search status handler must remain identifiable for observation-only audit");
+} else {
+  rejectMatch(statusMethod[1], /requestCanonical|ensureSearchWakeupSafely|startSearchWakeup|restartSearchDocumentEpoch/, "GET search-sync-status must be strictly observation-only");
+}
+
 requireMatch(productionWorker, /\/v1\/admin\/search\/shadow/, "production worker must expose the operator shadow search route");
 requireMatch(productionWorker, /\/v1\/admin\/search\/shadow[\s\S]*?authorized\(request, env\)/, "operator shadow search must require ingress authentication");
+requireMatch(productionWorker, /typeof env\.INGRESS_TOKEN === "string"[\s\S]*?env\.INGRESS_TOKEN\.length > 0/, "production ingress authentication must reject missing or empty tokens before comparison");
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`INDEX001 remediation gate: ${failure}`);

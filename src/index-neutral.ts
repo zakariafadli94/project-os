@@ -18,6 +18,7 @@ import { parseLayoutMode } from "./persistence/layout";
 import { assertSafeProjectId } from "./persistence/paths";
 import { createProductionPersistence } from "./persistence/production-factory";
 import { parseSearchQuery, type SearchFreshness, type SearchIndexProjectStatus } from "./search/contract";
+import { searchSyncEnabled } from "./search/sync-mode";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
 export { ProjectGuard } from "./durable/project-guard";
@@ -273,7 +274,7 @@ interface SearchFreshnessResponse {
   active_generation: number | null;
 }
 
-async function searchProjectOs(request: Request, env: Env): Promise<Response> {
+export async function searchProjectOs(request: Request, env: Env): Promise<Response> {
   let query;
   try {
     query = parseSearchQuery(await request.json());
@@ -603,6 +604,10 @@ export async function reconcileMaterializations(env: Env): Promise<Materializati
 }
 
 export async function reconcileSearchIndexes(env: Env): Promise<SearchFleetReconcileSummary> {
+  if (!searchSyncEnabled(env)) {
+    return { scanned: 0, scheduled: 0, current: 0, rebuilding: 0, failed: 0 };
+  }
+
   const registryStub = env.REGISTRY_GUARD.getByName("global");
   const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
   if (!registryResponse.ok) {

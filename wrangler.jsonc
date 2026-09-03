@@ -9,7 +9,8 @@
     "PROJECT_OS_MUTATION_GATE_MODE": "enforce",
     "PROJECT_OS_SCHEMA_WRITER_STAGE": "provider_v2",
     "PROJECT_OS_SCHEMA_CORE_V2_FLOOR_PROJECT_IDS": "PRJ-0002,PRJ-0005,PRJ-0006",
-    "PROJECT_OS_SEARCH_READ_MODE": "off"
+    "PROJECT_OS_SEARCH_READ_MODE": "off",
+    "PROJECT_OS_SEARCH_SYNC_MODE": "off"
   },
   "observability": {
     "enabled": true,

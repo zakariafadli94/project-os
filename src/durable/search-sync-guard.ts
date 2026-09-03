@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
+import { searchSyncEnabled } from "../search/sync-mode";
 
 const FAILURE_COUNT_KEY = "search-sync-failure-count-v1";
 const SEARCH_SYNC_RETRY_DELAY_MS = 1_000;
@@ -22,8 +23,11 @@ export class SearchSyncGuard extends DurableObject<Env> {
         if (!projectId || !/^PRJ-[0-9]{4,}$/.test(projectId)) {
           return Response.json({ error: "invalid_project_id" }, { status: 400 });
         }
+        if (!searchSyncEnabled(this.env)) {
+          return Response.json({ project_id: projectId, pending: false, sync_enabled: false });
+        }
         await this.armIfAbsent(SEARCH_SYNC_RETRY_DELAY_MS);
-        return Response.json({ project_id: projectId, pending: true });
+        return Response.json({ project_id: projectId, pending: true, sync_enabled: true });
       });
     }
     return Response.json({ error: "not_found" }, { status: 404 });
@@ -32,6 +36,8 @@ export class SearchSyncGuard extends DurableObject<Env> {
   async alarm(): Promise<void> {
     await this.serialize(async () => {
       await this.ctx.storage.deleteAlarm();
+      if (!searchSyncEnabled(this.env)) return;
+
       const projectId = this.ctx.id.name;
       if (!projectId || !/^PRJ-[0-9]{4,}$/.test(projectId)) return;
 

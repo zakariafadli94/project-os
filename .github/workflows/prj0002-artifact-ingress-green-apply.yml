@@ -25,6 +25,7 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import re
 
           path = Path('src/inbox/processor.ts')
           text = path.read_text()
@@ -57,27 +58,17 @@ jobs:
           text = text.replace(old, new, 1)
           text = text.replace('  for (const entry of workEntries) {', '  for (const entry of scanEntries) {', 1)
 
-          old = '''      if (previousFailure?.attempt_count && previousFailure.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
-                try {
-                  await archiveSource(objects, sourcePath, artifactQuarantinePath(mode, artifact.request_id));
-                  summary.processed += 1;
-                } catch (quarantineError) {
-                  summary.failed += 1;
-                  console.error("Project OS artifact quarantine cleanup deferred", {
-                    request_id: artifact.request_id,
-                    project_id: artifact.project_id,
-                    attempt_count: previousFailure.attempt_count,
-                    message: quarantineError instanceof Error ? quarantineError.message : String(quarantineError)
-                  });
-                }
+          pattern = re.compile(
+              r'      if \(previousFailure\?\.attempt_count && previousFailure\.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS\) \{.*?\n      \}\n      if \(previousFailure && options\.respectRetryBackoff',
+              re.S,
+          )
+          replacement = '''      if (previousFailure?.attempt_count && previousFailure.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
                 continue;
-              }'''
-          new = '''      if (previousFailure?.attempt_count && previousFailure.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
-                continue;
-              }'''
-          if old not in text:
-              raise SystemExit('exhausted cleanup pattern not found')
-          text = text.replace(old, new, 1)
+              }
+              if (previousFailure && options.respectRetryBackoff'''
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'exhausted cleanup pattern count={count}')
 
           old = '''      let receipt: ArtifactWriteReceipt;
               try {
@@ -95,8 +86,11 @@ jobs:
 
           runtime = Path('src/inbox/runtime.ts')
           text = runtime.read_text()
+          marker = 'export const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 1;'
+          if marker not in text:
+              raise SystemExit('runtime constant pattern not found')
           text = text.replace(
-              'export const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 1;',
+              marker,
               'export const ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION = 2;\nexport const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 1;',
               1,
           )

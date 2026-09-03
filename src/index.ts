@@ -1,7 +1,7 @@
 import type { Env } from "./env";
 import type { DurableInboxProcessSummary } from "./inbox/runtime";
 import { artifactInboxPath, inboxPath } from "./inbox/processor";
-import neutralWorker, { reconcileMaterializations, reconcileSearchIndexes } from "./index-neutral";
+import neutralWorker, { reconcileMaterializations, reconcileSearchIndexes, searchProjectOs } from "./index-neutral";
 import { parseLayoutMode } from "./persistence/layout";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 
@@ -51,6 +51,11 @@ const worker = {
           message: error instanceof Error ? error.message : String(error)
         }, { status: 502 });
       }
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/admin/search/shadow") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      return searchProjectOs(request, env);
     }
 
     if (request.method === "POST" && url.pathname === "/v1/admin/search/rebuild") {

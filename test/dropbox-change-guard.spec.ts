@@ -17,8 +17,10 @@ interface ChangeGuardStatus {
   requested_generation: number;
   completed_generation: number;
   alarm_scheduled: boolean;
+  alarm_at: number | null;
   processing_generation: number | null;
   last_error: string | null;
+  failure_count: number;
 }
 
 async function createProject(transactionId: string, slug: string) {
@@ -83,7 +85,7 @@ function interceptProjectList(
 describe("DropboxChangeGuard", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("durably coalesces duplicate notifications and completes the requested generation", async () => {
+  it("durably coalesces duplicate notifications and completes one pending generation", async () => {
     installDropboxMock();
     await createProject("TXN-CHANGE-GUARD-0001", "change-guard-one");
     const stub = guard("coalesce");
@@ -91,18 +93,20 @@ describe("DropboxChangeGuard", () => {
     expect((await notify(stub)).status).toBe(200);
     expect((await notify(stub)).status).toBe(200);
     expect(await status(stub)).toMatchObject({
-      requested_generation: 2,
+      requested_generation: 1,
       completed_generation: 0,
       alarm_scheduled: true,
-      processing_generation: null
+      processing_generation: null,
+      failure_count: 0
     });
 
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     expect(await status(stub)).toMatchObject({
-      requested_generation: 2,
-      completed_generation: 2,
+      requested_generation: 1,
+      completed_generation: 1,
       processing_generation: null,
-      last_error: null
+      last_error: null,
+      failure_count: 0
     });
   });
 
@@ -121,7 +125,8 @@ describe("DropboxChangeGuard", () => {
       requested_generation: 1,
       completed_generation: 0,
       alarm_scheduled: true,
-      processing_generation: null
+      processing_generation: null,
+      failure_count: 1
     });
     expect((await status(stub)).last_error).not.toBeNull();
 
@@ -131,8 +136,34 @@ describe("DropboxChangeGuard", () => {
       requested_generation: 1,
       completed_generation: 1,
       processing_generation: null,
-      last_error: null
+      last_error: null,
+      failure_count: 0
     });
+  });
+
+  it("defers persistent reconciliation failures after five rapid retries", async () => {
+    const mock = installDropboxMock();
+    await createProject("TXN-CHANGE-GUARD-0005", "change-guard-five");
+    const stub = guard("bounded-retry");
+    interceptProjectList(mock, async () =>
+      new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 }));
+
+    expect((await notify(stub)).status).toBe(200);
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+    }
+
+    const observed = await status(stub);
+    expect(observed).toMatchObject({
+      requested_generation: 1,
+      completed_generation: 0,
+      alarm_scheduled: true,
+      processing_generation: null,
+      failure_count: 6
+    });
+    expect(observed.last_error).not.toBeNull();
+    expect(observed.alarm_at).not.toBeNull();
+    expect((observed.alarm_at ?? 0) - Date.now()).toBeGreaterThan(240_000);
   });
 
   it("leaves a later notification pending for a subsequent alarm generation", async () => {

@@ -6,6 +6,7 @@ import {
   ProjectSearchSyncStore
 } from "../search/project-sync-store";
 import { ProjectSearchSynchronizer } from "../search/project-synchronizer";
+import { searchSyncEnabled } from "../search/sync-mode";
 import { SubrequestResilientProjectGuard } from "./project-guard-subrequest-resilient";
 
 const SEARCH_SIDE_EFFECT_PATHS = new Set([
@@ -73,11 +74,14 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
       return Response.json({ error: "project_not_initialized" }, { status: 404 });
     }
 
-    this.searchSyncStore.requestCanonical(state.revision);
-    await this.ensureSearchWakeupSafely();
+    if (searchSyncEnabled(this.env)) {
+      this.searchSyncStore.requestCanonical(state.revision);
+      await this.ensureSearchWakeupSafely();
+    }
     return Response.json({
       project_id: state.project_id,
       canonical_revision: state.revision,
+      sync_enabled: searchSyncEnabled(this.env),
       ...this.searchSyncStore.status()
     });
   }
@@ -106,15 +110,18 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
       return Response.json({ error: "invalid_reconcile_search_request" }, { status: 400 });
     }
 
-    this.searchSyncStore.requestCanonical(state.revision);
-    if (forceFull) {
-      this.forceCanonicalSearchReplay(state.revision);
-      restartSearchDocumentEpoch(this.ctx.storage);
+    if (searchSyncEnabled(this.env)) {
+      this.searchSyncStore.requestCanonical(state.revision);
+      if (forceFull) {
+        this.forceCanonicalSearchReplay(state.revision);
+        restartSearchDocumentEpoch(this.ctx.storage);
+      }
+      await this.ensureSearchWakeupSafely();
     }
-    await this.ensureSearchWakeupSafely();
     return Response.json({
       project_id: state.project_id,
       canonical_revision: state.revision,
+      sync_enabled: searchSyncEnabled(this.env),
       ...this.searchSyncStore.status()
     });
   }
@@ -126,10 +133,21 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
       return Response.json({ error: "project_not_initialized" }, { status: 404 });
     }
 
+    if (!searchSyncEnabled(this.env)) {
+      return Response.json({
+        project_id: state.project_id,
+        canonical_revision: state.revision,
+        sync_enabled: false,
+        ...this.searchSyncStore.status(),
+        more_work: false
+      });
+    }
+
     const result = await this.searchSynchronizer.runNext(state);
     return Response.json({
       project_id: state.project_id,
       canonical_revision: state.revision,
+      sync_enabled: true,
       ...result,
       ...this.searchSyncStore.status(),
       more_work: this.searchSyncStore.needsWork()
@@ -137,7 +155,7 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
   }
 
   private async captureSearchSideEffects(pathname: string, response: Response): Promise<void> {
-    if (!this.searchSyncStore || !response.ok) return;
+    if (!this.searchSyncStore || !response.ok || !searchSyncEnabled(this.env)) return;
     try {
       const body = await response.json<Record<string, unknown>>();
       if (pathname === "/transaction") {
@@ -194,12 +212,12 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
   }
 
   private async ensureSearchWakeupSafely(): Promise<void> {
-    if (!this.searchSyncStore?.needsWork()) return;
+    if (!searchSyncEnabled(this.env) || !this.searchSyncStore?.needsWork()) return;
     await this.startSearchWakeup();
   }
 
   private startSearchWakeup(): Promise<void> {
-    if (!this.searchSyncStore?.needsWork() || this.searchWakeKnownArmed) {
+    if (!searchSyncEnabled(this.env) || !this.searchSyncStore?.needsWork() || this.searchWakeKnownArmed) {
       return Promise.resolve();
     }
     if (this.searchWakeInFlight) return this.searchWakeInFlight;

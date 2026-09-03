@@ -2,8 +2,7 @@ import { expect, it } from "vitest";
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../src/domain/artifact-write";
 import {
   MAX_RETRYABLE_INBOX_ATTEMPTS,
-  processArtifactInbox,
-  type InboxProcessSummary
+  processArtifactInbox
 } from "../src/inbox/processor";
 import type { ObjectPersistence, ProviderEntry, ProviderObjectMetadata } from "../src/persistence/provider/contract";
 
@@ -109,7 +108,7 @@ it("defers retryable artifact execution until bounded backoff is due", async () 
   await processArtifactInbox(objects, "v2", async (item) => {
     executions += 1;
     return committed(item);
-  });
+  }, { respectRetryBackoff: true });
 
   expect(executions).toBe(0);
   expect(objects.files.has(incomingPath(request.request_id))).toBe(true);
@@ -122,14 +121,8 @@ it("honors an explicit per-call work-item budget before draining the artifact in
     objects.files.set(incomingPath(requestId), JSON.stringify(request));
   }
   let executions = 0;
-  const boundedProcess = processArtifactInbox as unknown as (
-    objects: ObjectPersistence,
-    mode: "v2",
-    execute: (request: ArtifactWriteRequest) => Promise<ArtifactWriteReceipt>,
-    options: { maxEntries: number }
-  ) => Promise<InboxProcessSummary>;
 
-  const summary = await boundedProcess(objects, "v2", async (item) => {
+  const summary = await processArtifactInbox(objects, "v2", async (item) => {
     executions += 1;
     return committed(item);
   }, { maxEntries: 1 });

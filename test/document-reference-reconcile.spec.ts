@@ -104,14 +104,16 @@ describe("reference reconciliation", () => {
     const state = project();
     const inputPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "market/report.pdf");
     const first = await dropbox.externalAdd(inputPath, "report-v1");
+    const documentId = await documentIdForProviderFile(state.project_id, first.id);
     const reconciler = new ManagedDocumentReconciler(runtime);
-    await reconciler.reconcileChanges(state, [change(first)]);
+    const initial = await reconciler.reconcileChanges(state, [change(first)]);
+    expect(initial.changed_document_ids).toEqual([documentId]);
 
     const referencePath = workspaceManagedDocumentPath(state.project_id, state.slug, "references", "UNCLASSIFIED/market/report.pdf");
     const edited = await dropbox.externalWrite(referencePath, "report-v2-human");
-    await reconciler.reconcileChanges(state, [change(edited)]);
+    const editSummary = await reconciler.reconcileChanges(state, [change(edited)]);
+    expect(editSummary.changed_document_ids).toEqual([documentId]);
 
-    const documentId = await documentIdForProviderFile(state.project_id, first.id);
     const versionId = await externalVersionIdFor(edited.rev);
     const ledger = new DocumentLedgerRepository(runtime);
     const head = await ledger.readHead(state.project_id, documentId);
@@ -145,6 +147,7 @@ describe("reference reconciliation", () => {
       intake_completed: 1,
       intake_resumed: 1
     });
+    expect(result.changed_document_ids).toEqual([]);
     expect(dropbox.files.has(inputPath)).toBe(false);
   });
 
@@ -154,8 +157,10 @@ describe("reference reconciliation", () => {
     const state = project();
     const firstPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "market/report.pdf");
     const first = await dropbox.externalAdd(firstPath, "same-report-bytes");
+    const originalDocumentId = await documentIdForProviderFile(state.project_id, first.id);
     const reconciler = new ManagedDocumentReconciler(runtime);
-    await reconciler.reconcileChanges(state, [change(first)]);
+    const initial = await reconciler.reconcileChanges(state, [change(first)]);
+    expect(initial.changed_document_ids).toEqual([originalDocumentId]);
 
     const secondPath = workspaceManagedDocumentPath(state.project_id, state.slug, "inputs", "duplicates/report-copy.pdf");
     const duplicate = await dropbox.externalAdd(secondPath, "same-report-bytes");
@@ -164,9 +169,9 @@ describe("reference reconciliation", () => {
 
     const ledger = new DocumentLedgerRepository(runtime);
     const fingerprint = await ledger.readReferenceFingerprint(state.project_id, duplicate.content_hash);
-    const originalDocumentId = await documentIdForProviderFile(state.project_id, first.id);
     const duplicateDocumentId = await documentIdForProviderFile(state.project_id, duplicate.id);
     expect(metrics).toMatchObject({ duplicates: 1, duplicate_cleaned: 1 });
+    expect(result.changed_document_ids).toEqual([]);
     expect(dropbox.files.has(secondPath)).toBe(false);
     expect(fingerprint?.document_id).toBe(originalDocumentId);
     expect(await ledger.readHead(state.project_id, duplicateDocumentId)).toBeNull();
@@ -193,6 +198,7 @@ describe("reference reconciliation", () => {
     const secondDocumentId = await documentIdForProviderFile(state.project_id, historicalCopy.id);
     const ledger = new DocumentLedgerRepository(runtime);
     expect(metrics).toMatchObject({ ingested: 1, intake_completed: 1, duplicates: 0 });
+    expect(result.changed_document_ids).toEqual([secondDocumentId]);
     expect(await ledger.readHead(state.project_id, secondDocumentId)).toMatchObject({
       kind: "reference",
       logical_path: "historical/old-report.pdf",

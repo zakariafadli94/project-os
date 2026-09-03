@@ -88,6 +88,9 @@ The webhook is a trigger, not the changed-file payload. Exact paths come from th
 - Source/referral ingestion never implies business acceptance and does not create a canonical project revision by itself.
 - Managed provider changes are trigger-first; scheduled maintenance is not a hidden periodic `INPUTS/` scanner.
 - Dropbox empty `INPUTS/` directories may remain because recursive folder deletion is not a race-safe empty-directory cleanup primitive.
+- Search is derived, reconstructible and non-canonical; every search request is explicitly project-scoped and cannot authorize a business mutation.
+- Managed-document search identity is `document_id` + `version_id`, never a provider file ID.
+- Search never falls back to a recursive Dropbox crawl and excludes active INPUTS, unresolved MutationGate candidates and generated Markdown duplicates from the normal corpus.
 
 ## Artifact publication contract
 
@@ -196,12 +199,26 @@ Authorization: Bearer <INGRESS_TOKEN>
 
 The route validates the whole project list before dispatch, recovers only the selected projects through the same intake engine, and is never invoked by scheduled maintenance.
 
+## Fast read/search model (IMP-INDEX001)
+
+The INDEX001 search subsystem builds deterministic SQLite FTS5 projections from authoritative structured project state and governed managed-document versions. It preserves separate canonical-revision and document-version freshness frontiers, uses logical authority references, and keeps ProjectGuard as the per-project coordination boundary.
+
+Code map:
+
+- `src/search/` — contracts, record builders, SQLite index, query compiler, rebuild and synchronization stores.
+- `src/durable/project-guard-search-sync.ts` — downstream per-project synchronization scheduling.
+- `src/durable/search-sync-guard.ts` — isolated derived-sync retry/serialization.
+- `docs/search.md` — authority, corpus, freshness, rebuild and verification contract.
+
+The current branch documentation is pre-deployment: merge, production rebuild/backfill, read-path activation and canonical completion remain separate gates.
+
 ## Current write-coordination design
 
 - Design: `docs/superpowers/specs/2026-08-23-dropbox-write-coordination-design.md`
 - Implementation plan: `docs/superpowers/plans/2026-08-23-dropbox-write-coordination.md`
 - Trigger-first INPUTS design: `docs/superpowers/specs/2026-08-31-input-lifecycle-triggered-ingestion-design.md`
 - Trigger-first INPUTS implementation plan: `docs/superpowers/plans/2026-08-31-input-lifecycle-triggered-ingestion.md`
+- Search contract: `docs/search.md`
 - Deployment: `docs/deployment.md`
 
 ## Persistence provider boundary
@@ -212,12 +229,16 @@ Production remains intentionally **Dropbox-only**. `createProductionPersistence`
 
 Persisted records remain schema `1.0`. Historical fields such as `provider_file_id`, `provider_rev`, and `provider_content_hash` keep their exact Dropbox V1 meaning through an explicit compatibility seam. IMP-PERSIST001 is runtime-neutral, not persisted-format-neutral: adding a durable provider kind, generalized revision/hash tokens, migration/upcasting, or another provider is owned by IMP-SCHEMA001 rather than this boundary.
 
-Operational modes remain unchanged: continuity is `stable` and MutationGate production mode remains `observe`.
+Operational modes remain unchanged: continuity is `stable` and MutationGate production mode remains `enforce`.
 
 ## Commands
 
 ```bash
 npm install
+npm run test:index001
+npm run check:persistence-boundary
+npm run test:persistence-high-risk
+npm test
 npm run check
 npm run deploy
 ```

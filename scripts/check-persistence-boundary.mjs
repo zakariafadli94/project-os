@@ -30,6 +30,12 @@ for (const file of srcFiles) {
     }
   }
   if (
+    rel.startsWith("src/search/")
+    && /persistence\/providers\/dropbox|webhook\/dropbox/.test(text)
+  ) {
+    violations.push(`${rel}: search core imports Dropbox integration code`);
+  }
+  if (
     rel === "src/persistence/compatibility/dropbox-v1-evidence.ts"
     && /providers\/dropbox|dropbox\/(?:client|retry|resilient-transport)/.test(text)
   ) {

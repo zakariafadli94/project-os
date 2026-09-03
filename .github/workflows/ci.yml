@@ -23,6 +23,9 @@ jobs:
             exit 1
           fi
       - run: npm install
-      - run: npm run check
+      - run: npm run test:index001
+      - run: npm run check:persistence-boundary
       - run: npm run test:persistence-high-risk
+      - run: npm test
+      - run: npm run check
       - run: npx wrangler deploy --dry-run

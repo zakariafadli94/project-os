@@ -63,7 +63,7 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
   };
 
   const projectNamespace = {
-    getByName() {
+    getByName(projectId: string) {
       return {
         fetch: vi.fn(async (input: RequestInfo | URL) => {
           const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
@@ -76,6 +76,39 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
               restored: 0,
               conflicts: 0,
               cursor_reset: false
+            });
+          }
+          if (url.pathname === "/reconcile-search") {
+            return Response.json({
+              project_id: projectId,
+              canonical_revision_requested: 1,
+              canonical_revision_indexed: 1,
+              document_generation_requested: 1,
+              document_generation_indexed: 1,
+              last_error: null
+            });
+          }
+          return Response.json({ error: "not_found" }, { status: 404 });
+        })
+      };
+    }
+  };
+
+  const searchIndexNamespace = {
+    getByName() {
+      return {
+        fetch: vi.fn(async (input: RequestInfo | URL) => {
+          const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+          if (url.pathname === "/status") {
+            const projectId = url.searchParams.get("project_id");
+            return Response.json({
+              project_id: projectId,
+              active_generation: 1,
+              canonical_revision_indexed: 1,
+              document_generation_indexed: 1,
+              rebuild_state: "idle",
+              freshness: "current",
+              last_error: null
             });
           }
           return Response.json({ error: "not_found" }, { status: 404 });
@@ -94,6 +127,7 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
     REGISTRY_GUARD: { getByName: () => registryStub },
     PROJECT_GUARD: projectNamespace,
     MATERIALIZATION_GUARD: materializationNamespace,
+    SEARCH_INDEX_GUARD: searchIndexNamespace,
     DROPBOX_CHANGE_GUARD: {
       getByName() {
         return {

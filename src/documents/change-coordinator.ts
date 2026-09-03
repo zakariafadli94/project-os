@@ -57,6 +57,16 @@ interface BootstrapCandidate {
   priority: number;
 }
 
+interface BootstrapResult {
+  adopted: number;
+  document_id?: string;
+}
+
+interface BootstrapBaselineResult {
+  adopted: number;
+  changed_document_ids: string[];
+}
+
 export class ManagedDocumentChangeCoordinator {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly reconciler: ManagedDocumentReconciler;
@@ -173,7 +183,11 @@ export class ManagedDocumentChangeCoordinator {
     const gate = await this.mutationGate.processChanges(state, page.entries, detectionSource);
     accumulateGate(summary, gate);
     const unhandled = await this.reconcileStableChanges(state, page.entries, summary);
-    if (baseline) summary.bootstrapped += await this.bootstrapBaseline(state, unhandled);
+    if (baseline) {
+      const bootstrap = await this.bootstrapBaseline(state, unhandled);
+      summary.bootstrapped += bootstrap.adopted;
+      accumulateChangedDocumentIds(summary, bootstrap.changed_document_ids);
+    }
     accumulateReconcile(summary, await this.reconciler.reconcileChanges(state, unhandled));
 
     summary.cursor_reset = cursorReset;
@@ -254,7 +268,9 @@ export class ManagedDocumentChangeCoordinator {
     }
 
     if (job.detection_source !== "incremental") {
-      summary.bootstrapped += await this.bootstrapOne(state, job.change);
+      const bootstrap = await this.bootstrapOne(state, job.change);
+      summary.bootstrapped += bootstrap.adopted;
+      if (bootstrap.document_id) accumulateChangedDocumentIds(summary, [bootstrap.document_id]);
     }
 
     const reconciled = await this.reconciler.reconcileChanges(state, [job.change]);
@@ -275,25 +291,33 @@ export class ManagedDocumentChangeCoordinator {
     return unhandled;
   }
 
-  private async bootstrapBaseline(state: ProjectState, changes: ProviderChangeEntry[]): Promise<number> {
+  private async bootstrapBaseline(
+    state: ProjectState,
+    changes: ProviderChangeEntry[]
+  ): Promise<BootstrapBaselineResult> {
     const candidates = changes
       .map((change) => this.bootstrapCandidate(state, change))
       .filter((candidate): candidate is BootstrapCandidate => candidate !== null)
       .sort((a, b) => a.priority - b.priority || a.change.path.localeCompare(b.change.path));
     let adopted = 0;
-    for (const candidate of candidates) adopted += await this.bootstrapOne(state, candidate.change);
-    return adopted;
+    const changedDocumentIds = new Set<string>();
+    for (const candidate of candidates) {
+      const result = await this.bootstrapOne(state, candidate.change);
+      adopted += result.adopted;
+      if (result.document_id) changedDocumentIds.add(result.document_id);
+    }
+    return { adopted, changed_document_ids: [...changedDocumentIds].sort() };
   }
 
-  private async bootstrapOne(state: ProjectState, change: ProviderChangeEntry): Promise<number> {
+  private async bootstrapOne(state: ProjectState, change: ProviderChangeEntry): Promise<BootstrapResult> {
     const candidate = this.bootstrapCandidate(state, change);
-    if (!candidate) return 0;
+    if (!candidate) return { adopted: 0 };
     const metadata = await this.metadataFor(candidate.change);
-    if (!metadata) return 0;
+    if (!metadata) return { adopted: 0 };
 
     if (candidate.stage === "published") {
       const classification = await this.mutationClassifier.classify(state, candidate.change.path, metadata);
-      if (classification.kind !== "not_final_zone") return 0;
+      if (classification.kind !== "not_final_zone") return { adopted: 0 };
     }
 
     const result = await this.bootstrapper.bootstrapExistingManagedPath(
@@ -302,7 +326,9 @@ export class ManagedDocumentChangeCoordinator {
       metadata,
       candidate.stage
     );
-    return result.adopted ? 1 : 0;
+    return result.adopted
+      ? { adopted: 1, document_id: result.head.document_id }
+      : { adopted: 0 };
   }
 
   private bootstrapCandidate(state: ProjectState, change: ProviderChangeEntry): BootstrapCandidate | null {
@@ -352,6 +378,7 @@ function accumulateStable(target: ManagedDocumentChangeSummary, source: StableWo
   target.restored += source.restored;
   target.conflicts += source.conflicts;
   if (source.captured === 0 && source.restored === 0 && source.conflicts === 0) target.ignored += 1;
+  if (source.document_id) accumulateChangedDocumentIds(target, [source.document_id]);
 }
 
 function accumulateReconcile(target: ManagedDocumentChangeSummary, source: ManagedDocumentReconcileSummary): void {
@@ -366,6 +393,14 @@ function accumulateReconcile(target: ManagedDocumentChangeSummary, source: Manag
   target.duplicate_cleaned += source.duplicate_cleaned;
   target.withdrawn += source.withdrawn;
   target.intake_resumed += source.intake_resumed;
+  accumulateChangedDocumentIds(target, source.changed_document_ids);
+}
+
+function accumulateChangedDocumentIds(target: ManagedDocumentChangeSummary, source: readonly string[]): void {
+  target.changed_document_ids = [...new Set([
+    ...target.changed_document_ids,
+    ...source
+  ])].sort();
 }
 
 function isProjectedDeliverableMetadata(state: ProjectState, relativePath: string): boolean {
@@ -386,6 +421,7 @@ function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): Man
     duplicate_cleaned: 0,
     withdrawn: 0,
     intake_resumed: 0,
+    changed_document_ids: [],
     candidates: 0,
     mutation_gate_mode: mode,
     policy_violations: 0,

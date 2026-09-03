@@ -43,7 +43,11 @@ if (!statusMethod) {
 
 requireMatch(productionWorker, /\/v1\/admin\/search\/shadow/, "production worker must expose the operator shadow search route");
 requireMatch(productionWorker, /\/v1\/admin\/search\/shadow[\s\S]*?authorized\(request, env\)/, "operator shadow search must require ingress authentication");
-requireMatch(productionWorker, /typeof env\.INGRESS_TOKEN === "string"[\s\S]*?env\.INGRESS_TOKEN\.length > 0/, "production ingress authentication must reject missing or empty tokens before comparison");
+requireMatch(
+  productionWorker,
+  /(?:typeof env\.INGRESS_TOKEN === "string"[\s\S]*?env\.INGRESS_TOKEN\.length > 0|typeof env\.INGRESS_TOKEN !== "string"[\s\S]*?env\.INGRESS_TOKEN\.length === 0)/,
+  "production ingress authentication must reject missing or empty tokens before comparison"
+);
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`INDEX001 remediation gate: ${failure}`);

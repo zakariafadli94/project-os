@@ -73,13 +73,13 @@ jobs:
           pattern = re.compile(
               r'(\n      let receipt: ArtifactWriteReceipt;\n      try \{\n        receipt = await executeArtifact\(artifact\);)',
           )
-          replacement = '''
+          match = pattern.search(text)
+          if match is None:
+              raise SystemExit('execute artifact pattern not found')
+          insertion = '''
               if (maxWorkItems !== undefined && workItems >= maxWorkItems) break;
-              workItems += 1;
-          \1'''
-          text, count = pattern.subn(replacement, text, count=1)
-          if count != 1:
-              raise SystemExit(f'execute artifact pattern count={count}')
+              workItems += 1;'''
+          text = text[:match.start()] + insertion + match.group(1) + text[match.end():]
           path.write_text(text)
 
           runtime = Path('src/inbox/runtime.ts')

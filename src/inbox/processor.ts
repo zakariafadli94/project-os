@@ -19,6 +19,8 @@ export interface InboxProcessSummary {
 
 export interface ArtifactInboxProcessOptions {
   maxEntries?: number;
+  maxScanEntries?: number;
+  maxWorkItems?: number;
   respectRetryBackoff?: boolean;
 }
 
@@ -186,14 +188,19 @@ export async function processArtifactInbox(
   const artifactEntries = entries
     .filter((item) => item.kind === "file" && item.name.endsWith(".json"))
     .sort((a, b) => a.name.localeCompare(b.name));
-  const workEntries = boundedArtifactEntries(artifactEntries, options.maxEntries);
+  const scanEntries = boundedArtifactEntries(artifactEntries, options.maxScanEntries ?? options.maxEntries);
+  const maxWorkItems = options.maxWorkItems ?? options.maxEntries;
+  if (maxWorkItems !== undefined && (!Number.isSafeInteger(maxWorkItems) || maxWorkItems < 1)) {
+    throw new Error("Artifact inbox maxWorkItems must be a positive safe integer");
+  }
+  let workItems = 0;
   const summary: InboxProcessSummary = {
     scanned: artifactEntries.length,
     processed: 0,
     failed: 0
   };
 
-  for (const entry of workEntries) {
+  for (const entry of scanEntries) {
     try {
       const sourcePath = entry.path;
       if (!sourcePath) {
@@ -232,24 +239,14 @@ export async function processArtifactInbox(
       const failurePath = artifactFailurePath(mode, artifact.request_id);
       const previousFailure = await readArtifactFailure(objects, failurePath, artifact);
       if (previousFailure?.attempt_count && previousFailure.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
-        try {
-          await archiveSource(objects, sourcePath, artifactQuarantinePath(mode, artifact.request_id));
-          summary.processed += 1;
-        } catch (quarantineError) {
-          summary.failed += 1;
-          console.error("Project OS artifact quarantine cleanup deferred", {
-            request_id: artifact.request_id,
-            project_id: artifact.project_id,
-            attempt_count: previousFailure.attempt_count,
-            message: quarantineError instanceof Error ? quarantineError.message : String(quarantineError)
-          });
-        }
-        continue;
-      }
-      if (previousFailure && options.respectRetryBackoff && !artifactRetryDue(previousFailure)) {
+      continue;
+    }
+    if (previousFailure && options.respectRetryBackoff && !artifactRetryDue(previousFailure)) {
         continue;
       }
 
+    if (maxWorkItems !== undefined && workItems >= maxWorkItems) break;
+    workItems += 1;
       let receipt: ArtifactWriteReceipt;
       try {
         receipt = await executeArtifact(artifact);

@@ -12,6 +12,7 @@ import {
   type InboxProcessSummary
 } from "./processor";
 
+export const ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION = 2;
 export const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 1;
 
 export interface DurableInboxProcessSummary extends InboxProcessSummary {
@@ -33,7 +34,8 @@ export async function processDurableInbox(env: Env): Promise<DurableInboxProcess
     mode,
     (artifact) => routeArtifact(env, artifact),
     {
-      maxEntries: ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION,
+      maxScanEntries: ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION,
+      maxWorkItems: ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION,
       respectRetryBackoff: true
     }
   );

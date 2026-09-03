@@ -8,7 +8,12 @@
     "PROJECT_OS_CONTINUITY_MODE": "stable",
     "PROJECT_OS_MUTATION_GATE_MODE": "enforce",
     "PROJECT_OS_SCHEMA_WRITER_STAGE": "provider_v2",
-    "PROJECT_OS_SCHEMA_CORE_V2_FLOOR_PROJECT_IDS": "PRJ-0002,PRJ-0005,PRJ-0006"
+    "PROJECT_OS_SCHEMA_CORE_V2_FLOOR_PROJECT_IDS": "PRJ-0002,PRJ-0005,PRJ-0006",
+    "PROJECT_OS_SEARCH_READ_MODE": "off"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
   },
   "version_metadata": {
     "binding": "CF_VERSION_METADATA"

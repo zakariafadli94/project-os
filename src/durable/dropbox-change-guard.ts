@@ -7,14 +7,19 @@ const REQUESTED_GENERATION_KEY = "dropbox-change-requested-generation-v1";
 const COMPLETED_GENERATION_KEY = "dropbox-change-completed-generation-v1";
 const PROCESSING_GENERATION_KEY = "dropbox-change-processing-generation-v1";
 const LAST_ERROR_KEY = "dropbox-change-last-error-v1";
+const FAILURE_COUNT_KEY = "dropbox-change-failure-count-v1";
 const CHANGE_ALARM_DELAY_MS = 1_000;
+const CHANGE_FAST_RETRY_LIMIT = 5;
+const CHANGE_DEFER_DELAY_MS = 300_000;
 
 export interface DropboxChangeGuardStatus {
   requested_generation: number;
   completed_generation: number;
   alarm_scheduled: boolean;
+  alarm_at: number | null;
   processing_generation: number | null;
   last_error: string | null;
+  failure_count: number;
 }
 
 export class DropboxChangeGuard extends DurableObject<Env> {
@@ -27,12 +32,7 @@ export class DropboxChangeGuard extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/notify") {
-      const requestedGeneration = await this.ctx.storage.transaction(async (transaction) => {
-        const current = await transaction.get<number>(REQUESTED_GENERATION_KEY) ?? 0;
-        const next = current + 1;
-        await transaction.put(REQUESTED_GENERATION_KEY, next);
-        return next;
-      });
+      const requestedGeneration = await this.registerNotification();
       await this.ensureAlarm();
       const completedGeneration = await this.ctx.storage.get<number>(COMPLETED_GENERATION_KEY) ?? 0;
       return Response.json({
@@ -57,6 +57,32 @@ export class DropboxChangeGuard extends DurableObject<Env> {
     return this.serializeWork(() => this.reconcileChanges());
   }
 
+  private async registerNotification(): Promise<number> {
+    return this.ctx.storage.transaction(async (transaction) => {
+      const requested = await transaction.get<number>(REQUESTED_GENERATION_KEY) ?? 0;
+      const completed = await transaction.get<number>(COMPLETED_GENERATION_KEY) ?? 0;
+      const processing = await transaction.get<number>(PROCESSING_GENERATION_KEY);
+
+      // A burst of Dropbox webhooks represents one durable unit of pending work,
+      // not one unit per callback. While a generation is already pending, avoid
+      // rewriting the requested counter. If reconciliation is actively running,
+      // preserve exactly one follow-up generation so changes arriving after its
+      // provider cursor snapshot cannot be lost.
+      let next = requested;
+      if (processing !== undefined) {
+        const followUp = processing + 1;
+        if (requested < followUp) {
+          next = followUp;
+          await transaction.put(REQUESTED_GENERATION_KEY, next);
+        }
+      } else if (requested <= completed) {
+        next = completed + 1;
+        await transaction.put(REQUESTED_GENERATION_KEY, next);
+      }
+      return next;
+    });
+  }
+
   private async reconcileChanges(): Promise<void> {
     const requestedGeneration = await this.ctx.storage.get<number>(REQUESTED_GENERATION_KEY) ?? 0;
     const completedGeneration = await this.ctx.storage.get<number>(COMPLETED_GENERATION_KEY) ?? 0;
@@ -75,10 +101,23 @@ export class DropboxChangeGuard extends DurableObject<Env> {
       }
       await this.ctx.storage.put(COMPLETED_GENERATION_KEY, processingGeneration);
       await this.ctx.storage.delete(LAST_ERROR_KEY);
+      await this.ctx.storage.delete(FAILURE_COUNT_KEY);
     } catch (error) {
+      const failureCount = (await this.ctx.storage.get<number>(FAILURE_COUNT_KEY) ?? 0) + 1;
+      await this.ctx.storage.put(FAILURE_COUNT_KEY, failureCount);
       await this.ctx.storage.put(LAST_ERROR_KEY, errorMessage(error));
       await this.ctx.storage.delete(PROCESSING_GENERATION_KEY);
-      await this.ctx.storage.setAlarm(Date.now() + CHANGE_ALARM_DELAY_MS);
+      const retryDelay = failureCount <= CHANGE_FAST_RETRY_LIMIT
+        ? CHANGE_ALARM_DELAY_MS
+        : CHANGE_DEFER_DELAY_MS;
+      await this.ctx.storage.setAlarm(Date.now() + retryDelay);
+      console.error("Project OS Dropbox change reconciliation deferred", {
+        requested_generation: requestedGeneration,
+        completed_generation: completedGeneration,
+        failure_count: failureCount,
+        retry_delay_ms: retryDelay,
+        message: errorMessage(error)
+      });
       return;
     }
 
@@ -91,19 +130,22 @@ export class DropboxChangeGuard extends DurableObject<Env> {
   }
 
   private async status(): Promise<DropboxChangeGuardStatus> {
-    const [requestedGeneration, completedGeneration, alarm, processingGeneration, lastError] = await Promise.all([
+    const [requestedGeneration, completedGeneration, alarm, processingGeneration, lastError, failureCount] = await Promise.all([
       this.ctx.storage.get<number>(REQUESTED_GENERATION_KEY),
       this.ctx.storage.get<number>(COMPLETED_GENERATION_KEY),
       this.ctx.storage.getAlarm(),
       this.ctx.storage.get<number>(PROCESSING_GENERATION_KEY),
-      this.ctx.storage.get<string>(LAST_ERROR_KEY)
+      this.ctx.storage.get<string>(LAST_ERROR_KEY),
+      this.ctx.storage.get<number>(FAILURE_COUNT_KEY)
     ]);
     return {
       requested_generation: requestedGeneration ?? 0,
       completed_generation: completedGeneration ?? 0,
       alarm_scheduled: alarm !== null,
+      alarm_at: alarm,
       processing_generation: processingGeneration ?? null,
-      last_error: lastError ?? null
+      last_error: lastError ?? null,
+      failure_count: failureCount ?? 0
     };
   }
 

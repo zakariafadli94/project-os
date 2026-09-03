@@ -23,8 +23,12 @@ const directPromotionLines = (text) => text
   .filter((line) => !/\bwrangler\s+deploy\b.*--dry-run\b/.test(line));
 
 // GitHub deploy.yml is the sole positive-traffic production promoter.
-requireText(deploy, "branches: [main]", "main-only automatic production trigger");
+// Production promotion is manual-only, bound to an exact SHA and rejected off main.
 requireText(deploy, "workflow_dispatch:", "manual production trigger");
+forbid(deploy, /^\s*push:\s*$/m, "automatic production trigger");
+requireText(deploy, "refs/heads/main", "main-only manual production guard");
+requireText(deploy, "expected_sha", "exact approved production SHA input");
+requireText(deploy, "confirm_production", "explicit production confirmation input");
 requireText(deploy, "group: project-os-production", "shared production serialization lock");
 requireText(deploy, "git-${GITHUB_SHA}", "exact Git-SHA Worker version tag");
 requireText(deploy, "worker_version_id", "post-deploy Worker version identity verification");

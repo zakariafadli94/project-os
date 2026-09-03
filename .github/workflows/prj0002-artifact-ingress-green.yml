@@ -1,0 +1,18 @@
+name: prj0002-artifact-ingress-green
+
+on:
+  push:
+    branches:
+      - fix/prj0002-artifact-ingress-green-proof
+
+jobs:
+  green-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npx vitest run test/inbox-artifact-ingress-bounds.spec.ts test/inbox-artifact-failure.spec.ts
+      - run: npm run typecheck

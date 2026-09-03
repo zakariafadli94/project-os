@@ -17,7 +17,15 @@ export interface InboxProcessSummary {
   failed: number;
 }
 
+export interface ArtifactInboxProcessOptions {
+  maxEntries?: number;
+  respectRetryBackoff?: boolean;
+}
+
 export const MAX_RETRYABLE_INBOX_ATTEMPTS = 8;
+export const ARTIFACT_RETRY_FAST_ATTEMPT_LIMIT = 5;
+export const ARTIFACT_RETRY_FAST_DELAY_MS = 1_000;
+export const ARTIFACT_RETRY_DEFER_DELAY_MS = 300_000;
 
 export type ExecuteTransaction = (transaction: Transaction) => Promise<Receipt>;
 export type ExecuteArtifact = (artifact: ArtifactWriteRequest) => Promise<ArtifactWriteReceipt>;
@@ -171,19 +179,21 @@ export async function processTransactionInbox(
 export async function processArtifactInbox(
   objects: ObjectPersistence,
   mode: LayoutMode,
-  executeArtifact: ExecuteArtifact
+  executeArtifact: ExecuteArtifact,
+  options: ArtifactInboxProcessOptions = {}
 ): Promise<InboxProcessSummary> {
   const entries = await objects.listChildren(artifactInboxPath(mode));
   const artifactEntries = entries
     .filter((item) => item.kind === "file" && item.name.endsWith(".json"))
     .sort((a, b) => a.name.localeCompare(b.name));
+  const workEntries = boundedArtifactEntries(artifactEntries, options.maxEntries);
   const summary: InboxProcessSummary = {
     scanned: artifactEntries.length,
     processed: 0,
     failed: 0
   };
 
-  for (const entry of artifactEntries) {
+  for (const entry of workEntries) {
     try {
       const sourcePath = entry.path;
       if (!sourcePath) {
@@ -219,6 +229,27 @@ export async function processArtifactInbox(
         continue;
       }
 
+      const failurePath = artifactFailurePath(mode, artifact.request_id);
+      const previousFailure = await readArtifactFailure(objects, failurePath, artifact);
+      if (previousFailure?.attempt_count && previousFailure.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
+        try {
+          await archiveSource(objects, sourcePath, artifactQuarantinePath(mode, artifact.request_id));
+          summary.processed += 1;
+        } catch (quarantineError) {
+          summary.failed += 1;
+          console.error("Project OS artifact quarantine cleanup deferred", {
+            request_id: artifact.request_id,
+            project_id: artifact.project_id,
+            attempt_count: previousFailure.attempt_count,
+            message: quarantineError instanceof Error ? quarantineError.message : String(quarantineError)
+          });
+        }
+        continue;
+      }
+      if (previousFailure && options.respectRetryBackoff && !artifactRetryDue(previousFailure)) {
+        continue;
+      }
+
       let receipt: ArtifactWriteReceipt;
       try {
         receipt = await executeArtifact(artifact);
@@ -226,7 +257,7 @@ export async function processArtifactInbox(
         summary.failed += 1;
         console.error("Project OS artifact processing failed", artifact.request_id, error);
         try {
-          const diagnostic = await recordArtifactFailure(objects, mode, artifact, error);
+          const diagnostic = await recordArtifactFailure(objects, mode, artifact, error, previousFailure);
           if (diagnostic.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
             await archiveSource(objects, sourcePath, artifactQuarantinePath(mode, artifact.request_id));
           }
@@ -245,7 +276,7 @@ export async function processArtifactInbox(
       await archiveSource(objects, sourcePath, terminalPath);
       await clearFailureBestEffort(
         objects,
-        artifactFailurePath(mode, artifact.request_id),
+        failurePath,
         "artifact",
         artifact.request_id
       );
@@ -416,11 +447,12 @@ async function recordArtifactFailure(
   objects: ObjectPersistence,
   mode: LayoutMode,
   artifact: ArtifactWriteRequest,
-  error: unknown
+  error: unknown,
+  previous: ArtifactFailureDiagnostic | null = null
 ): Promise<ArtifactFailureDiagnostic> {
   const path = artifactFailurePath(mode, artifact.request_id);
-  const previous = await readArtifactFailure(objects, path, artifact);
-  const common = retryableFailure(previous, error);
+  const prior = previous ?? await readArtifactFailure(objects, path, artifact);
+  const common = retryableFailure(prior, error);
   const diagnostic: ArtifactFailureDiagnostic = {
     ...common,
     request_id: artifact.request_id,
@@ -473,6 +505,23 @@ function validRetryableFailure(parsed: Partial<RetryableFailureDiagnostic>): boo
     && typeof parsed.first_failed_at === "string"
     && typeof parsed.last_failed_at === "string"
     && typeof parsed.message === "string";
+}
+
+function artifactRetryDue(failure: ArtifactFailureDiagnostic, now = Date.now()): boolean {
+  const lastFailedAt = Date.parse(failure.last_failed_at);
+  if (!Number.isFinite(lastFailedAt)) return true;
+  const delay = failure.attempt_count <= ARTIFACT_RETRY_FAST_ATTEMPT_LIMIT
+    ? ARTIFACT_RETRY_FAST_DELAY_MS
+    : ARTIFACT_RETRY_DEFER_DELAY_MS;
+  return now >= lastFailedAt + delay;
+}
+
+function boundedArtifactEntries(entries: ProviderEntry[], maxEntries: number | undefined): ProviderEntry[] {
+  if (maxEntries === undefined) return entries;
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) {
+    throw new Error("Artifact inbox maxEntries must be a positive safe integer");
+  }
+  return entries.slice(0, maxEntries);
 }
 
 async function clearFailureBestEffort(

@@ -1,10 +1,11 @@
 import { env } from "cloudflare:workers";
-import { createExecutionContext } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { createExecutionContext, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import worker from "../src/index-mutation-gate";
 import { reconcileSearchIndexes } from "../src/index-neutral";
 import { searchSyncEnabled } from "../src/search/sync-mode";
+import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 const authHeaders = {
@@ -19,7 +20,57 @@ function envWithSyncMode(mode?: string): Env {
   return candidate as unknown as Env;
 }
 
+async function createTransitionProject(): Promise<string> {
+  const response = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({
+      schema_version: "1.0",
+      transaction_id: "TXN-SYNC-TRANSITION-CREATE",
+      project_id: "PRJ-AUTO",
+      base_revision: 0,
+      operation: "project.create",
+      created_at: "2026-09-03T16:40:00+01:00",
+      payload: {
+        name: "Sync Transition Probe",
+        slug: "sync-transition-probe",
+        aliases: [],
+        objective: "prove on off on wake recovery"
+      }
+    })
+  }), testEnv, createExecutionContext());
+  expect(response.status).toBe(200);
+  const body = await response.json<{ project_id: string; status: string }>();
+  expect(body.status).toBe("committed");
+  return body.project_id;
+}
+
+async function commitTransitionTask(projectId: string, baseRevision: number, suffix: string): Promise<void> {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({
+      schema_version: "1.0",
+      transaction_id: `TXN-SYNC-TRANSITION-${suffix}`,
+      project_id: projectId,
+      base_revision: baseRevision,
+      operation: "task.create",
+      created_at: "2026-09-03T16:41:00+01:00",
+      payload: {
+        task_id: `TASK-TRANSITION${suffix}`,
+        title: `Transition ${suffix}`,
+        description: "derived sync wake must remain recoverable"
+      }
+    })
+  }), testEnv, ctx);
+  expect(response.status).toBe(200);
+  await waitOnExecutionContext(ctx);
+}
+
 describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   it.each([
     [undefined, false],
     ["off", false],
@@ -49,6 +100,36 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
       rebuilding: 0,
       failed: 0
     });
+  });
+
+  it("recovers wake scheduling across an on to off to on transition", async () => {
+    installDropboxMock();
+    const projectId = await createTransitionProject();
+    await commitTransitionTask(projectId, 1, "A001");
+
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const syncGuard = testEnv.SEARCH_SYNC_GUARD.getByName(projectId);
+    expect(await runInDurableObject(syncGuard, async (_instance, state) => state.storage.getAlarm())).not.toBeNull();
+
+    await runInDurableObject(projectGuard, async (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_SEARCH_SYNC_MODE = "off";
+    });
+    await runInDurableObject(syncGuard, async (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_SEARCH_SYNC_MODE = "off";
+    });
+
+    expect(await runDurableObjectAlarm(syncGuard)).toBe(true);
+    expect(await runDurableObjectAlarm(syncGuard)).toBe(false);
+
+    await runInDurableObject(projectGuard, async (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_SEARCH_SYNC_MODE = "on";
+    });
+    await runInDurableObject(syncGuard, async (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_SEARCH_SYNC_MODE = "on";
+    });
+
+    await commitTransitionTask(projectId, 2, "A002");
+    expect(await runDurableObjectAlarm(syncGuard)).toBe(true);
   });
 
   it("keeps public search off while allowing an authenticated operator shadow query surface", async () => {

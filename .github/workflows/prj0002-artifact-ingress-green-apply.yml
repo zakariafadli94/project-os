@@ -1,0 +1,118 @@
+name: prj0002-artifact-ingress-green-apply
+
+on:
+  push:
+    branches:
+      - fix/prj0002-artifact-ingress-control-boundary
+
+permissions:
+  contents: write
+
+jobs:
+  apply-green:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/prj0002-artifact-ingress-control-boundary
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - name: Apply minimal bounded-scan GREEN
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('src/inbox/processor.ts')
+          text = path.read_text()
+
+          old = '''export interface ArtifactInboxProcessOptions {
+            maxEntries?: number;
+            respectRetryBackoff?: boolean;
+          }'''
+          new = '''export interface ArtifactInboxProcessOptions {
+            maxEntries?: number;
+            maxScanEntries?: number;
+            maxWorkItems?: number;
+            respectRetryBackoff?: boolean;
+          }'''
+          if old not in text:
+              raise SystemExit('options interface pattern not found')
+          text = text.replace(old, new, 1)
+
+          old = '''  const workEntries = boundedArtifactEntries(artifactEntries, options.maxEntries);
+            const summary: InboxProcessSummary = {'''
+          new = '''  const scanEntries = boundedArtifactEntries(artifactEntries, options.maxScanEntries ?? options.maxEntries);
+            const maxWorkItems = options.maxWorkItems ?? options.maxEntries;
+            if (maxWorkItems !== undefined && (!Number.isSafeInteger(maxWorkItems) || maxWorkItems < 1)) {
+              throw new Error("Artifact inbox maxWorkItems must be a positive safe integer");
+            }
+            let workItems = 0;
+            const summary: InboxProcessSummary = {'''
+          if old not in text:
+              raise SystemExit('work entries pattern not found')
+          text = text.replace(old, new, 1)
+          text = text.replace('  for (const entry of workEntries) {', '  for (const entry of scanEntries) {', 1)
+
+          old = '''      if (previousFailure?.attempt_count && previousFailure.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
+                try {
+                  await archiveSource(objects, sourcePath, artifactQuarantinePath(mode, artifact.request_id));
+                  summary.processed += 1;
+                } catch (quarantineError) {
+                  summary.failed += 1;
+                  console.error("Project OS artifact quarantine cleanup deferred", {
+                    request_id: artifact.request_id,
+                    project_id: artifact.project_id,
+                    attempt_count: previousFailure.attempt_count,
+                    message: quarantineError instanceof Error ? quarantineError.message : String(quarantineError)
+                  });
+                }
+                continue;
+              }'''
+          new = '''      if (previousFailure?.attempt_count && previousFailure.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
+                continue;
+              }'''
+          if old not in text:
+              raise SystemExit('exhausted cleanup pattern not found')
+          text = text.replace(old, new, 1)
+
+          old = '''      let receipt: ArtifactWriteReceipt;
+              try {
+                receipt = await executeArtifact(artifact);'''
+          new = '''      if (maxWorkItems !== undefined && workItems >= maxWorkItems) break;
+              workItems += 1;
+
+              let receipt: ArtifactWriteReceipt;
+              try {
+                receipt = await executeArtifact(artifact);'''
+          if old not in text:
+              raise SystemExit('execute artifact pattern not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          runtime = Path('src/inbox/runtime.ts')
+          text = runtime.read_text()
+          text = text.replace(
+              'export const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 1;',
+              'export const ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION = 2;\nexport const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 1;',
+              1,
+          )
+          old = '''      maxEntries: ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION,
+                respectRetryBackoff: true'''
+          new = '''      maxScanEntries: ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION,
+                maxWorkItems: ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION,
+                respectRetryBackoff: true'''
+          if old not in text:
+              raise SystemExit('runtime budget pattern not found')
+          runtime.write_text(text.replace(old, new, 1))
+      - run: npx vitest run test/inbox-artifact-ingress-fairness.spec.ts test/inbox-artifact-ingress-bounds.spec.ts test/inbox-artifact-failure.spec.ts test/inbox-isolation.spec.ts
+      - name: Commit GREEN if targeted tests pass
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/inbox/processor.ts src/inbox/runtime.ts
+          git commit -m "fix(PRJ-0002): separate artifact scan and work budgets"
+          git push origin HEAD:fix/prj0002-artifact-ingress-control-boundary

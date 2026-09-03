@@ -51,9 +51,9 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
     });
   });
 
-  it("does not schedule derived search wake work from canonical commits when off", async () => {
+  it("keeps direct wake and canonical side-effect scheduling inert when off", async () => {
     const offEnv = envWithSyncMode("off");
-    const response = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
+    const createResponse = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
       method: "POST",
       headers: authHeaders,
       body: JSON.stringify({
@@ -71,11 +71,38 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
         }
       })
     }), offEnv, createExecutionContext());
-    expect(response.status).toBe(200);
-    const receipt = await response.json<{ project_id: string; status: string }>();
-    expect(receipt.status).toBe("committed");
+    expect(createResponse.status).toBe(200);
+    const created = await createResponse.json<{ project_id: string; status: string }>();
+    expect(created.status).toBe("committed");
 
-    const syncGuard = offEnv.SEARCH_SYNC_GUARD.getByName(receipt.project_id);
+    const taskResponse = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        schema_version: "1.0",
+        transaction_id: "TXN-SEARCH-SYNC-OFF-TASK",
+        project_id: created.project_id,
+        base_revision: 1,
+        operation: "task.create",
+        created_at: "2026-09-03T16:01:00+01:00",
+        payload: {
+          task_id: "TASK-SYNCOFF001",
+          title: "Sync disabled probe",
+          description: "must not schedule derived search work"
+        }
+      })
+    }), offEnv, createExecutionContext());
+    expect(taskResponse.status).toBe(200);
+    await expect(taskResponse.json()).resolves.toMatchObject({ status: "committed", new_revision: 2 });
+
+    const syncGuard = offEnv.SEARCH_SYNC_GUARD.getByName(created.project_id);
+    const wake = await syncGuard.fetch("https://search-sync.internal/wake", { method: "POST" });
+    expect(wake.status).toBe(200);
+    await expect(wake.json()).resolves.toMatchObject({
+      project_id: created.project_id,
+      pending: false,
+      sync_enabled: false
+    });
     expect(await runDurableObjectAlarm(syncGuard)).toBe(false);
   });
 

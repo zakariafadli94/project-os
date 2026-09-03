@@ -30,6 +30,12 @@ for (const file of srcFiles) {
     }
   }
   if (
+    rel.startsWith("src/search/")
+    && /persistence\/providers\//.test(text)
+  ) {
+    violations.push(`${rel}: search code must depend on provider-neutral persistence interfaces, not provider implementations`);
+  }
+  if (
     rel === "src/persistence/compatibility/dropbox-v1-evidence.ts"
     && /providers\/dropbox|dropbox\/(?:client|retry|resilient-transport)/.test(text)
   ) {

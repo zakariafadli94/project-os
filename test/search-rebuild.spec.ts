@@ -85,9 +85,20 @@ async function writeWorking(
   return receipt;
 }
 
+async function waitForSearchSyncAlarm(syncGuard: DurableObjectStub): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const alarm = await runInDurableObject(syncGuard, async (_instance, state) => state.storage.getAlarm());
+    if (alarm !== null) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  const alarm = await runInDurableObject(syncGuard, async (_instance, state) => state.storage.getAlarm());
+  expect(alarm).not.toBeNull();
+}
+
 async function drainSearchSync(projectId: string, alarms: number): Promise<void> {
   const syncGuard = testEnv.SEARCH_SYNC_GUARD.getByName(projectId);
   for (let index = 0; index < alarms; index += 1) {
+    await waitForSearchSyncAlarm(syncGuard);
     expect(await runDurableObjectAlarm(syncGuard)).toBe(true);
   }
 }

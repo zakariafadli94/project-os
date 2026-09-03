@@ -1,7 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:workers";
+import { createExecutionContext } from "cloudflare:test";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectState } from "../src/domain/project-state";
+import type { Env } from "../src/env";
+import worker from "../src/index";
 import { buildCanonicalSearchRecords } from "../src/search/canonical-records";
 import { parseSearchQuery, type ManagedDocumentSearchRecord } from "../src/search/contract";
+import { installDropboxMock } from "./helpers/mock-dropbox";
+
+const testEnv = env as unknown as Env;
+const authHeaders = {
+  authorization: `Bearer ${testEnv.INGRESS_TOKEN}`,
+  "content-type": "application/json"
+};
 
 function minimalState(): ProjectState {
   return {
@@ -30,6 +41,8 @@ function minimalState(): ProjectState {
 }
 
 describe("search provider neutrality and authority boundaries", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   it("keeps public canonical identity logical and provider-neutral", async () => {
     const records = await buildCanonicalSearchRecords(minimalState());
     const record = records.find((candidate) => candidate.record_id === "project:PRJ-0002");
@@ -88,5 +101,45 @@ describe("search provider neutrality and authority boundaries", () => {
       version_id: record.version_id
     });
     expect(JSON.stringify(record)).not.toMatch(/provider[_-]?file[_-]?id/i);
+  });
+
+  it("fails closed when SearchIndexGuard is unavailable and never falls back to Dropbox listing", async () => {
+    const dropbox = installDropboxMock();
+    const create = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        schema_version: "1.0",
+        transaction_id: "TXN-SEARCH-PROVIDER-NEUTRAL-CREATE-0001",
+        project_id: "PRJ-AUTO",
+        base_revision: 0,
+        operation: "project.create",
+        created_at: "2026-09-03T09:00:00+01:00",
+        payload: {
+          name: "Search Provider Neutral Fixture",
+          slug: "search-provider-neutral-fixture",
+          aliases: [],
+          objective: "Prove fail-closed search outage semantics"
+        }
+      })
+    }), testEnv, createExecutionContext());
+    expect(create.status).toBe(200);
+    const receipt = await create.json<{ project_id: string; status: string }>();
+    expect(receipt.status).toBe("committed");
+
+    dropbox.calls.length = 0;
+    vi.spyOn(testEnv.SEARCH_INDEX_GUARD, "getByName").mockReturnValue({
+      fetch: vi.fn(async () => Response.json({ error: "search_index_unavailable" }, { status: 503 }))
+    } as never);
+
+    const response = await worker.fetch(new Request("https://project-os.test/v1/search", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ project_ids: [receipt.project_id], text: "authority" })
+    }), testEnv, createExecutionContext());
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ error: "search_unavailable", status: 503 });
+    expect(dropbox.calls.some((call) => call.includes("/2/files/list_folder"))).toBe(false);
   });
 });

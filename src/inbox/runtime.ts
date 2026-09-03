@@ -12,6 +12,8 @@ import {
   type InboxProcessSummary
 } from "./processor";
 
+export const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 1;
+
 export interface DurableInboxProcessSummary extends InboxProcessSummary {
   mode: LayoutMode;
   inbox: string;
@@ -29,7 +31,11 @@ export async function processDurableInbox(env: Env): Promise<DurableInboxProcess
   const artifactSummary = await processArtifactInbox(
     persistence.objects,
     mode,
-    (artifact) => routeArtifact(env, artifact)
+    (artifact) => routeArtifact(env, artifact),
+    {
+      maxEntries: ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION,
+      respectRetryBackoff: true
+    }
   );
   const referralSummary = await processReferralInbox(env);
 

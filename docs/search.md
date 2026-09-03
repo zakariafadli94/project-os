@@ -1,12 +1,12 @@
 # Project OS search
 
-> IMP-INDEX001 pre-merge candidate. This document describes the branch implementation only. The feature is **not merged, not deployed, not production-rebuilt, and not activated as a production read path** until the separate gates in the accepted INDEX001 plan are satisfied.
+> IMP-INDEX001 production-completion remediation candidate. The deployed baseline already contains the derived search subsystem, manual-only production deployment, and a fail-closed public read gate. This branch adds a separate fail-closed synchronization gate and an authenticated operator-only shadow query surface. It does **not** authorize merge, deployment, rebuild/backfill, production wake/sync, public read activation, or canonical closure.
 
 ## Authority model
 
 Search is a **derived, reconstructible, non-canonical read model**. It never becomes a second source of truth and never authorizes a business mutation. Canonical project state, immutable events, receipts, managed-document ledgers and governed artifacts remain authoritative in their existing stores.
 
-Every public search query is explicitly project-scoped. `project_ids` is required and validated before query execution; callers cannot obtain an account-wide implicit search by omitting project scope. Project filtering is applied inside the search query before ranking.
+Every search query is explicitly project-scoped. `project_ids` is required and validated before query execution; callers cannot obtain an account-wide implicit search by omitting project scope. Project filtering is applied inside the search query before ranking.
 
 Search records carry logical authority references. Canonical entities use project/entity/revision identity. Managed documents use `document_id` and `version_id`; provider file IDs are not public document identity.
 
@@ -34,14 +34,37 @@ There is **no recursive Dropbox/provider scan fallback**. If the derived index i
 - `src/search/query-compiler.ts` — deterministic bounded lexical query compilation.
 - `src/search/search-index-guard.ts` — installation-scoped `SearchIndexGuard` mutation/query/rebuild boundary.
 - `src/search/rebuild.ts` — reconstructible staged rebuild from authoritative inputs.
+- `src/search/read-mode.ts` — public read-path kill switch.
+- `src/search/sync-mode.ts` — derived synchronization kill switch.
 - `src/durable/project-guard-search-sync.ts` — ProjectGuard-side delta scheduling after canonical/document changes.
-- `src/durable/search-sync-guard.ts` — isolated retry/serialization for derived synchronization.
+- `src/durable/search-sync-guard.ts` — isolated bounded retry/serialization for derived synchronization.
 
 `ProjectGuard` remains the per-project coordination boundary. Search synchronization is downstream derived work: a search-sync failure must not roll back or reinterpret an already committed canonical business revision.
 
+## Independent production gates
+
+Search read authority and search synchronization authority are intentionally separate.
+
+`PROJECT_OS_SEARCH_READ_MODE` controls only normal public retrieval through `POST /v1/search`:
+
+- exact `on` enables the public search route;
+- absent, `off`, or any other value fails closed with `404` before the public search handler runs.
+
+`PROJECT_OS_SEARCH_SYNC_MODE` controls only derived incremental synchronization and maintenance reconciliation:
+
+- exact `on` permits derived search reconciliation, ProjectGuard search side-effect scheduling, SearchSyncGuard wake, drain, and retry alarms;
+- absent, `off`, or any other value is fail-closed;
+- while off, `reconcileSearchIndexes()` returns an inert zero-work summary before reading the registry or touching search Durable Objects;
+- ProjectGuard does not advance requested search watermarks, restart a document epoch, schedule a wake, or drain derived sync while off;
+- SearchSyncGuard does not arm a wake and an already-fired/stale alarm exits without contacting ProjectGuard or scheduling another retry.
+
+Production configuration starts with **both modes off**. Enabling synchronization for controlled production proof does not implicitly enable the public read path. Enabling the public read path is a later, separate exact-commit deployment gate.
+
+Inbox processing, materialization reconciliation and Managed Document reconciliation are not controlled by `PROJECT_OS_SEARCH_SYNC_MODE` and remain operational independently.
+
 ## Public search
 
-Authenticated search uses:
+Authenticated normal search uses:
 
 ```text
 POST /v1/search
@@ -52,6 +75,20 @@ The request must include a non-empty explicit `project_ids` set. The implementat
 
 The response contains `hits` plus one freshness record per explicitly scoped project. Search results are references to authority; callers that need authoritative content should resolve the returned canonical entity or governed document identity rather than treating the index row itself as truth.
 
+## Operator shadow search
+
+Task 10 shadow-query proof does not require enabling the public read path. Authenticated operators use the distinct admin surface:
+
+```text
+POST /v1/admin/search/shadow
+Authorization: Bearer <INGRESS_TOKEN>
+Content-Type: application/json
+```
+
+The request and response contracts are the same project-scoped search contracts used by normal search, including bounded scope and freshness. The route is intentionally separate from `POST /v1/search`, so public read mode may remain `off` throughout shadow proof.
+
+The shadow route is read-only derived-state inspection. It creates no canonical authority, performs no provider fallback scan, does not trigger sync/rebuild as a side effect, and must not log raw query text, result snippets, document bodies, secrets or provider tokens.
+
 ## Freshness
 
 Canonical freshness and document freshness are separate dimensions and use separate requested/indexed watermarks:
@@ -60,7 +97,7 @@ Canonical freshness and document freshness are separate dimensions and use separ
 - `document_generation_requested` / `document_generation_indexed`;
 - managed-document epoch identity (`document_epoch`, `document_epoch_started_at`) where applicable.
 
-Public freshness state is one of:
+Freshness state is one of:
 
 - `current` — canonical and document frontiers have caught up to requested source state;
 - `lagging` — at least one frontier is behind but no failure is currently recorded;
@@ -75,6 +112,8 @@ A canonical watermark never proves document freshness, and a document watermark 
 Rebuild is reconstructible from authoritative canonical state and current governed document heads. It stages a new per-project generation while keeping the last proven active generation queryable. Promotion occurs only after the staged generation completes and source watermarks remain valid; a failed or incomplete staging generation cannot silently replace the active generation.
 
 Search-index loss does not rewrite canonical history or Managed Document state. Recovery is a derived-state rebuild, not a business-state migration.
+
+The rebuild admin route remains a separate explicit operator action; `PROJECT_OS_SEARCH_SYNC_MODE=off` prevents background reconciliation/wake/sync but does not silently convert the rebuild endpoint into a cron action. Production rebuild/backfill still requires its own authorization gate.
 
 ## Admin operations
 
@@ -97,15 +136,16 @@ GET /v1/admin/search/status?project_id=PRJ-0002
 Authorization: Bearer <INGRESS_TOKEN>
 ```
 
-The status response exposes source synchronization state, index state and rebuild state for the requested project. These endpoints are operational controls only; they do not mutate canonical business state.
+The status response exposes source synchronization state, index state and rebuild state for the requested project. With sync mode off, reading source search status is observational: it must not request new canonical synchronization or wake SearchSyncGuard.
 
 ## Failure semantics
 
-- Canonical commits and governed document authority remain valid when search synchronization fails.
+- Canonical commits and governed document authority remain valid when search synchronization fails or is disabled.
 - Search lag/failure is surfaced through explicit freshness/status state.
 - Query failure does not trigger a recursive provider scan fallback.
 - Rebuild failure leaves the previous proven active generation in place.
 - Derived sync/rebuild retries remain isolated from ProjectGuard canonical correctness.
+- Turning sync mode off stops new derived wake/drain/retry work without changing canonical or Managed Document state.
 
 ## Provider boundary
 
@@ -117,9 +157,13 @@ The search subsystem does not use embeddings, vector search, OCR, an external se
 
 Operational logs may include safe project/generation/revision/version identifiers, counters, statuses and bounded error metadata. They must not emit raw search query text, document bodies/snippets, secrets, provider tokens or sensitive payload content.
 
+The operator shadow endpoint adds no query logging of its own.
+
 ## Rollback rule
 
-Disabling or removing the search read path does **not** rewind, delete or reinterpret canonical state. Search/index state is disposable derived state. A rollback may stop query/sync/rebuild use and later reconstruct the index from durable truth without changing business revisions or governed-document authority.
+Public read rollback is configuration-only: return `PROJECT_OS_SEARCH_READ_MODE` to `off` and deploy the exact reviewed commit. This does not rewind, delete or reinterpret canonical state.
+
+Derived synchronization rollback is independent: return `PROJECT_OS_SEARCH_SYNC_MODE` to `off`. Any stale SearchSyncGuard alarm becomes inert when it fires and does not re-arm. Search/index state remains disposable derived state and may later be reconstructed from durable truth without changing business revisions or governed-document authority.
 
 ## Verification
 
@@ -135,7 +179,7 @@ Provider boundary:
 npm run check:persistence-boundary
 ```
 
-Persistence high-risk suite (runs the persistence boundary and includes INDEX001 synchronization/rebuild/worker/provider-neutral regressions):
+Persistence high-risk suite:
 
 ```bash
 npm run test:persistence-high-risk
@@ -146,20 +190,26 @@ Full repository verification:
 ```bash
 npm test
 npm run check
+npx wrangler deploy --dry-run
 ```
 
-The pull-request CI also performs a Wrangler dry-run. Passing these checks proves the pre-merge branch candidate only; it does not constitute production proof or canonical completion.
+`check:index001-remediation` statically requires manual-only production deployment, public read mode off, sync mode off, bounded Workers observability, fail-closed fleet/ProjectGuard/SearchSyncGuard sync controls, and the authenticated operator shadow route.
+
+Passing these checks proves the branch candidate only; it does not constitute production proof or canonical completion.
 
 ## Production gates still required after merge authorization
 
-The accepted plan keeps the following steps separate from branch implementation:
+The production-completion sequence remains separate from branch implementation:
 
-1. merge the reviewed exact candidate to `main`;
-2. deploy the authorized exact release;
-3. perform the controlled production search rebuild/backfill;
-4. verify production corpus, scope, freshness and authority invariants;
-5. activate the production read path only under its explicit gate;
-6. record production proof and close `TASK-IMPINDEX001` canonically only after a committed Project OS receipt;
-7. only then consider the next sequenced improvement package.
+1. merge only an explicitly authorized, fully green exact candidate;
+2. manually deploy the authorized exact release with both read and sync modes initially off;
+3. verify exact identity/health and that scheduled search reconciliation is inert;
+4. separately authorize and deploy sync mode `on` while public read remains `off`;
+5. perform the controlled `PRJ-0002` plus one rich-project rebuild/backfill and validate status/counts/authority;
+6. run shadow queries through `/v1/admin/search/shadow` while public read remains off;
+7. prove incremental synchronization, lag/failure semantics, recovery/replay and generation safety;
+8. only then separately authorize public read mode `on` and validate representative production retrieval;
+9. record production evidence and close `TASK-IMPINDEX001` canonically only after a committed Project OS receipt;
+10. only after INDEX001 closure consider the next sequenced package.
 
-None of those gates are executed by the pre-merge candidate described here.
+None of those production mutations are executed by this branch candidate.

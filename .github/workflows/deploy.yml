@@ -1,9 +1,16 @@
 name: deploy
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact main commit SHA approved for production deployment
+        required: true
+        type: string
+      confirm_production:
+        description: Type DEPLOY to confirm an explicit production deployment
+        required: true
+        type: string
 
 concurrency:
   group: project-os-production
@@ -21,6 +28,31 @@ jobs:
       HEALTH_URL: https://project-os-guard.zakaria-fadli-94.workers.dev/health
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify explicit production deployment gate
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          CONFIRM_PRODUCTION: ${{ inputs.confirm_production }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Production deployment must be dispatched from refs/heads/main."
+            exit 1
+          fi
+          if [ "$CONFIRM_PRODUCTION" != "DEPLOY" ]; then
+            echo "Production deployment requires confirm_production=DEPLOY."
+            exit 1
+          fi
+          if ! [[ "$EXPECTED_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "expected_sha must be an exact 40-character Git SHA."
+            exit 1
+          fi
+          if [ "${EXPECTED_SHA,,}" != "${GITHUB_SHA,,}" ]; then
+            echo "Approved expected_sha does not match the checked-out main commit."
+            exit 1
+          fi
+          echo "Explicit production gate verified for ${GITHUB_SHA}."
 
       - name: Verify required deployment credentials
         shell: bash

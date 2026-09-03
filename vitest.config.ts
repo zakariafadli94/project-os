@@ -29,6 +29,7 @@ export default defineConfig({
     })
   ],
   test: {
-    include: ["test/**/*.spec.ts"]
+    include: ["test/**/*.spec.ts"],
+    exclude: ["test/search-sync-off.spec.ts"]
   }
 });

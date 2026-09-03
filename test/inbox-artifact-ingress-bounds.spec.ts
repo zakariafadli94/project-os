@@ -114,6 +114,23 @@ it("defers retryable artifact execution until bounded backoff is due", async () 
   expect(objects.files.has(incomingPath(request.request_id))).toBe(true);
 });
 
+it("executes a retry once its bounded backoff is due", async () => {
+  const objects = new FakeObjects();
+  const request = artifact("ART-INGRESS-BACKOFF-DUE-0001");
+  objects.files.set(incomingPath(request.request_id), JSON.stringify(request));
+  objects.files.set(failurePath(request.request_id), failure(request, 1, "2000-01-01T00:00:00.000Z"));
+  let executions = 0;
+
+  await processArtifactInbox(objects, "v2", async (item) => {
+    executions += 1;
+    return committed(item);
+  }, { respectRetryBackoff: true });
+
+  expect(executions).toBe(1);
+  expect(objects.files.has(incomingPath(request.request_id))).toBe(false);
+  expect(objects.files.has(failurePath(request.request_id))).toBe(false);
+});
+
 it("honors an explicit per-call work-item budget before draining the artifact inbox", async () => {
   const objects = new FakeObjects();
   for (const requestId of ["ART-INGRESS-BUDGET-0001", "ART-INGRESS-BUDGET-0002", "ART-INGRESS-BUDGET-0003"]) {

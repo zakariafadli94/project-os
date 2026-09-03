@@ -11,8 +11,13 @@ const authHeaders = {
 };
 
 function envWithSearchReadMode(mode?: string): Env {
-  const overrides = mode === undefined ? {} : { PROJECT_OS_SEARCH_READ_MODE: mode };
-  return { ...testEnv, ...overrides } as Env;
+  const candidate = { ...testEnv } as Env & { PROJECT_OS_SEARCH_READ_MODE?: string };
+  if (mode === undefined) {
+    delete candidate.PROJECT_OS_SEARCH_READ_MODE;
+  } else {
+    candidate.PROJECT_OS_SEARCH_READ_MODE = mode;
+  }
+  return candidate as Env;
 }
 
 async function requestSearch(mode: string | undefined, authenticated = true): Promise<Response> {

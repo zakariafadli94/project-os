@@ -1,0 +1,27 @@
+name: prj0002-artifact-ingress-prepr-proof
+
+on:
+  push:
+    branches:
+      - fix/prj0002-artifact-ingress-prepr-proof
+
+jobs:
+  exact-sha-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 247af309160ad2011ea649a018c6f62e2aceaa1b
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run types
+      - run: npx vitest run test/inbox-artifact-ingress-bounds.spec.ts test/inbox-artifact-failure.spec.ts
+      - run: npm run typecheck
+      - run: npm run test:index001
+      - run: npm run check:persistence-boundary
+      - run: npm run test:persistence-high-risk
+      - run: npm test
+      - run: npm run check
+      - run: npx wrangler deploy --dry-run

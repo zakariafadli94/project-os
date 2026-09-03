@@ -25,7 +25,6 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
   private readonly searchSyncStore: ProjectSearchSyncStore | null;
   private readonly searchSynchronizer: ProjectSearchSynchronizer | null;
   private searchQueue: Promise<void> = Promise.resolve();
-  private searchWakeKnownArmed = false;
   private searchWakeInFlight: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -74,10 +73,6 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
       return Response.json({ error: "project_not_initialized" }, { status: 404 });
     }
 
-    if (searchSyncEnabled(this.env)) {
-      this.searchSyncStore.requestCanonical(state.revision);
-      await this.ensureSearchWakeupSafely();
-    }
     return Response.json({
       project_id: state.project_id,
       canonical_revision: state.revision,
@@ -127,7 +122,6 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
   }
 
   private async handleSearchDrain(): Promise<Response> {
-    this.searchWakeKnownArmed = false;
     const state = await this.loadSearchState();
     if (!state || !this.searchSyncStore || !this.searchSynchronizer) {
       return Response.json({ error: "project_not_initialized" }, { status: 404 });
@@ -217,7 +211,7 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
   }
 
   private startSearchWakeup(): Promise<void> {
-    if (!searchSyncEnabled(this.env) || !this.searchSyncStore?.needsWork() || this.searchWakeKnownArmed) {
+    if (!searchSyncEnabled(this.env) || !this.searchSyncStore?.needsWork()) {
       return Promise.resolve();
     }
     if (this.searchWakeInFlight) return this.searchWakeInFlight;
@@ -231,9 +225,7 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
           { method: "POST" }
         );
         if (!response.ok) throw new Error(`SearchSyncGuard wake returned ${response.status}`);
-        this.searchWakeKnownArmed = true;
       } catch (error) {
-        this.searchWakeKnownArmed = false;
         console.error("Project OS search synchronization wake failed", {
           project_id: this.ctx.id.name ?? null,
           message: error instanceof Error ? error.message : String(error)

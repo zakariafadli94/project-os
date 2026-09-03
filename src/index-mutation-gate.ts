@@ -2,6 +2,7 @@ import { deploymentIdentity } from "./deployment/identity";
 import { parseMutationCandidateResolutionRequest } from "./domain/mutation-candidate-resolution";
 import type { Env } from "./env";
 import baseWorker from "./index";
+import { searchReadDisabledResponse, searchReadEnabled } from "./search/read-mode";
 
 export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
 export { MaterializationGuard } from "./durable/materialization-guard";
@@ -17,6 +18,10 @@ const worker = {
   ...baseWorker,
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/v1/search" && !searchReadEnabled(env)) {
+      return searchReadDisabledResponse();
+    }
 
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({ status: "ok", ...deploymentIdentity(env) });

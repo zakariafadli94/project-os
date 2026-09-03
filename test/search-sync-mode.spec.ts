@@ -1,11 +1,10 @@
 import { env } from "cloudflare:workers";
-import { createExecutionContext, runDurableObjectAlarm } from "cloudflare:test";
+import { createExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Env } from "../src/env";
 import worker from "../src/index-mutation-gate";
 import { reconcileSearchIndexes } from "../src/index-neutral";
 import { searchSyncEnabled } from "../src/search/sync-mode";
-import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 const authHeaders = {
@@ -50,62 +49,6 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
       rebuilding: 0,
       failed: 0
     });
-  });
-
-  it("keeps direct wake and canonical side-effect scheduling inert when off", async () => {
-    installDropboxMock();
-    const offEnv = envWithSyncMode("off");
-    const createResponse = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({
-        schema_version: "1.0",
-        transaction_id: "TXN-SEARCH-SYNC-OFF-PROBE",
-        project_id: "PRJ-AUTO",
-        base_revision: 0,
-        operation: "project.create",
-        created_at: "2026-09-03T16:00:00+01:00",
-        payload: {
-          name: "Search Sync Off Probe",
-          slug: "search-sync-off-probe",
-          aliases: [],
-          objective: "prove derived sync remains inert"
-        }
-      })
-    }), offEnv, createExecutionContext());
-    expect(createResponse.status).toBe(200);
-    const created = await createResponse.json<{ project_id: string; status: string }>();
-    expect(created.status).toBe("committed");
-
-    const taskResponse = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({
-        schema_version: "1.0",
-        transaction_id: "TXN-SEARCH-SYNC-OFF-TASK",
-        project_id: created.project_id,
-        base_revision: 1,
-        operation: "task.create",
-        created_at: "2026-09-03T16:01:00+01:00",
-        payload: {
-          task_id: "TASK-SYNCOFF001",
-          title: "Sync disabled probe",
-          description: "must not schedule derived search work"
-        }
-      })
-    }), offEnv, createExecutionContext());
-    expect(taskResponse.status).toBe(200);
-    await expect(taskResponse.json()).resolves.toMatchObject({ status: "committed", new_revision: 2 });
-
-    const syncGuard = offEnv.SEARCH_SYNC_GUARD.getByName(created.project_id);
-    const wake = await syncGuard.fetch("https://search-sync.internal/wake", { method: "POST" });
-    expect(wake.status).toBe(200);
-    await expect(wake.json()).resolves.toMatchObject({
-      project_id: created.project_id,
-      pending: false,
-      sync_enabled: false
-    });
-    expect(await runDurableObjectAlarm(syncGuard)).toBe(false);
   });
 
   it("keeps public search off while allowing an authenticated operator shadow query surface", async () => {

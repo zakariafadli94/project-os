@@ -70,18 +70,16 @@ jobs:
           if count != 1:
               raise SystemExit(f'exhausted cleanup pattern count={count}')
 
-          old = '''      let receipt: ArtifactWriteReceipt;
-              try {
-                receipt = await executeArtifact(artifact);'''
-          new = '''      if (maxWorkItems !== undefined && workItems >= maxWorkItems) break;
+          pattern = re.compile(
+              r'(\n      let receipt: ArtifactWriteReceipt;\n      try \{\n        receipt = await executeArtifact\(artifact\);)',
+          )
+          replacement = '''
+              if (maxWorkItems !== undefined && workItems >= maxWorkItems) break;
               workItems += 1;
-
-              let receipt: ArtifactWriteReceipt;
-              try {
-                receipt = await executeArtifact(artifact);'''
-          if old not in text:
-              raise SystemExit('execute artifact pattern not found')
-          text = text.replace(old, new, 1)
+          \1'''
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'execute artifact pattern count={count}')
           path.write_text(text)
 
           runtime = Path('src/inbox/runtime.ts')

@@ -229,7 +229,7 @@ Production remains intentionally **Dropbox-only**. `createProductionPersistence`
 
 Persisted records remain schema `1.0`. Historical fields such as `provider_file_id`, `provider_rev`, and `provider_content_hash` keep their exact Dropbox V1 meaning through an explicit compatibility seam. IMP-PERSIST001 is runtime-neutral, not persisted-format-neutral: adding a durable provider kind, generalized revision/hash tokens, migration/upcasting, or another provider is owned by IMP-SCHEMA001 rather than this boundary.
 
-Operational modes remain unchanged: continuity is `stable` and MutationGate production mode remains `observe`.
+Operational modes remain unchanged: continuity is `stable` and MutationGate production mode remains `enforce`.
 
 ## Commands
 

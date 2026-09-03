@@ -66,7 +66,13 @@ function blockNextInboxList(mock: ReturnType<typeof installDropboxMock>) {
 
   return {
     releaseInbox,
-    blocked: () => blockedInboxList
+    async waitUntilBlocked(timeoutMs = 1_000): Promise<boolean> {
+      const startedAt = Date.now();
+      while (!blockedInboxList && Date.now() - startedAt < timeoutMs) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      return blockedInboxList;
+    }
   };
 }
 
@@ -129,8 +135,7 @@ describe("business ingress priority", () => {
     } as ScheduledController, testEnv, scheduledCtx);
 
     const scheduledBaseline = mock.calls.length;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const scheduledBlocked = scheduledGate.blocked();
+    const scheduledBlocked = await scheduledGate.waitUntilBlocked();
     const scheduledCallsWhileBlocked = maintenanceCallsWhileInboxBlocked(mock.calls.slice(scheduledBaseline));
 
     scheduledGate.releaseInbox();
@@ -161,8 +166,7 @@ describe("business ingress priority", () => {
     }), testEnv, webhookCtx);
     expect(response.status).toBe(200);
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const webhookBlocked = webhookGate.blocked();
+    const webhookBlocked = await webhookGate.waitUntilBlocked();
     const webhookCallsWhileBlocked = maintenanceCallsWhileInboxBlocked(mock.calls.slice(webhookBaseline));
 
     webhookGate.releaseInbox();

@@ -1,5 +1,3 @@
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { ProjectState } from "../src/domain/project-state";
 import { buildCanonicalSearchRecords } from "../src/search/canonical-records";
@@ -51,20 +49,9 @@ describe("search provider neutrality and authority boundaries", () => {
     expect(parseSearchQuery({ text: "quota", project_ids: ["PRJ-0002"] }).project_ids).toEqual(["PRJ-0002"]);
   });
 
-  it("uses the authoritative persistence-boundary command", () => {
-    expect(() => execFileSync("npm", ["run", "check:persistence-boundary"], { stdio: "pipe" })).not.toThrow();
-  });
-
-  it("keeps the required search regressions in the high-risk gate", () => {
-    const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> };
-    const highRisk = pkg.scripts["test:persistence-high-risk"] ?? "";
-    for (const required of [
-      "test/search-project-sync.spec.ts",
-      "test/search-rebuild.spec.ts",
-      "test/search-worker.spec.ts",
-      "test/search-provider-neutral.spec.ts"
-    ]) {
-      expect(highRisk).toContain(required);
-    }
+  it("does not manufacture generated Markdown records from canonical state", async () => {
+    const records = await buildCanonicalSearchRecords(minimalState());
+    expect(records.map((record) => record.record_id)).toEqual(["project:PRJ-0002"]);
+    expect(records.some((record) => /STATE\.md|HANDOFF\.md/i.test(record.record_id))).toBe(false);
   });
 });

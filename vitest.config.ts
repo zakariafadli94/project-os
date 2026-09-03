@@ -22,7 +22,8 @@ export default defineConfig({
           DROPBOX_REFRESH_TOKEN: "test-refresh-token",
           INGRESS_TOKEN: "test-ingress-token",
           PROJECT_OS_SCHEMA_WRITER_STAGE: "v1_only",
-          PROJECT_OS_SEARCH_READ_MODE: "on"
+          PROJECT_OS_SEARCH_READ_MODE: "on",
+          PROJECT_OS_SEARCH_SYNC_MODE: "on"
         }
       }
     })

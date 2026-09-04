@@ -68,6 +68,15 @@ async function commitTransitionTask(projectId: string, baseRevision: number, suf
   await waitOnExecutionContext(ctx);
 }
 
+async function waitForAlarm(stub: DurableObjectStub, attempts = 20): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const alarm = await runInDurableObject(stub, async (_instance, state) => state.storage.getAlarm());
+    if (alarm !== null) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  expect(await runInDurableObject(stub, async (_instance, state) => state.storage.getAlarm())).not.toBeNull();
+}
+
 describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -109,7 +118,7 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
 
     const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
     const syncGuard = testEnv.SEARCH_SYNC_GUARD.getByName(projectId);
-    expect(await runInDurableObject(syncGuard, async (_instance, state) => state.storage.getAlarm())).not.toBeNull();
+    await waitForAlarm(syncGuard);
 
     await runInDurableObject(projectGuard, async (instance) => {
       (instance as unknown as { env: Env }).env.PROJECT_OS_SEARCH_SYNC_MODE = "off";
@@ -129,6 +138,7 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
     });
 
     await commitTransitionTask(projectId, 2, "A002");
+    await waitForAlarm(syncGuard);
     expect(await runDurableObjectAlarm(syncGuard)).toBe(true);
   });
 

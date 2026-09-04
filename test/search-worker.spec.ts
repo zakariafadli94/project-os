@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { createExecutionContext, runDurableObjectAlarm } from "cloudflare:test";
+import { createExecutionContext, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/env";
@@ -48,8 +48,18 @@ async function createProject(name: string, slug: string, objective: string): Pro
   return receipt.project_id;
 }
 
+async function waitForAlarm(stub: DurableObjectStub, attempts = 20): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const alarm = await runInDurableObject(stub, async (_instance, state) => state.storage.getAlarm());
+    if (alarm !== null) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  expect(await runInDurableObject(stub, async (_instance, state) => state.storage.getAlarm())).not.toBeNull();
+}
+
 async function drainSearch(projectId: string): Promise<void> {
   const guard = testEnv.SEARCH_SYNC_GUARD.getByName(projectId);
+  await waitForAlarm(guard);
   for (let attempt = 0; attempt < 5; attempt += 1) {
     if (!await runDurableObjectAlarm(guard)) break;
   }

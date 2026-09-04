@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CanonicalCommitRecord } from "../src/domain/commit-record";
 import type { Receipt } from "../src/domain/receipt";
@@ -9,6 +9,7 @@ import type { Transaction } from "../src/domain/transaction";
 import type { Env } from "../src/env";
 import {
   machineCommitRecordPath,
+  machineMaterializationHeadPath,
   machineStatePath
 } from "../src/persistence/layout";
 import { encodeProjectState } from "../src/schema/project-state";
@@ -127,6 +128,124 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
     expect(commitReads.every((path) => allowedCommitReads.has(path))).toBe(true);
     expect(new Set(commitReads).size).toBeLessThanOrEqual(2);
     expect(commitReads.length).toBeLessThanOrEqual(3);
+  });
+
+  it("bounds search reconciliation and drain recovery from a verified materialization head", async () => {
+    const projectId = "PRJ-0002";
+    const mock = installDropboxMock();
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+
+    const created = await submit(projectId, {
+      schema_version: "1.0",
+      transaction_id: "TXN-SEARCH-FASTFORWARD-CREATE",
+      project_id: projectId,
+      base_revision: 0,
+      operation: "project.create",
+      created_at: at,
+      payload: {
+        name: "Search Fast Forward",
+        slug: "search-fast-forward",
+        aliases: [],
+        objective: "Bound search recovery reads"
+      }
+    });
+    expect(created).toMatchObject({ status: "committed", new_revision: 1 });
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+
+    let state = normalizeProjectState(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}"));
+    const staleSnapshot = state;
+    for (let revision = 2; revision <= 12; revision += 1) {
+      const transaction: Transaction = {
+        schema_version: "1.0",
+        transaction_id: `TXN-SEARCH-FASTFORWARD-${String(revision).padStart(2, "0")}`,
+        project_id: projectId,
+        base_revision: state.revision,
+        operation: "task.create",
+        created_at: at,
+        payload: {
+          task_id: `TASK-SEARCHFAST${String(revision).padStart(3, "0")}`,
+          title: `Search fast-forward task ${revision}`
+        }
+      };
+      const result = applyTransaction(state, transaction);
+      if (result.kind !== "commit") throw new Error(`Unexpected synthetic transition: ${result.kind}`);
+      const receipt: CanonicalCommitRecord["receipt"] = {
+        schema_version: "1.0",
+        transaction_id: transaction.transaction_id,
+        status: "committed",
+        project_id: projectId,
+        previous_revision: state.revision,
+        new_revision: result.state.revision,
+        event_id: result.event.event_id,
+        committed_at: transaction.created_at
+      };
+      await mock.writeExternal(
+        machineCommitRecordPath(projectId, result.state.revision),
+        `${JSON.stringify({
+          schema_version: "1.0",
+          project_id: projectId,
+          previous_revision: state.revision,
+          new_revision: result.state.revision,
+          transaction,
+          state: encodeProjectState(result.state, "provider_v2"),
+          event: result.event,
+          receipt
+        }, null, 2)}\n`
+      );
+      state = result.state;
+    }
+    const reconcileMaterialization = await projectionStub.fetch(
+      "https://materialization-guard.internal/reconcile",
+      { method: "POST" }
+    );
+    expect(reconcileMaterialization.status).toBe(200);
+    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    await mock.writeExternal(
+      machineStatePath(projectId),
+      `${JSON.stringify(encodeProjectState(staleSnapshot, "provider_v2"), null, 2)}\n`
+    );
+    await runInDurableObject(projectGuard, async (_instance, durableState) => {
+      durableState.storage.sql.exec("DELETE FROM project_state");
+    });
+    mock.downloadCalls.length = 0;
+
+    const response = await projectGuard.fetch("https://project-guard.internal/reconcile-search", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ force_full: true })
+    });
+    expect(response.status).toBe(200);
+    await expect(response.clone().json()).resolves.toMatchObject({ canonical_revision: 12 });
+    const commitReads = mock.downloadCalls.filter((path) => path.includes(`/projects/${projectId}/commits/`));
+    expect(commitReads).toContain(machineCommitRecordPath(projectId, 12));
+    expect(commitReads).not.toContain(machineCommitRecordPath(projectId, 2));
+    expect(new Set(commitReads).size).toBeLessThanOrEqual(3);
+    expect(commitReads.length).toBeLessThanOrEqual(4);
+
+    await runInDurableObject(projectGuard, async (_instance, durableState) => {
+      durableState.storage.sql.exec("DELETE FROM project_state");
+    });
+    mock.downloadCalls.length = 0;
+    const drain = await projectGuard.fetch("https://project-guard.internal/drain-search", { method: "POST" });
+    expect(drain.status).toBe(200);
+    await expect(drain.clone().json()).resolves.toMatchObject({ canonical_revision: 12 });
+    const drainCommitReads = mock.downloadCalls.filter((path) => path.includes(`/projects/${projectId}/commits/`));
+    expect(drainCommitReads).not.toContain(machineCommitRecordPath(projectId, 2));
+    expect(drainCommitReads.length).toBeLessThanOrEqual(4);
+
+    const headPath = machineMaterializationHeadPath(projectId);
+    const head = JSON.parse(mock.files.get(headPath) ?? "{}");
+    const materialization = JSON.parse(mock.files.get(head.record_path) ?? "{}");
+    materialization.result_root_hash = "0".repeat(64);
+    await mock.writeExternal(head.record_path, `${JSON.stringify(materialization, null, 2)}\n`);
+    await runInDurableObject(projectGuard, async (_instance, durableState) => {
+      durableState.storage.sql.exec("DELETE FROM project_state");
+    });
+    await expect(projectGuard.fetch(
+      "https://project-guard.internal/reconcile-search",
+      { method: "POST" }
+    )).rejects.toThrow("Verified materialization head binding mismatch");
   });
 
   it("keeps a current-revision real commit minimal and preserves stale conflicts", async () => {

@@ -185,6 +185,7 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
   private async loadSearchState() {
     const boundProjectId = this.ctx.id.name;
     if (!boundProjectId) return null;
+    await this.fastForwardFromLatestCanonicalCommit();
     const state = await this.loadOrRecoverState();
     if (!state) return null;
     if (state.project_id !== boundProjectId) {

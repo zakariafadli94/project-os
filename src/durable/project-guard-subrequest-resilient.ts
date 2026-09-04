@@ -238,7 +238,39 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
     }
   }
 
-  private async fastForwardFromVerifiedMachineSnapshot(): Promise<void> {
+  protected async fastForwardFromLatestCanonicalCommit(): Promise<void> {
+    if (this.layoutMode !== "v2") return;
+    const projectId = this.ctx.id.name;
+    if (!projectId || projectId === "PRJ-AUTO") return;
+
+    await this.fastForwardFromVerifiedMachineSnapshot();
+    const baseRevision = this.localRevision();
+    if (baseRevision < 0) return;
+    const head = await this.recoveryRepository.readMaterializationHead(projectId);
+    if (!head || head.target_revision <= baseRevision) return;
+
+    const materialization = await this.recoveryRepository.readMaterializationRecord(
+      projectId,
+      head.target_revision,
+      head.projection_version
+    );
+    if (
+      !materialization
+      || materialization.result_root_hash !== head.result_root_hash
+      || materialization.workspace_location !== head.workspace_location
+      || materialization.completed_at !== head.completed_at
+    ) {
+      throw new Error(`Verified materialization head binding mismatch for ${projectId} revision ${head.target_revision}`);
+    }
+
+    const record = await this.recoveryRepository.readCommitRecord(projectId, head.target_revision);
+    if (!record || record.event.event_id !== materialization.source_event_id) {
+      throw new Error(`Materialization canonical commit binding mismatch for ${projectId} revision ${head.target_revision}`);
+    }
+    this.persistVerifiedSnapshot(record.state, record.receipt);
+  }
+
+  protected async fastForwardFromVerifiedMachineSnapshot(): Promise<void> {
     if (this.layoutMode !== "v2") return;
     const projectId = this.ctx.id.name;
     if (!projectId || projectId === "PRJ-AUTO") return;

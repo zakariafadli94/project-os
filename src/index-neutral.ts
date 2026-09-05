@@ -171,7 +171,7 @@ const worker = {
         processInbox(env),
         reconcileMaterializations(env),
         reconcileManagedDocuments(env),
-        reconcileSearchIndexes(env)
+        reconcileSearchIndexes(env, controller.scheduledTime)
       ])
         .then(([inbox, materialization, documents, search]) => {
           console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents, search });
@@ -603,7 +603,10 @@ export async function reconcileMaterializations(env: Env): Promise<Materializati
   return summary;
 }
 
-export async function reconcileSearchIndexes(env: Env): Promise<SearchFleetReconcileSummary> {
+export async function reconcileSearchIndexes(
+  env: Env,
+  scheduledTime?: number
+): Promise<SearchFleetReconcileSummary> {
   if (!searchSyncEnabled(env)) {
     return { scanned: 0, scheduled: 0, current: 0, rebuilding: 0, failed: 0 };
   }
@@ -615,9 +618,12 @@ export async function reconcileSearchIndexes(env: Env): Promise<SearchFleetRecon
   }
 
   const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const projects = scheduledTime === undefined
+    ? registry.projects
+    : scheduledSearchProjects(registry.projects, scheduledTime);
   const searchIndex = env.SEARCH_INDEX_GUARD.getByName("global");
   const summary: SearchFleetReconcileSummary = {
-    scanned: registry.projects.length,
+    scanned: projects.length,
     scheduled: 0,
     current: 0,
     rebuilding: 0,
@@ -625,14 +631,14 @@ export async function reconcileSearchIndexes(env: Env): Promise<SearchFleetRecon
   };
 
   let cursor = 0;
-  const workerCount = Math.min(4, registry.projects.length);
+  const workerCount = Math.min(4, projects.length);
   const worker = async () => {
     for (;;) {
       const index = cursor;
       cursor += 1;
-      if (index >= registry.projects.length) return;
+      if (index >= projects.length) return;
 
-      const projectId = registry.projects[index].project_id;
+      const projectId = projects[index].project_id;
       try {
         const indexResponse = await searchIndex.fetch(
           `https://search-index.internal/status?project_id=${encodeURIComponent(projectId)}`,
@@ -680,6 +686,12 @@ export async function reconcileSearchIndexes(env: Env): Promise<SearchFleetRecon
 
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return summary;
+}
+
+function scheduledSearchProjects(projects: RegistryProject[], scheduledTime: number): RegistryProject[] {
+  if (projects.length === 0) return [];
+  const window = Math.floor(scheduledTime / 300_000);
+  return [projects[window % projects.length]];
 }
 
 export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocumentReconcileAllSummary> {

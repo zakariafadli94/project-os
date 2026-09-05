@@ -111,6 +111,65 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE production gate", () => {
     });
   });
 
+  it("rotates one project per scheduled search reconciliation window", async () => {
+    const reconciled: string[] = [];
+    const projects = Array.from({ length: 6 }, (_, index) => ({
+      project_id: `PRJ-000${index + 1}`
+    }));
+    const guarded = {
+      PROJECT_OS_SEARCH_SYNC_MODE: "on",
+      REGISTRY_GUARD: {
+        getByName: () => ({
+          fetch: async () => Response.json({ projects })
+        })
+      },
+      SEARCH_INDEX_GUARD: {
+        getByName: () => ({
+          fetch: async (input: RequestInfo | URL) => {
+            const projectId = new URL(String(input)).searchParams.get("project_id") ?? "";
+            return Response.json({
+              project_id: projectId,
+              freshness: "current",
+              active_generation: 1,
+              canonical_revision_indexed: 1,
+              document_generation_indexed: 1,
+              rebuild_state: "idle"
+            });
+          }
+        })
+      },
+      PROJECT_GUARD: {
+        getByName: (projectId: string) => ({
+          fetch: async () => {
+            reconciled.push(projectId);
+            return Response.json({
+              project_id: projectId,
+              canonical_revision: 1,
+              canonical_revision_requested: 1,
+              canonical_revision_indexed: 1,
+              document_epoch: "epoch-1",
+              document_epoch_started_at: "2026-09-05T00:00:00Z",
+              document_generation_requested: 1,
+              document_generation_indexed: 1,
+              document_full_rebuild_required: false,
+              last_error: null
+            });
+          }
+        })
+      }
+    } as unknown as Env;
+
+    const firstWindow = 1_800_000_000_000;
+    await expect(reconcileSearchIndexes(guarded, firstWindow)).resolves.toMatchObject({ scanned: 1, current: 1 });
+    await expect(reconcileSearchIndexes(guarded, firstWindow + 300_000)).resolves.toMatchObject({ scanned: 1, current: 1 });
+
+    expect(reconciled).toEqual(["PRJ-0001", "PRJ-0002"]);
+
+    reconciled.length = 0;
+    await expect(reconcileSearchIndexes(guarded)).resolves.toMatchObject({ scanned: 6, current: 6 });
+    expect(reconciled).toEqual(projects.map((project) => project.project_id));
+  });
+
   it("recovers wake scheduling across an on to off to on transition", async () => {
     installDropboxMock();
     const projectId = await createTransitionProject();

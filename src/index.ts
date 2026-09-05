@@ -83,7 +83,7 @@ const worker = {
         const inbox = await processInboxThroughGuard(env);
         const [materialization, search] = await Promise.all([
           reconcileMaterializations(env),
-          reconcileSearchIndexes(env)
+          reconcileSearchIndexes(env, controller.scheduledTime)
         ]);
         console.info("Project OS scheduled maintenance completed", { inbox, materialization, search });
       } catch (error) {

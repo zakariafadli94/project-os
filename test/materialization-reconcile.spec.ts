@@ -1,9 +1,10 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import worker, {
+import {
   reconcileMaterializations,
   type MaterializationReconcileSummary
 } from "../src/index";
+import worker from "../src/index-mutation-gate";
 import type { Env } from "../src/env";
 import { processDurableInbox } from "../src/inbox/runtime";
 import { installDropboxMock } from "./helpers/mock-dropbox";
@@ -16,6 +17,7 @@ interface FakeProjectBehavior {
 
 function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavior> = {}) {
   const calls: string[] = [];
+  const searchCalls: string[] = [];
   let inFlight = 0;
   let maxInFlight = 0;
 
@@ -79,6 +81,7 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
             });
           }
           if (url.pathname === "/reconcile-search") {
+            searchCalls.push(projectId);
             return Response.json({
               project_id: projectId,
               canonical_revision_requested: 1,
@@ -124,6 +127,7 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
     INGRESS_TOKEN: "test-ingress-token",
     PROJECT_OS_LAYOUT_MODE: "v2",
     PROJECT_OS_CONTINUITY_MODE: "stable",
+    PROJECT_OS_SEARCH_SYNC_MODE: "on",
     REGISTRY_GUARD: { getByName: () => registryStub },
     PROJECT_GUARD: projectNamespace,
     MATERIALIZATION_GUARD: materializationNamespace,
@@ -143,7 +147,7 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
     }
   } as unknown as Env;
 
-  return { env, calls, maxInFlight: () => maxInFlight };
+  return { env, calls, searchCalls, maxInFlight: () => maxInFlight };
 }
 
 describe("fleet materialization reconciliation", () => {
@@ -202,13 +206,14 @@ describe("fleet materialization reconciliation", () => {
     const incoming = `/PROJECT_OS/.project-os/transactions/incoming/${poisonId}.json`;
     const rejected = `/PROJECT_OS/.project-os/transactions/rejected/${poisonId}.json`;
     dropbox.files.set(incoming, "{broken-json");
-    const { env, calls } = fakeEnv(["PRJ-4131"]);
+    const projects = Array.from({ length: 6 }, (_, index) => `PRJ-${4131 + index}`);
+    const { env, calls, searchCalls } = fakeEnv(projects);
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const ctx = createExecutionContext();
 
     await worker.scheduled?.({
       cron: "*/5 * * * *",
-      scheduledTime: Date.now(),
+      scheduledTime: 1_800_000_000_000,
       noRetry: () => undefined
     } as ScheduledController, env, ctx);
     await waitOnExecutionContext(ctx);
@@ -216,6 +221,7 @@ describe("fleet materialization reconciliation", () => {
     expect(dropbox.files.has(incoming)).toBe(false);
     expect(dropbox.files.has(rejected)).toBe(true);
     expect(calls).toContain("PRJ-4131:/reconcile");
+    expect(searchCalls).toEqual(["PRJ-4131"]);
     expect(info).toHaveBeenCalledWith("Project OS scheduled maintenance completed", expect.objectContaining({
       inbox: expect.any(Object),
       materialization: expect.any(Object)

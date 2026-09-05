@@ -259,7 +259,7 @@ describe("Worker routing", () => {
       },
       mode: "create"
     };
-    const disabledEnv = { ...testEnv, PROJECT_OS_BINARY_ARTIFACT_INGRESS_MODE: "off" };
+    const disabledEnv: Env = { ...testEnv, PROJECT_OS_BINARY_ARTIFACT_INGRESS_MODE: "off" };
     const response = await worker.fetch(new Request("https://example.com/v1/artifacts", {
       method: "POST",
       headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },

@@ -243,4 +243,3 @@ Rollback disables new binary submissions while retaining all intents, receipts, 
 - Interrupted and replayed publication cannot overwrite different destination content or delete an unverified source.
 - Existing inline text artifact requests remain compatible.
 - PRJ-0003 recovery remains blocked until the new path is production-active and end-to-end verified.
-

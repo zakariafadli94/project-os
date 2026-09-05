@@ -223,6 +223,22 @@ export function machineArtifactReceiptPath(requestId: string): string {
   return `${MACHINE_ROOT}/artifacts/receipts/${assertSafeArtifactRequestId(requestId)}.json`;
 }
 
+export function machineArtifactStagingPath(requestId: string, fileName: string): string {
+  const safeRequestId = assertSafeArtifactRequestId(requestId);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(fileName) || fileName.startsWith(".")) {
+    throw new Error(`Unsafe artifact staging file name: ${fileName}`);
+  }
+  return `${MACHINE_ROOT}/artifacts/staging/${safeRequestId}/${fileName}`;
+}
+
+export function machineArtifactReplacementBackupPath(requestId: string): string {
+  return `${MACHINE_ROOT}/artifacts/replacements/${assertSafeArtifactRequestId(requestId)}/previous`;
+}
+
+export function machineArtifactRollbackEvidencePath(requestId: string): string {
+  return `${MACHINE_ROOT}/artifacts/replacements/${assertSafeArtifactRequestId(requestId)}/rollback.json`;
+}
+
 export function machineRegistryJsonPath(): string {
   return `${MACHINE_ROOT}/registry/PROJECT_REGISTRY.json`;
 }
@@ -278,6 +294,9 @@ export const v2Paths = {
   machineReceiptPath,
   machineArtifactRequestPath,
   machineArtifactReceiptPath,
+  machineArtifactStagingPath,
+  machineArtifactReplacementBackupPath,
+  machineArtifactRollbackEvidencePath,
   machineRegistryJsonPath,
   machineRegistryMarkdownPath
 } as const;

@@ -144,6 +144,8 @@ The source request is then moved to one of:
 
 Authenticated clients may instead call `POST /v1/artifacts`; it routes into the same ProjectGuard path. Direct Dropbox reads remain allowed. Direct final writes into governed business trees are not part of the supported operating contract.
 
+Opaque binary payloads use the staged-object variant rather than the inline `content` field. The client first uploads exactly one object beneath `/PROJECT_OS/.project-os/artifacts/staging/<request_id>/`, then submits its exact provider object ID, revision, size, and integrity evidence. ProjectGuard copies the bytes server-side and deletes staging only after the committed receipt and final provider verification. This path is default-off and size-limited; see `docs/binary-artifact-ingress.md`.
+
 ## Dropbox-backed mutation barrier
 
 For a sequence of dependent mutations submitted through Dropbox, use this order:

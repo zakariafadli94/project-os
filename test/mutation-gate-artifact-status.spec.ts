@@ -101,4 +101,40 @@ describe("MutationGate artifact verification state", () => {
     await expect(service.artifactStatus(request.project_id, request.request_id))
       .rejects.toThrow(`Artifact receipt does not match durable mutation intent: ${request.request_id}`);
   });
+
+  it("verifies staged artifacts from provider evidence without decoding final bytes as text", async () => {
+    const transport = new FakeStatusTransport();
+    const sourcePath = "/PROJECT_OS/.project-os/artifacts/staging/ART-STATUS-BINARY-0001/example.pdf";
+    await transport.upload(sourcePath, "opaque-binary-fixture");
+    const source = (await transport.getMetadata(sourcePath))!;
+    const runtime = persistenceFromDropbox(transport);
+    const state = emptyProjectState("PRJ-9902", "Artifact Status", "artifact-status", "Verify artifact status");
+    const request: ArtifactWriteRequest = {
+      request_id: "ART-STATUS-BINARY-0001",
+      project_id: state.project_id,
+      relative_path: "status/example.pdf",
+      content_sha256: "b".repeat(64),
+      source: {
+        kind: "staged_provider_object",
+        path: sourcePath,
+        object_id: source.id,
+        revision_token: source.rev,
+        size: source.size,
+        integrity: { algorithm: "dropbox-content-hash", value: source.content_hash }
+      },
+      mode: "create"
+    };
+    const prepared = await new ArtifactMutationIntentService(new MutationGateRepository(runtime), runtime).prepare(state, request);
+    await transport.upload(prepared.destination.path, "opaque-binary-fixture");
+    await transport.upload(machineArtifactReceiptPath(request.request_id), JSON.stringify({
+      request_id: request.request_id,
+      project_id: request.project_id,
+      relative_path: request.relative_path,
+      content_sha256: request.content_sha256,
+      status: "committed"
+    }));
+
+    expect(await new MutationGateService(runtime, "observe").artifactStatus(request.project_id, request.request_id))
+      .toMatchObject({ verification_state: "canonical_verified" });
+  });
 });

@@ -1,4 +1,4 @@
-import type { ArtifactWriteReceipt } from "../domain/artifact-write";
+import { isStagedArtifactWriteRequest, type ArtifactWriteReceipt } from "../domain/artifact-write";
 import { documentIdFor } from "../domain/managed-document";
 import type {
   MutationCandidateAdoptArtifactRequest,
@@ -131,6 +131,9 @@ export class MutationCandidateResolutionService {
     let nestedContent: string;
     let nestedSha: string;
     if (request.operation === "candidate.adopt_artifact") {
+      if (isStagedArtifactWriteRequest(request.artifact_request)) {
+        return terminal(request, "rejected", "CANDIDATE_CONTENT_UNSUPPORTED", "Text candidates cannot be adopted through staged binary ingress");
+      }
       nestedContent = request.artifact_request.content;
       nestedSha = request.artifact_request.content_sha256;
     } else {

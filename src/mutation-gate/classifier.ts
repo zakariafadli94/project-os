@@ -1,4 +1,11 @@
 import type { ManagedProviderObservation } from "../domain/managed-document";
+import { isStagedArtifactWriteRequest, parseArtifactWriteRequest } from "../domain/artifact-write";
+import {
+  matchesStagedArtifactPayload,
+  matchesStagedArtifactRollbackBackup,
+  parseStagedArtifactRollbackEvidence,
+  samePayload
+} from "../artifacts/staged-publication";
 import type { ProjectState } from "../domain/project-state";
 import { DocumentLedgerRepository } from "../documents/repository";
 import { sha256Text } from "../documents/hash";
@@ -8,7 +15,11 @@ import {
   toProviderObjectMetadata,
   type LegacyDropboxFileMetadata
 } from "../persistence/compatibility/dropbox-v1-legacy-data";
-import { workspaceProjectRoot } from "../persistence/layout";
+import {
+  machineArtifactReceiptPath,
+  machineArtifactRollbackEvidencePath,
+  workspaceProjectRoot
+} from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import {
@@ -54,6 +65,36 @@ export class MutationGateClassifier {
       throw new Error(`Mutation classification metadata path mismatch: ${metadata.path} != ${path}`);
     }
     const evidence = requireDropboxV1Evidence(metadata);
+
+    const intents = await this.mutations.listArtifactIntentsForDestination(state.project_id, path);
+    if (intents.length > 0) {
+      for (const intent of intents) {
+        const frozen = parseArtifactWriteRequest(JSON.parse(intent.request_json));
+        if (!isStagedArtifactWriteRequest(frozen)) continue;
+        const publishedPayload = matchesStagedArtifactPayload(frozen, metadata)
+          && intentExplainsProviderChange(intent, metadata, this.runtime.providerId);
+        const restoredPayload = await this.matchesActiveRollbackEvidence(intent, metadata);
+        if (publishedPayload || restoredPayload) {
+          return { kind: "governed_inflight", requestId: intent.request_id };
+        }
+      }
+
+      const inlineIntents = intents.filter((intent) => {
+        const frozen = parseArtifactWriteRequest(JSON.parse(intent.request_json));
+        return !isStagedArtifactWriteRequest(frozen);
+      });
+      if (inlineIntents.length > 0) {
+        const visible = await this.runtime.objects.readText(path);
+        if (visible !== null) {
+          const contentSha256 = await sha256Text(visible);
+          const exact = inlineIntents.find((intent) =>
+            intent.expected_content_sha256 === contentSha256
+            && intentExplainsProviderChange(intent, metadata, this.runtime.providerId)
+          );
+          if (exact) return { kind: "governed_inflight", requestId: exact.request_id };
+        }
+      }
+    }
 
     if (zone.kind === "working" || zone.kind === "review" || zone.kind === "deliverables") {
       const resolution = await this.workProducts.resolveVisible(
@@ -105,20 +146,27 @@ export class MutationGateClassifier {
       return { kind: "external_candidate" };
     }
 
-    const intents = await this.mutations.listArtifactIntentsForDestination(state.project_id, path);
-    if (intents.length > 0) {
-      const visible = await this.runtime.objects.readText(path);
-      if (visible !== null) {
-        const contentSha256 = await sha256Text(visible);
-        const exact = intents.find((intent) =>
-          intent.expected_content_sha256 === contentSha256
-          && intentExplainsProviderChange(intent, metadata, this.runtime.providerId)
-        );
-        if (exact) return { kind: "governed_inflight", requestId: exact.request_id };
-      }
-    }
-
     return { kind: "external_candidate" };
+  }
+
+  private async matchesActiveRollbackEvidence(
+    intent: CurrentMutationIntentRecord,
+    metadata: ProviderObjectMetadata
+  ): Promise<boolean> {
+    if (intent.mode !== "replace" || intent.provider_precondition.kind !== "existing") return false;
+    if (await this.runtime.objects.readText(machineArtifactReceiptPath(intent.request_id)) !== null) return false;
+    const raw = await this.runtime.objects.readText(machineArtifactRollbackEvidencePath(intent.request_id));
+    if (raw === null) return false;
+    const evidence = parseStagedArtifactRollbackEvidence(JSON.parse(raw));
+    if (
+      evidence.project_id !== intent.project_id
+      || evidence.request_id !== intent.request_id
+      || evidence.destination_path !== intent.destination_path
+      || evidence.provider_id !== this.runtime.providerId
+    ) return false;
+    const backup = await this.runtime.objects.getMetadata(evidence.backup.path);
+    if (!backup || !matchesStagedArtifactRollbackBackup(evidence, backup)) return false;
+    return samePayload(backup, metadata);
   }
 }
 

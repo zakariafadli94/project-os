@@ -38,6 +38,10 @@ export interface ObjectPersistence {
   listChildren(path: string): Promise<ProviderEntry[]>;
   move(from: string, to: string): Promise<void>;
   delete(path: string): Promise<void>;
+  deleteIfUnchanged?(
+    path: string,
+    expected: { objectId: string; revisionToken: string }
+  ): Promise<"deleted" | "missing" | "changed">;
 }
 
 export interface ConditionalWritePort {

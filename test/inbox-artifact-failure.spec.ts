@@ -110,3 +110,45 @@ it("quarantines an artifact after the bounded retry limit", async () => {
     status: "retryable_failure"
   });
 });
+
+it("persists a deterministic rejected artifact receipt before terminalizing the inbox manifest", async () => {
+  const objects = new FakeObjects();
+  const artifact = request();
+  const incoming = `/PROJECT_OS/.project-os/artifacts/incoming/${artifact.request_id}.json`;
+  objects.files.set(incoming, JSON.stringify(artifact));
+
+  const summary = await processArtifactInbox(objects, "v2", async (item) => ({
+    request_id: item.request_id,
+    project_id: item.project_id,
+    relative_path: item.relative_path,
+    content_sha256: item.content_sha256,
+    status: "rejected",
+    code: "BINARY_ARTIFACT_INGRESS_DISABLED",
+    message: "Staged binary artifact ingress is disabled"
+  }));
+
+  expect(summary).toEqual({ scanned: 1, processed: 1, failed: 0 });
+  expect(JSON.parse(objects.files.get(`/PROJECT_OS/.project-os/artifacts/receipts/${artifact.request_id}.json`) ?? "null"))
+    .toMatchObject({ status: "rejected", code: "BINARY_ARTIFACT_INGRESS_DISABLED" });
+  expect(objects.files.has(`/PROJECT_OS/.project-os/artifacts/rejected/${artifact.request_id}.json`)).toBe(true);
+});
+
+it("does not let an alternate-payload intent conflict occupy the original receipt path", async () => {
+  const objects = new FakeObjects();
+  const artifact = request();
+  const incoming = `/PROJECT_OS/.project-os/artifacts/incoming/${artifact.request_id}.json`;
+  objects.files.set(incoming, JSON.stringify(artifact));
+
+  await processArtifactInbox(objects, "v2", async (item) => ({
+    request_id: item.request_id,
+    project_id: item.project_id,
+    relative_path: item.relative_path,
+    content_sha256: item.content_sha256,
+    status: "conflict",
+    code: "ARTIFACT_INTENT_CONFLICT",
+    message: "request ID belongs to another frozen payload"
+  }));
+
+  expect(objects.files.has(`/PROJECT_OS/.project-os/artifacts/receipts/${artifact.request_id}.json`)).toBe(false);
+  expect(objects.files.has(`/PROJECT_OS/.project-os/artifacts/conflicts/${artifact.request_id}.json`)).toBe(true);
+});

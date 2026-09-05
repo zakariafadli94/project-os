@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ArtifactWriteRequest } from "../src/domain/artifact-write";
+import type { InlineArtifactWriteRequest } from "../src/domain/artifact-write";
 import { emptyProjectState } from "../src/domain/transitions";
 import { sha256Text } from "../src/documents/hash";
 import { DropboxConflictError, type DropboxEntry, type DropboxTransport } from "../src/dropbox/client";
@@ -41,7 +41,7 @@ class FakeArtifactIntentDropbox implements DropboxTransport {
   }
 }
 
-async function request(): Promise<ArtifactWriteRequest> {
+async function request(): Promise<InlineArtifactWriteRequest> {
   const content = "# frozen route";
   return {
     request_id: "ART-ROUTE-DRIFT-0001",

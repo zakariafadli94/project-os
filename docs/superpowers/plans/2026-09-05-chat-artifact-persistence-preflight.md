@@ -178,7 +178,7 @@ export class StagedArtifactPublisher {
 }
 ```
 
-The service must compare `ProviderObjectMetadata` structurally and use `serverSideCopy.copyObject`. Do not read bytes as text. For `replace`, preserve the existing archive rules by copying the existing destination to the frozen archive path before publication; do not overwrite through `upsertText`.
+The service must compare `ProviderObjectMetadata` structurally and use `serverSideCopy.copyObject`. Do not read bytes as text. For `replace`, preserve the existing archive rules by copying the observed destination to the frozen archive or rollback path, verifying the copy, and removing the original only through an identity-and-revision-conditioned delete before publication; do not overwrite through `upsertText`. Before restoring after a failed publication, persist request-specific rollback evidence tied to the exact governed backup. MutationGate may recognize the restored bytes only while that evidence and backup remain exact and no terminal receipt exists.
 
 - [ ] **Step 5: Strengthen the copy capability contract**
 

@@ -34,6 +34,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
   const calls: string[] = [];
   const uploadCalls: string[] = [];
   const downloadCalls: string[] = [];
+  const conditionalDeleteCalls: Array<{ path: string; parent_rev?: string }> = [];
   const matchedFaultOccurrences = new Map<number, number>();
   const consumedFaults = new Set<number>();
   let transientUploadFailures = options.transientUploadFailures ?? 0;
@@ -91,11 +92,12 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     });
   };
 
-  const writeExternal = async (path: string, content: string): Promise<void> => {
+  const writeExternal = async (path: string, content: string) => {
     ensureIdentity(path);
     files.set(path, content);
     bumpRevision(path);
     await recordFileChange(path);
+    return metadataFor(path);
   };
 
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -286,24 +288,31 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/delete_v2") {
-      const body = JSON.parse(await request.text()) as { path: string };
-      const directContent = files.get(body.path);
-      const prefix = `${body.path}/`;
+      const body = JSON.parse(await request.text()) as { path: string; parent_rev?: string };
+      if (body.parent_rev) conditionalDeleteCalls.push(body);
+      const resolvedPath = body.path.startsWith("id:")
+        ? [...fileIds.entries()].find(([, id]) => id === body.path)?.[0] ?? body.path
+        : body.path;
+      const directContent = files.get(resolvedPath);
+      const prefix = `${resolvedPath}/`;
       const descendants = [...files.keys()].filter((path) => path.startsWith(prefix));
       if (directContent === undefined && descendants.length === 0) {
         return new Response(JSON.stringify({ error_summary: "path_lookup/not_found/" }), { status: 409 });
       }
-      if (directContent !== undefined) recordDeletedChange(body.path);
-      files.delete(body.path);
-      fileIds.delete(body.path);
-      revisions.delete(body.path);
+      if (body.parent_rev && body.parent_rev !== `mock-rev-${revisions.get(resolvedPath) ?? 1}`) {
+        return new Response(JSON.stringify({ error_summary: "path_lookup/conflict/file/" }), { status: 409 });
+      }
+      if (directContent !== undefined) recordDeletedChange(resolvedPath);
+      files.delete(resolvedPath);
+      fileIds.delete(resolvedPath);
+      revisions.delete(resolvedPath);
       for (const path of descendants) {
         recordDeletedChange(path);
         files.delete(path);
         fileIds.delete(path);
         revisions.delete(path);
       }
-      return Response.json({ metadata: { path_display: body.path } });
+      return Response.json({ metadata: { path_display: resolvedPath } });
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder") {
@@ -344,6 +353,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     spy,
     uploadCalls,
     downloadCalls,
+    conditionalDeleteCalls,
     writeExternal,
     currentCursor: () => `cursor-${changeJournal.length}`,
     maxConcurrentUploads: () => maxConcurrentUploadCount

@@ -1,5 +1,6 @@
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "./domain/artifact-write";
 import { parseArtifactWriteRequest } from "./domain/artifact-write";
+import { binaryArtifactPolicyViolation } from "./artifacts/policy";
 import { continuityStatus } from "./continuity/policy";
 import { executeWithRollback, type TransactionExecutor } from "./continuity/rollback";
 import type { Env } from "./env";
@@ -134,6 +135,11 @@ const worker = {
           error: "invalid_artifact_request",
           message: error instanceof Error ? error.message : "Invalid artifact request"
         }, { status: 400 });
+      }
+
+      const policyViolation = binaryArtifactPolicyViolation(env, artifact);
+      if (policyViolation) {
+        return Response.json({ error: policyViolation.code, message: policyViolation.message }, { status: 409 });
       }
 
       return Response.json(await routeArtifact(env, artifact));

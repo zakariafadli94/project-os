@@ -4,7 +4,7 @@ import type {
   ProviderEntry,
   ProviderObjectMetadata
 } from "../../provider/contract";
-import { ProviderCapabilityError } from "../../provider/errors";
+import { ProviderCapabilityError, ProviderConflictError } from "../../provider/errors";
 import type {
   DropboxChangeEntry,
   DropboxEntry,
@@ -44,6 +44,22 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
       integrityHash: { semantics: "identified-algorithm" }
     }
   };
+
+  if (raw.deleteIfRevision) {
+    runtime.objects.deleteIfUnchanged = async (path, expected) => {
+      try {
+        const deleted = await call(
+          "delete",
+          path,
+          () => raw.deleteIfRevision!(expected.objectId, expected.revisionToken)
+        );
+        return deleted ? "deleted" : "missing";
+      } catch (error) {
+        if (error instanceof ProviderConflictError) return "changed";
+        throw error;
+      }
+    };
+  }
 
   if (raw.beginRequestTrace) {
     runtime.diagnostics = {

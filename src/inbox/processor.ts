@@ -4,6 +4,7 @@ import type { Receipt } from "../domain/receipt";
 import { parseTransaction, type Transaction } from "../domain/transaction";
 import {
   type LayoutMode,
+  machineArtifactReceiptPath,
   machineArtifactRequestPath,
   machineTransactionPath
 } from "../persistence/layout";
@@ -178,6 +179,21 @@ export async function processTransactionInbox(
   return summary;
 }
 
+async function persistArtifactReceipt(
+  objects: ObjectPersistence,
+  receipt: ArtifactWriteReceipt
+): Promise<void> {
+  const path = machineArtifactReceiptPath(receipt.request_id);
+  const content = `${JSON.stringify(receipt, null, 2)}\n`;
+  try {
+    await objects.createText(path, content);
+  } catch (error) {
+    if (!(error instanceof ProviderConflictError)) throw error;
+    const existing = await objects.readText(path);
+    if (existing !== content) throw new Error(`Artifact receipt conflict: ${receipt.request_id}`);
+  }
+}
+
 export async function processArtifactInbox(
   objects: ObjectPersistence,
   mode: LayoutMode,
@@ -268,6 +284,9 @@ export async function processArtifactInbox(
         continue;
       }
 
+      if (receipt.code !== "ARTIFACT_INTENT_CONFLICT" && receipt.code !== "IDEMPOTENCY_PAYLOAD_MISMATCH") {
+        await persistArtifactReceipt(objects, receipt);
+      }
       const statusFolder = receipt.status === "conflict" ? "conflicts" : receipt.status;
       const terminalPath = terminalArtifactRequestPath(mode, statusFolder, artifact.request_id);
       await archiveSource(objects, sourcePath, terminalPath);

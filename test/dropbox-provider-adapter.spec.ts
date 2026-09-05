@@ -32,6 +32,7 @@ function rawTransport(overrides: Partial<DropboxTransport> = {}): DropboxTranspo
     listFolder: async () => [],
     listFolderChanges: async () => ({ entries: [], cursor: "cursor" }),
     delete: async () => undefined,
+    deleteIfRevision: async () => true,
     ...overrides
   };
 }
@@ -87,6 +88,33 @@ it("keeps provider-side copy as an explicit capability", async () => {
     revisionToken: "015abc"
   });
   expect(calls).toEqual([["/from.bin", "/to.bin"]]);
+});
+
+it("binds conditional delete to the stable object ID and exact revision", async () => {
+  const calls: Array<[string, string]> = [];
+  const runtime = createDropboxPersistence(rawTransport({
+    deleteIfRevision: async (path, revision) => {
+      calls.push([path, revision]);
+      return true;
+    }
+  }));
+
+  await expect(runtime.objects.deleteIfUnchanged!(metadata.path, {
+    objectId: metadata.id,
+    revisionToken: metadata.rev
+  })).resolves.toBe("deleted");
+  expect(calls).toEqual([[metadata.id, metadata.rev]]);
+});
+
+it("reports a conditional delete revision conflict without deleting", async () => {
+  const runtime = createDropboxPersistence(rawTransport({
+    deleteIfRevision: async () => { throw new DropboxConflictError("changed", "req-delete"); }
+  }));
+
+  await expect(runtime.objects.deleteIfUnchanged!(metadata.path, {
+    objectId: metadata.id,
+    revisionToken: metadata.rev
+  })).resolves.toBe("changed");
 });
 
 it("maps incremental changes and embedded file metadata", async () => {

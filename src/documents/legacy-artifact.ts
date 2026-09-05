@@ -1,4 +1,4 @@
-import type { ArtifactWriteRequest } from "../domain/artifact-write";
+import type { InlineArtifactWriteRequest } from "../domain/artifact-write";
 import {
   documentIdFor,
   documentIdForProviderFile,
@@ -52,7 +52,7 @@ export class LegacyArtifactDocumentWriter {
 
   async writeIfManaged(
     state: ProjectState,
-    request: ArtifactWriteRequest
+    request: InlineArtifactWriteRequest
   ): Promise<LegacyManagedArtifactWriteResult | null> {
     if (request.project_id !== state.project_id) throw new Error("Artifact request project_id does not match project state");
     if (state.status === "archived") throw new Error("Archived projects do not accept artifact writes");
@@ -70,7 +70,7 @@ export class LegacyArtifactDocumentWriter {
 
   private async writePublished(
     state: ProjectState,
-    request: ArtifactWriteRequest,
+    request: InlineArtifactWriteRequest,
     destination: Extract<ManagedArtifactDestination, { zone: "deliverables" }>
   ): Promise<LegacyManagedArtifactWriteResult> {
     const documentId = await documentIdFor(request.project_id, destination.logicalPath);
@@ -152,7 +152,7 @@ export class LegacyArtifactDocumentWriter {
 
   private async writeReference(
     state: ProjectState,
-    request: ArtifactWriteRequest,
+    request: InlineArtifactWriteRequest,
     destination: Extract<ManagedArtifactDestination, { zone: "references" }>,
     payloadPath: string
   ): Promise<LegacyManagedArtifactWriteResult> {
@@ -289,7 +289,7 @@ export class LegacyArtifactDocumentWriter {
   }
 
   private async persistPublishedVersion(
-    request: ArtifactWriteRequest,
+    request: InlineArtifactWriteRequest,
     destination: Extract<ManagedArtifactDestination, { zone: "deliverables" }>,
     payloadPath: string,
     contentSha256: string,
@@ -333,7 +333,7 @@ export class LegacyArtifactDocumentWriter {
   }
 
   private async persistReferenceVersion(
-    request: ArtifactWriteRequest,
+    request: InlineArtifactWriteRequest,
     destination: Extract<ManagedArtifactDestination, { zone: "references" }>,
     payloadPath: string,
     documentId: string,
@@ -474,7 +474,7 @@ export class LegacyArtifactDocumentWriter {
 
   private validateReplay(
     record: DocumentVersionRecord,
-    request: ArtifactWriteRequest,
+    request: InlineArtifactWriteRequest,
     path: string,
     expectedContentSha256 = request.content_sha256
   ): LegacyManagedArtifactWriteResult {
@@ -508,7 +508,7 @@ export class LegacyArtifactDocumentWriter {
 
 function classifyManagedDestination(
   state: ProjectState,
-  request: ArtifactWriteRequest,
+  request: InlineArtifactWriteRequest,
   destination: ResolvedArtifactDestination
 ): ManagedArtifactDestination | null {
   const root = workspaceProjectRoot(state.project_id, state.slug);

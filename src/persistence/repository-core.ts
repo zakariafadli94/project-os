@@ -1,4 +1,4 @@
-import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
+import type { ArtifactWriteReceipt, InlineArtifactWriteRequest } from "../domain/artifact-write";
 import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../domain/commit-record";
 import type { DomainEvent } from "../domain/event";
 import {
@@ -286,7 +286,7 @@ export class ProjectRepository {
     }
   }
 
-  async writeArtifact(state: ProjectState, request: ArtifactWriteRequest): Promise<"written" | "idempotent"> {
+  async writeArtifact(state: ProjectState, request: InlineArtifactWriteRequest): Promise<"written" | "idempotent"> {
     if (this.mode === "legacy") throw new Error("Artifact writes require workspace layout mode");
     if (request.project_id !== state.project_id) throw new Error("Artifact request project_id does not match project state");
     if (state.status === "archived") throw new Error("Archived projects do not accept artifact writes");

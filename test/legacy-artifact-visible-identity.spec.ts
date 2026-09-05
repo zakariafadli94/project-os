@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ArtifactWriteRequest } from "../src/domain/artifact-write";
+import type { InlineArtifactWriteRequest } from "../src/domain/artifact-write";
 import { emptyProjectState } from "../src/domain/transitions";
 import { DropboxConflictError, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import { workspaceProjectRoot } from "../src/dropbox/layout";
@@ -81,7 +81,7 @@ function state(targetPrefix: string) {
   return project;
 }
 
-async function request(content: string, id: string): Promise<ArtifactWriteRequest> {
+async function request(content: string, id: string): Promise<InlineArtifactWriteRequest> {
   return {
     request_id: id,
     project_id: "PRJ-0003",

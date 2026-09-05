@@ -95,7 +95,14 @@ export function withProviderResilience(
         await objects.delete(from);
       }
     }),
-    delete: (path) => retry("delete", path, () => runtime.objects.delete(path))
+    delete: (path) => retry("delete", path, () => runtime.objects.delete(path)),
+    ...(runtime.objects.deleteIfUnchanged ? {
+      deleteIfUnchanged: (path, expected) => retry(
+        "conditional-delete",
+        path,
+        () => runtime.objects.deleteIfUnchanged!(path, expected)
+      )
+    } : {})
   };
 
   return {

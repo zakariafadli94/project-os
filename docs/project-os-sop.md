@@ -184,6 +184,8 @@ Managed-document lifecycle operations are a separate typed interface and must no
 
 Agent/operator writes to final business outputs must also use governed artifact/document ingress. A raw Dropbox create/update/move into `DELIVERABLES/**`, governed artifact destinations or business `ARTIFACTS/**` is not a parallel publication route.
 
+Before qualifying artifact production, prove persistence from the current chat with a representative canary. This applies to binary output, more than 10 files, more than 15 minutes before the first durable output, and gate-dependent packages. Require the full `LOCAL_GENERATED → STAGED → SUBMITTED → COMMITTED → CANONICAL_VERIFIED → ACCEPTED` evidence chain; a text canary does not prove the binary route. If the required capability is unavailable, preserve existing local work and do not begin bulk generation or bypass the governed final zone.
+
 When a typed route exists, ChatGPT/operator must use it. If a raw provider write happens anyway, treat it as external/unverified until ProjectGuard evidence proves otherwise. Never fabricate a receipt, document head, mutation intent or hidden ledger record to make a bypass look governed.
 
 Detailed final-zone contract: `docs/mutation-gate.md`.

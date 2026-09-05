@@ -1,9 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { documentIdFor } from "../src/domain/managed-document";
+import type { StagedArtifactWriteRequest } from "../src/domain/artifact-write";
 import { emptyProjectState } from "../src/domain/transitions";
 import { type DropboxEntry, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
-import { machineDocumentHeadPath } from "../src/dropbox/layout";
+import {
+  machineArtifactReceiptPath,
+  machineArtifactReplacementBackupPath,
+  machineArtifactRollbackEvidencePath,
+  machineDocumentHeadPath
+} from "../src/dropbox/layout";
+import { stagedArtifactRollbackEvidence } from "../src/artifacts/staged-publication";
 import { MutationGateClassifier } from "../src/mutation-gate/classifier";
+import { ArtifactMutationIntentService } from "../src/mutation-gate/artifact-intent";
+import { MutationGateRepository } from "../src/mutation-gate/repository";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
@@ -12,6 +21,7 @@ import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 class FakeClassifierDropbox implements DropboxTransport {
   readonly files = new Map<string, string>();
   readonly metadata = new Map<string, DropboxFileMetadata>();
+  readonly downloadPaths: string[] = [];
   private revision = 0;
 
   async seed(path: string, content: string, id?: string): Promise<DropboxFileMetadata> {
@@ -32,7 +42,10 @@ class FakeClassifierDropbox implements DropboxTransport {
   }
 
   async upload(path: string, content: string, _mode: "add" | "overwrite"): Promise<void> { this.files.set(path, content); }
-  async download(path: string): Promise<string | null> { return this.files.get(path) ?? null; }
+  async download(path: string): Promise<string | null> {
+    this.downloadPaths.push(path);
+    return this.files.get(path) ?? null;
+  }
   async move(): Promise<void> { throw new Error("unused"); }
   async getMetadata(path: string): Promise<DropboxFileMetadata | null> { return this.metadata.get(path) ?? null; }
   async listFolder(path: string): Promise<DropboxEntry[]> {
@@ -215,5 +228,108 @@ describe("MutationGateClassifier", () => {
 
     await expect(new MutationGateClassifier(persistenceFromDropbox(transport)).classify(state(), path, metadata))
       .resolves.toEqual({ kind: "governed_current", documentId });
+  });
+
+  it("recognizes staged binary provider evidence as governed inflight without text hashing", async () => {
+    const transport = new FakeClassifierDropbox();
+    const runtime = persistenceFromDropbox(transport);
+    const current = state();
+    const requestId = "ART-BINARY-CLASSIFIER-0001";
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/binary.pdf";
+    const content = "opaque\u0000bytes";
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
+    const integrity = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    await new ArtifactMutationIntentService(new MutationGateRepository(runtime), runtime).prepare(current, {
+      request_id: requestId,
+      project_id: current.project_id,
+      relative_path: "binary.pdf",
+      content_sha256: "a".repeat(64),
+      source: {
+        kind: "staged_provider_object",
+        path: `/PROJECT_OS/.project-os/artifacts/staging/${requestId}/binary.pdf`,
+        object_id: "id:staged",
+        revision_token: "rev-staged",
+        size: new TextEncoder().encode(content).byteLength,
+        integrity: { algorithm: "dropbox-content-hash", value: integrity }
+      },
+      mode: "create"
+    });
+    const metadata = await transport.seed(path, content, "id:binary-final");
+
+    await expect(new MutationGateClassifier(runtime).classify(current, path, metadata))
+      .resolves.toEqual({ kind: "governed_inflight", requestId });
+    expect(transport.downloadPaths).not.toContain(path);
+  });
+
+  it("recognizes restored replace bytes with active request-specific rollback evidence", async () => {
+    const transport = new FakeClassifierDropbox();
+    const runtime = persistenceFromDropbox(transport);
+    const current = state();
+    const requestId = "ART-BINARY-CLASSIFIER-0002";
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/replaced.pdf";
+    const originalContent = "original\u0000opaque\u0000bytes";
+    await transport.seed(path, originalContent, "id:original");
+    const artifactRequest: StagedArtifactWriteRequest = {
+      request_id: requestId,
+      project_id: current.project_id,
+      relative_path: "replaced.pdf",
+      content_sha256: "b".repeat(64),
+      source: {
+        kind: "staged_provider_object",
+        path: `/PROJECT_OS/.project-os/artifacts/staging/${requestId}/replaced.pdf`,
+        object_id: "id:staged-replacement",
+        revision_token: "rev-staged-replacement",
+        size: 99,
+        integrity: { algorithm: "dropbox-content-hash", value: "c".repeat(64) }
+      },
+      mode: "replace"
+    };
+    await new ArtifactMutationIntentService(new MutationGateRepository(runtime), runtime).prepare(current, artifactRequest);
+
+    const backupPath = machineArtifactReplacementBackupPath(requestId);
+    await transport.seed(backupPath, originalContent, "id:rollback-backup");
+    const backup = await runtime.objects.getMetadata(backupPath);
+    await runtime.objects.createText(
+      machineArtifactRollbackEvidencePath(requestId),
+      `${JSON.stringify(stagedArtifactRollbackEvidence(artifactRequest, path, backup!, runtime.providerId), null, 2)}\n`
+    );
+
+    const restored = await transport.seed(path, originalContent, "id:restored-copy");
+    await expect(new MutationGateClassifier(runtime).classify(current, path, restored))
+      .resolves.toEqual({ kind: "governed_inflight", requestId });
+    expect(transport.downloadPaths).not.toContain(path);
+
+    await runtime.objects.createText(machineArtifactReceiptPath(requestId), '{"status":"committed"}\n');
+    await expect(new MutationGateClassifier(runtime).classify(current, path, restored))
+      .resolves.toEqual({ kind: "external_candidate" });
+  });
+
+  it("does not treat an external object with old replace bytes as a restored precondition", async () => {
+    const transport = new FakeClassifierDropbox();
+    const runtime = persistenceFromDropbox(transport);
+    const current = state();
+    const requestId = "ART-BINARY-CLASSIFIER-0003";
+    const path = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARTIFACTS/external-old-bytes.pdf";
+    const originalContent = "old\u0000bytes";
+    await transport.seed(path, originalContent, "id:original");
+    await new ArtifactMutationIntentService(new MutationGateRepository(runtime), runtime).prepare(current, {
+      request_id: requestId,
+      project_id: current.project_id,
+      relative_path: "external-old-bytes.pdf",
+      content_sha256: "d".repeat(64),
+      source: {
+        kind: "staged_provider_object",
+        path: `/PROJECT_OS/.project-os/artifacts/staging/${requestId}/external-old-bytes.pdf`,
+        object_id: "id:staged-external-test",
+        revision_token: "rev-staged-external-test",
+        size: 88,
+        integrity: { algorithm: "dropbox-content-hash", value: "e".repeat(64) }
+      },
+      mode: "replace"
+    });
+
+    const external = await transport.seed(path, originalContent, "id:external");
+    await expect(new MutationGateClassifier(runtime).classify(current, path, external))
+      .resolves.toEqual({ kind: "external_candidate" });
   });
 });

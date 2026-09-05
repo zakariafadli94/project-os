@@ -3,6 +3,7 @@ export interface DropboxTransport {
   download(path: string): Promise<string | null>;
   move(from: string, to: string): Promise<void>;
   delete?(path: string): Promise<void>;
+  deleteIfRevision?(path: string, revision: string): Promise<boolean>;
   listFolder?(path: string): Promise<DropboxEntry[]>;
   getMetadata?(path: string): Promise<DropboxFileMetadata | null>;
   uploadConditional?(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata>;
@@ -256,6 +257,25 @@ export class DropboxClient implements DropboxTransport {
       throw new DropboxConflictError(`Dropbox delete conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
     }
     throw this.errorFromResponse(`Dropbox delete failed for ${path}`, response, text);
+  }
+
+  async deleteIfRevision(path: string, revision: string): Promise<boolean> {
+    const token = await this.accessToken();
+    const response = await this.runtimeFetch("files/delete_v2", "https://api.dropboxapi.com/2/files/delete_v2", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ path, parent_rev: revision })
+    }, path);
+    if (response.ok) return true;
+    const text = await response.text();
+    if (response.status === 409 && text.includes("not_found")) return false;
+    if (response.status === 409) {
+      throw new DropboxConflictError(`Dropbox conditional delete conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
+    }
+    throw this.errorFromResponse(`Dropbox conditional delete failed for ${path}`, response, text);
   }
 
   async ensureDirectory(path: string): Promise<void> {

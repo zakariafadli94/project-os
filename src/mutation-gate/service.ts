@@ -1,4 +1,9 @@
-import { parseArtifactWriteRequest, type ArtifactWriteReceipt } from "../domain/artifact-write";
+import { samePayload } from "../artifacts/staged-publication";
+import {
+  isStagedArtifactWriteRequest,
+  parseArtifactWriteRequest,
+  type ArtifactWriteReceipt
+} from "../domain/artifact-write";
 import type { MutationDetectionSource } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
 import { ArtifactContentConflictError } from "../persistence/repository-core";
@@ -212,9 +217,23 @@ export class MutationGateService {
       };
     }
 
-    const visible = await this.runtime.objects.readText(intent.destination_path);
-    const finalEffectVerified = visible !== null
-      && await sha256Text(visible) === intent.expected_content_sha256;
+    const frozenRequest = parseArtifactWriteRequest(JSON.parse(intent.request_json));
+    let finalEffectVerified: boolean;
+    if (isStagedArtifactWriteRequest(frozenRequest)) {
+      const visible = await this.runtime.objects.getMetadata(intent.destination_path);
+      const expected: ProviderObjectMetadata = {
+        path: frozenRequest.source.path,
+        size: frozenRequest.source.size,
+        objectId: frozenRequest.source.object_id,
+        revisionToken: frozenRequest.source.revision_token,
+        integrityHash: frozenRequest.source.integrity
+      };
+      finalEffectVerified = visible !== null && samePayload(expected, visible);
+    } else {
+      const visible = await this.runtime.objects.readText(intent.destination_path);
+      finalEffectVerified = visible !== null
+        && await sha256Text(visible) === intent.expected_content_sha256;
+    }
     return {
       request_id: requestId,
       project_id: projectId,

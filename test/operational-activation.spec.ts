@@ -55,9 +55,9 @@ describe("Operational Activation Contract", () => {
     const operating = renderOperating(state);
     const handoff = renderHandoff(state);
 
-    expect(OPERATING_CONTRACT_VERSION).toBe(2);
+    expect(OPERATING_CONTRACT_VERSION).toBe(3);
     expect(operating).toContain("note_id: OPERATING");
-    expect(operating).toContain("operating_contract_version: 2");
+    expect(operating).toContain("operating_contract_version: 3");
     expect(operating).toContain("INPUTS/");
     expect(operating).toContain("REFERENCES/UNCLASSIFIED/");
     expect(operating).toContain("WORKING/");
@@ -65,9 +65,16 @@ describe("Operational Activation Contract", () => {
     expect(operating).toContain("DELIVERABLES/");
     expect(operating).toContain("typed");
     expect(operating).toContain("receipt");
+    expect(operating).toContain("## Artifact persistence preflight");
+    expect(operating).toContain("more than 10 files");
+    expect(operating).toContain("more than 15 minutes");
+    expect(operating).toContain("current chat");
+    expect(operating).toContain("A successful text canary does not prove binary persistence");
+    expect(operating).toContain("LOCAL_GENERATED → STAGED → SUBMITTED → COMMITTED → CANONICAL_VERIFIED → ACCEPTED");
+    expect(operating).toContain("Do not begin bulk generation");
 
     expect(handoff).toContain("## Operating contract");
-    expect(handoff).toContain("Operating contract version: 2");
+    expect(handoff).toContain("Operating contract version: 3");
     expect(handoff).toContain("[[OPERATING|Current operating contract]]");
     expect(handoff).toContain("Sources → INPUTS/ → REFERENCES/");
     expect(handoff).toContain("Drafts → WORKING/ → REVIEW/");
@@ -82,7 +89,7 @@ describe("Operational Activation Contract", () => {
     const plan = await planProjection(record, null, CURRENT_PROJECTION_VERSION);
     const operating = plan.changed_outputs.get("global:OPERATING");
     expect(operating?.relative_path).toBe("OPERATING.md");
-    expect(operating?.content).toContain("operating_contract_version: 2");
+    expect(operating?.content).toContain("operating_contract_version: 3");
   });
 
   it("keeps projection v1 byte-contract behavior without OPERATING or the new HANDOFF bootstrap", async () => {

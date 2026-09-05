@@ -24,11 +24,15 @@ Production layout is V2, continuity remains stable, and the initial MutationGate
 PROJECT_OS_LAYOUT_MODE=v2
 PROJECT_OS_CONTINUITY_MODE=stable
 PROJECT_OS_MUTATION_GATE_MODE=observe
+PROJECT_OS_BINARY_ARTIFACT_INGRESS_MODE=off
+PROJECT_OS_BINARY_ARTIFACT_MAX_BYTES=10485760
 ```
 
 Do not change continuity mode merely because a feature PR is merged. Transparent candidate rollout/cutover remains owned by the later deployment package.
 
 Do not enable `PROJECT_OS_MUTATION_GATE_MODE=enforce` in the first MutationGate production deployment. `enforce` is a separate rollout gate after observe-mode inventory and production proof.
+
+Binary artifact ingress also remains `off` when its implementation is first merged or deployed. Enablement is a separate, explicitly authorized production action after the checklist in `docs/binary-artifact-ingress.md` passes. Do not combine that activation with PRJ-0003 recovery.
 
 The scheduled trigger runs every five minutes. It performs independent recovery/reconciliation jobs for:
 

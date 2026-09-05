@@ -241,4 +241,31 @@ describe("Worker routing", () => {
     });
     expect(mock.files.has(`/PROJECT_OS/WORKSPACE/PROJECTS/${receipt.project_id}-admin-project/PROJECT.md`)).toBe(true);
   });
+
+  it("rejects staged artifacts before Durable Object routing while binary ingress is disabled", async () => {
+    const ctx = createExecutionContext();
+    const artifact = {
+      request_id: "ART-BINARY-DISABLED-0001",
+      project_id: "PRJ-0003",
+      relative_path: "example.pdf",
+      content_sha256: "a".repeat(64),
+      source: {
+        kind: "staged_provider_object",
+        path: "/PROJECT_OS/.project-os/artifacts/staging/ART-BINARY-DISABLED-0001/example.pdf",
+        object_id: "id:source",
+        revision_token: "rev-1",
+        size: 100,
+        integrity: { algorithm: "dropbox-content-hash", value: "hash" }
+      },
+      mode: "create"
+    };
+    const response = await worker.fetch(new Request("https://example.com/v1/artifacts", {
+      method: "POST",
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(artifact)
+    }), testEnv, ctx);
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: "BINARY_ARTIFACT_INGRESS_DISABLED" });
+  });
 });

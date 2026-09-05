@@ -1,5 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
-import { parseArtifactWriteRequest, type ArtifactWriteReceipt, type ArtifactWriteRequest } from "../domain/artifact-write";
+import {
+  StagedArtifactConflictError,
+  StagedArtifactSourceMismatchError
+} from "../artifacts/staged-publication";
+import {
+  isStagedArtifactWriteRequest,
+  parseArtifactWriteRequest,
+  type ArtifactWriteReceipt,
+  type ArtifactWriteRequest
+} from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
 import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
@@ -13,6 +22,7 @@ import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinato
 import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
+import { MutationIntentConflictError } from "../mutation-gate/repository";
 import { parseLayoutMode, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
@@ -272,7 +282,9 @@ export class ProjectGuard extends DurableObject<Env> {
           "The same request_id was reused with different artifact content or path"
         ));
       }
-      return Response.json(JSON.parse(existing.receipt_json) as ArtifactWriteReceipt);
+      const existingReceipt = JSON.parse(existing.receipt_json) as ArtifactWriteReceipt;
+      if (existingReceipt.status === "committed") await this.repository.cleanupStagedArtifact(artifact);
+      return Response.json(existingReceipt);
     }
 
     if (this.ctx.id.name && this.ctx.id.name !== artifact.project_id) {
@@ -290,7 +302,7 @@ export class ProjectGuard extends DurableObject<Env> {
       );
     }
 
-    if (await sha256Hex(artifact.content) !== artifact.content_sha256) {
+    if (!isStagedArtifactWriteRequest(artifact) && await sha256Hex(artifact.content) !== artifact.content_sha256) {
       return this.finalizeArtifact(
         artifact,
         this.artifactReceipt(artifact, "rejected", "CONTENT_HASH_MISMATCH", "content_sha256 does not match artifact content")
@@ -300,10 +312,21 @@ export class ProjectGuard extends DurableObject<Env> {
     try {
       await this.repository.writeArtifact(state, artifact);
     } catch (error) {
-      if (error instanceof ArtifactContentConflictError) {
+      if (error instanceof ArtifactContentConflictError || error instanceof StagedArtifactConflictError) {
         return this.finalizeArtifact(
           artifact,
           this.artifactReceipt(artifact, "conflict", "ARTIFACT_CONTENT_CONFLICT", error.message)
+        );
+      }
+      if (error instanceof StagedArtifactSourceMismatchError) {
+        return this.finalizeArtifact(
+          artifact,
+          this.artifactReceipt(artifact, "rejected", "ARTIFACT_EVIDENCE_MISMATCH", error.message)
+        );
+      }
+      if (error instanceof MutationIntentConflictError) {
+        return Response.json(
+          this.artifactReceipt(artifact, "conflict", "ARTIFACT_INTENT_CONFLICT", error.message)
         );
       }
       throw error;
@@ -433,6 +456,7 @@ export class ProjectGuard extends DurableObject<Env> {
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
     await this.repository.writeArtifactReceipt(receipt);
     this.persistArtifact(request, receipt);
+    if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
     return Response.json(receipt);
   }
 

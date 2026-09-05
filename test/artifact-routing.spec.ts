@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ArtifactWriteRequest } from "../src/domain/artifact-write";
+import type { InlineArtifactWriteRequest } from "../src/domain/artifact-write";
 import { parseTransaction } from "../src/domain/transaction";
 import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
 import { sha256Text } from "../src/documents/hash";
@@ -82,7 +82,7 @@ function providerHash(content: string): string {
   return acc.toString(16).padStart(8, "0").repeat(8).slice(0, 64);
 }
 
-async function artifactRequest(overrides: Partial<ArtifactWriteRequest> = {}): Promise<ArtifactWriteRequest> {
+async function artifactRequest(overrides: Partial<InlineArtifactWriteRequest> = {}): Promise<InlineArtifactWriteRequest> {
   const content = overrides.content ?? "# routed";
   return {
     request_id: "ART-ROUTING-000001",

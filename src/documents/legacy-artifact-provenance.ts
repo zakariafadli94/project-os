@@ -1,4 +1,4 @@
-import type { ArtifactWriteRequest } from "../domain/artifact-write";
+import type { InlineArtifactWriteRequest } from "../domain/artifact-write";
 import {
   documentIdFor,
   documentIdForProviderFile,
@@ -28,7 +28,7 @@ type ManagedArtifactDestination =
 
 export async function ensureLegacyArtifactRequestProvenance(
   state: ProjectState,
-  request: ArtifactWriteRequest,
+  request: InlineArtifactWriteRequest,
   input: PersistenceInput
 ): Promise<void> {
   const destination = classifyManagedDestination(state, request, resolveArtifactDestination(state, request.relative_path));
@@ -155,7 +155,7 @@ async function readOrRestoreHead(
   return await ledger.readHead(projectId, documentId) ?? await ledger.restoreHeadFromVersions(projectId, documentId);
 }
 
-function assertReplay(record: DocumentVersionRecord, request: ArtifactWriteRequest, path: string): void {
+function assertReplay(record: DocumentVersionRecord, request: InlineArtifactWriteRequest, path: string): void {
   if (
     record.source !== "legacy_artifact_api"
     || record.content_sha256 !== request.content_sha256
@@ -167,7 +167,7 @@ function assertReplay(record: DocumentVersionRecord, request: ArtifactWriteReque
 
 function classifyManagedDestination(
   state: ProjectState,
-  request: ArtifactWriteRequest,
+  request: InlineArtifactWriteRequest,
   destination: ResolvedArtifactDestination
 ): ManagedArtifactDestination | null {
   const root = workspaceProjectRoot(state.project_id, state.slug);

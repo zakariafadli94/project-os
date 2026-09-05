@@ -1,4 +1,5 @@
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
+import { binaryArtifactPolicyViolation } from "../artifacts/policy";
 import type { Env } from "../env";
 import { executeTransactionWithContinuity } from "../index-neutral";
 import { parseLayoutMode, type LayoutMode } from "../persistence/layout";
@@ -52,6 +53,18 @@ export async function processDurableInbox(env: Env): Promise<DurableInboxProcess
 }
 
 async function routeArtifact(env: Env, artifact: ArtifactWriteRequest): Promise<ArtifactWriteReceipt> {
+  const policyViolation = binaryArtifactPolicyViolation(env, artifact);
+  if (policyViolation) {
+    return {
+      request_id: artifact.request_id,
+      project_id: artifact.project_id,
+      relative_path: artifact.relative_path,
+      content_sha256: artifact.content_sha256,
+      status: "rejected",
+      code: policyViolation.code,
+      message: policyViolation.message
+    };
+  }
   const stub = env.PROJECT_GUARD.getByName(artifact.project_id);
   const response = await stub.fetch("https://project-guard.internal/artifact", {
     method: "POST",

@@ -78,7 +78,10 @@ function wrapObjects(
     getMetadata: (path) => objects.getMetadata(path),
     listChildren: (path) => objects.listChildren(path),
     move: (from, to) => objects.move(from, to),
-    delete: (path) => objects.delete(path)
+    delete: (path) => objects.delete(path),
+    ...(objects.deleteIfUnchanged ? {
+      deleteIfUnchanged: (path, expected) => objects.deleteIfUnchanged!(path, expected)
+    } : {})
   };
 }
 

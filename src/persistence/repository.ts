@@ -1,6 +1,15 @@
 export * from "./repository-core";
 
-import type { ArtifactWriteRequest } from "../domain/artifact-write";
+import {
+  matchesStagedArtifactRollbackBackup,
+  parseStagedArtifactRollbackEvidence,
+  stagedSourceMismatch,
+  StagedArtifactPublisher
+} from "../artifacts/staged-publication";
+import {
+  isStagedArtifactWriteRequest,
+  type ArtifactWriteRequest
+} from "../domain/artifact-write";
 import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../domain/commit-record";
 import type { ProjectState } from "../domain/project-state";
 import type { Receipt } from "../domain/receipt";
@@ -20,6 +29,8 @@ import type { SchemaWriterStage } from "../schema/writer-stage";
 import { resolveArtifactDestination, type ResolvedArtifactDestination } from "./artifact-routing";
 import {
   machineCommitRecordPath,
+  machineArtifactReplacementBackupPath,
+  machineArtifactRollbackEvidencePath,
   machineManifestPath,
   machineReceiptPath,
   machineStatePath,
@@ -43,6 +54,7 @@ export class ProjectRepository extends CoreProjectRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;
+  private readonly stagedArtifactPublisher: StagedArtifactPublisher;
   private readonly requestedSchemaWriterStage?: SchemaWriterStage;
 
   constructor(
@@ -59,6 +71,7 @@ export class ProjectRepository extends CoreProjectRepository {
     const mutationRepository = new MutationGateRepository(runtime, writerStage);
     this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
     this.mutationGate = new MutationGateService(runtime, mutationGateMode, writerStage);
+    this.stagedArtifactPublisher = new StagedArtifactPublisher(runtime);
   }
 
   override async readProjectState(projectId: string): Promise<ProjectState | null> {
@@ -83,6 +96,57 @@ export class ProjectRepository extends CoreProjectRepository {
       throw new Error(`Canonical receipt binding mismatch: expected ${transactionId}, got ${receipt.transaction_id}`);
     }
     return receipt;
+  }
+
+  async cleanupStagedArtifact(request: ArtifactWriteRequest): Promise<boolean> {
+    if (!isStagedArtifactWriteRequest(request)) return false;
+    const status = await this.mutationGate.artifactStatus(request.project_id, request.request_id);
+    if (status?.verification_state !== "canonical_verified") return false;
+    const source = await this.runtime.objects.getMetadata(request.source.path);
+    if (source !== null) {
+      if (stagedSourceMismatch(request, source)) return false;
+      if (!source.objectId || !source.revisionToken || !this.runtime.objects.deleteIfUnchanged) return false;
+      const deleted = await this.runtime.objects.deleteIfUnchanged(source.path, {
+        objectId: source.objectId,
+        revisionToken: source.revisionToken
+      });
+      if (deleted === "changed") return false;
+    }
+    const rollbackEvidencePath = machineArtifactRollbackEvidencePath(request.request_id);
+    const evidenceBefore = await this.runtime.objects.getMetadata(rollbackEvidencePath);
+    const evidenceRaw = await this.runtime.objects.readText(rollbackEvidencePath);
+    const evidenceAfter = await this.runtime.objects.getMetadata(rollbackEvidencePath);
+    if (!sameProviderObservation(evidenceBefore, evidenceAfter)) return false;
+    if ((evidenceRaw === null) !== (evidenceAfter === null)) return false;
+    const rollbackEvidence = evidenceRaw === null
+      ? null
+      : parseStagedArtifactRollbackEvidence(JSON.parse(evidenceRaw));
+    if (rollbackEvidence && (
+      rollbackEvidence.project_id !== request.project_id
+      || rollbackEvidence.request_id !== request.request_id
+      || rollbackEvidence.provider_id !== this.runtime.providerId
+    )) return false;
+
+    const backupPath = machineArtifactReplacementBackupPath(request.request_id);
+    const backup = await this.runtime.objects.getMetadata(backupPath);
+    if (backup) {
+      if (!rollbackEvidence || !matchesStagedArtifactRollbackBackup(rollbackEvidence, backup)) return false;
+      if (!backup.objectId || !backup.revisionToken || !this.runtime.objects.deleteIfUnchanged) return false;
+      const deleted = await this.runtime.objects.deleteIfUnchanged(backup.path, {
+        objectId: backup.objectId,
+        revisionToken: backup.revisionToken
+      });
+      if (deleted === "changed") return false;
+    }
+    if (evidenceAfter) {
+      if (!evidenceAfter.objectId || !evidenceAfter.revisionToken || !this.runtime.objects.deleteIfUnchanged) return false;
+      const deleted = await this.runtime.objects.deleteIfUnchanged(evidenceAfter.path, {
+        objectId: evidenceAfter.objectId,
+        revisionToken: evidenceAfter.revisionToken
+      });
+      if (deleted === "changed") return false;
+    }
+    return true;
   }
 
   override async writeCommitRecord(record: CanonicalCommitRecord): Promise<void> {
@@ -155,7 +219,13 @@ export class ProjectRepository extends CoreProjectRepository {
     preparedDestination?: ResolvedArtifactDestination,
     resolutionContext?: CandidateResolutionContext
   ): Promise<"written" | "idempotent"> {
-    if (this.repositoryMode === "legacy") return super.writeArtifact(state, request);
+    if (state.status === "archived") throw new Error("Archived projects do not accept artifact writes");
+    if (this.repositoryMode === "legacy") {
+      if (isStagedArtifactWriteRequest(request)) {
+        throw new Error("Staged binary artifacts require the V2 governed repository");
+      }
+      return super.writeArtifact(state, request);
+    }
 
     const prepared = await this.artifactMutationIntents.prepare(state, request);
     if (preparedDestination && !sameDestination(preparedDestination, prepared.destination)) {
@@ -164,6 +234,11 @@ export class ProjectRepository extends CoreProjectRepository {
     const replayState = stateForPreparedDestination(state, request, prepared.destination);
     await this.mutationGate.assertDestinationClear(replayState, prepared.destination.path, resolutionContext);
 
+    if (isStagedArtifactWriteRequest(request)) {
+      const status = await this.mutationGate.artifactStatus(request.project_id, request.request_id);
+      if (status?.verification_state === "canonical_verified") return "idempotent";
+      return this.stagedArtifactPublisher.publish(request, prepared.destination);
+    }
     const managed = await new LegacyArtifactDocumentWriter(this.runtime).writeIfManaged(replayState, request);
     if (managed !== null) return managed;
     return super.writeArtifact(replayState, request);
@@ -172,6 +247,19 @@ export class ProjectRepository extends CoreProjectRepository {
   private writerStage(): SchemaWriterStage {
     return schemaWriterStageFor(this.runtime, this.requestedSchemaWriterStage);
   }
+}
+
+function sameProviderObservation(
+  left: import("./provider/contract").ProviderObjectMetadata | null,
+  right: import("./provider/contract").ProviderObjectMetadata | null
+): boolean {
+  if (left === null || right === null) return left === right;
+  return left.path === right.path
+    && left.objectId === right.objectId
+    && left.revisionToken === right.revisionToken
+    && left.size === right.size
+    && left.integrityHash?.algorithm === right.integrityHash?.algorithm
+    && left.integrityHash?.value === right.integrityHash?.value;
 }
 
 function stateForPreparedDestination(

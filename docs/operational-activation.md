@@ -52,6 +52,8 @@ canonical business facts
   -> committed receipt gate
 ```
 
+Before binary output, more than 10 files, more than 15 minutes of work before the first durable result, or any gate-dependent package, the current chat must prove a representative end-to-end persistence canary. The evidence sequence is `LOCAL_GENERATED → STAGED → SUBMITTED → COMMITTED → CANONICAL_VERIFIED → ACCEPTED`. A text canary does not prove binary persistence, and an unavailable or incomplete canary blocks bulk generation rather than authorizing a direct final-zone write.
+
 Generated project projections such as `STATE.md`, `HANDOFF.md`, `ROADMAP.md`, `TASKS/`, `DECISIONS/`, `CONSTRAINTS/` and `RESEARCH/` remain generated/canonical-derived views; editing them never creates canonical truth.
 
 ## Managed-zone activation

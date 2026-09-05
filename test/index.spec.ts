@@ -192,12 +192,11 @@ describe("Worker routing", () => {
     }), testEnv, ctx);
     expect(unauthorized.status).toBe(401);
 
-    const disabledEnv = { ...testEnv, PROJECT_OS_BINARY_ARTIFACT_INGRESS_MODE: "off" };
     const response = await worker.fetch(new Request("https://example.com/v1/artifacts", {
       method: "POST",
       headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
       body: JSON.stringify(artifact)
-    }), disabledEnv, ctx);
+    }), testEnv, ctx);
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ status: "committed", request_id: artifact.request_id });
     expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${project.project_id}-artifact-direct/ARTIFACTS/direct/a.md`)).toBe(content);
@@ -260,11 +259,12 @@ describe("Worker routing", () => {
       },
       mode: "create"
     };
+    const disabledEnv = { ...testEnv, PROJECT_OS_BINARY_ARTIFACT_INGRESS_MODE: "off" };
     const response = await worker.fetch(new Request("https://example.com/v1/artifacts", {
       method: "POST",
       headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
       body: JSON.stringify(artifact)
-    }), testEnv, ctx);
+    }), disabledEnv, ctx);
 
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ error: "BINARY_ARTIFACT_INGRESS_DISABLED" });

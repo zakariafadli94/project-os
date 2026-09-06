@@ -1,10 +1,9 @@
-import { readFileSync } from "node:fs";
+/// <reference types="vite/client" />
+import workflowText from "../.github/workflows/recover-inputs.yml?raw";
 import { describe, expect, it } from "vitest";
 
-const workflowPath = ".github/workflows/recover-inputs.yml";
-
 function workflowSource(): string {
-  return readFileSync(workflowPath, "utf8");
+  return workflowText;
 }
 
 describe("recover-inputs GitHub Actions workflow", () => {

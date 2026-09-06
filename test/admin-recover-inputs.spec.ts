@@ -8,6 +8,10 @@ import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 
+function withIngressToken(token: string | undefined): Env {
+  return { ...testEnv, INGRESS_TOKEN: token } as unknown as Env;
+}
+
 async function createProject(transactionId: string, slug: string): Promise<string> {
   const ctx = createExecutionContext();
   const response = await worker.fetch(new Request("https://example.com/v1/transactions", {
@@ -71,10 +75,36 @@ function assertSummaryInvariant(summary: {
 describe("POST /v1/admin/recover-inputs", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("requires ingress authorization", async () => {
+  it("fails closed for missing, empty, or wrong ingress secrets and accepts the configured secret", async () => {
     installDropboxMock();
-    const response = await worker.fetch(recoveryRequest({ project_ids: ["PRJ-0002"] }, "wrong-token"), testEnv, createExecutionContext());
-    expect(response.status).toBe(401);
+
+    const absent = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, "undefined"),
+      withIngressToken(undefined),
+      createExecutionContext()
+    );
+    expect(absent.status).toBe(401);
+
+    const empty = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, ""),
+      withIngressToken(""),
+      createExecutionContext()
+    );
+    expect(empty.status).toBe(401);
+
+    const wrong = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, "wrong-token"),
+      testEnv,
+      createExecutionContext()
+    );
+    expect(wrong.status).toBe(401);
+
+    const correct = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, testEnv.INGRESS_TOKEN),
+      testEnv,
+      createExecutionContext()
+    );
+    expect(correct.status).toBe(400);
   });
 
   it("requires an explicit non-empty project list", async () => {
@@ -173,11 +203,40 @@ describe("POST /v1/admin/recover-inputs", () => {
 describe("GET /v1/admin/input-recovery-status", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("requires authorization and an exact four-digit project ID", async () => {
+  it("fails closed for missing, empty, or wrong ingress secrets and accepts the configured secret", async () => {
     installDropboxMock();
-    const unauthorized = await worker.fetch(recoveryStatusRequest("PRJ-0002", "wrong-token"), testEnv, createExecutionContext());
-    expect(unauthorized.status).toBe(401);
 
+    const absent = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", "undefined"),
+      withIngressToken(undefined),
+      createExecutionContext()
+    );
+    expect(absent.status).toBe(401);
+
+    const empty = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", ""),
+      withIngressToken(""),
+      createExecutionContext()
+    );
+    expect(empty.status).toBe(401);
+
+    const wrong = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", "wrong-token"),
+      testEnv,
+      createExecutionContext()
+    );
+    expect(wrong.status).toBe(401);
+
+    const correct = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", testEnv.INGRESS_TOKEN),
+      testEnv,
+      createExecutionContext()
+    );
+    expect(correct.status).toBe(400);
+  });
+
+  it("requires an exact four-digit project ID", async () => {
+    installDropboxMock();
     for (const invalid of ["PRJ-000", "PRJ-00000", "PRJ-AUTO", "prj-0002", "PRJ-12A4"]) {
       const response = await worker.fetch(recoveryStatusRequest(invalid), testEnv, createExecutionContext());
       expect(response.status, invalid).toBe(400);

@@ -2,12 +2,13 @@ import { env } from "cloudflare:workers";
 import {
   createExecutionContext,
   runDurableObjectAlarm,
+  runInDurableObject,
   waitOnExecutionContext
 } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index-mutation-gate";
 import type { Env } from "../src/env";
-import { installDropboxMock } from "./helpers/mock-dropbox";
+import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env & {
   DROPBOX_CHANGE_GUARD: DurableObjectNamespace;
@@ -139,6 +140,55 @@ describe("DropboxChangeGuard", () => {
       last_error: null,
       failure_count: 0
     });
+  });
+
+  it("keeps a generation open and re-arms while a durable document job remains pending", async () => {
+    const faults: DropboxMockFault[] = [];
+    const mock = installDropboxMock({ faults });
+    const slug = "change-guard-pending-job";
+    const projectId = await createProject("TXN-CHANGE-GUARD-0006", slug);
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+
+    const baseline = await projectGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(baseline.status).toBe(200);
+
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-${slug}`;
+    const badInput = `${root}/INPUTS/retry.pdf`;
+    faults.push({
+      endpoint: "/2/files/copy_v2",
+      occurrence: 1,
+      status: 409,
+      error_summary: "to/conflict/file/...",
+      path: badInput
+    });
+    await mock.writeExternal(badInput, "%PDF retry later");
+
+    const stub = guard("pending-document-job");
+    expect((await notify(stub)).status).toBe(200);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    let pendingJobs: Array<{ status: string; attempts: number; last_error: string | null }> = [];
+    await runInDurableObject(projectGuard, async (_instance, state) => {
+      pendingJobs = state.storage.sql.exec<{ status: string; attempts: number; last_error: string | null }>(
+        `SELECT status, attempts, last_error
+         FROM managed_document_change_jobs
+         WHERE status = 'pending'`
+      ).toArray();
+    });
+    expect(pendingJobs).toHaveLength(1);
+    expect(pendingJobs[0]).toMatchObject({ status: "pending", attempts: 1 });
+    expect(pendingJobs[0].last_error).not.toBeNull();
+
+    const observed = await status(stub);
+    expect(observed).toMatchObject({
+      requested_generation: 1,
+      completed_generation: 0,
+      alarm_scheduled: true,
+      processing_generation: null,
+      failure_count: 1
+    });
+    expect(observed.last_error).not.toBeNull();
+    expect(observed.alarm_at).not.toBeNull();
   });
 
   it("defers persistent reconciliation failures after five rapid retries", async () => {

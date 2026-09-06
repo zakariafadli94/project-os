@@ -78,7 +78,25 @@ assert.doesNotMatch(source, /set\s+-x/);
 
 const jobs = Object.values(workflow.jobs ?? {});
 assert.equal(jobs.length, 1, "exactly one recovery job is expected");
+const [recoveryJob] = jobs;
+for (const [name, value] of Object.entries(recoveryJob?.env ?? {})) {
+  assert.doesNotMatch(
+    String(value),
+    /\$\{\{\s*runner\./,
+    `job-level env ${name} must not use the unavailable runner context`
+  );
+}
 const steps = jobs.flatMap((job) => Array.isArray(job?.steps) ? job.steps : []);
+const payloadStep = steps.find((step) => step?.name === "Build strict recovery payload");
+assert.deepEqual(payloadStep?.env, {
+  RECOVERY_PAYLOAD_FILE: "${{ runner.temp }}/recover-inputs-payload.json",
+}, "the payload path must be scoped to the build step where the runner context is available");
+const recoveryStep = steps.find((step) => step?.name === "Run targeted recovery and verify INPUTS drained");
+assert.deepEqual(recoveryStep?.env, {
+  RECOVERY_RESPONSE_FILE: "${{ runner.temp }}/recover-inputs-response.json",
+  RECOVERY_PAYLOAD_FILE: "${{ runner.temp }}/recover-inputs-payload.json",
+  POSTCHECK_RESPONSE_FILE: "${{ runner.temp }}/recover-inputs-postcheck.json",
+}, "runner.temp paths must be scoped to the recovery step where the runner context is available");
 const runSource = steps.map((step) => typeof step?.run === "string" ? step.run : "").join("\n");
 assert.match(runSource, /--request POST[\s\S]*\/v1\/admin\/recover-inputs/);
 assert.match(runSource, /--request GET[\s\S]*\/v1\/admin\/input-recovery-status\?project_id=/);

@@ -227,6 +227,8 @@ export interface ManagedDocumentReconcileAllSummary {
   restored: number;
   conflicts: number;
   cursor_resets: number;
+  jobs_pending: number;
+  job_failures: number;
 }
 
 export interface SearchFleetReconcileSummary {
@@ -245,6 +247,8 @@ interface ManagedDocumentProjectSummary {
   restored: number;
   conflicts: number;
   cursor_reset: boolean;
+  jobs_pending: number;
+  job_failures: number;
 }
 
 interface MaterializationStatusResponse {
@@ -714,7 +718,9 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
     duplicates: 0,
     restored: 0,
     conflicts: 0,
-    cursor_resets: 0
+    cursor_resets: 0,
+    jobs_pending: 0,
+    job_failures: 0
   };
 
   let cursor = 0;
@@ -737,6 +743,8 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
         summary.restored += projectSummary.restored;
         summary.conflicts += projectSummary.conflicts;
         summary.cursor_resets += projectSummary.cursor_reset ? 1 : 0;
+        summary.jobs_pending += projectSummary.jobs_pending;
+        summary.job_failures += projectSummary.job_failures;
       } catch (error) {
         summary.projects_failed += 1;
         console.error("Project OS managed document reconcile failed", {

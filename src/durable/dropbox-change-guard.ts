@@ -99,6 +99,11 @@ export class DropboxChangeGuard extends DurableObject<Env> {
       if (summary.projects_failed > 0) {
         throw new Error(`Managed-document fleet reconciliation failed for ${summary.projects_failed} project(s)`);
       }
+      if (summary.jobs_pending > 0) {
+        throw new Error(
+          `Managed-document fleet reconciliation left ${summary.jobs_pending} job(s) pending after ${summary.job_failures} failure(s)`
+        );
+      }
       await this.ctx.storage.put(COMPLETED_GENERATION_KEY, processingGeneration);
       await this.ctx.storage.delete(LAST_ERROR_KEY);
       await this.ctx.storage.delete(FAILURE_COUNT_KEY);

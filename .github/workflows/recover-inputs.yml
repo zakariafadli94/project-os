@@ -1,6 +1,6 @@
 name: Recover Project OS INPUTS
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       project_id:
@@ -12,8 +12,7 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: project-os-input-recovery
@@ -48,8 +47,8 @@ jobs:
             exit 1
           fi
 
-          if ! [[ "$PROJECT_ID" =~ ^PRJ-[0-9]{4,}$ ]]; then
-            echo "project_id must match PRJ-xxxx using decimal digits."
+          if ! [[ "$PROJECT_ID" =~ ^PRJ-[0-9]{4}$ ]]; then
+            echo "project_id must match exactly PRJ-xxxx using four decimal digits."
             exit 1
           fi
 
@@ -58,7 +57,6 @@ jobs:
             exit 1
           fi
 
-          echo "::add-mask::$INGRESS_TOKEN"
           echo "Manual recovery gate validated for $PROJECT_ID."
 
       - name: Build strict recovery payload
@@ -68,7 +66,7 @@ jobs:
           node <<'NODE'
           const fs = require("node:fs");
           const projectId = process.env.PROJECT_ID ?? "";
-          if (!/^PRJ-[0-9]{4,}$/.test(projectId)) throw new Error("Invalid project_id");
+          if (!/^PRJ-[0-9]{4}$/.test(projectId)) throw new Error("Invalid project_id");
           fs.writeFileSync(
             process.env.RECOVERY_PAYLOAD_FILE,
             JSON.stringify({ project_ids: [projectId] }),
@@ -76,7 +74,7 @@ jobs:
           );
           NODE
 
-      - name: Run targeted recovery
+      - name: Run targeted recovery and verify INPUTS drained
         shell: bash
         run: |
           set -euo pipefail
@@ -122,10 +120,13 @@ jobs:
               throw new Error(`Recovery response contained invalid ${key}`);
             }
           }
+          if (safe.scanned !== safe.completed + safe.duplicate_cleaned + safe.conflicts + safe.withdrawn + safe.failed) {
+            throw new Error("Recovery summary invariant violated");
+          }
           if (safe.failed !== 0 || safe.conflicts !== 0) {
             throw new Error(`Recovery completed with failed=${safe.failed} conflicts=${safe.conflicts}`);
           }
-          console.log("Sanitized recovery response:", JSON.stringify(safe));
+          console.log("Sanitized recovery summary:", JSON.stringify(safe));
           NODE
 
           curl \
@@ -138,15 +139,18 @@ jobs:
             --request GET \
             --header "Authorization: Bearer $INGRESS_TOKEN" \
             --output "$POSTCHECK_RESPONSE_FILE" \
-            "$PROJECT_OS_URL/v1/admin/schema-status?project_id=$PROJECT_ID"
+            "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=$PROJECT_ID"
 
           node <<'NODE'
           const fs = require("node:fs");
           const body = JSON.parse(fs.readFileSync(process.env.POSTCHECK_RESPONSE_FILE, "utf8"));
           const projectId = process.env.PROJECT_ID;
           if (body?.project_id !== projectId) throw new Error("Post-recovery project_id mismatch");
-          if (!Number.isSafeInteger(body?.storage_version) || body.storage_version < 1) {
-            throw new Error("Post-recovery storage version is invalid");
+          if (!Number.isSafeInteger(body?.remaining) || body.remaining < 0) {
+            throw new Error("Post-recovery remaining INPUT count is invalid");
           }
-          console.log(`Post-recovery read-only verification passed for ${projectId}.`);
+          if (body?.remaining !== 0) {
+            throw new Error(`Post-recovery verification found ${body.remaining} INPUTS remaining`);
+          }
+          console.log(`Post-recovery INPUT verification passed for ${projectId}: remaining=0.`);
           NODE

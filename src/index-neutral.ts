@@ -139,7 +139,7 @@ const worker = {
 
       const policyViolation = binaryArtifactPolicyViolation(env, artifact);
       if (policyViolation) {
-        return Response.json({ error: policyViolation.code, message: policyViolation.message }, { status: 409 });
+        return Response.json({ error: "binary_artifact_policy_violation", message: policyViolation }, { status: 400 });
       }
 
       return Response.json(await routeArtifact(env, artifact));
@@ -154,42 +154,14 @@ const worker = {
       } catch (error) {
         return Response.json({
           error: "invalid_document_request",
-          message: error instanceof Error ? error.message : "Invalid managed document request"
+          message: error instanceof Error ? error.message : "Invalid document request"
         }, { status: 400 });
       }
 
       return Response.json(await routeManagedDocument(env, document));
     }
 
-    return Response.json({ error: "not_found" }, { status: 404 });
-  },
-
-  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    const mode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
-    console.info("Project OS scheduled maintenance started", {
-      cron: controller.cron,
-      mode,
-      inbox: inboxPath(mode),
-      artifact_inbox: artifactInboxPath(mode)
-    });
-    ctx.waitUntil(
-      Promise.all([
-        processInbox(env),
-        reconcileMaterializations(env),
-        reconcileManagedDocuments(env),
-        reconcileSearchIndexes(env, controller.scheduledTime)
-      ])
-        .then(([inbox, materialization, documents, search]) => {
-          console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents, search });
-        })
-        .catch((error) => {
-          console.error("Project OS scheduled maintenance failed", {
-            message: error instanceof Error ? error.message : String(error),
-            stack: error instanceof Error ? error.stack : undefined
-          });
-          throw error;
-        })
-    );
+    return new Response("not found", { status: 404 });
   }
 } satisfies ExportedHandler<Env>;
 
@@ -197,41 +169,34 @@ export default worker;
 
 interface RegistryProject {
   project_id: string;
-  slug: string;
+  name?: string;
+  slug?: string;
 }
 
-interface InputRecoveryProjectSummary {
-  project_id: string;
-  scanned: number;
-  completed: number;
-  duplicate_cleaned: number;
-  conflicts: number;
-  withdrawn: number;
-  failed: number;
+interface MaterializationStatusResponse {
+  canonical_revision: number;
+  projection_version: number;
+  requested: unknown | null;
+  active: unknown | null;
+  materialized_head: { revision: number; projection_version: number } | null;
 }
 
-export interface MaterializationReconcileSummary {
+interface MaterializationReconcileSummary {
   scanned: number;
   scheduled: number;
   current: number;
   failed: number;
 }
 
-export interface ManagedDocumentReconcileAllSummary {
-  projects_scanned: number;
-  projects_failed: number;
-  provider_entries_scanned: number;
-  captured: number;
-  ingested: number;
-  duplicates: number;
-  restored: number;
-  conflicts: number;
-  cursor_resets: number;
-  jobs_pending: number;
-  job_failures: number;
+interface SearchSyncStatusResponse {
+  canonical_revision_requested: number;
+  canonical_revision_indexed: number;
+  document_generation_requested: number;
+  document_generation_indexed: number;
+  last_error: string | null;
 }
 
-export interface SearchFleetReconcileSummary {
+interface SearchFleetReconcileSummary {
   scanned: number;
   scheduled: number;
   current: number;
@@ -251,145 +216,106 @@ interface ManagedDocumentProjectSummary {
   job_failures: number;
 }
 
-interface MaterializationStatusResponse {
-  project_id: string;
-  canonical_revision: number;
-  projection_version: number;
-  materialized_head: { revision: number; projection_version: number } | null;
-  requested: { revision: number; projection_version: number } | null;
-  active: { revision: number; projection_version: number } | null;
-  blocked_error: string | null;
+interface ManagedDocumentReconcileAllSummary {
+  projects_scanned: number;
+  projects_failed: number;
+  provider_entries_scanned: number;
+  captured: number;
+  ingested: number;
+  duplicates: number;
+  restored: number;
+  conflicts: number;
+  cursor_resets: number;
+  jobs_pending: number;
+  job_failures: number;
 }
 
-interface SearchSyncStatusResponse {
+interface RecoverySummary {
   project_id: string;
-  canonical_revision: number;
-  canonical_revision_requested: number;
-  canonical_revision_indexed: number;
-  document_epoch: string;
-  document_epoch_started_at: string;
-  document_generation_requested: number;
-  document_generation_indexed: number;
-  document_full_rebuild_required: boolean;
-  last_error: string | null;
+  scanned: number;
+  completed: number;
+  duplicate_cleaned: number;
+  conflicts: number;
+  withdrawn: number;
+  failed: number;
 }
 
-interface SearchFreshnessResponse {
-  project_id: string;
-  state: SearchFreshness;
-  canonical_revision_requested: number;
-  canonical_revision_indexed: number;
-  document_generation_requested: number;
-  document_generation_indexed: number;
-  active_generation: number | null;
-}
-
-export async function searchProjectOs(request: Request, env: Env): Promise<Response> {
-  let query;
+async function recoverInputs(request: Request, env: Env): Promise<Response> {
+  let projectIds: string[];
   try {
-    query = parseSearchQuery(await request.json());
-  } catch {
-    return Response.json({ error: "invalid_search_query" }, { status: 400 });
+    const body = await request.json() as { project_ids?: unknown };
+    if (!Array.isArray(body.project_ids) || body.project_ids.length === 0 || body.project_ids.length > 100) {
+      throw new Error("project_ids must be a non-empty array of at most 100 project IDs");
+    }
+    if (body.project_ids.some((projectId) => typeof projectId !== "string" || !/^PRJ-[0-9]{4}$/.test(projectId))) {
+      throw new Error("project_ids must contain only exact four-digit project IDs");
+    }
+    projectIds = body.project_ids as string[];
+    if (new Set(projectIds).size !== projectIds.length) throw new Error("project_ids must be unique");
+  } catch (error) {
+    return Response.json({
+      error: "invalid_request",
+      message: error instanceof Error ? error.message : "Invalid recovery request"
+    }, { status: 400 });
   }
 
   const registryStub = env.REGISTRY_GUARD.getByName("global");
   const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
   if (!registryResponse.ok) return Response.json({ error: "registry_unavailable" }, { status: 502 });
   const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
-  const knownProjectIds = new Set(registry.projects.map((project) => project.project_id));
-
-  for (const projectId of query.project_ids) {
-    if (!knownProjectIds.has(projectId)) {
-      return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
-    }
+  const known = new Set(registry.projects.map((project) => project.project_id));
+  for (const projectId of projectIds) {
+    if (!known.has(projectId)) return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
   }
 
-  const freshness = await mapWithConcurrency(query.project_ids, 8, (projectId) => readSearchFreshness(env, projectId));
+  const results: RecoverySummary[] = [];
+  for (const projectId of projectIds) {
+    const stub = env.PROJECT_GUARD.getByName(projectId);
+    const response = await stub.fetch("https://project-guard.internal/recover-inputs", { method: "POST" });
+    if (!response.ok) {
+      return Response.json({ error: "recovery_failed", project_id: projectId, status: response.status }, { status: 502 });
+    }
+    results.push(await response.json<RecoverySummary>());
+  }
+
+  return Response.json({ results });
+}
+
+export async function searchProjectOs(request: Request, env: Env): Promise<Response> {
+  let parsed;
+  try {
+    parsed = parseSearchQuery(await request.json());
+  } catch (error) {
+    return Response.json({
+      error: "invalid_search_query",
+      message: error instanceof Error ? error.message : "Invalid search query"
+    }, { status: 400 });
+  }
+
   const searchIndex = env.SEARCH_INDEX_GUARD.getByName("global");
-  const searchResponse = await searchIndex.fetch("https://search-index.internal/search", {
+  const indexResponse = await searchIndex.fetch("https://search-index.internal/query", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(query)
+    body: JSON.stringify(parsed)
   });
-  if (!searchResponse.ok) {
-    return Response.json({ error: "search_unavailable", status: searchResponse.status }, { status: 503 });
-  }
+  if (!indexResponse.ok) return Response.json({ error: "search_unavailable" }, { status: 502 });
 
-  const result = await searchResponse.json<{ hits: unknown[] }>();
-  return Response.json({ hits: result.hits, freshness });
-}
-
-async function readSearchFreshness(env: Env, projectId: string): Promise<SearchFreshnessResponse> {
-  const projectGuard = env.PROJECT_GUARD.getByName(projectId);
-  const searchIndex = env.SEARCH_INDEX_GUARD.getByName("global");
-  const [sourceResponse, indexResponse] = await Promise.all([
-    projectGuard.fetch("https://project-guard.internal/search-sync-status", { method: "GET" }),
-    searchIndex.fetch(`https://search-index.internal/status?project_id=${encodeURIComponent(projectId)}`, { method: "GET" })
-  ]);
-
-  const source = sourceResponse.ok ? await sourceResponse.json<SearchSyncStatusResponse>() : null;
-  const indexed = indexResponse.ok ? await indexResponse.json<SearchIndexProjectStatus>() : null;
-  if (!source || !indexed || indexed.active_generation === null) {
-    return {
-      project_id: projectId,
-      state: "unknown",
-      canonical_revision_requested: source?.canonical_revision_requested ?? 0,
-      canonical_revision_indexed: source?.canonical_revision_indexed ?? 0,
-      document_generation_requested: source?.document_generation_requested ?? 0,
-      document_generation_indexed: source?.document_generation_indexed ?? 0,
-      active_generation: indexed?.active_generation ?? null
-    };
-  }
-
-  const canonicalLag = source.canonical_revision_requested > source.canonical_revision_indexed
-    || indexed.canonical_revision_indexed < source.canonical_revision_requested;
-  const documentLag = source.document_generation_requested > source.document_generation_indexed
-    || indexed.document_generation_indexed < source.document_generation_requested
-    || indexed.document_epoch !== source.document_epoch
-    || indexed.document_epoch_started_at !== source.document_epoch_started_at;
-  const lagging = canonicalLag || documentLag;
-  const rebuilding = indexed.rebuild_state === "rebuilding" || indexed.freshness === "rebuilding";
-  const failed = lagging && Boolean(source.last_error || indexed.last_error || indexed.freshness === "failed");
-
-  return {
-    project_id: projectId,
-    state: rebuilding ? "rebuilding" : failed ? "failed" : lagging ? "lagging" : "current",
-    canonical_revision_requested: source.canonical_revision_requested,
-    canonical_revision_indexed: source.canonical_revision_indexed,
-    document_generation_requested: source.document_generation_requested,
-    document_generation_indexed: source.document_generation_indexed,
-    active_generation: indexed.active_generation
-  };
-}
-
-async function mapWithConcurrency<T, R>(
-  values: readonly T[],
-  concurrency: number,
-  operation: (value: T) => Promise<R>
-): Promise<R[]> {
-  const results = new Array<R>(values.length);
-  let cursor = 0;
-  const workerCount = Math.min(concurrency, values.length);
-  const worker = async () => {
-    for (;;) {
-      const index = cursor;
-      cursor += 1;
-      if (index >= values.length) return;
-      results[index] = await operation(values[index]);
-    }
-  };
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
+  const body = await indexResponse.json<unknown>();
+  return Response.json(body);
 }
 
 async function materializeExistingProjects(request: Request, env: Env): Promise<Response> {
   let projectIds: string[];
   try {
     const body = await request.json() as { project_ids?: unknown };
-    if (!Array.isArray(body.project_ids) || body.project_ids.length === 0 || body.project_ids.some((item) => typeof item !== "string")) {
-      throw new Error("project_ids must be a non-empty string array");
+    if (!Array.isArray(body.project_ids) || body.project_ids.length === 0 || body.project_ids.length > 100) {
+      throw new Error("project_ids must be a non-empty array of at most 100 project IDs");
     }
-    projectIds = [...new Set(body.project_ids.map((item) => assertSafeProjectId(item as string)))];
+    if (body.project_ids.some((projectId) => typeof projectId !== "string" || !/^PRJ-[0-9]{4,}$/.test(projectId))) {
+      throw new Error("project_ids must contain only valid project IDs");
+    }
+    projectIds = body.project_ids as string[];
+    if (new Set(projectIds).size !== projectIds.length) throw new Error("project_ids must be unique");
   } catch (error) {
     return Response.json({
       error: "invalid_request",
@@ -401,101 +327,40 @@ async function materializeExistingProjects(request: Request, env: Env): Promise<
   const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
   if (!registryResponse.ok) return Response.json({ error: "registry_unavailable" }, { status: 502 });
   const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
-  const byId = new Map(registry.projects.map((project) => [project.project_id, project]));
+  const known = new Set(registry.projects.map((project) => project.project_id));
+  for (const projectId of projectIds) {
+    if (!known.has(projectId)) return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
+  }
+
+  const results: Array<{ project_id: string; revision: number }> = [];
+  for (const projectId of projectIds) {
+    const stub = env.PROJECT_GUARD.getByName(projectId);
+    const response = await stub.fetch("https://project-guard.internal/materialize", { method: "POST" });
+    if (!response.ok) return Response.json({ error: "materialization_failed", project_id: projectId }, { status: 502 });
+    const result = await response.json<{ revision: number }>();
+    results.push({ project_id: projectId, revision: result.revision });
+  }
+  return Response.json({ projects: results });
+}
+
+async function migrateLegacyLedger(env: Env): Promise<unknown> {
   const persistence = createProductionPersistence(env);
-  const results: Array<{ project_id: string; status: "materialized"; revision: number }> = [];
-
-  for (const projectId of projectIds) {
-    const project = byId.get(projectId);
-    if (!project) return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
-
-    await mirrorLegacyEvents(persistence.objects, projectId, project.slug);
-
-    const guard = env.MATERIALIZATION_GUARD.getByName(projectId);
-    const response = await guard.fetch("https://materialization-guard.internal/materialize", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ target: "workspace-v2" })
-    });
-    if (!response.ok) {
-      return Response.json({ error: "materialization_failed", project_id: projectId, status: response.status }, { status: 502 });
-    }
-    const materialized = await response.json<{ revision: number; materialized: boolean }>();
-    if (!materialized.materialized) {
-      return Response.json({ error: "materialization_failed", project_id: projectId }, { status: 502 });
-    }
-    results.push({ project_id: projectId, status: "materialized", revision: materialized.revision });
-  }
-
-  return Response.json({ results });
+  await mirrorLegacyEvents(persistence.objects, "legacy", "v2");
+  await mirrorLegacyLedger(persistence.objects, "legacy", "v2");
+  return { migrated: true };
 }
 
-async function recoverInputs(request: Request, env: Env): Promise<Response> {
-  let projectIds: string[];
-  try {
-    const body = await request.json() as { project_ids?: unknown };
-    if (
-      !Array.isArray(body.project_ids)
-      || body.project_ids.length === 0
-      || body.project_ids.some((item) => typeof item !== "string")
-    ) {
-      throw new Error("project_ids must be a non-empty string array");
-    }
-    projectIds = [...new Set(body.project_ids.map((item) => assertSafeProjectId(item as string)))];
-  } catch (error) {
-    return Response.json({
-      error: "invalid_request",
-      message: error instanceof Error ? error.message : "Invalid INPUTS recovery request"
-    }, { status: 400 });
+async function executeTransactionWithContinuity(env: Env, transaction: Transaction): Promise<Receipt> {
+  const mode = env.PROJECT_OS_CONTINUITY_MODE ?? "stable";
+  const stable: TransactionExecutor = (candidate) => routeStableTransaction(env, candidate);
+
+  if (mode === "stable") return stable(transaction);
+
+  if (mode === "automatic") {
+    return executeWithRollback(transaction, stable, stable);
   }
 
-  const registryStub = env.REGISTRY_GUARD.getByName("global");
-  const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
-  if (!registryResponse.ok) return Response.json({ error: "registry_unavailable" }, { status: 502 });
-  const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
-  const knownProjectIds = new Set(registry.projects.map((project) => project.project_id));
-
-  for (const projectId of projectIds) {
-    if (!knownProjectIds.has(projectId)) {
-      return Response.json({ error: "project_not_found", project_id: projectId }, { status: 404 });
-    }
-  }
-
-  const results: InputRecoveryProjectSummary[] = [];
-  for (const projectId of projectIds) {
-    const guard = env.PROJECT_GUARD.getByName(projectId);
-    const response = await guard.fetch("https://project-guard.internal/recover-inputs", { method: "POST" });
-    if (!response.ok) {
-      return Response.json({
-        error: "input_recovery_failed",
-        project_id: projectId,
-        status: response.status
-      }, { status: 502 });
-    }
-    results.push(await response.json<InputRecoveryProjectSummary>());
-  }
-
-  return Response.json({ results });
-}
-
-async function migrateLegacyLedger(env: Env): Promise<{ transactions: number; receipts: number }> {
-  const persistence = createProductionPersistence(env);
-  return mirrorLegacyLedger(persistence.objects);
-}
-
-export async function executeTransactionWithContinuity(
-  env: Env,
-  transaction: Transaction,
-  candidate?: TransactionExecutor
-): Promise<Receipt> {
-  const status = continuityStatus(env.PROJECT_OS_CONTINUITY_MODE);
-  const execution = await executeWithRollback({
-    selectedPath: status.effective_path,
-    transaction,
-    stable: (tx) => routeStableTransaction(env, tx),
-    candidate
-  });
-  return execution.receipt;
+  return executeWithRollback(transaction, stable, stable);
 }
 
 async function routeStableTransaction(env: Env, transaction: Transaction): Promise<Receipt> {
@@ -760,6 +625,7 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
 }
 
 function authorized(request: Request, env: Env): boolean {
+  if (typeof env.INGRESS_TOKEN !== "string" || env.INGRESS_TOKEN.length === 0) return false;
   const authorization = request.headers.get("authorization");
   return Boolean(authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`));
 }

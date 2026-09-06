@@ -760,6 +760,7 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
 }
 
 function authorized(request: Request, env: Env): boolean {
+  if (typeof env.INGRESS_TOKEN !== "string" || env.INGRESS_TOKEN.length === 0) return false;
   const authorization = request.headers.get("authorization");
   return Boolean(authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`));
 }

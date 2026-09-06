@@ -8,6 +8,10 @@ import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 
+function withIngressToken(token: string | undefined): Env {
+  return { ...testEnv, INGRESS_TOKEN: token } as unknown as Env;
+}
+
 async function createProject(transactionId: string, slug: string): Promise<string> {
   const ctx = createExecutionContext();
   const response = await worker.fetch(new Request("https://example.com/v1/transactions", {
@@ -48,13 +52,59 @@ function recoveryRequest(body: unknown, token = testEnv.INGRESS_TOKEN): Request 
   });
 }
 
+function recoveryStatusRequest(projectId: string, token = testEnv.INGRESS_TOKEN): Request {
+  return new Request(`https://example.com/v1/admin/input-recovery-status?project_id=${encodeURIComponent(projectId)}`, {
+    method: "GET",
+    headers: { authorization: `Bearer ${token}` }
+  });
+}
+
+function assertSummaryInvariant(summary: {
+  scanned: number;
+  completed: number;
+  duplicate_cleaned: number;
+  conflicts: number;
+  withdrawn: number;
+  failed: number;
+}): void {
+  expect(summary.scanned).toBe(
+    summary.completed + summary.duplicate_cleaned + summary.conflicts + summary.withdrawn + summary.failed
+  );
+}
+
 describe("POST /v1/admin/recover-inputs", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("requires ingress authorization", async () => {
+  it("fails closed for missing, empty, or wrong ingress secrets and accepts the configured secret", async () => {
     installDropboxMock();
-    const response = await worker.fetch(recoveryRequest({ project_ids: ["PRJ-0002"] }, "wrong-token"), testEnv, createExecutionContext());
-    expect(response.status).toBe(401);
+
+    const absent = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, "undefined"),
+      withIngressToken(undefined),
+      createExecutionContext()
+    );
+    expect(absent.status).toBe(401);
+
+    const empty = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, ""),
+      withIngressToken(""),
+      createExecutionContext()
+    );
+    expect(empty.status).toBe(401);
+
+    const wrong = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, "wrong-token"),
+      testEnv,
+      createExecutionContext()
+    );
+    expect(wrong.status).toBe(401);
+
+    const correct = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, testEnv.INGRESS_TOKEN),
+      testEnv,
+      createExecutionContext()
+    );
+    expect(correct.status).toBe(400);
   });
 
   it("requires an explicit non-empty project list", async () => {
@@ -113,7 +163,16 @@ describe("POST /v1/admin/recover-inputs", () => {
       createExecutionContext()
     );
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
+    const body = await response.json<{ results: Array<{
+      project_id: string;
+      scanned: number;
+      completed: number;
+      duplicate_cleaned: number;
+      conflicts: number;
+      withdrawn: number;
+      failed: number;
+    }> }>();
+    expect(body).toMatchObject({
       results: [{
         project_id: selectedProject,
         scanned: 1,
@@ -124,6 +183,7 @@ describe("POST /v1/admin/recover-inputs", () => {
         failed: 0
       }]
     });
+    assertSummaryInvariant(body.results[0]);
 
     expect(mock.files.has(selectedInput)).toBe(false);
     expect(mock.files.get(workspaceManagedDocumentPath(
@@ -133,5 +193,78 @@ describe("POST /v1/admin/recover-inputs", () => {
       `UNCLASSIFIED/${selectedRelative}`
     ))).toBe("selected historical source");
     expect(mock.files.get(untouchedInput)).toBe("untouched historical source");
+
+    const status = await worker.fetch(recoveryStatusRequest(selectedProject), testEnv, createExecutionContext());
+    expect(status.status).toBe(200);
+    expect(await status.json()).toEqual({ project_id: selectedProject, remaining: 0 });
+  });
+});
+
+describe("GET /v1/admin/input-recovery-status", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("fails closed for missing, empty, or wrong ingress secrets and accepts the configured secret", async () => {
+    installDropboxMock();
+
+    const absent = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", "undefined"),
+      withIngressToken(undefined),
+      createExecutionContext()
+    );
+    expect(absent.status).toBe(401);
+
+    const empty = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", ""),
+      withIngressToken(""),
+      createExecutionContext()
+    );
+    expect(empty.status).toBe(401);
+
+    const wrong = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", "wrong-token"),
+      testEnv,
+      createExecutionContext()
+    );
+    expect(wrong.status).toBe(401);
+
+    const correct = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", testEnv.INGRESS_TOKEN),
+      testEnv,
+      createExecutionContext()
+    );
+    expect(correct.status).toBe(400);
+  });
+
+  it("requires an exact four-digit project ID", async () => {
+    installDropboxMock();
+    for (const invalid of ["PRJ-000", "PRJ-00000", "PRJ-AUTO", "prj-0002", "PRJ-12A4"]) {
+      const response = await worker.fetch(recoveryStatusRequest(invalid), testEnv, createExecutionContext());
+      expect(response.status, invalid).toBe(400);
+    }
+  });
+
+  it("counts remaining INPUTS without provider mutation", async () => {
+    const mock = installDropboxMock();
+    const projectId = await createProject("TXN-ADMIN-RECOVERY-STATUS-0001", "admin-recovery-status");
+    const relative = "pending.md";
+    const input = workspaceManagedDocumentPath(projectId, "admin-recovery-status", "inputs", relative);
+    const reference = workspaceManagedDocumentPath(projectId, "admin-recovery-status", "references", `UNCLASSIFIED/${relative}`);
+    await mock.writeExternal(input, "pending source");
+    const baseline = mock.calls.length;
+
+    const response = await worker.fetch(recoveryStatusRequest(projectId), testEnv, createExecutionContext());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ project_id: projectId, remaining: 1 });
+    expect(mock.files.get(input)).toBe("pending source");
+    expect(mock.files.has(reference)).toBe(false);
+
+    const mutationCalls = mock.calls.slice(baseline).filter((call) =>
+      call.includes("/2/files/upload")
+      || call.includes("/2/files/delete_v2")
+      || call.includes("/2/files/move_v2")
+      || call.includes("/2/files/copy_v2")
+      || call.includes("/2/files/create_folder_v2")
+    );
+    expect(mutationCalls).toEqual([]);
   });
 });

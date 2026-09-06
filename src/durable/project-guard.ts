@@ -44,6 +44,9 @@ export class ProjectGuard extends NeutralProjectGuard {
     if (request.method === "POST" && url.pathname === "/recover-inputs") {
       return this.handleInputRecovery();
     }
+    if (request.method === "GET" && url.pathname === "/input-recovery-status") {
+      return this.handleInputRecoveryStatus();
+    }
     return super.fetch(request);
   }
 
@@ -97,6 +100,17 @@ export class ProjectGuard extends NeutralProjectGuard {
     return Response.json({
       project_id: boundProjectId,
       ...await this.inputRecovery.recover(state)
+    });
+  }
+
+  private async handleInputRecoveryStatus(): Promise<Response> {
+    const boundProjectId = this.ctx.id.name;
+    if (!boundProjectId) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+    const state = await this.loadBoundState(boundProjectId);
+    if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+    return Response.json({
+      project_id: boundProjectId,
+      ...await this.inputRecovery.status(state)
     });
   }
 

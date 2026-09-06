@@ -17,6 +17,10 @@ export interface InputRecoverySummary {
   failed: number;
 }
 
+export interface InputRecoveryStatus {
+  remaining: number;
+}
+
 interface DiscoveredInput {
   path: string;
   relativePath: string;
@@ -36,8 +40,7 @@ export class InputRecoveryService {
     const summary = emptySummary();
     if (state.status === "archived") return summary;
 
-    const root = workspaceManagedZoneRoot(state.project_id, state.slug, "inputs");
-    const inputs = await this.discover(root, "");
+    const inputs = await this.discoverInputs(state);
     summary.scanned = inputs.length;
 
     for (const input of inputs) {
@@ -63,6 +66,15 @@ export class InputRecoveryService {
     }
 
     return summary;
+  }
+
+  async status(state: ProjectState): Promise<InputRecoveryStatus> {
+    return { remaining: (await this.discoverInputs(state)).length };
+  }
+
+  private async discoverInputs(state: ProjectState): Promise<DiscoveredInput[]> {
+    const root = workspaceManagedZoneRoot(state.project_id, state.slug, "inputs");
+    return this.discover(root, "");
   }
 
   private async discover(path: string, relativePrefix: string): Promise<DiscoveredInput[]> {

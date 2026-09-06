@@ -13,6 +13,7 @@ export { SearchIndexGuard } from "./search/search-index-guard";
 
 const OPERATOR_TOKEN_TTL_MS = 15 * 60_000;
 const OPERATOR_TOKEN_FUTURE_SKEW_MS = 60_000;
+const EXACT_PROJECT_ID = /^PRJ-[0-9]{4}$/;
 
 const worker = {
   ...baseWorker,
@@ -30,11 +31,21 @@ const worker = {
     if (request.method === "GET" && url.pathname === "/v1/admin/schema-status") {
       if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
       const projectId = url.searchParams.get("project_id");
-      if (!projectId || !/^PRJ-[0-9]{4,}$/.test(projectId)) {
+      if (!projectId || !EXACT_PROJECT_ID.test(projectId)) {
         return Response.json({ error: "invalid_project_id" }, { status: 400 });
       }
       const stub = env.PROJECT_GUARD.getByName(projectId);
       return stub.fetch("https://project-guard.internal/schema-status", { method: "GET" });
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/admin/input-recovery-status") {
+      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const projectId = url.searchParams.get("project_id");
+      if (!projectId || !EXACT_PROJECT_ID.test(projectId)) {
+        return Response.json({ error: "invalid_project_id" }, { status: 400 });
+      }
+      const stub = env.PROJECT_GUARD.getByName(projectId);
+      return stub.fetch("https://project-guard.internal/input-recovery-status", { method: "GET" });
     }
 
     if (request.method === "POST" && url.pathname === "/v1/mutation-candidates/resolve") {
@@ -65,6 +76,7 @@ const worker = {
 export default worker;
 
 function authorizedIngress(request: Request, env: Env): boolean {
+  if (typeof env.INGRESS_TOKEN !== "string" || env.INGRESS_TOKEN.length === 0) return false;
   const authorization = request.headers.get("authorization");
   return !!authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`);
 }

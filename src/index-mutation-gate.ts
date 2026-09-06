@@ -5,6 +5,7 @@ import baseWorker from "./index";
 import { searchReadDisabledResponse, searchReadEnabled } from "./search/read-mode";
 
 export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
+export { FallbackIngressGuard } from "./durable/fallback-ingress-guard";
 export { MaterializationGuard } from "./durable/materialization-guard";
 export { DiagnosticProjectGuard as ProjectGuard } from "./durable/project-guard-diagnostics";
 export { RegistryGuard } from "./durable/registry-guard";
@@ -14,6 +15,14 @@ export { SearchIndexGuard } from "./search/search-index-guard";
 const OPERATOR_TOKEN_TTL_MS = 15 * 60_000;
 const OPERATOR_TOKEN_FUTURE_SKEW_MS = 60_000;
 const EXACT_PROJECT_ID = /^PRJ-[0-9]{4}$/;
+const FALLBACK_MAX_ENVELOPE_BYTES = 128 * 1024;
+const encoder = new TextEncoder();
+
+interface DecryptedFallbackEnvelope {
+  key_id: string;
+  client_public_key: JsonWebKey;
+  plaintext: string;
+}
 
 const worker = {
   ...baseWorker,
@@ -26,6 +35,18 @@ const worker = {
 
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({ status: "ok", ...deploymentIdentity(env) });
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/fallback-ingress/key") {
+      return env.FALLBACK_INGRESS_GUARD.getByName("global").fetch(
+        "https://fallback-ingress.internal/key",
+        { method: "GET" }
+      );
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/fallback-ingress") {
+      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      return handleFallbackIngress(request, env, ctx);
     }
 
     if (request.method === "GET" && url.pathname === "/v1/admin/schema-status") {
@@ -75,6 +96,149 @@ const worker = {
 
 export default worker;
 
+async function handleFallbackIngress(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const declaredLength = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > FALLBACK_MAX_ENVELOPE_BYTES) {
+    return Response.json({ error: "fallback_envelope_too_large" }, { status: 413 });
+  }
+
+  let rawEnvelope: string;
+  try {
+    rawEnvelope = await request.text();
+  } catch {
+    return Response.json({ error: "invalid_fallback_envelope" }, { status: 400 });
+  }
+  if (encoder.encode(rawEnvelope).byteLength > FALLBACK_MAX_ENVELOPE_BYTES) {
+    return Response.json({ error: "fallback_envelope_too_large" }, { status: 413 });
+  }
+
+  const fallbackGuard = env.FALLBACK_INGRESS_GUARD.getByName("global");
+  const decryptedResponse = await fallbackGuard.fetch("https://fallback-ingress.internal/decrypt", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: rawEnvelope
+  });
+  if (!decryptedResponse.ok) {
+    await decryptedResponse.text();
+    return Response.json({ error: "invalid_fallback_envelope" }, { status: 400 });
+  }
+
+  const decrypted = await decryptedResponse.json<DecryptedFallbackEnvelope>();
+  let inner: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(decrypted.plaintext) as unknown;
+    if (!isRecord(parsed) || parsed.schema_version !== "1.0") throw new Error("invalid request");
+    if (typeof parsed.request_id !== "string" || parsed.request_id.length === 0 || parsed.request_id.length > 128) {
+      throw new Error("invalid request id");
+    }
+    inner = parsed;
+  } catch {
+    return Response.json({ error: "invalid_fallback_request" }, { status: 400 });
+  }
+
+  const requestId = inner.request_id as string;
+  let plaintextResponse: Record<string, unknown>;
+
+  if (inner.operation === "project_context") {
+    const projectId = inner.project_id;
+    if (typeof projectId !== "string" || !EXACT_PROJECT_ID.test(projectId)) {
+      return Response.json({ error: "invalid_fallback_request" }, { status: 400 });
+    }
+    const statusResponse = await env.PROJECT_GUARD.getByName(projectId).fetch(
+      "https://project-guard.internal/search-sync-status",
+      { method: "GET" }
+    );
+    if (!statusResponse.ok) {
+      await statusResponse.text();
+      return encryptFallbackResponse(fallbackGuard, decrypted, {
+        schema_version: "1.0",
+        request_id: requestId,
+        operation: "project_context",
+        result: { project_id: projectId, status: "unavailable", http_status: statusResponse.status }
+      });
+    }
+    const status = await statusResponse.json<Record<string, unknown>>();
+    if (status.project_id !== projectId || !Number.isSafeInteger(status.canonical_revision)) {
+      return Response.json({ error: "fallback_context_invalid" }, { status: 502 });
+    }
+    plaintextResponse = {
+      schema_version: "1.0",
+      request_id: requestId,
+      operation: "project_context",
+      result: {
+        project_id: projectId,
+        revision: status.canonical_revision
+      }
+    };
+  } else if (inner.operation === "transaction") {
+    if (!isRecord(inner.transaction)) {
+      return Response.json({ error: "invalid_fallback_request" }, { status: 400 });
+    }
+    const authorization = request.headers.get("authorization");
+    if (!authorization) return Response.json({ error: "unauthorized" }, { status: 401 });
+    const transactionResponse = await baseWorker.fetch(
+      new Request("https://project-os.internal/v1/transactions", {
+        method: "POST",
+        headers: {
+          authorization,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(inner.transaction)
+      }),
+      env,
+      ctx
+    );
+    let result: unknown;
+    try {
+      result = await transactionResponse.json<unknown>();
+    } catch {
+      return Response.json({ error: "fallback_transaction_invalid_response" }, { status: 502 });
+    }
+    plaintextResponse = {
+      schema_version: "1.0",
+      request_id: requestId,
+      operation: "transaction",
+      http_status: transactionResponse.status,
+      result
+    };
+  } else {
+    return Response.json({ error: "invalid_fallback_request" }, { status: 400 });
+  }
+
+  return encryptFallbackResponse(fallbackGuard, decrypted, plaintextResponse);
+}
+
+async function encryptFallbackResponse(
+  guard: DurableObjectStub,
+  decrypted: DecryptedFallbackEnvelope,
+  plaintext: Record<string, unknown>
+): Promise<Response> {
+  const encrypted = await guard.fetch("https://fallback-ingress.internal/encrypt", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      key_id: decrypted.key_id,
+      client_public_key: decrypted.client_public_key,
+      plaintext: JSON.stringify(plaintext)
+    })
+  });
+  if (!encrypted.ok) {
+    await encrypted.text();
+    return Response.json({ error: "fallback_response_encryption_failed" }, { status: 502 });
+  }
+  return new Response(encrypted.body, {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store"
+    }
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function authorizedIngress(request: Request, env: Env): boolean {
   if (typeof env.INGRESS_TOKEN !== "string" || env.INGRESS_TOKEN.length === 0) return false;
   const authorization = request.headers.get("authorization");
@@ -106,7 +270,6 @@ function validOperatorToken(token: string, now: number): boolean {
 }
 
 function secureStringEqual(left: string, right: string): boolean {
-  const encoder = new TextEncoder();
   const a = encoder.encode(left);
   const b = encoder.encode(right);
   const length = Math.max(a.length, b.length);

@@ -187,7 +187,7 @@ describe("GET /v1/admin/input-recovery-status", () => {
   it("counts remaining INPUTS without provider mutation", async () => {
     const mock = installDropboxMock();
     const projectId = await createProject("TXN-ADMIN-RECOVERY-STATUS-0001", "admin-recovery-status");
-    const relative = "nested/pending.md";
+    const relative = "pending.md";
     const input = workspaceManagedDocumentPath(projectId, "admin-recovery-status", "inputs", relative);
     const reference = workspaceManagedDocumentPath(projectId, "admin-recovery-status", "references", `UNCLASSIFIED/${relative}`);
     await mock.writeExternal(input, "pending source");

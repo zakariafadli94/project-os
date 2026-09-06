@@ -48,6 +48,26 @@ function recoveryRequest(body: unknown, token = testEnv.INGRESS_TOKEN): Request 
   });
 }
 
+function recoveryStatusRequest(projectId: string, token = testEnv.INGRESS_TOKEN): Request {
+  return new Request(`https://example.com/v1/admin/input-recovery-status?project_id=${encodeURIComponent(projectId)}`, {
+    method: "GET",
+    headers: { authorization: `Bearer ${token}` }
+  });
+}
+
+function assertSummaryInvariant(summary: {
+  scanned: number;
+  completed: number;
+  duplicate_cleaned: number;
+  conflicts: number;
+  withdrawn: number;
+  failed: number;
+}): void {
+  expect(summary.scanned).toBe(
+    summary.completed + summary.duplicate_cleaned + summary.conflicts + summary.withdrawn + summary.failed
+  );
+}
+
 describe("POST /v1/admin/recover-inputs", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -113,7 +133,16 @@ describe("POST /v1/admin/recover-inputs", () => {
       createExecutionContext()
     );
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
+    const body = await response.json<{ results: Array<{
+      project_id: string;
+      scanned: number;
+      completed: number;
+      duplicate_cleaned: number;
+      conflicts: number;
+      withdrawn: number;
+      failed: number;
+    }> }>();
+    expect(body).toMatchObject({
       results: [{
         project_id: selectedProject,
         scanned: 1,
@@ -124,6 +153,7 @@ describe("POST /v1/admin/recover-inputs", () => {
         failed: 0
       }]
     });
+    assertSummaryInvariant(body.results[0]);
 
     expect(mock.files.has(selectedInput)).toBe(false);
     expect(mock.files.get(workspaceManagedDocumentPath(
@@ -133,5 +163,49 @@ describe("POST /v1/admin/recover-inputs", () => {
       `UNCLASSIFIED/${selectedRelative}`
     ))).toBe("selected historical source");
     expect(mock.files.get(untouchedInput)).toBe("untouched historical source");
+
+    const status = await worker.fetch(recoveryStatusRequest(selectedProject), testEnv, createExecutionContext());
+    expect(status.status).toBe(200);
+    expect(await status.json()).toEqual({ project_id: selectedProject, remaining: 0 });
+  });
+});
+
+describe("GET /v1/admin/input-recovery-status", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("requires authorization and an exact four-digit project ID", async () => {
+    installDropboxMock();
+    const unauthorized = await worker.fetch(recoveryStatusRequest("PRJ-0002", "wrong-token"), testEnv, createExecutionContext());
+    expect(unauthorized.status).toBe(401);
+
+    for (const invalid of ["PRJ-000", "PRJ-00000", "PRJ-AUTO", "prj-0002", "PRJ-12A4"]) {
+      const response = await worker.fetch(recoveryStatusRequest(invalid), testEnv, createExecutionContext());
+      expect(response.status, invalid).toBe(400);
+    }
+  });
+
+  it("counts remaining INPUTS without provider mutation", async () => {
+    const mock = installDropboxMock();
+    const projectId = await createProject("TXN-ADMIN-RECOVERY-STATUS-0001", "admin-recovery-status");
+    const relative = "nested/pending.md";
+    const input = workspaceManagedDocumentPath(projectId, "admin-recovery-status", "inputs", relative);
+    const reference = workspaceManagedDocumentPath(projectId, "admin-recovery-status", "references", `UNCLASSIFIED/${relative}`);
+    await mock.writeExternal(input, "pending source");
+    const baseline = mock.calls.length;
+
+    const response = await worker.fetch(recoveryStatusRequest(projectId), testEnv, createExecutionContext());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ project_id: projectId, remaining: 1 });
+    expect(mock.files.get(input)).toBe("pending source");
+    expect(mock.files.has(reference)).toBe(false);
+
+    const mutationCalls = mock.calls.slice(baseline).filter((call) =>
+      call.includes("/2/files/upload")
+      || call.includes("/2/files/delete_v2")
+      || call.includes("/2/files/move_v2")
+      || call.includes("/2/files/copy_v2")
+      || call.includes("/2/files/create_folder_v2")
+    );
+    expect(mutationCalls).toEqual([]);
   });
 });

@@ -1,0 +1,146 @@
+name: Recover Project OS INPUTS
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: Exact Project OS project ID to recover (PRJ-xxxx)
+        required: true
+        type: string
+      confirm_recovery:
+        description: Type RECOVER to confirm the targeted recovery
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project-os-input-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      PROJECT_OS_URL: https://project-os-guard.zakaria-fadli-94.workers.dev
+      PROJECT_ID: ${{ inputs.project_id }}
+      CONFIRM_RECOVERY: ${{ inputs.confirm_recovery }}
+      INGRESS_TOKEN: ${{ secrets.INGRESS_TOKEN }}
+      RECOVERY_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-response.json
+      RECOVERY_PAYLOAD_FILE: ${{ runner.temp }}/recover-inputs-payload.json
+      POSTCHECK_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-postcheck.json
+
+    steps:
+      - name: Validate manual recovery gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "INPUT recovery must be dispatched from refs/heads/main."
+            exit 1
+          fi
+
+          if [ "$CONFIRM_RECOVERY" != "RECOVER" ]; then
+            echo "INPUT recovery requires confirm_recovery=RECOVER."
+            exit 1
+          fi
+
+          if ! [[ "$PROJECT_ID" =~ ^PRJ-[0-9]{4,}$ ]]; then
+            echo "project_id must match PRJ-xxxx using decimal digits."
+            exit 1
+          fi
+
+          if [ -z "$INGRESS_TOKEN" ]; then
+            echo "Required ingress credential is not configured in GitHub Actions."
+            exit 1
+          fi
+
+          echo "::add-mask::$INGRESS_TOKEN"
+          echo "Manual recovery gate validated for $PROJECT_ID."
+
+      - name: Build strict recovery payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const projectId = process.env.PROJECT_ID ?? "";
+          if (!/^PRJ-[0-9]{4,}$/.test(projectId)) throw new Error("Invalid project_id");
+          fs.writeFileSync(
+            process.env.RECOVERY_PAYLOAD_FILE,
+            JSON.stringify({ project_ids: [projectId] }),
+            { mode: 0o600 }
+          );
+          NODE
+
+      - name: Run targeted recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RECOVERY_PAYLOAD_FILE" "$RECOVERY_RESPONSE_FILE" "$POSTCHECK_RESPONSE_FILE"' EXIT
+
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --connect-timeout 5 \
+            --max-time 30 \
+            --retry 0 \
+            --request POST \
+            --header "Authorization: Bearer $INGRESS_TOKEN" \
+            --header 'Content-Type: application/json' \
+            --data-binary "@$RECOVERY_PAYLOAD_FILE" \
+            --output "$RECOVERY_RESPONSE_FILE" \
+            "$PROJECT_OS_URL/v1/admin/recover-inputs"
+
+          node <<'NODE'
+          const fs = require("node:fs");
+          const body = JSON.parse(fs.readFileSync(process.env.RECOVERY_RESPONSE_FILE, "utf8"));
+          const projectId = process.env.PROJECT_ID;
+          if (!Array.isArray(body?.results) || body.results.length !== 1) {
+            throw new Error("Recovery response did not contain exactly one result");
+          }
+          const result = body.results[0];
+          if (result?.project_id !== projectId) {
+            throw new Error("Recovery response project_id mismatch");
+          }
+          const keys = ["scanned", "completed", "duplicate_cleaned", "conflicts", "withdrawn", "failed"];
+          const sanitized = { project_id: projectId };
+          for (const key of keys) {
+            const value = result?.[key];
+            if (!Number.isSafeInteger(value) || value < 0) {
+              throw new Error(`Recovery response contained invalid ${key}`);
+            }
+            sanitized[key] = value;
+          }
+          if (sanitized.failed !== 0 || sanitized.conflicts !== 0) {
+            throw new Error(`Recovery completed with failed=${sanitized.failed} conflicts=${sanitized.conflicts}`);
+          }
+          console.log("Sanitized recovery response:", JSON.stringify(sanitized));
+          NODE
+
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --connect-timeout 5 \
+            --max-time 15 \
+            --retry 0 \
+            --request GET \
+            --header "Authorization: Bearer $INGRESS_TOKEN" \
+            --output "$POSTCHECK_RESPONSE_FILE" \
+            "$PROJECT_OS_URL/v1/admin/schema-status?project_id=$PROJECT_ID"
+
+          node <<'NODE'
+          const fs = require("node:fs");
+          const body = JSON.parse(fs.readFileSync(process.env.POSTCHECK_RESPONSE_FILE, "utf8"));
+          const projectId = process.env.PROJECT_ID;
+          if (body?.project_id !== projectId) throw new Error("Post-recovery project_id mismatch");
+          if (!Number.isSafeInteger(body?.storage_version) || body.storage_version < 1) {
+            throw new Error("Post-recovery storage version is invalid");
+          }
+          console.log(`Post-recovery read-only verification passed for ${projectId}.`);
+          NODE

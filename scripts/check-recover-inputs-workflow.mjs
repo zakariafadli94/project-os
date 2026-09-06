@@ -36,20 +36,20 @@ function assertProjectIdCases() {
   for (const value of valid) assert.equal(nodePattern.test(value), true, `Node should accept ${value}`);
   for (const value of invalid) assert.equal(nodePattern.test(value), false, `Node should reject ${value}`);
 
-  const bashProgram = String.raw`
-set -euo pipefail
-valid=(PRJ-0000 PRJ-0002 PRJ-9999)
-invalid=(PRJ-000 PRJ-00000 PRJ-12A4 prj-0002 PRJ_0002 ' PRJ-0002' 'PRJ-0002 ' PRJ-AUTO)
-for value in "${valid[@]}"; do
-  [[ "$value" =~ ^PRJ-[0-9]{4}$ ]] || { echo "Bash rejected valid project id" >&2; exit 1; }
-done
-for value in "${invalid[@]}"; do
-  if [[ "$value" =~ ^PRJ-[0-9]{4}$ ]]; then
-    echo "Bash accepted invalid project id" >&2
-    exit 1
-  fi
-done
-`;
+  const bashProgram = [
+    "set -euo pipefail",
+    "valid=(PRJ-0000 PRJ-0002 PRJ-9999)",
+    "invalid=(PRJ-000 PRJ-00000 PRJ-12A4 prj-0002 PRJ_0002 ' PRJ-0002' 'PRJ-0002 ' PRJ-AUTO)",
+    "for value in \"${valid[@]}\"; do",
+    "  [[ \"$value\" =~ ^PRJ-[0-9]{4}$ ]] || { echo \"Bash rejected valid project id\" >&2; exit 1; }",
+    "done",
+    "for value in \"${invalid[@]}\"; do",
+    "  if [[ \"$value\" =~ ^PRJ-[0-9]{4}$ ]]; then",
+    "    echo \"Bash accepted invalid project id\" >&2",
+    "    exit 1",
+    "  fi",
+    "done",
+  ].join("\n");
   const bash = spawnSync("bash", ["-c", bashProgram], { encoding: "utf8" });
   assert.equal(bash.status, 0, bash.stderr || bash.stdout || "Bash project ID cases failed");
 }

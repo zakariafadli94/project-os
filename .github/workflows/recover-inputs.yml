@@ -107,19 +107,25 @@ jobs:
           if (result?.project_id !== projectId) {
             throw new Error("Recovery response project_id mismatch");
           }
-          const keys = ["scanned", "completed", "duplicate_cleaned", "conflicts", "withdrawn", "failed"];
-          const sanitized = { project_id: projectId };
-          for (const key of keys) {
-            const value = result?.[key];
+          const safe = {
+            project_id: result.project_id,
+            scanned: result.scanned,
+            completed: result.completed,
+            duplicate_cleaned: result.duplicate_cleaned,
+            conflicts: result.conflicts,
+            withdrawn: result.withdrawn,
+            failed: result.failed,
+          };
+          for (const [key, value] of Object.entries(safe)) {
+            if (key === "project_id") continue;
             if (!Number.isSafeInteger(value) || value < 0) {
               throw new Error(`Recovery response contained invalid ${key}`);
             }
-            sanitized[key] = value;
           }
-          if (sanitized.failed !== 0 || sanitized.conflicts !== 0) {
-            throw new Error(`Recovery completed with failed=${sanitized.failed} conflicts=${sanitized.conflicts}`);
+          if (safe.failed !== 0 || safe.conflicts !== 0) {
+            throw new Error(`Recovery completed with failed=${safe.failed} conflicts=${safe.conflicts}`);
           }
-          console.log("Sanitized recovery response:", JSON.stringify(sanitized));
+          console.log("Sanitized recovery response:", JSON.stringify(safe));
           NODE
 
           curl \

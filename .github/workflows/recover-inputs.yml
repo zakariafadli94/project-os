@@ -27,9 +27,6 @@ jobs:
       PROJECT_ID: ${{ inputs.project_id }}
       CONFIRM_RECOVERY: ${{ inputs.confirm_recovery }}
       INGRESS_TOKEN: ${{ secrets.INGRESS_TOKEN }}
-      RECOVERY_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-response.json
-      RECOVERY_PAYLOAD_FILE: ${{ runner.temp }}/recover-inputs-payload.json
-      POSTCHECK_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-postcheck.json
 
     steps:
       - name: Validate manual recovery gate
@@ -60,6 +57,8 @@ jobs:
           echo "Manual recovery gate validated for $PROJECT_ID."
 
       - name: Build strict recovery payload
+        env:
+          RECOVERY_PAYLOAD_FILE: ${{ runner.temp }}/recover-inputs-payload.json
         shell: bash
         run: |
           set -euo pipefail
@@ -75,6 +74,10 @@ jobs:
           NODE
 
       - name: Run targeted recovery and verify INPUTS drained
+        env:
+          RECOVERY_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-response.json
+          RECOVERY_PAYLOAD_FILE: ${{ runner.temp }}/recover-inputs-payload.json
+          POSTCHECK_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-postcheck.json
         shell: bash
         run: |
           set -euo pipefail

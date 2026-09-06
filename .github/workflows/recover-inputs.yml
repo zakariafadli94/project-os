@@ -27,9 +27,6 @@ jobs:
       PROJECT_ID: ${{ inputs.project_id }}
       CONFIRM_RECOVERY: ${{ inputs.confirm_recovery }}
       INGRESS_TOKEN: ${{ secrets.INGRESS_TOKEN }}
-      
-      
-      
 
     steps:
       - name: Validate manual recovery gate

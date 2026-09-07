@@ -1,3 +1,4 @@
+import { isReviewCandidate } from "../domain/artifact-write";
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
 import { binaryArtifactPolicyViolation } from "../artifacts/policy";
 import type { Env } from "../env";
@@ -13,8 +14,8 @@ import {
   type InboxProcessSummary
 } from "./processor";
 
-export const ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION = 2;
-export const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 1;
+export const ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION = 16;
+export const ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION = 4;
 
 export interface DurableInboxProcessSummary extends InboxProcessSummary {
   mode: LayoutMode;
@@ -37,7 +38,8 @@ export async function processDurableInbox(env: Env): Promise<DurableInboxProcess
     {
       maxScanEntries: ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION,
       maxWorkItems: ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION,
-      respectRetryBackoff: true
+      respectRetryBackoff: true,
+      rotateScan: true
     }
   );
   const referralSummary = await processReferralInbox(env);
@@ -54,7 +56,7 @@ export async function processDurableInbox(env: Env): Promise<DurableInboxProcess
 
 async function routeArtifact(env: Env, artifact: ArtifactWriteRequest): Promise<ArtifactWriteReceipt> {
   const policyViolation = binaryArtifactPolicyViolation(env, artifact);
-  if (policyViolation) {
+  if (policyViolation && !isReviewCandidate(artifact)) {
     return {
       request_id: artifact.request_id,
       project_id: artifact.project_id,

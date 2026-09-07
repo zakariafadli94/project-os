@@ -32,3 +32,20 @@ describe("admin inbox processing", () => {
     });
   });
 });
+
+it("runs the project transaction before a bounded batch of four artifacts", async () => {
+  const mock = installDropboxMock();
+  const { sha256Text } = await import("../src/documents/hash");
+  mock.files.set("/PROJECT_OS/.project-os/transactions/incoming/TXN-BATCH-CREATE-0001.json", JSON.stringify({
+    schema_version:"1.0", transaction_id:"TXN-BATCH-CREATE-0001", project_id:"PRJ-AUTO", base_revision:0,
+    operation:"project.create", created_at:"2026-09-07T10:00:00Z", payload:{name:"Batch",slug:"batch",aliases:[],objective:"Test"}
+  }));
+  for (let i = 1; i <= 5; i++) {
+    const request_id = `ART-BATCH-REVIEW-000${i}`;
+    mock.files.set(`/PROJECT_OS/.project-os/artifacts/incoming/${request_id}.json`, JSON.stringify({request_id,project_id:"PRJ-0001",relative_path:`file-${i}.md`,content:"batch",content_sha256:await sha256Text("batch"),mode:"create"}));
+  }
+  const response = await worker.fetch(new Request("https://example.com/v1/admin/process-inbox", {method:"POST",headers:{authorization:`Bearer ${testEnv.INGRESS_TOKEN}`}}),testEnv,createExecutionContext());
+  expect(await response.json()).toMatchObject({processed:5,failed:0});
+  for(let i=1;i<=4;i++) expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0001-batch/ARTIFACTS/file-${i}.md`)).toBe("batch");
+  expect(mock.files.has("/PROJECT_OS/.project-os/artifacts/incoming/ART-BATCH-REVIEW-0005.json")).toBe(true);
+});

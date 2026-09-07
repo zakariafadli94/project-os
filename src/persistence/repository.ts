@@ -1,3 +1,5 @@
+import { ReviewCandidateJournal } from "../artifacts/review-journal";
+import { isReviewCandidate } from "../domain/artifact-write";
 export * from "./repository-core";
 
 import {
@@ -8,6 +10,8 @@ import {
 } from "../artifacts/staged-publication";
 import {
   isStagedArtifactWriteRequest,
+  type ReviewCandidateRequest,
+  type ArtifactWriteReceipt,
   type ArtifactWriteRequest
 } from "../domain/artifact-write";
 import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../domain/commit-record";
@@ -54,6 +58,7 @@ export class ProjectRepository extends CoreProjectRepository {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;
+  readonly reviewJournal: ReviewCandidateJournal;
   private readonly stagedArtifactPublisher: StagedArtifactPublisher;
   private readonly requestedSchemaWriterStage?: SchemaWriterStage;
 
@@ -71,6 +76,7 @@ export class ProjectRepository extends CoreProjectRepository {
     const mutationRepository = new MutationGateRepository(runtime, writerStage);
     this.artifactMutationIntents = new ArtifactMutationIntentService(mutationRepository, runtime);
     this.mutationGate = new MutationGateService(runtime, mutationGateMode, writerStage);
+    this.reviewJournal = new ReviewCandidateJournal(runtime);
     this.stagedArtifactPublisher = new StagedArtifactPublisher(runtime);
   }
 
@@ -217,7 +223,8 @@ export class ProjectRepository extends CoreProjectRepository {
     state: ProjectState,
     request: ArtifactWriteRequest,
     preparedDestination?: ResolvedArtifactDestination,
-    resolutionContext?: CandidateResolutionContext
+    resolutionContext?: CandidateResolutionContext,
+    beforeReviewCopy?: () => void
   ): Promise<"written" | "idempotent"> {
     if (state.status === "archived") throw new Error("Archived projects do not accept artifact writes");
     if (this.repositoryMode === "legacy") {
@@ -237,11 +244,17 @@ export class ProjectRepository extends CoreProjectRepository {
     if (isStagedArtifactWriteRequest(request)) {
       const status = await this.mutationGate.artifactStatus(request.project_id, request.request_id);
       if (status?.verification_state === "canonical_verified") return "idempotent";
-      return this.stagedArtifactPublisher.publish(request, prepared.destination);
+      return this.stagedArtifactPublisher.publish(request, prepared.destination, isReviewCandidate(request)
+        ? metadata => this.reviewJournal.recordObservation(request, metadata)
+        : undefined, beforeReviewCopy);
     }
     const managed = await new LegacyArtifactDocumentWriter(this.runtime).writeIfManaged(replayState, request);
     if (managed !== null) return managed;
     return super.writeArtifact(replayState, request);
+  }
+
+  async reviewCandidateObservation(state: ProjectState, request: ReviewCandidateRequest): Promise<NonNullable<ArtifactWriteReceipt["final_observation"]>> {
+    return this.reviewJournal.observation(request);
   }
 
   private writerStage(): SchemaWriterStage {
@@ -278,7 +291,7 @@ function stateForPreparedDestination(
         }
       : {}
   };
-  const reconstructed = resolveArtifactDestination(replayState, request.relative_path);
+  const reconstructed = resolveArtifactDestination(replayState, request.relative_path, request);
   if (!sameDestination(reconstructed, destination)) {
     throw new Error(`Durable artifact destination cannot be reconstructed safely: ${request.request_id}`);
   }

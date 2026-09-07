@@ -296,3 +296,81 @@ describe("staged artifact publication", () => {
     })).toBe(false);
   });
 });
+
+describe("review binary verification", () => {
+  async function reviewFixture(bytes = new TextEncoder().encode("%PDF-1.7\nexample\n%%EOF")) {
+    const digest = async (value: Uint8Array) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(value)))].map(x => x.toString(16).padStart(2, "0")).join("");
+    const blockHash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    const hash = await digest(bytes);
+    const integrity = { algorithm: "dropbox-content-hash", value: await digest(blockHash) };
+    const f = fixture({ ...sourceMetadata, size: bytes.length, integrityHash: integrity });
+    const candidate = {
+      ...request, operation: "REVIEW_CANDIDATE" as const, base_revision: 149,
+      media_type: "application/pdf" as const, content_sha256: hash,
+      source: { ...request.source, provider_id: "dropbox", size: bytes.length, integrity }
+    };
+    Object.assign(f.runtime.objects, { readBytes: async () => bytes });
+    return { ...f, candidate, bytes };
+  }
+  it("reads bounded bytes before copying a review candidate", async () => {
+    const f = await reviewFixture();
+    let read = false;
+    Object.assign(f.runtime.objects, { readBytes: async (_path: string, maxBytes: number) => { read = true; expect(maxBytes).toBe(f.bytes.length); return f.bytes; } });
+    await new StagedArtifactPublisher(f.runtime).publish(f.candidate, { path: destinationPath });
+    expect(read).toBe(true);
+  });
+  it.each(["sha", "type", "provider", "size", "integrity", "capability"])("rejects review %s mismatch before copy", async kind => {
+    const f = await reviewFixture();
+    if (kind === "sha") f.candidate.content_sha256 = "c".repeat(64);
+    if (kind === "type") Object.assign(f.candidate, { media_type: "image/png" });
+    if (kind === "provider") f.candidate.source.provider_id = "other";
+    if (kind === "size") Object.assign(f.runtime.objects, { readBytes: async () => new Uint8Array(1000) });
+    if (kind === "integrity") {
+      f.candidate.source.integrity.value = "d".repeat(64);
+      f.metadata.set(sourcePath, { ...f.metadata.get(sourcePath)!, integrityHash: f.candidate.source.integrity });
+    }
+    if (kind === "capability") delete (f.runtime.objects as unknown as { readBytes?: unknown }).readBytes;
+    await expect(new StagedArtifactPublisher(f.runtime).publish(f.candidate, { path: destinationPath })).rejects.toThrow();
+    expect(f.metadata.has(destinationPath)).toBe(false);
+  });
+});
+
+it("keeps transient binary verification failures retryable", async () => {
+  const { ProviderOperationError } = await import("../src/persistence/provider/errors");
+  const f = fixture();
+  const error = new ProviderOperationError("temporary", true);
+  Object.assign(f.runtime.objects, {readBytes: async () => {throw error;}});
+  await expect(new StagedArtifactPublisher(f.runtime).publish({...request, operation:"REVIEW_CANDIDATE",base_revision:149,media_type:"application/pdf",source:{...request.source,provider_id:"dropbox"}}, {path:destinationPath})).rejects.toBe(error);
+});
+it("freezes the verified provider observation and rejects a later same-byte identity replacement", async () => {
+  const { ReviewCandidateJournal } = await import("../src/artifacts/review-journal");
+  const f = fixture();
+  const candidate = {...request,mode:"create" as const,operation:"REVIEW_CANDIDATE" as const,base_revision:149,media_type:"application/pdf" as const,source:{...request.source,provider_id:"dropbox"}};
+  const first = {...sourceMetadata,path:destinationPath,objectId:"id:first",revisionToken:"rev-first"};
+  f.metadata.set(destinationPath,first);
+  const journal = new ReviewCandidateJournal(f.runtime);
+  await journal.recordObservation(candidate,first);
+  f.metadata.set(destinationPath,{...first,objectId:"id:external",revisionToken:"rev-external"});
+  await expect(journal.observation(candidate)).rejects.toThrow(/changed/);
+});
+it("rechecks authorization immediately before copy after the byte read", async () => {
+  const f = fixture();
+  await expect(new StagedArtifactPublisher(f.runtime).publish(request,{path:destinationPath},undefined,()=>{throw new Error("expired capability");})).rejects.toThrow(/expired/);
+  expect(f.metadata.has(destinationPath)).toBe(false);
+});
+it("retains a verified copy when journaling succeeds but its response is lost", async () => {
+  const f = fixture();
+  const observations: ProviderObjectMetadata[] = [];
+  let copies = 0;
+  const copy = f.runtime.serverSideCopy.copyObject;
+  f.runtime.serverSideCopy.copyObject = async (from,to) => { copies++; return copy(from,to); };
+  await expect(new StagedArtifactPublisher(f.runtime).publish(request,{path:destinationPath},async metadata => {
+    observations.push(metadata);
+    throw new Error("journal response lost");
+  })).rejects.toThrow(/response lost/);
+  expect(f.metadata.get(destinationPath)).toEqual(observations[0]);
+  await expect(new StagedArtifactPublisher(f.runtime).publish(request,{path:destinationPath},async metadata => {
+    expect(metadata).toEqual(observations[0]);
+  })).resolves.toBe("idempotent");
+  expect(copies).toBe(1);
+});

@@ -1,3 +1,5 @@
+import { isReviewCandidate } from "./domain/artifact-write";
+import { ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION, ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION } from "./inbox/runtime";
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "./domain/artifact-write";
 import { parseArtifactWriteRequest } from "./domain/artifact-write";
 import { binaryArtifactPolicyViolation } from "./artifacts/policy";
@@ -139,7 +141,7 @@ const worker = {
       }
 
       const policyViolation = binaryArtifactPolicyViolation(env, artifact);
-      if (policyViolation) {
+      if (policyViolation && !isReviewCandidate(artifact)) {
         return Response.json({ error: policyViolation.code, message: policyViolation.message }, { status: 409 });
       }
 
@@ -534,6 +536,8 @@ async function routeStableTransaction(env: Env, transaction: Transaction): Promi
 }
 
 async function routeArtifact(env: Env, artifact: ArtifactWriteRequest): Promise<ArtifactWriteReceipt> {
+  const violation = binaryArtifactPolicyViolation(env, artifact);
+  if (violation && !isReviewCandidate(artifact)) return {request_id:artifact.request_id,project_id:artifact.project_id,relative_path:artifact.relative_path,content_sha256:artifact.content_sha256,status:"rejected",code:violation.code,message:violation.message};
   const stub = env.PROJECT_GUARD.getByName(artifact.project_id);
   const response = await stub.fetch("https://project-guard.internal/artifact", {
     method: "POST",
@@ -566,7 +570,8 @@ async function processInbox(env: Env): Promise<InboxProcessSummary> {
   const artifactSummary = await processArtifactInbox(
     persistence.objects,
     mode,
-    (artifact) => routeArtifact(env, artifact)
+    (artifact) => routeArtifact(env, artifact),
+    { maxScanEntries: ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION, maxWorkItems: ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION, respectRetryBackoff: true, rotateScan: true }
   );
   return {
     scanned: transactionSummary.scanned + artifactSummary.scanned,

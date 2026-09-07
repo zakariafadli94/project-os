@@ -1,8 +1,11 @@
-import { isStagedArtifactWriteRequest, type ArtifactWriteRequest } from "../domain/artifact-write";
+import { reviewCandidatePolicyViolation } from "./review-policy";
+import { isReviewCandidate, isStagedArtifactWriteRequest, type ArtifactWriteRequest } from "../domain/artifact-write";
 
 export interface BinaryArtifactPolicyEnv {
   PROJECT_OS_BINARY_ARTIFACT_INGRESS_MODE?: string;
   PROJECT_OS_BINARY_ARTIFACT_MAX_BYTES?: string;
+  PROJECT_OS_REVIEW_CANDIDATE_INGRESS_MODE?: string;
+  PROJECT_OS_REVIEW_CANDIDATE_CAPABILITY?: string;
 }
 export interface BinaryArtifactPolicy {
   enabled: boolean;
@@ -10,7 +13,7 @@ export interface BinaryArtifactPolicy {
 }
 
 export interface BinaryArtifactPolicyViolation {
-  code: "BINARY_ARTIFACT_INGRESS_DISABLED" | "BINARY_ARTIFACT_TOO_LARGE";
+  code: "BINARY_ARTIFACT_INGRESS_DISABLED" | "BINARY_ARTIFACT_TOO_LARGE" | "REVIEW_CANDIDATE_DISABLED" | "REVIEW_CAPABILITY_DENIED";
   message: string;
 }
 
@@ -33,6 +36,7 @@ export function binaryArtifactPolicyViolation(
   env: BinaryArtifactPolicyEnv,
   request: ArtifactWriteRequest
 ): BinaryArtifactPolicyViolation | null {
+  if (isReviewCandidate(request)) return reviewCandidatePolicyViolation(env, request);
   if (!isStagedArtifactWriteRequest(request)) return null;
   const policy = parseBinaryArtifactPolicy(env);
   if (!policy.enabled) {

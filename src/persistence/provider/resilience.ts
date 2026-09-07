@@ -57,6 +57,7 @@ export function withProviderResilience(
   };
 
   const objects: ObjectPersistence = {
+    ...(runtime.objects.readBytes ? { readBytes: (path: string, maxBytes: number) => retry("read-bytes", path, () => runtime.objects.readBytes!(path, maxBytes)) } : {}),
     readText: (path) => retry("read", path, () => runtime.objects.readText(path)),
     createText: (path, content) => retry("create", path, () => runtime.objects.createText(path, content)),
     upsertText: (path, content) => retry("upsert", path, () => runtime.objects.upsertText(path, content)),

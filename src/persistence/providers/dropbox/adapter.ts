@@ -4,7 +4,7 @@ import type {
   ProviderEntry,
   ProviderObjectMetadata
 } from "../../provider/contract";
-import { ProviderCapabilityError, ProviderConflictError } from "../../provider/errors";
+import { ProviderBinaryReadLimitError, ProviderCapabilityError, ProviderConflictError } from "../../provider/errors";
 import type {
   DropboxChangeEntry,
   DropboxEntry,
@@ -44,6 +44,10 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
       integrityHash: { semantics: "identified-algorithm" }
     }
   };
+
+  if (raw.downloadBytes) {
+    runtime.objects.readBytes = (path, maxBytes) => call("read", path, () => raw.downloadBytes!(path, maxBytes));
+  }
 
   if (raw.deleteIfRevision) {
     runtime.objects.deleteIfUnchanged = async (path, expected) => {
@@ -117,6 +121,7 @@ async function call<T>(operation: DropboxOperation, target: string, fn: () => Pr
   try {
     return await fn();
   } catch (error) {
+    if (error instanceof ProviderBinaryReadLimitError) throw error;
     const mapped = mapDropboxError(error, operation);
     if (mapped === error && error instanceof Error) {
       throw new Error(`Dropbox ${operation} failed for ${target}: ${error.message}`);

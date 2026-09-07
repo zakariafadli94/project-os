@@ -1,3 +1,4 @@
+import { isReviewCandidate, type ArtifactWriteRequest } from "../domain/artifact-write";
 import type { ArtifactRouteRecord, ProjectState } from "../domain/project-state";
 import { workspaceArtifactPath, workspaceProjectRoot } from "./layout";
 
@@ -16,7 +17,13 @@ export interface ResolvedArtifactDestination {
   archive_path?: string;
 }
 
-export function resolveArtifactDestination(state: ProjectState, relativePath: string): ResolvedArtifactDestination {
+export function resolveArtifactDestination(state: ProjectState, relativePath: string, request?: ArtifactWriteRequest): ResolvedArtifactDestination {
+  if (request && isReviewCandidate(request)) {
+    if (request.project_id !== state.project_id) throw new ArtifactGovernanceConflictError("Review project binding mismatch");
+    const file = safeRelative(relativePath, "review filename");
+    if (file.includes("/") || request.mode !== "create") throw new ArtifactGovernanceConflictError("Review candidates are create-only files");
+    return { path: `${workspaceProjectRoot(state.project_id, state.slug)}/REVIEW/CANDIDATES/${request.request_id}/${file}` };
+  }
   const relative = safeRelative(relativePath, "artifact relative path");
   const routes = Object.values(state.artifact_routes ?? {}).sort((a, b) => b.source_prefix.length - a.source_prefix.length);
 

@@ -23,6 +23,7 @@ export interface ArtifactInboxProcessOptions {
   maxScanEntries?: number;
   maxWorkItems?: number;
   respectRetryBackoff?: boolean;
+  rotateScan?: boolean;
 }
 
 export const MAX_RETRYABLE_INBOX_ATTEMPTS = 8;
@@ -204,7 +205,12 @@ export async function processArtifactInbox(
   const artifactEntries = entries
     .filter((item) => item.kind === "file" && item.name.endsWith(".json"))
     .sort((a, b) => a.name.localeCompare(b.name));
-  const scanEntries = boundedArtifactEntries(artifactEntries, options.maxScanEntries ?? options.maxEntries);
+  const cursorPath = `${artifactInboxPath(mode).replace(/incoming$/, "scan-cursor.json")}`;
+  const cursor = options.rotateScan ? await objects.readText(cursorPath) : null;
+  const after = cursor ? artifactEntries.findIndex(entry => entry.name > cursor) : -1;
+  const ordered = after > 0 ? [...artifactEntries.slice(after), ...artifactEntries.slice(0, after)] : artifactEntries;
+  const scanEntries = boundedArtifactEntries(ordered, options.maxScanEntries ?? options.maxEntries);
+  let lastScanned: string | undefined;
   const maxWorkItems = options.maxWorkItems ?? options.maxEntries;
   if (maxWorkItems !== undefined && (!Number.isSafeInteger(maxWorkItems) || maxWorkItems < 1)) {
     throw new Error("Artifact inbox maxWorkItems must be a positive safe integer");
@@ -217,6 +223,8 @@ export async function processArtifactInbox(
   };
 
   for (const entry of scanEntries) {
+    if (maxWorkItems !== undefined && workItems >= maxWorkItems) break;
+    lastScanned = entry.name;
     try {
       const sourcePath = entry.path;
       if (!sourcePath) {
@@ -239,6 +247,7 @@ export async function processArtifactInbox(
           throw new Error("Artifact filename must exactly match request_id");
         }
       } catch (error) {
+        workItems += 1;
         const fallbackId = filenameRequestId ?? await syntheticInboxId("ART-INVALID", entry.name, raw);
         const rejectedPath = terminalArtifactRequestPath(mode, "rejected", fallbackId);
         await safeAdd(objects, rejectedPath, `${JSON.stringify({
@@ -305,6 +314,8 @@ export async function processArtifactInbox(
       });
     }
   }
+
+  if (options.rotateScan && lastScanned) await objects.upsertText(cursorPath, lastScanned);
 
   return summary;
 }

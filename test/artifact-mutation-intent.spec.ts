@@ -164,3 +164,18 @@ describe("ArtifactMutationIntentService", () => {
     })).rejects.toThrow(/intent conflict/i);
   });
 });
+
+it("rejects stale review revision before intent, but keeps frozen exact crash replay", async () => {
+  const { candidate } = await import("./helpers/review-candidate");
+  const { parseArtifactWriteRequest } = await import("../src/domain/artifact-write");
+  const raw = new FakeArtifactIntentDropbox();
+  const runtime = persistenceFromDropbox(raw);
+  const intents = new ArtifactMutationIntentService(new MutationGateRepository(runtime), runtime);
+  const state = { ...stateBeforeRoute(), project_id: "PRJ-0002", revision: 150 };
+  const request = parseArtifactWriteRequest(candidate);
+  await expect(intents.prepare(state, request)).rejects.toThrow(/revision/i);
+  expect(raw.uploads).toHaveLength(0);
+  const first = await intents.prepare({ ...state, revision: 149 }, request);
+  const replay = await intents.prepare(state, request);
+  expect(replay.intent).toEqual(first.intent);
+});

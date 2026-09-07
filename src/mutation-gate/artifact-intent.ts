@@ -1,3 +1,4 @@
+import { isReviewCandidate } from "../domain/artifact-write";
 import type { ArtifactWriteRequest } from "../domain/artifact-write";
 import { mutationIntentIdFor } from "../domain/mutation-gate";
 import type { ProjectState } from "../domain/project-state";
@@ -52,7 +53,10 @@ export class ArtifactMutationIntentService {
       return { intent: existing, destination: destinationFromIntent(existing) };
     }
 
-    const destination = resolveArtifactDestination(state, request.relative_path);
+    if (isReviewCandidate(request) && request.base_revision !== state.revision) {
+      throw new ReviewCandidateRevisionError();
+    }
+    const destination = resolveArtifactDestination(state, request.relative_path, request);
     const providerPrecondition = await this.providerPrecondition(destination.path);
     const intent: CurrentMutationIntentRecord = {
       schema_version: "1.0",
@@ -134,4 +138,8 @@ export function destinationFromIntent(intent: CurrentMutationIntentRecord): Reso
       }
     } : {})
   };
+}
+
+export class ReviewCandidateRevisionError extends Error {
+  constructor() { super("Review candidate base revision does not match current canonical revision"); }
 }

@@ -1,3 +1,5 @@
+import { isReviewCandidate } from "../domain/artifact-write";
+import { ReviewBinaryValidationError, verifyReviewBytes } from "./review-bytes";
 import type { StagedArtifactWriteRequest } from "../domain/artifact-write";
 import type { ResolvedArtifactDestination } from "../persistence/artifact-routing";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
@@ -28,13 +30,26 @@ export class StagedArtifactPublisher {
 
   async publish(
     request: StagedArtifactWriteRequest,
-    destination: ResolvedArtifactDestination
+    destination: ResolvedArtifactDestination,
+    onVerified?: (metadata: ProviderObjectMetadata) => Promise<void>,
+    beforeCopy?: () => void
   ): Promise<"written" | "idempotent"> {
     const source = await this.runtime.objects.getMetadata(request.source.path);
     this.assertSource(request, source);
+    if (isReviewCandidate(request)) {
+      try { await verifyReviewBytes(this.runtime, request); }
+      catch (error) {
+        if (error instanceof ReviewBinaryValidationError) throw new StagedArtifactSourceMismatchError(error.message);
+        throw error;
+      }
+      this.assertSource(request, await this.runtime.objects.getMetadata(request.source.path));
+    }
 
     const existing = await this.runtime.objects.getMetadata(destination.path);
-    if (existing && samePayload(source!, existing)) return "idempotent";
+    if (existing && samePayload(source!, existing)) {
+      await onVerified?.(existing);
+      return "idempotent";
+    }
     if (existing && request.mode === "create") throw new StagedArtifactConflictError(destination.path);
     const priorRollback = request.mode === "replace"
       ? await this.readRollbackEvidence(request, destination.path)
@@ -46,6 +61,8 @@ export class StagedArtifactPublisher {
       cleanupOnSuccess: boolean;
     } | null = null;
     let published: ProviderObjectMetadata | null = null;
+    let verified: ProviderObjectMetadata | null = null;
+    beforeCopy?.();
     try {
       if (existing) {
         if (destination.archive_path) {
@@ -96,6 +113,7 @@ export class StagedArtifactPublisher {
       if (!visible || !sameObservation(published, visible) || !samePayload(source!, visible)) {
         throw new StagedArtifactSourceMismatchError("final provider evidence does not match source");
       }
+      verified = visible;
     } catch (error) {
       const currentDestination = await this.runtime.objects.getMetadata(destination.path);
       const originalStillVisible = Boolean(
@@ -107,6 +125,9 @@ export class StagedArtifactPublisher {
       }
       throw error;
     }
+    // A lost journal response must preserve the verified copy for exact replay.
+    // Rollback applies only to publication/verification failures above.
+    if (verified) await onVerified?.(verified);
     if (rollbackBackup?.cleanupOnSuccess) await this.deleteObserved(rollbackBackup.metadata);
     return "written";
   }

@@ -74,3 +74,66 @@ LOCAL_GENERATED → STAGED → SUBMITTED → COMMITTED → CANONICAL_VERIFIED �
 ## Activation gate
 
 Merging or deploying this code does not activate binary ingress. Enablement is a separate, explicitly authorized production action after CI, dry-run, health, controlled canary, replay, size-limit, mismatch, and cleanup evidence are accepted. PRJ-0003 recovery is a separate operation and is never implied by activation.
+
+## Proposed REVIEW_CANDIDATE contract
+
+This branch adds a separate, disabled-by-default capability for immutable review attachments. It does not activate production, publish files, accept business facts, or mutate a managed document head.
+
+`operation: REVIEW_CANDIDATE` requires `mode: create`, current `base_revision`, a safe basename in `relative_path`, `media_type`, `content_sha256`, and the normal staged source with an additional `provider_id`. The exact source path must be `/PROJECT_OS/.project-os/artifacts/staging/<request_id>/<relative_path>`. Changing a rejected request ID requires restaging under the new matching directory and capturing fresh provider evidence.
+
+The governed destination is `REVIEW/CANDIDATES/<request_id>/<relative_path>`. This reserved namespace holds independent immutable submissions, not sequential versions of an existing work product. It creates no working/review/published head. Managed operations cannot claim `CANDIDATES` as a logical root; ordinary artifact routes still cannot target REVIEW. A candidate never replaces or supersedes another. Promotion into a managed work product or DELIVERABLES requires a separately governed operation; this ingress does not provide promotion.
+
+### Exact temporary authorization
+
+`PROJECT_OS_REVIEW_CANDIDATE_INGRESS_MODE` stays `off` in repository configuration. `scoped` requires `PROJECT_OS_REVIEW_CANDIDATE_CAPABILITY` containing a strict JSON object:
+
+```json
+{
+  "issued_at": "2026-09-07T12:00:00.000Z",
+  "expires_at": "2026-09-07T12:30:00.000Z",
+  "requests": [
+    {
+      "request_id": "ART-REVIEW-EXAMPLE-0001",
+      "project_id": "PRJ-0002",
+      "operation": "REVIEW_CANDIDATE",
+      "base_revision": 149,
+      "relative_path": "example.pdf",
+      "media_type": "application/pdf",
+      "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "mode": "create",
+      "source": {
+        "kind": "staged_provider_object",
+        "provider_id": "dropbox",
+        "path": "/PROJECT_OS/.project-os/artifacts/staging/ART-REVIEW-EXAMPLE-0001/example.pdf",
+        "object_id": "id:example",
+        "revision_token": "example-revision",
+        "size": 123,
+        "integrity": {
+          "algorithm": "dropbox-content-hash",
+          "value": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      }
+    }
+  ]
+}
+```
+
+The example uses expired dates and illustrative provider observations/hashes. Replace these with the freshly verified complete request and a separately authorized validity window; a request ID or content hash alone is insufficient. Maximum: ten requests, 64 KiB configuration, one-hour validity, 10 MiB per file. Unknown keys, wildcards, missing fields, future issuance and expiry fail closed. No capability is installed by this branch.
+
+The public endpoint remains authenticated. REVIEW requests reach ProjectGuard so terminal replay can be recovered before checking authorization for new work. ProjectGuard requires V2 layout and enforced MutationGate, checks the exact capability, and rechecks expiration after reading bytes and immediately before copy. Global binary `on` cannot authorize REVIEW. Setting the dedicated mode back to `off`, removing the capability, or letting it expire prevents new copies while preserving exact terminal replay. Previously terminally rejected IDs remain rejected: create a new request/staging directory after correcting the cause.
+
+### Verification and receipts
+
+Supported declared formats are PDF (`.pdf`), PNG (`.png`), JPEG (`.jpg`/`.jpeg`) and ZIP (`.zip`). The runtime verifies the byte signature and matching extension, not a complete semantic document parse or malware scan. DOCX/XLSX/PPTX are not validated as Office documents; package them inside a ZIP candidate if needed. Do not merely rename an Office document and claim Office validation.
+
+The provider must implement bounded binary reads. The reader cancels an oversized stream without trusting Content-Length. Source bytes are checked against raw SHA-256 and the provider's identified integrity algorithm, then source identity/revision is rechecked before and after copy. Transient provider failures remain retryable. The final verified copy observation is frozen under `.project-os/artifacts/review-observations/`; a subsequent identity/revision change cannot be silently adopted into the receipt.
+
+Receipts explicitly carry `operation: REVIEW_CANDIDATE`, `accepted: false`, `published: false`, and, on commit, the exact final provider observation. An immutable full-request terminal record under `.project-os/artifacts/review-terminals/` precedes the ordinary receipt and SQLite record, so a crash between writes can recover the same outcome. The status endpoint reports `canonical_verified` only while the visible identity, revision, size and integrity still match the frozen receipt. Unknown/altered candidate files remain external mutations under MutationGate. They are never bootstrapped as managed document heads.
+
+### Bounded batch execution
+
+Each invocation processes transactions first, then at most four artifact work items from a scan of at most sixteen entries. Malformed requests consume work budget. Retry backoff and the eight-attempt ceiling remain in force. A durable scan cursor advances past exhausted prefixes across invocations; a failure does not force every later invocation to start with the same first entries. The legacy neutral entrypoint uses the same bounds. Writes remain sequential through per-project ProjectGuard.
+
+### Review gate
+
+Before any separately authorized live activation, prove the exact file class/destination with a representative canary and verify committed receipt, final observation, replay, expiry, mismatches and rollback. Production deployment, activation, canonical SOP acceptance and any PRJ-0007 file submission are outside this branch's mandate.

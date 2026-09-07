@@ -1,5 +1,6 @@
+import { reviewReceiptMatchesObservation } from "../artifacts/review-receipt";
 import type { ManagedProviderObservation } from "../domain/managed-document";
-import { isStagedArtifactWriteRequest, parseArtifactWriteRequest } from "../domain/artifact-write";
+import { isReviewCandidate, isStagedArtifactWriteRequest, parseArtifactWriteRequest } from "../domain/artifact-write";
 import {
   matchesStagedArtifactPayload,
   matchesStagedArtifactRollbackBackup,
@@ -71,6 +72,15 @@ export class MutationGateClassifier {
       for (const intent of intents) {
         const frozen = parseArtifactWriteRequest(JSON.parse(intent.request_json));
         if (!isStagedArtifactWriteRequest(frozen)) continue;
+        if (isReviewCandidate(frozen)) {
+          const raw = await this.runtime.objects.readText(machineArtifactReceiptPath(intent.request_id));
+          if (raw !== null) {
+            if (reviewReceiptMatchesObservation(JSON.parse(raw), frozen, metadata, this.runtime.providerId)) {
+              return { kind: "governed_inflight", requestId: intent.request_id };
+            }
+            continue;
+          }
+        }
         const publishedPayload = matchesStagedArtifactPayload(frozen, metadata)
           && intentExplainsProviderChange(intent, metadata, this.runtime.providerId);
         const restoredPayload = await this.matchesActiveRollbackEvidence(intent, metadata);
@@ -199,6 +209,7 @@ function strictZone(state: ProjectState, path: string): StrictZone | null {
   const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
   if (!path.startsWith(root)) return null;
   const relative = path.slice(root.length);
+  if (relative.toUpperCase().startsWith("REVIEW/CANDIDATES/")) return { kind: "artifacts" };
   if (relative.startsWith("WORKING/") && relative.length > "WORKING/".length) {
     return { kind: "working", logicalPath: relative.slice("WORKING/".length) };
   }

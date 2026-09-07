@@ -10,6 +10,7 @@ export interface DropboxMockFault {
 }
 
 export interface DropboxMockOptions {
+  realContentHash?: boolean;
   transientUploadFailures?: number;
   faults?: DropboxMockFault[];
 }
@@ -57,7 +58,10 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
   };
 
   const contentHash = async (content: string): Promise<string> => {
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
+    const bytes = new TextEncoder().encode(content);
+    const digest = options.realContentHash
+      ? await crypto.subtle.digest("SHA-256", await crypto.subtle.digest("SHA-256", bytes))
+      : await crypto.subtle.digest("SHA-256", bytes);
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   };
 

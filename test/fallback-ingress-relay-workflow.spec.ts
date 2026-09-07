@@ -5,13 +5,14 @@ import { describe, expect, it } from "vitest";
 const source = workflowText;
 
 describe("encrypted fallback ingress relay workflow", () => {
-  it("is owner-only, serialized, and grants only issue write permission", () => {
+  it("is owner-only, serialized without dropping pending requests, and grants only issue write permission", () => {
     expect(source).toContain('"on":');
     expect(source).toContain("issue_comment:");
     expect(source).toContain("types: [created]");
     expect(source).toContain("permissions:\n  issues: write");
     expect(source).toContain("group: project-os-fallback-ingress-relay");
     expect(source).toContain("cancel-in-progress: false");
+    expect(source).toContain("queue: max");
     expect(source).toContain("runs-on: ubuntu-latest");
     expect(source).toContain("timeout-minutes: 2");
     expect(source).toContain("github.event.issue.title == 'Project OS encrypted fallback relay'");

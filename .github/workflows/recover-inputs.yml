@@ -330,18 +330,32 @@ jobs:
           console.log("Sanitized recovery summary:", JSON.stringify(safe));
           NODE
 
-          curl \
-            --fail-with-body \
-            --silent \
-            --show-error \
-            --connect-timeout 5 \
-            --max-time 15 \
-            --retry 0 \
-            --request GET \
-            --header "Authorization: Bearer $OPERATOR_TOKEN" \
-            --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
-            --output "$POSTCHECK_RESPONSE_FILE" \
-            "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=$PROJECT_ID"
+          postcheck_ready=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            postcheck_status=$(curl --silent --show-error --max-time 15 \
+              --output "$POSTCHECK_RESPONSE_FILE" \
+              --write-out '%{http_code}' \
+              --request GET \
+              --header "Authorization: Bearer $OPERATOR_TOKEN" \
+              --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
+              "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=$PROJECT_ID" || true)
+            postcheck_decision=$(node scripts/recovery-http-policy.mjs postcheck "$postcheck_status")
+            if [ "$postcheck_decision" = "ready" ]; then
+              postcheck_ready=1
+              break
+            fi
+            if [ "$postcheck_decision" = "retry" ]; then
+              echo "Post-recovery verification received transient HTTP $postcheck_status on attempt $attempt; waiting for operator version propagation."
+              sleep 2
+              continue
+            fi
+            echo "Unexpected post-recovery verification response: HTTP ${postcheck_status:-curl-error}."
+            exit 1
+          done
+          if [ "$postcheck_ready" -ne 1 ]; then
+            echo "Post-recovery verification did not become ready within the bounded retry window."
+            exit 1
+          fi
 
           node <<'NODE'
           const fs = require("node:fs");

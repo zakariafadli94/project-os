@@ -381,7 +381,11 @@ function authorizedResolution(request: Request, env: Env, now = Date.now()): boo
   const authorization = request.headers.get("authorization");
   if (!authorization) return false;
 
-  if (secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`)) return true;
+  if (
+    typeof env.INGRESS_TOKEN === "string" &&
+    env.INGRESS_TOKEN.length > 0 &&
+    secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`)
+  ) return true;
 
   const operatorToken = env.MUTATION_GATE_OPERATOR_TOKEN;
   if (!operatorToken || !validOperatorToken(operatorToken, now)) return false;

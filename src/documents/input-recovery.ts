@@ -69,29 +69,48 @@ export class InputRecoveryService {
   }
 
   async status(state: ProjectState): Promise<InputRecoveryStatus> {
-    return { remaining: (await this.discoverInputs(state)).length };
+    return { remaining: await countProjectInputFiles(this.runtime, state.project_id, state.slug) };
   }
 
   private async discoverInputs(state: ProjectState): Promise<DiscoveredInput[]> {
-    const root = workspaceManagedZoneRoot(state.project_id, state.slug, "inputs");
-    return this.discover(root, "");
+    return discoverProjectInputs(this.runtime, state.project_id, state.slug);
   }
+}
 
-  private async discover(path: string, relativePrefix: string): Promise<DiscoveredInput[]> {
-    const entries = await this.runtime.objects.listChildren(path);
-    const discovered: DiscoveredInput[] = [];
-    for (const entry of entries) {
-      if (entry.kind === "deleted") continue;
-      const childPath = providerPathFor(path, entry);
-      const relativePath = relativePrefix ? `${relativePrefix}/${entry.name}` : entry.name;
-      if (entry.kind === "folder") {
-        discovered.push(...await this.discover(childPath, relativePath));
-      } else if (entry.kind === "file") {
-        discovered.push({ path: childPath, relativePath });
-      }
+export async function countProjectInputFiles(
+  runtime: ProjectOsPersistenceRuntime,
+  projectId: string,
+  slug: string
+): Promise<number> {
+  return (await discoverProjectInputs(runtime, projectId, slug)).length;
+}
+
+async function discoverProjectInputs(
+  runtime: ProjectOsPersistenceRuntime,
+  projectId: string,
+  slug: string
+): Promise<DiscoveredInput[]> {
+  return discover(runtime, workspaceManagedZoneRoot(projectId, slug, "inputs"), "");
+}
+
+async function discover(
+  runtime: ProjectOsPersistenceRuntime,
+  path: string,
+  relativePrefix: string
+): Promise<DiscoveredInput[]> {
+  const entries = await runtime.objects.listChildren(path);
+  const discovered: DiscoveredInput[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "deleted") continue;
+    const childPath = providerPathFor(path, entry);
+    const relativePath = relativePrefix ? `${relativePrefix}/${entry.name}` : entry.name;
+    if (entry.kind === "folder") {
+      discovered.push(...await discover(runtime, childPath, relativePath));
+    } else if (entry.kind === "file") {
+      discovered.push({ path: childPath, relativePath });
     }
-    return discovered;
   }
+  return discovered;
 }
 
 function providerPathFor(parent: string, entry: ProviderEntry): string {

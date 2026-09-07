@@ -6,9 +6,11 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const workflowsDir = join(root, ".github", "workflows");
 const deployPath = join(workflowsDir, "deploy.yml");
 const operatorPath = join(workflowsDir, "mutation-candidate-reject.yml");
+const recoveryPath = join(workflowsDir, "recover-inputs.yml");
 const disableBuildsPath = join(workflowsDir, "r0-disable-cloudflare-workers-builds.yml");
 const deploy = readFileSync(deployPath, "utf8");
 const operator = readFileSync(operatorPath, "utf8");
+const recovery = readFileSync(recoveryPath, "utf8");
 const disableBuilds = readFileSync(disableBuildsPath, "utf8");
 
 const requireText = (text, needle, label = needle) => {
@@ -48,6 +50,19 @@ forbid(operator, /OPERATOR_VERSION_(?:ID|TAG)[^\n]*@(?:[1-9][0-9]*(?:\.[0-9]+)?|
 forbid(operator, /CLEANUP_VERSION_TAG/, "cleanup version that can become a second production release");
 forbid(operator, /wrangler\s+rollback\b/, "operator rollback command");
 
+// INPUT recovery uses the same zero-traffic isolation and may address its
+// temporary version only through a version override.
+requireText(recovery, "BASE_VERSION_ID", "captured recovery base production version");
+requireText(recovery, "OPERATOR_VERSION_ID", "ephemeral recovery version id");
+requireText(recovery, "$BASE_VERSION_ID@100%", "recovery base version held at 100 percent");
+requireText(recovery, "$OPERATOR_VERSION_ID@0%", "recovery operator version held at zero percent");
+requireText(recovery, "Cloudflare-Workers-Version-Overrides", "version-targeted recovery requests");
+requireText(recovery, "Verify normal traffic remains on base version", "recovery zero-traffic verification");
+requireText(recovery, "Restore base production deployment", "recovery base-only cleanup");
+forbid(recovery, /OPERATOR_VERSION_(?:ID|TAG)[^\n]*@(?:[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9])%/, "positive recovery-version traffic");
+forbid(recovery, /CLEANUP_VERSION_TAG/, "recovery cleanup version that can become a second production release");
+forbid(recovery, /wrangler\s+rollback\b/, "recovery rollback command");
+
 // R0 account cutover removes Cloudflare Workers Builds triggers and delegates
 // the final republish to deploy.yml rather than promoting Worker code itself.
 requireText(disableBuilds, "[operator] Project OS R0 disable Cloudflare Workers Builds", "owner-only R0 cutover control issue");
@@ -64,7 +79,12 @@ if (directPromotionLines(disableBuilds).length > 0) {
 // No third workflow may mutate Worker production deployment state. A Wrangler
 // dry-run in CI is explicitly non-promoting and remains allowed.
 for (const name of readdirSync(workflowsDir).filter((entry) => /\.ya?ml$/.test(entry))) {
-  if (name === "deploy.yml" || name === "mutation-candidate-reject.yml" || name === "r0-disable-cloudflare-workers-builds.yml") continue;
+  if (
+    name === "deploy.yml"
+    || name === "mutation-candidate-reject.yml"
+    || name === "recover-inputs.yml"
+    || name === "r0-disable-cloudflare-workers-builds.yml"
+  ) continue;
   const content = readFileSync(join(workflowsDir, name), "utf8");
   const offenders = directPromotionLines(content);
   if (offenders.length > 0) {

@@ -64,13 +64,20 @@ const worker = {
     }
 
     if (request.method === "GET" && url.pathname === "/v1/admin/input-recovery-status") {
-      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      if (!authorizedRecovery(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
       const projectId = url.searchParams.get("project_id");
       if (!projectId || !EXACT_PROJECT_ID.test(projectId)) {
         return Response.json({ error: "invalid_project_id" }, { status: 400 });
       }
       const stub = env.PROJECT_GUARD.getByName(projectId);
       return stub.fetch("https://project-guard.internal/input-recovery-status", { method: "GET" });
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/admin/recover-inputs") {
+      if (!authorizedRecovery(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const headers = new Headers(request.headers);
+      headers.set("authorization", `Bearer ${env.INGRESS_TOKEN}`);
+      return baseWorker.fetch(new Request(request, { headers }), env, ctx);
     }
 
     if (request.method === "POST" && url.pathname === "/v1/mutation-candidates/resolve") {
@@ -375,6 +382,18 @@ function authorizedIngress(request: Request, env: Env): boolean {
   if (typeof env.INGRESS_TOKEN !== "string" || env.INGRESS_TOKEN.length === 0) return false;
   const authorization = request.headers.get("authorization");
   return !!authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`);
+}
+
+function authorizedRecovery(request: Request, env: Env, now = Date.now()): boolean {
+  const authorization = request.headers.get("authorization");
+  if (!authorization) return false;
+
+  if (typeof env.INGRESS_TOKEN === "string" && env.INGRESS_TOKEN.length > 0
+      && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`)) return true;
+
+  const operatorToken = env.INPUT_RECOVERY_OPERATOR_TOKEN;
+  return Boolean(operatorToken && validOperatorToken(operatorToken, now)
+    && secureStringEqual(authorization, `Bearer ${operatorToken}`));
 }
 
 function authorizedResolution(request: Request, env: Env, now = Date.now()): boolean {

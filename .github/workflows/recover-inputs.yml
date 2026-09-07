@@ -12,24 +12,37 @@ name: Recover Project OS INPUTS
         required: true
         type: string
 
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
-  group: project-os-input-recovery
+  group: project-os-production
   cancel-in-progress: false
 
 jobs:
   recover-inputs:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 25
     env:
       PROJECT_OS_URL: https://project-os-guard.zakaria-fadli-94.workers.dev
+      WORKER_NAME: project-os-guard
       PROJECT_ID: ${{ inputs.project_id }}
       CONFIRM_RECOVERY: ${{ inputs.confirm_recovery }}
-      INGRESS_TOKEN: ${{ secrets.INGRESS_TOKEN }}
 
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Validate manual recovery gate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         shell: bash
         run: |
           set -euo pipefail
@@ -49,8 +62,8 @@ jobs:
             exit 1
           fi
 
-          if [ -z "$INGRESS_TOKEN" ]; then
-            echo "Required ingress credential is not configured in GitHub Actions."
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "Existing Cloudflare deployment credentials are not configured."
             exit 1
           fi
 
@@ -73,15 +86,200 @@ jobs:
           );
           NODE
 
+      - name: Capture active production deployment
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          deployment_json=$(curl --fail --silent --show-error --max-time 30 \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER_NAME/deployments")
+          DEPLOYMENT_JSON="$deployment_json" node <<'NODE'
+          const fs = require("node:fs");
+          const body = JSON.parse(process.env.DEPLOYMENT_JSON ?? "null");
+          const deployments = body?.result?.deployments ?? body?.deployments;
+          if (!Array.isArray(deployments) || deployments.length === 0) {
+            throw new Error("Cloudflare returned no active Worker deployment");
+          }
+          const active = deployments[0];
+          if (!Array.isArray(active?.versions) || active.versions.length !== 1) {
+            throw new Error("INPUT recovery operator requires a single-version 100% base deployment");
+          }
+          const base = active.versions[0];
+          if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(base.version_id ?? ""))) {
+            throw new Error("Invalid active Worker version id");
+          }
+          if (Number(base.percentage) !== 100) {
+            throw new Error(`Active base Worker is not at 100% traffic: ${String(base.percentage)}`);
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, `BASE_VERSION_ID=${base.version_id}\n`);
+          console.log(`Captured authoritative base Worker version ${base.version_id}`);
+          NODE
+
+      - name: Verify base deployment is Git-attributed
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health")
+          echo "$response"
+          HEALTH_JSON="$response" node <<'NODE'
+          const body = JSON.parse(process.env.HEALTH_JSON ?? "null");
+          const base = process.env.BASE_VERSION_ID;
+          if (body?.status !== "ok" || body?.worker_version_id !== base) {
+            throw new Error("Health identity does not match captured base deployment");
+          }
+          if (!/^[a-f0-9]{40}$/.test(String(body?.git_sha ?? ""))) {
+            throw new Error("Base deployment is not attributable to an exact Git SHA");
+          }
+          if (body?.worker_version_tag !== `git-${body.git_sha}`) {
+            throw new Error("Base Worker version tag is not authoritative git-<sha>");
+          }
+          NODE
+
+      - name: Generate ephemeral recovery token and version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPERATOR_TOKEN=$(node -e 'const { randomBytes } = require("node:crypto"); process.stdout.write(`${Date.now()}.${randomBytes(32).toString("hex")}`)')
+          OPERATOR_VERSION_TAG="input-recovery-op-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "::add-mask::$OPERATOR_TOKEN"
+          {
+            echo "OPERATOR_TOKEN=$OPERATOR_TOKEN"
+            echo "OPERATOR_VERSION_TAG=$OPERATOR_VERSION_TAG"
+            echo "TOKEN_VERSION_CREATED=false"
+          } >> "$GITHUB_ENV"
+
+      - name: Create ephemeral recovery-token version
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          secret_file="$RUNNER_TEMP/input-recovery-operator-secrets.json"
+          upload_output="$RUNNER_TEMP/input-recovery-operator-upload.txt"
+          versions_json="$RUNNER_TEMP/input-recovery-operator-versions.json"
+          trap 'rm -f "$secret_file" "$upload_output" "$versions_json"' EXIT
+          node -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({INPUT_RECOVERY_OPERATOR_TOKEN: process.env.OPERATOR_TOKEN}), { mode: 0o600 })' "$secret_file"
+          timeout 60s npx wrangler versions upload \
+            --secrets-file "$secret_file" \
+            --tag "$OPERATOR_VERSION_TAG" \
+            --message "INPUT recovery zero-traffic operator version for run $GITHUB_RUN_ID" | tee "$upload_output"
+          timeout 60s npx wrangler versions list --json > "$versions_json"
+          OPERATOR_VERSION_ID=$(UPLOAD_OUTPUT="$upload_output" VERSIONS_JSON="$versions_json" node <<'NODE'
+          const fs = require("node:fs");
+          const output = fs.readFileSync(process.env.UPLOAD_OUTPUT, "utf8");
+          const direct = output.match(/Worker Version ID:\s*([0-9a-f-]{36})/i)?.[1];
+          if (direct) {
+            process.stdout.write(direct);
+            process.exit(0);
+          }
+          const data = JSON.parse(fs.readFileSync(process.env.VERSIONS_JSON, "utf8"));
+          const targetTag = process.env.OPERATOR_VERSION_TAG;
+          const candidates = Array.isArray(data) ? data : (Array.isArray(data?.versions) ? data.versions : []);
+          for (const item of candidates) {
+            const tag = item?.tag ?? item?.metadata?.tag ?? item?.annotations?.["workers/tag"];
+            const id = item?.id ?? item?.version_id;
+            if (tag === targetTag && /^[0-9a-f-]{36}$/i.test(String(id ?? ""))) {
+              process.stdout.write(id);
+              process.exit(0);
+            }
+          }
+          throw new Error(`Could not resolve Worker version id for tag ${targetTag}`);
+          NODE
+          )
+          if ! [[ "$OPERATOR_VERSION_ID" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+            echo "Invalid operator Worker version id: $OPERATOR_VERSION_ID"
+            exit 1
+          fi
+          {
+            echo "OPERATOR_VERSION_ID=$OPERATOR_VERSION_ID"
+            echo "TOKEN_VERSION_CREATED=true"
+          } >> "$GITHUB_ENV"
+          echo "Created zero-traffic operator Worker version $OPERATOR_VERSION_ID"
+
+      - name: Attach operator version at zero percent traffic
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 60s npx wrangler versions deploy \
+            "$BASE_VERSION_ID@100%" \
+            "$OPERATOR_VERSION_ID@0%" \
+            --message "INPUT recovery zero-traffic operator window for run $GITHUB_RUN_ID" \
+            --yes
+
+      - name: Verify normal traffic remains on base version
+        shell: bash
+        run: |
+          set -euo pipefail
+          response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health")
+          echo "$response"
+          HEALTH_JSON="$response" node <<'NODE'
+          const body = JSON.parse(process.env.HEALTH_JSON ?? "null");
+          if (body?.status !== "ok" || body?.worker_version_id !== process.env.BASE_VERSION_ID) {
+            throw new Error(`Normal production traffic left base version ${process.env.BASE_VERSION_ID}`);
+          }
+          NODE
+
+      - name: Verify version override reaches operator version
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            response=$(curl --fail --silent --show-error --max-time 15 \
+              --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
+              "$PROJECT_OS_URL/health" || true)
+            if HEALTH_JSON="$response" node -e 'const b=JSON.parse(process.env.HEALTH_JSON||"null"); process.exit(b?.worker_version_id===process.env.OPERATOR_VERSION_ID ? 0 : 1)' 2>/dev/null; then
+              echo "Version override is pinned to the zero-traffic operator version."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Could not verify operator version override within the bounded retry window."
+          exit 1
+
+      - name: Verify ephemeral recovery token readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            readiness_status=$(curl --silent --show-error --max-time 15 \
+              --output /tmp/input-recovery-readiness-body.json \
+              --write-out '%{http_code}' \
+              --request GET \
+              --header "Authorization: Bearer $OPERATOR_TOKEN" \
+              --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
+              "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=PRJ-000" || true)
+            readiness_decision=$(node scripts/recovery-http-policy.mjs \
+              readiness "$readiness_status" /tmp/input-recovery-readiness-body.json)
+            if [ "$readiness_decision" = "ready" ]; then
+              echo "Ephemeral recovery token is active only on the targeted zero-traffic Worker version."
+              exit 0
+            fi
+            if [ "$readiness_decision" = "retry" ]; then
+              echo "Recovery readiness received transient HTTP $readiness_status on attempt $attempt; waiting for operator version propagation."
+              sleep 2
+              continue
+            fi
+            echo "Unexpected recovery-token readiness response: HTTP ${readiness_status:-curl-error}."
+            exit 1
+          done
+          echo "Ephemeral recovery token did not become ready within the bounded retry window."
+          exit 1
+
       - name: Run targeted recovery and verify INPUTS drained
         env:
           RECOVERY_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-response.json
           RECOVERY_PAYLOAD_FILE: ${{ runner.temp }}/recover-inputs-payload.json
-          POSTCHECK_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-postcheck.json
         shell: bash
         run: |
           set -euo pipefail
-          trap 'rm -f "$RECOVERY_PAYLOAD_FILE" "$RECOVERY_RESPONSE_FILE" "$POSTCHECK_RESPONSE_FILE"' EXIT
+          trap 'rm -f "$RECOVERY_PAYLOAD_FILE" "$RECOVERY_RESPONSE_FILE"' EXIT
 
           curl \
             --fail-with-body \
@@ -91,7 +289,8 @@ jobs:
             --max-time 30 \
             --retry 0 \
             --request POST \
-            --header "Authorization: Bearer $INGRESS_TOKEN" \
+            --header "Authorization: Bearer $OPERATOR_TOKEN" \
+            --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
             --header 'Content-Type: application/json' \
             --data-binary "@$RECOVERY_PAYLOAD_FILE" \
             --output "$RECOVERY_RESPONSE_FILE" \
@@ -105,9 +304,7 @@ jobs:
             throw new Error("Recovery response did not contain exactly one result");
           }
           const result = body.results[0];
-          if (result?.project_id !== projectId) {
-            throw new Error("Recovery response project_id mismatch");
-          }
+          if (result?.project_id !== projectId) throw new Error("Recovery response project_id mismatch");
           const safe = {
             project_id: result.project_id,
             scanned: result.scanned,
@@ -116,6 +313,7 @@ jobs:
             conflicts: result.conflicts,
             withdrawn: result.withdrawn,
             failed: result.failed,
+            remaining: result.remaining,
           };
           for (const [key, value] of Object.entries(safe)) {
             if (key === "project_id") continue;
@@ -129,31 +327,87 @@ jobs:
           if (safe.failed !== 0 || safe.conflicts !== 0) {
             throw new Error(`Recovery completed with failed=${safe.failed} conflicts=${safe.conflicts}`);
           }
+          if (safe.remaining !== 0) {
+            throw new Error(`Post-recovery verification found ${safe.remaining} INPUTS remaining`);
+          }
           console.log("Sanitized recovery summary:", JSON.stringify(safe));
-          NODE
-
-          curl \
-            --fail-with-body \
-            --silent \
-            --show-error \
-            --connect-timeout 5 \
-            --max-time 15 \
-            --retry 0 \
-            --request GET \
-            --header "Authorization: Bearer $INGRESS_TOKEN" \
-            --output "$POSTCHECK_RESPONSE_FILE" \
-            "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=$PROJECT_ID"
-
-          node <<'NODE'
-          const fs = require("node:fs");
-          const body = JSON.parse(fs.readFileSync(process.env.POSTCHECK_RESPONSE_FILE, "utf8"));
-          const projectId = process.env.PROJECT_ID;
-          if (body?.project_id !== projectId) throw new Error("Post-recovery project_id mismatch");
-          if (!Number.isSafeInteger(body?.remaining) || body.remaining < 0) {
-            throw new Error("Post-recovery remaining INPUT count is invalid");
-          }
-          if (body?.remaining !== 0) {
-            throw new Error(`Post-recovery verification found ${body.remaining} INPUTS remaining`);
-          }
           console.log(`Post-recovery INPUT verification passed for ${projectId}: remaining=0.`);
           NODE
+
+      - name: Restore base production deployment and verify cleanup
+        if: always()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -u -o pipefail
+          if [ -z "${BASE_VERSION_ID:-}" ] || [ "${TOKEN_VERSION_CREATED:-false}" != "true" ]; then
+            echo "No operator Worker version was created; production deployment needs no cleanup."
+            exit 0
+          fi
+
+          cleanup_failed=0
+          if ! timeout 60s npx wrangler versions deploy \
+            "$BASE_VERSION_ID@100%" \
+            --message "INPUT recovery restore authoritative base after run $GITHUB_RUN_ID" \
+            --yes; then
+            echo "Failed to restore the authoritative base Worker deployment."
+            cleanup_failed=1
+          fi
+
+          health_ok=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if response=$(curl --fail --silent --show-error --max-time 15 "$PROJECT_OS_URL/health"); then
+              if HEALTH_JSON="$response" node -e 'const b=JSON.parse(process.env.HEALTH_JSON||"null"); process.exit(b?.worker_version_id===process.env.BASE_VERSION_ID ? 0 : 1)' 2>/dev/null; then
+                health_ok=1
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ "$health_ok" -ne 1 ]; then
+            echo "Production did not converge back to the authoritative base Worker version."
+            cleanup_failed=1
+          fi
+
+          override_removed=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            response=$(curl --fail --silent --show-error --max-time 15 \
+              --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
+              "$PROJECT_OS_URL/health" || true)
+            if HEALTH_JSON="$response" node -e 'const b=JSON.parse(process.env.HEALTH_JSON||"null"); process.exit(b?.worker_version_id===process.env.BASE_VERSION_ID ? 0 : 1)' 2>/dev/null; then
+              echo "Operator version is no longer present in the active deployment."
+              override_removed=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$override_removed" -ne 1 ]; then
+            echo "Operator version override still resolves after cleanup."
+            cleanup_failed=1
+          fi
+
+          revoked=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            revoke_status=$(curl --silent --show-error --max-time 15 \
+              --output /tmp/input-recovery-revoke-body.json \
+              --write-out '%{http_code}' \
+              --request GET \
+              --header "Authorization: Bearer $OPERATOR_TOKEN" \
+              "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=PRJ-000" || true)
+            revoke_decision=$(node scripts/recovery-http-policy.mjs revocation "$revoke_status")
+            if [ "$revoke_decision" = "revoked" ]; then
+              echo "Operator token revocation verified with HTTP $revoke_status on normal production traffic."
+              revoked=1
+              break
+            fi
+            echo "Recovery token still not verified revoked on attempt $attempt; received ${revoke_status:-curl-error}."
+            sleep 2
+          done
+          if [ "$revoked" -ne 1 ]; then
+            echo "Expected HTTP 401 or 404 after operator-version cleanup."
+            cleanup_failed=1
+          fi
+
+          exit "$cleanup_failed"

@@ -5,6 +5,7 @@ import { continuityStatus } from "./continuity/policy";
 import { executeWithRollback, type TransactionExecutor } from "./continuity/rollback";
 import type { Env } from "./env";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "./domain/managed-document-request";
+import { countProjectInputFiles } from "./documents/input-recovery";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
 import {
@@ -208,6 +209,10 @@ interface InputRecoveryProjectSummary {
   conflicts: number;
   withdrawn: number;
   failed: number;
+}
+
+interface VerifiedInputRecoveryProjectSummary extends InputRecoveryProjectSummary {
+  remaining: number;
 }
 
 export interface MaterializationReconcileSummary {
@@ -461,8 +466,10 @@ async function recoverInputs(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  const results: InputRecoveryProjectSummary[] = [];
+  const persistence = createProductionPersistence(env);
+  const results: VerifiedInputRecoveryProjectSummary[] = [];
   for (const projectId of projectIds) {
+    const project = registry.projects.find((candidate) => candidate.project_id === projectId)!;
     const guard = env.PROJECT_GUARD.getByName(projectId);
     const response = await guard.fetch("https://project-guard.internal/recover-inputs", { method: "POST" });
     if (!response.ok) {
@@ -472,7 +479,9 @@ async function recoverInputs(request: Request, env: Env): Promise<Response> {
         status: response.status
       }, { status: 502 });
     }
-    results.push(await response.json<InputRecoveryProjectSummary>());
+    const summary = await response.json<InputRecoveryProjectSummary>();
+    const remaining = await countProjectInputFiles(persistence, projectId, project.slug);
+    results.push({ ...summary, remaining });
   }
 
   return Response.json({ results });

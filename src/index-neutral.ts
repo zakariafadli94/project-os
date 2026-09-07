@@ -5,6 +5,7 @@ import { continuityStatus } from "./continuity/policy";
 import { executeWithRollback, type TransactionExecutor } from "./continuity/rollback";
 import type { Env } from "./env";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "./domain/managed-document-request";
+import { countProjectInputFiles } from "./documents/input-recovery";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
 import {
@@ -465,8 +466,10 @@ async function recoverInputs(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  const persistence = createProductionPersistence(env);
   const results: VerifiedInputRecoveryProjectSummary[] = [];
   for (const projectId of projectIds) {
+    const project = registry.projects.find((candidate) => candidate.project_id === projectId)!;
     const guard = env.PROJECT_GUARD.getByName(projectId);
     const response = await guard.fetch("https://project-guard.internal/recover-inputs", { method: "POST" });
     if (!response.ok) {
@@ -477,16 +480,8 @@ async function recoverInputs(request: Request, env: Env): Promise<Response> {
       }, { status: 502 });
     }
     const summary = await response.json<InputRecoveryProjectSummary>();
-    const statusResponse = await guard.fetch("https://project-guard.internal/input-recovery-status", { method: "GET" });
-    if (!statusResponse.ok) {
-      return Response.json({
-        error: "input_recovery_verification_failed",
-        project_id: projectId,
-        status: statusResponse.status
-      }, { status: 502 });
-    }
-    const status = await statusResponse.json<{ remaining: number }>();
-    results.push({ ...summary, remaining: status.remaining });
+    const remaining = await countProjectInputFiles(persistence, projectId, project.slug);
+    results.push({ ...summary, remaining });
   }
 
   return Response.json({ results });

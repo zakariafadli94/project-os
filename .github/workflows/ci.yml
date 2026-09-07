@@ -23,6 +23,8 @@ jobs:
             exit 1
           fi
       - run: npm ci
+      - name: Typecheck fallback ingress
+        run: npm run typecheck
       - name: Test encrypted fallback ingress
         run: npx vitest run test/fallback-ingress.spec.ts
       - run: npm run test:index001

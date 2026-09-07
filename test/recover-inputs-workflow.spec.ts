@@ -51,8 +51,8 @@ describe("recover-inputs GitHub Actions workflow", () => {
     expect(source).toContain("--retry 0");
     expect(source).toContain("Sanitized recovery summary:");
     expect(source).toContain("safe.scanned !== safe.completed + safe.duplicate_cleaned + safe.conflicts + safe.withdrawn + safe.failed");
-    expect(source).toContain("/v1/admin/input-recovery-status?project_id=");
-    expect(source).toContain("body?.remaining !== 0");
+    expect(source).toContain("safe.remaining !== 0");
+    expect(source).toContain("Post-recovery INPUT verification passed");
     expect(source).not.toMatch(/--request\s+(PUT|PATCH|DELETE)\b/i);
   });
 

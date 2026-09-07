@@ -609,6 +609,21 @@ If Dropbox/ProjectGuard is unavailable:
 - refresh canonical state before retrying a durable canonical mutation;
 - refresh managed-document head/provider state before retrying a document mutation.
 
+### 25.1 Encrypted fallback ingress for ChatGPT Dropbox connector outages
+
+Use the encrypted fallback ingress only when the ChatGPT Dropbox connector is unavailable but GitHub and the production Project OS Worker remain available.
+
+- Dropbox and ProjectGuard remain canonical. GitHub is transport only.
+- Never place plaintext Project OS project data or transactions in GitHub issue comments. The relay may carry only the encrypted fallback envelope and encrypted response framing.
+- Retrieve the fallback public key and use the owner-only encrypted GitHub relay.
+- First submit an encrypted `project_context` request to retrieve the current bounded canonical context and revision.
+- Construct any typed transaction using that current `base_revision` and a fresh unique `transaction_id`.
+- Submit the typed transaction through the encrypted `transaction` operation, which must route through the ordinary ProjectGuard transaction path.
+- Treat the mutation as durable only after decrypting and verifying a committed receipt/result from ProjectGuard; never infer persistence from relay delivery alone.
+- On retry, conflict, timeout, or uncertain result, refresh canonical context before retrying. Reuse the same transaction only when its idempotent `transaction_id` is intentionally being checked; never silently resolve a business-direction conflict.
+- If the encrypted fallback path itself is unavailable, remain in the fail-closed non-durable mode above and keep intended mutations separate from committed state.
+- when the ChatGPT Dropbox connector becomes available again, refresh HANDOFF.md and STATE.md and refresh canonical context before returning to normal Dropbox-backed work.
+
 If a business commit is already canonical but materialization is delayed:
 
 - do not call the business change uncommitted;

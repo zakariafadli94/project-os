@@ -314,4 +314,40 @@ describe("encrypted Project OS fallback ingress", () => {
     });
     expect(context.decrypted.result.revision).toBe(created.new_revision + 1);
   });
+
+  it("rotates the server key after a successful exchange and rejects a retired-key replay", async () => {
+    const created = await createProject("TXN-FALLBACK-ROTATE-0001", "fallback-rotate");
+    const keyBefore = await fetchFallbackKey();
+    const client = await encryptFallbackRequest(keyBefore, {
+      schema_version: "1.0",
+      request_id: "FBK-ROTATE-0001",
+      operation: "project_context",
+      project_id: created.project_id
+    });
+
+    const sendEnvelope = () => worker.fetch(
+      new Request("https://example.com/v1/fallback-ingress", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${testEnv.INGRESS_TOKEN}`,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(client.envelope)
+      }),
+      testEnv,
+      createExecutionContext()
+    );
+
+    const first = await sendEnvelope();
+    expect(first.status).toBe(200);
+    const encrypted = await first.json<FallbackEncryptedResponse>();
+    await decryptFallbackResponse(keyBefore.key_id, client.shared_secret, encrypted);
+
+    const keyAfter = await fetchFallbackKey();
+    expect(keyAfter.key_id).not.toBe(keyBefore.key_id);
+
+    const replay = await sendEnvelope();
+    expect(replay.status).toBe(400);
+    expect(await replay.json()).toEqual({ error: "invalid_fallback_envelope" });
+  });
 });

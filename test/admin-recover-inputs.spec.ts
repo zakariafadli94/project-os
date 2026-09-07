@@ -12,6 +12,10 @@ function withIngressToken(token: string | undefined): Env {
   return { ...testEnv, INGRESS_TOKEN: token } as unknown as Env;
 }
 
+function withRecoveryOperatorToken(token: string): Env {
+  return { ...testEnv, INPUT_RECOVERY_OPERATOR_TOKEN: token } as Env;
+}
+
 async function createProject(transactionId: string, slug: string): Promise<string> {
   const ctx = createExecutionContext();
   const response = await worker.fetch(new Request("https://example.com/v1/transactions", {
@@ -266,5 +270,74 @@ describe("GET /v1/admin/input-recovery-status", () => {
       || call.includes("/2/files/create_folder_v2")
     );
     expect(mutationCalls).toEqual([]);
+  });
+});
+
+describe("ephemeral INPUT recovery operator authentication", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("accepts a current recovery token only on the two recovery routes", async () => {
+    installDropboxMock();
+    const token = `${Date.now()}.recovery-operator-secret`;
+    const operatorEnv = withRecoveryOperatorToken(token);
+
+    const recovery = await worker.fetch(
+      recoveryRequest({ project_ids: [] }, token),
+      operatorEnv,
+      createExecutionContext()
+    );
+    expect(recovery.status).toBe(400);
+
+    const status = await worker.fetch(
+      recoveryStatusRequest("PRJ-000", token),
+      operatorEnv,
+      createExecutionContext()
+    );
+    expect(status.status).toBe(400);
+
+    const resolution = await worker.fetch(new Request("https://example.com/v1/mutation-candidates/resolve", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: "{}"
+    }), operatorEnv, createExecutionContext());
+    expect(resolution.status).toBe(401);
+
+    const transaction = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: "{}"
+    }), operatorEnv, createExecutionContext());
+    expect(transaction.status).toBe(401);
+  });
+
+  it("rejects expired and future-skewed recovery tokens", async () => {
+    installDropboxMock();
+    const now = Date.now();
+    const tokens = [
+      `${now - 16 * 60_000}.expired-recovery-operator`,
+      `${now + 2 * 60_000}.future-recovery-operator`
+    ];
+
+    for (const token of tokens) {
+      const operatorEnv = withRecoveryOperatorToken(token);
+      const recovery = await worker.fetch(
+        recoveryRequest({ project_ids: [] }, token),
+        operatorEnv,
+        createExecutionContext()
+      );
+      const status = await worker.fetch(
+        recoveryStatusRequest("PRJ-0002", token),
+        operatorEnv,
+        createExecutionContext()
+      );
+      expect(recovery.status, token).toBe(401);
+      expect(status.status, token).toBe(401);
+    }
   });
 });

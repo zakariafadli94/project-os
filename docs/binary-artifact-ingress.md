@@ -122,6 +122,27 @@ The example uses expired dates and illustrative provider observations/hashes. Re
 
 The public endpoint remains authenticated. REVIEW requests reach ProjectGuard so terminal replay can be recovered before checking authorization for new work. ProjectGuard requires V2 layout and enforced MutationGate, checks the exact capability, and rechecks expiration after reading bytes and immediately before copy. Global binary `on` cannot authorize REVIEW. Setting the dedicated mode back to `off`, removing the capability, or letting it expire prevents new copies while preserving exact terminal replay. Previously terminally rejected IDs remain rejected: create a new request/staging directory after correcting the cause.
 
+### Explicit promotion into managed deliverables
+
+`REVIEW_CANDIDATE` is a durable review submission, not a published document. A separately authenticated `review_candidate.promote` request is required to make an explicit acceptance decision and create a managed work-product version:
+
+```json
+{
+  "operation": "review_candidate.promote",
+  "request_id": "DOCREQ-REVIEW-PROMOTE-0001",
+  "project_id": "PRJ-0002",
+  "candidate_request_id": "ART-REVIEW-EXAMPLE-0001",
+  "logical_path": "dg-v2.0/example.pdf",
+  "expected_project_revision": 150,
+  "accepted": true,
+  "created_at": "2026-09-07T12:45:00.000Z"
+}
+```
+
+The promotion gate requires the candidate's immutable terminal receipt to be `committed`, revalidates its provider ID, path, object ID, revision, size and integrity, verifies the supported binary signature, and checks the project revision immediately before the provider effects. The destination is exactly `DELIVERABLES/<logical_path>`. Promotion is create-only: an existing managed head or a different object at that destination is a conflict. The candidate remains in `REVIEW/CANDIDATES/` for audit and replay.
+
+The promotion receipt carries `accepted: true`, `published: true` and `candidate_request_id`. It is backed by an immutable version, an immutable provider payload snapshot and an immutable promotion record under `.project-os/projects/<PRJ>/documents/promotions/`. Exact request replay repairs a missing head or receipt after a partial provider success, but never overwrites a different visible object or rebinds a request ID to new content. No automatic promotion or bulk PRJ-0007 publication is performed by this flow.
+
 ### Verification and receipts
 
 Supported declared formats are PDF (`.pdf`), PNG (`.png`), JPEG (`.jpg`/`.jpeg`) and ZIP (`.zip`). The runtime verifies the byte signature and matching extension, not a complete semantic document parse or malware scan. DOCX/XLSX/PPTX are not validated as Office documents; package them inside a ZIP candidate if needed. Do not merely rename an Office document and claim Office validation.

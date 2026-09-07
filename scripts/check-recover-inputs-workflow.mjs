@@ -110,7 +110,6 @@ assert.deepEqual(stepByName.get("Build strict recovery payload")?.env, {
 assert.deepEqual(stepByName.get("Run targeted recovery and verify INPUTS drained")?.env, {
   RECOVERY_RESPONSE_FILE: "${{ runner.temp }}/recover-inputs-response.json",
   RECOVERY_PAYLOAD_FILE: "${{ runner.temp }}/recover-inputs-payload.json",
-  POSTCHECK_RESPONSE_FILE: "${{ runner.temp }}/recover-inputs-postcheck.json",
 }, "recovery paths must use runner.temp only at step scope");
 
 assert.equal(
@@ -151,14 +150,14 @@ assert.doesNotMatch(attachSource, /OPERATOR_VERSION_ID@(?:[1-9][0-9]*(?:\.[0-9]+
 
 const runSource = String(stepByName.get("Run targeted recovery and verify INPUTS drained")?.run ?? "");
 assert.match(runSource, /--request POST[\s\S]*\/v1\/admin\/recover-inputs/);
-assert.match(runSource, /--request GET[\s\S]*\/v1\/admin\/input-recovery-status\?project_id=/);
-assert.equal((runSource.match(/Cloudflare-Workers-Version-Overrides/g) ?? []).length, 2);
-assert.equal((runSource.match(/Authorization: Bearer \$OPERATOR_TOKEN/g) ?? []).length, 2);
+assert.equal((runSource.match(/Cloudflare-Workers-Version-Overrides/g) ?? []).length, 1);
+assert.equal((runSource.match(/Authorization: Bearer \$OPERATOR_TOKEN/g) ?? []).length, 1);
 assert.match(runSource, /--connect-timeout 5/);
 assert.match(runSource, /--max-time 30/);
 assert.match(runSource, /--retry 0/);
 assert.match(runSource, /safe\.scanned\s*!==\s*safe\.completed\s*\+\s*safe\.duplicate_cleaned\s*\+\s*safe\.conflicts\s*\+\s*safe\.withdrawn\s*\+\s*safe\.failed/);
-assert.match(runSource, /body\?\.remaining\s*!==\s*0/);
+assert.match(runSource, /safe\.remaining\s*!==\s*0/);
+assert.doesNotMatch(runSource, /--request GET/);
 assert.doesNotMatch(runSource, /--request\s+(PUT|PATCH|DELETE)\b/i);
 
 const cleanup = stepByName.get("Restore base production deployment and verify cleanup");

@@ -276,11 +276,10 @@ jobs:
         env:
           RECOVERY_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-response.json
           RECOVERY_PAYLOAD_FILE: ${{ runner.temp }}/recover-inputs-payload.json
-          POSTCHECK_RESPONSE_FILE: ${{ runner.temp }}/recover-inputs-postcheck.json
         shell: bash
         run: |
           set -euo pipefail
-          trap 'rm -f "$RECOVERY_PAYLOAD_FILE" "$RECOVERY_RESPONSE_FILE" "$POSTCHECK_RESPONSE_FILE"' EXIT
+          trap 'rm -f "$RECOVERY_PAYLOAD_FILE" "$RECOVERY_RESPONSE_FILE"' EXIT
 
           curl \
             --fail-with-body \
@@ -314,6 +313,7 @@ jobs:
             conflicts: result.conflicts,
             withdrawn: result.withdrawn,
             failed: result.failed,
+            remaining: result.remaining,
           };
           for (const [key, value] of Object.entries(safe)) {
             if (key === "project_id") continue;
@@ -327,47 +327,10 @@ jobs:
           if (safe.failed !== 0 || safe.conflicts !== 0) {
             throw new Error(`Recovery completed with failed=${safe.failed} conflicts=${safe.conflicts}`);
           }
+          if (safe.remaining !== 0) {
+            throw new Error(`Post-recovery verification found ${safe.remaining} INPUTS remaining`);
+          }
           console.log("Sanitized recovery summary:", JSON.stringify(safe));
-          NODE
-
-          postcheck_ready=0
-          for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            postcheck_status=$(curl --silent --show-error --max-time 15 \
-              --output "$POSTCHECK_RESPONSE_FILE" \
-              --write-out '%{http_code}' \
-              --request GET \
-              --header "Authorization: Bearer $OPERATOR_TOKEN" \
-              --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
-              "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=$PROJECT_ID" || true)
-            postcheck_decision=$(node scripts/recovery-http-policy.mjs postcheck "$postcheck_status")
-            if [ "$postcheck_decision" = "ready" ]; then
-              postcheck_ready=1
-              break
-            fi
-            if [ "$postcheck_decision" = "retry" ]; then
-              echo "Post-recovery verification received transient HTTP $postcheck_status on attempt $attempt; waiting for operator version propagation."
-              sleep 2
-              continue
-            fi
-            echo "Unexpected post-recovery verification response: HTTP ${postcheck_status:-curl-error}."
-            exit 1
-          done
-          if [ "$postcheck_ready" -ne 1 ]; then
-            echo "Post-recovery verification did not become ready within the bounded retry window."
-            exit 1
-          fi
-
-          node <<'NODE'
-          const fs = require("node:fs");
-          const body = JSON.parse(fs.readFileSync(process.env.POSTCHECK_RESPONSE_FILE, "utf8"));
-          const projectId = process.env.PROJECT_ID;
-          if (body?.project_id !== projectId) throw new Error("Post-recovery project_id mismatch");
-          if (!Number.isSafeInteger(body?.remaining) || body.remaining < 0) {
-            throw new Error("Post-recovery remaining INPUT count is invalid");
-          }
-          if (body?.remaining !== 0) {
-            throw new Error(`Post-recovery verification found ${body.remaining} INPUTS remaining`);
-          }
           console.log(`Post-recovery INPUT verification passed for ${projectId}: remaining=0.`);
           NODE
 

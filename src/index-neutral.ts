@@ -208,6 +208,7 @@ interface InputRecoveryProjectSummary {
   conflicts: number;
   withdrawn: number;
   failed: number;
+  remaining: number;
 }
 
 export interface MaterializationReconcileSummary {

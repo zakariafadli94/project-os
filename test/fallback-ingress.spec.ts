@@ -239,7 +239,7 @@ describe("encrypted Project OS fallback ingress", () => {
     expect(await response.json()).toEqual({ error: "unauthorized" });
   });
 
-  it("returns canonical project context encrypted end-to-end", async () => {
+  it("returns compact canonical recovery context encrypted end-to-end", async () => {
     const created = await createProject("TXN-FALLBACK-CONTEXT-0001", "fallback-context");
     const result = await exchange({
       schema_version: "1.0",
@@ -254,10 +254,26 @@ describe("encrypted Project OS fallback ingress", () => {
       operation: "project_context",
       result: {
         project_id: created.project_id,
-        revision: created.new_revision
+        revision: created.new_revision,
+        name: "Fallback ingress fallback-context",
+        slug: "fallback-context",
+        objective: "Encrypted connector outage fallback test",
+        status: "active",
+        current_phase_id: null,
+        current_phase: null,
+        active_tasks: [],
+        blockers: [],
+        constraints: [],
+        accepted_decisions: [],
+        research_index: [],
+        deliverables_index: []
       }
     });
+    expect(typeof result.decrypted.result.updated_at).toBe("string");
+    expect(result.decrypted.result).toHaveProperty("framing");
+    expect(result.decrypted.result).toHaveProperty("discovery");
     expect(JSON.stringify(result.body)).not.toContain(created.project_id);
+    expect(JSON.stringify(result.body)).not.toContain("Encrypted connector outage fallback test");
   });
 
   it("commits a typed transaction through the encrypted transport and replays it idempotently", async () => {
@@ -313,6 +329,10 @@ describe("encrypted Project OS fallback ingress", () => {
       project_id: created.project_id
     });
     expect(context.decrypted.result.revision).toBe(created.new_revision + 1);
+    expect(context.decrypted.result.research_index).toEqual([
+      expect.objectContaining({ research_id: "RES-FALLBACK0001", title: "Fallback ingress evidence" })
+    ]);
+    expect(JSON.stringify(context.body)).not.toContain("Fallback ingress evidence");
   });
 
   it("rotates the server key after a successful exchange and rejects a retired-key replay", async () => {

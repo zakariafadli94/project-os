@@ -1,7 +1,11 @@
 import { deploymentIdentity } from "./deployment/identity";
 import { parseMutationCandidateResolutionRequest } from "./domain/mutation-candidate-resolution";
+import type { ProjectState } from "./domain/project-state";
 import type { Env } from "./env";
 import baseWorker from "./index";
+import { parseLayoutMode } from "./persistence/layout";
+import { createProductionPersistence } from "./persistence/production-factory";
+import { ProjectRepository } from "./persistence/repository";
 import { searchReadDisabledResponse, searchReadEnabled } from "./search/read-mode";
 
 export { DropboxChangeGuard } from "./durable/dropbox-change-guard";
@@ -144,31 +148,68 @@ async function handleFallbackIngress(request: Request, env: Env, ctx: ExecutionC
     if (typeof projectId !== "string" || !EXACT_PROJECT_ID.test(projectId)) {
       return Response.json({ error: "invalid_fallback_request" }, { status: 400 });
     }
+
     const statusResponse = await env.PROJECT_GUARD.getByName(projectId).fetch(
       "https://project-guard.internal/search-sync-status",
       { method: "GET" }
     );
     if (!statusResponse.ok) {
       await statusResponse.text();
-      return encryptFallbackResponse(fallbackGuard, decrypted, {
-        schema_version: "1.0",
-        request_id: requestId,
-        operation: "project_context",
-        result: { project_id: projectId, status: "unavailable", http_status: statusResponse.status }
-      });
+      return encryptFallbackResponse(fallbackGuard, decrypted, fallbackContextUnavailable(
+        requestId,
+        projectId,
+        "canonical_revision_unavailable",
+        statusResponse.status
+      ));
     }
+
     const status = await statusResponse.json<Record<string, unknown>>();
     if (status.project_id !== projectId || !Number.isSafeInteger(status.canonical_revision)) {
       return Response.json({ error: "fallback_context_invalid" }, { status: 502 });
     }
+    const canonicalRevision = status.canonical_revision as number;
+
+    let state: ProjectState | null;
+    try {
+      const repository = new ProjectRepository(
+        createProductionPersistence(env, projectId),
+        parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE)
+      );
+      state = await repository.readProjectState(projectId);
+    } catch {
+      return encryptFallbackResponse(fallbackGuard, decrypted, fallbackContextUnavailable(
+        requestId,
+        projectId,
+        "canonical_context_snapshot_unavailable",
+        503,
+        canonicalRevision
+      ));
+    }
+
+    if (!state) {
+      return encryptFallbackResponse(fallbackGuard, decrypted, fallbackContextUnavailable(
+        requestId,
+        projectId,
+        "canonical_context_snapshot_missing",
+        404,
+        canonicalRevision
+      ));
+    }
+    if (state.revision !== canonicalRevision) {
+      return encryptFallbackResponse(fallbackGuard, decrypted, fallbackContextUnavailable(
+        requestId,
+        projectId,
+        "canonical_context_snapshot_stale",
+        409,
+        canonicalRevision
+      ));
+    }
+
     plaintextResponse = {
       schema_version: "1.0",
       request_id: requestId,
       operation: "project_context",
-      result: {
-        project_id: projectId,
-        revision: status.canonical_revision
-      }
+      result: buildFallbackProjectContext(state)
     };
   } else if (inner.operation === "transaction") {
     if (!isRecord(inner.transaction)) {
@@ -206,6 +247,102 @@ async function handleFallbackIngress(request: Request, env: Env, ctx: ExecutionC
   }
 
   return encryptFallbackResponse(fallbackGuard, decrypted, plaintextResponse);
+}
+
+function fallbackContextUnavailable(
+  requestId: string,
+  projectId: string,
+  code: string,
+  httpStatus: number,
+  revision?: number
+): Record<string, unknown> {
+  return {
+    schema_version: "1.0",
+    request_id: requestId,
+    operation: "project_context",
+    result: {
+      project_id: projectId,
+      status: "unavailable",
+      code,
+      http_status: httpStatus,
+      ...(revision !== undefined ? { revision } : {})
+    }
+  };
+}
+
+function buildFallbackProjectContext(state: ProjectState): Record<string, unknown> {
+  const currentPhase = state.current_phase_id ? state.plan_phases[state.current_phase_id] ?? null : null;
+  const activeTasks = Object.values(state.tasks)
+    .filter((task) => task.status === "active" || task.status === "blocked")
+    .sort((left, right) => left.task_id.localeCompare(right.task_id))
+    .map((task) => ({
+      task_id: task.task_id,
+      title: task.title,
+      status: task.status,
+      ...(task.description ? { description: task.description } : {}),
+      ...(task.phase_id ? { phase_id: task.phase_id } : {}),
+      ...(task.blocked_reason ? { blocked_reason: task.blocked_reason } : {}),
+      ...(task.result ? { result: task.result } : {}),
+      updated_at: task.updated_at
+    }));
+  const blockers = Object.values(state.tasks)
+    .filter((task) => task.status === "blocked")
+    .sort((left, right) => left.task_id.localeCompare(right.task_id))
+    .map((task) => ({
+      task_id: task.task_id,
+      title: task.title,
+      blocked_reason: task.blocked_reason ?? "blocked"
+    }));
+  const constraints = Object.values(state.constraints)
+    .sort((left, right) => left.constraint_id.localeCompare(right.constraint_id));
+  const acceptedDecisions = Object.values(state.decisions)
+    .filter((decision) => decision.status === "accepted")
+    .sort((left, right) => left.decision_id.localeCompare(right.decision_id))
+    .map((decision) => ({
+      decision_id: decision.decision_id,
+      title: decision.title,
+      status: decision.status,
+      impacts: decision.impacts,
+      updated_at: decision.updated_at
+    }));
+  const researchIndex = Object.values(state.research)
+    .sort((left, right) => left.research_id.localeCompare(right.research_id))
+    .map((research) => ({
+      research_id: research.research_id,
+      title: research.title,
+      ...(research.source ? { source: research.source } : {}),
+      created_at: research.created_at
+    }));
+  const deliverablesIndex = Object.values(state.deliverables)
+    .sort((left, right) => left.deliverable_id.localeCompare(right.deliverable_id))
+    .map((deliverable) => ({
+      deliverable_id: deliverable.deliverable_id,
+      title: deliverable.title,
+      status: deliverable.status,
+      ...(deliverable.reference ? { reference: deliverable.reference } : {}),
+      updated_at: deliverable.updated_at
+    }));
+
+  return {
+    project_id: state.project_id,
+    revision: state.revision,
+    name: state.name,
+    slug: state.slug,
+    aliases: state.aliases,
+    objective: state.objective,
+    framing: state.framing,
+    discovery: state.discovery,
+    status: state.status,
+    current_phase_id: state.current_phase_id,
+    current_phase: currentPhase,
+    active_tasks: activeTasks,
+    blockers,
+    constraints,
+    accepted_decisions: acceptedDecisions,
+    research_index: researchIndex,
+    deliverables_index: deliverablesIndex,
+    updated_at: state.updated_at
+  };
 }
 
 async function encryptFallbackResponse(

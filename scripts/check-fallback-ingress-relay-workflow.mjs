@@ -23,7 +23,8 @@ assert.deepEqual(workflow.permissions, { issues: "write" }, "relay may only writ
 assert.deepEqual(workflow.concurrency, {
   group: "project-os-fallback-ingress-relay",
   "cancel-in-progress": false,
-});
+  queue: "max",
+}, "relay must serialize requests without replacing pending requests");
 
 const jobs = Object.values(workflow.jobs ?? {});
 assert.equal(jobs.length, 1, "exactly one relay job is expected");

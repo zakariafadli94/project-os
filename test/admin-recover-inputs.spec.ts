@@ -175,6 +175,7 @@ describe("POST /v1/admin/recover-inputs", () => {
       conflicts: number;
       withdrawn: number;
       failed: number;
+      remaining: number;
     }> }>();
     expect(body).toMatchObject({
       results: [{
@@ -184,7 +185,8 @@ describe("POST /v1/admin/recover-inputs", () => {
         duplicate_cleaned: 0,
         conflicts: 0,
         withdrawn: 0,
-        failed: 0
+        failed: 0,
+        remaining: 0
       }]
     });
     assertSummaryInvariant(body.results[0]);

@@ -478,6 +478,8 @@ export class ProjectGuard extends DurableObject<Env> {
         return this.managedDocumentService.promoteToReview(request, state);
       case "publish":
         return this.managedDocumentService.publish(request, state);
+      case "review_candidate.promote":
+        return this.managedDocumentService.promoteReviewCandidate(request, state);
       case "reopen":
         return this.managedDocumentService.reopenPublished(request, state);
       case "reference.classify":

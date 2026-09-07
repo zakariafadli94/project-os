@@ -40,3 +40,7 @@ export class ProviderCapabilityError extends Error {
     this.name = "ProviderCapabilityError";
   }
 }
+
+export class ProviderBinaryReadLimitError extends Error {
+  constructor() { super("Binary read exceeds byte limit"); this.name = "ProviderBinaryReadLimitError"; }
+}

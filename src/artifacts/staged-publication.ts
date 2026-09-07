@@ -61,6 +61,7 @@ export class StagedArtifactPublisher {
       cleanupOnSuccess: boolean;
     } | null = null;
     let published: ProviderObjectMetadata | null = null;
+    let verified: ProviderObjectMetadata | null = null;
     beforeCopy?.();
     try {
       if (existing) {
@@ -112,7 +113,7 @@ export class StagedArtifactPublisher {
       if (!visible || !sameObservation(published, visible) || !samePayload(source!, visible)) {
         throw new StagedArtifactSourceMismatchError("final provider evidence does not match source");
       }
-      await onVerified?.(visible);
+      verified = visible;
     } catch (error) {
       const currentDestination = await this.runtime.objects.getMetadata(destination.path);
       const originalStillVisible = Boolean(
@@ -124,6 +125,9 @@ export class StagedArtifactPublisher {
       }
       throw error;
     }
+    // A lost journal response must preserve the verified copy for exact replay.
+    // Rollback applies only to publication/verification failures above.
+    if (verified) await onVerified?.(verified);
     if (rollbackBackup?.cleanupOnSuccess) await this.deleteObserved(rollbackBackup.metadata);
     return "written";
   }

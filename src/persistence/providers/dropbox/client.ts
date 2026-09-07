@@ -1,3 +1,4 @@
+import { ProviderBinaryReadLimitError } from "../../provider/errors";
 export interface DropboxTransport {
   upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void>;
   download(path: string): Promise<string | null>;
@@ -206,7 +207,7 @@ export class DropboxClient implements DropboxTransport {
         const { done, value } = await reader.read();
         if (done) break;
         size += value.byteLength;
-        if (size > maxBytes) { await reader.cancel(); throw new Error("Binary read exceeds byte limit"); }
+        if (size > maxBytes) { await reader.cancel(); throw new ProviderBinaryReadLimitError(); }
         chunks.push(value);
       }
     } finally { reader.releaseLock(); }

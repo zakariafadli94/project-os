@@ -4,7 +4,7 @@ import type {
   ProviderEntry,
   ProviderObjectMetadata
 } from "../../provider/contract";
-import { ProviderCapabilityError, ProviderConflictError } from "../../provider/errors";
+import { ProviderBinaryReadLimitError, ProviderCapabilityError, ProviderConflictError } from "../../provider/errors";
 import type {
   DropboxChangeEntry,
   DropboxEntry,
@@ -121,6 +121,7 @@ async function call<T>(operation: DropboxOperation, target: string, fn: () => Pr
   try {
     return await fn();
   } catch (error) {
+    if (error instanceof ProviderBinaryReadLimitError) throw error;
     const mapped = mapDropboxError(error, operation);
     if (mapped === error && error instanceof Error) {
       throw new Error(`Dropbox ${operation} failed for ${target}: ${error.message}`);

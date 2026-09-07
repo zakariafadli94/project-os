@@ -358,3 +358,19 @@ it("rechecks authorization immediately before copy after the byte read", async (
   await expect(new StagedArtifactPublisher(f.runtime).publish(request,{path:destinationPath},undefined,()=>{throw new Error("expired capability");})).rejects.toThrow(/expired/);
   expect(f.metadata.has(destinationPath)).toBe(false);
 });
+it("retains a verified copy when journaling succeeds but its response is lost", async () => {
+  const f = fixture();
+  const observations: ProviderObjectMetadata[] = [];
+  let copies = 0;
+  const copy = f.runtime.serverSideCopy.copyObject;
+  f.runtime.serverSideCopy.copyObject = async (from,to) => { copies++; return copy(from,to); };
+  await expect(new StagedArtifactPublisher(f.runtime).publish(request,{path:destinationPath},async metadata => {
+    observations.push(metadata);
+    throw new Error("journal response lost");
+  })).rejects.toThrow(/response lost/);
+  expect(f.metadata.get(destinationPath)).toEqual(observations[0]);
+  await expect(new StagedArtifactPublisher(f.runtime).publish(request,{path:destinationPath},async metadata => {
+    expect(metadata).toEqual(observations[0]);
+  })).resolves.toBe("idempotent");
+  expect(copies).toBe(1);
+});

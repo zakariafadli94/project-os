@@ -23,3 +23,8 @@ it("cancels oversized streaming bodies without trusting content-length", async (
   await expect(raw.downloadBytes("/source", 4)).rejects.toThrow(/limit/);
   expect(cancelled).toBe(true);
 });
+it("preserves a deterministic oversize failure through the adapter", async () => {
+  const raw = client(() => new Response(new Uint8Array(5)));
+  const runtime = withProviderResilience(createDropboxPersistence(raw));
+  await expect(runtime.objects.readBytes!("/source",4)).rejects.toMatchObject({name:"ProviderBinaryReadLimitError"});
+});

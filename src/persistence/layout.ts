@@ -175,6 +175,11 @@ export function machineDocumentProviderPayloadPath(projectId: string, documentId
   return `${machineDocumentRoot(projectId)}/payloads/provider/${assertSafeDocumentId(documentId)}/${assertSafeDocumentVersionId(versionId)}/payload`;
 }
 
+export function machineDocumentPromotionPath(projectId: string, requestId: string): string {
+  if (!/^DOCREQ-[A-Z0-9-]{8,}$/.test(requestId)) throw new Error(`Unsafe managed document request id: ${requestId}`);
+  return `${machineDocumentRoot(projectId)}/promotions/${requestId}.json`;
+}
+
 export function machineInputIntakePath(projectId: string, intakeId: string): string {
   return `${machineDocumentRoot(projectId)}/intakes/${assertSafeInputIntakeId(intakeId)}.json`;
 }
@@ -282,6 +287,7 @@ export const v2Paths = {
   machineDocumentVersionPath,
   machineDocumentTextPayloadPath,
   machineDocumentProviderPayloadPath,
+  machineDocumentPromotionPath,
   machineInputIntakePath,
   machineInputIntakeSourceBindingPath,
   machineMutationGateRoot,

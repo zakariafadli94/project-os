@@ -1,7 +1,6 @@
-import { readFileSync } from "node:fs";
+/// <reference types="vite/client" />
+import sop from "../docs/project-os-sop.md?raw";
 import { describe, expect, it } from "vitest";
-
-const sop = readFileSync("docs/project-os-sop.md", "utf8");
 
 describe("Project OS SOP encrypted fallback recovery", () => {
   it("defines the connector-outage fallback as a governed recovery path", () => {

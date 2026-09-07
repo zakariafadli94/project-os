@@ -169,18 +169,19 @@ async function handleFallbackIngress(request: Request, env: Env, ctx: ExecutionC
     }
     const canonicalRevision = status.canonical_revision as number;
 
-    let state: ProjectState | null;
+    let state: ProjectState | null = null;
     try {
       const repository = new ProjectRepository(
         createProductionPersistence(env, projectId),
         parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE)
       );
-      state = await repository.readProjectState(projectId);
+      const record = await repository.readCommitRecord(projectId, canonicalRevision);
+      state = record?.state ?? null;
     } catch {
       return encryptFallbackResponse(fallbackGuard, decrypted, fallbackContextUnavailable(
         requestId,
         projectId,
-        "canonical_context_snapshot_unavailable",
+        "canonical_commit_unavailable",
         503,
         canonicalRevision
       ));
@@ -190,19 +191,13 @@ async function handleFallbackIngress(request: Request, env: Env, ctx: ExecutionC
       return encryptFallbackResponse(fallbackGuard, decrypted, fallbackContextUnavailable(
         requestId,
         projectId,
-        "canonical_context_snapshot_missing",
+        "canonical_commit_missing",
         404,
         canonicalRevision
       ));
     }
-    if (state.revision !== canonicalRevision) {
-      return encryptFallbackResponse(fallbackGuard, decrypted, fallbackContextUnavailable(
-        requestId,
-        projectId,
-        "canonical_context_snapshot_stale",
-        409,
-        canonicalRevision
-      ));
+    if (state.project_id !== projectId || state.revision !== canonicalRevision) {
+      return Response.json({ error: "fallback_context_invalid" }, { status: 502 });
     }
 
     plaintextResponse = {

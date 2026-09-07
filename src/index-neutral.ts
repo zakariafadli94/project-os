@@ -208,6 +208,9 @@ interface InputRecoveryProjectSummary {
   conflicts: number;
   withdrawn: number;
   failed: number;
+}
+
+interface VerifiedInputRecoveryProjectSummary extends InputRecoveryProjectSummary {
   remaining: number;
 }
 
@@ -462,7 +465,7 @@ async function recoverInputs(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  const results: InputRecoveryProjectSummary[] = [];
+  const results: VerifiedInputRecoveryProjectSummary[] = [];
   for (const projectId of projectIds) {
     const guard = env.PROJECT_GUARD.getByName(projectId);
     const response = await guard.fetch("https://project-guard.internal/recover-inputs", { method: "POST" });
@@ -473,7 +476,17 @@ async function recoverInputs(request: Request, env: Env): Promise<Response> {
         status: response.status
       }, { status: 502 });
     }
-    results.push(await response.json<InputRecoveryProjectSummary>());
+    const summary = await response.json<InputRecoveryProjectSummary>();
+    const statusResponse = await guard.fetch("https://project-guard.internal/input-recovery-status", { method: "GET" });
+    if (!statusResponse.ok) {
+      return Response.json({
+        error: "input_recovery_verification_failed",
+        project_id: projectId,
+        status: statusResponse.status
+      }, { status: 502 });
+    }
+    const status = await statusResponse.json<{ remaining: number }>();
+    results.push({ ...summary, remaining: status.remaining });
   }
 
   return Response.json({ results });

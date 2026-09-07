@@ -17,12 +17,6 @@ export function classifyRevocationResponse(status) {
   return status === 401 || status === 404 ? "revoked" : "retry";
 }
 
-export function classifyPostcheckResponse(status) {
-  if (status === 200) return "ready";
-  if (status === 401 || status === 404) return "retry";
-  return "fail";
-}
-
 function runCli(args) {
   const [phase, rawStatus, bodyPath] = args;
   const status = Number(rawStatus);
@@ -33,7 +27,6 @@ function runCli(args) {
     return classifyReadinessResponse(status, readFileSync(bodyPath, "utf8"));
   }
   if (phase === "revocation") return classifyRevocationResponse(status);
-  if (phase === "postcheck") return classifyPostcheckResponse(status);
   throw new Error(`Unknown recovery HTTP phase: ${phase ?? ""}`);
 }
 

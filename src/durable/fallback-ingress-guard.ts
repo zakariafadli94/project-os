@@ -160,20 +160,20 @@ async function encryptResponse(
 ): Promise<{ schema_version: "1.0"; key_id: string; iv: string; ciphertext: string }> {
   const sharedSecret = await deriveSharedSecret(key.private_key, clientPublicKey);
   const aesKey = await deriveAesKey(sharedSecret, key.key_id, "response", ["encrypt"]);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ivBytes = crypto.getRandomValues(new Uint8Array(12));
   const ciphertext = await crypto.subtle.encrypt(
     {
       name: "AES-GCM",
-      iv,
+      iv: toArrayBuffer(ivBytes),
       additionalData: additionalData(key.key_id, "response")
     },
     aesKey,
-    encoder.encode(plaintext)
+    toArrayBuffer(encoder.encode(plaintext))
   );
   return {
     schema_version: SCHEMA_VERSION,
     key_id: key.key_id,
-    iv: base64UrlEncode(iv),
+    iv: base64UrlEncode(ivBytes),
     ciphertext: base64UrlEncode(new Uint8Array(ciphertext))
   };
 }
@@ -217,8 +217,8 @@ async function deriveAesKey(
   );
 }
 
-function additionalData(keyId: string, direction: Direction): Uint8Array {
-  return encoder.encode(`project-os-fallback-v1:${keyId}:${direction}`);
+function additionalData(keyId: string, direction: Direction): ArrayBuffer {
+  return toArrayBuffer(encoder.encode(`project-os-fallback-v1:${keyId}:${direction}`));
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -227,10 +227,16 @@ function base64UrlEncode(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function base64UrlDecode(value: string): Uint8Array {
+function base64UrlDecode(value: string): ArrayBuffer {
   const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
   const binary = atob(padded);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return toArrayBuffer(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -97,9 +97,10 @@ export class ProjectGuard extends NeutralProjectGuard {
     if (!boundProjectId) return Response.json({ error: "project_not_initialized" }, { status: 404 });
     const state = await this.loadBoundState(boundProjectId);
     if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
-    const summary = await this.inputRecovery.recover(state);
-    const status = await this.inputRecovery.status(state);
-    return Response.json({ project_id: boundProjectId, ...summary, ...status });
+    return Response.json({
+      project_id: boundProjectId,
+      ...await this.inputRecovery.recover(state)
+    });
   }
 
   private async handleInputRecoveryStatus(): Promise<Response> {

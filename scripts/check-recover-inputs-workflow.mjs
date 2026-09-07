@@ -167,9 +167,9 @@ const cleanupSource = String(cleanup?.run ?? "");
 assert.match(cleanupSource, /timeout 60s npx wrangler versions deploy/);
 assert.ok(cleanupSource.includes("$BASE_VERSION_ID@100%"));
 assert.ok(cleanupSource.includes("Operator version is no longer present in the active deployment."));
-assert.ok(cleanupSource.includes("Operator token revocation verified with HTTP 401"));
+assert.ok(cleanupSource.includes("Operator token revocation verified with HTTP $revoke_status"));
 assert.match(cleanupSource, /Cloudflare-Workers-Version-Overrides/);
-assert.match(cleanupSource, /revoke_status[\s\S]*"401"/);
+assert.match(cleanupSource, /recovery-http-policy\.mjs revocation/);
 assert.doesNotMatch(cleanupSource, /OPERATOR_VERSION_ID@0%/);
 
 assert.doesNotMatch(source, /while\s+(?:true|:)/, "unbounded loops are forbidden");

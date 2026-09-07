@@ -255,12 +255,14 @@ jobs:
               --header "Authorization: Bearer $OPERATOR_TOKEN" \
               --header "Cloudflare-Workers-Version-Overrides: $WORKER_NAME=\"$OPERATOR_VERSION_ID\"" \
               "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=PRJ-000" || true)
-            if [ "$readiness_status" = "400" ] && grep -q '"error":"invalid_project_id"' /tmp/input-recovery-readiness-body.json; then
+            readiness_decision=$(node scripts/recovery-http-policy.mjs \
+              readiness "$readiness_status" /tmp/input-recovery-readiness-body.json)
+            if [ "$readiness_decision" = "ready" ]; then
               echo "Ephemeral recovery token is active only on the targeted zero-traffic Worker version."
               exit 0
             fi
-            if [ "$readiness_status" = "401" ]; then
-              echo "Recovery readiness received HTTP 401 on attempt $attempt; waiting for operator version propagation."
+            if [ "$readiness_decision" = "retry" ]; then
+              echo "Recovery readiness received transient HTTP $readiness_status on attempt $attempt; waiting for operator version propagation."
               sleep 2
               continue
             fi
@@ -417,8 +419,9 @@ jobs:
               --request GET \
               --header "Authorization: Bearer $OPERATOR_TOKEN" \
               "$PROJECT_OS_URL/v1/admin/input-recovery-status?project_id=PRJ-000" || true)
-            if [ "$revoke_status" = "401" ]; then
-              echo "Operator token revocation verified with HTTP 401 on normal production traffic."
+            revoke_decision=$(node scripts/recovery-http-policy.mjs revocation "$revoke_status")
+            if [ "$revoke_decision" = "revoked" ]; then
+              echo "Operator token revocation verified with HTTP $revoke_status on normal production traffic."
               revoked=1
               break
             fi
@@ -426,7 +429,7 @@ jobs:
             sleep 2
           done
           if [ "$revoked" -ne 1 ]; then
-            echo "Expected HTTP 401 after operator-version cleanup."
+            echo "Expected HTTP 401 or 404 after operator-version cleanup."
             cleanup_failed=1
           fi
 

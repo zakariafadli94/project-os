@@ -63,7 +63,8 @@ describe("recover-inputs GitHub Actions workflow", () => {
     expect(source).toContain("if: always()");
     expect(source).toContain("Restore base production deployment and verify cleanup");
     expect(source).toContain("Operator version is no longer present in the active deployment.");
-    expect(source).toContain("Operator token revocation verified with HTTP 401");
+    expect(source).toContain("scripts/recovery-http-policy.mjs");
+    expect(source).toContain("Operator token revocation verified with HTTP $revoke_status");
     expect(source).toContain("TOKEN_VERSION_CREATED");
   });
 

@@ -30,7 +30,7 @@ interface EncryptRequest {
 }
 
 export class FallbackIngressGuard extends DurableObject<Env> {
-  private readonly keyPair: Promise<StoredKeyPair>;
+  private keyPair: Promise<StoredKeyPair>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -77,7 +77,9 @@ export class FallbackIngressGuard extends DurableObject<Env> {
         if (!secureStringEqual(body.key_id, key.key_id)) {
           return Response.json({ error: "invalid_fallback_key" }, { status: 400 });
         }
-        return Response.json(await encryptResponse(key, body.client_public_key, body.plaintext));
+        const encrypted = await encryptResponse(key, body.client_public_key, body.plaintext);
+        await this.rotateKeyPair(key.key_id);
+        return Response.json(encrypted);
       } catch {
         return Response.json({ error: "invalid_fallback_response" }, { status: 400 });
       }
@@ -90,19 +92,32 @@ export class FallbackIngressGuard extends DurableObject<Env> {
     const existing = await this.ctx.storage.get<StoredKeyPair>(KEY_STORAGE_KEY);
     if (existing) return existing;
 
-    const generated = await crypto.subtle.generateKey(
-      { name: "ECDH", namedCurve: "P-256" },
-      true,
-      ["deriveBits"]
-    ) as CryptoKeyPair;
-    const key: StoredKeyPair = {
-      key_id: base64UrlEncode(crypto.getRandomValues(new Uint8Array(18))),
-      public_key: await crypto.subtle.exportKey("jwk", generated.publicKey),
-      private_key: await crypto.subtle.exportKey("jwk", generated.privateKey)
-    };
+    const key = await generateStoredKeyPair();
     await this.ctx.storage.put(KEY_STORAGE_KEY, key);
     return key;
   }
+
+  private async rotateKeyPair(expectedKeyId: string): Promise<void> {
+    const current = await this.keyPair;
+    if (!secureStringEqual(current.key_id, expectedKeyId)) return;
+
+    const next = await generateStoredKeyPair();
+    await this.ctx.storage.put(KEY_STORAGE_KEY, next);
+    this.keyPair = Promise.resolve(next);
+  }
+}
+
+async function generateStoredKeyPair(): Promise<StoredKeyPair> {
+  const generated = await crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" },
+    true,
+    ["deriveBits"]
+  ) as CryptoKeyPair;
+  return {
+    key_id: base64UrlEncode(crypto.getRandomValues(new Uint8Array(18))),
+    public_key: await crypto.subtle.exportKey("jwk", generated.publicKey),
+    private_key: await crypto.subtle.exportKey("jwk", generated.privateKey)
+  };
 }
 
 function parseEnvelope(value: unknown): EncryptedEnvelope {

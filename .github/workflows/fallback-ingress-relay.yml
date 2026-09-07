@@ -1,0 +1,169 @@
+name: encrypted fallback ingress relay
+
+"on":
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: project-os-fallback-ingress-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    if: >-
+      github.event.issue.title == 'Project OS encrypted fallback relay' &&
+      github.event.issue.user.login == github.repository_owner &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, 'PROJECT_OS_FALLBACK_V1 ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Relay encrypted Project OS envelope
+        env:
+          INGRESS_TOKEN: ${{ secrets.INGRESS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const requestPrefix = "PROJECT_OS_FALLBACK_V1 ";
+          const responsePrefix = "PROJECT_OS_FALLBACK_RESPONSE_V1 ";
+          const retryPrefix = "PROJECT_OS_FALLBACK_RETRY_V1 ";
+          const workerUrl = "https://project-os-guard.zakaria-fadli-94.workers.dev/v1/fallback-ingress";
+          const maxEnvelopeBytes = 128 * 1024;
+
+          function requireEnv(name) {
+            const value = process.env[name];
+            if (typeof value !== "string" || value.length === 0) throw new Error("fallback relay configuration invalid");
+            return value;
+          }
+
+          function isRecord(value) {
+            return typeof value === "object" && value !== null && !Array.isArray(value);
+          }
+
+          function assertEnvelope(envelope) {
+            if (!isRecord(envelope)) throw new Error("fallback relay request invalid");
+            if (Object.keys(envelope).sort().join(",") !== "ciphertext,client_public_key,iv,key_id,schema_version") {
+              throw new Error("fallback relay request invalid");
+            }
+            if (envelope.schema_version !== "1.0") throw new Error("fallback relay request invalid");
+            if (typeof envelope.key_id !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(envelope.key_id)) {
+              throw new Error("fallback relay request invalid");
+            }
+            if (typeof envelope.iv !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(envelope.iv)) {
+              throw new Error("fallback relay request invalid");
+            }
+            if (typeof envelope.ciphertext !== "string" || envelope.ciphertext.length < 16) {
+              throw new Error("fallback relay request invalid");
+            }
+            const publicKey = envelope.client_public_key;
+            if (!isRecord(publicKey) || publicKey.kty !== "EC" || publicKey.crv !== "P-256" ||
+                typeof publicKey.x !== "string" || publicKey.x.length === 0 ||
+                typeof publicKey.y !== "string" || publicKey.y.length === 0 || publicKey.d !== undefined) {
+              throw new Error("fallback relay request invalid");
+            }
+          }
+
+          function assertEncryptedResponse(encryptedResponse) {
+            if (!isRecord(encryptedResponse)) throw new Error("fallback relay response invalid");
+            if (Object.keys(encryptedResponse).sort().join(",") !== "ciphertext,iv,key_id,schema_version") {
+              throw new Error("fallback relay response invalid");
+            }
+            if (encryptedResponse.schema_version !== "1.0") throw new Error("fallback relay response invalid");
+            if (typeof encryptedResponse.key_id !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(encryptedResponse.key_id)) {
+              throw new Error("fallback relay response invalid");
+            }
+            if (typeof encryptedResponse.iv !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(encryptedResponse.iv)) {
+              throw new Error("fallback relay response invalid");
+            }
+            if (typeof encryptedResponse.ciphertext !== "string" || encryptedResponse.ciphertext.length < 16) {
+              throw new Error("fallback relay response invalid");
+            }
+          }
+
+          async function postIssueComment(repository, issueNumber, githubToken, body) {
+            const response = await fetch(`https://api.github.com/repos/${repository}/issues/${issueNumber}/comments`, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${githubToken}`,
+                accept: "application/vnd.github+json",
+                "x-github-api-version": "2022-11-28",
+                "content-type": "application/json"
+              },
+              body: JSON.stringify({ body })
+            });
+            if (!response.ok) throw new Error("fallback relay response publication failed");
+          }
+
+          async function main() {
+            const ingressToken = requireEnv("INGRESS_TOKEN");
+            const githubToken = requireEnv("GITHUB_TOKEN");
+            const commentBody = requireEnv("COMMENT_BODY");
+            const repository = requireEnv("REPOSITORY");
+            const issueNumber = requireEnv("ISSUE_NUMBER");
+
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !/^[1-9][0-9]*$/.test(issueNumber)) {
+              throw new Error("fallback relay target invalid");
+            }
+            if (!commentBody.startsWith(requestPrefix)) throw new Error("fallback relay request invalid");
+
+            const framed = commentBody.slice(requestPrefix.length);
+            const separator = framed.indexOf(" ");
+            if (separator <= 0) throw new Error("fallback relay request invalid");
+            const tag = framed.slice(0, separator);
+            if (!/^[A-Za-z0-9_-]{16,64}$/.test(tag)) throw new Error("fallback relay request invalid");
+            const envelopeText = framed.slice(separator + 1).trim();
+            if (Buffer.byteLength(envelopeText, "utf8") === 0 || Buffer.byteLength(envelopeText, "utf8") > maxEnvelopeBytes) {
+              throw new Error("fallback relay request invalid");
+            }
+
+            let envelope;
+            try {
+              envelope = JSON.parse(envelopeText);
+            } catch {
+              throw new Error("fallback relay request invalid");
+            }
+            assertEnvelope(envelope);
+
+            const workerResponse = await fetch(workerUrl, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${ingressToken}`,
+                "content-type": "application/json"
+              },
+              body: envelopeText
+            });
+
+            let reply;
+            if (workerResponse.status === 200) {
+              const responseText = await workerResponse.text();
+              if (Buffer.byteLength(responseText, "utf8") === 0 || Buffer.byteLength(responseText, "utf8") > maxEnvelopeBytes) {
+                throw new Error("fallback relay response invalid");
+              }
+              let encryptedResponse;
+              try {
+                encryptedResponse = JSON.parse(responseText);
+              } catch {
+                throw new Error("fallback relay response invalid");
+              }
+              assertEncryptedResponse(encryptedResponse);
+              reply = `${responsePrefix}${tag} ${responseText}`;
+            } else {
+              reply = `${retryPrefix}${tag} ${workerResponse.status}`;
+            }
+
+            await postIssueComment(repository, issueNumber, githubToken, reply);
+          }
+
+          main().catch((error) => {
+            console.error(error instanceof Error ? error.message : "fallback relay failed");
+            process.exit(1);
+          });
+          NODE

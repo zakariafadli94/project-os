@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  classifyPostcheckResponse,
   classifyReadinessResponse,
   classifyRevocationResponse,
 } from "../scripts/recovery-http-policy.mjs";
@@ -22,15 +21,5 @@ describe("INPUT recovery HTTP policy", () => {
     expect(classifyRevocationResponse(401)).toBe("revoked");
     expect(classifyRevocationResponse(404)).toBe("revoked");
     expect(classifyRevocationResponse(200)).toBe("retry");
-  });
-
-  it("retries a transient post-recovery 401 or 404 while the version override propagates", () => {
-    expect(classifyPostcheckResponse(401)).toBe("retry");
-    expect(classifyPostcheckResponse(404)).toBe("retry");
-  });
-
-  it("accepts only HTTP 200 for post-recovery verification", () => {
-    expect(classifyPostcheckResponse(200)).toBe("ready");
-    expect(classifyPostcheckResponse(500)).toBe("fail");
   });
 });

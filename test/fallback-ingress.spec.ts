@@ -1,8 +1,9 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index-mutation-gate";
 import type { Env } from "../src/env";
+import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
 const encoder = new TextEncoder();
@@ -186,6 +187,9 @@ async function createProject(transactionId: string, slug: string): Promise<{ pro
 }
 
 describe("encrypted Project OS fallback ingress", () => {
+  beforeEach(() => installDropboxMock());
+  afterEach(() => vi.restoreAllMocks());
+
   it("exposes only a public encryption key without requiring ingress authorization", async () => {
     const response = await worker.fetch(
       new Request("https://example.com/v1/fallback-ingress/key"),

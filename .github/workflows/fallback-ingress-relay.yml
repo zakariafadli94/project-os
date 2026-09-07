@@ -35,9 +35,13 @@ jobs:
           node <<'NODE'
           const requestPrefix = "PROJECT_OS_FALLBACK_V1 ";
           const responsePrefix = "PROJECT_OS_FALLBACK_RESPONSE_V1 ";
+          const partPrefix = "PROJECT_OS_FALLBACK_RESPONSE_PART_V1 ";
+          const unavailablePrefix = "PROJECT_OS_FALLBACK_UNAVAILABLE_V1 ";
           const retryPrefix = "PROJECT_OS_FALLBACK_RETRY_V1 ";
           const workerUrl = "https://project-os-guard.zakaria-fadli-94.workers.dev/v1/fallback-ingress";
           const maxEnvelopeBytes = 128 * 1024;
+          const maxResponseBytes = 1024 * 1024;
+          const partCharacters = 48000;
 
           function requireEnv(name) {
             const value = process.env[name];
@@ -103,6 +107,23 @@ jobs:
             if (!response.ok) throw new Error("fallback relay response publication failed");
           }
 
+          async function readResponse(response) {
+            const reader = response.body.getReader();
+            const chunks = [];
+            let size = 0;
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              size += value.byteLength;
+              if (size > maxResponseBytes) {
+                await reader.cancel();
+                return null;
+              }
+              chunks.push(Buffer.from(value));
+            }
+            return Buffer.concat(chunks).toString("utf8");
+          }
+
           async function main() {
             const ingressToken = requireEnv("INGRESS_TOKEN");
             const githubToken = requireEnv("GITHUB_TOKEN");
@@ -144,8 +165,13 @@ jobs:
 
             let reply;
             if (workerResponse.status === 200) {
-              const responseText = await workerResponse.text();
-              if (Buffer.byteLength(responseText, "utf8") === 0 || Buffer.byteLength(responseText, "utf8") > maxEnvelopeBytes) {
+              const responseText = await readResponse(workerResponse);
+              if (responseText === null) {
+                await postIssueComment(repository, issueNumber, githubToken,
+                  `${unavailablePrefix}${tag} response_too_large`);
+                return;
+              }
+              if (Buffer.byteLength(responseText, "utf8") === 0) {
                 throw new Error("fallback relay response invalid");
               }
               let encryptedResponse;
@@ -155,7 +181,20 @@ jobs:
                 throw new Error("fallback relay response invalid");
               }
               assertEncryptedResponse(encryptedResponse);
-              reply = `${responsePrefix}${tag} ${responseText}`;
+              // Canonical JSON is ASCII ciphertext; no project plaintext enters this transport.
+              const serialized = JSON.stringify(encryptedResponse);
+              if (!/^[\x20-\x7e]+$/.test(serialized)) throw new Error("fallback relay response invalid");
+              if (serialized.length > partCharacters) {
+                const total = Math.ceil(serialized.length / partCharacters);
+                for (let index = 0; index < total; index += 1) {
+                  if (index > 0) await new Promise((resolve) => setTimeout(resolve, 1100));
+                  const part = serialized.slice(index * partCharacters, (index + 1) * partCharacters);
+                  await postIssueComment(repository, issueNumber, githubToken,
+                    `${partPrefix}${tag} ${index + 1}/${total} ${part}`);
+                }
+                return;
+              }
+              reply = `${responsePrefix}${tag} ${serialized}`;
             } else {
               reply = `${retryPrefix}${tag} ${workerResponse.status}`;
             }

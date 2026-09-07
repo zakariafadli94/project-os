@@ -8,6 +8,7 @@ const documentIdSchema = z.string().regex(/^DOC-[A-F0-9]{24}$/);
 const versionIdSchema = z.string().regex(/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/);
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const providerFileIdSchema = z.string().regex(/^id:[A-Za-z0-9_-]+$/);
+const candidateRequestIdSchema = z.string().regex(/^ART-[A-Z0-9-]{10,}$/);
 
 const RESERVED_WORKSPACE_ROOTS = new Set([
   ".PROJECT-OS",
@@ -74,6 +75,7 @@ export interface DocumentVersionRecord {
   provider_path?: string;
   size?: number;
   media_type?: string;
+  source_candidate_request_id?: string;
   request_id?: string;
 }
 
@@ -172,6 +174,7 @@ const versionRecordSchema = z.strictObject({
   provider_path: z.string().min(1).optional(),
   size: z.number().int().nonnegative().safe().optional(),
   media_type: z.string().min(1).max(255).optional(),
+  source_candidate_request_id: candidateRequestIdSchema.optional(),
   request_id: z.string().regex(/^[A-Z][A-Z0-9-]{7,}$/).optional()
 }).superRefine((value, ctx) => {
   try {

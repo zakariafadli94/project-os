@@ -260,9 +260,9 @@ describe("encrypted Project OS fallback ingress", () => {
       operation: "research.add",
       created_at: "2026-09-06T22:11:00+01:00",
       payload: {
-        research_id: "RES-FALLBACK-0001",
+        research_id: "RES-FALLBACK0001",
         title: "Fallback ingress evidence",
-        content: "Connector-independent encrypted ingress committed through the normal ProjectGuard transaction path."
+        body: "Connector-independent encrypted ingress committed through the normal ProjectGuard transaction path."
       }
     };
 

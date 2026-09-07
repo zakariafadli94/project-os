@@ -233,7 +233,7 @@ export async function externalVersionIdFor(providerRev: string): Promise<string>
 export function assertManagedRelativePath(value: string): string {
   const safe = assertSafeRelative(value, "managed document path", 16, 512);
   const root = safe.split("/")[0].toUpperCase();
-  if (RESERVED_WORKSPACE_ROOTS.has(root)) {
+  if (root === "CANDIDATES" || RESERVED_WORKSPACE_ROOTS.has(root)) {
     throw new Error(`managed document path must be relative to its managed zone, not start with reserved root ${safe.split("/")[0]}`);
   }
   return safe;
@@ -242,7 +242,7 @@ export function assertManagedRelativePath(value: string): string {
 export function assertReferenceCollectionPath(value: string): string {
   const safe = assertSafeRelative(value, "reference collection path", 4, 256);
   const root = safe.split("/")[0].toUpperCase();
-  if (RESERVED_WORKSPACE_ROOTS.has(root)) {
+  if (root === "CANDIDATES" || RESERVED_WORKSPACE_ROOTS.has(root)) {
     throw new Error(`reference collection path cannot use reserved workspace root ${safe.split("/")[0]}`);
   }
   return safe;

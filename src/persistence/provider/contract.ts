@@ -31,6 +31,7 @@ export interface ProviderChangePage {
 }
 
 export interface ObjectPersistence {
+  readBytes?(path: string, maxBytes: number): Promise<Uint8Array | null>;
   readText(path: string): Promise<string | null>;
   createText(path: string, content: string): Promise<void>;
   upsertText(path: string, content: string): Promise<void>;

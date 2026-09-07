@@ -336,6 +336,7 @@ export class ManagedDocumentChangeCoordinator {
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!change.path.startsWith(root)) return null;
     const relative = change.path.slice(root.length);
+    if (relative.toUpperCase().startsWith("REVIEW/CANDIDATES/")) return null;
 
     if (relative.startsWith("DELIVERABLES/") && relative.length > "DELIVERABLES/".length) {
       const managedRelative = relative.slice("DELIVERABLES/".length);

@@ -98,3 +98,17 @@ it("skips exhausted artifacts without retrying cleanup and still admits one heal
   expect(objects.files.has(incomingPath(healthy.request_id))).toBe(false);
   expect(objects.files.has(incomingPath(outsideScan.request_id))).toBe(true);
 });
+
+it("advances a bounded scan past exhausted prefixes on the next invocation", async () => {
+  const objects = new FakeObjects();
+  for (let i=0;i<3;i++) {
+    const request = artifact(`ART-INGRESS-ROTATE-000${i}`);
+    objects.files.set(incomingPath(request.request_id), JSON.stringify(request));
+    if(i<2) objects.files.set(failurePath(request.request_id),JSON.stringify({schema_version:"1.0",request_id:request.request_id,project_id:request.project_id,status:"retryable_failure",attempt_count:8,first_failed_at:"2000-01-01T00:00:00Z",last_failed_at:"2000-01-01T00:00:00Z",message:"exhausted"}));
+  }
+  let executions = 0;
+  const options = {maxScanEntries:2,maxWorkItems:1,respectRetryBackoff:true,rotateScan:true};
+  await processArtifactInbox(objects,"v2",async r=>{executions++;return committed(r);},options);
+  await processArtifactInbox(objects,"v2",async r=>{executions++;return committed(r);},options);
+  expect(executions).toBe(1);
+});

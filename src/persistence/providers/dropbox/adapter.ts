@@ -45,6 +45,10 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
     }
   };
 
+  if (raw.downloadBytes) {
+    runtime.objects.readBytes = (path, maxBytes) => call("read", path, () => raw.downloadBytes!(path, maxBytes));
+  }
+
   if (raw.deleteIfRevision) {
     runtime.objects.deleteIfUnchanged = async (path, expected) => {
       try {

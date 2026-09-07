@@ -1,9 +1,13 @@
+import { ReviewCapabilityExpiredError } from "../artifacts/review-policy";
+import { binaryArtifactPolicyViolation } from "../artifacts/policy";
+import { ReviewCandidateRevisionError } from "../mutation-gate/artifact-intent";
 import { DurableObject } from "cloudflare:workers";
 import {
   StagedArtifactConflictError,
   StagedArtifactSourceMismatchError
 } from "../artifacts/staged-publication";
 import {
+  isReviewCandidate,
   isStagedArtifactWriteRequest,
   parseArtifactWriteRequest,
   type ArtifactWriteReceipt,
@@ -287,6 +291,24 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json(existingReceipt);
     }
 
+    if (isReviewCandidate(artifact)) {
+      try {
+        const terminal = await this.repository.reviewJournal.terminal(artifact);
+        if (terminal) return this.finalizeArtifact(artifact, terminal);
+      } catch (error) {
+        if (error instanceof MutationIntentConflictError) return Response.json(this.artifactReceipt(artifact, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH", "Request ID already has different terminal evidence"));
+        throw error;
+      }
+    }
+
+    if (isReviewCandidate(artifact)) {
+      const violation = binaryArtifactPolicyViolation(this.env, artifact);
+      if (violation) return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "rejected", violation.code, violation.message));
+      if (this.env.PROJECT_OS_LAYOUT_MODE !== "v2" || this.env.PROJECT_OS_MUTATION_GATE_MODE !== "enforce") {
+        return Response.json(this.artifactReceipt(artifact, "rejected", "REVIEW_GOVERNANCE_REQUIRED", "Review requires V2 layout and enforced MutationGate"));
+      }
+    }
+
     if (this.ctx.id.name && this.ctx.id.name !== artifact.project_id) {
       return this.finalizeArtifact(
         artifact,
@@ -310,8 +332,16 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     try {
-      await this.repository.writeArtifact(state, artifact);
+      await this.repository.writeArtifact(state, artifact, undefined, undefined, isReviewCandidate(artifact) ? () => {
+        if (binaryArtifactPolicyViolation(this.env, artifact)) throw new ReviewCapabilityExpiredError();
+      } : undefined);
     } catch (error) {
+      if (error instanceof ReviewCapabilityExpiredError) {
+        return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "rejected", "REVIEW_CAPABILITY_DENIED", error.message));
+      }
+      if (error instanceof ReviewCandidateRevisionError) {
+        return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "conflict", "BASE_REVISION_CONFLICT", error.message));
+      }
       if (error instanceof ArtifactContentConflictError || error instanceof StagedArtifactConflictError) {
         return this.finalizeArtifact(
           artifact,
@@ -332,7 +362,9 @@ export class ProjectGuard extends DurableObject<Env> {
       throw error;
     }
 
-    return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "committed"));
+    const committed = this.artifactReceipt(artifact, "committed");
+    if (isReviewCandidate(artifact)) committed.final_observation = await this.repository.reviewCandidateObservation(state, artifact);
+    return this.finalizeArtifact(artifact, committed);
   }
 
   private async handleManagedDocument(request: Request): Promise<Response> {
@@ -454,6 +486,7 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
+    if (isReviewCandidate(request)) await this.repository.reviewJournal.recordTerminal(request, receipt);
     await this.repository.writeArtifactReceipt(receipt);
     this.persistArtifact(request, receipt);
     if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
@@ -676,6 +709,7 @@ export class ProjectGuard extends DurableObject<Env> {
       relative_path: request.relative_path,
       content_sha256: request.content_sha256,
       status,
+      ...(isReviewCandidate(request) ? { operation: "REVIEW_CANDIDATE" as const, accepted: false as const, published: false as const } : {}),
       ...(code ? { code } : {}),
       ...(message ? { message } : {})
     };

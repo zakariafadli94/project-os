@@ -1,3 +1,5 @@
+import { isReviewCandidate } from "../domain/artifact-write";
+import { reviewReceiptMatchesObservation } from "../artifacts/review-receipt";
 import { samePayload } from "../artifacts/staged-publication";
 import {
   isStagedArtifactWriteRequest,
@@ -69,6 +71,9 @@ export interface MutationCandidateStatus {
 }
 
 export interface MutationArtifactStatus {
+  operation?: "REVIEW_CANDIDATE";
+  accepted?: false;
+  published?: false;
   request_id: string;
   project_id: string;
   intent_id: string;
@@ -228,7 +233,9 @@ export class MutationGateService {
         revisionToken: frozenRequest.source.revision_token,
         integrityHash: frozenRequest.source.integrity
       };
-      finalEffectVerified = visible !== null && samePayload(expected, visible);
+      finalEffectVerified = visible !== null && (isReviewCandidate(frozenRequest)
+        ? reviewReceiptMatchesObservation(receipt, frozenRequest, visible, this.runtime.providerId)
+        : samePayload(expected, visible));
     } else {
       const visible = await this.runtime.objects.readText(intent.destination_path);
       finalEffectVerified = visible !== null
@@ -240,6 +247,7 @@ export class MutationGateService {
       intent_id: intent.intent_id,
       destination_path: intent.destination_path,
       gate_mode: this.mode,
+      ...(isReviewCandidate(frozenRequest) ? { operation: "REVIEW_CANDIDATE" as const, accepted: false as const, published: false as const } : {}),
       verification_state: finalEffectVerified ? "canonical_verified" : "committed",
       receipt_status: "committed"
     };

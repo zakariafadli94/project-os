@@ -32,6 +32,15 @@ requireMatch(mutationClassifier, /machineArtifactReceiptPath\(intent\.request_id
 requireMatch(mutationClassifier, /matchesStagedArtifactRollbackBackup\(evidence, backup\)/, "rollback recognition must verify the exact governed backup identity");
 requireMatch(stagedPublication, /evidence\.backup\.revision_token === metadata\.revisionToken/, "rollback backup cleanup must require frozen revision evidence");
 
+const reviewGuard = await readFile(new URL("../src/durable/project-guard-neutral.ts", import.meta.url), "utf8");
+const reviewJournal = await readFile(new URL("../src/artifacts/review-journal.ts", import.meta.url), "utf8");
+requireMatch(config, /"PROJECT_OS_REVIEW_CANDIDATE_INGRESS_MODE"\s*:\s*"off"/, "review candidate ingress must default off");
+requireMatch(config, /"PROJECT_OS_REVIEW_CANDIDATE_CAPABILITY"\s*:\s*""/, "repository must not activate a review capability");
+requireBefore(reviewGuard, "reviewJournal.terminal(artifact)", "binaryArtifactPolicyViolation(this.env, artifact)", "review exact terminal recovery must precede authorization for new effects");
+requireBefore(reviewGuard, "reviewJournal.recordTerminal(request, receipt)", "this.repository.writeArtifactReceipt(receipt)", "review terminal journal must precede receipt and local state");
+requireMatch(reviewGuard, /PROJECT_OS_MUTATION_GATE_MODE !== "enforce"/, "review requires enforced MutationGate");
+requireMatch(reviewJournal, /reviewReceiptMatchesObservation/, "review observation must retain the exact frozen provider identity");
+
 if (failures.length > 0) {
   for (const failure of failures) console.error(`Binary artifact ingress gate: ${failure}`);
   process.exit(1);

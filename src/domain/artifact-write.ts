@@ -50,16 +50,35 @@ export const stagedArtifactWriteRequestSchema = z.strictObject({
   }
 });
 
+export const reviewCandidateRequestSchema = z.strictObject({
+  ...artifactBase,
+  operation: z.literal("REVIEW_CANDIDATE"),
+  mode: z.literal("create"),
+  base_revision: z.number().int().nonnegative().safe(),
+  relative_path: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
+  media_type: z.enum(["application/pdf", "image/png", "image/jpeg", "application/zip"]),
+  source: stagedSourceSchema.extend({ provider_id: z.string().min(1) })
+}).superRefine((value, ctx) => {
+  if (value.source.path !== `/PROJECT_OS/.project-os/artifacts/staging/${value.request_id}/${value.relative_path}`) {
+    ctx.addIssue({ code: "custom", path: ["source", "path"], message: "Review source must match request_id staging directory and filename exactly" });
+  }
+});
+
 export const artifactWriteRequestSchema = z.union([
   inlineArtifactWriteRequestSchema,
-  stagedArtifactWriteRequestSchema
+  stagedArtifactWriteRequestSchema,
+  reviewCandidateRequestSchema
 ]);
 
 export type InlineArtifactWriteRequest = z.infer<typeof inlineArtifactWriteRequestSchema>;
-export type StagedArtifactWriteRequest = z.infer<typeof stagedArtifactWriteRequestSchema>;
+export type StagedArtifactWriteRequest = z.infer<typeof stagedArtifactWriteRequestSchema> | ReviewCandidateRequest;
 export type ArtifactWriteRequest = z.infer<typeof artifactWriteRequestSchema>;
 
 export interface ArtifactWriteReceipt {
+  operation?: "REVIEW_CANDIDATE";
+  accepted?: false;
+  published?: false;
+  final_observation?: { provider_id: string; path: string; object_id: string; revision_token: string; size: number; integrity: { algorithm: string; value: string } };
   request_id: string;
   project_id: string;
   relative_path: string;
@@ -77,4 +96,9 @@ export function isStagedArtifactWriteRequest(
   request: ArtifactWriteRequest
 ): request is StagedArtifactWriteRequest {
   return "source" in request;
+}
+
+export type ReviewCandidateRequest = z.infer<typeof reviewCandidateRequestSchema>;
+export function isReviewCandidate(request: ArtifactWriteRequest): request is ReviewCandidateRequest {
+  return "operation" in request && request.operation === "REVIEW_CANDIDATE";
 }

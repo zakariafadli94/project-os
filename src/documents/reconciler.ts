@@ -604,6 +604,7 @@ function classifyManagedPath(
   const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
   if (!path.startsWith(root)) return null;
   const relative = path.slice(root.length);
+  if (relative.toUpperCase().startsWith("REVIEW/CANDIDATES/")) return null;
   const zones = [
     ["INPUTS/", "inputs"],
     ["REFERENCES/", "references"],

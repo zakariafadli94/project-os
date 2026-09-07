@@ -62,6 +62,7 @@ function wrapObjects(
   };
 
   return {
+    ...(objects.readBytes ? { readBytes: (path: string, maxBytes: number) => objects.readBytes!(path, maxBytes) } : {}),
     readText: async (path) => {
       const content = await objects.readText(path);
       observe(path, content);

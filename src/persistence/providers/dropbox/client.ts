@@ -1,6 +1,7 @@
 export interface DropboxTransport {
   upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void>;
   download(path: string): Promise<string | null>;
+  downloadBytes?(path: string, maxBytes: number): Promise<Uint8Array | null>;
   move(from: string, to: string): Promise<void>;
   delete?(path: string): Promise<void>;
   deleteIfRevision?(path: string, revision: string): Promise<boolean>;
@@ -182,6 +183,37 @@ export class DropboxClient implements DropboxTransport {
     const text = await response.text();
     if (response.status === 409 && text.includes("not_found")) return null;
     throw this.errorFromResponse(`Dropbox download failed for ${path}`, response, text);
+  }
+
+  async downloadBytes(path: string, maxBytes: number): Promise<Uint8Array | null> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 10 * 1024 * 1024) throw new Error("Invalid binary read limit");
+    const token = await this.accessToken();
+    const response = await this.runtimeFetch("files/download", "https://content.dropboxapi.com/2/files/download", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Dropbox-API-Arg": JSON.stringify({ path }) }
+    }, path);
+    if (!response.ok) {
+      const text = await response.text();
+      if (response.status === 409 && text.includes("not_found")) return null;
+      throw this.errorFromResponse(`Dropbox binary download failed for ${path}`, response, text);
+    }
+    const reader = response.body?.getReader();
+    if (!reader) return new Uint8Array();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxBytes) { await reader.cancel(); throw new Error("Binary read exceeds byte limit"); }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    return bytes;
   }
 
   async getMetadata(path: string): Promise<DropboxFileMetadata | null> {

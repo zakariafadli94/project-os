@@ -1,4 +1,5 @@
 import { ProviderBinaryReadLimitError } from "../../provider/errors";
+import type { ProviderRequestScope } from "../../provider/contract";
 export interface DropboxTransport {
   upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void>;
   download(path: string): Promise<string | null>;
@@ -7,6 +8,7 @@ export interface DropboxTransport {
   delete?(path: string): Promise<void>;
   deleteIfRevision?(path: string, revision: string): Promise<boolean>;
   listFolder?(path: string): Promise<DropboxEntry[]>;
+  listFolderPage?(path: string, cursor: string | null, limit: number): Promise<DropboxListPage>;
   getMetadata?(path: string): Promise<DropboxFileMetadata | null>;
   uploadConditional?(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata>;
   copy?(from: string, to: string): Promise<DropboxFileMetadata>;
@@ -47,6 +49,11 @@ export interface DropboxChangePage {
   cursor: string;
 }
 
+export interface DropboxListPage {
+  entries: DropboxEntry[];
+  cursor: string | null;
+}
+
 export class DropboxApiError extends Error {
   constructor(
     message: string,
@@ -79,6 +86,10 @@ export interface DropboxCredentials {
   refreshToken: string;
 }
 
+export interface DropboxClientOptions {
+  requestScope?: ProviderRequestScope;
+}
+
 type DropboxUploadMode = "add" | "overwrite" | { ".tag": "update"; update: string };
 type DropboxFolderCreateResult = "created" | "exists" | "parent_missing";
 
@@ -99,7 +110,10 @@ export class DropboxClient implements DropboxTransport {
   private requestIndex = 0;
   private requestOperation: string | null = null;
 
-  constructor(private readonly credentials: DropboxCredentials) {}
+  constructor(
+    private readonly credentials: DropboxCredentials,
+    private readonly options: DropboxClientOptions = {}
+  ) {}
 
   beginRequestTrace(operation: string): void {
     const normalized = operation.trim();
@@ -377,6 +391,45 @@ export class DropboxClient implements DropboxTransport {
     }
   }
 
+  async listFolderPage(path: string, cursor: string | null, limit: number): Promise<DropboxListPage> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2_000) {
+      throw new Error("Dropbox list page limit must be an integer from 1 through 2000");
+    }
+    const token = await this.accessToken();
+    const response = cursor
+      ? await this.runtimeFetch("files/list_folder/continue", "https://api.dropboxapi.com/2/files/list_folder/continue", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ cursor })
+        }, path)
+      : await this.runtimeFetch("files/list_folder", "https://api.dropboxapi.com/2/files/list_folder", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ path, recursive: false, include_deleted: false, limit })
+        }, path);
+    const text = await response.text();
+    if (!response.ok) {
+      if (response.status === 409 && text.includes("not_found") && cursor === null) {
+        return { entries: [], cursor: null };
+      }
+      throw this.errorFromResponse(`Dropbox list_folder page failed for ${path}`, response, text);
+    }
+    const parsed = JSON.parse(text) as {
+      entries: Array<{ ".tag": DropboxEntry["tag"]; name: string; path_lower?: string; path_display?: string }>;
+      cursor: string;
+      has_more: boolean;
+    };
+    return {
+      entries: parsed.entries.map((entry) => ({
+        tag: entry[".tag"],
+        name: entry.name,
+        path_lower: entry.path_lower,
+        path_display: entry.path_display
+      })),
+      cursor: parsed.has_more ? parsed.cursor : null
+    };
+  }
+
   async listFolderChanges(root?: string, cursor?: string): Promise<DropboxChangePage> {
     if ((root && cursor) || (!root && !cursor)) {
       throw new Error("Dropbox change listing requires exactly one of root or cursor");
@@ -549,7 +602,11 @@ export class DropboxClient implements DropboxTransport {
   ): Promise<Response> {
     const requestIndex = ++this.requestIndex;
     try {
-      return await fetch(input, init);
+      this.options.requestScope?.beforeHttp();
+      return await fetch(input, {
+        ...init,
+        signal: this.options.requestScope?.signal ?? init?.signal
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const pathContext = path ? ` for ${path}` : "";

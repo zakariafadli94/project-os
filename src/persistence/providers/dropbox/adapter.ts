@@ -108,6 +108,15 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
     };
   }
 
+  if (raw.listFolderPage) {
+    runtime.pagedListing = {
+      listPage: async (input) => {
+        const page = await call("list", input.path, () => raw.listFolderPage!(input.path, input.cursor, input.limit));
+        return { entries: page.entries.map(mapEntry), cursor: page.cursor };
+      }
+    };
+  }
+
   if (raw.ensureDirectory) {
     runtime.directoryProvisioning = {
       ensureDirectory: (path) => call("ensure-directory", path, () => raw.ensureDirectory!(path))

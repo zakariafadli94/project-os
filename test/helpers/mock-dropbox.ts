@@ -7,6 +7,9 @@ export interface DropboxMockFault {
   error_summary: string;
   method?: string;
   path?: string;
+  phase?: "before" | "after";
+  pause?: Promise<void>;
+  responseHeaders?: Record<string, string>;
 }
 
 export interface DropboxMockOptions {
@@ -145,7 +148,19 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       downloadCalls.push(apiPath);
     }
 
+    const faultResponse = (index: number, fault: DropboxMockFault): Response => new Response(
+      JSON.stringify({ error_summary: fault.error_summary }),
+      {
+        status: fault.status,
+        headers: {
+          "x-dropbox-request-id": `req-fault-${index}`,
+          ...fault.responseHeaders
+        }
+      }
+    );
+
     const faults = options.faults ?? [];
+    let selectedFault: { index: number; fault: DropboxMockFault } | undefined;
     for (let index = 0; index < faults.length; index += 1) {
       if (consumedFaults.has(index)) continue;
       const fault = faults[index];
@@ -159,14 +174,25 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       if (occurrence !== fault.occurrence) continue;
 
       consumedFaults.add(index);
-      return new Response(JSON.stringify({ error_summary: fault.error_summary }), {
-        status: fault.status,
-        headers: { "x-dropbox-request-id": `req-fault-${index}` }
-      });
+      selectedFault = { index, fault };
+      break;
     }
 
+    if (selectedFault?.fault.pause) await selectedFault.fault.pause;
+    if (selectedFault && (selectedFault.fault.phase ?? "before") === "before") {
+      return faultResponse(selectedFault.index, selectedFault.fault);
+    }
+
+    const respond = async (response: Response): Promise<Response> => {
+      if (selectedFault?.fault.phase === "after" && response.ok) {
+        await response.arrayBuffer();
+        return faultResponse(selectedFault.index, selectedFault.fault);
+      }
+      return response;
+    };
+
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/oauth2/token") {
-      return Response.json({ access_token: "test-access-token", expires_in: 14400 });
+      return respond(Response.json({ access_token: "test-access-token", expires_in: 14400 }));
     }
 
     if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/upload") {
@@ -175,38 +201,38 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       try {
         if (transientUploadFailures > 0) {
           transientUploadFailures -= 1;
-          return new Response(JSON.stringify({ error_summary: "too_many_write_operations/..." }), {
+          return respond(new Response(JSON.stringify({ error_summary: "too_many_write_operations/..." }), {
             status: 409,
             headers: { "x-dropbox-request-id": `req-transient-${transientUploadFailures}` }
-          });
+          }));
         }
 
         const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as {
           path?: string;
           mode?: "add" | "overwrite" | { ".tag": "update"; update: string };
         };
-        if (!arg.path) return new Response("missing path", { status: 400 });
+        if (!arg.path) return respond(new Response("missing path", { status: 400 }));
         const content = new TextDecoder().decode(await request.arrayBuffer());
         if (arg.mode === "add" && files.has(arg.path)) {
-          return new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
+          return respond(new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
             status: 409,
             headers: { "x-dropbox-request-id": "req-conflict" }
-          });
+          }));
         }
         if (typeof arg.mode === "object" && arg.mode?.[".tag"] === "update") {
           const current = await metadataFor(arg.path);
           if (!current || current.rev !== arg.mode.update) {
-            return new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
+            return respond(new Response(JSON.stringify({ error_summary: "path/conflict/file/" }), {
               status: 409,
               headers: { "x-dropbox-request-id": "req-update-conflict" }
-            });
+            }));
           }
         }
         ensureIdentity(arg.path);
         files.set(arg.path, content);
         bumpRevision(arg.path);
         await recordFileChange(arg.path);
-        return Response.json(await metadataFor(arg.path));
+        return respond(Response.json(await metadataFor(arg.path)));
       } finally {
         concurrentUploads -= 1;
       }
@@ -215,17 +241,17 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/download") {
       const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string };
       if (!arg.path || !files.has(arg.path)) {
-        return new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 });
+        return respond(new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 }));
       }
-      return new Response(files.get(arg.path), { status: 200 });
+      return respond(new Response(files.get(arg.path), { status: 200 }));
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/get_metadata") {
       const body = JSON.parse(await request.text()) as { path?: string };
       if (!body.path || !files.has(body.path)) {
-        return new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 });
+        return respond(new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 }));
       }
-      return Response.json(await metadataFor(body.path));
+      return respond(Response.json(await metadataFor(body.path)));
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/move_v2") {
@@ -235,12 +261,12 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       const descendants = [...files.entries()].filter(([path]) => path.startsWith(sourcePrefix));
 
       if (directContent === undefined && descendants.length === 0) {
-        return new Response(JSON.stringify({ error_summary: "from_lookup/not_found/" }), { status: 409 });
+        return respond(new Response(JSON.stringify({ error_summary: "from_lookup/not_found/" }), { status: 409 }));
       }
 
       if (directContent !== undefined) {
         if (files.has(body.to_path)) {
-          return new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 });
+          return respond(new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 }));
         }
         const id = ensureIdentity(body.from_path);
         const rev = revisions.get(body.from_path) ?? 1;
@@ -255,7 +281,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       } else {
         const destinationPrefix = `${body.to_path}/`;
         if ([...files.keys()].some((path) => path === body.to_path || path.startsWith(destinationPrefix))) {
-          return new Response(JSON.stringify({ error_summary: "to/conflict/folder/" }), { status: 409 });
+          return respond(new Response(JSON.stringify({ error_summary: "to/conflict/folder/" }), { status: 409 }));
         }
         for (const [path, content] of descendants) {
           const destination = `${body.to_path}${path.slice(body.from_path.length)}`;
@@ -272,23 +298,23 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
         }
       }
 
-      return Response.json({ metadata: await metadataFor(body.to_path) ?? { path_display: body.to_path } });
+      return respond(Response.json({ metadata: await metadataFor(body.to_path) ?? { path_display: body.to_path } }));
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/copy_v2") {
       const body = JSON.parse(await request.text()) as { from_path: string; to_path: string };
       const content = files.get(body.from_path);
       if (content === undefined) {
-        return new Response(JSON.stringify({ error_summary: "from_lookup/not_found/" }), { status: 409 });
+        return respond(new Response(JSON.stringify({ error_summary: "from_lookup/not_found/" }), { status: 409 }));
       }
       if (files.has(body.to_path)) {
-        return new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 });
+        return respond(new Response(JSON.stringify({ error_summary: "to/conflict/file/" }), { status: 409 }));
       }
       files.set(body.to_path, content);
       ensureIdentity(body.to_path);
       bumpRevision(body.to_path);
       await recordFileChange(body.to_path);
-      return Response.json({ metadata: await metadataFor(body.to_path) });
+      return respond(Response.json({ metadata: await metadataFor(body.to_path) }));
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/delete_v2") {
@@ -301,10 +327,10 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       const prefix = `${resolvedPath}/`;
       const descendants = [...files.keys()].filter((path) => path.startsWith(prefix));
       if (directContent === undefined && descendants.length === 0) {
-        return new Response(JSON.stringify({ error_summary: "path_lookup/not_found/" }), { status: 409 });
+        return respond(new Response(JSON.stringify({ error_summary: "path_lookup/not_found/" }), { status: 409 }));
       }
       if (body.parent_rev && body.parent_rev !== `mock-rev-${revisions.get(resolvedPath) ?? 1}`) {
-        return new Response(JSON.stringify({ error_summary: "path_lookup/conflict/file/" }), { status: 409 });
+        return respond(new Response(JSON.stringify({ error_summary: "path_lookup/conflict/file/" }), { status: 409 }));
       }
       if (directContent !== undefined) recordDeletedChange(resolvedPath);
       files.delete(resolvedPath);
@@ -316,7 +342,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
         fileIds.delete(path);
         revisions.delete(path);
       }
-      return Response.json({ metadata: { path_display: resolvedPath } });
+      return respond(Response.json({ metadata: { path_display: resolvedPath } }));
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder") {
@@ -327,25 +353,25 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
         .sort()
         .map((path) => metadataFor(path))))
         .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-      return Response.json({ entries, cursor: `cursor-${changeJournal.length}`, has_more: false });
+      return respond(Response.json({ entries, cursor: `cursor-${changeJournal.length}`, has_more: false }));
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder/continue") {
       const body = JSON.parse(await request.text()) as { cursor?: string };
       const match = /^cursor-(\d+)$/.exec(body.cursor ?? "");
       if (!match) {
-        return new Response(JSON.stringify({ error_summary: "reset/invalid_cursor" }), { status: 409 });
+        return respond(new Response(JSON.stringify({ error_summary: "reset/invalid_cursor" }), { status: 409 }));
       }
       const start = Number(match[1]);
-      return Response.json({
+      return respond(Response.json({
         entries: changeJournal.slice(start),
         cursor: `cursor-${changeJournal.length}`,
         has_more: false
-      });
+      }));
     }
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/create_folder_v2") {
-      return Response.json({ metadata: { ".tag": "folder" } });
+      return respond(Response.json({ metadata: { ".tag": "folder" } }));
     }
 
     throw new Error(`Unhandled outbound request in Dropbox mock: ${request.method} ${request.url}`);

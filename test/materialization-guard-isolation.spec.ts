@@ -150,6 +150,26 @@ describe("MaterializationGuard isolation boundary", () => {
     });
   });
 
+  it("reports unverified convergence health instead of inferring it from the head", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3910";
+    await createProject(projectId, "convergence-health", "TXN-MATISO-3910-CREATE");
+
+    const response = await materializationNamespace().getByName(projectId).fetch(
+      "https://materialization-guard.internal/status",
+      { method: "GET" }
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      convergence: {
+        schema_version: "1.0",
+        project_id: projectId,
+        converged: false,
+        layers: { human_handoff: { state: "unknown" } }
+      }
+    });
+  });
+
   it("hands a committed canonical revision to MaterializationGuard automatically", async () => {
     installDropboxMock();
     const projectId = "PRJ-3909";

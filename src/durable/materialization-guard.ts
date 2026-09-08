@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { unknownHealth } from "../convergence/health";
 import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
 import type { Env } from "../env";
@@ -234,7 +235,8 @@ export class MaterializationGuard extends DurableObject<Env> {
         : null,
       blocked_error: status.last_error,
       output_count: status.output_count,
-      attempt_output_count: status.attempt_output_count
+      attempt_output_count: status.attempt_output_count,
+      convergence: unknownHealth(state.project_id, new Date().toISOString())
     };
   }
 

@@ -1,4 +1,5 @@
 import type { ProjectionOutputEvidence } from "../domain/materialization";
+import type { Progress } from "../convergence/contract";
 
 export interface MaterializationTargetRequest {
   revision: number;
@@ -46,6 +47,12 @@ interface CountRow {
   count: number;
 }
 
+interface ConvergenceCheckpointRow {
+  [key: string]: SqlStorageValue;
+  progress_json: string;
+  provider_token: string;
+}
+
 export function initializeMaterializationSchema(storage: DurableObjectStorage): void {
   storage.sql.exec(`
     CREATE TABLE IF NOT EXISTS materialization_control (
@@ -79,6 +86,19 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
       content_hash TEXT NOT NULL,
       source_revision INTEGER NOT NULL,
       status TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS convergence_checkpoint (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      progress_json TEXT NOT NULL,
+      provider_token TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS convergence_attempts (
+      obligation_id TEXT NOT NULL,
+      attempt_number INTEGER NOT NULL,
+      reservation_json TEXT NOT NULL,
+      PRIMARY KEY(obligation_id, attempt_number)
     );
   `);
 }
@@ -347,6 +367,28 @@ export class MaterializationLedger {
       output_count,
       attempt_output_count
     };
+  }
+
+  readConvergenceCheckpoint(): { progress: Progress; token: string } | null {
+    const row = this.storage.sql.exec<ConvergenceCheckpointRow>(
+      "SELECT progress_json, provider_token FROM convergence_checkpoint WHERE singleton = 1"
+    ).toArray()[0];
+    if (!row) return null;
+    const progress = JSON.parse(row.progress_json) as Progress;
+    return { progress, token: row.provider_token };
+  }
+
+  restoreConvergenceCheckpoint(progress: Progress, token: string): void {
+    if (!token) throw new Error("Convergence checkpoint requires a provider token");
+    this.storage.sql.exec(
+      `INSERT INTO convergence_checkpoint (singleton, progress_json, provider_token)
+       VALUES (1, ?, ?)
+       ON CONFLICT(singleton) DO UPDATE SET
+         progress_json = excluded.progress_json,
+         provider_token = excluded.provider_token`,
+      JSON.stringify(progress),
+      token
+    );
   }
 
   private control(): ControlRow {

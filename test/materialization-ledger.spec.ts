@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ProjectionOutputEvidence } from "../src/domain/materialization";
+import { initialProgress } from "../src/convergence/journal";
 import {
   initializeMaterializationSchema,
   MaterializationLedger
@@ -135,6 +136,16 @@ describe("MaterializationLedger", () => {
       expect(status.output_count).toBe(2);
       expect(status.attempt_output_count).toBe(0);
       expect(status.active).toBeNull();
+    });
+  });
+
+  it("retains a verified external convergence checkpoint across ledger instances", async () => {
+    const projectId = "PRJ-3408";
+    await withLedger(projectId, (ledger) => {
+      const progress = initialProgress(projectId, "2026-09-08T00:00:00.000Z", "writer-1");
+      ledger.restoreConvergenceCheckpoint(progress, "mock-rev-1");
+
+      expect(ledger.readConvergenceCheckpoint()).toEqual({ progress, token: "mock-rev-1" });
     });
   });
 });

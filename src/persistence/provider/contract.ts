@@ -30,6 +30,21 @@ export interface ProviderChangePage {
   cursor: string;
 }
 
+export interface ProviderRequestScope {
+  deadlineMs: number;
+  signal: AbortSignal;
+  beforeHttp(): void;
+}
+
+export interface ProviderListPage {
+  entries: ProviderEntry[];
+  cursor: string | null;
+}
+
+export interface PagedListingPort {
+  listPage(input: { path: string; cursor: string | null; limit: number }): Promise<ProviderListPage>;
+}
+
 export interface ObjectPersistence {
   readBytes?(path: string, maxBytes: number): Promise<Uint8Array | null>;
   readText(path: string): Promise<string | null>;

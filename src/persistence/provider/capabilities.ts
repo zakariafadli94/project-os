@@ -3,6 +3,7 @@ import type {
   DirectoryProvisioningPort,
   IncrementalChangeFeedPort,
   ObjectPersistence,
+  PagedListingPort,
   ServerSideCopyPort
 } from "./contract";
 import { ProviderCapabilityError } from "./errors";
@@ -23,6 +24,7 @@ export interface PersistenceRuntime {
   conditionalWrite?: ConditionalWritePort;
   serverSideCopy?: ServerSideCopyPort;
   changeFeed?: IncrementalChangeFeedPort;
+  pagedListing?: PagedListingPort;
   directoryProvisioning?: DirectoryProvisioningPort;
   diagnostics?: ProviderRequestDiagnosticsPort;
   evidence?: Partial<ProviderEvidenceCapabilities>;
@@ -34,6 +36,7 @@ export interface ProjectOsPersistenceRuntime {
   conditionalWrite: ConditionalWritePort;
   serverSideCopy: ServerSideCopyPort;
   changeFeed: IncrementalChangeFeedPort;
+  pagedListing?: PagedListingPort;
   directoryProvisioning?: DirectoryProvisioningPort;
   diagnostics?: ProviderRequestDiagnosticsPort;
   evidence: ProviderEvidenceCapabilities;

@@ -45,6 +45,11 @@ function projectionStub(projectId: string) {
   return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 }
 
+async function materializeThroughContinuations(projectId: string): Promise<void> {
+  const stub = projectionStub(projectId);
+  for (let slice = 0; slice < 8; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+}
+
 describe("ProjectGuard crash-safe canonical commits", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -55,7 +60,7 @@ describe("ProjectGuard crash-safe canonical commits", () => {
 
     const created = await submit(projectId, createTransaction(projectId));
     expect(created.new_revision).toBe(1);
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(1);
 
     const transaction = {
@@ -86,7 +91,7 @@ describe("ProjectGuard crash-safe canonical commits", () => {
     expect(replayBeforeProjection).toEqual(committed);
     expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(2);
     expect(mock.files.has(machineReceiptPath(transaction.transaction_id))).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(2);
@@ -98,7 +103,7 @@ describe("ProjectGuard crash-safe canonical commits", () => {
     const stub = projectionStub(projectId);
 
     await submit(projectId, createTransaction(projectId));
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
 
     const first = await submit(projectId, {
       schema_version: "1.0",
@@ -131,7 +136,7 @@ describe("ProjectGuard crash-safe canonical commits", () => {
     expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(true);
     expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(1);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     const state = JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}");
     expect(state.revision).toBe(3);
     expect(state.tasks).toHaveProperty("TASK-COMMIT1702A");

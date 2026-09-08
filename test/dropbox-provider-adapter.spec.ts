@@ -158,6 +158,20 @@ it("maps incremental changes and embedded file metadata", async () => {
   });
 });
 
+it("keeps a folder listing to one provider page", async () => {
+  const runtime = createDropboxPersistence(rawTransport({
+    listFolderPage: async () => ({
+      entries: [{ tag: "file", name: "one.txt", path_display: "/PROJECT_OS/one.txt" }],
+      cursor: "next-page"
+    })
+  }));
+
+  await expect(runtime.pagedListing!.listPage({ path: "/PROJECT_OS", cursor: null, limit: 25 })).resolves.toEqual({
+    entries: [{ kind: "file", name: "one.txt", path: "/PROJECT_OS/one.txt" }],
+    cursor: "next-page"
+  });
+});
+
 it("maps cursor reset to the neutral cursor-reset condition", async () => {
   const runtime = createDropboxPersistence(rawTransport({
     listFolderChanges: async () => { throw new DropboxCursorResetError("reset", "req-2"); }

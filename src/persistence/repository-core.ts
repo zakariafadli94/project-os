@@ -72,6 +72,15 @@ export class ArtifactContentConflictError extends Error {
   }
 }
 
+/** A commit add may have reached the provider although its acknowledgement was lost. */
+export class CommitOutcomeUnknownError extends Error {
+  constructor(public readonly path: string, cause?: unknown) {
+    super(`Canonical commit outcome is unknown: ${path}`);
+    this.name = "CommitOutcomeUnknownError";
+    this.cause = cause;
+  }
+}
+
 export class ProjectRepository {
   protected readonly persistence: ProjectOsPersistenceRuntime;
 
@@ -178,10 +187,13 @@ export class ProjectRepository {
   async writeCommitRecord(record: CanonicalCommitRecord): Promise<void> {
     if (this.mode !== "v2") throw new Error("Canonical commit records require V2 layout mode");
     const validated = parseCanonicalCommitRecord(record);
-    await this.safeAdd(
-      machineCommitRecordPath(validated.project_id, validated.new_revision),
-      pretty(validated)
-    );
+    const path = machineCommitRecordPath(validated.project_id, validated.new_revision);
+    const content = pretty(validated);
+    try {
+      await this.persistence.objects.createText(path, content);
+    } catch (error) {
+      await this.confirmImmutableCommitOutcome(path, content, error);
+    }
   }
 
   async writeCompletedMaterializationRecord(record: CompletedMaterializationRecord): Promise<void> {
@@ -258,6 +270,26 @@ export class ProjectRepository {
     if (options.publishReceipt !== false) {
       await this.writeReceipt(validated.receipt);
     }
+  }
+
+  /** Exact bytes for one independently repairable canonical derivative. */
+  canonicalDerivativeText(
+    layer: "event" | "receipt" | "state" | "manifest",
+    record: CanonicalCommitRecord
+  ): string {
+    const validated = parseCanonicalCommitRecord(record);
+    if (layer === "event") return pretty(validated.event);
+    if (layer === "receipt") return pretty(validated.receipt);
+    if (layer === "state") return pretty(validated.state);
+    return pretty(manifestFor(validated.state));
+  }
+
+  async writeCanonicalEvent(record: CanonicalCommitRecord): Promise<void> {
+    const validated = parseCanonicalCommitRecord(record);
+    await this.safeAdd(
+      machineEventPath(validated.project_id, validated.event.event_id),
+      this.canonicalDerivativeText("event", validated)
+    );
   }
 
   async writeCommit(
@@ -501,6 +533,23 @@ export class ProjectRepository {
         throw new Error(`Immutable persistence path conflict with different content: ${path}`);
       }
     }
+  }
+
+  /**
+   * Only an exact deterministic record readback turns a failed create into
+   * success. A failed read is deliberately non-terminal so ProjectGuard can
+   * retry recovery instead of emitting an incorrect receipt.
+   */
+  protected async confirmImmutableCommitOutcome(path: string, content: string, original: unknown): Promise<void> {
+    let existing: string | null;
+    try {
+      existing = await this.persistence.objects.readText(path);
+    } catch (error) {
+      throw new CommitOutcomeUnknownError(path, error);
+    }
+    if (existing === content) return;
+    if (existing === null) throw original;
+    throw new Error(`Immutable persistence path conflict with different content: ${path}`);
   }
 }
 

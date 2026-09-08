@@ -155,6 +155,22 @@ export function machineMaterializationHeadPath(projectId: string): string {
   return `${machineProjectRoot(projectId)}/materialization-head.json`;
 }
 
+export function machineConvergenceRoot(projectId: string): string {
+  return `${machineProjectRoot(projectId)}/convergence`;
+}
+
+export function convergenceProgressPath(projectId: string): string {
+  return `${machineConvergenceRoot(projectId)}/progress.json`;
+}
+
+export function convergenceAttemptPath(projectId: string, obligationId: string, attemptNumber: number): string {
+  if (!/^[a-f0-9]{64}$/.test(obligationId)) throw new Error(`Unsafe convergence obligation id: ${obligationId}`);
+  if (!Number.isSafeInteger(attemptNumber) || attemptNumber < 1) {
+    throw new Error(`Invalid convergence attempt number: ${attemptNumber}`);
+  }
+  return `${machineConvergenceRoot(projectId)}/attempts/${obligationId}/ATTEMPT-${attemptNumber.toString().padStart(6, "0")}.json`;
+}
+
 export function machineDocumentRoot(projectId: string): string {
   return `${machineProjectRoot(projectId)}/documents`;
 }
@@ -277,6 +293,9 @@ export const v2Paths = {
   machineMaterializationRoot,
   machineMaterializationRecordPath,
   machineMaterializationHeadPath,
+  machineConvergenceRoot,
+  convergenceProgressPath,
+  convergenceAttemptPath,
   machineDocumentRoot,
   machineDocumentHeadPath,
   machineDocumentVersionPath,

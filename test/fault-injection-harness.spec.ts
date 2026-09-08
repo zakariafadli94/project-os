@@ -22,6 +22,29 @@ async function remove(path: string): Promise<Response> {
 }
 
 describe("deterministic Dropbox fault injection", () => {
+  it("retains a successful upload when its response is lost", async () => {
+    const path = "/PROJECT_OS/.project-os/projects/PRJ-9258/convergence/progress.json";
+    const mock = installDropboxMock({
+      faults: [{
+        endpoint: "/2/files/upload",
+        occurrence: 1,
+        path,
+        status: 503,
+        error_summary: "injected/lost_ack",
+        phase: "after"
+      }]
+    });
+
+    const response = await fetch("https://content.dropboxapi.com/2/files/upload", {
+      method: "POST",
+      headers: { "Dropbox-API-Arg": JSON.stringify({ path, mode: "add" }) },
+      body: "durable"
+    });
+
+    expect(response.status).toBe(503);
+    expect(mock.files.get(path)).toBe("durable");
+  });
+
   it("fails exactly the configured endpoint occurrence and then resumes normal behavior", async () => {
     const mock = installDropboxMock({
       faults: [{

@@ -5,6 +5,7 @@ import { parseArtifactWriteRequest } from "./domain/artifact-write";
 import { binaryArtifactPolicyViolation } from "./artifacts/policy";
 import { continuityStatus } from "./continuity/policy";
 import { executeWithRollback, type TransactionExecutor } from "./continuity/rollback";
+import type { ConvergenceHealth } from "./convergence/contract";
 import type { Env } from "./env";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "./domain/managed-document-request";
 import { countProjectInputFiles } from "./documents/input-recovery";
@@ -266,6 +267,7 @@ interface MaterializationStatusResponse {
   requested: { revision: number; projection_version: number } | null;
   active: { revision: number; projection_version: number } | null;
   blocked_error: string | null;
+  convergence: ConvergenceHealth;
 }
 
 interface SearchSyncStatusResponse {

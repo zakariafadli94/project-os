@@ -8,15 +8,19 @@ import {
 import { withProviderResilience } from "./provider/resilience";
 import { createDropboxPersistence } from "./providers/dropbox/adapter";
 import { DropboxClient } from "./providers/dropbox/client";
+import type { ProviderRequestScope } from "./provider/contract";
 
 export function createProductionPersistence(
   env: Env,
-  projectId?: string | null
+  projectId?: string | null,
+  requestScope?: ProviderRequestScope
 ): ProjectOsPersistenceRuntime {
   const raw = new DropboxClient({
     appKey: env.DROPBOX_APP_KEY,
     appSecret: env.DROPBOX_APP_SECRET,
     refreshToken: env.DROPBOX_REFRESH_TOKEN
+  }, {
+    ...(requestScope ? { requestScope } : {})
   });
   const runtime = requireProjectOsPersistence(withProviderResilience(createDropboxPersistence(raw)));
   const writerStage = resolveSchemaWriterStageForProject(

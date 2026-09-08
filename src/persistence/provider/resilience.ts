@@ -136,6 +136,11 @@ export function withProviderResilience(
         )
       }
     } : {}),
+    ...(runtime.pagedListing ? {
+      pagedListing: {
+        listPage: (input) => retry("list-page", input.path, () => runtime.pagedListing!.listPage(input))
+      }
+    } : {}),
     ...(runtime.directoryProvisioning ? {
       directoryProvisioning: {
         ensureDirectory: (path) => retry(

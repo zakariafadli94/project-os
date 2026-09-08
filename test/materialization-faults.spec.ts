@@ -45,7 +45,10 @@ function materializationStub(projectId: string) {
 }
 
 async function materialize(projectId: string): Promise<void> {
-  expect(await runDurableObjectAlarm(materializationStub(projectId))).toBe(true);
+  const stub = materializationStub(projectId);
+  for (let slice = 0; slice < 4; slice += 1) {
+    if (!await runDurableObjectAlarm(stub)) return;
+  }
 }
 
 describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
@@ -157,12 +160,20 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
       payload: { task_id: "TASK-MAT3802", title: "Head repair" }
     });
 
-    await expect(runDurableObjectAlarm(stub)).rejects.toThrow();
+    let rejected = false;
+    for (let slice = 0; slice < 4 && !rejected; slice += 1) {
+      try {
+        await runDurableObjectAlarm(stub);
+      } catch {
+        rejected = true;
+      }
+    }
+    expect(rejected).toBe(true);
     expect(mock.files.has(machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION))).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
     const workspaceWritesBeforeRepair = mock.uploadCalls.filter((path) => path.startsWith(`${root}/`)).length;
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materialize(projectId);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(2);
     expect(mock.uploadCalls.filter((path) => path.startsWith(`${root}/`)).length).toBe(workspaceWritesBeforeRepair);
   });
@@ -230,7 +241,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
       payload: { decision_id: "DEC-MAT3804", title: "Burst decision", decision: "Ship", reason: "Proof", impacts: [] }
     });
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materialize(projectId);
     for (const revision of [2, 3, 4, 5]) {
       expect(mock.files.has(machineCommitRecordPath(projectId, revision))).toBe(true);
     }

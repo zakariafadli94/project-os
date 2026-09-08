@@ -43,7 +43,6 @@ import {
 } from "./layout";
 import { receiptPath } from "./paths";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
-import { ProviderConflictError } from "./provider/errors";
 import {
   asProjectOsPersistence,
   type PersistenceInput
@@ -170,11 +169,7 @@ export class ProjectRepository extends CoreProjectRepository {
     try {
       await this.runtime.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof ProviderConflictError)) throw error;
-      const existing = await this.runtime.objects.readText(path);
-      if (existing !== content) {
-        throw new Error(`Immutable persistence path conflict with different content: ${path}`);
-      }
+      await this.confirmImmutableCommitOutcome(path, content, error);
     }
   }
 
@@ -184,6 +179,13 @@ export class ProjectRepository extends CoreProjectRepository {
     const encodedManifest = encodeManifest(state, writerStage);
     await this.runtime.objects.upsertText(machineStatePath(state.project_id), pretty(encodedState));
     await this.runtime.objects.upsertText(machineManifestPath(state.project_id), pretty(encodedManifest));
+  }
+
+  override canonicalDerivativeText(
+    layer: "event" | "receipt" | "state" | "manifest",
+    record: CanonicalCommitRecord
+  ): string {
+    return encodeCanonicalDerivative(layer, record, this.writerStage());
   }
 
   override async materializeCanonicalDerivatives(
@@ -260,6 +262,21 @@ export class ProjectRepository extends CoreProjectRepository {
   private writerStage(): SchemaWriterStage {
     return schemaWriterStageFor(this.runtime, this.requestedSchemaWriterStage);
   }
+}
+
+export function encodeCanonicalDerivative(
+  layer: "event" | "receipt" | "state" | "manifest",
+  record: CanonicalCommitRecord,
+  stage: SchemaWriterStage
+): string {
+  const value = layer === "event"
+    ? record.event
+    : layer === "receipt"
+      ? record.receipt
+      : layer === "state"
+        ? encodeProjectState(record.state, stage)
+        : encodeManifest(record.state, stage);
+  return pretty(value);
 }
 
 function sameProviderObservation(

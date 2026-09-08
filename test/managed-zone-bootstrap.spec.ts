@@ -89,7 +89,9 @@ describe("projection-v2 managed-zone bootstrap", () => {
     const projectId = created.project_id;
     const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
     const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
-    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    for (let slice = 0; slice < 8; slice += 1) {
+      if (!await runDurableObjectAlarm(projectionStub)) break;
+    }
 
     expect(directoryCalls).toEqual(expectedManagedDirectories(projectId, slug));
     const activeHead = JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}");

@@ -69,6 +69,19 @@ export interface AttemptReservation {
   lease_until: string;
 }
 
+export interface EffectIntent {
+  id: string;
+  path: string;
+  destination: string | null;
+  kind: "create" | "replace" | "delete" | "move";
+  object_id: string | null;
+  expected_token: string | null;
+  desired_hash: string | null;
+  authorized_previous_hash: string | null;
+  state: "prepared" | "uncertain" | "verified" | "neutralized" | "blocked";
+  verified_token: string | null;
+}
+
 export interface Progress {
   schema_version: "1.0";
   project_id: string;
@@ -85,7 +98,7 @@ export interface Progress {
   requested: Target | null;
   parked: Target[];
   obligations: Record<string, unknown>;
-  effects: Record<string, unknown>;
+  effects: Record<string, EffectIntent>;
   partial_outputs: Record<string, unknown>;
   cursors: Record<string, string | null>;
   last_queue: "machine" | "human";

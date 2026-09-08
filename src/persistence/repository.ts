@@ -43,7 +43,6 @@ import {
 } from "./layout";
 import { receiptPath } from "./paths";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
-import { ProviderConflictError } from "./provider/errors";
 import {
   asProjectOsPersistence,
   type PersistenceInput
@@ -170,11 +169,7 @@ export class ProjectRepository extends CoreProjectRepository {
     try {
       await this.runtime.objects.createText(path, content);
     } catch (error) {
-      if (!(error instanceof ProviderConflictError)) throw error;
-      const existing = await this.runtime.objects.readText(path);
-      if (existing !== content) {
-        throw new Error(`Immutable persistence path conflict with different content: ${path}`);
-      }
+      await this.confirmImmutableCommitOutcome(path, content, error);
     }
   }
 

@@ -11,11 +11,16 @@ import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
   uploads: Array<{ path: string; mode: "add" | "overwrite" }> = [];
+  loseNextAddAcknowledgement = false;
 
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
     if (mode === "add" && this.files.has(path)) throw new DropboxConflictError("already exists", "req-test");
     this.files.set(path, content);
     this.uploads.push({ path, mode });
+    if (mode === "add" && this.loseNextAddAcknowledgement) {
+      this.loseNextAddAcknowledgement = false;
+      throw new Error("provider acknowledgement lost after write");
+    }
   }
 
   async download(path: string): Promise<string | null> {
@@ -127,6 +132,17 @@ describe("ProjectRepository canonical commit records", () => {
     const conflicting = fixture();
     conflicting.state.name = "Different committed reality";
     await expect(repository.writeCommitRecord(conflicting)).rejects.toThrow(/immutable.*conflict/i);
+  });
+
+  it("accepts an exact readback when the commit provider acknowledgement is lost", async () => {
+    const transport = new FakeTransport();
+    transport.loseNextAddAcknowledgement = true;
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
+    const record = fixture();
+
+    await expect(repository.writeCommitRecord(record)).resolves.toBeUndefined();
+    expect(await repository.readCommitRecord(record.project_id, record.new_revision)).toEqual(record);
+    expect(transport.uploads).toHaveLength(1);
   });
 
   it("materializes event, V2 snapshots, human views and standalone receipt from a committed record", async () => {

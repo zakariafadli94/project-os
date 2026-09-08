@@ -125,3 +125,10 @@ export interface SliceBudget {
   beforeHttp(): void;
   canStartEffect(requiredCalls: number): boolean;
 }
+
+export interface SliceResult {
+  health: ConvergenceHealth;
+  more_work: boolean;
+  next_alarm_at: string | null;
+  provider_calls: number;
+}

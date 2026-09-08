@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { createSliceBudget, providerRequestScopeFor } from "../convergence/budget";
 import { unknownHealth } from "../convergence/health";
 import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
@@ -26,10 +27,9 @@ export interface MaterializationTargetRequestBody {
 
 export class MaterializationGuard extends DurableObject<Env> {
   private readonly projectId: string;
-  private readonly persistence: ProjectOsPersistenceRuntime;
-  private readonly repository: ProjectRepository;
   private readonly ledger: MaterializationLedger;
-  private readonly coordinator: MaterializationCoordinator;
+  private readonly layoutMode: ReturnType<typeof parseLayoutMode>;
+  private readonly projectionConcurrency: number;
   private queue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -40,19 +40,9 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
     this.projectId = projectId;
     initializeMaterializationSchema(ctx.storage);
-    this.persistence = createProductionPersistence(env, projectId);
-    this.repository = new ProjectRepository(this.persistence, parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
     this.ledger = new MaterializationLedger(ctx.storage);
-    this.coordinator = new MaterializationCoordinator({
-      projectId,
-      repository: this.repository,
-      ledger: this.ledger,
-      writer: new WorkspaceProjectionWriter(
-        this.persistence.objects,
-        parseProjectionConcurrency(env.PROJECT_OS_PROJECTION_CONCURRENCY)
-      ),
-      projectionVersion: CURRENT_PROJECTION_VERSION
-    });
+    this.layoutMode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
+    this.projectionConcurrency = parseProjectionConcurrency(env.PROJECT_OS_PROJECTION_CONCURRENCY);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -75,7 +65,8 @@ export class MaterializationGuard extends DurableObject<Env> {
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
     return this.serialize(async () => {
       try {
-        const result = await this.coordinator.runNext(alarmInfo?.retryCount ?? 0);
+        const { coordinator } = this.coordinatorForSlice();
+        const result = await coordinator.runNext(alarmInfo?.retryCount ?? 0);
         if (result.more_work) {
           await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
         }
@@ -116,26 +107,28 @@ export class MaterializationGuard extends DurableObject<Env> {
       return Response.json({ error: "project_binding_mismatch" }, { status: 409 });
     }
 
-    this.coordinator.requestTarget(body.revision, body.projection_version);
+    this.ledger.requestTarget({ revision: body.revision, projection_version: body.projection_version });
     await this.ensureAlarmIfPending();
     return Response.json({
       project_id: this.projectId,
-      requested: this.coordinator.status().requested
+      requested: this.ledger.status().requested
     });
   }
 
   private async handleStatus(): Promise<Response> {
-    const state = await this.canonicalState();
+    const { coordinator, repository } = this.coordinatorForSlice(false);
+    const state = await this.canonicalState(repository);
     if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
-    await this.coordinator.reconcile(state.revision);
+    await coordinator.reconcile(state.revision);
     await this.ensureAlarmIfPending();
     return Response.json(this.statusResponse(state));
   }
 
   private async handleReconcile(): Promise<Response> {
-    const state = await this.canonicalState();
+    const { coordinator, repository } = this.coordinatorForSlice(false);
+    const state = await this.canonicalState(repository);
     if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
-    await this.coordinator.reconcile(state.revision);
+    await coordinator.reconcile(state.revision);
     await this.ensureAlarmIfPending();
     return Response.json(this.statusResponse(state));
   }
@@ -151,19 +144,24 @@ export class MaterializationGuard extends DurableObject<Env> {
       return Response.json({ error: "invalid_materialize_target" }, { status: 400 });
     }
 
-    const state = await this.canonicalState();
+    const { coordinator, repository } = this.coordinatorForSlice();
+    const state = await this.canonicalState(repository);
     if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
 
     const record = state.revision > 0
-      ? await this.repository.readCommitRecord(state.project_id, state.revision)
+      ? await repository.readCommitRecord(state.project_id, state.revision)
       : null;
     if (record) {
-      await this.coordinator.reconcile(state.revision);
-      this.coordinator.requestTarget(state.revision, CURRENT_PROJECTION_VERSION);
-      await this.coordinator.runUntilIdle();
-      await this.ctx.storage.deleteAlarm();
+      await coordinator.reconcile(state.revision);
+      coordinator.requestTarget(state.revision, CURRENT_PROJECTION_VERSION);
+      let result = await coordinator.runNext();
+      for (let slice = 0; result.more_work && slice < 127; slice += 1) {
+        result = await this.coordinatorForSlice().coordinator.runNext();
+      }
+      if (result.more_work) await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+      else await this.ctx.storage.deleteAlarm();
     } else {
-      await this.repository.materializeV2(state);
+      await repository.materializeV2(state);
     }
 
     return Response.json({
@@ -182,8 +180,8 @@ export class MaterializationGuard extends DurableObject<Env> {
    * missing revision. This keeps MaterializationGuard independent from
    * ProjectGuard while preserving immutable commit truth as the authority.
    */
-  private async canonicalState(): Promise<ProjectState | null> {
-    let state = await this.repository.readProjectState(this.projectId);
+  private async canonicalState(repository: ProjectRepository): Promise<ProjectState | null> {
+    let state = await repository.readProjectState(this.projectId);
     if (state && state.project_id !== this.projectId) {
       throw new Error(
         `MaterializationGuard state binding mismatch: expected ${this.projectId}, got ${state.project_id}`
@@ -192,7 +190,7 @@ export class MaterializationGuard extends DurableObject<Env> {
 
     let nextRevision = (state?.revision ?? 0) + 1;
     while (true) {
-      const record = await this.repository.readCommitRecord(this.projectId, nextRevision);
+      const record = await repository.readCommitRecord(this.projectId, nextRevision);
       if (!record) return state;
 
       const expectedPreviousRevision = state?.revision ?? 0;
@@ -220,7 +218,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   }
 
   private statusResponse(state: ProjectState) {
-    const status = this.coordinator.status();
+    const status = this.ledger.status();
     return {
       project_id: state.project_id,
       canonical_revision: state.revision,
@@ -241,7 +239,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   }
 
   private async ensureAlarmIfPending(): Promise<void> {
-    const status = this.coordinator.status();
+    const status = this.ledger.status();
     if (!status.active && !status.requested) return;
     const existing = await this.ctx.storage.getAlarm();
     if (existing === null) {
@@ -259,6 +257,27 @@ export class MaterializationGuard extends DurableObject<Env> {
     } finally {
       release();
     }
+  }
+
+  private coordinatorForSlice(bounded = true): { coordinator: MaterializationCoordinator; repository: ProjectRepository } {
+    const budget = bounded ? createSliceBudget(() => Date.now(), new AbortController().signal) : undefined;
+    const persistence = createProductionPersistence(
+      this.env,
+      this.projectId,
+      budget ? providerRequestScopeFor(budget) : undefined
+    );
+    const repository = new ProjectRepository(persistence, this.layoutMode);
+    return {
+      repository,
+      coordinator: new MaterializationCoordinator({
+        projectId: this.projectId,
+        repository,
+        ledger: this.ledger,
+        writer: new WorkspaceProjectionWriter(persistence, this.projectionConcurrency),
+        projectionVersion: CURRENT_PROJECTION_VERSION,
+        ...(budget ? { sliceBudget: budget } : {})
+      })
+    };
   }
 }
 

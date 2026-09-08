@@ -54,7 +54,9 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       }
     });
     expect(created).toMatchObject({ status: "committed", new_revision: 1 });
-    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    for (let slice = 0; slice < 8; slice += 1) {
+      if (!await runDurableObjectAlarm(projectionStub)) break;
+    }
 
     let state = normalizeProjectState(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}"));
     expect(state.revision).toBe(1);
@@ -151,7 +153,9 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       }
     });
     expect(created).toMatchObject({ status: "committed", new_revision: 1 });
-    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    for (let slice = 0; slice < 8; slice += 1) {
+      if (!await runDurableObjectAlarm(projectionStub)) break;
+    }
 
     let state = normalizeProjectState(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}"));
     const staleSnapshot = state;
@@ -200,7 +204,9 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       { method: "POST" }
     );
     expect(reconcileMaterialization.status).toBe(200);
-    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    for (let slice = 0; slice < 8; slice += 1) {
+      if (!await runDurableObjectAlarm(projectionStub)) break;
+    }
     await mock.writeExternal(
       machineStatePath(projectId),
       `${JSON.stringify(encodeProjectState(staleSnapshot, "provider_v2"), null, 2)}\n`

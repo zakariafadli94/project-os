@@ -1,4 +1,5 @@
 import type { SliceBudget } from "./contract";
+import type { ProviderRequestScope } from "../persistence/provider/contract";
 
 const MAX_PROVIDER_CALLS = 32;
 const SLICE_DURATION_MS = 10_000;
@@ -25,4 +26,12 @@ export function createSliceBudget(now: () => number, signal: AbortSignal): Slice
     }
   };
   return budget;
+}
+
+export function providerRequestScopeFor(budget: SliceBudget): ProviderRequestScope {
+  return {
+    deadlineMs: budget.deadline_ms,
+    signal: budget.signal,
+    beforeHttp: () => budget.beforeHttp()
+  };
 }

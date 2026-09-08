@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ProjectionOutputEvidence } from "../src/domain/materialization";
 import { sha256Text } from "../src/materialization/hash";
+import { createSliceBudget } from "../src/convergence/budget";
 import type { PlannedProjectionOutput, ProjectionPlan } from "../src/materialization/planner";
 import {
   MaterializationOutputConflictError,
@@ -214,6 +215,42 @@ describe("WorkspaceProjectionWriter", () => {
     })).rejects.toBeInstanceOf(MaterializationOutputConflictError);
 
     expect(verified).toContain("one");
+  });
+
+  it("writes the critical STATE and HANDOFF pair before a non-critical output can fail", async () => {
+    const objects = new InstrumentedObjects();
+    objects.failPath = "/workspace/BRIEF.md";
+    const writer = new WorkspaceProjectionWriter(objects, 1);
+    const state = await output("global:STATE", "STATE.md", `${MANAGED_NOTICE}\nstate`, { critical: true });
+    const handoff = await output("global:HANDOFF", "HANDOFF.md", `${MANAGED_NOTICE}\nhandoff`, { critical: true });
+    const brief = await output("global:BRIEF", "BRIEF.md", `${MANAGED_NOTICE}\nbrief`);
+
+    await expect(writer.materialize(plan([brief, handoff, state]), { workspaceRoot: "/workspace" }))
+      .rejects.toThrow("injected failure");
+
+    expect(objects.files.get("/workspace/STATE.md")).toBe(`${MANAGED_NOTICE}\nstate`);
+    expect(objects.files.get("/workspace/HANDOFF.md")).toBe(`${MANAGED_NOTICE}\nhandoff`);
+  });
+
+  it("stops a materialization slice before exhausting its checkpoint reserve", async () => {
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    class ScopedObjects extends InstrumentedObjects {
+      override async readText(path: string) { budget.beforeHttp(); return super.readText(path); }
+      override async createText(path: string, content: string) { budget.beforeHttp(); return super.createText(path, content); }
+      override async upsertText(path: string, content: string) { budget.beforeHttp(); return super.upsertText(path, content); }
+    }
+    const objects = new ScopedObjects();
+    const writer = new WorkspaceProjectionWriter(objects, 1);
+    const outputs = await Promise.all(
+      ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O"].map((key) =>
+        output(`global:${key}`, `${key}.md`, `${MANAGED_NOTICE}\n${key}`)
+      )
+    );
+    const result = await writer.materializeSlice(plan(outputs), { workspaceRoot: "/workspace" }, budget);
+
+    expect(result.nextKey).not.toBeNull();
+    expect(result.verified.size).toBeLessThan(outputs.length);
+    expect(budget.calls_left).toBeGreaterThanOrEqual(4);
   });
 
   it("never exceeds configured concurrent writes", async () => {

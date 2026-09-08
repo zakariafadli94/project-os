@@ -54,6 +54,11 @@ function projectionStub(projectId: string) {
   return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 }
 
+async function materializeThroughContinuations(projectId: string): Promise<void> {
+  const stub = projectionStub(projectId);
+  for (let slice = 0; slice < 8; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+}
+
 describe("ProjectGuard data-preserving rollback", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -61,7 +66,7 @@ describe("ProjectGuard data-preserving rollback", () => {
     const projectId = "PRJ-2020";
     const mock = installDropboxMock();
     await createProject(projectId);
-    expect(await runDurableObjectAlarm(projectionStub(projectId))).toBe(true);
+    await materializeThroughContinuations(projectId);
     const tx = taskTx(projectId, "TASK-ROLLBACK2020");
 
     const execution = await executeWithRollback({
@@ -83,7 +88,7 @@ describe("ProjectGuard data-preserving rollback", () => {
 
     const replay = await submit(projectId, tx);
     expect(replay).toEqual(execution.receipt);
-    expect(await runDurableObjectAlarm(projectionStub(projectId))).toBe(true);
+    await materializeThroughContinuations(projectId);
     const state = JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}");
     expect(state.revision).toBe(2);
     expect(state.tasks).toHaveProperty("TASK-ROLLBACK2020");

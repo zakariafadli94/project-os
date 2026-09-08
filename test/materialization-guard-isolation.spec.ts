@@ -128,7 +128,10 @@ describe("MaterializationGuard isolation boundary", () => {
       })
     });
     expect(response.status).toBe(200);
-    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    for (let slice = 0; slice < 4; slice += 1) {
+      expect(await runDurableObjectAlarm(guard)).toBe(true);
+      if (mock.files.has(machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION))) break;
+    }
     expect(
       mock.files.has(machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION))
     ).toBe(true);

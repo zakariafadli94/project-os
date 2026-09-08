@@ -63,6 +63,11 @@ function projectionStub(projectId: string) {
   return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 }
 
+async function materializeThroughContinuations(projectId: string): Promise<void> {
+  const stub = projectionStub(projectId);
+  for (let slice = 0; slice < 8; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+}
+
 describe("archive-safe materialization", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -75,7 +80,7 @@ describe("archive-safe materialization", () => {
     const activeRoot = workspaceProjectRoot(projectId, slug);
     const archiveRoot = archiveProjectRoot(projectId, slug);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     const activeHead = JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}");
     expect(activeHead).toMatchObject({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION, workspace_location: "active" });
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(true);
@@ -84,7 +89,7 @@ describe("archive-safe materialization", () => {
     expect(archived).toMatchObject({ status: "committed", previous_revision: 1, new_revision: 2 });
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(false);
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);
 
@@ -114,7 +119,7 @@ describe("archive-safe materialization", () => {
     const activeRoot = workspaceProjectRoot(projectId, slug);
     const archiveRoot = archiveProjectRoot(projectId, slug);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     faults.push({
       endpoint: "/2/files/upload",
       method: "POST",
@@ -125,14 +130,18 @@ describe("archive-safe materialization", () => {
     });
 
     await archiveProject(projectId, "TXN-MATARCH-ARCHIVE-000002");
-    await expect(runDurableObjectAlarm(stub)).rejects.toThrow();
+    let rejected = false;
+    for (let slice = 0; slice < 8 && !rejected; slice += 1) {
+      try { await runDurableObjectAlarm(stub); } catch { rejected = true; }
+    }
+    expect(rejected).toBe(true);
 
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(false);
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
     expect(mock.files.has(machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION))).toBe(false);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(false);
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}")).toMatchObject({
@@ -150,7 +159,7 @@ describe("archive-safe materialization", () => {
     const activeRoot = workspaceProjectRoot(projectId, slug);
     const archiveRoot = archiveProjectRoot(projectId, slug);
 
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     mock.files.set(`${archiveRoot}/PROJECT.md`, mock.files.get(`${activeRoot}/PROJECT.md`) ?? "duplicate");
 
     await archiveProject(projectId, "TXN-MATARCH-ARCHIVE-000003");

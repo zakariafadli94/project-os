@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createSliceBudget } from "../src/convergence/budget";
+import { createSliceBudget, providerRequestScopeFor } from "../src/convergence/budget";
 
 describe("convergence slice budget", () => {
   it("reserves checkpoint capacity and never starts a thirty-third provider call", () => {
@@ -13,5 +13,14 @@ describe("convergence slice budget", () => {
 
     now = 10_000;
     expect(budget.canStartEffect(1)).toBe(false);
+  });
+
+  it("exposes the same hard call budget to the Dropbox client", () => {
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const scope = providerRequestScopeFor(budget);
+
+    for (let index = 0; index < 32; index += 1) scope.beforeHttp();
+    expect(() => scope.beforeHttp()).toThrow("slice_budget_exhausted");
+    expect(scope.deadlineMs).toBe(10_000);
   });
 });

@@ -42,6 +42,12 @@ async function createRegisteredProject(slug: string): Promise<Receipt> {
   return response.json<Receipt>();
 }
 
+async function materializeThroughContinuations(stub: DurableObjectStub): Promise<void> {
+  for (let slice = 0; slice < 8; slice += 1) {
+    if (!await runDurableObjectAlarm(stub)) return;
+  }
+}
+
 describe("ProjectGuard crash-safe archive commits", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -56,7 +62,7 @@ describe("ProjectGuard crash-safe archive commits", () => {
     const projectId = created.project_id;
     const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 
-    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    await materializeThroughContinuations(projectionStub);
     expect(mock.files.has(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(true);
     expect(mock.files.has(`${archiveProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(false);
 

@@ -285,7 +285,9 @@ describe("ProjectGuard search synchronization", () => {
     expect(after.last_error).toMatch(/CANONICAL_SNAPSHOT_HASH_MISMATCH/);
 
     const materializationStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
-    expect(await runDurableObjectAlarm(materializationStub)).toBe(true);
+    for (let slice = 0; slice < 8; slice += 1) {
+      if (!await runDurableObjectAlarm(materializationStub)) break;
+    }
     const materialization = await projectStub.fetch("https://project-guard.internal/materialization-status");
     expect(materialization.status).toBe(200);
     expect(await materialization.json()).toMatchObject({

@@ -1,4 +1,5 @@
 import type { ProjectionOutputEvidence } from "../domain/materialization";
+import type { SliceBudget } from "../convergence/contract";
 import {
   asProjectOsPersistence,
   type PersistenceInput
@@ -82,10 +83,55 @@ export class WorkspaceProjectionWriter {
       (output.critical ? critical : nonCritical).push(output);
     }
 
-    await this.runStage(plan.project_id, nonCritical, root, verified, options);
     await this.runStage(plan.project_id, critical, root, verified, options);
+    await this.runStage(plan.project_id, nonCritical, root, verified, options);
     await this.removeObsoleteDeliverableProjections(plan, root, options);
     return verified;
+  }
+
+  /**
+   * Performs only the effects that still leave room for the durable
+   * checkpoint. The persistence runtime owns the actual provider-call
+   * accounting; this method makes the decision before it starts an output.
+   */
+  async materializeSlice(
+    plan: ProjectionPlan,
+    options: WorkspaceProjectionWriterOptions,
+    budget: SliceBudget
+  ): Promise<{ verified: Map<string, ProjectionOutputEvidence>; nextKey: string | null }> {
+    const verified = new Map<string, ProjectionOutputEvidence>();
+    const root = normalizeWorkspaceRoot(options.workspaceRoot);
+    const ordered = [...plan.changed_outputs.values()].sort((left, right) =>
+      Number(right.critical) - Number(left.critical) || left.key.localeCompare(right.key)
+    );
+
+    for (const output of ordered) {
+      const priorAttempt = options.alreadyVerified?.get(output.key);
+      if (priorAttempt && sameEvidence(priorAttempt, output)) {
+        verified.set(output.key, priorAttempt);
+        await options.onOutputOutcome?.(output.key, "attempt_reuse");
+        await options.onOutputVerified?.(output.key, priorAttempt);
+        continue;
+      }
+
+      const requiredCalls = output.critical ? 3 : 2;
+      if (!budget.canStartEffect(requiredCalls)) {
+        return { verified, nextKey: output.key };
+      }
+
+      const result = await this.materializeOne(plan.project_id, output, root, options);
+      verified.set(output.key, result.evidence);
+      await options.onOutputOutcome?.(output.key, result.outcome);
+      await options.onOutputVerified?.(output.key, result.evidence);
+    }
+
+    if (plan.removed_outputs.length > 0) {
+      // A removal reads the current bytes before deleting them. Reserve both
+      // calls before starting the removal phase.
+      if (!budget.canStartEffect(2)) return { verified, nextKey: "__removed_outputs__" };
+      await this.removeObsoleteDeliverableProjections(plan, root, options);
+    }
+    return { verified, nextKey: null };
   }
 
   async verifyCritical(plan: ProjectionPlan, workspaceRoot: string): Promise<void> {

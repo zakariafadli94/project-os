@@ -17,6 +17,7 @@ import {
 } from "./planner";
 import type { MaterializationLedgerStatus, MaterializationTarget } from "./ledger";
 import { MaterializationOutputConflictError, type ProjectionWriteOutcome } from "./writer";
+import type { SliceBudget } from "../convergence/contract";
 
 export interface MaterializationRepositoryPort {
   readCommitRecord(projectId: string, revision: number): Promise<CanonicalCommitRecord | null>;
@@ -63,6 +64,12 @@ export interface ProjectionWriterPort {
     onOutputVerified?: (key: string, evidence: ProjectionOutputEvidence) => void | Promise<void>;
     onOutputOutcome?: (key: string, outcome: ProjectionWriteOutcome) => void | Promise<void>;
   }): Promise<Map<string, ProjectionOutputEvidence>>;
+  materializeSlice?(plan: ProjectionPlan, options: {
+    workspaceRoot: string;
+    alreadyVerified?: ReadonlyMap<string, ProjectionOutputEvidence>;
+    onOutputVerified?: (key: string, evidence: ProjectionOutputEvidence) => void | Promise<void>;
+    onOutputOutcome?: (key: string, outcome: ProjectionWriteOutcome) => void | Promise<void>;
+  }, budget: SliceBudget): Promise<{ verified: Map<string, ProjectionOutputEvidence>; nextKey: string | null }>;
   verifyCritical?(plan: ProjectionPlan, workspaceRoot: string): Promise<void>;
 }
 
@@ -80,6 +87,7 @@ export interface MaterializationCoordinatorOptions {
   projectionVersion?: number;
   workspaceRootFor?: (state: ProjectState) => string;
   now?: () => string;
+  sliceBudget?: SliceBudget;
 }
 
 export interface MaterializationRunResult {
@@ -105,6 +113,7 @@ export class MaterializationCoordinator {
   private readonly projectionVersion: number;
   private readonly workspaceRootFor: (state: ProjectState) => string;
   private readonly now: () => string;
+  private readonly sliceBudget: SliceBudget | undefined;
 
   constructor(options: MaterializationCoordinatorOptions) {
     this.projectId = options.projectId;
@@ -117,6 +126,7 @@ export class MaterializationCoordinator {
     }
     this.workspaceRootFor = options.workspaceRootFor ?? ((state) => workspaceProjectRoot(state.project_id, state.slug));
     this.now = options.now ?? (() => new Date().toISOString());
+    this.sliceBudget = options.sliceBudget;
   }
 
   requestTarget(revision: number, projectionVersion = this.projectionVersion): void {
@@ -206,12 +216,15 @@ export class MaterializationCoordinator {
     let plan: ProjectionPlan | null = null;
     let verifiedCount = 0;
     const metrics: MaterializationAttemptMetrics = { uploaded: 0, contentHash: 0, attemptReuse: 0 };
+    const priorAttempts = this.ledger.attemptOutputs();
 
     try {
-      await this.repository.materializeCanonicalDerivatives(record, {
-        ...(record.transaction.operation === "project.create" ? { publishReceipt: false } : {}),
-        projectionVersion: target.projection_version
-      });
+      if (priorAttempts.size === 0) {
+        await this.repository.materializeCanonicalDerivatives(record, {
+          ...(record.transaction.operation === "project.create" ? { publishReceipt: false } : {}),
+          projectionVersion: target.projection_version
+        });
+      }
 
       const baseline = await this.loadExternalBaseline(target.revision);
       if (baseline) {
@@ -255,13 +268,30 @@ export class MaterializationCoordinator {
         }
       }
 
-      const verified = await this.writer.materialize(plan, {
+      const writerOptions: Parameters<ProjectionWriterPort["materialize"]>[1] = {
         workspaceRoot,
         alreadyVerified: attempts,
         onOutputOutcome: (_key, outcome) => countOutcome(metrics, outcome),
         onOutputVerified: (key, evidence) => this.ledger.recordVerifiedOutput(key, evidence)
-      });
+      };
+      const sliced = this.sliceBudget && this.writer.materializeSlice
+        ? await this.writer.materializeSlice(plan, writerOptions, this.sliceBudget)
+        : null;
+      const verified = sliced
+        ? sliced.verified
+        : await this.writer.materialize(plan, writerOptions);
       verifiedCount = verified.size;
+
+      if (sliced?.nextKey !== null && sliced?.nextKey !== undefined) {
+        return {
+          project_id: this.projectId,
+          target_revision: target.revision,
+          projection_version: target.projection_version,
+          completed: false,
+          repaired_head: false,
+          more_work: true
+        };
+      }
 
       if (archived) {
         if (moveAfterWrite) await this.archiveWorkspaceOrConflict(record.state, activeRoot);
@@ -340,7 +370,26 @@ export class MaterializationCoordinator {
   private async loadExternalBaseline(canonicalRevision: number): Promise<ProjectionBaseline | null> {
     let head = await this.repository.readMaterializationHead(this.projectId);
     if (!head) head = await this.repairHeadFromCompletedRecords(canonicalRevision);
-    return head ? rebuildProjectionBaseline(this.repository, head) : null;
+    if (!head) return null;
+
+    const localHead = this.ledger.status().head;
+    if (
+      localHead
+      && localHead.revision === head.target_revision
+      && localHead.projection_version === head.projection_version
+    ) {
+      const tip = await this.repository.readMaterializationRecord(
+        this.projectId,
+        head.target_revision,
+        head.projection_version
+      );
+      const outputs = this.ledger.baselineOutputs();
+      if (tip && await matchesCachedBaseline(head, tip, outputs)) {
+        return { head, outputs, chain_depth: tip.chain_depth };
+      }
+    }
+
+    return rebuildProjectionBaseline(this.repository, head);
   }
 
   private async repairHeadFromCompletedRecords(canonicalRevision: number): Promise<MaterializationHead | null> {
@@ -485,6 +534,20 @@ export async function rebuildProjectionBaseline(
   }
 
   return { head, outputs, chain_depth: final.chain_depth };
+}
+
+async function matchesCachedBaseline(
+  head: MaterializationHead,
+  tip: CompletedMaterializationRecord,
+  outputs: ReadonlyMap<string, ProjectionOutputEvidence>
+): Promise<boolean> {
+  return tip.project_id === head.project_id
+    && tip.target_revision === head.target_revision
+    && tip.projection_version === head.projection_version
+    && tip.result_root_hash === head.result_root_hash
+    && tip.workspace_location === head.workspace_location
+    && tip.total_output_count === outputs.size
+    && await projectionIndexRootHash(outputs) === head.result_root_hash;
 }
 
 function applyPlanToBaseline(

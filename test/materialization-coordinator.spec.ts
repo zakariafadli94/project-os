@@ -21,6 +21,8 @@ import {
 } from "../src/materialization/coordinator";
 import { projectionIndexRootHash } from "../src/materialization/hash";
 import type { ProjectionPlan } from "../src/materialization/planner";
+import { createSliceBudget } from "../src/convergence/budget";
+import type { SliceBudget } from "../src/convergence/contract";
 
 const at = "2026-08-24T17:20:00+01:00";
 let seq = 0;
@@ -108,11 +110,13 @@ class FakeRepository implements MaterializationRepositoryPort {
   derivativeCalls = 0;
   headWrites = 0;
   recordWrites = 0;
+  recordReads = 0;
   failHeadOnce = false;
 
   async readCommitRecord(_projectId: string, revision: number) { return this.commits.get(revision) ?? null; }
   async readMaterializationHead() { return this.head; }
   async readMaterializationRecord(projectId: string, revision: number, pv: number) {
+    this.recordReads += 1;
     return this.records.get(`${projectId}:${revision}:${pv}`) ?? null;
   }
   async listMaterializationRecordRefs(projectId: string): Promise<MaterializationGenerationRef[]> {
@@ -234,7 +238,13 @@ class FakeWriter implements ProjectionWriterPort {
   }
 }
 
-function coordinator(repo: FakeRepository, ledger = new FakeLedger(), writer = new FakeWriter(), projectionVersion = CURRENT_PROJECTION_VERSION) {
+function coordinator(
+  repo: FakeRepository,
+  ledger = new FakeLedger(),
+  writer = new FakeWriter(),
+  projectionVersion = CURRENT_PROJECTION_VERSION,
+  sliceBudget?: SliceBudget
+) {
   return {
     ledger,
     writer,
@@ -244,6 +254,7 @@ function coordinator(repo: FakeRepository, ledger = new FakeLedger(), writer = n
       ledger,
       writer,
       projectionVersion,
+      sliceBudget,
       workspaceRootFor: (state) => workspaceProjectRoot(state.project_id, state.slug),
       now: () => "2026-08-24T17:21:00+01:00"
     })
@@ -345,6 +356,7 @@ describe("MaterializationCoordinator", () => {
     const completed = repo.records.get(`PRJ-3501:${target.new_revision}:${CURRENT_PROJECTION_VERSION}`)!;
     expect(completed.record_kind).toBe("snapshot");
     expect(completed.chain_depth).toBe(0);
+    expect(repo.recordReads).toBe(2);
   });
 
   it("repairs a failed head write from immutable evidence without rewriting workspace", async () => {
@@ -418,6 +430,46 @@ describe("MaterializationCoordinator", () => {
     await value.runNext();
     expect(writer.touched.at(-1)?.length).toBeGreaterThan(0);
     expect(writer.touched.at(-1)?.length).toBeLessThan(repo.head ? repo.head.target_revision + 20 : 20);
+    expect(repo.head?.target_revision).toBe(record.new_revision);
+  });
+
+  it("persists a partial writer slice and resumes it before publishing the head", async () => {
+    class SliceWriter extends FakeWriter {
+      slices = 0;
+
+      async materializeSlice(plan: ProjectionPlan, options: Parameters<FakeWriter["materialize"]>[1]) {
+        this.slices += 1;
+        if (this.slices > 1) {
+          return { verified: await this.materialize(plan, options), nextKey: null };
+        }
+        const [key, output] = [...plan.changed_outputs][0];
+        const evidence: ProjectionOutputEvidence = {
+          relative_path: output.relative_path,
+          input_hash: output.input_hash,
+          content_hash: output.content_hash,
+          source_revision: output.source_revision
+        };
+        await options.onOutputVerified?.(key, evidence);
+        return { verified: new Map([[key, evidence]]), nextKey: "next-output" };
+      }
+    }
+
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const ledger = new FakeLedger();
+    const writer = new SliceWriter();
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, ledger, writer, CURRENT_PROJECTION_VERSION, budget);
+    value.requestTarget(record.new_revision);
+
+    const first = await value.runNext();
+    expect(first).toMatchObject({ completed: false, more_work: true });
+    expect(repo.head).toBeNull();
+    expect(ledger.attempts.size).toBe(1);
+
+    const second = await value.runNext();
+    expect(second.completed).toBe(true);
     expect(repo.head?.target_revision).toBe(record.new_revision);
   });
 

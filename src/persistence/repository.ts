@@ -181,6 +181,13 @@ export class ProjectRepository extends CoreProjectRepository {
     await this.runtime.objects.upsertText(machineManifestPath(state.project_id), pretty(encodedManifest));
   }
 
+  override canonicalDerivativeText(
+    layer: "event" | "receipt" | "state" | "manifest",
+    record: CanonicalCommitRecord
+  ): string {
+    return encodeCanonicalDerivative(layer, record, this.writerStage());
+  }
+
   override async materializeCanonicalDerivatives(
     record: CanonicalCommitRecord,
     options: ActivationDerivativeOptions = {}
@@ -255,6 +262,21 @@ export class ProjectRepository extends CoreProjectRepository {
   private writerStage(): SchemaWriterStage {
     return schemaWriterStageFor(this.runtime, this.requestedSchemaWriterStage);
   }
+}
+
+export function encodeCanonicalDerivative(
+  layer: "event" | "receipt" | "state" | "manifest",
+  record: CanonicalCommitRecord,
+  stage: SchemaWriterStage
+): string {
+  const value = layer === "event"
+    ? record.event
+    : layer === "receipt"
+      ? record.receipt
+      : layer === "state"
+        ? encodeProjectState(record.state, stage)
+        : encodeManifest(record.state, stage);
+  return pretty(value);
 }
 
 function sameProviderObservation(

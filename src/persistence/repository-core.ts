@@ -272,6 +272,26 @@ export class ProjectRepository {
     }
   }
 
+  /** Exact bytes for one independently repairable canonical derivative. */
+  canonicalDerivativeText(
+    layer: "event" | "receipt" | "state" | "manifest",
+    record: CanonicalCommitRecord
+  ): string {
+    const validated = parseCanonicalCommitRecord(record);
+    if (layer === "event") return pretty(validated.event);
+    if (layer === "receipt") return pretty(validated.receipt);
+    if (layer === "state") return pretty(validated.state);
+    return pretty(manifestFor(validated.state));
+  }
+
+  async writeCanonicalEvent(record: CanonicalCommitRecord): Promise<void> {
+    const validated = parseCanonicalCommitRecord(record);
+    await this.safeAdd(
+      machineEventPath(validated.project_id, validated.event.event_id),
+      this.canonicalDerivativeText("event", validated)
+    );
+  }
+
   async writeCommit(
     state: ProjectState,
     event: DomainEvent,

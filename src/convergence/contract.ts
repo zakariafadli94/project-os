@@ -109,6 +109,14 @@ export interface Progress {
   last_error_code: string | null;
 }
 
+export interface VerifiedCanonical {
+  project_id: string;
+  state: import("../domain/project-state").ProjectState;
+  record: import("../domain/commit-record").CanonicalCommitRecord | null;
+  baseline_kind: "commit" | "pre_commit001";
+  complete: boolean;
+}
+
 export interface SliceBudget {
   deadline_ms: number;
   calls_left: number;

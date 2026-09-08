@@ -55,10 +55,10 @@ export class FencedEffects {
   ) {}
 
   async prepare(progress: Progress, token: string, intent: EffectIntent): Promise<string> {
-    const saved = await this.journal.save({
-      ...progress,
-      effects: { ...progress.effects, [intent.id]: { ...intent, state: "prepared" } }
-    }, token);
+    const preparedIntent = { ...intent, state: "prepared" as const };
+    // The caller keeps this same progress object for the rest of its slice.
+    progress.effects[intent.id] = preparedIntent;
+    const saved = await this.journal.save({ ...progress, effects: { ...progress.effects } }, token);
     this.prepared.set(intent.id, { token: saved, incarnation: progress.incarnation });
     return saved;
   }
@@ -96,6 +96,10 @@ export class FencedEffects {
       throw new Error("effect_neutralization_unproven");
     }
     return observed;
+  }
+
+  async observe(path: string): Promise<ObservedText | null> {
+    return observeText(this.runtime, path);
   }
 
   private async assertPrepared(intent: EffectIntent): Promise<void> {

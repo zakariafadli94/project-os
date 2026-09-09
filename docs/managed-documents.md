@@ -118,6 +118,8 @@ If a published file is deleted externally, the frozen published version is resto
 
 A previously unknown file appearing in `DELIVERABLES/**` is different: it is a strict final-zone mutation. Project OS requires durable governed provenance before a published bootstrap is allowed. Without that provenance, MutationGate preserves the bytes as an external mutation candidate and creates **no** published pointer.
 
+An accepted `REVIEW_CANDIDATE` becomes a managed DELIVERABLE only through the explicit `review_candidate.promote` operation. That operation requires a committed candidate receipt, a caller-supplied `accepted: true` decision, the expected project revision and fresh provider evidence. It creates one immutable published version and head for `DELIVERABLES/<logical_path>` while retaining the original candidate in `REVIEW/CANDIDATES/`. It is create-only and conflicts with a different existing head or destination object; it never treats an arbitrary final-zone file as an implicit publication.
+
 Detailed final-zone/operator contract: `docs/mutation-gate.md`.
 
 ## Generated projections are different
@@ -163,6 +165,8 @@ Managed-document durable evidence lives outside the Obsidian workspace:
 │   └── <REQUEST>/
 │       ├── intent.json
 │       └── receipt.json
+├── promotions/
+│   └── <REQUEST>.json
 ├── intakes/
 │   └── <INTAKE>.json
 ├── reference-fingerprints/
@@ -248,6 +252,8 @@ immutable request intent
 If Dropbox CAS succeeds and Project OS crashes before the version/head is written, exact replay may repair the operation only when the visible `DELIVERABLES` metadata matches the immutable REVIEW candidate evidence (content hash and size). Otherwise recovery fails closed as a conflict.
 
 If `HEAD.json` is lost while immutable history and visible managed content remain, status/mutation paths rebuild the logical head from the active causal history before proceeding. Reconstruction fails closed on ambiguous multiple active tips.
+
+For an explicit review-candidate promotion, the recovery order is immutable candidate receipt and observation, immutable provider payload snapshot, visible DELIVERABLES copy, published version, immutable promotion evidence, then published head and request receipt. If the provider copy succeeds before a later response is lost, exact replay verifies the same candidate payload and destination, reuses the immutable snapshot and completes the missing ledger effects. A different destination object, changed candidate revision or changed project revision remains a conflict.
 
 The same principle applies throughout the ledger: ambiguous/partial provider state is verified before an operation is considered committed.
 

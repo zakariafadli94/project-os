@@ -30,6 +30,47 @@ describe("managed document API request", () => {
     expect(parseManagedDocumentRequest(request)).toMatchObject({ operation: request.operation, project_id });
   });
 
+  it("parses an explicitly accepted review candidate promotion", () => {
+    expect(parseManagedDocumentRequest({
+      operation: "review_candidate.promote",
+      request_id: "DOCREQ-CANDIDATE-PROMOTE-0001",
+      project_id,
+      candidate_request_id: "ART-REVIEW-CANDIDATE-0001",
+      logical_path: "dg-v2.0/fiche.pdf",
+      expected_project_revision: 28,
+      accepted: true,
+      created_at
+    })).toMatchObject({
+      operation: "review_candidate.promote",
+      candidate_request_id: "ART-REVIEW-CANDIDATE-0001",
+      accepted: true
+    });
+  });
+
+  it("requires literal acceptance and a safe target for review candidate promotion", () => {
+    expect(() => parseManagedDocumentRequest({
+      operation: "review_candidate.promote",
+      request_id: "DOCREQ-CANDIDATE-PROMOTE-0002",
+      project_id,
+      candidate_request_id: "ART-REVIEW-CANDIDATE-0001",
+      logical_path: "dg-v2.0/fiche.pdf",
+      expected_project_revision: 28,
+      accepted: false,
+      created_at
+    })).toThrow();
+
+    expect(() => parseManagedDocumentRequest({
+      operation: "review_candidate.promote",
+      request_id: "DOCREQ-CANDIDATE-PROMOTE-0003",
+      project_id,
+      candidate_request_id: "ART-REVIEW-CANDIDATE-0001",
+      logical_path: "../fiche.pdf",
+      expected_project_revision: 28,
+      accepted: true,
+      created_at
+    })).toThrow();
+  });
+
   it("rejects unknown fields and unsafe logical/reference paths", () => {
     expect(() => parseManagedDocumentRequest({
       operation: "working.write", request_id: "DOCREQ-WORK-000009", project_id,

@@ -24,6 +24,7 @@ const documentIdSchema = z.string().regex(/^DOC-[A-F0-9]{24}$/);
 const versionIdSchema = z.string().regex(/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/);
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const requestIdSchema = z.string().regex(/^[A-Z][A-Z0-9-]{7,}$/);
+const candidateRequestIdSchema = z.string().regex(/^ART-[A-Z0-9-]{10,}$/);
 const kindSchema = z.enum(["reference", "work_product"]);
 const stageSchema = z.enum(["reference", "working", "review", "published", "recovered_external"]);
 const sourceSchema = z.enum(["project_os", "external_human", "input_ingest", "legacy_artifact_api"]);
@@ -79,6 +80,7 @@ const versionV2Schema = z.strictObject({
   content_sha256: hashSchema.optional(),
   provider_evidence: providerObservationSchema.optional(),
   media_type: z.string().min(1).max(255).optional(),
+  source_candidate_request_id: candidateRequestIdSchema.optional(),
   request_id: requestIdSchema.optional()
 }).superRefine((value, ctx) => {
   try {

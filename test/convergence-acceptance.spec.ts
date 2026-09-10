@@ -136,6 +136,58 @@ describe("post-commit convergence acceptance", () => {
     });
   });
 
+  it("uses the reserved effect runtime to complete an already materialized human verification", async () => {
+    const mock = installDropboxMock();
+    const effectRuntime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9277", 1)[0]!;
+    const effectRepository = new ProjectRepository(effectRuntime, "v2");
+    await effectRepository.writeCommitRecord(record);
+    await effectRepository.materializeCanonicalDerivatives(record);
+    await runHumanSlice({ record, repository: effectRepository, runtime: effectRuntime, ledger: new AcceptanceLedger() });
+
+    const requestRuntime = {
+      ...effectRuntime,
+      objects: {
+        ...effectRuntime.objects,
+        async readText(path: string) {
+          if (path === machineCommitRecordPath(record.project_id, record.new_revision)) {
+            return effectRuntime.objects.readText(path);
+          }
+          throw new Error("request_scope_must_not_verify_completed_human_output");
+        }
+      }
+    };
+    const journal = new ConvergenceJournal(effectRuntime, record.project_id);
+    const progress = initialProgress(record.project_id, "1970-01-01T00:00:00.000Z", "effect-verification");
+    progress.active = { revision: record.new_revision, projection_version: 3 };
+    progress.obligations["b".repeat(64)] = {
+      id: "b".repeat(64), layer: "human_handoff", from_revision: 0,
+      target: { revision: record.new_revision, projection_version: 3 }, incident: 1,
+      state: "verified", first_pending_at: "1970-01-01T00:00:00.000Z",
+      next_attempt_at: null, failure_count: 0, last_attempt_number: 1,
+      last_closed_attempt_number: 1, last_verified_at: "1970-01-01T00:00:00.000Z",
+      code: null, lease_until: null, continuation: "verify"
+    };
+    await journal.save(progress, null);
+    const engine = new ConvergenceEngine({
+      projectId: record.project_id,
+      repository: new ProjectRepository(requestRuntime, "v2"),
+      runtime: requestRuntime,
+      effectRuntime,
+      humanRepository: effectRepository,
+      journal,
+      ledger: new AcceptanceLedger() as never,
+      now: () => 0,
+      enableHuman: true
+    });
+
+    await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+
+    const saved = await journal.load();
+    expect(saved?.progress.obligations["b".repeat(64)]?.continuation).toBeNull();
+    expect(mock.files.get(machineMaterializationHeadPath(record.project_id))).toContain('"target_revision": 1');
+  });
+
   it("keeps a human projection pending when reconciliation reaches its slice boundary", async () => {
     installDropboxMock();
     const baseRuntime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));

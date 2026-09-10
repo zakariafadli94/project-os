@@ -391,6 +391,21 @@ describe("WorkspaceProjectionWriter", () => {
     expect(objects.maxReadInFlight).toBeGreaterThan(1);
   });
 
+  it("verifies the critical STATE/HANDOFF pair with configured concurrent reads", async () => {
+    const objects = new InstrumentedObjects();
+    objects.readDelay = 10;
+    const writer = new WorkspaceProjectionWriter(objects, 2);
+    const state = await output("global:STATE", "STATE.md", `${MANAGED_NOTICE}\nstate`, { critical: true });
+    const handoff = await output("global:HANDOFF", "HANDOFF.md", `${MANAGED_NOTICE}\nhandoff`, { critical: true });
+    objects.files.set("/workspace/STATE.md", state.content);
+    objects.files.set("/workspace/HANDOFF.md", handoff.content);
+
+    await writer.verifyCritical(plan([state, handoff]), "/workspace");
+
+    expect(objects.maxReadInFlight).toBeLessThanOrEqual(2);
+    expect(objects.maxReadInFlight).toBeGreaterThan(1);
+  });
+
   it("parses only conservative concurrency 1..4 and defaults to 4", () => {
     expect(parseProjectionConcurrency()).toBe(4);
     expect(parseProjectionConcurrency("1")).toBe(1);

@@ -152,18 +152,33 @@ export class WorkspaceProjectionWriter {
 
   async verifyCritical(plan: ProjectionPlan, workspaceRoot: string): Promise<void> {
     const root = normalizeWorkspaceRoot(workspaceRoot);
-    for (const output of plan.changed_outputs.values()) {
-      if (!output.critical) continue;
-      const path = joinWorkspacePath(root, output.relative_path);
-      const persisted = await this.objects.readText(path);
-      if (persisted === null || await sha256Text(persisted) !== output.content_hash) {
-        throw new MaterializationOutputConflictError(
-          output.key,
-          path,
-          `Critical materialization verification failed at final workspace location: ${path}`
-        );
+    const outputs = [...plan.changed_outputs.values()].filter((output) => output.critical);
+    let cursor = 0;
+    const failures: unknown[] = [];
+    const worker = async () => {
+      for (;;) {
+        if (failures.length > 0) return;
+        const output = outputs[cursor];
+        cursor += 1;
+        if (!output) return;
+        const path = joinWorkspacePath(root, output.relative_path);
+        try {
+          const persisted = await this.objects.readText(path);
+          if (persisted === null || await sha256Text(persisted) !== output.content_hash) {
+            throw new MaterializationOutputConflictError(
+              output.key,
+              path,
+              `Critical materialization verification failed at final workspace location: ${path}`
+            );
+          }
+        } catch (error) {
+          failures.push(error);
+          return;
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.concurrency, outputs.length) }, () => worker()));
+    if (failures.length > 0) throw failures[0];
   }
 
   async verifyOutputs(

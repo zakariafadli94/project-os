@@ -87,6 +87,47 @@ describe("post-commit convergence acceptance", () => {
     });
   });
 
+  it("uses the reserved effect runtime for bounded human materialization", async () => {
+    const mock = installDropboxMock();
+    const effectRuntime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9275", 1)[0]!;
+    const repository = new ProjectRepository(effectRuntime, "v2");
+    await repository.writeCommitRecord(record);
+    await repository.writeReceipt(record.receipt);
+    const root = workspaceProjectRoot(record.project_id, record.state.slug);
+    const requestRuntime = {
+      ...effectRuntime,
+      objects: {
+        ...effectRuntime.objects,
+        async createText(path: string, content: string) {
+          if (path.startsWith(`${root}/`)) throw new Error("request_scope_must_not_write_human_output");
+          return effectRuntime.objects.createText(path, content);
+        }
+      }
+    };
+    const journal = new ConvergenceJournal(effectRuntime, record.project_id);
+    const engine = new ConvergenceEngine({
+      projectId: record.project_id,
+      repository,
+      runtime: requestRuntime,
+      effectRuntime,
+      journal,
+      ledger: new AcceptanceLedger() as never,
+      now: () => 0,
+      enableHuman: true
+    });
+
+    for (let slice = 0; slice < 8; slice += 1) {
+      await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+      if (mock.files.has(machineMaterializationHeadPath(record.project_id))) break;
+    }
+
+    expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
+      target_revision: 1,
+      projection_version: 3
+    });
+  });
+
   it("keeps a human projection pending when reconciliation reaches its slice boundary", async () => {
     installDropboxMock();
     const baseRuntime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));

@@ -751,7 +751,10 @@ export class ConvergenceEngine {
       const human = await runHumanSlice({
         record,
         repository: this.input.repository,
-        runtime: this.input.runtime,
+        // Human output effects are fenced by the durable reservation above.
+        // They therefore use the same full-slice effect scope as retried
+        // canonical derivatives, while discovery remains on request scope.
+        runtime: this.effectRuntime(),
         ledger: this.input.ledger,
         budget: reserveCheckpointForJournal(budget),
         now: () => new Date(this.input.now()).toISOString()

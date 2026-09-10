@@ -590,6 +590,31 @@ describe("MaterializationCoordinator", () => {
     expect(repo.head?.target_revision).toBe(record.new_revision);
   });
 
+  it("treats an exhausted slice deadline as resumable work instead of a failed materialization", async () => {
+    class DeadlineWriter extends FakeWriter {
+      async materializeSlice() {
+        throw new Error("Dropbox read failed: slice_budget_exhausted");
+      }
+    }
+
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const ledger = new FakeLedger();
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, ledger, new DeadlineWriter(), CURRENT_PROJECTION_VERSION, budget);
+    value.requestTarget(record.new_revision);
+
+    await expect(value.runNext()).resolves.toMatchObject({
+      completed: false,
+      more_work: true,
+      target_revision: record.new_revision
+    });
+    expect(ledger.lastError).toBeNull();
+    expect(ledger.active?.revision).toBe(record.new_revision);
+    expect(repo.head).toBeNull();
+  });
+
   it("records supplied coalesced revisions in the completed generation", async () => {
     const record = createFixture();
     const repo = new FakeRepository();

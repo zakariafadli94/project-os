@@ -46,7 +46,15 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
     }
     coordinator.requestTarget(input.record.new_revision, CURRENT_PROJECTION_VERSION);
     const result = await coordinator.runNext();
-    return { complete: result.completed, more_work: result.more_work };
+    const status = coordinator.status();
+    // A cold ledger can reconcile an already-published generation and find
+    // no local target to run. That is a completed human handoff, not an idle
+    // pending slice: the engine will immediately perform its independent
+    // generation/head and critical-pair verification before declaring health.
+    const alreadyPublished = !result.more_work
+      && status.head?.revision === input.record.new_revision
+      && status.head.projection_version === CURRENT_PROJECTION_VERSION;
+    return { complete: result.completed || alreadyPublished, more_work: result.more_work };
   } catch (error) {
     if (input.budget && isSliceBudgetExhaustion(error)) return { complete: false, more_work: true };
     throw error;

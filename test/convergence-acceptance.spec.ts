@@ -22,13 +22,23 @@ import { installDropboxMock } from "./helpers/mock-dropbox";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class AcceptanceLedger implements MaterializationLedgerPort {
+  constructor(private readonly ignoreCurrentTargetRequest = false) {}
+
   private requested: { revision: number; projection_version: number } | null = null;
   private active: { revision: number; projection_version: number; coalesced_revisions: number[] } | null = null;
   private head: { revision: number; projection_version: number } | null = null;
   private readonly outputs = new Map<string, ProjectionOutputEvidence>();
   private pendingFinalVerification: FinalVerificationItem[] | null = null;
 
-  requestTarget(target: { revision: number; projection_version: number }) { this.requested = target; }
+  requestTarget(target: { revision: number; projection_version: number }) {
+    if (
+      this.ignoreCurrentTargetRequest
+      && this.active === null
+      && this.head?.revision === target.revision
+      && this.head.projection_version === target.projection_version
+    ) return;
+    this.requested = target;
+  }
   beginNextTarget() {
     if (!this.active && this.requested) {
       this.active = { ...this.requested, coalesced_revisions: [] };
@@ -208,6 +218,29 @@ describe("post-commit convergence acceptance", () => {
     const saved = await journal.load();
     expect(saved?.progress.obligations["b".repeat(64)]?.continuation).toBeNull();
     expect(mock.files.get(machineMaterializationHeadPath(record.project_id))).toContain('"target_revision": 1');
+  });
+
+  it("recognizes a current published generation when resuming a pending human handoff", async () => {
+    const mock = installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9279", 1)[0]!;
+    const repository = new ProjectRepository(runtime, "v2");
+    await repository.writeCommitRecord(record);
+
+    await runHumanSlice({ record, repository, runtime, ledger: new AcceptanceLedger() });
+
+    const resumed = await runHumanSlice({
+      record,
+      repository,
+      runtime,
+      ledger: new AcceptanceLedger(true)
+    });
+
+    expect(resumed).toEqual({ complete: true, more_work: false });
+    expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
+      target_revision: record.new_revision,
+      projection_version: 3
+    });
   });
 
   it("does not start a human projection from a legacy requested target before machine evidence is current", async () => {

@@ -57,19 +57,17 @@ export async function repairDerivative(
 ): Promise<LayerHealth> {
   const path = derivativePath(layer, record);
   const content = repository.canonicalDerivativeText(layer, record);
-  const observed = await observeTextForEffects(effects, path);
   const expected = await textEvidence(content, record.new_revision);
-  if (observed?.content === content) return current(expected, observed, record.new_revision);
   if (
     intent.id !== `${layer}:${record.new_revision}`
     || intent.path !== path
     || intent.desired_hash !== expected.hash
-  ) return pending(expected, observed, "effect_intent_mismatch");
+  ) return pending(expected, null, "effect_intent_mismatch");
   try {
     const after = await effects.replace(intent, content);
     return current(expected, after, record.new_revision);
   } catch (error) {
-    return pending(expected, observed, error instanceof Error ? error.message : "effect_blocked");
+    return pending(expected, null, error instanceof Error ? error.message : "effect_blocked");
   }
 }
 

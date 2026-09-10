@@ -32,8 +32,10 @@ describe("canonical derivative convergence", () => {
     if (!inspection.intent) throw new Error("missing repair intent");
     token = await effects.prepare(progress, token, inspection.intent);
 
+    const repeatedObservation = vi.spyOn(effects, "observe");
     const health = await repairDerivative("state", record, effects, repository, inspection.intent);
     expect(health.state).toBe("current");
+    expect(repeatedObservation).not.toHaveBeenCalled();
     expect(mock.files.get(`/PROJECT_OS/.project-os/projects/${record.project_id}/state.json`)).toBe(
       repository.canonicalDerivativeText("state", record)
     );

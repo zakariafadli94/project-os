@@ -435,6 +435,16 @@ describe("SearchIndex generation-safe rebuild", () => {
     await drainSearchSync(projectId, 1);
 
     await runInDurableObject(searchGuard, async (_instance, state) => {
+      // The cleanup batch must be tested against a fixed cardinality, not
+      // against concurrent stale rows from the global search guard or however
+      // many canonical records this project's source happens to derive.
+      state.storage.sql.exec("DELETE FROM search_rebuild_items WHERE project_id != ?", projectId);
+      state.storage.sql.exec("DELETE FROM search_rebuild_jobs WHERE project_id != ?", projectId);
+      state.storage.sql.exec("DELETE FROM search_fts WHERE project_id != ?", projectId);
+      state.storage.sql.exec("DELETE FROM search_records WHERE project_id != ?", projectId);
+      state.storage.sql.exec("DELETE FROM search_project_heads WHERE project_id != ?", projectId);
+      state.storage.sql.exec("DELETE FROM search_fts WHERE project_id = ? AND generation = ?", projectId, 1);
+      state.storage.sql.exec("DELETE FROM search_records WHERE project_id = ? AND generation = ?", projectId, 1);
       for (let index = 0; index < 40; index += 1) {
         const recordId = `seed:cleanup:${index.toString().padStart(2, "0")}`;
         state.storage.sql.exec(
@@ -467,7 +477,7 @@ describe("SearchIndex generation-safe rebuild", () => {
       }
     });
     const oldCount = await generationRecordCount(searchGuard, projectId, 1);
-    expect(oldCount).toBeGreaterThan(32);
+    expect(oldCount).toBe(40);
 
     expect((await startRebuild(projectId)).status).toBe(202);
     expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
@@ -479,10 +489,10 @@ describe("SearchIndex generation-safe rebuild", () => {
 
     expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
     const afterFirstCleanup = await generationRecordCount(searchGuard, projectId, 1);
-    expect(afterFirstCleanup).toBeGreaterThan(0);
-    expect(afterFirstCleanup).toBeLessThan(oldCount);
+    expect(afterFirstCleanup).toBe(8);
 
     expect(await runDurableObjectAlarm(searchGuard)).toBe(true);
-    expect(await generationRecordCount(searchGuard, projectId, 1)).toBe(0);
+    const afterSecondCleanup = await generationRecordCount(searchGuard, projectId, 1);
+    expect(afterSecondCleanup).toBe(0);
   });
 });

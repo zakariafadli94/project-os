@@ -10,6 +10,17 @@ export interface MaterializationTarget extends MaterializationTargetRequest {
   coalesced_revisions: number[];
 }
 
+/** A persistent final-observation obligation for the exact published index. */
+export type FinalVerificationItem = {
+  key: string;
+  expected: "present";
+  evidence: ProjectionOutputEvidence;
+} | {
+  key: string;
+  expected: "absent";
+  evidence: ProjectionOutputEvidence;
+};
+
 export interface MaterializationLedgerStatus {
   head: MaterializationTargetRequest | null;
   requested: MaterializationTargetRequest | null;
@@ -31,6 +42,8 @@ interface ControlRow {
   active_coalesced_json: string;
   active_immutable_revision: number | null;
   active_verification_epoch: number;
+  active_final_verification_json: string;
+  active_managed_zones_ready: number;
   active_status: string | null;
   last_error: string | null;
 }
@@ -68,6 +81,8 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
       active_coalesced_json TEXT NOT NULL DEFAULT '[]',
       active_immutable_revision INTEGER,
       active_verification_epoch INTEGER NOT NULL DEFAULT 0,
+      active_final_verification_json TEXT NOT NULL DEFAULT '[]',
+      active_managed_zones_ready INTEGER NOT NULL DEFAULT 0,
       active_status TEXT,
       last_error TEXT
     );
@@ -113,6 +128,16 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
   }
   try {
     storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_verification_epoch INTEGER NOT NULL DEFAULT 0");
+  } catch (error) {
+    if (!String(error).includes("duplicate column name")) throw error;
+  }
+  try {
+    storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_final_verification_json TEXT NOT NULL DEFAULT '[]'");
+  } catch (error) {
+    if (!String(error).includes("duplicate column name")) throw error;
+  }
+  try {
+    storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_managed_zones_ready INTEGER NOT NULL DEFAULT 0");
   } catch (error) {
     if (!String(error).includes("duplicate column name")) throw error;
   }
@@ -179,6 +204,7 @@ export class MaterializationLedger {
         this.storage.sql.exec(
           `UPDATE materialization_control
            SET active_verification_epoch = active_verification_epoch + 1,
+               active_final_verification_json = '[]',
                active_status = 'running', last_error = NULL
            WHERE singleton = 1`
         );
@@ -218,7 +244,9 @@ export class MaterializationLedger {
       this.storage.sql.exec(
         `UPDATE materialization_control
          SET active_revision = ?, active_projection_version = ?, active_coalesced_json = ?, active_immutable_revision = NULL,
-             active_verification_epoch = active_verification_epoch + 1, active_status = 'running', last_error = NULL
+             active_verification_epoch = active_verification_epoch + 1, active_final_verification_json = '[]',
+             active_managed_zones_ready = 0,
+             active_status = 'running', last_error = NULL
          WHERE singleton = 1`,
         row.requested_revision,
         row.requested_projection_version,
@@ -262,6 +290,20 @@ export class MaterializationLedger {
     );
   }
 
+  managedZoneBootstrapReady(): boolean {
+    const row = this.control();
+    return row.active_revision !== null && row.active_managed_zones_ready === 1;
+  }
+
+  markManagedZoneBootstrapReady(): void {
+    if (this.control().active_revision === null) {
+      throw new Error("Cannot mark managed zones ready without an active target");
+    }
+    this.storage.sql.exec(
+      "UPDATE materialization_control SET active_managed_zones_ready = 1 WHERE singleton = 1"
+    );
+  }
+
   attemptOutputs(): Map<string, ProjectionOutputEvidence> {
     const row = this.control();
     if (row.active_revision === null || row.active_projection_version === null) return new Map();
@@ -275,6 +317,49 @@ export class MaterializationLedger {
       row.active_verification_epoch
     ).toArray();
     return outputMap(rows);
+  }
+
+  finalVerificationActive(): boolean {
+    const row = this.control();
+    return row.active_revision !== null && row.active_status === "verifying";
+  }
+
+  beginFinalVerification(items: readonly FinalVerificationItem[]): void {
+    const row = this.control();
+    if (row.active_revision === null || row.active_projection_version === null) {
+      throw new Error("Cannot begin final materialization verification without an active target");
+    }
+    if (row.active_status === "verifying") return;
+    const pending = normalizeFinalVerificationItems(items);
+    if (pending.length === 0) {
+      throw new Error("Final materialization verification requires at least one changed output");
+    }
+    this.storage.sql.exec(
+      `UPDATE materialization_control
+       SET active_status = 'verifying', active_final_verification_json = ?
+       WHERE singleton = 1`,
+      JSON.stringify(pending)
+    );
+  }
+
+  finalVerificationPending(): FinalVerificationItem[] {
+    const row = this.control();
+    if (row.active_status !== "verifying") return [];
+    return parseFinalVerificationItems(row.active_final_verification_json);
+  }
+
+  completeFinalVerification(keys: readonly string[]): void {
+    const row = this.control();
+    if (row.active_revision === null || row.active_status !== "verifying") {
+      throw new Error("Cannot complete final materialization verification without an active verification pass");
+    }
+    const completed = new Set(keys);
+    const remaining = parseFinalVerificationItems(row.active_final_verification_json)
+      .filter((item) => !completed.has(item.key));
+    this.storage.sql.exec(
+      "UPDATE materialization_control SET active_final_verification_json = ? WHERE singleton = 1",
+      JSON.stringify(remaining)
+    );
   }
 
   baselineOutputs(): Map<string, ProjectionOutputEvidence> {
@@ -344,7 +429,9 @@ export class MaterializationLedger {
              requested_revision = CASE WHEN ? THEN NULL ELSE requested_revision END,
              requested_projection_version = CASE WHEN ? THEN NULL ELSE requested_projection_version END,
              active_revision = NULL, active_projection_version = NULL,
-             active_coalesced_json = '[]', active_immutable_revision = NULL, active_status = NULL, last_error = NULL
+             active_coalesced_json = '[]', active_immutable_revision = NULL, active_final_verification_json = '[]',
+             active_managed_zones_ready = 0,
+             active_status = NULL, last_error = NULL
          WHERE singleton = 1`,
         input.revision,
         input.projection_version,
@@ -381,7 +468,9 @@ export class MaterializationLedger {
              requested_revision = CASE WHEN ? THEN NULL ELSE requested_revision END,
              requested_projection_version = CASE WHEN ? THEN NULL ELSE requested_projection_version END,
              active_revision = NULL, active_projection_version = NULL,
-             active_coalesced_json = '[]', active_immutable_revision = NULL, active_status = NULL, last_error = NULL
+             active_coalesced_json = '[]', active_immutable_revision = NULL, active_final_verification_json = '[]',
+             active_managed_zones_ready = 0,
+             active_status = NULL, last_error = NULL
          WHERE singleton = 1`,
         head.revision,
         head.projection_version,
@@ -442,7 +531,8 @@ export class MaterializationLedger {
   private control(): ControlRow {
     return this.storage.sql.exec<ControlRow>(
       `SELECT head_revision, head_projection_version, requested_revision, requested_projection_version,
-              active_revision, active_projection_version, active_coalesced_json, active_immutable_revision, active_verification_epoch, active_status, last_error
+              active_revision, active_projection_version, active_coalesced_json, active_immutable_revision,
+              active_verification_epoch, active_final_verification_json, active_managed_zones_ready, active_status, last_error
        FROM materialization_control WHERE singleton = 1`
     ).one();
   }
@@ -500,6 +590,64 @@ function parseRevisionList(raw: string): number[] {
     throw new Error("Invalid materialization coalesced revision state");
   }
   return uniqueSorted(values);
+}
+
+function normalizeFinalVerificationItems(items: readonly FinalVerificationItem[]): FinalVerificationItem[] {
+  const byKey = new Map<string, FinalVerificationItem>();
+  for (const item of items) {
+    if (!item.key || (item.expected !== "present" && item.expected !== "absent")) {
+      throw new Error("Invalid materialization final verification state");
+    }
+    if (byKey.has(item.key)) {
+      throw new Error(`Duplicate materialization final verification item: ${item.key}`);
+    }
+    byKey.set(item.key, {
+      key: item.key,
+      expected: item.expected,
+      evidence: { ...item.evidence }
+    });
+  }
+  return [...byKey.values()].sort((left, right) => left.key.localeCompare(right.key));
+}
+
+function parseFinalVerificationItems(raw: string): FinalVerificationItem[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("Invalid materialization final verification state");
+  }
+  if (!Array.isArray(parsed)) throw new Error("Invalid materialization final verification state");
+  return normalizeFinalVerificationItems(parsed.map((value) => {
+    if (!value || typeof value !== "object") throw new Error("Invalid materialization final verification state");
+    const candidate = value as {
+      key?: unknown;
+      expected?: unknown;
+      evidence?: Partial<ProjectionOutputEvidence>;
+    };
+    const evidence = candidate.evidence;
+    if (
+      typeof candidate.key !== "string"
+      || (candidate.expected !== "present" && candidate.expected !== "absent")
+      || !evidence
+      || typeof evidence.relative_path !== "string"
+      || typeof evidence.input_hash !== "string"
+      || typeof evidence.content_hash !== "string"
+      || !Number.isSafeInteger(evidence.source_revision)
+    ) {
+      throw new Error("Invalid materialization final verification state");
+    }
+    return {
+      key: candidate.key,
+      expected: candidate.expected,
+      evidence: {
+        relative_path: evidence.relative_path,
+        input_hash: evidence.input_hash,
+        content_hash: evidence.content_hash,
+        source_revision: evidence.source_revision
+      }
+    } as FinalVerificationItem;
+  }));
 }
 
 function integerRange(start: number, end: number): number[] {

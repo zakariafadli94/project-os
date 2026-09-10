@@ -15,7 +15,7 @@ import {
   type ProjectionBaseline as PlannerBaseline,
   type ProjectionPlan
 } from "./planner";
-import type { MaterializationLedgerStatus, MaterializationTarget } from "./ledger";
+import type { FinalVerificationItem, MaterializationLedgerStatus, MaterializationTarget } from "./ledger";
 import { MaterializationOutputConflictError, type ProjectionWriteOutcome } from "./writer";
 import type { SliceBudget } from "../convergence/contract";
 
@@ -36,6 +36,10 @@ export interface MaterializationRepositoryPort {
   ): Promise<void>;
   writeCanonicalEvent?(record: CanonicalCommitRecord): Promise<void>;
   writeReceipt?(receipt: CanonicalCommitRecord["receipt"]): Promise<void>;
+  /** Idempotently establishes the visible managed zones before active V2 output. */
+  ensureManagedWorkspaceDirectories?(state: ProjectState): Promise<void>;
+  /** Determines whether an interrupted archive move left one visible workspace root. */
+  archiveWorkspaceLocation?(state: ProjectState): Promise<"active" | "archive" | "missing" | "conflict">;
   archiveHumanWorkspace?(state: ProjectState): Promise<void>;
 }
 
@@ -44,9 +48,15 @@ export interface MaterializationLedgerPort {
   beginNextTarget(): MaterializationTarget | null;
   recordVerifiedOutput(key: string, evidence: ProjectionOutputEvidence): void;
   attemptOutputs(): Map<string, ProjectionOutputEvidence>;
+  finalVerificationActive(): boolean;
+  beginFinalVerification(items: readonly FinalVerificationItem[]): void;
+  finalVerificationPending(): FinalVerificationItem[];
+  completeFinalVerification(keys: readonly string[]): void;
   baselineOutputs(): Map<string, ProjectionOutputEvidence>;
   immutableDerivativesThrough(): number | null;
   markImmutableDerivativesThrough(revision: number): void;
+  managedZoneBootstrapReady?(): boolean;
+  markManagedZoneBootstrapReady?(): void;
   failActive(message: string): void;
   completeTarget(input: {
     revision: number;
@@ -76,6 +86,7 @@ export interface ProjectionWriterPort {
   }, budget: SliceBudget): Promise<{ verified: Map<string, ProjectionOutputEvidence>; nextKey: string | null }>;
   verifyCritical?(plan: ProjectionPlan, workspaceRoot: string): Promise<void>;
   verifyOutputs?(outputs: ReadonlyMap<string, ProjectionOutputEvidence>, workspaceRoot: string): Promise<void>;
+  verifyAbsentOutputs?(outputs: ReadonlyMap<string, ProjectionOutputEvidence>, workspaceRoot: string): Promise<void>;
 }
 
 export interface ProjectionBaseline {
@@ -248,6 +259,33 @@ export class MaterializationCoordinator {
         });
       }
 
+      // The convergence engine has already repaired the machine derivatives,
+      // so it does not call `materializeCanonicalDerivatives`.  Keep its
+      // managed-zone bootstrap nevertheless: visible INPUTS/REFERENCES/
+      // WORKING/REVIEW/DELIVERABLES must exist before the human writer starts
+      // publishing an active V2 projection.  It is intentionally skipped for
+      // archives, which must never recreate an active workspace structure.
+      if (
+        priorAttempts.size === 0
+        && record.state.status !== "archived"
+        && this.repository.ensureManagedWorkspaceDirectories
+      ) {
+        if (this.ledger.managedZoneBootstrapReady?.() !== true && this.sliceBudget && !this.sliceBudget.canStartEffect(7)) {
+          return {
+            project_id: this.projectId,
+            target_revision: target.revision,
+            projection_version: target.projection_version,
+            completed: false,
+            repaired_head: false,
+            more_work: true
+          };
+        }
+        if (this.ledger.managedZoneBootstrapReady?.() !== true) {
+          await this.repository.ensureManagedWorkspaceDirectories(record.state);
+          this.ledger.markManagedZoneBootstrapReady?.();
+        }
+      }
+
       const baseline = await this.loadExternalBaseline(target.revision);
       if (baseline) {
         const local = this.ledger.status().head;
@@ -280,7 +318,17 @@ export class MaterializationCoordinator {
       if (archived) {
         workspaceLocation = "archive";
         const baselineAlreadyArchived = baseline?.head.workspace_location === "archive";
-        if (baselineAlreadyArchived) {
+        const observedLocation = this.repository.archiveWorkspaceLocation
+          ? await this.repository.archiveWorkspaceLocation(record.state)
+          : null;
+        if (observedLocation === "conflict") {
+          throw new MaterializationOutputConflictError(
+            "workspace:archive",
+            activeRoot,
+            `Archived workspace move is inconsistent: both roots exist for ${this.projectId}`
+          );
+        }
+        if (baselineAlreadyArchived || observedLocation === "archive") {
           workspaceRoot = archiveRoot;
         } else if (attempts.size > 0) {
           await this.archiveWorkspaceOrConflict(record.state, activeRoot);
@@ -290,33 +338,45 @@ export class MaterializationCoordinator {
         }
       }
 
-      const writerOptions: Parameters<ProjectionWriterPort["materialize"]>[1] = {
-        workspaceRoot,
-        alreadyVerified: attempts,
-        onOutputOutcome: (_key, outcome) => countOutcome(metrics, outcome),
-        onOutputVerified: (key, evidence) => this.ledger.recordVerifiedOutput(key, evidence)
-      };
-      const sliced = this.sliceBudget && this.writer.materializeSlice
-        ? await this.writer.materializeSlice(plan, writerOptions, this.sliceBudget)
-        : null;
-      const verified = sliced
-        ? sliced.verified
-        : await this.writer.materialize(plan, writerOptions);
-      verifiedCount = verified.size;
-
-      if (sliced?.nextKey !== null && sliced?.nextKey !== undefined) {
-        return {
-          project_id: this.projectId,
-          target_revision: target.revision,
-          projection_version: target.projection_version,
-          completed: false,
-          repaired_head: false,
-          more_work: true
+      let verified = attempts;
+      let fullOutputs: Map<string, ProjectionOutputEvidence> | null = null;
+      if (!(this.sliceBudget && this.ledger.finalVerificationActive())) {
+        const writerOptions: Parameters<ProjectionWriterPort["materialize"]>[1] = {
+          workspaceRoot,
+          alreadyVerified: attempts,
+          onOutputOutcome: (_key, outcome) => countOutcome(metrics, outcome),
+          onOutputVerified: (key, evidence) => this.ledger.recordVerifiedOutput(key, evidence)
         };
+        const sliced = this.sliceBudget && this.writer.materializeSlice
+          ? await this.writer.materializeSlice(plan, writerOptions, this.sliceBudget)
+          : null;
+        verified = sliced
+          ? sliced.verified
+          : await this.writer.materialize(plan, writerOptions);
+        verifiedCount = verified.size;
+
+        if (sliced?.nextKey !== null && sliced?.nextKey !== undefined) {
+          return pendingMaterializationResult(this.projectId, target);
+        }
+
+        if (archived && moveAfterWrite) {
+          await this.archiveWorkspaceOrConflict(record.state, activeRoot);
+        }
+        if (this.sliceBudget) {
+          const missing = [...plan.changed_outputs.keys()].filter((key) => !verified.has(key));
+          if (missing.length > 0) {
+            throw new Error(`Final materialization verification is missing changed outputs: ${missing.join(", ")}`);
+          }
+          fullOutputs = applyPlanToBaseline(baseline?.outputs ?? new Map(), plan, verified);
+          this.ledger.beginFinalVerification(finalVerificationItems(fullOutputs, plan));
+        }
       }
 
-      if (archived) {
-        if (moveAfterWrite) await this.archiveWorkspaceOrConflict(record.state, activeRoot);
+      if (this.sliceBudget) {
+        const finalVerificationComplete = await this.verifyFinalOutputBatch(archived ? archiveRoot : workspaceRoot);
+        if (!finalVerificationComplete) return pendingMaterializationResult(this.projectId, target);
+        verified = this.ledger.attemptOutputs();
+        verifiedCount = verified.size;
       }
 
       if (!this.writer.verifyCritical) {
@@ -324,7 +384,7 @@ export class MaterializationCoordinator {
       }
       await this.writer.verifyCritical(plan, archived ? archiveRoot : activeRoot);
 
-      const fullOutputs = applyPlanToBaseline(baseline?.outputs ?? new Map(), plan, verified);
+      fullOutputs ??= applyPlanToBaseline(baseline?.outputs ?? new Map(), plan, verified);
       const resultRootHash = await projectionIndexRootHash(fullOutputs);
       const snapshot = baseline === null
         || baseline.head.projection_version !== target.projection_version
@@ -536,10 +596,95 @@ export class MaterializationCoordinator {
     }
   }
 
+  private async verifyFinalOutputBatch(workspaceRoot: string): Promise<boolean> {
+    if (!this.sliceBudget || !this.writer.verifyOutputs) {
+      throw new Error("Bounded materialization requires final output verification");
+    }
+    const pending = this.ledger.finalVerificationPending();
+    if (pending.length === 0) return true;
+    const attempts = this.ledger.attemptOutputs();
+    const batchSize = selectFinalVerificationBatchSize(this.sliceBudget, pending.length);
+    if (batchSize === 0) return false;
+    const batch = pending.slice(0, batchSize);
+    const present = new Map(batch
+      .filter((item) => item.expected === "present")
+      .map((item) => [item.key, item.evidence] as const));
+    const absent = new Map(batch
+      .filter((item) => item.expected === "absent")
+      .map((item) => [item.key, item.evidence] as const));
+    for (const [key, evidence] of present) {
+      const attempt = attempts.get(key);
+      if (attempt && attempt.content_hash !== evidence.content_hash) {
+        throw new Error(`Final materialization verification evidence diverged for ${key}`);
+      }
+    }
+    if (present.size > 0) await this.writer.verifyOutputs(present, workspaceRoot);
+    if (absent.size > 0) {
+      if (!this.writer.verifyAbsentOutputs) {
+        throw new Error("Bounded materialization requires final removed-output verification");
+      }
+      await this.writer.verifyAbsentOutputs(absent, workspaceRoot);
+    }
+    // Do not clear the last batch before record/head publication. A cold
+    // restart in this interval will observe it again rather than trust a
+    // completed cursor with no published generation.
+    if (batch.length === pending.length) return true;
+    this.ledger.completeFinalVerification(batch.map((item) => item.key));
+    return false;
+  }
+
   private hasMoreWork(): boolean {
     const status = this.ledger.status();
     return status.active !== null || status.requested !== null;
   }
+}
+
+function finalVerificationItems(
+  outputs: ReadonlyMap<string, ProjectionOutputEvidence>,
+  plan: ProjectionPlan
+): FinalVerificationItem[] {
+  const items: FinalVerificationItem[] = [...outputs.entries()].map(([key, evidence]) => ({
+    key,
+    expected: "present",
+    evidence
+  }));
+  for (const key of plan.removed_outputs) {
+    const evidence = plan.removed_output_evidence?.get(key);
+    if (!evidence) {
+      throw new Error(`Final materialization verification is missing removed-output evidence for ${key}`);
+    }
+    items.push({ key, expected: "absent", evidence });
+  }
+  return items;
+}
+
+/**
+ * Final output reads must never take the journal reserve. If this is the last
+ * batch, also reserve the immutable record/head publication and its critical
+ * post-publication checks. Earlier batches consume only provider reads, then
+ * durably retain their remaining-key cursor for the next fresh slice.
+ */
+function selectFinalVerificationBatchSize(budget: SliceBudget, pendingCount: number): number {
+  const publicationCalls = 8;
+  for (let size = pendingCount; size >= 1; size -= 1) {
+    const isFinalBatch = size === pendingCount;
+    if (budget.canStartEffect(size + (isFinalBatch ? publicationCalls : 0))) return size;
+  }
+  return 0;
+}
+
+function pendingMaterializationResult(
+  projectId: string,
+  target: MaterializationTarget
+): MaterializationRunResult {
+  return {
+    project_id: projectId,
+    target_revision: target.revision,
+    projection_version: target.projection_version,
+    completed: false,
+    repaired_head: false,
+    more_work: true
+  };
 }
 
 function criticalPairEvidence(

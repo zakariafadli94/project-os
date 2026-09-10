@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Env } from "../src/env";
@@ -10,6 +10,8 @@ import {
   machineMaterializationRecordPath,
   workspaceProjectRoot
 } from "../src/persistence/layout";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -28,6 +30,17 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   return response.json<Receipt>();
 }
 
+/**
+ * These tests address the projection owner, not allocation.  A direct
+ * ProjectGuard fixture deliberately bypasses RegistryGuard, so seed the
+ * receipt that RegistryGuard would have committed before convergence may run.
+ */
+async function createSyntheticProject(projectId: string, slug: string, transactionId: string): Promise<Receipt> {
+  const receipt = await submit(projectId, createTx(projectId, slug, transactionId));
+  await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(receipt);
+  return receipt;
+}
+
 function createTx(projectId: string, slug: string, transactionId: string) {
   return {
     schema_version: "1.0",
@@ -44,11 +57,38 @@ function materializationStub(projectId: string) {
   return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 }
 
+async function enableRepairMaterialization(projectId: string): Promise<void> {
+  await runInDurableObject(materializationStub(projectId), (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
+}
+
+async function materializeSlice(projectId: string): Promise<Response> {
+  return materializationStub(projectId).fetch("https://materialization-guard.internal/materialize", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ target: "workspace-v2" })
+  });
+}
+
 async function materialize(projectId: string): Promise<void> {
-  const stub = materializationStub(projectId);
-  for (let slice = 0; slice < 8; slice += 1) {
-    if (!await runDurableObjectAlarm(stub)) return;
+  for (let slice = 0; slice < 64; slice += 1) {
+    const response = await materializeSlice(projectId);
+    if (response.status === 200) return;
+    expect(response.status).toBe(202);
   }
+  throw new Error("materialization_did_not_converge");
+}
+
+async function materializeUntil(projectId: string, reached: () => boolean): Promise<void> {
+  for (let slice = 0; slice < 64; slice += 1) {
+    const response = await materializeSlice(projectId);
+    expect([200, 202]).toContain(response.status);
+    if (reached()) return;
+  }
+  throw new Error("materialization_target_not_reached");
 }
 
 describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
@@ -64,8 +104,9 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     const slug = "projection-efficiency";
     const root = workspaceProjectRoot(projectId, slug);
     const stub = materializationStub(projectId);
+    await enableRepairMaterialization(projectId);
 
-    await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3801-CREATE"));
+    await createSyntheticProject(projectId, slug, "TXN-MATFAULT-3801-CREATE");
     await materialize(projectId);
     await submit(projectId, {
       schema_version: "1.0", transaction_id: "TXN-MATFAULT-3801-TASK", project_id: projectId,
@@ -143,8 +184,9 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     const slug = "head-repair";
     const root = workspaceProjectRoot(projectId, slug);
     const stub = materializationStub(projectId);
+    await enableRepairMaterialization(projectId);
 
-    await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3802-CREATE"));
+    await createSyntheticProject(projectId, slug, "TXN-MATFAULT-3802-CREATE");
     await materialize(projectId);
     faults.push({
       endpoint: "/2/files/upload",
@@ -160,21 +202,14 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
       payload: { task_id: "TASK-MAT3802", title: "Head repair" }
     });
 
-    let rejected = false;
-    for (let slice = 0; slice < 4 && !rejected; slice += 1) {
-      try {
-        await runDurableObjectAlarm(stub);
-      } catch {
-        rejected = true;
-      }
-    }
-    expect(rejected).toBe(true);
-    expect(mock.files.has(machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION))).toBe(true);
+    const generationPath = machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION);
+    await materializeUntil(projectId, () => mock.files.has(generationPath));
+    expect(mock.files.has(generationPath)).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
     mock.files.delete(`${root}/HANDOFF.md`);
     mock.uploadCalls.length = 0;
 
-    await materialize(projectId);
+    expect((await materializeSlice(projectId)).status).toBe(202);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
     expect(mock.uploadCalls.filter((path) => path.startsWith(`${root}/`))).toEqual([]);
   });
@@ -188,8 +223,9 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     const root = workspaceProjectRoot(projectId, slug);
     const taskPath = `${root}/TASKS/TASK-MAT3810.md`;
     const stub = materializationStub(projectId);
+    await enableRepairMaterialization(projectId);
 
-    await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3810-CREATE"));
+    await createSyntheticProject(projectId, slug, "TXN-MATFAULT-3810-CREATE");
     await materialize(projectId);
     faults.push({
       endpoint: "/2/files/upload", method: "POST", path: machineMaterializationHeadPath(projectId),
@@ -201,22 +237,15 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
       payload: { task_id: "TASK-MAT3810", title: "Fresh observation" }
     });
 
-    let rejected = false;
-    for (let slice = 0; slice < 4 && !rejected; slice += 1) {
-      try {
-        await runDurableObjectAlarm(stub);
-      } catch {
-        rejected = true;
-      }
-    }
-    expect(rejected).toBe(true);
+    const generationPath = machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION);
+    await materializeUntil(projectId, () => mock.files.has(generationPath));
     expect(mock.files.has(taskPath)).toBe(true);
     mock.files.set(taskPath, "<!-- MACHINE-MANAGED: generated by Project OS -->\ntampered task");
     mock.uploadCalls.length = 0;
 
-    await materialize(projectId);
+    expect((await materializeSlice(projectId)).status).toBe(202);
 
-    expect(mock.uploadCalls).toEqual([]);
+    expect(mock.uploadCalls.filter((path) => path.startsWith(`${root}/`))).toEqual([]);
     expect(mock.files.get(taskPath)).toContain("tampered task");
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
   });
@@ -225,7 +254,8 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     const projectId = "PRJ-3803";
     const slug = "hot-state-rebuild";
     const stub = materializationStub(projectId);
-    await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3803-CREATE"));
+    await enableRepairMaterialization(projectId);
+    await createSyntheticProject(projectId, slug, "TXN-MATFAULT-3803-CREATE");
     await materialize(projectId);
 
     await runInDurableObject(stub, async (_instance, state) => {
@@ -244,8 +274,8 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
             last_error = NULL
         WHERE singleton = 1
       `);
+      await state.storage.deleteAlarm();
     });
-    await evictDurableObject(stub);
     mock.uploadCalls.length = 0;
 
     const response = await stub.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
@@ -260,7 +290,8 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     const projectId = "PRJ-3804";
     const slug = "burst-coalescing";
     const stub = materializationStub(projectId);
-    await submit(projectId, createTx(projectId, slug, "TXN-MATFAULT-3804-CREATE"));
+    await enableRepairMaterialization(projectId);
+    await createSyntheticProject(projectId, slug, "TXN-MATFAULT-3804-CREATE");
     await materialize(projectId);
 
     await submit(projectId, {

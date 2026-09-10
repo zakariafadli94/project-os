@@ -5,6 +5,8 @@ import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import { emptyProjectState } from "../src/domain/transitions";
 import { machineCommitRecordPath, machineStatePath } from "../src/dropbox/layout";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -70,6 +72,7 @@ describe("ProjectGuard commit-record compatibility", () => {
 
     const committed = await submit(projectId, transaction);
     expect(committed).toMatchObject({ status: "committed", previous_revision: 0, new_revision: 1, event_id: "EVT-000001" });
+    await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(committed);
     expect(mock.files.has(machineCommitRecordPath(projectId, 1))).toBe(true);
     expect(mock.files.has(machineStatePath(projectId))).toBe(false);
 
@@ -84,7 +87,15 @@ describe("ProjectGuard commit-record compatibility", () => {
     expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(false);
     expect(mock.files.has(machineStatePath(projectId))).toBe(false);
 
-    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    await runInDurableObject(projectionStub, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
+      expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+      if (mock.files.has(machineStatePath(projectId))) break;
+    }
     expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(1);
   });
 });

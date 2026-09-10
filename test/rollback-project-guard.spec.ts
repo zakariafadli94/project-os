@@ -1,11 +1,13 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { executeWithRollback } from "../src/continuity/rollback";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import type { Transaction } from "../src/domain/transaction";
 import { machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -22,7 +24,7 @@ async function submit(projectId: string, transaction: Transaction): Promise<Rece
 }
 
 async function createProject(projectId: string): Promise<Receipt> {
-  return submit(projectId, {
+  const receipt = await submit(projectId, {
     schema_version: "1.0",
     transaction_id: `TXN-ROLLBACK-${projectId.slice(4)}-CREATE`,
     project_id: projectId,
@@ -36,6 +38,8 @@ async function createProject(projectId: string): Promise<Receipt> {
       objective: "Rollback proof"
     }
   });
+  await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(receipt);
+  return receipt;
 }
 
 function taskTx(projectId: string, id: string): Transaction {
@@ -56,7 +60,12 @@ function projectionStub(projectId: string) {
 
 async function materializeThroughContinuations(projectId: string): Promise<void> {
   const stub = projectionStub(projectId);
-  for (let slice = 0; slice < 8; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+  await runInDurableObject(stub, (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
+  for (let slice = 0; slice < 64; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
 }
 
 describe("ProjectGuard data-preserving rollback", () => {

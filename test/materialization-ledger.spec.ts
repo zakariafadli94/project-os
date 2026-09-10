@@ -78,6 +78,21 @@ describe("MaterializationLedger", () => {
     });
   });
 
+  it("persists managed-zone bootstrap within an active target without carrying it into the next target", async () => {
+    await withLedger("PRJ-3412", (ledger) => {
+      ledger.requestTarget({ revision: 1, projection_version: 3 });
+      ledger.beginNextTarget();
+      expect(ledger.managedZoneBootstrapReady()).toBe(false);
+      ledger.markManagedZoneBootstrapReady();
+      expect(ledger.managedZoneBootstrapReady()).toBe(true);
+
+      ledger.completeTarget({ revision: 1, projection_version: 3, outputs: new Map(), removed_outputs: [] });
+      ledger.requestTarget({ revision: 2, projection_version: 3 });
+      ledger.beginNextTarget();
+      expect(ledger.managedZoneBootstrapReady()).toBe(false);
+    });
+  });
+
   it("persists the immutable-evidence checkpoint across ledger instances", async () => {
     const projectId = "PRJ-3409";
     const stub = env.PROJECT_GUARD.getByName(projectId);
@@ -126,6 +141,33 @@ describe("MaterializationLedger", () => {
       expect(ledger.attemptOutputs()).toEqual(new Map([
         ["global:STATE", evidence("STATE.md", "f", 3)]
       ]));
+    });
+  });
+
+  it("persists a bounded final-verification cursor and clears it on retry", async () => {
+    await withLedger("PRJ-3413", (ledger) => {
+      ledger.requestTarget({ revision: 3, projection_version: 1 });
+      ledger.beginNextTarget();
+      ledger.recordVerifiedOutput("global:STATE", evidence("STATE.md", "g", 3));
+      ledger.recordVerifiedOutput("global:HANDOFF", evidence("HANDOFF.md", "h", 3));
+      ledger.beginFinalVerification([
+        { key: "deliverable:DEL-3413", expected: "absent", evidence: evidence("DELIVERABLES/DEL-3413.md", "i", 2) },
+        { key: "global:HANDOFF", expected: "present", evidence: evidence("HANDOFF.md", "h", 3) },
+        { key: "global:STATE", expected: "present", evidence: evidence("STATE.md", "g", 3) }
+      ]);
+      ledger.completeFinalVerification(["global:HANDOFF"]);
+
+      const resumed = new MaterializationLedger((ledger as unknown as { storage: DurableObjectStorage }).storage);
+      expect(resumed.finalVerificationActive()).toBe(true);
+      expect(resumed.finalVerificationPending()).toEqual([
+        { key: "deliverable:DEL-3413", expected: "absent", evidence: evidence("DELIVERABLES/DEL-3413.md", "i", 2) },
+        { key: "global:STATE", expected: "present", evidence: evidence("STATE.md", "g", 3) }
+      ]);
+
+      resumed.failActive("external edit");
+      resumed.beginNextTarget();
+      expect(resumed.finalVerificationActive()).toBe(false);
+      expect(resumed.attemptOutputs()).toEqual(new Map());
     });
   });
 

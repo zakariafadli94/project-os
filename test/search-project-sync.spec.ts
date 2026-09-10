@@ -3,6 +3,8 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import {
   initializeProjectSearchSyncSchema,
   ProjectSearchSyncStore,
@@ -255,6 +257,7 @@ describe("ProjectGuard search synchronization", () => {
     expect(response.status).toBe(200);
     const receipt = await response.json<Receipt>();
     expect(receipt).toMatchObject({ status: "committed", new_revision: 1 });
+    await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(receipt);
 
     const beforeResponse = await projectStub.fetch("https://project-guard.internal/search-sync-status");
     expect(beforeResponse.status).toBe(200);
@@ -285,8 +288,15 @@ describe("ProjectGuard search synchronization", () => {
     expect(after.last_error).toMatch(/CANONICAL_SNAPSHOT_HASH_MISMATCH/);
 
     const materializationStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
-    for (let slice = 0; slice < 8; slice += 1) {
+    await runInDurableObject(materializationStub, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
       if (!await runDurableObjectAlarm(materializationStub)) break;
+      const status = await projectStub.fetch("https://project-guard.internal/materialization-status");
+      if ((await status.json<{ materialized_head: { revision: number } | null }>()).materialized_head?.revision === 1) break;
     }
     const materialization = await projectStub.fetch("https://project-guard.internal/materialization-status");
     expect(materialization.status).toBe(200);

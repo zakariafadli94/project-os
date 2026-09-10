@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -64,6 +64,14 @@ function expectedManagedDirectories(projectId: string, slug: string): string[] {
   ];
 }
 
+async function enableRepairMaterialization(projectId: string): Promise<void> {
+  await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
+}
+
 describe("projection-v2 managed-zone bootstrap", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -89,7 +97,8 @@ describe("projection-v2 managed-zone bootstrap", () => {
     const projectId = created.project_id;
     const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
     const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
-    for (let slice = 0; slice < 8; slice += 1) {
+    await enableRepairMaterialization(projectId);
+    for (let slice = 0; slice < 64; slice += 1) {
       if (!await runDurableObjectAlarm(projectionStub)) break;
     }
 
@@ -117,7 +126,9 @@ describe("projection-v2 managed-zone bootstrap", () => {
       payload: { reason: "Verify archived projection does not provision active zones" }
     });
     expect(archived).toMatchObject({ status: "committed", previous_revision: 1, new_revision: 2 });
-    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    for (let slice = 0; slice < 64; slice += 1) {
+      if (!await runDurableObjectAlarm(projectionStub)) break;
+    }
     expect(directoryCalls).toEqual([]);
   });
 });

@@ -464,6 +464,24 @@ export class ProjectRepository {
     throw new Error(`Archived workspace move is inconsistent: ${from} -> ${to}`);
   }
 
+  /**
+   * Read-only evidence for archive resumption.  A completed generation may
+   * fail after the physical move; the next writer must then continue in the
+   * archive root rather than recreate the active one.
+   */
+  async archiveWorkspaceLocation(state: ProjectState): Promise<"active" | "archive" | "missing" | "conflict"> {
+    const active = await this.persistence.objects.readText(
+      `${workspaceProjectRoot(state.project_id, state.slug)}/PROJECT.md`
+    );
+    const archive = await this.persistence.objects.readText(
+      `${archiveProjectRoot(state.project_id, state.slug)}/PROJECT.md`
+    );
+    if (active !== null && archive !== null) return "conflict";
+    if (archive !== null) return "archive";
+    if (active !== null) return "active";
+    return "missing";
+  }
+
   async writeMachineState(state: ProjectState, event: DomainEvent): Promise<void> {
     await this.safeAdd(machineEventPath(state.project_id, event.event_id), pretty(event));
     await this.writeMachineSnapshot(state);

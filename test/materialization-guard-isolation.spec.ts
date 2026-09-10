@@ -9,6 +9,8 @@ import {
   machineMaterializationRecordPath,
   workspaceProjectRoot
 } from "../src/persistence/layout";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -42,7 +44,12 @@ async function createProject(projectId: string, slug: string, transactionId: str
     })
   });
   expect(response.status).toBe(200);
-  return response.json<Receipt>();
+  const receipt = await response.json<Receipt>();
+  // This fixture addresses MaterializationGuard in isolation.  Production
+  // finalizes the receipt through RegistryGuard before repair convergence can
+  // consume the commit; reproduce that canonical precondition here.
+  await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(receipt);
+  return receipt;
 }
 
 describe("MaterializationGuard isolation boundary", () => {

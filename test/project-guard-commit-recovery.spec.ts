@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -10,6 +10,8 @@ import {
   machineReceiptPath,
   machineStatePath
 } from "../src/dropbox/layout";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -48,7 +50,16 @@ function projectionStub(projectId: string) {
 
 async function materializeThroughContinuations(projectId: string): Promise<void> {
   const stub = projectionStub(projectId);
-  for (let slice = 0; slice < 8; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+  await runInDurableObject(stub, (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
+  for (let slice = 0; slice < 64; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+}
+
+async function finalizeSyntheticProjectCreate(projectId: string, receipt: Receipt): Promise<void> {
+  await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(receipt);
 }
 
 describe("ProjectGuard crash-safe canonical commits", () => {
@@ -61,6 +72,7 @@ describe("ProjectGuard crash-safe canonical commits", () => {
 
     const created = await submit(projectId, createTransaction(projectId));
     expect(created.new_revision).toBe(1);
+    await finalizeSyntheticProjectCreate(projectId, created);
     await materializeThroughContinuations(projectId);
     expect(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}").revision).toBe(1);
 
@@ -103,7 +115,8 @@ describe("ProjectGuard crash-safe canonical commits", () => {
     const mock = installDropboxMock();
     const stub = projectionStub(projectId);
 
-    await submit(projectId, createTransaction(projectId));
+    const created = await submit(projectId, createTransaction(projectId));
+    await finalizeSyntheticProjectCreate(projectId, created);
     await materializeThroughContinuations(projectId);
 
     const first = await submit(projectId, {

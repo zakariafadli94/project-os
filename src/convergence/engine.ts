@@ -91,16 +91,17 @@ export class ConvergenceEngine {
     if (discovered && !discovered.complete) return health;
     const latestRevision = discovered?.record?.new_revision ?? progress.canonical_observed_revision;
     if (latestRevision === 0) return health;
-    const records = [];
-    const firstRevision = discovered ? progress.canonical_observed_revision + 1 : latestRevision;
-    for (let revision = firstRevision; revision <= latestRevision; revision += 1) {
-      if (!budget.canStartEffect(3)) return health;
-      const record = discovered?.record?.new_revision === revision
-        ? discovered.record
-        : await this.input.repository.readCommitRecord(this.input.projectId, revision);
+    let records = discovered?.records ?? [];
+    // With no new commit, continue observing the durable watermark. The
+    // discovery window is deliberately empty in this case, but a completed
+    // projection still needs a fresh read of its latest immutable evidence.
+    if (records.length === 0 && latestRevision > 0) {
+      if (!budget.canStartEffect(1)) return health;
+      const record = await this.input.repository.readCommitRecord(this.input.projectId, latestRevision);
       if (!record) return health;
-      records.push(record);
+      records = [record];
     }
+    if (records.length === 0) return health;
     const record = records.at(-1);
     if (!record) return health;
     const latestDerivative: Record<"event" | "receipt", LayerHealth | null> = {
@@ -110,6 +111,11 @@ export class ConvergenceEngine {
     const firstMissingDerivative: Partial<Record<"event" | "receipt", LayerHealth>> = {};
     for (const candidate of records) {
       for (const layer of ["event", "receipt"] as const) {
+        // Observation is read-only, but it still crosses the same bounded
+        // provider boundary. A long catch-up window must yield an honest
+        // partial/unknown health result rather than spending the journal
+        // reserve and failing the status endpoint itself.
+        if (!budget.canStartEffect(1)) return health;
         const observed = await observeDerivative(layer, candidate, this.input.runtime, this.input.repository);
         latestDerivative[layer] = observed;
         if (observed.state !== "current" && firstMissingDerivative[layer] === undefined) {
@@ -220,11 +226,9 @@ export class ConvergenceEngine {
       health.commit_accepted_at = clock.t0;
       health.commit_time_code = clock.code;
     }
-    const records = [];
-    for (let revision = firstDiscoveredRevision; revision <= discovered.record.new_revision; revision += 1) {
-      const record = await this.input.repository.readCommitRecord(this.input.projectId, revision);
-      if (!record) throw new Error(`canonical_commit_missing_after_discovery:${revision}`);
-      records.push(record);
+    const records = discovered.records;
+    if (records.length === 0 || records[0].new_revision !== firstDiscoveredRevision) {
+      throw new Error(`canonical_discovery_window_invalid:${firstDiscoveredRevision}`);
     }
 
     const discoveredRecord = discovered.record;
@@ -263,6 +267,7 @@ export class ConvergenceEngine {
               continuation: null
             };
           }
+          markImmutableDerivativeVerifiedThrough(progress, layer, record.new_revision);
           health.layers[layer] = layerHealth;
           return;
         }
@@ -295,7 +300,15 @@ export class ConvergenceEngine {
         };
         return;
       }
-      if (!budget.canStartEffect(12)) {
+      // A current derivative needs only a bounded read.  Reserve the larger
+      // write budget only after that observation; otherwise four healthy
+      // layers can consume enough reads to make the last one permanently
+      // look pending without ever observing it.
+      // The inspection itself reads two canonical objects.  Keep an
+      // additional two-call cushion for the journal checkpoint and any
+      // provider-side pagination/metadata follow-up, so an observation can
+      // never consume the slice's last reserved capacity.
+      if (!budget.canStartEffect(4)) {
         allMachineRepairsCurrent = false;
         const nextAttemptAt = new Date(this.input.now()).toISOString();
         progress.obligations[obligationId] = pendingMachineObligation({
@@ -323,10 +336,29 @@ export class ConvergenceEngine {
             continuation: null
           };
         }
+        markImmutableDerivativeVerifiedThrough(progress, layer, record.new_revision);
         health.layers[layer] = inspection.current;
         return;
       }
       if (!inspection.intent) throw new Error("derivative_repair_intent_missing");
+      // `inspectDerivativeRepair` consumed the two observation calls above.
+      // Keep the original twelve-call envelope (including journal and
+      // checkpoint reserve) before any mutation path begins.
+      if (!budget.canStartEffect(10)) {
+        allMachineRepairsCurrent = false;
+        const nextAttemptAt = new Date(this.input.now()).toISOString();
+        progress.obligations[obligationId] = pendingMachineObligation({
+          obligationId,
+          layer,
+          record,
+          existing: existingObligation,
+          nextAttemptAt,
+          code: "slice_budget_pending"
+        });
+        progress.next_alarm_at = minimumWake([progress.next_alarm_at, nextAttemptAt]);
+        health.layers[layer] = pendingLayer(record.new_revision, this.input.now(), "slice_budget_pending");
+        return;
+      }
       const uncheckpointed = await this.uncheckpointedAttempt({
         obligationId,
         layer,
@@ -369,6 +401,7 @@ export class ConvergenceEngine {
       });
       const layerHealth = await repairDerivative(layer, record, effects, this.input.repository, inspection.intent);
       if (layerHealth.state === "current") {
+        markImmutableDerivativeVerifiedThrough(progress, layer, record.new_revision);
         health.layers[layer] = layerHealth;
         return;
       }
@@ -408,8 +441,31 @@ export class ConvergenceEngine {
     };
 
     for (const record of records) {
-      await repair("event", record);
-      await repair("receipt", record);
+      // Event and receipt are immutable per-revision evidence. Once a
+      // contiguous prefix is durably verified, a catch-up slice need not
+      // spend its final capacity rereading that suffix. After the cursor
+      // advances, the no-new-commit path freshly observes the latest record.
+      if (record.new_revision > progress.event_verified_through) {
+        await repair("event", record);
+      } else {
+        // The high-water mark is a persisted verification proof. During a
+        // long catch-up window, spending the final slice capacity rereading
+        // an already verified immutable suffix can otherwise starve the
+        // state/manifest pair indefinitely. Once this window advances, the
+        // no-new-commit path above freshly observes the latest record again.
+        health.layers.event = {
+          ...currentLayer(record.new_revision, this.input.now()),
+          verified_through: progress.event_verified_through
+        };
+      }
+      if (record.new_revision > progress.receipt_verified_through) {
+        await repair("receipt", record);
+      } else {
+        health.layers.receipt = {
+          ...currentLayer(record.new_revision, this.input.now()),
+          verified_through: progress.receipt_verified_through
+        };
+      }
     }
     await repair("state", discovered.record);
     await repair("manifest", discovered.record);
@@ -538,6 +594,7 @@ export class ConvergenceEngine {
     }
     const inspection = await inspectDerivativeRepair(due.layer, record, effects, this.input.repository);
     if (inspection.current) {
+      markImmutableDerivativeVerifiedThrough(progress, due.layer, record.new_revision);
       progress.obligations[due.id] = {
         ...due,
         state: "verified",
@@ -605,6 +662,7 @@ export class ConvergenceEngine {
     });
     const layerHealth = await repairDerivative(due.layer, record, effects, this.input.repository, inspection.intent);
     if (layerHealth.state === "current") {
+      markImmutableDerivativeVerifiedThrough(progress, due.layer, record.new_revision);
       progress.obligations[due.id] = {
         ...due,
         state: "verified",
@@ -663,8 +721,12 @@ export class ConvergenceEngine {
     health: ConvergenceHealth
   ): Promise<SliceResult | null> {
     if (!this.input.enableHuman) return null;
-    const status = this.input.ledger.status();
-    const target = checkpoint.progress.active ?? status.active ?? status.requested;
+    // A legacy ledger request only says that a projection was requested.  It
+    // is not proof that event, receipt, state and manifest reached the
+    // canonical revision.  The convergence checkpoint becomes active only
+    // after those machine layers are current, and is therefore the sole
+    // authority allowed to start (or resume) a human projection.
+    const target = checkpoint.progress.active;
     if (!target) return null;
     const existing = Object.values(checkpoint.progress.obligations).find((obligation) =>
       obligation.layer === "human_handoff" && obligation.target.revision === target.revision
@@ -1147,6 +1209,16 @@ function markHumanLayersNotApplicable(health: ConvergenceHealth): void {
 function markHumanLayersPending(health: ConvergenceHealth, revision: number, nowMs: number, code: string): void {
   for (const layer of ["human_state", "human_handoff", "generation", "head"] as const) {
     health.layers[layer] = pendingLayer(revision, nowMs, code);
+  }
+}
+
+/** Advance only a contiguous immutable-evidence prefix. */
+function markImmutableDerivativeVerifiedThrough(progress: Progress, layer: Layer, revision: number): void {
+  if (layer === "event" && revision === progress.event_verified_through + 1) {
+    progress.event_verified_through = revision;
+  }
+  if (layer === "receipt" && revision === progress.receipt_verified_through + 1) {
+    progress.receipt_verified_through = revision;
   }
 }
 

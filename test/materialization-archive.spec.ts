@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Env } from "../src/env";
@@ -65,11 +65,37 @@ function projectionStub(projectId: string) {
 
 async function materializeThroughContinuations(projectId: string): Promise<void> {
   const stub = projectionStub(projectId);
-  for (let slice = 0; slice < 8; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+  await runInDurableObject(stub, (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
+  for (let slice = 0; slice < 64; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+}
+
+async function materializeUntil(projectId: string, reached: () => boolean): Promise<void> {
+  const stub = projectionStub(projectId);
+  let lastStatus: number | null = null;
+  for (let slice = 0; slice < 64; slice += 1) {
+    const response = await stub.fetch("https://materialization-guard.internal/materialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "workspace-v2" })
+    });
+    lastStatus = response.status;
+    expect([200, 202]).toContain(response.status);
+    if (reached()) return;
+  }
+  const status = await stub.fetch("https://materialization-guard.internal/status");
+  const body = await status.json<{ blocked_error: string | null }>();
+  throw new Error(`archive_materialization_target_not_reached:${lastStatus}:${body.blocked_error ?? "none"}`);
 }
 
 describe("archive-safe materialization", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
 
   it("moves the verified active workspace once and publishes an archive generation with relative evidence", async () => {
     const mock = installDropboxMock();
@@ -110,6 +136,7 @@ describe("archive-safe materialization", () => {
   });
 
   it("resumes after the workspace moved but generation evidence failed without recreating active workspace", async () => {
+    vi.useFakeTimers();
     const faults: DropboxMockFault[] = [];
     const mock = installDropboxMock({ faults });
     const slug = "materialization-archive-resume";
@@ -130,18 +157,24 @@ describe("archive-safe materialization", () => {
     });
 
     await archiveProject(projectId, "TXN-MATARCH-ARCHIVE-000002");
-    let rejected = false;
-    for (let slice = 0; slice < 8 && !rejected; slice += 1) {
-      try { await runDurableObjectAlarm(stub); } catch { rejected = true; }
-    }
-    expect(rejected).toBe(true);
+    // A bounded human slice can complete the physical move just before it
+    // reaches the immutable generation write. Wait for the injected write
+    // itself so the next phase is genuinely testing its recovery, not merely
+    // a normal continuation of the first slice.
+    await materializeUntil(projectId, () =>
+      mock.files.has(`${archiveRoot}/PROJECT.md`)
+      && mock.uploadCalls.includes(machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION))
+    );
 
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(false);
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
     expect(mock.files.has(machineMaterializationRecordPath(projectId, 2, CURRENT_PROJECTION_VERSION))).toBe(false);
 
-    await materializeThroughContinuations(projectId);
+    vi.setSystemTime(Date.now() + 60_000);
+    await materializeUntil(projectId, () => JSON.parse(
+      mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}"
+    ).target_revision === 2);
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(false);
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}")).toMatchObject({

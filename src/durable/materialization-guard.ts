@@ -83,12 +83,20 @@ export class MaterializationGuard extends DurableObject<Env> {
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
     return this.serialize(async () => {
       try {
-        if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, this.projectId) === "repair") {
+        const convergenceMode = convergenceModeForProject(
+          this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES,
+          this.projectId
+        );
+        if (convergenceMode === "repair") {
           const { engine, budget } = this.convergenceEngineForSlice();
           const result = await engine.runSlice(budget);
           await this.scheduleConvergenceContinuation(result.more_work, result.next_alarm_at);
           return;
         }
+        // A V2 project is owned exclusively by the convergence writer once it
+        // is activated. Before activation, legacy queued targets must not let
+        // the old coordinator write (or perpetually re-arm itself).
+        if (this.layoutMode === "v2") return;
         const { coordinator } = this.coordinatorForSlice();
         const result = await coordinator.runNext(alarmInfo?.retryCount ?? 0);
         if (result.more_work) {

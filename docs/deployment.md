@@ -546,3 +546,11 @@ The same deployment returned a fresh authenticated mutation context for PRJ-0003
 GitHub Actions run `34507075052` passed its complete CI job on the merged source, and the exact source also passed the local full suite (203 files / 1,015 tests), static checks, and a Cloudflare dry run. Human-facing alert delivery remains deliberately deferred under the policy recorded above; immutable incidents, retry state, and payload-free metrics remain enabled.
 
 The isolated canary's required 24-hour qualification clock starts from this current deployment. No extension, PRJ-0003 activation, or canonical repair is permitted before `2026-09-11T17:26:03Z`, and it additionally requires the planned observation, recovery, capacity, and rollback evidence to remain satisfactory. No deliberate fault is injected into PRJ-0003.
+
+## 23. Governed Control Tower deployment
+
+The separate Control Tower endpoint is `https://project-os-control-tower.zakaria-fadli-94.workers.dev/mcp`. Deployment is manual, is bound to an exact reviewed `main` SHA, and runs the complete repository gate before uploading only `wrangler.control-tower.jsonc`. GitHub OAuth admits only the configured owner identity. The Control Tower receives no Dropbox, ingress-token, or mutation-context-signing secret; it reaches the existing guards through service and Durable Object bindings.
+
+Qualification first denies an unauthenticated MCP `tools/list`, then lists tools using an authenticated owner token and performs only a read-only `project_os_get_context` for synthetic `PRJ-0008`. A write, replay, or conflict proof is a later explicitly recorded production exercise and must use PRJ-0008. PRJ-0003 remains excluded.
+
+Rollback disables or removes only the `project-os-control-tower` route/deployment. It must not redeploy or reconfigure `project-os-guard`, touch the Dropbox inbox, or alter canonical project state. Restoration uses the same exact reviewed Control Tower Worker version, followed by the read-only PRJ-0008 check.

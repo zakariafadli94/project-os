@@ -88,3 +88,7 @@ The last local hardening SHA `d63578252e7d64329540ce001ad0dc908d906454` bounds a
 Continuity remains `stable` for every real project. The only enabled convergence writer is synthetic PRJ-0008 on Worker version `7e624e43-d288-4cf5-97bd-cbc43c11aa33`; its ordinary current-state materialization is verified at revision 2 / projection version 3. The live historical admission reader can now read PRJ-0003 revision 267, but PRJ-0003 remains in the stable path with no writer activation, canonical mutation, or repair.
 
 The new Worker deployment began the 24-hour isolated qualification window at `2026-09-10T17:26:03Z`. The deferred human-alert policy changes only the human-delivery ACK requirement. Reader compatibility, fencing, recovery, capacity, transport, rollback compatibility, and the full canary window remain mandatory before any extension.
+
+## Governed Control Tower continuity boundary
+
+The OAuth-protected Control Tower is an optional ingress channel, not a replacement persistence plane. Its deployment and route-only rollback leave `project-os-guard`, the canonical Dropbox inbox, and stable project traffic unchanged. Initial production qualification is restricted to unauthenticated denial, authenticated tool discovery, and read-only synthetic PRJ-0008 context; mutation, replay, visibility, and rollback evidence are recorded separately before normal projects are released. PRJ-0003 stays read-only until its independent convergence gate passes.

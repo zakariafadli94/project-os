@@ -55,6 +55,26 @@ describe("MutationGate ephemeral operator authentication", () => {
     expect(transaction.status).toBe(401);
   });
 
+  it("accepts a current Control Tower operator token for a version-targeted ordinary mutation", async () => {
+    const token = `${Date.now()}.${"d".repeat(64)}`;
+    const operatorEnv = {
+      ...testEnv,
+      CONTROL_TOWER_OPERATOR_TOKEN: token
+    } as Env & { CONTROL_TOWER_OPERATOR_TOKEN: string };
+
+    const response = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: "{}"
+    }), operatorEnv, createExecutionContext());
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "invalid_transaction" });
+  });
+
   it("rejects expired, future-skewed, and missing operator tokens", async () => {
     const now = Date.now();
     const expiredToken = `${now - 16 * 60_000}.${"b".repeat(64)}`;

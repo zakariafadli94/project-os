@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { minimumWake } from "../src/convergence/retry";
-import { ConvergenceEngine, nextConvergenceWake } from "../src/convergence/engine";
+import { classifyHumanFailure, ConvergenceEngine, nextConvergenceWake } from "../src/convergence/engine";
 import { createSliceBudget, providerRequestScopeFor } from "../src/convergence/budget";
 import { ConvergenceJournal } from "../src/convergence/journal";
 import { initialProgress } from "../src/convergence/journal";
@@ -23,6 +23,12 @@ import { afterEach, vi } from "vitest";
 afterEach(() => vi.restoreAllMocks());
 
 describe("convergence engine scheduling", () => {
+  it("classifies human materialization failures without exposing provider diagnostics", () => {
+    expect(classifyHumanFailure(new Error("slice_budget_exhausted"))).toBe("human_slice_budget_exhausted");
+    expect(classifyHumanFailure(new Error("Dropbox upload failed: provider detail"))).toBe("human_provider_failure");
+    expect(classifyHumanFailure(new Error("unexpected internal failure"))).toBe("human_internal_failure");
+  });
+
   it("does not postpone an already-due continuation", () => {
     expect(nextConvergenceWake("2026-09-08T00:00:05.000Z", ["2026-09-08T00:00:02.000Z", null])).toBe(
       minimumWake(["2026-09-08T00:00:05.000Z", "2026-09-08T00:00:02.000Z"])

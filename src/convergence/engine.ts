@@ -783,7 +783,13 @@ export class ConvergenceEngine {
         ? new Date(this.input.now()).toISOString()
         : new Date(this.input.now()).toISOString();
       return human.complete || human.more_work;
-    } catch {
+    } catch (error) {
+      const code = classifyHumanFailure(error);
+      console.warn("Project OS human materialization pending", {
+        project_id: this.input.projectId,
+        target_revision: record.new_revision,
+        code
+      });
       const failureCount = (existing?.failure_count ?? 0) + 1;
       const retry = nextRetryAt({
         nowMs: this.input.now(),
@@ -804,7 +810,7 @@ export class ConvergenceEngine {
         last_attempt_number: attemptNumber,
         last_closed_attempt_number: attemptNumber,
         last_verified_at: null,
-        code: "human_write_failed",
+        code,
         lease_until: null,
         continuation: null
       };
@@ -812,7 +818,7 @@ export class ConvergenceEngine {
       progress.next_alarm_at = minimumWake([nextPendingWake(progress), retry.at]);
       for (const pendingLayerName of ["human_state", "human_handoff", "generation", "head"] as const) {
         health.layers[pendingLayerName] = {
-          ...pendingLayer(record.new_revision, this.input.now(), "human_write_failed"),
+          ...pendingLayer(record.new_revision, this.input.now(), code),
           state: retry.state,
           failure_count: failureCount,
           next_attempt_at: retry.at
@@ -1095,6 +1101,14 @@ async function retryFromUncheckpointedAttempt(input: {
 
 function isSliceBudgetExhaustion(error: unknown): boolean {
   return error instanceof Error && error.message.includes("slice_budget_exhausted");
+}
+
+/** Maps runtime errors to an allowlisted diagnostic code for durable state and logs. */
+export function classifyHumanFailure(error: unknown):
+  "human_slice_budget_exhausted" | "human_provider_failure" | "human_internal_failure" {
+  if (isSliceBudgetExhaustion(error)) return "human_slice_budget_exhausted";
+  if (error instanceof Error && /^(Dropbox|provider)/i.test(error.message)) return "human_provider_failure";
+  return "human_internal_failure";
 }
 
 function markHumanLayersNotApplicable(health: ConvergenceHealth): void {

@@ -311,6 +311,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
     expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
 
     mock.calls.length = 0;
+    mock.providerCalls.length = 0;
     mock.downloadCalls.length = 0;
     mock.uploadCalls.length = 0;
 
@@ -333,8 +334,19 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
     const nextCommitPath = machineCommitRecordPath(projectId, 2);
     expect(mock.downloadCalls.filter((path) => path === nextCommitPath)).toHaveLength(1);
 
-    const providerCalls = mock.calls.filter((call) => call.startsWith("POST /2/files/"));
-    expect(providerCalls).toHaveLength(3);
+    // A process-wide fetch interceptor also observes unrelated asynchronous
+    // work from other isolated Durable Objects. Count only I/O attributable to
+    // this project and this commit's receipt: this is the actual hot-path
+    // contract, while a global endpoint count is timing-dependent in CI.
+    const attributedProviderCalls = mock.providerCalls.filter(({ paths }) => paths.some((path) => (
+      path.includes(`/projects/${projectId}/`)
+      || path.endsWith("/TXN-HOTPATH-0002-COMMIT.json")
+    )));
+    expect(attributedProviderCalls.map(({ endpoint }) => endpoint)).toEqual([
+      "POST /2/files/download",
+      "POST /2/files/download",
+      "POST /2/files/upload"
+    ]);
 
     mock.uploadCalls.length = 0;
     const stale = await submit(projectId, {

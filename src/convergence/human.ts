@@ -23,18 +23,27 @@ export interface HumanSliceInput {
  * but retain the existing generation/head fencing in MaterializationCoordinator.
  */
 export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete: boolean; more_work: boolean }> {
-  const coordinator = new MaterializationCoordinator({
-    projectId: input.record.project_id,
-    repository: input.repository,
-    ledger: input.ledger,
-    writer: new WorkspaceProjectionWriter(input.runtime, 1),
-    projectionVersion: CURRENT_PROJECTION_VERSION,
-    canonicalDerivativesAlreadyCurrent: true,
-    ...(input.now ? { now: input.now } : {}),
-    ...(input.budget ? { sliceBudget: input.budget } : {})
-  });
-  await coordinator.reconcile(input.record.new_revision);
-  coordinator.requestTarget(input.record.new_revision, CURRENT_PROJECTION_VERSION);
-  const result = await coordinator.runNext();
-  return { complete: result.completed, more_work: result.more_work };
+  try {
+    const coordinator = new MaterializationCoordinator({
+      projectId: input.record.project_id,
+      repository: input.repository,
+      ledger: input.ledger,
+      writer: new WorkspaceProjectionWriter(input.runtime, 1),
+      projectionVersion: CURRENT_PROJECTION_VERSION,
+      canonicalDerivativesAlreadyCurrent: true,
+      ...(input.now ? { now: input.now } : {}),
+      ...(input.budget ? { sliceBudget: input.budget } : {})
+    });
+    await coordinator.reconcile(input.record.new_revision);
+    coordinator.requestTarget(input.record.new_revision, CURRENT_PROJECTION_VERSION);
+    const result = await coordinator.runNext();
+    return { complete: result.completed, more_work: result.more_work };
+  } catch (error) {
+    if (input.budget && isSliceBudgetExhaustion(error)) return { complete: false, more_work: true };
+    throw error;
+  }
+}
+
+function isSliceBudgetExhaustion(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("slice_budget_exhausted");
 }

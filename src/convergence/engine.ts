@@ -50,6 +50,7 @@ export class ConvergenceEngine {
     runtime: ProjectOsPersistenceRuntime;
     effectRuntime?: ProjectOsPersistenceRuntime;
     humanRepository?: ProjectRepository;
+    humanProjectionConcurrency?: number;
     journal: ConvergenceJournal;
     ledger: MaterializationLedger;
     now: () => number;
@@ -758,6 +759,7 @@ export class ConvergenceEngine {
         runtime: this.effectRuntime(),
         ledger: this.input.ledger,
         budget: reserveCheckpointForJournal(budget),
+        projectionConcurrency: this.input.humanProjectionConcurrency,
         now: () => new Date(this.input.now()).toISOString()
       });
       for (const currentLayerName of ["human_state", "human_handoff", "generation", "head"] as const) {

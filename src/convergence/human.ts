@@ -15,6 +15,7 @@ export interface HumanSliceInput {
   runtime: ProjectOsPersistenceRuntime;
   ledger: MaterializationLedgerPort;
   budget?: SliceBudget;
+  projectionConcurrency?: number;
   now?: () => string;
 }
 
@@ -28,7 +29,7 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
       projectId: input.record.project_id,
       repository: input.repository,
       ledger: input.ledger,
-      writer: new WorkspaceProjectionWriter(input.runtime, 1),
+      writer: new WorkspaceProjectionWriter(input.runtime, input.projectionConcurrency ?? 1),
       projectionVersion: CURRENT_PROJECTION_VERSION,
       canonicalDerivativesAlreadyCurrent: true,
       ...(input.now ? { now: input.now } : {}),

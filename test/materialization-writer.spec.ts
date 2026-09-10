@@ -22,13 +22,23 @@ class InstrumentedObjects implements ObjectPersistence {
   uploads: Array<{ path: string; mode: "add" | "overwrite" }> = [];
   downloads: string[] = [];
   uploadDelay = 0;
+  readDelay = 0;
   inFlight = 0;
   maxInFlight = 0;
+  readInFlight = 0;
+  maxReadInFlight = 0;
   failPath: string | null = null;
 
   async readText(path: string): Promise<string | null> {
     this.downloads.push(path);
-    return this.files.get(path) ?? null;
+    this.readInFlight += 1;
+    this.maxReadInFlight = Math.max(this.maxReadInFlight, this.readInFlight);
+    try {
+      if (this.readDelay) await new Promise((resolve) => setTimeout(resolve, this.readDelay));
+      return this.files.get(path) ?? null;
+    } finally {
+      this.readInFlight -= 1;
+    }
   }
 
   async createText(path: string, content: string): Promise<void> {
@@ -356,6 +366,29 @@ describe("WorkspaceProjectionWriter", () => {
 
     expect(objects.maxInFlight).toBeLessThanOrEqual(2);
     expect(objects.maxInFlight).toBeGreaterThan(1);
+  });
+
+  it("verifies completed outputs with bounded parallel reads", async () => {
+    const objects = new InstrumentedObjects();
+    objects.readDelay = 10;
+    const writer = new WorkspaceProjectionWriter(objects, 2);
+    const outputs = await Promise.all(
+      [1, 2, 3, 4].map((index) => output(`key-${index}`, `F-${index}.md`, `${MANAGED_NOTICE}\n${index}`))
+    );
+    for (const item of outputs) objects.files.set(`/workspace/${item.relative_path}`, item.content);
+
+    await writer.verifyOutputs(
+      new Map(outputs.map((item) => [item.key, {
+        relative_path: item.relative_path,
+        input_hash: item.input_hash,
+        content_hash: item.content_hash,
+        source_revision: item.source_revision
+      }])),
+      "/workspace"
+    );
+
+    expect(objects.maxReadInFlight).toBeLessThanOrEqual(2);
+    expect(objects.maxReadInFlight).toBeGreaterThan(1);
   });
 
   it("parses only conservative concurrency 1..4 and defaults to 4", () => {

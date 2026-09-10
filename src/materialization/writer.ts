@@ -116,6 +116,11 @@ export class WorkspaceProjectionWriter {
     for (const output of ordered) {
       const priorAttempt = options.alreadyVerified?.get(output.key);
       if (priorAttempt && sameEvidence(priorAttempt, output)) {
+        // This slice cannot repeatedly spend its bounded provider budget on
+        // outputs completed by earlier slices: doing so can starve every new
+        // output behind the critical pair. The coordinator re-observes the
+        // complete output index once all slices are done, immediately before
+        // it creates a completed generation or publishes its head.
         verified.set(output.key, priorAttempt);
         await options.onOutputOutcome?.(output.key, "attempt_reuse");
         await options.onOutputVerified?.(output.key, priorAttempt);
@@ -166,17 +171,34 @@ export class WorkspaceProjectionWriter {
     workspaceRoot: string
   ): Promise<void> {
     const root = normalizeWorkspaceRoot(workspaceRoot);
-    for (const [key, evidence] of outputs) {
-      const path = joinWorkspacePath(root, evidence.relative_path);
-      const persisted = await this.objects.readText(path);
-      if (persisted === null || await sha256Text(persisted) !== evidence.content_hash) {
-        throw new MaterializationOutputConflictError(
-          key,
-          path,
-          `Completed materialization verification failed at final workspace location: ${path}`
-        );
+    const entries = [...outputs.entries()];
+    let cursor = 0;
+    const failures: unknown[] = [];
+    const worker = async () => {
+      for (;;) {
+        if (failures.length > 0) return;
+        const current = entries[cursor];
+        cursor += 1;
+        if (!current) return;
+        const [key, evidence] = current;
+        const path = joinWorkspacePath(root, evidence.relative_path);
+        try {
+          const persisted = await this.objects.readText(path);
+          if (persisted === null || await sha256Text(persisted) !== evidence.content_hash) {
+            throw new MaterializationOutputConflictError(
+              key,
+              path,
+              `Completed materialization verification failed at final workspace location: ${path}`
+            );
+          }
+        } catch (error) {
+          failures.push(error);
+          return;
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.concurrency, entries.length) }, () => worker()));
+    if (failures.length > 0) throw failures[0];
   }
 
   private async runStage(

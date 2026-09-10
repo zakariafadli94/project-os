@@ -1,6 +1,8 @@
 import { parseCanonicalCommitRecord, type CanonicalCommitRecord } from "../../src/domain/commit-record";
 import { parseTransaction } from "../../src/domain/transaction";
 import { applyTransaction } from "../../src/domain/transitions";
+import { machineCommitRecordPath } from "../../src/persistence/layout";
+import type { installDropboxMock } from "./mock-dropbox";
 
 const CREATED_AT = "2026-09-08T00:00:00.000Z";
 
@@ -60,4 +62,17 @@ export function commitFixture(projectId: string, through: number): CanonicalComm
   }
 
   return records;
+}
+
+/** Test-only canonical commit seeding; no provider write is performed. */
+export function seedCommits(
+  mock: ReturnType<typeof installDropboxMock>,
+  records: readonly CanonicalCommitRecord[]
+): void {
+  for (const record of records) {
+    mock.files.set(
+      machineCommitRecordPath(record.project_id, record.new_revision),
+      `${JSON.stringify(record, null, 2)}\n`
+    );
+  }
 }

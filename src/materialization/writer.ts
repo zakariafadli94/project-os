@@ -1,11 +1,13 @@
 import type { ProjectionOutputEvidence } from "../domain/materialization";
 import type { SliceBudget } from "../convergence/contract";
+import { observeText, type ObservedText } from "../convergence/fenced-effects";
 import {
   asProjectOsPersistence,
   type PersistenceInput
 } from "../persistence/provider/runtime";
 import { machineProjectRoot } from "../persistence/layout";
 import type { ObjectPersistence } from "../persistence/provider/contract";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ProviderConflictError } from "../persistence/provider/errors";
 import { MANAGED_NOTICE } from "../render/shared";
 import { sha256Text } from "./hash";
@@ -50,6 +52,7 @@ export interface WorkspaceProjectionWriterOptions {
 
 export class WorkspaceProjectionWriter {
   private readonly objects: ObjectPersistence;
+  private readonly runtime: ProjectOsPersistenceRuntime | null;
 
   constructor(
     input: ObjectPersistence | PersistenceInput,
@@ -58,9 +61,13 @@ export class WorkspaceProjectionWriter {
     if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 4) {
       throw new Error(`Invalid projection writer concurrency: ${concurrency}`);
     }
-    this.objects = isObjectPersistence(input)
-      ? input
-      : asProjectOsPersistence(input).objects;
+    if (isObjectPersistence(input)) {
+      this.objects = input;
+      this.runtime = null;
+    } else {
+      this.runtime = asProjectOsPersistence(input);
+      this.objects = this.runtime.objects;
+    }
   }
 
   async materialize(
@@ -114,8 +121,11 @@ export class WorkspaceProjectionWriter {
         continue;
       }
 
-      const requiredCalls = output.critical ? 3 : 2;
-      if (!budget.canStartEffect(requiredCalls)) {
+      const requiredCalls = this.runtime ? (output.critical ? 7 : 4) : (output.critical ? 3 : 2);
+      // Keep room for both critical-pair reads and the head read after
+      // publication, in addition to the journal checkpoint reserve owned by
+      // the enclosing convergence slice.
+      if (!budget.canStartEffect(requiredCalls + 5)) {
         return { verified, nextKey: output.key };
       }
 
@@ -126,9 +136,9 @@ export class WorkspaceProjectionWriter {
     }
 
     if (plan.removed_outputs.length > 0) {
-      // A removal reads the current bytes before deleting them. Reserve both
-      // calls before starting the removal phase.
-      if (!budget.canStartEffect(2)) return { verified, nextKey: "__removed_outputs__" };
+      // A runtime-backed removal makes a stable observation and a conditional
+      // delete; reserve all four provider calls before it starts.
+      if (!budget.canStartEffect(this.runtime ? 4 : 2)) return { verified, nextKey: "__removed_outputs__" };
       await this.removeObsoleteDeliverableProjections(plan, root, options);
     }
     return { verified, nextKey: null };
@@ -145,6 +155,24 @@ export class WorkspaceProjectionWriter {
           output.key,
           path,
           `Critical materialization verification failed at final workspace location: ${path}`
+        );
+      }
+    }
+  }
+
+  async verifyOutputs(
+    outputs: ReadonlyMap<string, ProjectionOutputEvidence>,
+    workspaceRoot: string
+  ): Promise<void> {
+    const root = normalizeWorkspaceRoot(workspaceRoot);
+    for (const [key, evidence] of outputs) {
+      const path = joinWorkspacePath(root, evidence.relative_path);
+      const persisted = await this.objects.readText(path);
+      if (persisted === null || await sha256Text(persisted) !== evidence.content_hash) {
+        throw new MaterializationOutputConflictError(
+          key,
+          path,
+          `Completed materialization verification failed at final workspace location: ${path}`
         );
       }
     }
@@ -201,20 +229,44 @@ export class WorkspaceProjectionWriter {
         throw new Error(`Removed deliverable projection is missing completed baseline evidence: ${key}`);
       }
       const path = joinWorkspacePath(root, evidence.relative_path);
-      const current = await this.objects.readText(path);
-      if (current === null) continue;
-      const currentHash = await sha256Text(current);
+      const observed = await this.observeForWrite(path);
+      if (observed === null) continue;
+      const currentHash = observed.hash;
       if (currentHash !== evidence.content_hash) {
         await this.preserveUnexpectedContent(plan.project_id, {
           key,
           path,
-          currentContent: current,
+          currentContent: observed.content,
           currentHash
         }, options.onUnexpectedContent);
         throw new MaterializationOutputConflictError(
           key,
           path,
           `Refusing to delete an obsolete deliverable projection whose bytes changed since the completed baseline: ${path}`
+        );
+      }
+      if (this.runtime) {
+        if (!this.runtime.objects.deleteIfUnchanged) {
+          throw new Error(`Conditional delete is unavailable for obsolete projection: ${path}`);
+        }
+        const outcome = await this.runtime.objects.deleteIfUnchanged(path, {
+          objectId: observed.object_id,
+          revisionToken: observed.token
+        });
+        if (outcome === "deleted" || outcome === "missing") continue;
+        const changed = await this.observeForWrite(path);
+        if (changed !== null) {
+          await this.preserveUnexpectedContent(plan.project_id, {
+            key,
+            path,
+            currentContent: changed.content,
+            currentHash: changed.hash
+          }, options.onUnexpectedContent);
+        }
+        throw new MaterializationOutputConflictError(
+          key,
+          path,
+          `Refusing to delete an obsolete deliverable projection whose bytes changed after observation: ${path}`
         );
       }
       await this.objects.delete(path);
@@ -228,8 +280,9 @@ export class WorkspaceProjectionWriter {
     options: WorkspaceProjectionWriterOptions
   ): Promise<{ evidence: ProjectionOutputEvidence; outcome: ProjectionWriteOutcome }> {
     const path = joinWorkspacePath(root, output.relative_path);
-    const current = await this.objects.readText(path);
-    const currentHash = current === null ? null : await sha256Text(current);
+    const observed = await this.observeForWrite(path);
+    const current = observed?.content ?? null;
+    const currentHash = observed?.hash ?? null;
     const desired = evidenceFor(output);
 
     if (currentHash === output.content_hash) return { evidence: desired, outcome: "content_hash" };
@@ -266,12 +319,17 @@ export class WorkspaceProjectionWriter {
       );
     }
 
-    if (current === null) await this.objects.createText(path, output.content);
-    else await this.objects.upsertText(path, output.content);
+    if (current === null) {
+      await this.createOrVerify(path, output.content);
+    } else if (this.runtime && observed) {
+      await this.runtime.conditionalWrite.writeTextConditional(path, output.content, observed.token);
+    } else {
+      await this.objects.upsertText(path, output.content);
+    }
 
     if (output.critical) {
-      const persisted = await this.objects.readText(path);
-      if (persisted === null || await sha256Text(persisted) !== output.content_hash) {
+      const persisted = await this.observeForWrite(path);
+      if (persisted === null || persisted.hash !== output.content_hash) {
         throw new MaterializationOutputConflictError(
           output.key,
           path,
@@ -281,6 +339,27 @@ export class WorkspaceProjectionWriter {
     }
 
     return { evidence: desired, outcome: "uploaded" };
+  }
+
+  private async observeForWrite(path: string): Promise<ObservedText | { content: string; hash: string; object_id: string; token: string } | null> {
+    if (this.runtime) return observeText(this.runtime, path);
+    const content = await this.objects.readText(path);
+    if (content === null) return null;
+    return {
+      content,
+      hash: await sha256Text(content),
+      object_id: "legacy-object",
+      token: "legacy-token"
+    };
+  }
+
+  private async createOrVerify(path: string, content: string): Promise<void> {
+    try {
+      await this.objects.createText(path, content);
+    } catch (error) {
+      const observed = await this.observeForWrite(path);
+      if (!observed || observed.hash !== await sha256Text(content)) throw error;
+    }
   }
 
   private async preserveUnexpectedContent(

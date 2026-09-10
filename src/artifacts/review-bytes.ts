@@ -3,11 +3,19 @@ import type { ReviewCandidateRequest } from "../domain/artifact-write";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 
 export async function verifyReviewBytes(runtime: ProjectOsPersistenceRuntime, request: ReviewCandidateRequest): Promise<void> {
+  return verifyReviewBytesAtPath(runtime, request, request.source.path);
+}
+
+export async function verifyReviewBytesAtPath(
+  runtime: ProjectOsPersistenceRuntime,
+  request: ReviewCandidateRequest,
+  path: string
+): Promise<void> {
   if (request.source.provider_id !== runtime.providerId) throw new ReviewBinaryValidationError("provider identity mismatch");
   if (!runtime.objects.readBytes) throw new ReviewBinaryValidationError("bounded binary read capability required");
   if (request.source.size < 1 || request.source.size > 10 * 1024 * 1024) throw new ReviewBinaryValidationError("binary size limit");
   let bytes: Uint8Array | null;
-  try { bytes = await runtime.objects.readBytes(request.source.path, request.source.size); }
+  try { bytes = await runtime.objects.readBytes(path, request.source.size); }
   catch (error) {
     if (error instanceof ProviderBinaryReadLimitError) throw new ReviewBinaryValidationError(error.message);
     throw error;

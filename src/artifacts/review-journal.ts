@@ -1,4 +1,4 @@
-import { parseArtifactWriteRequest, type ArtifactWriteReceipt, type ReviewCandidateRequest } from "../domain/artifact-write";
+import { isReviewCandidate, parseArtifactWriteRequest, type ArtifactWriteReceipt, type ReviewCandidateRequest } from "../domain/artifact-write";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderConflictError } from "../persistence/provider/errors";
@@ -7,10 +7,33 @@ import { MutationIntentConflictError } from "../mutation-gate/repository";
 import { reviewReceiptMatchesObservation } from "./review-receipt";
 
 type Observation = NonNullable<ArtifactWriteReceipt["final_observation"]>;
+
+export class ReviewCandidateEvidenceChangedError extends Error {
+  constructor(message = "Final review observation changed before receipt") {
+    super(message);
+    this.name = "ReviewCandidateEvidenceChangedError";
+  }
+}
+
 export class ReviewCandidateJournal {
   constructor(private readonly runtime: ProjectOsPersistenceRuntime) {}
   private path(request: ReviewCandidateRequest, kind: "observations" | "terminals"): string {
-    return machineArtifactReceiptPath(request.request_id).replace("/receipts/", `/review-${kind}/`);
+    return this.pathFor(request.request_id, kind);
+  }
+  async terminalByRequestId(projectId: string, requestId: string): Promise<{ request: ReviewCandidateRequest; receipt: ArtifactWriteReceipt } | null> {
+    if (!/^PRJ-[0-9]{4,}$/.test(projectId) || !/^ART-[A-Z0-9-]{10,}$/.test(requestId)) {
+      throw new Error("Invalid review candidate lookup binding");
+    }
+    const raw = await this.runtime.objects.readText(this.pathFor(requestId, "terminals"));
+    if (raw === null) return null;
+    const record = JSON.parse(raw) as { request: unknown; receipt: ArtifactWriteReceipt };
+    const request = parseArtifactWriteRequest(record.request);
+    if (!isReviewCandidate(request) || request.project_id !== projectId || request.request_id !== requestId) {
+      throw new Error("Invalid review candidate terminal binding");
+    }
+    const receipt = await this.terminal(request);
+    if (!receipt) throw new Error("Missing review candidate terminal receipt");
+    return { request, receipt };
   }
   async recordObservation(request: ReviewCandidateRequest, metadata: ProviderObjectMetadata): Promise<void> {
     if (!metadata.objectId || !metadata.revisionToken || !metadata.integrityHash) throw new Error("Missing final review evidence");
@@ -23,7 +46,9 @@ export class ReviewCandidateJournal {
     const observation = JSON.parse(raw) as Observation;
     const current = await this.runtime.objects.getMetadata(observation.path);
     const receipt = {request_id:request.request_id,project_id:request.project_id,relative_path:request.relative_path,content_sha256:request.content_sha256,status:"committed",operation:"REVIEW_CANDIDATE",accepted:false,published:false,final_observation:observation};
-    if (!current || !reviewReceiptMatchesObservation(receipt,request,current,this.runtime.providerId)) throw new Error("Final review observation changed before receipt");
+    if (!current || !reviewReceiptMatchesObservation(receipt,request,current,this.runtime.providerId)) {
+      throw new ReviewCandidateEvidenceChangedError();
+    }
     return observation;
   }
   async recordTerminal(request: ReviewCandidateRequest, receipt: ArtifactWriteReceipt): Promise<void> {
@@ -44,5 +69,9 @@ export class ReviewCandidateJournal {
       if (!(error instanceof ProviderConflictError)) throw error;
       if (await this.runtime.objects.readText(path) !== content) throw new Error("Conflicting immutable review evidence");
     }
+  }
+  private pathFor(requestId: string, kind: "observations" | "terminals"): string {
+    if (!/^ART-[A-Z0-9-]{10,}$/.test(requestId)) throw new Error(`Invalid review candidate request id: ${requestId}`);
+    return machineArtifactReceiptPath(requestId).replace("/receipts/", `/review-${kind}/`);
   }
 }

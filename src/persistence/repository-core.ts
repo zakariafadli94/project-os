@@ -235,10 +235,58 @@ export class ProjectRepository {
     ) {
       throw new Error("Materialization head does not match its immutable completed record");
     }
-    await this.persistence.objects.upsertText(
-      machineMaterializationHeadPath(validated.project_id),
-      pretty(validated)
-    );
+    const path = machineMaterializationHeadPath(validated.project_id);
+    const content = pretty(validated);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.readMaterializationHeadForConditionalWrite(validated.project_id, path);
+      if (!current) {
+        try {
+          await this.persistence.objects.createText(path, content);
+          return;
+        } catch (error) {
+          if (error instanceof ProviderConflictError) continue;
+          throw error;
+        }
+      }
+
+      const progress = compareMaterializationHeadProgress(validated, current.head);
+      if (progress < 0) return;
+      if (progress === 0) {
+        if (sameMaterializationHead(validated, current.head)) return;
+        throw new Error("Materialization head conflicts with the immutable generation at the same target");
+      }
+
+      if (!current.revisionToken) {
+        throw new Error("Materialization head update requires a provider revision token");
+      }
+      try {
+        await this.persistence.conditionalWrite.writeTextConditional(path, content, current.revisionToken);
+        return;
+      } catch (error) {
+        if (error instanceof ProviderConflictError) continue;
+        throw error;
+      }
+    }
+    throw new ProviderConflictError(`Materialization head changed concurrently for ${validated.project_id}`);
+  }
+
+  private async readMaterializationHeadForConditionalWrite(
+    projectId: string,
+    path: string
+  ): Promise<{ head: MaterializationHead; revisionToken: string | undefined } | null> {
+    const metadata = await this.persistence.objects.getMetadata(path);
+    if (!metadata) return null;
+    const raw = await this.persistence.objects.readText(path);
+    if (raw === null) throw new ProviderConflictError(`Materialization head disappeared during observation for ${projectId}`);
+    const head = parseMaterializationHead(JSON.parse(raw));
+    if (head.project_id !== projectId) {
+      throw new Error(`Materialization head binding mismatch for ${projectId}`);
+    }
+    const expectedPath = machineMaterializationRecordPath(projectId, head.target_revision, head.projection_version);
+    if (head.record_path !== expectedPath) {
+      throw new Error(`Materialization head record binding mismatch for ${projectId}`);
+    }
+    return { head, revisionToken: metadata.revisionToken };
   }
 
   async materializeCommit(
@@ -551,6 +599,26 @@ export class ProjectRepository {
     if (existing === null) throw original;
     throw new Error(`Immutable persistence path conflict with different content: ${path}`);
   }
+}
+
+function compareMaterializationHeadProgress(
+  left: MaterializationHead,
+  right: MaterializationHead
+): number {
+  if (left.projection_version !== right.projection_version) {
+    return left.projection_version - right.projection_version;
+  }
+  return left.target_revision - right.target_revision;
+}
+
+function sameMaterializationHead(left: MaterializationHead, right: MaterializationHead): boolean {
+  return left.project_id === right.project_id
+    && left.target_revision === right.target_revision
+    && left.projection_version === right.projection_version
+    && left.workspace_location === right.workspace_location
+    && left.record_path === right.record_path
+    && left.result_root_hash === right.result_root_hash
+    && left.completed_at === right.completed_at;
 }
 
 function manifestFor(state: ProjectState): object {

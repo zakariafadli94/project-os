@@ -32,6 +32,19 @@ import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
 import { parseMutationGateMode } from "../mutation-gate/service";
+import { AdmissionError, issueMutationContext, verifyMutationContext, type MutationContext } from "../admission/mutation-context";
+import { decodeAdmission } from "../admission/transport";
+import { discoverCanonical } from "../convergence/discovery";
+import { initialProgress } from "../convergence/journal";
+import { sha256Canonical } from "../materialization/hash";
+import {
+  admissionModeForProject,
+  assertCapacity,
+  convergenceModeForProject,
+  type CapacityObservation
+} from "../convergence/rollout";
+import { freshnessRejectionMetric, workerLogConvergenceTelemetry } from "../convergence/observability";
+import { deploymentIdentity } from "../deployment/identity";
 
 interface TransactionRow {
   [key: string]: SqlStorageValue;
@@ -53,6 +66,21 @@ interface DocumentRequestRow {
 interface StateRow {
   [key: string]: SqlStorageValue;
   state_json: string;
+}
+
+function isCapacityObservation(value: unknown): value is CapacityObservation {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<CapacityObservation>;
+  const queuedOutputs = candidate.queued_outputs;
+  const oldestPendingSeconds = candidate.oldest_pending_seconds;
+  return typeof queuedOutputs === "number"
+    && Number.isSafeInteger(queuedOutputs)
+    && queuedOutputs >= 0
+    && typeof oldestPendingSeconds === "number"
+    && Number.isFinite(oldestPendingSeconds)
+    && oldestPendingSeconds >= 0
+    && typeof candidate.continuation_available === "boolean"
+    && typeof candidate.within_qualified_envelope === "boolean";
 }
 
 interface ManagedDocumentTerminalReceipt {
@@ -90,6 +118,10 @@ export class ProjectGuard extends DurableObject<Env> {
         status TEXT NOT NULL,
         receipt_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS transaction_intents (
+        transaction_id TEXT PRIMARY KEY,
+        payload_hash TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS artifact_requests (
         request_id TEXT PRIMARY KEY,
         request_json TEXT NOT NULL,
@@ -103,6 +135,10 @@ export class ProjectGuard extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS project_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         state_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS admission_floor (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        strict INTEGER NOT NULL CHECK (strict = 1)
       );
     `);
     this.layoutMode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
@@ -122,11 +158,11 @@ export class ProjectGuard extends DurableObject<Env> {
     const pathname = url.pathname;
 
     if (request.method === "POST" && pathname === "/artifact") {
-      return this.serialize(() => this.handleArtifact(request));
+      return this.serialize(() => this.handleArtifact(request)).catch((error) => this.admissionErrorResponse(error));
     }
 
     if (request.method === "POST" && pathname === "/document") {
-      return this.serialize(() => this.handleManagedDocument(request));
+      return this.serialize(() => this.handleManagedDocument(request)).catch((error) => this.admissionErrorResponse(error));
     }
 
     if (request.method === "GET" && pathname === "/document-status") {
@@ -153,23 +189,34 @@ export class ProjectGuard extends DurableObject<Env> {
       return this.forwardMaterializationRequest(request, "/materialize");
     }
 
+    if (request.method === "GET" && pathname === "/mutation-context") {
+      return this.serialize(() => this.handleMutationContextRead());
+    }
+
     if (request.method !== "POST" || pathname !== "/transaction") {
       return Response.json({ error: "not_found" }, { status: 404 });
     }
 
     return this.serialize(async () => {
       let tx: Transaction;
+      let mutationContext: MutationContext | null;
       try {
-        tx = parseTransaction(await request.json());
+        const admission = decodeAdmission(await request.json(), parseTransaction);
+        tx = admission.request;
+        mutationContext = admission.mutation_context;
       } catch (error) {
+        if (error instanceof AdmissionError) throw error;
         return Response.json({
           error: "invalid_transaction",
           message: error instanceof Error ? error.message : "Invalid transaction"
         }, { status: 400 });
       }
 
+      await this.ensureTransactionIntent(tx);
+
       const existing = this.findReceipt(tx.transaction_id);
       if (existing) {
+        await this.verifyCommittedReplayPayload(tx, existing);
         await this.replayStatusSideEffects(tx, existing);
         return Response.json(existing);
       }
@@ -190,12 +237,23 @@ export class ProjectGuard extends DurableObject<Env> {
 
       let reconciledState: ProjectState | null = null;
       if (this.layoutMode === "v2") {
+        const localState = this.loadState();
+        if (this.strictAdmissionEnabled(tx.project_id) && localState) {
+          await this.verifyAdmission(mutationContext, tx, localState);
+        }
         reconciledState = await this.reconcileCanonicalCommits();
         const reconciled = this.findReceipt(tx.transaction_id);
         if (reconciled) {
+          await this.verifyCommittedReplayPayload(tx, reconciled);
           await this.replayStatusSideEffects(tx, reconciled);
           return Response.json(reconciled);
         }
+      }
+
+
+      if (this.strictAdmissionEnabled(tx.project_id)) {
+        if (!reconciledState) throw new AdmissionError("canonical_unavailable", 503);
+        await this.verifyAdmission(mutationContext, tx, reconciledState);
       }
 
       const canonicalReceipt = await this.repository.readReceipt(tx.transaction_id);
@@ -203,6 +261,7 @@ export class ProjectGuard extends DurableObject<Env> {
         if (canonicalReceipt.project_id !== tx.project_id) {
           throw new Error(`Canonical receipt project binding mismatch for ${tx.transaction_id}`);
         }
+        await this.verifyCommittedReplayPayload(tx, canonicalReceipt);
         this.persistReceipt(canonicalReceipt);
         await this.replayStatusSideEffects(tx, canonicalReceipt);
         return Response.json(canonicalReceipt);
@@ -211,6 +270,7 @@ export class ProjectGuard extends DurableObject<Env> {
       const state = this.layoutMode === "v2"
         ? reconciledState
         : await this.loadOrRecoverState();
+      await this.assertCommitCapacity(tx.project_id);
       const result = applyTransaction(state, tx);
 
       if (result.kind === "rejected" || result.kind === "conflict") {
@@ -257,6 +317,9 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.syncRegistryStatus(result.state);
       }
       return Response.json(receipt);
+    }).catch((error) => {
+      if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+      throw error;
     });
   }
 
@@ -266,9 +329,13 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async handleArtifact(request: Request): Promise<Response> {
     let artifact: ArtifactWriteRequest;
+    let mutationContext: MutationContext | null;
     try {
-      artifact = parseArtifactWriteRequest(await request.json());
+      const admission = decodeAdmission(await request.json(), parseArtifactWriteRequest);
+      artifact = admission.request;
+      mutationContext = admission.mutation_context;
     } catch (error) {
+      if (error instanceof AdmissionError) throw error;
       return Response.json({
         error: "invalid_artifact_request",
         message: error instanceof Error ? error.message : "Invalid artifact request"
@@ -324,6 +391,8 @@ export class ProjectGuard extends DurableObject<Env> {
       );
     }
 
+    await this.verifyEffectAdmission(mutationContext, artifact.project_id, state);
+
     if (!isStagedArtifactWriteRequest(artifact) && await sha256Hex(artifact.content) !== artifact.content_sha256) {
       return this.finalizeArtifact(
         artifact,
@@ -369,9 +438,13 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async handleManagedDocument(request: Request): Promise<Response> {
     let operation: ManagedDocumentRequest;
+    let mutationContext: MutationContext | null;
     try {
-      operation = parseManagedDocumentRequest(await request.json());
+      const admission = decodeAdmission(await request.json(), parseManagedDocumentRequest);
+      operation = admission.request;
+      mutationContext = admission.mutation_context;
     } catch (error) {
+      if (error instanceof AdmissionError) throw error;
       return Response.json({
         error: "invalid_document_request",
         message: error instanceof Error ? error.message : "Invalid managed document request"
@@ -410,6 +483,9 @@ export class ProjectGuard extends DurableObject<Env> {
         "Project state is not initialized"
       ));
     }
+
+
+    await this.verifyEffectAdmission(mutationContext, operation.project_id, state);
 
     try {
       await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
@@ -478,6 +554,8 @@ export class ProjectGuard extends DurableObject<Env> {
         return this.managedDocumentService.promoteToReview(request, state);
       case "publish":
         return this.managedDocumentService.publish(request, state);
+      case "review_candidate.promote":
+        return this.managedDocumentService.promoteReviewCandidate(request, state);
       case "reopen":
         return this.managedDocumentService.reopenPublished(request, state);
       case "reference.classify":
@@ -514,6 +592,169 @@ export class ProjectGuard extends DurableObject<Env> {
       "SELECT state_json FROM project_state WHERE singleton = 1"
     ).toArray()[0];
     return row ? normalizeProjectState(JSON.parse(row.state_json)) : null;
+  }
+
+  private async handleMutationContextRead(): Promise<Response> {
+    const projectId = this.ctx.id.name;
+    const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
+    if (!projectId || projectId === AUTO_PROJECT_ID || !secret) {
+      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    }
+    const progress = initialProgress(projectId, new Date().toISOString(), crypto.randomUUID());
+    let latest: ProjectState | null = null;
+    for (let page = 0; page < 4; page += 1) {
+      const budget = {
+        deadline_ms: Number.MAX_SAFE_INTEGER,
+        calls_left: 1024,
+        now: () => Date.now(),
+        signal: new AbortController().signal,
+        beforeHttp() { this.calls_left -= 1; },
+        canStartEffect: () => true
+      };
+      const discovered = await discoverCanonical(this.repository, this.persistence, progress, budget);
+      if (!discovered) {
+        if (!latest) return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+        const context = await issueMutationContext(latest, secret, Date.now());
+        return Response.json({ context, canonical_state: latest });
+      }
+      latest = discovered.state;
+      progress.canonical_observed_revision = discovered.state.revision;
+      if (discovered.complete) {
+        const context = await issueMutationContext(discovered.state, secret, Date.now());
+        return Response.json({ context, canonical_state: discovered.state });
+      }
+    }
+    return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+  }
+
+  protected strictAdmissionEnabled(projectId: string): boolean {
+    const configuredStrict = admissionModeForProject(
+      this.env.PROJECT_OS_ADMISSION_PROJECT_MODES,
+      projectId
+    ) === "strict";
+    if (configuredStrict && this.ctx.id.name === projectId) {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO admission_floor (singleton, strict) VALUES (1, 1) ON CONFLICT(singleton) DO NOTHING"
+      );
+      return true;
+    }
+    return this.ctx.storage.sql.exec<{ strict: number }>(
+      "SELECT strict FROM admission_floor WHERE singleton = 1"
+    ).toArray()[0]?.strict === 1;
+  }
+
+  /**
+   * Capacity gates new canonical work only once the explicit repair writer is
+   * enabled for this project. Existing durable repairs bypass this path.
+   */
+  private async assertCommitCapacity(projectId: string): Promise<void> {
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, projectId) !== "repair") return;
+    let response: Response;
+    try {
+      response = await this.env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
+        "https://materialization-guard.internal/capacity"
+      );
+    } catch {
+      throw new AdmissionError("convergence_capacity_exceeded", 503);
+    }
+    if (!response.ok) throw new AdmissionError("convergence_capacity_exceeded", 503);
+    let observation: unknown;
+    try {
+      observation = await response.json();
+    } catch {
+      throw new AdmissionError("convergence_capacity_exceeded", 503);
+    }
+    if (!isCapacityObservation(observation)) throw new AdmissionError("convergence_capacity_exceeded", 503);
+    try {
+      assertCapacity(observation);
+    } catch {
+      throw new AdmissionError("convergence_capacity_exceeded", 503);
+    }
+  }
+
+  private async verifyAdmission(context: MutationContext | null, tx: Transaction, state: ProjectState): Promise<void> {
+    const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
+    if (!secret) {
+      const error = new AdmissionError("canonical_unavailable", 503);
+      this.reportAdmissionRejection(error, tx.project_id, state.revision, context?.canonical_revision ?? null);
+      throw error;
+    }
+    try {
+      await verifyMutationContext(context, state, tx.base_revision, secret, Date.now());
+    } catch (error) {
+      if (error instanceof AdmissionError) {
+        this.reportAdmissionRejection(error, tx.project_id, state.revision, context?.canonical_revision ?? null);
+      }
+      throw error;
+    }
+  }
+
+  protected async verifyEffectAdmission(
+    context: MutationContext | null,
+    projectId: string,
+    state: ProjectState
+  ): Promise<void> {
+    if (!this.strictAdmissionEnabled(projectId)) return;
+    const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
+    if (!secret) {
+      const error = new AdmissionError("canonical_unavailable", 503);
+      this.reportAdmissionRejection(error, projectId, state.revision, context?.canonical_revision ?? null);
+      throw error;
+    }
+    try {
+      await verifyMutationContext(context, state, context?.canonical_revision ?? state.revision, secret, Date.now());
+    } catch (error) {
+      if (error instanceof AdmissionError) {
+        this.reportAdmissionRejection(error, projectId, state.revision, context?.canonical_revision ?? null);
+      }
+      throw error;
+    }
+  }
+
+  private reportAdmissionRejection(
+    error: AdmissionError,
+    projectId: string,
+    targetRevision: number,
+    observedRevision: number | null
+  ): void {
+    try {
+      workerLogConvergenceTelemetry().emit(freshnessRejectionMetric({
+        projectId,
+        targetRevision,
+        observedRevision,
+        code: error.code,
+        deploymentSha: deploymentIdentity(this.env).git_sha ?? "unknown"
+      }));
+    } catch {
+      // Admission protection must not depend on a telemetry sink.
+    }
+  }
+
+  private admissionErrorResponse(error: unknown): Response {
+    if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+    throw error;
+  }
+
+  private async ensureTransactionIntent(tx: Transaction): Promise<void> {
+    const payloadHash = await sha256Canonical(tx);
+    const row = this.ctx.storage.sql.exec<{ payload_hash: string }>(
+      "SELECT payload_hash FROM transaction_intents WHERE transaction_id = ?",
+      tx.transaction_id
+    ).toArray()[0];
+    if (row && row.payload_hash !== payloadHash) throw new AdmissionError("idempotency_payload_mismatch", 409);
+    if (!row) this.ctx.storage.sql.exec(
+      "INSERT INTO transaction_intents (transaction_id, payload_hash) VALUES (?, ?)",
+      tx.transaction_id,
+      payloadHash
+    );
+  }
+
+  private async verifyCommittedReplayPayload(tx: Transaction, receipt: Receipt): Promise<void> {
+    if (receipt.status !== "committed" || this.layoutMode !== "v2") return;
+    const record = await this.repository.readCommitRecord(tx.project_id, receipt.new_revision);
+    if (record && await sha256Canonical(record.transaction) !== await sha256Canonical(tx)) {
+      throw new AdmissionError("idempotency_payload_mismatch", 409);
+    }
   }
 
   protected async loadOrRecoverState(): Promise<ProjectState | null> {

@@ -45,6 +45,8 @@ The initial production configuration is explicitly `PROJECT_OS_CONTINUITY_MODE=s
 
 Candidate evaluation is deliberately an internal library contract. The only Worker endpoint added by this improvement is an authenticated read-only status endpoint (`GET /v1/admin/continuity`). Normal user and project routes do not change.
 
+Admission context is transported unchanged through candidate and stable execution. An admission failure is authoritative and never triggers fallback. A rollback runtime is eligible only if it can read the convergence journal, preserve bounded continuation and enforce an already-established strict-admission floor; rollback never deletes durable repair evidence or lowers a canonical revision.
+
 ## Relationship to later roadmap items
 
 This gate controls **eligibility to switch**. It does not pretend that cross-store crash consistency, destructive recovery, or data-preserving rollback already exist. Those proofs are supplied by later roadmap items (`IMP-FAULTTEST001`, `IMP-RECOVERY001`, `IMP-COMMIT001`, `IMP-ROLLBACK001`). Until those proofs exist for a candidate, the gate keeps Project OS on the stable path automatically.
@@ -72,3 +74,11 @@ The improvement is ready for production validation only when:
 - no canonical Project OS state is changed merely by installing the control plane.
 
 This document is the source-controlled continuity contract for the implementation. The durable Project OS decision record is written only after production validation through the canonical transaction path.
+
+## 2026-09-09 convergence rollout boundary
+
+Local convergence and admission tests are complete, and the production continuity decision remains `stable`. The implementation SHA `00250b623ee88bdcbed71252223b4adaee179c17` passed the 193-file / 935-test suite, the 26-file / 148-test persistence high-risk gate, static contracts, and a direct Wrangler dry-run that exited before upload. Regression SHA `3bbf7d2102dffeca834368cc8c5336840a2f8fda` then passed 193 files / 936 tests, including a six-attempt synthetic HANDOFF exhaustion, immutable alert, and scheduled recovery without a new canonical commit. The independent production proofs still missing are migration of the external promotion/fallback paths, a monitoring acknowledgement and recovery exercise, and the isolated 24-hour canary. These conditions preserve the stable reader/writer path; they do not authorise a merge, deployment, activation downgrade, or PRJ-0003 repair.
+
+The final local rectification gate at `b7bca495c4805256db49b8db937d4b4ffc133176` passed the complete 201-file / 971-test suite, static contracts, the 26-file / 148-test persistence gate, and a bundle-only Wrangler dry-run. It does not alter the continuity decision: owner-compatible promotion/fallback integration, monitoring ACK/recovery, and an isolated 24-hour canary are still absent. No activation, deployment, canonical Dropbox mutation, or PRJ-0003 repair occurred.
+
+The last local hardening SHA `d63578252e7d64329540ce001ad0dc908d906454` bounds a monitoring acknowledgement body that stalls after the HTTP response. The new regression was red before correction, then the full 201-file / 972-test suite, static gates, persistence gate, and direct bundle-only dry-run passed. Continuity remains `stable`: this local timeout proof is not an external monitoring ACK, canary, activation, deployment, or permission to repair PRJ-0003.

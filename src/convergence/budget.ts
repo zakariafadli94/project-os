@@ -32,6 +32,7 @@ export function providerRequestScopeFor(budget: SliceBudget): ProviderRequestSco
   return {
     deadlineMs: budget.deadline_ms,
     signal: budget.signal,
+    now: budget.now,
     beforeHttp: () => budget.beforeHttp()
   };
 }

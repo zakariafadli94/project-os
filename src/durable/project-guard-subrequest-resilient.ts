@@ -15,6 +15,8 @@ import { ManagedWorkingHeadService } from "../documents/working-head-service";
 import type { Env } from "../env";
 import { ProjectRepository } from "../persistence/repository";
 import { MutationGateProjectGuard } from "./project-guard-mutation-gate";
+import type { MutationContext } from "../admission/mutation-context";
+import { decodeAdmission } from "../admission/transport";
 
 interface StateRow {
   [key: string]: SqlStorageValue;
@@ -101,7 +103,7 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       if (inspected.kind === "working_head") {
         return this.serializeRecovery(async () => {
           await this.fastForwardFromVerifiedMachineSnapshot();
-          return this.handleWorkingHead(inspected.request);
+          return this.handleWorkingHead(inspected.request, inspected.context);
         });
       }
     }
@@ -130,7 +132,7 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
     return transaction.base_revision > localRevision;
   }
 
-  private async handleWorkingHead(operation: WorkingHeadRequest): Promise<Response> {
+  private async handleWorkingHead(operation: WorkingHeadRequest, context: MutationContext | null): Promise<Response> {
     if (this.ctx.id.name && this.ctx.id.name !== operation.project_id) {
       return Response.json(workingHeadTerminalReceipt(
         operation,
@@ -150,6 +152,8 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
         "Project state is not initialized"
       ));
     }
+
+    await this.verifyEffectAdmission(context, operation.project_id, state);
 
     const serialized = JSON.stringify(operation);
     try {
@@ -373,7 +377,7 @@ async function inspectTransaction(request: JsonReadableRequest): Promise<Transac
     return null;
   }
   try {
-    return parseTransaction(raw);
+    return decodeAdmission(raw, parseTransaction).request;
   } catch {
     return null;
   }
@@ -382,7 +386,7 @@ async function inspectTransaction(request: JsonReadableRequest): Promise<Transac
 async function inspectWorkingHeadRequest(request: JsonReadableRequest): Promise<
   | { kind: "other" }
   | { kind: "invalid"; message: string }
-  | { kind: "working_head"; request: WorkingHeadRequest }
+  | { kind: "working_head"; request: WorkingHeadRequest; context: MutationContext | null }
 > {
   let raw: unknown;
   try {
@@ -390,9 +394,19 @@ async function inspectWorkingHeadRequest(request: JsonReadableRequest): Promise<
   } catch {
     return { kind: "other" };
   }
-  if (!isWorkingHeadOperation(raw)) return { kind: "other" };
+  let admission;
   try {
-    return { kind: "working_head", request: parseWorkingHeadRequest(raw) };
+    admission = decodeAdmission(raw, (value) => value);
+  } catch (error) {
+    return { kind: "invalid", message: error instanceof Error ? error.message : "Invalid admission envelope" };
+  }
+  if (!isWorkingHeadOperation(admission.request)) return { kind: "other" };
+  try {
+    return {
+      kind: "working_head",
+      request: parseWorkingHeadRequest(admission.request),
+      context: admission.mutation_context
+    };
   } catch (error) {
     return {
       kind: "invalid",

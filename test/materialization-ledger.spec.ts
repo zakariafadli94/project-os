@@ -78,6 +78,27 @@ describe("MaterializationLedger", () => {
     });
   });
 
+  it("persists the immutable-evidence checkpoint across ledger instances", async () => {
+    const projectId = "PRJ-3409";
+    const stub = env.PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      initializeMaterializationSchema(state.storage);
+      const first = new MaterializationLedger(state.storage);
+      first.requestTarget({ revision: 2, projection_version: 1 });
+      first.requestTarget({ revision: 3, projection_version: 1 });
+      first.requestTarget({ revision: 5, projection_version: 1 });
+      expect(first.beginNextTarget()).toEqual({
+        revision: 5,
+        projection_version: 1,
+        coalesced_revisions: [2, 3, 4]
+      });
+      first.markImmutableDerivativesThrough(2);
+
+      const restarted = new MaterializationLedger(state.storage);
+      expect(restarted.immutableDerivativesThrough()).toBe(2);
+    });
+  });
+
   it("failure does not advance completed head", async () => {
     await withLedger("PRJ-3405", (ledger) => {
       ledger.requestTarget({ revision: 3, projection_version: 1 });
@@ -87,6 +108,24 @@ describe("MaterializationLedger", () => {
       expect(status.head).toBeNull();
       expect(status.active?.revision).toBe(3);
       expect(status.last_error).toBe("provider conflict");
+    });
+  });
+
+  it("requires a fresh verification epoch before reusing output progress after failure", async () => {
+    await withLedger("PRJ-3410", (ledger) => {
+      ledger.requestTarget({ revision: 3, projection_version: 1 });
+      expect(ledger.beginNextTarget()?.revision).toBe(3);
+      ledger.recordVerifiedOutput("global:STATE", evidence("STATE.md", "f", 3));
+      expect(ledger.attemptOutputs().size).toBe(1);
+
+      ledger.failActive("provider interruption");
+      expect(ledger.beginNextTarget()?.revision).toBe(3);
+      expect(ledger.attemptOutputs()).toEqual(new Map());
+
+      ledger.recordVerifiedOutput("global:STATE", evidence("STATE.md", "f", 3));
+      expect(ledger.attemptOutputs()).toEqual(new Map([
+        ["global:STATE", evidence("STATE.md", "f", 3)]
+      ]));
     });
   });
 

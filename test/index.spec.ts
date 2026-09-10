@@ -202,7 +202,7 @@ describe("Worker routing", () => {
     expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${project.project_id}-artifact-direct/ARTIFACTS/direct/a.md`)).toBe(content);
   });
 
-  it("requires auth and materializes existing projects without changing their revision", async () => {
+  it("requires auth and reports an inactive V2 writer without changing the revision", async () => {
     const mock = installDropboxMock();
     const ctx = createExecutionContext();
 
@@ -235,11 +235,13 @@ describe("Worker routing", () => {
       headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
       body: JSON.stringify({ project_ids: [receipt.project_id] })
     }), testEnv, ctx);
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(409);
     await expect(response.json()).resolves.toEqual({
-      results: [{ project_id: receipt.project_id, status: "materialized", revision: 1 }]
+      error: "materialization_blocked",
+      project_id: receipt.project_id,
+      detail: { error: "convergence_writer_inactive", project_id: receipt.project_id, mode: "off" }
     });
-    expect(mock.files.has(`/PROJECT_OS/WORKSPACE/PROJECTS/${receipt.project_id}-admin-project/PROJECT.md`)).toBe(true);
+    expect(mock.files.has(`/PROJECT_OS/WORKSPACE/PROJECTS/${receipt.project_id}-admin-project/PROJECT.md`)).toBe(false);
   });
 
   it("rejects staged artifacts before Durable Object routing while binary ingress is disabled", async () => {

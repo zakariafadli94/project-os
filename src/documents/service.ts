@@ -3,6 +3,10 @@ import type {
   ManagedDocumentHead,
   ManagedProviderObservation
 } from "../domain/managed-document";
+import type { ArtifactWriteReceipt } from "../domain/artifact-write";
+import { ReviewBinaryValidationError, verifyReviewBytesAtPath } from "../artifacts/review-bytes";
+import { ReviewCandidateEvidenceChangedError, ReviewCandidateJournal } from "../artifacts/review-journal";
+import { samePayload } from "../artifacts/staged-publication";
 import { assertManagedRelativePath, assertReferenceCollectionPath, documentIdFor } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
 import {
@@ -13,7 +17,7 @@ import {
   asProjectOsPersistence,
   type PersistenceInput
 } from "../persistence/compatibility/legacy-dropbox-runtime";
-import { workspaceManagedDocumentPath } from "../persistence/layout";
+import { machineDocumentProviderPayloadPath, workspaceManagedDocumentPath } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import {
@@ -23,6 +27,7 @@ import {
 import { sha256Text } from "./hash";
 import { enforceManagedMarkdownIdentity } from "./identity-frontmatter";
 import { DocumentLedgerRepository } from "./repository";
+import { ManagedDocumentPromotionJournal } from "./promotion-journal";
 
 export interface ManagedTextWriteRequest {
   request_id: string;
@@ -52,6 +57,17 @@ export interface ManagedLifecycleRequest {
   created_at: string;
 }
 
+export interface ManagedReviewCandidatePromotionRequest {
+  operation: "review_candidate.promote";
+  request_id: string;
+  project_id: string;
+  candidate_request_id: string;
+  logical_path: string;
+  expected_project_revision: number;
+  accepted: true;
+  created_at: string;
+}
+
 export interface ManagedReferenceClassificationRequest extends ManagedLifecycleRequest {
   collection_path: string;
 }
@@ -65,6 +81,9 @@ export interface ManagedDocumentReceipt {
   logical_path: string;
   status: "committed";
   provider_rev?: string;
+  candidate_request_id?: string;
+  accepted?: true;
+  published?: true;
 }
 
 export class ManagedDocumentConflictError extends Error {
@@ -81,10 +100,14 @@ export class ManagedDocumentConflictError extends Error {
 export class ManagedDocumentService {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly ledger: DocumentLedgerRepository;
+  private readonly reviewCandidates: ReviewCandidateJournal;
+  private readonly promotions: ManagedDocumentPromotionJournal;
 
   constructor(input: PersistenceInput) {
     this.runtime = asProjectOsPersistence(input);
     this.ledger = new DocumentLedgerRepository(this.runtime);
+    this.reviewCandidates = new ReviewCandidateJournal(this.runtime);
+    this.promotions = new ManagedDocumentPromotionJournal(this.runtime);
   }
 
   status(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
@@ -371,6 +394,211 @@ export class ManagedDocumentService {
     return persistPublished(metadata);
   }
 
+  async promoteReviewCandidate(
+    request: ManagedReviewCandidatePromotionRequest,
+    state: ProjectState
+  ): Promise<ManagedDocumentReceipt> {
+    this.assertMutableProject(request.project_id, state);
+    const logicalPath = assertManagedRelativePath(request.logical_path);
+    const documentId = await documentIdFor(request.project_id, logicalPath);
+    const versionId = await requestVersionIdFor(request.request_id, "published");
+    const existingVersion = await this.ledger.readVersion(request.project_id, documentId, versionId);
+    const existingHead = await this.ledger.readHead(request.project_id, documentId);
+
+    if (existingVersion) {
+      if (
+        existingVersion.stage !== "published"
+        || existingVersion.logical_path !== logicalPath
+        || existingVersion.source_candidate_request_id !== request.candidate_request_id
+      ) {
+        throw new ManagedDocumentConflictError(
+          "PROMOTION_HISTORY_CONFLICT",
+          "Promotion request id is already bound to different immutable document history",
+          documentId
+        );
+      }
+      if (!existingHead) {
+        const evidence = await this.promotions.read(request.project_id, request.request_id);
+        if (!evidence) {
+          throw new ManagedDocumentConflictError(
+            "PROMOTION_HISTORY_INCOMPLETE",
+            "Published version exists without immutable promotion evidence",
+            documentId
+          );
+        }
+        await this.ledger.writeHead(this.publishedHeadFromEvidence(evidence));
+      } else if (existingHead.published_version_id !== versionId) {
+        throw new ManagedDocumentConflictError(
+          "DOCUMENT_ALREADY_EXISTS",
+          "Logical document already has a different managed head",
+          documentId
+        );
+      }
+      return receiptFor(request.request_id, existingVersion);
+    }
+
+    if (state.revision !== request.expected_project_revision) {
+      throw new ManagedDocumentConflictError(
+        "PROJECT_REVISION_CONFLICT",
+        `Project revision changed before review candidate promotion: expected ${request.expected_project_revision}, got ${state.revision}`,
+        documentId
+      );
+    }
+    if (existingHead) {
+      throw new ManagedDocumentConflictError(
+        "DOCUMENT_ALREADY_EXISTS",
+        "Logical document already has a managed head",
+        documentId
+      );
+    }
+
+    const destinationPath = workspaceManagedDocumentPath(state.project_id, state.slug, "deliverables", logicalPath);
+    const terminal = await this.reviewCandidates.terminalByRequestId(request.project_id, request.candidate_request_id);
+    if (!terminal || terminal.receipt.status !== "committed" || !terminal.receipt.final_observation) {
+      throw new ManagedDocumentConflictError(
+        "CANDIDATE_RECEIPT_NOT_COMMITTED",
+        "Promotion requires a committed REVIEW_CANDIDATE receipt with final provider observation",
+        documentId
+      );
+    }
+
+    const candidate = terminal.request;
+    let sourceObservation: Awaited<ReturnType<ReviewCandidateJournal["observation"]>>;
+    try {
+      sourceObservation = await this.reviewCandidates.observation(candidate);
+    } catch (error) {
+      if (error instanceof ReviewCandidateEvidenceChangedError) {
+        throw new ManagedDocumentConflictError("CANDIDATE_EVIDENCE_CHANGED", error.message, documentId);
+      }
+      throw error;
+    }
+    if (!sameReviewObservation(terminal.receipt.final_observation, sourceObservation)) {
+      throw new ManagedDocumentConflictError(
+        "CANDIDATE_EVIDENCE_CHANGED",
+        "Committed review terminal evidence does not match the frozen provider observation",
+        documentId
+      );
+    }
+    const sourceMetadata = metadataFromReviewObservation(sourceObservation);
+    try {
+      await verifyReviewBytesAtPath(this.runtime, candidate, sourceObservation.path);
+    } catch (error) {
+      if (error instanceof ReviewBinaryValidationError) {
+        throw new ManagedDocumentConflictError("CANDIDATE_EVIDENCE_CHANGED", error.message, documentId);
+      }
+      throw error;
+    }
+
+    const immutablePayloadPath = machineDocumentProviderPayloadPath(request.project_id, documentId, versionId);
+    const existingDestination = await this.runtime.objects.getMetadata(destinationPath);
+    if (existingDestination && !samePayload(sourceMetadata, existingDestination)) {
+      throw new ManagedDocumentConflictError(
+        "DELIVERABLE_PATH_COLLISION",
+        `DELIVERABLES target already exists with different content: ${destinationPath}`,
+        documentId
+      );
+    }
+    await this.ledger.snapshotProviderFile(
+      request.project_id,
+      documentId,
+      versionId,
+      sourceObservation.path,
+      sourceMetadata
+    );
+
+    let destinationMetadata: ProviderObjectMetadata;
+    if (existingDestination) {
+      destinationMetadata = existingDestination;
+    } else {
+      try {
+        destinationMetadata = await this.runtime.serverSideCopy.copyObject(sourceObservation.path, destinationPath);
+      } catch (error) {
+        if (!(error instanceof ProviderConflictError)) throw error;
+        const raced = await this.runtime.objects.getMetadata(destinationPath);
+        if (!raced || !samePayload(sourceMetadata, raced)) {
+          throw new ManagedDocumentConflictError(
+            "DELIVERABLE_PATH_COLLISION",
+            `DELIVERABLES target changed concurrently: ${destinationPath}`,
+            documentId
+          );
+        }
+        destinationMetadata = raced;
+      }
+    }
+    if (!samePayload(sourceMetadata, destinationMetadata)) {
+      throw new ManagedDocumentConflictError(
+        "CANDIDATE_EVIDENCE_CHANGED",
+        "Published provider object does not match the verified candidate payload",
+        documentId
+      );
+    }
+
+    const record: DocumentVersionRecord = {
+      schema_version: "1.0",
+      project_id: request.project_id,
+      document_id: documentId,
+      version_id: versionId,
+      kind: "work_product",
+      stage: "published",
+      logical_path: logicalPath,
+      source: "project_os",
+      created_at: request.created_at,
+      immutable_payload_path: immutablePayloadPath,
+      media_type: candidate.media_type,
+      source_candidate_request_id: request.candidate_request_id,
+      ...providerVersionFields(destinationMetadata, destinationPath),
+      request_id: request.request_id
+    };
+    await this.ledger.writeVersion(record);
+
+    const evidence = {
+      schema_version: "1.0" as const,
+      request_id: request.request_id,
+      project_id: request.project_id,
+      candidate_request_id: request.candidate_request_id,
+      document_id: documentId,
+      version_id: versionId,
+      logical_path: logicalPath,
+      destination_path: destinationPath,
+      accepted: true as const,
+      published: true as const,
+      source: providerEvidenceFromMetadata(this.runtime.providerId, sourceMetadata),
+      destination: providerEvidenceFromMetadata(this.runtime.providerId, { ...destinationMetadata, path: destinationPath }),
+      created_at: request.created_at
+    };
+    await this.promotions.write(evidence);
+    await this.ledger.writeHead(this.publishedHeadFromEvidence(evidence));
+    return receiptFor(request.request_id, record);
+  }
+
+  private publishedHeadFromEvidence(evidence: {
+    project_id: string;
+    document_id: string;
+    version_id: string;
+    logical_path: string;
+    destination_path: string;
+    destination: {
+      path: string;
+      object_id: string;
+      revision_token: string;
+      size: number;
+      integrity_hash: { algorithm: string; value: string };
+      provider_id: string;
+    };
+  }): ManagedDocumentHead {
+    const metadata = metadataFromProviderEvidence(evidence.destination);
+    return {
+      schema_version: "1.0",
+      project_id: evidence.project_id,
+      document_id: evidence.document_id,
+      kind: "work_product",
+      logical_path: evidence.logical_path,
+      published_version_id: evidence.version_id,
+      provider: { published: providerObservation(metadata, evidence.destination_path) },
+      reconciliation_status: "clean"
+    };
+  }
+
   async reopenPublished(request: ManagedLifecycleRequest, state: ProjectState): Promise<ManagedDocumentReceipt> {
     this.assertMutableProject(request.project_id, state);
     const versionId = await requestVersionIdFor(request.request_id, "working");
@@ -635,6 +863,66 @@ function providerObservation(metadata: ProviderObjectMetadata, path: string): Ma
   return toManagedProviderObservation({ ...metadata, path });
 }
 
+function metadataFromReviewObservation(observation: {
+  provider_id: string;
+  path: string;
+  object_id: string;
+  revision_token: string;
+  size: number;
+  integrity: { algorithm: string; value: string };
+}): ProviderObjectMetadata {
+  return {
+    path: observation.path,
+    size: observation.size,
+    objectId: observation.object_id,
+    revisionToken: observation.revision_token,
+    integrityHash: observation.integrity
+  };
+}
+
+function sameReviewObservation(
+  left: NonNullable<ArtifactWriteReceipt["final_observation"]>,
+  right: NonNullable<ArtifactWriteReceipt["final_observation"]>
+): boolean {
+  return left.provider_id === right.provider_id
+    && left.path === right.path
+    && left.object_id === right.object_id
+    && left.revision_token === right.revision_token
+    && left.size === right.size
+    && left.integrity.algorithm === right.integrity.algorithm
+    && left.integrity.value === right.integrity.value;
+}
+
+function providerEvidenceFromMetadata(providerId: string, metadata: ProviderObjectMetadata) {
+  if (!metadata.objectId || !metadata.revisionToken || !metadata.integrityHash) {
+    throw new Error(`Complete provider evidence is required for ${metadata.path}`);
+  }
+  return {
+    provider_id: providerId,
+    path: metadata.path,
+    object_id: metadata.objectId,
+    revision_token: metadata.revisionToken,
+    integrity_hash: metadata.integrityHash,
+    size: metadata.size
+  };
+}
+
+function metadataFromProviderEvidence(observation: {
+  path: string;
+  object_id: string;
+  revision_token: string;
+  integrity_hash: { algorithm: string; value: string };
+  size: number;
+}): ProviderObjectMetadata {
+  return {
+    path: observation.path,
+    objectId: observation.object_id,
+    revisionToken: observation.revision_token,
+    integrityHash: observation.integrity_hash,
+    size: observation.size
+  };
+}
+
 function compactProviderState<T extends Record<string, ManagedProviderObservation | undefined>>(state: T): T {
   return Object.fromEntries(Object.entries(state).filter(([, value]) => value !== undefined)) as T;
 }
@@ -651,6 +939,13 @@ function receiptFor(requestId: string, record: DocumentVersionRecord): ManagedDo
     stage: record.stage,
     logical_path: record.logical_path,
     status: "committed",
-    ...(record.provider_rev ? { provider_rev: record.provider_rev } : {})
+    ...(record.provider_rev ? { provider_rev: record.provider_rev } : {}),
+    ...(record.source_candidate_request_id
+      ? {
+          candidate_request_id: record.source_candidate_request_id,
+          accepted: true as const,
+          ...(record.stage === "published" ? { published: true as const } : {})
+        }
+      : {})
   };
 }

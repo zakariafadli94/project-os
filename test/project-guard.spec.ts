@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { evictDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -32,15 +32,22 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   return response.json<Receipt>();
 }
 
-async function materialize(projectId: string): Promise<{ project_id: string; revision: number; materialized: boolean }> {
+async function requestMaterialize(projectId: string): Promise<Response> {
   const stub = testEnv.PROJECT_GUARD.getByName(projectId);
-  const response = await stub.fetch("https://project-guard.internal/materialize", {
+  return stub.fetch("https://project-guard.internal/materialize", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ target: "workspace-v2" })
   });
-  expect(response.status).toBe(200);
-  return response.json();
+}
+
+async function enableRepairMaterialization(projectId: string): Promise<void> {
+  const stub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+  await runInDurableObject(stub, (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
 }
 
 describe("ProjectGuard", () => {
@@ -68,13 +75,16 @@ describe("ProjectGuard", () => {
     expect(dropbox.files.has(`/PROJECT_OS/RECEIPTS/${tx.transaction_id}.json`)).toBe(false);
   });
 
-  it("materializes workspace views without mutating business revision", async () => {
+  it("uses bounded convergence materialization without mutating business revision", async () => {
     const projectId = "PRJ-1098";
     await submit(projectId, createTx(projectId, "TXN-PROJECT-1098-0001"));
+    await enableRepairMaterialization(projectId);
 
-    const result = await materialize(projectId);
-    expect(result).toEqual({ project_id: projectId, revision: 1, materialized: true });
-    expect(dropbox.files.has("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-1098-project-1098/STATE.md")).toBe(true);
+    const response = await requestMaterialize(projectId);
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({
+      project_id: projectId, revision: 1, materialized: false, status: "pending"
+    });
 
     const task = await submit(projectId, {
       schema_version: "1.0",
@@ -88,7 +98,7 @@ describe("ProjectGuard", () => {
     expect(task.new_revision).toBe(2);
   });
 
-  it("normalizes legacy stored state on read without changing revision or inventing deliverable acceptance", async () => {
+  it("blocks legacy direct workspace materialization until convergence activation", async () => {
     const projectId = "PRJ-1097";
     const legacyState = {
       schema_version: "1.0",
@@ -121,14 +131,7 @@ describe("ProjectGuard", () => {
 
     dropbox.files.set(machineStatePath(projectId), `${JSON.stringify(legacyState, null, 2)}\n`);
 
-    const result = await materialize(projectId);
-    expect(result).toEqual({ project_id: projectId, revision: 7, materialized: true });
-
-    const brief = dropbox.files.get("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-1097-legacy-state/BRIEF.md");
-    const deliverable = dropbox.files.get("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-1097-legacy-state/DELIVERABLES/DEL-1097.md");
-    expect(brief).toContain("Scope has not been defined yet.");
-    expect(deliverable).toContain("Status: legacy_completed");
-    expect(deliverable).toContain("Acceptance: not inferred");
+    expect((await requestMaterialize(projectId)).status).toBe(409);
 
     const framing = await submit(projectId, {
       schema_version: "1.0",

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { advanceVerifiedThrough } from "../src/convergence/discovery";
-import { repairDerivative } from "../src/convergence/derivatives";
+import { inspectDerivativeRepair, repairDerivative } from "../src/convergence/derivatives";
 import { createSliceBudget } from "../src/convergence/budget";
 import { FencedEffects } from "../src/convergence/fenced-effects";
 import { ConvergenceJournal, initialProgress } from "../src/convergence/journal";
@@ -28,13 +28,11 @@ describe("canonical derivative convergence", () => {
     let token = await journal.save(progress, null);
     const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
     const effects = new FencedEffects(runtime, journal, budget);
-    token = await effects.prepare(progress, token, {
-      id: "state:1", path: `/PROJECT_OS/.project-os/projects/${record.project_id}/state.json`, destination: null,
-      kind: "create", object_id: null, expected_token: null, desired_hash: null,
-      authorized_previous_hash: null, state: "prepared", verified_token: null
-    });
+    const inspection = await inspectDerivativeRepair("state", record, effects, repository);
+    if (!inspection.intent) throw new Error("missing repair intent");
+    token = await effects.prepare(progress, token, inspection.intent);
 
-    const health = await repairDerivative("state", record, progress, effects, repository);
+    const health = await repairDerivative("state", record, effects, repository, inspection.intent);
     expect(health.state).toBe("current");
     expect(mock.files.get(`/PROJECT_OS/.project-os/projects/${record.project_id}/state.json`)).toBe(
       repository.canonicalDerivativeText("state", record)

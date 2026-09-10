@@ -30,6 +30,26 @@ describe("managed document API request", () => {
     expect(parseManagedDocumentRequest(request)).toMatchObject({ operation: request.operation, project_id });
   });
 
+  it("parses only an explicitly accepted review candidate promotion", () => {
+    const request = {
+      operation: "review_candidate.promote",
+      request_id: "DOCREQ-CANDIDATE-000001",
+      project_id,
+      candidate_request_id: "ART-REVIEW-CANDIDATE-0001",
+      logical_path: "reports/final-report.pdf",
+      expected_project_revision: 149,
+      accepted: true,
+      created_at
+    };
+
+    expect(parseManagedDocumentRequest(request)).toMatchObject(request);
+    expect(() => parseManagedDocumentRequest({ ...request, accepted: false })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, logical_path: "../STATE.md" })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, candidate_request_id: "DOCREQ-NOT-A-CANDIDATE" })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, expected_project_revision: 149.5 })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, unexpected: true })).toThrow();
+  });
+
   it("rejects unknown fields and unsafe logical/reference paths", () => {
     expect(() => parseManagedDocumentRequest({
       operation: "working.write", request_id: "DOCREQ-WORK-000009", project_id,

@@ -34,7 +34,7 @@ validate/apply transaction
   -> advance materialization head
 ```
 
-If immediate scheduling fails after the commit record exists, the commit remains valid. The ProjectGuard alarm and the five-minute fleet reconciliation cron can reconstruct the pending target later.
+If immediate scheduling fails after the commit record exists, the commit remains valid. The MaterializationGuard alarm and the five-minute fleet reconciliation cron can reconstruct the pending target later.
 
 `project.create` keeps its existing RegistryGuard receipt ownership: ProjectGuard does not race the standalone create receipt before registry finalization.
 
@@ -67,9 +67,7 @@ Materialization identity contains both:
 - canonical business revision;
 - projection version.
 
-The current projection version begins at `1`.
-
-A renderer/projection change can bump the projection version and rematerialize the current canonical revision without creating a domain event or fake business revision.
+The active projection version is `3`. Earlier projection versions remain readable as immutable historical evidence; a renderer/projection change can bump the version and rematerialize the current canonical revision without creating a domain event or fake business revision.
 
 ## `input_hash` versus `content_hash`
 
@@ -133,7 +131,7 @@ Provider concurrency is bounded by `PROJECT_OS_PROJECTION_CONCURRENCY`; accepted
 
 ## Hot SQLite ledger
 
-ProjectGuard SQLite tracks operational projection progress such as:
+MaterializationGuard SQLite tracks operational projection progress such as:
 
 - latest local completed head;
 - requested target;
@@ -174,7 +172,7 @@ An already active target is not preempted mid-write. Newer work is queued for th
 
 ## Alarm retry and reconciliation
 
-A committed target requests a ProjectGuard alarm.
+A committed target requests a MaterializationGuard alarm.
 
 Transient technical materialization failures:
 
@@ -191,6 +189,12 @@ The five-minute scheduled Worker maintenance performs both:
 - materialization reconciliation across registry projects.
 
 Fleet reconciliation uses at most four projects concurrently and isolates one project's failure from the rest.
+
+### Repair-writer admission backpressure
+
+`PROJECT_OS_CONVERGENCE_PROJECT_MODES` defaults every project to `off`. Only an explicitly configured `repair` project makes ProjectGuard query its named MaterializationGuard before appending a new canonical commit. The internal, read-only probe fails closed with HTTP 503 `convergence_capacity_exceeded` if durable continuation is absent while work is pending, if the queue exceeds the qualified 200-output envelope, or if the oldest pending work exceeds 600 seconds. Existing durable repairs do not pass through this admission path and remain eligible to drain the queue.
+
+This is a code-level guard, not a production activation: the notification-ACK, compatible-stable, recovery, and isolated-canary evidence remains required before any project mode changes.
 
 ## Archive flow
 
@@ -254,6 +258,34 @@ final_state
 No Markdown body, secret, Dropbox token or artifact content is logged.
 
 These signals are the foundation for later `IMP-OBSERVE001` and `IMP-PERF001`; `IMP-MATERIAL001` does not add a metrics backend or final performance SLOs.
+
+### Convergence incidents and monitoring acknowledgement
+
+An exhausted, blocked, or over-600-second convergence obligation creates an immutable incident under its project convergence root before any monitoring request. Notification delivery is separately reserved with a deterministic id; a lost response is retried with that same id and cannot erase the incident.
+
+The optional runtime adapter uses `PROJECT_OS_MONITORING_WEBHOOK_URL` and the secret `PROJECT_OS_MONITORING_WEBHOOK_TOKEN`. The endpoint must be HTTPS and return the explicit JSON acknowledgement for the submitted id. Missing configuration, a non-2xx response, malformed JSON, or a mismatched acknowledgement leaves delivery pending and schedules the durable retry. Console output alone is never an acknowledgement or a rollout proof.
+
+Enabling these variables in a deployed environment remains a separate production action. A real endpoint ACK and its monitored recovery exercise are required before `notification_ack_proven` can be marked true.
+
+### Deferred human-alert policy (2026-09-10)
+
+Human-facing delivery is deliberately inactive. Missing monitoring configuration therefore leaves the immutable incident, notification reservation, retry state, and payload-free runtime metrics intact; it neither creates an acknowledgement nor changes repair behavior. A rollout review may explicitly use the `deferred` human-alert policy, under which the still-false `notification_ack_proven` field alone is non-blocking. The original `required` policy remains the default, and this exception does not waive reader, writer, fencing, transport, capacity, recovery, compatibility, or canary evidence.
+
+### Convergence metric envelope
+
+Each repair slice additionally emits a fixed, payload-free metric envelope to the Worker’s structured runtime logs. Counters are `commit_observed`, `obligations_verified`, `retries`, `exhaustions`, `layer_conflicts`, `handoff_failures`, `freshness_rejections`, and `conditional_write_conflicts`; histograms are `commit_to_layer_verified` when a trustworthy publication clock exists and `tranche_duration`; gauges cover revision lag, oldest pending age, queue depth, missing alarms, fleet success age, and audit-cursor age when those owners have supplied a timestamp.
+
+The sole fields are the authenticated project/revision/layer/projection identifiers, attempt and next-wake metadata, deployment SHA, consumed provider calls, and correlation ID. The emitter accepts neither errors, requests, provider responses, Markdown, nor business payloads, so those values cannot be included accidentally. Worker logs can be exported to a monitoring system, but remain distinct from the HTTPS acknowledgement channel above.
+
+## 2026-09-09 local qualification boundary
+
+The permanent-convergence implementation at `00250b623ee88bdcbed71252223b4adaee179c17` passed the local 193-file / 935-test suite, including the 26-file / 148-test persistence high-risk gate. The same SHA passed the synthetic revision-258/capacity selection and a 1,673.38 KiB (282.11 KiB gzip) direct Wrangler dry-run that exited before upload. This proves bounded continuation, replay, critical-pair fencing, durable incident delivery state, read-only observation, and synthetic capacity behavior in the test runtime. It does not make a production projection current by itself: the isolated 24-hour canary, real provider latency measurements, monitoring ACK exercise, and authorised activation remain separate gates. No canonical Dropbox materialization or PRJ-0003 repair was performed during this qualification.
+
+The follow-up regression on `3bbf7d2102dffeca834368cc8c5336840a2f8fda` exhausts all six durable retries of the revision-258 synthetic critical pair. It proves that the revision-257 head and receipt survive the outage, the durable incident is opened, and a later scheduled recovery alone advances the verified pair and head to 258 without creating revision 259. The local full suite passed 193 files / 936 tests; this remains a fictitious `PRJ-9258` proof, never a mutation of PRJ-0003.
+
+The final local code gate at `b7bca495c4805256db49b8db937d4b4ffc133176` adds the explicit repair-writer capacity refusal and the synthetic 263→264 intermediate-derivative regression. It passed 201 files / 971 tests and a direct bundle-only Wrangler dry-run. The capacity probe is internal and read-only; no project mode or external state changed. The result is not a canary, monitoring-ACK, or production-repair proof.
+
+The follow-up implementation SHA `d63578252e7d64329540ce001ad0dc908d906454` keeps the monitoring receiver within its five-second bound even when its HTTP response arrives but its acknowledgement body stalls. The test was red before the fix and the full local suite then passed 201 files / 972 tests, with the same 26-file / 148-test persistence gate and a bundle-only Wrangler dry-run. No monitoring endpoint was configured or acknowledged in production.
 
 ## User experience
 

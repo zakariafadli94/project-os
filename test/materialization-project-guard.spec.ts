@@ -161,7 +161,7 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(receipt.status).toBe("committed");
     expect(receipt.new_revision).toBe(2);
 
-    expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
+    await materializeThroughContinuations(projectId);
     expect(JSON.parse(dropbox.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
     expect(dropbox.files.has(machineCommitRecordPath(projectId, 2))).toBe(true);
     expect(dropbox.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
@@ -192,7 +192,7 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(after.output_count).toBeGreaterThan(0);
   });
 
-  it("keeps the existing synchronous /materialize admin compatibility route", async () => {
+  it("fails closed when the V2 admin writer is not activated", async () => {
     const projectId = "PRJ-3604";
     const slug = "sync-materialize";
     await submit(projectId, createTx(projectId, slug, "TXN-MATERIAL-PG-3604-CREATE"));
@@ -205,9 +205,11 @@ describe("ProjectGuard asynchronous materialization", () => {
         body: JSON.stringify({ target: "workspace-v2" })
       }
     );
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ project_id: projectId, revision: 1, materialized: true });
-    expect(JSON.parse(dropbox.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: "convergence_writer_inactive", project_id: projectId, mode: "off"
+    });
+    expect(dropbox.files.has(machineMaterializationHeadPath(projectId))).toBe(false);
   });
 
   it("reconcile-materialization requeues current canonical state without changing the business revision", async () => {

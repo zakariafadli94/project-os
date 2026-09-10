@@ -159,6 +159,10 @@ export function machineConvergenceRoot(projectId: string): string {
   return `${machineProjectRoot(projectId)}/convergence`;
 }
 
+export function machineFleetCursorPath(): string {
+  return `${MACHINE_ROOT}/convergence/fleet.json`;
+}
+
 export function convergenceProgressPath(projectId: string): string {
   return `${machineConvergenceRoot(projectId)}/progress.json`;
 }
@@ -169,6 +173,19 @@ export function convergenceAttemptPath(projectId: string, obligationId: string, 
     throw new Error(`Invalid convergence attempt number: ${attemptNumber}`);
   }
   return `${machineConvergenceRoot(projectId)}/attempts/${obligationId}/ATTEMPT-${attemptNumber.toString().padStart(6, "0")}.json`;
+}
+
+export function convergenceIncidentPath(projectId: string, incidentId: string): string {
+  if (!/^inc-[a-f0-9]{64}$/.test(incidentId)) throw new Error(`Unsafe convergence incident id: ${incidentId}`);
+  return `${machineConvergenceRoot(projectId)}/incidents/${incidentId}.json`;
+}
+
+export function convergenceNotificationAttemptPath(projectId: string, incidentId: string, attemptNumber: number): string {
+  if (!/^inc-[a-f0-9]{64}$/.test(incidentId)) throw new Error(`Unsafe convergence incident id: ${incidentId}`);
+  if (!Number.isSafeInteger(attemptNumber) || attemptNumber < 1) {
+    throw new Error(`Invalid convergence notification attempt: ${attemptNumber}`);
+  }
+  return `${machineConvergenceRoot(projectId)}/notifications/${incidentId}/ATTEMPT-${attemptNumber.toString().padStart(6, "0")}.json`;
 }
 
 export function machineDocumentRoot(projectId: string): string {
@@ -189,6 +206,11 @@ export function machineDocumentTextPayloadPath(projectId: string, sha256: string
 
 export function machineDocumentProviderPayloadPath(projectId: string, documentId: string, versionId: string): string {
   return `${machineDocumentRoot(projectId)}/payloads/provider/${assertSafeDocumentId(documentId)}/${assertSafeDocumentVersionId(versionId)}/payload`;
+}
+
+export function machineDocumentPromotionPath(projectId: string, requestId: string): string {
+  if (!/^DOCREQ-[A-Z0-9-]{8,}$/.test(requestId)) throw new Error(`Unsafe managed document request id: ${requestId}`);
+  return `${machineDocumentRoot(projectId)}/promotions/${requestId}.json`;
 }
 
 export function machineInputIntakePath(projectId: string, intakeId: string): string {
@@ -296,11 +318,14 @@ export const v2Paths = {
   machineConvergenceRoot,
   convergenceProgressPath,
   convergenceAttemptPath,
+  convergenceIncidentPath,
+  convergenceNotificationAttemptPath,
   machineDocumentRoot,
   machineDocumentHeadPath,
   machineDocumentVersionPath,
   machineDocumentTextPayloadPath,
   machineDocumentProviderPayloadPath,
+  machineDocumentPromotionPath,
   machineInputIntakePath,
   machineInputIntakeSourceBindingPath,
   machineMutationGateRoot,

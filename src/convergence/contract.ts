@@ -55,6 +55,24 @@ export interface Target {
   projection_version: number;
 }
 
+export interface Obligation {
+  id: string;
+  layer: Layer;
+  from_revision: number;
+  target: Target;
+  incident: number;
+  state: ObligationState;
+  first_pending_at: string;
+  next_attempt_at: string | null;
+  failure_count: number;
+  last_attempt_number: number;
+  last_closed_attempt_number: number;
+  last_verified_at: string | null;
+  code: string | null;
+  lease_until: string | null;
+  continuation: string | null;
+}
+
 export interface AttemptReservation {
   schema_version: "1.0";
   project_id: string;
@@ -82,6 +100,18 @@ export interface EffectIntent {
   verified_token: string | null;
 }
 
+/** Durable delivery and resolution state for an immutable convergence incident. */
+export interface AlertProgress {
+  incident: number;
+  layers: Layer[];
+  created_at: string;
+  notification_pending: boolean;
+  delivered_at: string | null;
+  resolved_at: string | null;
+  next_attempt_at: string | null;
+  failure_count: number;
+}
+
 export interface Progress {
   schema_version: "1.0";
   project_id: string;
@@ -97,13 +127,13 @@ export interface Progress {
   active: Target | null;
   requested: Target | null;
   parked: Target[];
-  obligations: Record<string, unknown>;
+  obligations: Record<string, Obligation>;
   effects: Record<string, EffectIntent>;
   partial_outputs: Record<string, unknown>;
   cursors: Record<string, string | null>;
   last_queue: "machine" | "human";
   next_alarm_at: string | null;
-  alerts: Record<string, unknown>;
+  alerts: Record<string, AlertProgress>;
   first_observed_at: string;
   commit_accepted_at: string | null;
   last_error_code: string | null;

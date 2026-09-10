@@ -3,6 +3,7 @@ import {
   archiveProjectRoot,
   machineCommitRecordPath,
   machineDocumentHeadPath,
+  machineDocumentPromotionPath,
   machineDocumentProviderPayloadPath,
   machineDocumentTextPayloadPath,
   machineDocumentVersionPath,
@@ -68,6 +69,8 @@ it("builds project-isolated hidden document ledger paths", () => {
     .toBe(`/PROJECT_OS/.project-os/projects/PRJ-0002/documents/payloads/sha256/${hash}`);
   expect(machineDocumentProviderPayloadPath("PRJ-0002", documentId, versionId))
     .toBe(`/PROJECT_OS/.project-os/projects/PRJ-0002/documents/payloads/provider/${documentId}/${versionId}/payload`);
+  expect(machineDocumentPromotionPath("PRJ-0002", "DOCREQ-CANDIDATE-000001"))
+    .toBe("/PROJECT_OS/.project-os/projects/PRJ-0002/documents/promotions/DOCREQ-CANDIDATE-000001.json");
 });
 
 it("builds project-isolated mutation-gate paths", () => {
@@ -95,6 +98,7 @@ it("rejects unsafe managed document path components", () => {
   expect(() => machineDocumentHeadPath("PRJ-0002", "DOC-bad")).toThrow();
   expect(() => machineDocumentVersionPath("PRJ-0002", "DOC-0123456789ABCDEF01234567", "VER-bad")).toThrow();
   expect(() => machineDocumentTextPayloadPath("PRJ-0002", "abc")).toThrow();
+  expect(() => machineDocumentPromotionPath("PRJ-0002", "DOCREQ-bad")).toThrow();
 });
 
 it("rejects unsafe mutation-gate path components", () => {

@@ -1,4 +1,6 @@
-export const candidate = {
+import type { ReviewCandidateRequest } from "../../src/domain/artifact-write";
+
+export const candidate: ReviewCandidateRequest = {
   request_id: "ART-REVIEW-CANDIDATE-0001", project_id: "PRJ-0002",
   operation: "REVIEW_CANDIDATE", base_revision: 149,
   relative_path: "example.pdf", media_type: "application/pdf",

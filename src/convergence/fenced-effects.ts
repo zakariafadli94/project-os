@@ -110,7 +110,7 @@ export class FencedEffects {
       !current
       || current.token !== prepared.token
       || current.progress.incarnation !== prepared.incarnation
-      || current.progress.effects[intent.id]?.state !== "prepared"
+      || !sameIntent(current.progress.effects[intent.id], intent)
     ) {
       throw new Error("fencing_checkpoint_changed");
     }
@@ -119,4 +119,18 @@ export class FencedEffects {
   private requireEffectBudget(): void {
     if (!this.budget.canStartEffect(1)) throw new Error("slice_budget_exhausted");
   }
+}
+
+function sameIntent(left: EffectIntent | undefined, right: EffectIntent): boolean {
+  return left !== undefined
+    && left.id === right.id
+    && left.path === right.path
+    && left.destination === right.destination
+    && left.kind === right.kind
+    && left.object_id === right.object_id
+    && left.expected_token === right.expected_token
+    && left.desired_hash === right.desired_hash
+    && left.authorized_previous_hash === right.authorized_previous_hash
+    && left.state === right.state
+    && left.verified_token === right.verified_token;
 }

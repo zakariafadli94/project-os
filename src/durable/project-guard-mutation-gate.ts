@@ -15,6 +15,8 @@ import {
 } from "../persistence/layout";
 import { ProviderOperationError } from "../persistence/provider/errors";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
+import { AdmissionError, type MutationContext } from "../admission/mutation-context";
+import { decodeAdmission, encodeAdmission } from "../admission/transport";
 import {
   MutationCandidateResolutionService,
   type CandidateResolutionDownstreamReceipt
@@ -141,9 +143,13 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
 
   private async handleCandidateResolution(request: Request): Promise<Response> {
     let resolution;
+    let mutationContext: MutationContext | null;
     try {
-      resolution = parseMutationCandidateResolutionRequest(await request.json());
+      const admission = decodeAdmission(await request.json(), parseMutationCandidateResolutionRequest);
+      resolution = admission.request;
+      mutationContext = admission.mutation_context;
     } catch (error) {
+      if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
       return Response.json({
         error: "invalid_mutation_candidate_resolution",
         message: error instanceof Error ? error.message : "Invalid mutation candidate resolution request"
@@ -168,17 +174,22 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
     }
 
     try {
+      const replay = await this.resolutionService.replay(resolution);
+      if (replay) return Response.json(replay);
+
       const state = await this.loadResolutionState();
       if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+      await this.verifyEffectAdmission(mutationContext, resolution.project_id, state);
 
       const receipt = await this.resolutionService.resolve(resolution, state, {
         artifact: (adoption, currentState, candidatePath) =>
           this.executeArtifactAdoption(adoption, currentState, candidatePath),
         working: (adoption, currentState) =>
-          this.executeWorkingAdoption(adoption, currentState)
+          this.executeWorkingAdoption(adoption, currentState, mutationContext)
       });
       return Response.json(receipt);
     } catch (error) {
+      if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
       if (error instanceof ProviderOperationError && error.retryable) {
         return providerUnavailableResponse(error);
       }
@@ -224,12 +235,13 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
 
   private async executeWorkingAdoption(
     adoption: MutationCandidateAdoptWorkingRequest,
-    _state: ProjectState
+    _state: ProjectState,
+    mutationContext: MutationContext | null
   ): Promise<CandidateResolutionDownstreamReceipt> {
     const response = await super.fetch(new Request("https://project-guard.internal/document", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(adoption.document_request)
+      body: JSON.stringify(encodeAdmission(adoption.document_request, mutationContext))
     }));
     if (!response.ok) {
       return {

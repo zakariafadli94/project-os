@@ -25,10 +25,23 @@ import { createProductionPersistence } from "./persistence/production-factory";
 import { parseSearchQuery, type SearchFreshness, type SearchIndexProjectStatus } from "./search/contract";
 import { searchSyncEnabled } from "./search/sync-mode";
 import { verifyDropboxSignature } from "./webhook/dropbox";
+import { AdmissionError, type MutationContext, type MutationContextResponse } from "./admission/mutation-context";
+import { decodeAdmission } from "./admission/transport";
+import { renderState } from "./render/state";
+import { renderHandoff } from "./render/handoff";
 
 export { ProjectGuard } from "./durable/project-guard";
 export { RegistryGuard } from "./durable/registry-guard";
 export { inboxPath, artifactInboxPath } from "./inbox/processor";
+
+export function runScheduledMaintenance<TInbox, TMaterialization, TDocuments, TSearch>(jobs: {
+  inbox: () => Promise<TInbox>;
+  materialization: () => Promise<TMaterialization>;
+  documents: () => Promise<TDocuments>;
+  search: () => Promise<TSearch>;
+}): Promise<[TInbox, TMaterialization, TDocuments, TSearch]> {
+  return Promise.all([jobs.inbox(), jobs.materialization(), jobs.documents(), jobs.search()]);
+}
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -116,25 +129,61 @@ const worker = {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 
       let transaction: Transaction;
+      let mutationContext: MutationContext | null;
       try {
-        transaction = parseTransaction(await request.json());
+        const admission = decodeAdmission(await request.json(), parseTransaction);
+        transaction = admission.request;
+        mutationContext = admission.mutation_context;
       } catch (error) {
+        if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
         return Response.json({
           error: "invalid_transaction",
           message: error instanceof Error ? error.message : "Invalid transaction"
         }, { status: 400 });
       }
 
-      return Response.json(await executeTransactionWithContinuity(env, transaction));
+      try {
+        return Response.json(await executeTransactionWithContinuity(env, transaction, undefined, mutationContext));
+      } catch (error) {
+        if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+        throw error;
+      }
+    }
+
+    const mutationContextMatch = url.pathname.match(/^\/v1\/projects\/(PRJ-[0-9]{4,})\/mutation-context$/);
+    if (request.method === "GET" && mutationContextMatch) {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const projectId = mutationContextMatch[1];
+      const response = await env.PROJECT_GUARD.getByName(projectId).fetch(
+        "https://project-guard.internal/mutation-context"
+      );
+      if (!response.ok) {
+        const error: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+        return Response.json({ error: error.error ?? "canonical_unavailable" }, { status: response.status });
+      }
+      const canonical = await response.json<Pick<MutationContextResponse, "context" | "canonical_state">>();
+      return Response.json({
+        ...canonical,
+        views: {
+          state: renderState(canonical.canonical_state),
+          handoff: renderHandoff(canonical.canonical_state),
+          status: "unknown",
+          verified_at: null
+        }
+      });
     }
 
     if (request.method === "POST" && url.pathname === "/v1/artifacts") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 
       let artifact: ArtifactWriteRequest;
+      let mutationContext: MutationContext | null;
       try {
-        artifact = parseArtifactWriteRequest(await request.json());
+        const admission = decodeAdmission(await request.json(), parseArtifactWriteRequest);
+        artifact = admission.request;
+        mutationContext = admission.mutation_context;
       } catch (error) {
+        if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
         return Response.json({
           error: "invalid_artifact_request",
           message: error instanceof Error ? error.message : "Invalid artifact request"
@@ -146,23 +195,37 @@ const worker = {
         return Response.json({ error: policyViolation.code, message: policyViolation.message }, { status: 409 });
       }
 
-      return Response.json(await routeArtifact(env, artifact));
+      try {
+        return Response.json(await routeArtifact(env, artifact, mutationContext));
+      } catch (error) {
+        if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+        throw error;
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/v1/documents") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 
       let document: ManagedDocumentRequest;
+      let mutationContext: MutationContext | null;
       try {
-        document = parseManagedDocumentRequest(await request.json());
+        const admission = decodeAdmission(await request.json(), parseManagedDocumentRequest);
+        document = admission.request;
+        mutationContext = admission.mutation_context;
       } catch (error) {
+        if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
         return Response.json({
           error: "invalid_document_request",
           message: error instanceof Error ? error.message : "Invalid managed document request"
         }, { status: 400 });
       }
 
-      return Response.json(await routeManagedDocument(env, document));
+      try {
+        return Response.json(await routeManagedDocument(env, document, mutationContext));
+      } catch (error) {
+        if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+        throw error;
+      }
     }
 
     return Response.json({ error: "not_found" }, { status: 404 });
@@ -177,12 +240,12 @@ const worker = {
       artifact_inbox: artifactInboxPath(mode)
     });
     ctx.waitUntil(
-      Promise.all([
-        processInbox(env),
-        reconcileMaterializations(env),
-        reconcileManagedDocuments(env),
-        reconcileSearchIndexes(env, controller.scheduledTime)
-      ])
+      runScheduledMaintenance({
+        inbox: () => processInbox(env),
+        materialization: () => reconcileMaterializations(env),
+        documents: () => reconcileManagedDocuments(env),
+        search: () => reconcileSearchIndexes(env, controller.scheduledTime)
+      })
         .then(([inbox, materialization, documents, search]) => {
           console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents, search });
         })
@@ -412,7 +475,7 @@ async function materializeExistingProjects(request: Request, env: Env): Promise<
   const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
   const byId = new Map(registry.projects.map((project) => [project.project_id, project]));
   const persistence = createProductionPersistence(env);
-  const results: Array<{ project_id: string; status: "materialized"; revision: number }> = [];
+  const results: Array<{ project_id: string; status: "materialized" | "pending"; revision: number }> = [];
 
   for (const projectId of projectIds) {
     const project = byId.get(projectId);
@@ -426,8 +489,17 @@ async function materializeExistingProjects(request: Request, env: Env): Promise<
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ target: "workspace-v2" })
     });
-    if (!response.ok) {
+    if (response.status === 409) {
+      const blocked = await response.json<unknown>();
+      return Response.json({ error: "materialization_blocked", project_id: projectId, detail: blocked }, { status: 409 });
+    }
+    if (!response.ok && response.status !== 202) {
       return Response.json({ error: "materialization_failed", project_id: projectId, status: response.status }, { status: 502 });
+    }
+    if (response.status === 202) {
+      const pending = await response.json<{ revision: number }>();
+      results.push({ project_id: projectId, status: "pending", revision: pending.revision });
+      continue;
     }
     const materialized = await response.json<{ revision: number; materialized: boolean }>();
     if (!materialized.materialized) {
@@ -499,19 +571,21 @@ async function migrateLegacyLedger(env: Env): Promise<{ transactions: number; re
 export async function executeTransactionWithContinuity(
   env: Env,
   transaction: Transaction,
-  candidate?: TransactionExecutor
+  candidate?: TransactionExecutor,
+  context: MutationContext | null = null
 ): Promise<Receipt> {
   const status = continuityStatus(env.PROJECT_OS_CONTINUITY_MODE);
   const execution = await executeWithRollback({
     selectedPath: status.effective_path,
     transaction,
-    stable: (tx) => routeStableTransaction(env, tx),
+    context,
+    stable: (tx) => routeStableTransaction(env, tx, context),
     candidate
   });
   return execution.receipt;
 }
 
-async function routeStableTransaction(env: Env, transaction: Transaction): Promise<Receipt> {
+async function routeStableTransaction(env: Env, transaction: Transaction, context: MutationContext | null): Promise<Receipt> {
   if (transaction.operation === "project.create") {
     const stub = env.REGISTRY_GUARD.getByName("global");
     const response = await stub.fetch("https://registry-guard.internal/create", {
@@ -531,34 +605,48 @@ async function routeStableTransaction(env: Env, transaction: Transaction): Promi
   const response = await stub.fetch("https://project-guard.internal/transaction", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(transaction)
+    body: JSON.stringify({ admission_version: "1.0", request: transaction, mutation_context: context })
   });
-  if (!response.ok) throw new Error(`ProjectGuard returned ${response.status}`);
+  if (!response.ok) {
+    const body: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+    if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
+      throw new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"]);
+    }
+    throw new Error(`ProjectGuard returned ${response.status}`);
+  }
   return response.json<Receipt>();
 }
 
-async function routeArtifact(env: Env, artifact: ArtifactWriteRequest): Promise<ArtifactWriteReceipt> {
+async function routeArtifact(env: Env, artifact: ArtifactWriteRequest, context: MutationContext | null = null): Promise<ArtifactWriteReceipt> {
   const violation = binaryArtifactPolicyViolation(env, artifact);
   if (violation && !isReviewCandidate(artifact)) return {request_id:artifact.request_id,project_id:artifact.project_id,relative_path:artifact.relative_path,content_sha256:artifact.content_sha256,status:"rejected",code:violation.code,message:violation.message};
   const stub = env.PROJECT_GUARD.getByName(artifact.project_id);
   const response = await stub.fetch("https://project-guard.internal/artifact", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(artifact)
+    body: JSON.stringify({ admission_version: "1.0", request: artifact, mutation_context: context })
   });
-  if (!response.ok) throw new Error(`ProjectGuard artifact route returned ${response.status}`);
+  if (!response.ok) throw await projectGuardRouteError(response, "artifact");
   return response.json<ArtifactWriteReceipt>();
 }
 
-async function routeManagedDocument(env: Env, document: ManagedDocumentRequest): Promise<unknown> {
+async function routeManagedDocument(env: Env, document: ManagedDocumentRequest, context: MutationContext | null = null): Promise<unknown> {
   const stub = env.PROJECT_GUARD.getByName(document.project_id);
   const response = await stub.fetch("https://project-guard.internal/document", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(document)
+    body: JSON.stringify({ admission_version: "1.0", request: document, mutation_context: context })
   });
-  if (!response.ok) throw new Error(`ProjectGuard document route returned ${response.status}`);
+  if (!response.ok) throw await projectGuardRouteError(response, "document");
   return response.json();
+}
+
+async function projectGuardRouteError(response: Response, route: string): Promise<Error> {
+  const body: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+  if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
+    return new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"]);
+  }
+  return new Error(`ProjectGuard ${route} route returned ${response.status}`);
 }
 
 async function processInbox(env: Env): Promise<InboxProcessSummary> {
@@ -567,12 +655,12 @@ async function processInbox(env: Env): Promise<InboxProcessSummary> {
   const transactionSummary = await processTransactionInbox(
     persistence.objects,
     mode,
-    (transaction) => executeTransactionWithContinuity(env, transaction)
+    (transaction, context) => executeTransactionWithContinuity(env, transaction, undefined, context)
   );
   const artifactSummary = await processArtifactInbox(
     persistence.objects,
     mode,
-    (artifact) => routeArtifact(env, artifact),
+    (artifact, context) => routeArtifact(env, artifact, context),
     { maxScanEntries: ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION, maxWorkItems: ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION, respectRetryBackoff: true, rotateScan: true }
   );
   return {
@@ -603,17 +691,8 @@ export async function reconcileMaterializations(env: Env): Promise<Materializati
       if (index >= registry.projects.length) return;
       const project = registry.projects[index];
       try {
-        const stub = env.MATERIALIZATION_GUARD.getByName(project.project_id);
-        const response = await stub.fetch("https://materialization-guard.internal/reconcile", {
-          method: "POST"
-        });
-        if (!response.ok) throw new Error(`MaterializationGuard returned ${response.status}`);
-        const status = await response.json<MaterializationStatusResponse>();
-        const headCurrent = status.materialized_head !== null
-          && status.materialized_head.revision === status.canonical_revision
-          && status.materialized_head.projection_version === status.projection_version;
-        const workPending = status.requested !== null || status.active !== null || !headCurrent;
-        if (workPending) summary.scheduled += 1;
+        const outcome = await reconcileMaterializationProject(env, project.project_id);
+        if (outcome === "scheduled") summary.scheduled += 1;
         else summary.current += 1;
       } catch (error) {
         summary.failed += 1;
@@ -627,6 +706,20 @@ export async function reconcileMaterializations(env: Env): Promise<Materializati
 
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return summary;
+}
+
+export async function reconcileMaterializationProject(
+  env: Env,
+  projectId: string
+): Promise<"scheduled" | "current"> {
+  const stub = env.MATERIALIZATION_GUARD.getByName(projectId);
+  const response = await stub.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+  if (!response.ok) throw new Error(`MaterializationGuard returned ${response.status}`);
+  const status = await response.json<MaterializationStatusResponse>();
+  const headCurrent = status.materialized_head !== null
+    && status.materialized_head.revision === status.canonical_revision
+    && status.materialized_head.projection_version === status.projection_version;
+  return status.requested !== null || status.active !== null || !headCurrent ? "scheduled" : "current";
 }
 
 export async function reconcileSearchIndexes(

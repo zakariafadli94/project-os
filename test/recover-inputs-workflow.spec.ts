@@ -1,4 +1,3 @@
-/// <reference types="vite/client" />
 import workflowText from "../.github/workflows/recover-inputs.yml?raw";
 import { describe, expect, it } from "vitest";
 

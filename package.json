@@ -20,10 +20,16 @@
     "check:persistence-boundary": "node scripts/check-persistence-boundary.mjs",
     "check:production-promotion-authority": "node scripts/check-production-promotion-authority.mjs",
     "check:mutation-gate-repair-workflow": "node scripts/check-mutation-gate-repair-workflow.mjs",
+    "check:control-tower-deployment": "node scripts/check-control-tower-deployment.mjs",
+    "operator:submit": "node scripts/control-tower-operator.mjs",
     "check": "npm run types && npm run typecheck && npm run check:persistence-boundary && npm run check:production-promotion-authority && npm run check:mutation-gate-repair-workflow && npm run check:index001-remediation && npm run check:binary-artifact-ingress && npm run check:recover-inputs-workflow && npm run check:fallback-ingress-boundaries && npm run test:search-sync-off && npm test",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
+    "@cloudflare/workers-oauth-provider": "0.10.3",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "0.22.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

@@ -197,6 +197,10 @@ export class ProjectGuard extends DurableObject<Env> {
       return this.serialize(() => this.handleMutationContextRead());
     }
 
+    if (request.method === "GET" && pathname === "/receipt") {
+      return this.serialize(() => this.handleReceiptRead(new URL(request.url)));
+    }
+
     if (request.method !== "POST" || pathname !== "/transaction") {
       return Response.json({ error: "not_found" }, { status: 404 });
     }
@@ -897,6 +901,23 @@ export class ProjectGuard extends DurableObject<Env> {
       "SELECT request_json, receipt_json FROM document_requests WHERE request_id = ?",
       requestId
     ).toArray()[0] ?? null;
+  }
+
+  private async handleReceiptRead(url: URL): Promise<Response> {
+    const requestId = url.searchParams.get("request_id");
+    const kind = url.searchParams.get("kind");
+    if (!requestId || !["transaction", "document", "artifact"].includes(kind ?? "")) {
+      return Response.json({ error: "invalid_receipt_query" }, { status: 400 });
+    }
+    const row = kind === "transaction"
+      ? this.findReceipt(requestId)
+      : kind === "document"
+        ? this.findDocumentRequest(requestId)
+        : this.findArtifact(requestId);
+    const receipt = row && typeof row === "object" && "receipt_json" in row
+      ? JSON.parse(row.receipt_json)
+      : row;
+    return receipt ? Response.json(receipt) : Response.json({ error: "receipt_not_found" }, { status: 404 });
   }
 
   private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<void> {

@@ -34,6 +34,9 @@ export { ProjectGuard } from "./durable/project-guard";
 export { RegistryGuard } from "./durable/registry-guard";
 export { inboxPath, artifactInboxPath } from "./inbox/processor";
 
+const OPERATOR_TOKEN_TTL_MS = 15 * 60_000;
+const OPERATOR_TOKEN_FUTURE_SKEW_MS = 60_000;
+
 export function runScheduledMaintenance<TInbox, TMaterialization, TDocuments, TSearch>(jobs: {
   inbox: () => Promise<TInbox>;
   materialization: () => Promise<TMaterialization>;
@@ -628,7 +631,7 @@ async function routeStableTransaction(env: Env, transaction: Transaction, contex
   return response.json<Receipt>();
 }
 
-async function routeArtifact(env: Env, artifact: ArtifactWriteRequest, context: MutationContext | null = null): Promise<ArtifactWriteReceipt> {
+export async function routeArtifact(env: Env, artifact: ArtifactWriteRequest, context: MutationContext | null = null): Promise<ArtifactWriteReceipt> {
   const violation = binaryArtifactPolicyViolation(env, artifact);
   if (violation && !isReviewCandidate(artifact)) return {request_id:artifact.request_id,project_id:artifact.project_id,relative_path:artifact.relative_path,content_sha256:artifact.content_sha256,status:"rejected",code:violation.code,message:violation.message};
   const stub = env.PROJECT_GUARD.getByName(artifact.project_id);
@@ -641,7 +644,7 @@ async function routeArtifact(env: Env, artifact: ArtifactWriteRequest, context: 
   return response.json<ArtifactWriteReceipt>();
 }
 
-async function routeManagedDocument(env: Env, document: ManagedDocumentRequest, context: MutationContext | null = null): Promise<unknown> {
+export async function routeManagedDocument(env: Env, document: ManagedDocumentRequest, context: MutationContext | null = null): Promise<unknown> {
   const stub = env.PROJECT_GUARD.getByName(document.project_id);
   const response = await stub.fetch("https://project-guard.internal/document", {
     method: "POST",
@@ -880,9 +883,22 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
 }
 
 function authorized(request: Request, env: Env): boolean {
-  if (typeof env.INGRESS_TOKEN !== "string" || env.INGRESS_TOKEN.length === 0) return false;
   const authorization = request.headers.get("authorization");
-  return Boolean(authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`));
+  if (!authorization) return false;
+  if (typeof env.INGRESS_TOKEN === "string" && env.INGRESS_TOKEN.length > 0
+      && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`)) return true;
+  const operatorToken = env.CONTROL_TOWER_OPERATOR_TOKEN;
+  return Boolean(operatorToken && validOperatorToken(operatorToken)
+    && secureStringEqual(authorization, `Bearer ${operatorToken}`));
+}
+
+function validOperatorToken(token: string, now = Date.now()): boolean {
+  const separator = token.indexOf(".");
+  if (separator <= 0) return false;
+  const issuedAt = Number(token.slice(0, separator));
+  if (!Number.isSafeInteger(issuedAt)) return false;
+  if (issuedAt > now + OPERATOR_TOKEN_FUTURE_SKEW_MS) return false;
+  return now - issuedAt <= OPERATOR_TOKEN_TTL_MS;
 }
 
 function secureStringEqual(left: string, right: string): boolean {

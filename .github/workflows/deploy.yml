@@ -11,6 +11,14 @@ on:
         description: Type DEPLOY to confirm an explicit production deployment
         required: true
         type: string
+      deployment_target:
+        description: Production component to deploy
+        required: false
+        default: project_guard
+        type: choice
+        options:
+          - project_guard
+          - control_tower
 
 concurrency:
   group: project-os-production
@@ -26,6 +34,10 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       HEALTH_URL: https://project-os-guard.zakaria-fadli-94.workers.dev/health
+      CONTROL_TOWER_URL: https://project-os-control-tower.zakaria-fadli-94.workers.dev
+      GITHUB_CLIENT_ID: ${{ secrets.CONTROL_TOWER_GITHUB_CLIENT_ID }}
+      GITHUB_CLIENT_SECRET: ${{ secrets.CONTROL_TOWER_GITHUB_CLIENT_SECRET }}
+      OAUTH_COOKIE_ENCRYPTION_KEY: ${{ secrets.CONTROL_TOWER_COOKIE_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +84,8 @@ jobs:
       - name: Verify project
         run: npm run check
 
-      - name: Deploy exact Git release
+      - name: Deploy exact Project Guard Git release
+        if: inputs.deployment_target != 'control_tower'
         shell: bash
         run: |
           set -euo pipefail
@@ -81,6 +94,7 @@ jobs:
             --message "GitHub Actions production ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
 
       - name: Verify exact production identity and health
+        if: inputs.deployment_target != 'control_tower'
         shell: bash
         run: |
           set -euo pipefail
@@ -114,6 +128,42 @@ jobs:
           done
           echo "Production health/identity check failed after deployment."
           exit 1
+
+      - name: Verify Control Tower credentials
+        if: inputs.deployment_target == 'control_tower'
+        run: |
+          test -n "$GITHUB_CLIENT_ID"
+          test -n "$GITHUB_CLIENT_SECRET"
+          test -n "$OAUTH_COOKIE_ENCRYPTION_KEY"
+
+      - name: Create fail-closed Control Tower service
+        if: inputs.deployment_target == 'control_tower'
+        run: >-
+          npx wrangler deploy --config wrangler.control-tower.jsonc
+          --var GITHUB_CLIENT_ID:${GITHUB_CLIENT_ID}
+          --tag "bootstrap-${GITHUB_SHA}"
+          --message "Fail-closed Control Tower bootstrap ${GITHUB_SHA}"
+
+      - name: Configure Control Tower OAuth secrets
+        if: inputs.deployment_target == 'control_tower'
+        run: |
+          printf '%s' "$GITHUB_CLIENT_SECRET" | npx wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.control-tower.jsonc
+          printf '%s' "$OAUTH_COOKIE_ENCRYPTION_KEY" | npx wrangler secret put OAUTH_COOKIE_ENCRYPTION_KEY --config wrangler.control-tower.jsonc
+
+      - name: Deploy exact Control Tower Git release
+        if: inputs.deployment_target == 'control_tower'
+        run: >-
+          npx wrangler deploy --config wrangler.control-tower.jsonc
+          --var GITHUB_CLIENT_ID:${GITHUB_CLIENT_ID}
+          --tag "git-${GITHUB_SHA}"
+          --message "GitHub Actions Control Tower ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
+
+      - name: Verify Control Tower OAuth boundary
+        if: inputs.deployment_target == 'control_tower'
+        env:
+          CONTROL_TOWER_REQUIRE_LIVE: "true"
+          CONTROL_TOWER_BEARER_TOKEN: ${{ secrets.CONTROL_TOWER_QUALIFICATION_TOKEN }}
+        run: node scripts/check-control-tower-deployment.mjs
 
       - name: Publish deployment status
         if: always()

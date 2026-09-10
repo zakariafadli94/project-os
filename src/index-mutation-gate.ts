@@ -194,9 +194,14 @@ const worker = {
 export default worker;
 
 function authorizedIngress(request: Request, env: Env): boolean {
-  if (typeof env.INGRESS_TOKEN !== "string" || env.INGRESS_TOKEN.length === 0) return false;
   const authorization = request.headers.get("authorization");
-  return !!authorization && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`);
+  if (!authorization) return false;
+  if (typeof env.INGRESS_TOKEN === "string" && env.INGRESS_TOKEN.length > 0
+      && secureStringEqual(authorization, `Bearer ${env.INGRESS_TOKEN}`)) return true;
+
+  const operatorToken = env.CONTROL_TOWER_OPERATOR_TOKEN;
+  return Boolean(operatorToken && validOperatorToken(operatorToken, Date.now())
+    && secureStringEqual(authorization, `Bearer ${operatorToken}`));
 }
 
 function authorizedRecovery(request: Request, env: Env, now = Date.now()): boolean {

@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "project-os-control-tower",
+  "main": "src/control-tower/index.ts",
+  "compatibility_date": "2026-09-10",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "7625d95ddb6c4e578a5bd2e9ed333f63" }
+  ],
+  "vars": {
+    "CONTROL_TOWER_PUBLIC_URL": "https://project-os-control-tower.zakaria-fadli-94.workers.dev"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "PROJECT_GUARD", "class_name": "ProjectGuard", "script_name": "project-os-guard" },
+      { "name": "REGISTRY_GUARD", "class_name": "RegistryGuard", "script_name": "project-os-guard" }
+    ]
+  }
+}

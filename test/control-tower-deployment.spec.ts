@@ -4,6 +4,7 @@ import checker from "../scripts/check-control-tower-deployment.mjs?raw";
 import config from "../wrangler.control-tower.jsonc?raw";
 import deployment from "../docs/deployment.md?raw";
 import continuity from "../docs/continuity.md?raw";
+import authoritativeDeploy from "../.github/workflows/deploy.yml?raw";
 
 describe("Control Tower deployment policy", () => {
   it("requires a manual exact-SHA deployment after the complete repository gate", async () => {
@@ -12,17 +13,19 @@ describe("Control Tower deployment policy", () => {
     expect(workflow).toContain("expected_sha");
     expect(workflow).toContain("refs/heads/main");
     expect(workflow).toContain("npm run check");
-    expect(workflow).toContain("wrangler.control-tower.jsonc");
-    expect(workflow).toContain('git-${GITHUB_SHA}');
+    expect(workflow).toContain("/actions/workflows/deploy.yml/dispatches");
+    expect(workflow).not.toMatch(/\bwrangler\s+deploy\b/);
+    expect(authoritativeDeploy).toContain("wrangler.control-tower.jsonc");
+    expect(authoritativeDeploy).toContain('git-${GITHUB_SHA}');
   });
 
   it("keeps Project OS credentials outside the Control Tower boundary", async () => {
-    const combined = `${workflow}\n${config}`;
+    const combined = `${workflow}\n${authoritativeDeploy}\n${config}`;
 
     expect(combined).not.toMatch(/INGRESS_TOKEN|MUTATION_CONTEXT_SIGNING_KEY|DROPBOX_/);
-    expect(workflow).toContain("GITHUB_CLIENT_ID");
-    expect(workflow).toContain("GITHUB_CLIENT_SECRET");
-    expect(workflow).toContain("OAUTH_COOKIE_ENCRYPTION_KEY");
+    expect(combined).toContain("GITHUB_CLIENT_ID");
+    expect(combined).toContain("GITHUB_CLIENT_SECRET");
+    expect(combined).toContain("OAUTH_COOKIE_ENCRYPTION_KEY");
   });
 
   it("qualifies only synthetic PRJ-0008 and proves OAuth denial plus authenticated tools", async () => {

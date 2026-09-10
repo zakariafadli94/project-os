@@ -49,6 +49,7 @@ export class ConvergenceEngine {
     repository: ProjectRepository;
     runtime: ProjectOsPersistenceRuntime;
     effectRuntime?: ProjectOsPersistenceRuntime;
+    humanRepository?: ProjectRepository;
     journal: ConvergenceJournal;
     ledger: MaterializationLedger;
     now: () => number;
@@ -750,7 +751,7 @@ export class ConvergenceEngine {
     try {
       const human = await runHumanSlice({
         record,
-        repository: this.input.repository,
+        repository: this.input.humanRepository ?? this.input.repository,
         // Human output effects are fenced by the durable reservation above.
         // They therefore use the same full-slice effect scope as retried
         // canonical derivatives, while discovery remains on request scope.

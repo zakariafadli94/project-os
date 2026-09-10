@@ -100,17 +100,25 @@ describe("post-commit convergence acceptance", () => {
       objects: {
         ...effectRuntime.objects,
         async createText(path: string, content: string) {
-          if (path.startsWith(`${root}/`)) throw new Error("request_scope_must_not_write_human_output");
+          if (
+            path.startsWith(`${root}/`)
+            || path.includes(`/projects/${record.project_id}/materializations/`)
+            || path === machineMaterializationHeadPath(record.project_id)
+          ) {
+            throw new Error("request_scope_must_not_write_human_output");
+          }
           return effectRuntime.objects.createText(path, content);
         }
       }
     };
+    const requestRepository = new ProjectRepository(requestRuntime, "v2");
     const journal = new ConvergenceJournal(effectRuntime, record.project_id);
     const engine = new ConvergenceEngine({
       projectId: record.project_id,
-      repository,
+      repository: requestRepository,
       runtime: requestRuntime,
       effectRuntime,
+      humanRepository: repository,
       journal,
       ledger: new AcceptanceLedger() as never,
       now: () => 0,

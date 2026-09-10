@@ -6,6 +6,7 @@ import { ConvergenceJournal, initialProgress } from "../src/convergence/journal"
 import { machineCommitRecordPath, machineReceiptPath } from "../src/dropbox/layout";
 import { sha256Text } from "../src/documents/hash";
 import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import {

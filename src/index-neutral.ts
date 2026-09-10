@@ -34,6 +34,15 @@ export { ProjectGuard } from "./durable/project-guard";
 export { RegistryGuard } from "./durable/registry-guard";
 export { inboxPath, artifactInboxPath } from "./inbox/processor";
 
+export function runScheduledMaintenance<TInbox, TMaterialization, TDocuments, TSearch>(jobs: {
+  inbox: () => Promise<TInbox>;
+  materialization: () => Promise<TMaterialization>;
+  documents: () => Promise<TDocuments>;
+  search: () => Promise<TSearch>;
+}): Promise<[TInbox, TMaterialization, TDocuments, TSearch]> {
+  return Promise.all([jobs.inbox(), jobs.materialization(), jobs.documents(), jobs.search()]);
+}
+
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -231,12 +240,12 @@ const worker = {
       artifact_inbox: artifactInboxPath(mode)
     });
     ctx.waitUntil(
-      Promise.all([
-        processInbox(env),
-        reconcileMaterializations(env),
-        reconcileManagedDocuments(env),
-        reconcileSearchIndexes(env, controller.scheduledTime)
-      ])
+      runScheduledMaintenance({
+        inbox: () => processInbox(env),
+        materialization: () => reconcileMaterializations(env),
+        documents: () => reconcileManagedDocuments(env),
+        search: () => reconcileSearchIndexes(env, controller.scheduledTime)
+      })
         .then(([inbox, materialization, documents, search]) => {
           console.info("Project OS scheduled maintenance completed", { inbox, materialization, documents, search });
         })

@@ -4,10 +4,10 @@ import type { ProviderRequestScope } from "../persistence/provider/contract";
 const MAX_PROVIDER_CALLS = 32;
 const SLICE_DURATION_MS = 10_000;
 const CHECKPOINT_CALL_RESERVE = 4;
-// Dropbox tail latency in production regularly exceeds one second.
-// Keep enough wall time for incident persistence plus the final conditional
-// progress checkpoint after ordinary repair work has yielded.
-const CHECKPOINT_TIME_RESERVE_MS = 4_000;
+// Stop starting multi-call effects early, allow an already-started Dropbox
+// operation to settle, then retain a separate window for durable checkpoints.
+const EFFECT_START_TIME_RESERVE_MS = 6_000;
+const CHECKPOINT_TIME_RESERVE_MS = 3_000;
 
 export function createSliceBudget(now: () => number, signal: AbortSignal): SliceBudget {
   const budget: SliceBudget = {
@@ -25,7 +25,7 @@ export function createSliceBudget(now: () => number, signal: AbortSignal): Slice
       if (!Number.isSafeInteger(requiredCalls) || requiredCalls < 1) return false;
       return !signal.aborted
         && budget.calls_left >= requiredCalls + CHECKPOINT_CALL_RESERVE
-        && now() < budget.deadline_ms - CHECKPOINT_TIME_RESERVE_MS;
+        && now() < budget.deadline_ms - EFFECT_START_TIME_RESERVE_MS;
     }
   };
   return budget;

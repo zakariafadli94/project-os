@@ -48,6 +48,7 @@ export class ConvergenceEngine {
     projectId: string;
     repository: ProjectRepository;
     runtime: ProjectOsPersistenceRuntime;
+    effectRuntime?: ProjectOsPersistenceRuntime;
     journal: ConvergenceJournal;
     ledger: MaterializationLedger;
     now: () => number;
@@ -195,7 +196,7 @@ export class ConvergenceEngine {
       });
     }
 
-    const effects = new FencedEffects(this.input.runtime, this.input.journal, budget);
+    const effects = new FencedEffects(this.effectRuntime(), this.input.journal, budget);
     let token = checkpoint.token;
     const progress = checkpoint.progress;
     const firstDiscoveredRevision = progress.canonical_observed_revision + 1;
@@ -482,6 +483,10 @@ export class ConvergenceEngine {
     return { progress, token };
   }
 
+  private effectRuntime(): ProjectOsPersistenceRuntime {
+    return this.input.effectRuntime ?? this.input.runtime;
+  }
+
   private blankHealth(firstObservedAt?: string): ConvergenceHealth {
     const health = unknownHealth(
       this.input.projectId,
@@ -507,7 +512,7 @@ export class ConvergenceEngine {
 
     const record = await this.input.repository.readCommitRecord(this.input.projectId, due.target.revision);
     if (!record) throw new Error(`canonical_commit_missing_for_retry:${due.target.revision}`);
-    const effects = new FencedEffects(this.input.runtime, this.input.journal, budget);
+    const effects = new FencedEffects(this.effectRuntime(), this.input.journal, budget);
     const progress = checkpoint.progress;
     let token = checkpoint.token;
     if (!budget.canStartEffect(12)) {

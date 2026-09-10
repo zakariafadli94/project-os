@@ -1,9 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runHumanSlice } from "../src/convergence/human";
 import { ConvergenceEngine } from "../src/convergence/engine";
 import { createSliceBudget } from "../src/convergence/budget";
 import { ConvergenceJournal, initialProgress } from "../src/convergence/journal";
-import type { MaterializationLedgerPort } from "../src/materialization/coordinator";
+import { MaterializationCoordinator, type MaterializationLedgerPort } from "../src/materialization/coordinator";
 import type { ProjectionOutputEvidence } from "../src/domain/materialization";
 import { ProjectRepository } from "../src/persistence/repository";
 import {
@@ -113,6 +113,29 @@ describe("post-commit convergence acceptance", () => {
       ledger: new AcceptanceLedger(),
       budget: createSliceBudget(() => 0, new AbortController().signal)
     })).resolves.toEqual({ complete: false, more_work: true });
+  });
+
+  it("does not repeat reconciliation for an already active human target", async () => {
+    installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9274", 1)[0];
+    const repository = new ProjectRepository(runtime, "v2");
+    const ledger = new AcceptanceLedger();
+    ledger.requestTarget({ revision: record.new_revision, projection_version: 3 });
+    ledger.beginNextTarget();
+    const reconcile = vi.spyOn(MaterializationCoordinator.prototype, "reconcile");
+    const runNext = vi.spyOn(MaterializationCoordinator.prototype, "runNext").mockResolvedValue({
+      project_id: record.project_id, target_revision: record.new_revision, projection_version: 3,
+      completed: false, repaired_head: false, more_work: true
+    });
+
+    try {
+      await runHumanSlice({ record, repository, runtime, ledger });
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(runNext).toHaveBeenCalledOnce();
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it("marks the human pair current only after revision-258 generation and head are verified", async () => {

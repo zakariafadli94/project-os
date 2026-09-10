@@ -340,4 +340,44 @@ describe("convergence rollout gates", () => {
     expect(alarmAt).not.toBeNull();
     expect(alarmAt ?? 0).toBeGreaterThanOrEqual(Date.now() + 1_500);
   });
+
+  it("rearms a persisted convergence continuation when fleet reconciliation finds no legacy work", async () => {
+    const projectId = "PRJ-9987";
+    const testEnv = env as unknown as Env;
+    installDropboxMock();
+    const record = commitFixture(projectId, 1)[0]!;
+    const persistence = createProductionPersistence(testEnv, projectId);
+    const repository = new ProjectRepository(persistence, "v2");
+    await repository.writeCommitRecord(record);
+
+    const journal = new ConvergenceJournal(persistence, projectId);
+    const retryAt = new Date(Date.now() + 60_000).toISOString();
+    const progress = initialProgress(projectId, new Date().toISOString(), "fleet-rearm");
+    progress.canonical_observed_revision = 1;
+    progress.active = { revision: 1, projection_version: 3 };
+    progress.next_alarm_at = retryAt;
+    progress.obligations["f".repeat(64)] = {
+      id: "f".repeat(64), layer: "human_handoff", from_revision: 0,
+      target: { revision: 1, projection_version: 3 }, incident: 1,
+      state: "retry_wait", first_pending_at: new Date().toISOString(),
+      next_attempt_at: retryAt, failure_count: 1,
+      last_attempt_number: 1, last_closed_attempt_number: 1, last_verified_at: null,
+      code: "human_write_failed", lease_until: null, continuation: null
+    };
+    await journal.save(progress, null);
+
+    const guard = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    await runInDurableObject(guard, async (instance, state) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+      await state.storage.deleteAlarm();
+    });
+
+    const response = await guard.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    expect(response.status).toBe(200);
+    const alarmAt = await runInDurableObject(guard, async (_instance, state) => state.storage.getAlarm());
+    expect(alarmAt).not.toBeNull();
+    expect(alarmAt ?? 0).toBeGreaterThanOrEqual(Date.parse(retryAt) - 100);
+  });
 });

@@ -470,6 +470,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       providerReservedEffectScopeFor(budget)
     );
     const repository = new ProjectRepository(persistence, this.layoutMode);
+    const humanRepository = new ProjectRepository(effectPersistence, this.layoutMode);
     return {
       budget,
       engine: new ConvergenceEngine({
@@ -477,6 +478,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         repository,
         runtime: persistence,
         effectRuntime: effectPersistence,
+        humanRepository,
         journal: new ConvergenceJournal(checkpointPersistence, this.projectId),
         ledger: this.ledger,
         now: () => Date.now(),

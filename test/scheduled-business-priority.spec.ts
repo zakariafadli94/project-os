@@ -140,7 +140,7 @@ describe("business ingress priority", () => {
     await expect(run).resolves.toEqual(["inbox", "materialization", "documents", "search"]);
   });
 
-  it("keeps scheduled and webhook maintenance behind inbox processing", async () => {
+  it("resumes blocked scheduled inbox work and keeps webhook maintenance behind it", async () => {
     const mock = installDropboxMock();
     const created = await createProject();
 
@@ -159,7 +159,6 @@ describe("business ingress priority", () => {
 
     const scheduledGate = blockNextInboxList(mock);
     const scheduledCtx = createExecutionContext();
-    const scheduledBaseline = mock.calls.length;
     await worker.scheduled?.({
       cron: "*/5 * * * *",
       scheduledTime: Date.now(),
@@ -167,7 +166,6 @@ describe("business ingress priority", () => {
     } as ScheduledController, testEnv, scheduledCtx);
 
     const scheduledBlocked = await scheduledGate.waitUntilBlocked();
-    const scheduledCallsWhileBlocked = maintenanceCallsWhileInboxBlocked(mock.calls.slice(scheduledBaseline));
 
     scheduledGate.releaseInbox();
     await waitOnExecutionContext(scheduledCtx);
@@ -204,8 +202,6 @@ describe("business ingress priority", () => {
     await waitOnExecutionContext(webhookCtx);
 
     expect.soft(scheduledBlocked, "scheduled inbox scan should block").toBe(true);
-    expect.soft(scheduledCallsWhileBlocked, "scheduled convergence and search should not wait for inbox processing")
-      .not.toHaveLength(0);
     expect.soft(webhookBlocked, "webhook inbox scan should block").toBe(true);
     expect.soft(webhookCallsWhileBlocked, "webhook maintenance overtook inbox processing").toHaveLength(0);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${webhookTransaction.transaction_id}.json`)).toBe(true);

@@ -30,6 +30,20 @@ export function createSliceBudget(now: () => number, signal: AbortSignal): Slice
 
 export function providerRequestScopeFor(budget: SliceBudget): ProviderRequestScope {
   return {
+    deadlineMs: budget.deadline_ms - CHECKPOINT_TIME_RESERVE_MS,
+    signal: budget.signal,
+    now: budget.now,
+    beforeHttp: () => budget.beforeHttp()
+  };
+}
+
+/**
+ * Checkpoint writes use the final reserved second of the slice. Provider work
+ * is aborted before this boundary so an unexpectedly slow Dropbox request
+ * cannot consume the only window in which durable progress can be saved.
+ */
+export function providerCheckpointScopeFor(budget: SliceBudget): ProviderRequestScope {
+  return {
     deadlineMs: budget.deadline_ms,
     signal: budget.signal,
     now: budget.now,

@@ -563,6 +563,9 @@ export async function dispatchAlertDelivery(input: {
 
   const now = new Date(nowMs).toISOString();
   const attemptNumber = previous.failure_count + 1;
+  // With no receiver there is no external effect to reserve. Keep the alert
+  // pending without spending provider calls on an impossible delivery.
+  if (!port) return pendingAlertProgress(previous, alert.incident_id, attemptNumber, nowMs);
   const candidate: AlertDelivery = {
     incident_id: alert.incident_id,
     state: "pending",
@@ -577,8 +580,6 @@ export async function dispatchAlertDelivery(input: {
   }
   const reservation = persisted ?? candidate;
   if (!persisted) await journal.reserveNotification(reservation);
-  if (!port) return pendingAlertProgress(previous, alert.incident_id, attemptNumber, nowMs);
-
   try {
     const delivery = await deliverAlert(port, alert, reservation, now);
     if (delivery.state === "acknowledged") {

@@ -32,6 +32,7 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
       writer: new WorkspaceProjectionWriter(input.runtime, input.projectionConcurrency ?? 1),
       projectionVersion: CURRENT_PROJECTION_VERSION,
       canonicalDerivativesAlreadyCurrent: true,
+      verifyExistingCriticalPairOnly: true,
       ...(input.now ? { now: input.now } : {}),
       ...(input.budget ? { sliceBudget: input.budget } : {})
     });

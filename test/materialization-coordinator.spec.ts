@@ -213,6 +213,7 @@ class FakeWriter implements ProjectionWriterPort {
   failAfter: number | null = null;
   verifyCalls = 0;
   verifyOutputCalls = 0;
+  verifiedOutputKeys: string[][] = [];
   failVerificationOnCall: number | null = null;
 
   async materialize(plan: ProjectionPlan, options: {
@@ -254,10 +255,11 @@ class FakeWriter implements ProjectionWriterPort {
     }
   }
 
-  async verifyOutputs(): Promise<void> {
+  async verifyOutputs(outputs: ReadonlyMap<string, ProjectionOutputEvidence>): Promise<void> {
     // The coordinator unit double has no provider workspace; production
     // coverage exercises the real writer against the Dropbox mock.
     this.verifyOutputCalls += 1;
+    this.verifiedOutputKeys.push([...outputs.keys()].sort());
   }
 }
 
@@ -266,7 +268,8 @@ function coordinator(
   ledger = new FakeLedger(),
   writer = new FakeWriter(),
   projectionVersion = CURRENT_PROJECTION_VERSION,
-  sliceBudget?: SliceBudget
+  sliceBudget?: SliceBudget,
+  options: Partial<import("../src/materialization/coordinator").MaterializationCoordinatorOptions> = {}
 ) {
   return {
     ledger,
@@ -278,6 +281,7 @@ function coordinator(
       writer,
       projectionVersion,
       sliceBudget,
+      ...options,
       workspaceRootFor: (state) => workspaceProjectRoot(state.project_id, state.slug),
       now: () => "2026-08-24T17:21:00+01:00"
     })
@@ -423,6 +427,30 @@ describe("MaterializationCoordinator", () => {
     expect(writer.calls).toBe(callsAfterFailure);
     expect(writer.verifyOutputCalls).toBe(1);
     expect(repo.recordWrites).toBe(1);
+  });
+
+  it("revalidates only the critical pair before convergence republishes a stale head", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    repo.failHeadOnce = true;
+    const initial = coordinator(repo);
+    initial.value.requestTarget(record.new_revision);
+    await expect(initial.value.runNext()).rejects.toThrow(/head failure/);
+
+    const recovery = coordinator(
+      repo,
+      new FakeLedger(),
+      new FakeWriter(),
+      CURRENT_PROJECTION_VERSION,
+      undefined,
+      { verifyExistingCriticalPairOnly: true }
+    );
+    recovery.value.requestTarget(record.new_revision);
+    await recovery.value.runNext();
+
+    expect(recovery.writer.verifiedOutputKeys).toEqual([["global:HANDOFF", "global:STATE"]]);
+    expect(repo.head?.target_revision).toBe(record.new_revision);
   });
 
   it("does not regress a newer head while resuming an older completed record", async () => {

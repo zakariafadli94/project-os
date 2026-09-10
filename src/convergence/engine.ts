@@ -903,15 +903,23 @@ export class ConvergenceEngine {
       markHumanLayersPending(health, record.new_revision, this.input.now(), "verification_budget_pending");
       return false;
     }
+    const runtime = this.effectRuntime();
+    const repository = this.input.humanRepository ?? this.input.repository;
     health.layers.canonical = currentLayer(record.new_revision, this.input.now());
-    for (const layer of ["event", "receipt", "state", "manifest"] as const) {
-      health.layers[layer] = await observeDerivative(layer, record, this.input.runtime, this.input.repository);
+    const observedDerivatives = await Promise.all(
+      (["event", "receipt", "state", "manifest"] as const).map(async (layer) => [
+        layer,
+        await observeDerivative(layer, record, runtime, repository)
+      ] as const)
+    );
+    for (const [layer, observed] of observedDerivatives) {
+      health.layers[layer] = observed;
     }
-    const head = await this.input.repository.readMaterializationHead(this.input.projectId);
+    const head = await repository.readMaterializationHead(this.input.projectId);
     const generation = head
       && head.target_revision === record.new_revision
       && head.projection_version === CURRENT_PROJECTION_VERSION
-      ? await this.input.repository.readMaterializationRecord(
+      ? await repository.readMaterializationRecord(
           this.input.projectId,
           head.target_revision,
           head.projection_version
@@ -932,7 +940,8 @@ export class ConvergenceEngine {
       ? archiveProjectRoot(record.state.project_id, record.state.slug)
       : workspaceProjectRoot(record.state.project_id, record.state.slug);
     try {
-      await new WorkspaceProjectionWriter(this.input.runtime, 1).verifyCritical(criticalPlan, root);
+      await new WorkspaceProjectionWriter(runtime, this.input.humanProjectionConcurrency ?? 1)
+        .verifyCritical(criticalPlan, root);
     } catch {
       markHumanLayersPending(health, record.new_revision, this.input.now(), "critical_pair_not_current");
       return false;

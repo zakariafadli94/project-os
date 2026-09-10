@@ -145,6 +145,34 @@ describe("convergence observability", () => {
     expect(second).toMatchObject({ notification_pending: false, delivered_at: first.next_attempt_at });
   });
 
+  it("does not spend provider calls on a notification reservation when no receiver is configured", async () => {
+    const alert = await buildAlertRecord({
+      projectId: "PRJ-9258", layer: "human_handoff", incident: 6,
+      createdAt: "2026-09-08T00:10:40.000Z", code: "critical_pair_drift",
+      relativePath: "convergence/human_handoff",
+      expected: { revision: 258, identity: null, hash: null, projection_version: 3, root_hash: null },
+      observed: { revision: 257, identity: null, hash: null, projection_version: 3, root_hash: null },
+      lastSuccessAt: null, deploymentSha: "b".repeat(40)
+    });
+    const journal = {
+      async readNotification(): Promise<never> { throw new Error("unexpected_notification_read"); },
+      async reserveNotification(): Promise<never> { throw new Error("unexpected_notification_reservation"); }
+    };
+    const previous = {
+      incident: 6, layers: ["human_handoff" as const], created_at: alert.created_at,
+      notification_pending: true, delivered_at: null, resolved_at: null,
+      next_attempt_at: null, failure_count: 0
+    };
+
+    const result = await dispatchAlertDelivery({
+      alert, previous, journal, port: undefined,
+      nowMs: Date.parse("2026-09-08T00:10:41.000Z")
+    });
+
+    expect(result).toMatchObject({ notification_pending: true, failure_count: 1 });
+    expect(result.next_attempt_at).not.toBeNull();
+  });
+
   it("reuses a durable notification reservation when the progress checkpoint was lost", async () => {
     const alert = await buildAlertRecord({
       projectId: "PRJ-9258", layer: "human_handoff", incident: 6,

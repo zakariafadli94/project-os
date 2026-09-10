@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createSliceBudget, providerRequestScopeFor } from "../src/convergence/budget";
+import {
+  createSliceBudget,
+  providerCheckpointScopeFor,
+  providerRequestScopeFor
+} from "../src/convergence/budget";
 
 describe("convergence slice budget", () => {
   it("reserves checkpoint capacity and never starts a thirty-third provider call", () => {
@@ -21,6 +25,13 @@ describe("convergence slice budget", () => {
 
     for (let index = 0; index < 32; index += 1) scope.beforeHttp();
     expect(() => scope.beforeHttp()).toThrow("slice_budget_exhausted");
-    expect(scope.deadlineMs).toBe(10_000);
+    expect(scope.deadlineMs).toBe(9_000);
+  });
+
+  it("stops provider work before the deadline reserved for the durable checkpoint", () => {
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+
+    expect(providerRequestScopeFor(budget).deadlineMs).toBe(9_000);
+    expect(providerCheckpointScopeFor(budget).deadlineMs).toBe(10_000);
   });
 });

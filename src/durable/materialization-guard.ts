@@ -1,5 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
-import { createSliceBudget, providerRequestScopeFor } from "../convergence/budget";
+import {
+  createSliceBudget,
+  providerCheckpointScopeFor,
+  providerRequestScopeFor
+} from "../convergence/budget";
 import { ConvergenceEngine } from "../convergence/engine";
 import { unknownHealth } from "../convergence/health";
 import type { ConvergenceHealth } from "../convergence/contract";
@@ -446,6 +450,11 @@ export class MaterializationGuard extends DurableObject<Env> {
   private convergenceEngineForSlice(): { engine: ConvergenceEngine; budget: ReturnType<typeof createSliceBudget> } {
     const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
     const persistence = createProductionPersistence(this.env, this.projectId, providerRequestScopeFor(budget));
+    const checkpointPersistence = createProductionPersistence(
+      this.env,
+      this.projectId,
+      providerCheckpointScopeFor(budget)
+    );
     const repository = new ProjectRepository(persistence, this.layoutMode);
     return {
       budget,
@@ -453,7 +462,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         projectId: this.projectId,
         repository,
         runtime: persistence,
-        journal: new ConvergenceJournal(persistence, this.projectId),
+        journal: new ConvergenceJournal(checkpointPersistence, this.projectId),
         ledger: this.ledger,
         now: () => Date.now(),
         deploymentSha: deploymentIdentity(this.env).git_sha ?? "unknown",

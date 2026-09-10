@@ -378,6 +378,17 @@ export class MaterializationCoordinator {
         more_work: this.hasMoreWork()
       };
     } catch (error) {
+      if (this.sliceBudget && isSliceBudgetExhaustion(error)) {
+        logMaterializationAttempt("info", record, target, plan, metrics, verifiedCount, retryCount, startedAt, "pending");
+        return {
+          project_id: this.projectId,
+          target_revision: target.revision,
+          projection_version: target.projection_version,
+          completed: false,
+          repaired_head: false,
+          more_work: true
+        };
+      }
       this.ledger.failActive(error instanceof Error ? error.message : String(error));
       logMaterializationAttempt("error", record, target, plan, metrics, verifiedCount, retryCount, startedAt, "failed");
       throw error;
@@ -678,7 +689,7 @@ function logMaterializationAttempt(
   verifiedCount: number,
   retryCount: number,
   startedAt: number,
-  finalState: "complete" | "failed"
+  finalState: "complete" | "pending" | "failed"
 ): void {
   const payload = {
     project_id: record.project_id,
@@ -700,6 +711,10 @@ function logMaterializationAttempt(
   };
   if (level === "info") console.info("Project OS materialization attempt", payload);
   else console.error("Project OS materialization attempt", payload);
+}
+
+function isSliceBudgetExhaustion(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("slice_budget_exhausted");
 }
 
 function generationId(projectId: string, revision: number, projectionVersion: number): string {

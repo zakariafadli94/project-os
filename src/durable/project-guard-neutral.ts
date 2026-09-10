@@ -606,6 +606,16 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     const progress = initialProgress(projectId, new Date().toISOString(), crypto.randomUUID());
     let latest: ProjectState | null = null;
+    const historicalSnapshot = await this.repository.readProjectState(projectId);
+    if (historicalSnapshot) {
+      // Older projects predate the immutable commit log. Their validated
+      // machine snapshot is a read-only baseline; discovery still requires a
+      // contiguous immutable chain for every later revision.
+      progress.canonical_observed_revision = historicalSnapshot.revision;
+      progress.baseline_revision = historicalSnapshot.revision;
+      progress.baseline_kind = "pre_commit001";
+      latest = historicalSnapshot;
+    }
     for (let page = 0; page < 4; page += 1) {
       const budget = {
         deadline_ms: Number.MAX_SAFE_INTEGER,

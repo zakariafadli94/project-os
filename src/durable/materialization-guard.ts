@@ -205,6 +205,30 @@ export class MaterializationGuard extends DurableObject<Env> {
     });
   }
 
+  private async hasDurablyVerifiedCurrentTarget(record: import("../domain/commit-record").CanonicalCommitRecord): Promise<boolean> {
+    const target = { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION };
+    const head = this.ledger.status().head;
+    if (!head || head.revision !== target.revision || head.projection_version !== target.projection_version) {
+      return false;
+    }
+    const saved = await new ConvergenceJournal(
+      createProductionPersistence(this.env, this.projectId),
+      this.projectId
+    ).load();
+    if (!saved) return false;
+    const progress = saved.progress;
+    const targetObligations = Object.values(progress.obligations).filter((obligation) =>
+      obligation.target.revision === target.revision
+      && obligation.target.projection_version === target.projection_version
+    );
+    return progress.canonical_observed_revision >= target.revision
+      && progress.active === null
+      && progress.requested === null
+      && progress.next_alarm_at === null
+      && targetObligations.some((obligation) => obligation.layer === "human_handoff" && obligation.state === "verified")
+      && targetObligations.every((obligation) => obligation.state === "verified");
+  }
+
   /**
    * Internal, read-only admission probe. ProjectGuard uses it before a new
    * canonical commit only for an explicitly enabled repair writer. A missing
@@ -314,6 +338,15 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
     if (record) {
       if (convergenceMode === "repair") {
+        if (await this.hasDurablyVerifiedCurrentTarget(record)) {
+          await this.ctx.storage.deleteAlarm();
+          return Response.json({
+            project_id: state.project_id,
+            revision: state.revision,
+            materialized: true,
+            status: "current"
+          });
+        }
         const { engine, budget } = this.convergenceEngineForSlice();
         const result = await engine.runSlice(budget);
         // A recovery slice may spend its bounded request budget discovering

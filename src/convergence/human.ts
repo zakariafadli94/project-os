@@ -34,7 +34,14 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
       ...(input.now ? { now: input.now } : {}),
       ...(input.budget ? { sliceBudget: input.budget } : {})
     });
-    await coordinator.reconcile(input.record.new_revision);
+    const active = coordinator.status().active;
+    if (
+      !active
+      || active.revision !== input.record.new_revision
+      || active.projection_version !== CURRENT_PROJECTION_VERSION
+    ) {
+      await coordinator.reconcile(input.record.new_revision);
+    }
     coordinator.requestTarget(input.record.new_revision, CURRENT_PROJECTION_VERSION);
     const result = await coordinator.runNext();
     return { complete: result.completed, more_work: result.more_work };

@@ -149,6 +149,45 @@ describe("MaterializationGuard isolation boundary", () => {
     ).toBe(true);
   });
 
+  it("reports a verified repair canary as current after its writer becomes idle", async () => {
+    const mock = installDropboxMock();
+    const projectId = "PRJ-3912";
+    await createProject(projectId, "repair-current", "TXN-MATISO-3912-CREATE");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    await guard.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId,
+        revision: 1,
+        projection_version: CURRENT_PROJECTION_VERSION
+      })
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
+      if (!await runDurableObjectAlarm(guard)) break;
+    }
+    expect(mock.files.has(machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION))).toBe(true);
+
+    const response = await guard.fetch("https://materialization-guard.internal/materialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "workspace-v2" })
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      project_id: projectId,
+      revision: 1,
+      materialized: true,
+      status: "current"
+    });
+  });
+
   it("reconciles and reports projection status from canonical machine state", async () => {
     installDropboxMock();
     const projectId = "PRJ-3907";

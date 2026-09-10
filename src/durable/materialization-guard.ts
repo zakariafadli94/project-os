@@ -316,7 +316,17 @@ export class MaterializationGuard extends DurableObject<Env> {
       if (convergenceMode === "repair") {
         const { engine, budget } = this.convergenceEngineForSlice();
         const result = await engine.runSlice(budget);
-        if (result.more_work || !result.health.converged) {
+        // A recovery slice may spend its bounded request budget discovering
+        // that no durable work remains. Re-observe with a fresh read-only
+        // budget before reporting "pending"; otherwise a verified canary is
+        // indistinguishable from an unfinished one to this admin endpoint.
+        const health = result.more_work || result.health.converged
+          ? result.health
+          : await (() => {
+              const verification = this.convergenceEngineForSlice();
+              return verification.engine.observe(verification.budget);
+            })();
+        if (result.more_work || !health.converged) {
           await this.scheduleConvergenceContinuation(true, result.next_alarm_at);
           return Response.json({
             project_id: state.project_id,

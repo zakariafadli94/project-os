@@ -231,7 +231,7 @@ export class ConvergenceEngine {
       const existingObligation = progress.obligations[obligationId];
       if (
         existingObligation
-        && (existingObligation.state === "retry_wait" || existingObligation.state === "exhausted")
+        && (existingObligation.state === "pending" || existingObligation.state === "retry_wait" || existingObligation.state === "exhausted")
         && existingObligation.next_attempt_at !== null
         && Date.parse(existingObligation.next_attempt_at) > this.input.now()
       ) {
@@ -498,7 +498,7 @@ export class ConvergenceEngine {
   ): Promise<SliceResult | null> {
     const due = Object.values(checkpoint.progress.obligations).find((obligation) =>
       isMachineLayer(obligation.layer)
-      && (obligation.state === "retry_wait" || obligation.state === "exhausted")
+      && (obligation.state === "pending" || obligation.state === "retry_wait" || obligation.state === "exhausted")
       && obligation.next_attempt_at !== null
       && Date.parse(obligation.next_attempt_at) <= this.input.now()
     );

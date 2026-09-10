@@ -53,3 +53,13 @@ export function providerCheckpointScopeFor(budget: SliceBudget): ProviderRequest
     beforeHttp: () => budget.beforeHttp()
   };
 }
+
+/**
+ * A derivative write may use the remaining bounded slice only after both its
+ * intent and attempt reservation are durable. If it reaches the deadline,
+ * the next slice observes that immutable reservation and reconciles the
+ * provider outcome instead of issuing a speculative duplicate write.
+ */
+export function providerReservedEffectScopeFor(budget: SliceBudget): ProviderRequestScope {
+  return providerCheckpointScopeFor(budget);
+}

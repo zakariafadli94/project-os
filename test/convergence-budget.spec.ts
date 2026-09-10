@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createSliceBudget,
   providerCheckpointScopeFor,
+  providerReservedEffectScopeFor,
   providerRequestScopeFor
 } from "../src/convergence/budget";
 
@@ -33,6 +34,7 @@ describe("convergence slice budget", () => {
     const budget = createSliceBudget(() => now, new AbortController().signal);
 
     expect(providerRequestScopeFor(budget).deadlineMs).toBe(7_000);
+    expect(providerReservedEffectScopeFor(budget).deadlineMs).toBe(10_000);
     expect(providerCheckpointScopeFor(budget).deadlineMs).toBe(10_000);
     now = 7_000;
     expect(budget.canStartEffect(1)).toBe(false);

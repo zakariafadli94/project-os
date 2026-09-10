@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   createSliceBudget,
   providerCheckpointScopeFor,
+  providerReservedEffectScopeFor,
   providerRequestScopeFor
 } from "../convergence/budget";
 import { ConvergenceEngine } from "../convergence/engine";
@@ -455,6 +456,11 @@ export class MaterializationGuard extends DurableObject<Env> {
       this.projectId,
       providerCheckpointScopeFor(budget)
     );
+    const effectPersistence = createProductionPersistence(
+      this.env,
+      this.projectId,
+      providerReservedEffectScopeFor(budget)
+    );
     const repository = new ProjectRepository(persistence, this.layoutMode);
     return {
       budget,
@@ -462,6 +468,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         projectId: this.projectId,
         repository,
         runtime: persistence,
+        effectRuntime: effectPersistence,
         journal: new ConvergenceJournal(checkpointPersistence, this.projectId),
         ledger: this.ledger,
         now: () => Date.now(),

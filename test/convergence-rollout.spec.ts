@@ -283,6 +283,26 @@ describe("convergence rollout gates", () => {
     expect([...mock.files.keys()].some((path) => path.includes("/WORKSPACE/PROJECTS/PRJ-9990-"))).toBe(false);
   });
 
+  it("does not rearm the legacy writer alarm for a V2 project outside repair mode", async () => {
+    const projectId = "PRJ-9992";
+    const testEnv = env as unknown as Env;
+    const mock = installDropboxMock();
+    const record = commitFixture(projectId, 1)[0];
+    mock.files.set(machineCommitRecordPath(projectId, 1), `${JSON.stringify(record, null, 2)}\n`);
+    const guard = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+
+    const requested = await guard.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, revision: 1, projection_version: 3 })
+    });
+    expect(requested.status).toBe(200);
+
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const alarmAt = await runInDurableObject(guard, async (_instance, state) => state.storage.getAlarm());
+    expect(alarmAt).toBeNull();
+  });
+
   it("keeps the persisted human retry deadline when repair is activated", async () => {
     const projectId = "PRJ-9989";
     const slug = "alarm-retry";

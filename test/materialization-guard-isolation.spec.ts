@@ -118,6 +118,11 @@ describe("MaterializationGuard isolation boundary", () => {
     expect(receipt).toMatchObject({ status: "committed", new_revision: 1 });
 
     const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
     const response = await guard.fetch("https://materialization-guard.internal/request-target", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -128,7 +133,7 @@ describe("MaterializationGuard isolation boundary", () => {
       })
     });
     expect(response.status).toBe(200);
-    for (let slice = 0; slice < 4; slice += 1) {
+    for (let slice = 0; slice < 32; slice += 1) {
       expect(await runDurableObjectAlarm(guard)).toBe(true);
       if (mock.files.has(machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION))) break;
     }

@@ -479,6 +479,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         runtime: persistence,
         effectRuntime: effectPersistence,
         humanRepository,
+        humanProjectionConcurrency: this.projectionConcurrency,
         journal: new ConvergenceJournal(checkpointPersistence, this.projectId),
         ledger: this.ledger,
         now: () => Date.now(),

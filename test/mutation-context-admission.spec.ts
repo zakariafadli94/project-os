@@ -5,7 +5,7 @@ import worker from "../src/index";
 import type { MutationContextResponse } from "../src/admission/mutation-context";
 import { encodeAdmission } from "../src/admission/transport";
 import type { Env } from "../src/env";
-import { machineCommitRecordPath, machineReceiptPath } from "../src/dropbox/layout";
+import { machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
@@ -59,6 +59,25 @@ describe("canonical mutation-context admission", () => {
     expect(body.views).toMatchObject({ status: "unknown", verified_at: null });
     expect(body.views.state).toContain("revision: 2");
     expect(body.views.handoff).toContain(projectId);
+  });
+
+  it("serves a context from a verified historical snapshot followed by recent commits", async () => {
+    const projectId = "PRJ-9980";
+    const mock = installDropboxMock();
+    const records = commitFixture(projectId, 267);
+    mock.files.set(machineStatePath(projectId), `${JSON.stringify(records[255].state, null, 2)}\n`);
+    for (const record of records.slice(256)) {
+      mock.files.set(machineCommitRecordPath(projectId, record.new_revision), `${JSON.stringify(record, null, 2)}\n`);
+    }
+
+    const response = await readContext(projectId, strictEnv(projectId));
+
+    expect(response.status).toBe(200);
+    await expect(response.json<MutationContextResponse>()).resolves.toMatchObject({
+      context: { project_id: projectId, canonical_revision: 267 },
+      canonical_state: { project_id: projectId, revision: 267 }
+    });
+    expect(mock.uploadCalls).toEqual([]);
   });
 
   it("rejects strict mutations before durable business effects and accepts the fresh envelope", async () => {

@@ -104,6 +104,16 @@ export class ConvergenceEngine {
     if (records.length === 0) return health;
     const record = records.at(-1);
     if (!record) return health;
+    if (this.input.enableHuman && records.length === 1) {
+      // Completed-target verification already reads all four machine
+      // derivatives.  Do not spend the bounded observation window reading
+      // event and receipt a second time before the critical pair can be
+      // checked. A multi-record discovery window still scans every event and
+      // receipt below, so a coalesced head cannot hide an older gap.
+      const verified = await this.verifyCompletedTarget(record, budget, health);
+      health.converged = verified && isConverged(health);
+      return health;
+    }
     const latestDerivative: Record<"event" | "receipt", LayerHealth | null> = {
       event: null,
       receipt: null

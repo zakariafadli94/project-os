@@ -81,6 +81,17 @@ const worker = {
       return materializeExistingProjects(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/v1/admin/workspace-v2/status") {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const projectId = url.searchParams.get("project_id");
+      if (!projectId || !/^PRJ-[0-9]{4,}$/.test(projectId)) {
+        return Response.json({ error: "invalid_project_id" }, { status: 400 });
+      }
+      return env.PROJECT_GUARD.getByName(projectId).fetch(
+        "https://project-guard.internal/materialization-diagnostic-status"
+      );
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/admin/workspace-v2/migrate-ledger") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
       try {

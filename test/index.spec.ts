@@ -244,6 +244,46 @@ describe("Worker routing", () => {
     expect(mock.files.has(`/PROJECT_OS/WORKSPACE/PROJECTS/${receipt.project_id}-admin-project/PROJECT.md`)).toBe(false);
   });
 
+  it("exposes authenticated read-only workspace V2 status for one canonical project", async () => {
+    const ctx = createExecutionContext();
+    const created = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        schema_version: "1.0",
+        transaction_id: "TXN-ADMIN-STATUS-0001",
+        project_id: "PRJ-AUTO",
+        base_revision: 0,
+        operation: "project.create",
+        created_at: "2026-09-10T15:30:00.000Z",
+        payload: { name: "Status Project", slug: "status-project", aliases: [], objective: "Inspect convergence safely" }
+      })
+    }), testEnv, ctx);
+    expect(created.status).toBe(200);
+    const project = await created.json<{ project_id: string }>();
+    const path = `/v1/admin/workspace-v2/status?project_id=${project.project_id}`;
+
+    const unauthorized = await worker.fetch(new Request(`https://example.com${path}`), testEnv, ctx);
+    expect(unauthorized.status).toBe(401);
+
+    const response = await worker.fetch(new Request(`https://example.com${path}`, {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    }), testEnv, ctx);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      project_id: project.project_id,
+      canonical_revision: 1,
+      materialized_head: null,
+      requested: { revision: 1, projection_version: 3 },
+      diagnostic: {
+        read_only: true,
+        final_verification_pending_count: 0,
+        managed_zones_ready: false,
+        human_handoff: null
+      }
+    });
+  });
+
   it("rejects staged artifacts before Durable Object routing while binary ingress is disabled", async () => {
     const ctx = createExecutionContext();
     const artifact = {

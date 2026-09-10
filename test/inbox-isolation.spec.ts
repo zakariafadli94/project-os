@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { createExecutionContext, runDurableObjectAlarm, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/env";
@@ -136,8 +136,14 @@ describe("inbox entry isolation", () => {
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${startTask.transaction_id}.json`)).toBe(true);
 
     const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
-    for (let slice = 0; slice < 8; slice += 1) {
+    await runInDurableObject(projectionStub, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
       if (!await runDurableObjectAlarm(projectionStub)) break;
+      if (mock.files.has(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`)) break;
     }
     expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`)).toContain("Status: active");
   });

@@ -4,6 +4,7 @@ import { ConvergenceEngine } from "../src/convergence/engine";
 import { createSliceBudget } from "../src/convergence/budget";
 import { ConvergenceJournal, initialProgress } from "../src/convergence/journal";
 import { MaterializationCoordinator, type MaterializationLedgerPort } from "../src/materialization/coordinator";
+import type { FinalVerificationItem } from "../src/materialization/ledger";
 import type { ProjectionOutputEvidence } from "../src/domain/materialization";
 import { ProjectRepository } from "../src/persistence/repository";
 import {
@@ -25,6 +26,7 @@ class AcceptanceLedger implements MaterializationLedgerPort {
   private active: { revision: number; projection_version: number; coalesced_revisions: number[] } | null = null;
   private head: { revision: number; projection_version: number } | null = null;
   private readonly outputs = new Map<string, ProjectionOutputEvidence>();
+  private pendingFinalVerification: FinalVerificationItem[] | null = null;
 
   requestTarget(target: { revision: number; projection_version: number }) { this.requested = target; }
   beginNextTarget() {
@@ -35,6 +37,15 @@ class AcceptanceLedger implements MaterializationLedgerPort {
   }
   recordVerifiedOutput(key: string, evidence: ProjectionOutputEvidence) { this.outputs.set(key, evidence); }
   attemptOutputs() { return new Map(this.outputs); }
+  finalVerificationActive() { return this.pendingFinalVerification !== null; }
+  beginFinalVerification(items: readonly FinalVerificationItem[]) {
+    if (this.pendingFinalVerification === null) this.pendingFinalVerification = [...items].sort((left, right) => left.key.localeCompare(right.key));
+  }
+  finalVerificationPending() { return [...(this.pendingFinalVerification ?? [])]; }
+  completeFinalVerification(keys: readonly string[]) {
+    const completed = new Set(keys);
+    this.pendingFinalVerification = (this.pendingFinalVerification ?? []).filter((item) => !completed.has(item.key));
+  }
   baselineOutputs() { return new Map(); }
   immutableDerivativesThrough() { return null; }
   markImmutableDerivativesThrough(_revision: number) {}
@@ -43,22 +54,33 @@ class AcceptanceLedger implements MaterializationLedgerPort {
     this.head = { revision: input.revision, projection_version: input.projection_version };
     this.active = null;
     this.requested = null;
+    this.pendingFinalVerification = null;
   }
   restoreExternalBaseline(head: { revision: number; projection_version: number }, _outputs: ReadonlyMap<string, ProjectionOutputEvidence>) {
     this.head = head;
     this.active = null;
+    this.pendingFinalVerification = null;
   }
   status() {
     return {
       head: this.head,
       requested: this.requested,
       active: this.active,
-      active_status: this.active ? "running" as const : null,
+      active_status: this.active ? (this.pendingFinalVerification === null ? "running" : "verifying") : null,
       last_error: null,
       output_count: this.outputs.size,
       attempt_output_count: this.outputs.size
     };
   }
+}
+
+async function runUntilConverged(engine: ConvergenceEngine, now: number, maxSlices = 16) {
+  let latest: Awaited<ReturnType<ConvergenceEngine["runSlice"]>> | null = null;
+  for (let slice = 0; slice < maxSlices; slice += 1) {
+    latest = await engine.runSlice(createSliceBudget(() => now, new AbortController().signal));
+    if (latest.health.converged) return latest;
+  }
+  throw new Error("convergence_did_not_complete_within_bounded_slices");
 }
 
 describe("post-commit convergence acceptance", () => {
@@ -188,6 +210,30 @@ describe("post-commit convergence acceptance", () => {
     expect(mock.files.get(machineMaterializationHeadPath(record.project_id))).toContain('"target_revision": 1');
   });
 
+  it("does not start a human projection from a legacy requested target before machine evidence is current", async () => {
+    const mock = installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9278", 1)[0]!;
+    const repository = new ProjectRepository(runtime, "v2");
+    await repository.writeCommitRecord(record);
+    const ledger = new AcceptanceLedger();
+    ledger.requestTarget({ revision: record.new_revision, projection_version: 3 });
+    const engine = new ConvergenceEngine({
+      projectId: record.project_id,
+      repository,
+      runtime,
+      journal: new ConvergenceJournal(runtime, record.project_id),
+      ledger: ledger as never,
+      now: () => 0,
+      enableHuman: true
+    });
+
+    await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+
+    const root = workspaceProjectRoot(record.project_id, record.state.slug);
+    expect(mock.uploadCalls.filter((path) => path.startsWith(`${root}/`))).toEqual([]);
+  });
+
   it("keeps a human projection pending when reconciliation reaches its slice boundary", async () => {
     installDropboxMock();
     const baseRuntime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
@@ -256,15 +302,13 @@ describe("post-commit convergence acceptance", () => {
       enableHuman: true
     });
 
-    await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
-    const result = await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
-    const verified = await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+    const result = await runUntilConverged(engine, 0);
 
     expect(result.health.layers.human_state.state).toBe("current");
     expect(result.health.layers.human_handoff.state).toBe("current");
     expect(result.health.layers.generation.state).toBe("current");
     expect(result.health.layers.head.state).toBe("current");
-    expect(verified.health.converged).toBe(true);
+    expect(result.health.converged).toBe(true);
     expect(mock.files.get(`${workspaceProjectRoot(record.project_id, record.state.slug)}/HANDOFF.md`)).toContain("Revision: 258");
   });
 
@@ -392,7 +436,7 @@ describe("post-commit convergence acceptance", () => {
       projectId: record.project_id, repository, runtime, journal, ledger: ledger as never,
       now: () => retryAt, enableHuman: true
     });
-    const complete = await recovered.runSlice(createSliceBudget(() => retryAt, new AbortController().signal));
+    const complete = await runUntilConverged(recovered, retryAt);
 
     expect(complete.health.layers.human_handoff.state).toBe("current");
     expect(mock.files.get(`${root}/HANDOFF.md`)).toContain("Revision: 258");
@@ -436,7 +480,7 @@ describe("post-commit convergence acceptance", () => {
       projectId: record258.project_id, repository, runtime, journal, ledger: ledger as never,
       now: () => 1_200_000, enableHuman: true
     });
-    const complete = await recovered.runSlice(createSliceBudget(() => 1_200_000, new AbortController().signal));
+    const complete = await runUntilConverged(recovered, 1_200_000);
 
     expect(complete.health.layers.human_handoff.state).toBe("current");
     expect(mock.files.get(`${root}/STATE.md`)).toContain("Revision: 258");
@@ -527,8 +571,15 @@ describe("post-commit convergence acceptance", () => {
     // No input transaction and no handoff arrive during the outage. A later
     // scheduled slice alone must rebuild the critical pair, publish 258 and
     // resolve the same durable incident.
-    await runAt(1_200_000);
-    const verified = await runAt(1_200_000);
+    const verified = await runUntilConverged(new ConvergenceEngine({
+      projectId: record258.project_id,
+      repository,
+      runtime,
+      journal,
+      ledger: ledger as never,
+      now: () => 1_200_000,
+      enableHuman: true
+    }), 1_200_000);
     const completed = await journal.load();
 
     expect(verified.health.converged).toBe(true);

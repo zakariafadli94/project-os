@@ -216,6 +216,40 @@ export class WorkspaceProjectionWriter {
     if (failures.length > 0) throw failures[0];
   }
 
+  async verifyAbsentOutputs(
+    outputs: ReadonlyMap<string, ProjectionOutputEvidence>,
+    workspaceRoot: string
+  ): Promise<void> {
+    const root = normalizeWorkspaceRoot(workspaceRoot);
+    const entries = [...outputs.entries()];
+    let cursor = 0;
+    const failures: unknown[] = [];
+    const worker = async () => {
+      for (;;) {
+        if (failures.length > 0) return;
+        const current = entries[cursor];
+        cursor += 1;
+        if (!current) return;
+        const [key, evidence] = current;
+        const path = joinWorkspacePath(root, evidence.relative_path);
+        try {
+          if (await this.objects.readText(path) !== null) {
+            throw new MaterializationOutputConflictError(
+              key,
+              path,
+              `Removed materialization output reappeared before final publication: ${path}`
+            );
+          }
+        } catch (error) {
+          failures.push(error);
+          return;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.concurrency, entries.length) }, () => worker()));
+    if (failures.length > 0) throw failures[0];
+  }
+
   private async runStage(
     projectId: string,
     outputs: PlannedProjectionOutput[],

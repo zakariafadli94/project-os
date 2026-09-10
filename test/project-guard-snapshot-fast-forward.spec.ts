@@ -12,6 +12,8 @@ import {
   machineMaterializationHeadPath,
   machineStatePath
 } from "../src/persistence/layout";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import { encodeProjectState } from "../src/schema/project-state";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
@@ -26,6 +28,39 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   });
   expect(response.status).toBe(200);
   return response.json<Receipt>();
+}
+
+async function enableRepairMaterialization(projectId: string): Promise<void> {
+  await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
+}
+
+async function materializeThroughContinuations(projectId: string): Promise<void> {
+  const stub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+  await enableRepairMaterialization(projectId);
+  for (let slice = 0; slice < 64; slice += 1) {
+    if (!await runDurableObjectAlarm(stub)) return;
+  }
+}
+
+async function materializeUntilRevision(projectId: string, revision: number): Promise<void> {
+  const stub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+  await enableRepairMaterialization(projectId);
+  for (let slice = 0; slice < 256; slice += 1) {
+    const response = await stub.fetch("https://materialization-guard.internal/materialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "workspace-v2" })
+    });
+    expect([200, 202]).toContain(response.status);
+    if (response.status === 200) return;
+  }
+  const status = await stub.fetch("https://materialization-guard.internal/status");
+  const body = await status.json<{ blocked_error: string | null }>();
+  throw new Error(`materialization_did_not_reach_revision_${revision}:${body.blocked_error ?? "none"}`);
 }
 
 describe("ProjectGuard canonical snapshot catch-up", () => {
@@ -54,9 +89,8 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       }
     });
     expect(created).toMatchObject({ status: "committed", new_revision: 1 });
-    for (let slice = 0; slice < 16; slice += 1) {
-      if (!await runDurableObjectAlarm(projectionStub)) break;
-    }
+    await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(created);
+    await materializeThroughContinuations(projectId);
 
     let state = normalizeProjectState(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}"));
     expect(state.revision).toBe(1);
@@ -153,9 +187,8 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       }
     });
     expect(created).toMatchObject({ status: "committed", new_revision: 1 });
-    for (let slice = 0; slice < 8; slice += 1) {
-      if (!await runDurableObjectAlarm(projectionStub)) break;
-    }
+    await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(created);
+    await materializeThroughContinuations(projectId);
 
     let state = normalizeProjectState(JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}"));
     const staleSnapshot = state;
@@ -199,14 +232,15 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       );
       state = result.state;
     }
+    // Reconciliation itself must run under the activated single writer: in
+    // V2, an inactive guard deliberately retains only its legacy queue.
+    await enableRepairMaterialization(projectId);
     const reconcileMaterialization = await projectionStub.fetch(
       "https://materialization-guard.internal/reconcile",
       { method: "POST" }
     );
     expect(reconcileMaterialization.status).toBe(200);
-    for (let slice = 0; slice < 16; slice += 1) {
-      if (!await runDurableObjectAlarm(projectionStub)) break;
-    }
+    await materializeUntilRevision(projectId, 12);
     await mock.writeExternal(
       machineStatePath(projectId),
       `${JSON.stringify(encodeProjectState(staleSnapshot, "provider_v2"), null, 2)}\n`
@@ -277,6 +311,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
     expect(await runDurableObjectAlarm(projectionStub)).toBe(true);
 
     mock.calls.length = 0;
+    mock.providerCalls.length = 0;
     mock.downloadCalls.length = 0;
     mock.uploadCalls.length = 0;
 
@@ -299,8 +334,19 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
     const nextCommitPath = machineCommitRecordPath(projectId, 2);
     expect(mock.downloadCalls.filter((path) => path === nextCommitPath)).toHaveLength(1);
 
-    const providerCalls = mock.calls.filter((call) => call.startsWith("POST /2/files/"));
-    expect(providerCalls).toHaveLength(3);
+    // A process-wide fetch interceptor also observes unrelated asynchronous
+    // work from other isolated Durable Objects. Count only I/O attributable to
+    // this project and this commit's receipt: this is the actual hot-path
+    // contract, while a global endpoint count is timing-dependent in CI.
+    const attributedProviderCalls = mock.providerCalls.filter(({ paths }) => paths.some((path) => (
+      path.includes(`/projects/${projectId}/`)
+      || path.endsWith("/TXN-HOTPATH-0002-COMMIT.json")
+    )));
+    expect(attributedProviderCalls.map(({ endpoint }) => endpoint)).toEqual([
+      "POST /2/files/download",
+      "POST /2/files/download",
+      "POST /2/files/upload"
+    ]);
 
     mock.uploadCalls.length = 0;
     const stale = await submit(projectId, {

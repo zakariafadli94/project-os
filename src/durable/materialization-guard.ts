@@ -19,7 +19,7 @@ import {
 import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
 import type { Env } from "../env";
-import { MaterializationCoordinator } from "../materialization/coordinator";
+import { MaterializationCoordinator, rebuildProjectionBaseline } from "../materialization/coordinator";
 import { initializeMaterializationSchema, MaterializationLedger } from "../materialization/ledger";
 import {
   MaterializationOutputConflictError,
@@ -219,7 +219,16 @@ export class MaterializationGuard extends DurableObject<Env> {
         const headCurrent = head !== null
           && head.target_revision === state.revision
           && head.projection_version === CURRENT_PROJECTION_VERSION;
-        if (!headCurrent) {
+        if (headCurrent && head) {
+          // SQLite is only a projection accelerator.  Once a complete,
+          // immutable generation is already current, reconstruct the local
+          // baseline from it without invoking the retired coordinator writer.
+          const baseline = await rebuildProjectionBaseline(repository, head);
+          this.ledger.restoreExternalBaseline(
+            { revision: head.target_revision, projection_version: head.projection_version },
+            baseline.outputs
+          );
+        } else {
           const { engine } = this.convergenceEngineForSlice();
           await engine.requestTarget({ revision: state.revision, projection_version: CURRENT_PROJECTION_VERSION });
           await this.scheduleConvergenceContinuation(true, new Date().toISOString());

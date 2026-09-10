@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -42,8 +42,13 @@ async function createRegisteredProject(slug: string): Promise<Receipt> {
   return response.json<Receipt>();
 }
 
-async function materializeThroughContinuations(stub: DurableObjectStub): Promise<void> {
-  for (let slice = 0; slice < 8; slice += 1) {
+async function materializeThroughContinuations(projectId: string, stub: DurableObjectStub): Promise<void> {
+  await runInDurableObject(stub, (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
+  for (let slice = 0; slice < 64; slice += 1) {
     if (!await runDurableObjectAlarm(stub)) return;
   }
 }
@@ -62,7 +67,7 @@ describe("ProjectGuard crash-safe archive commits", () => {
     const projectId = created.project_id;
     const projectionStub = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 
-    await materializeThroughContinuations(projectionStub);
+    await materializeThroughContinuations(projectId, projectionStub);
     expect(mock.files.has(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(true);
     expect(mock.files.has(`${archiveProjectRoot(projectId, slug)}/PROJECT.md`)).toBe(false);
 

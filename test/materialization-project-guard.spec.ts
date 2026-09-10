@@ -9,6 +9,8 @@ import {
   machineMaterializationHeadPath,
   workspaceProjectRoot
 } from "../src/persistence/layout";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -43,9 +45,20 @@ function materializationStub(projectId: string) {
 
 async function materializeThroughContinuations(projectId: string): Promise<void> {
   const stub = materializationStub(projectId);
-  for (let slice = 0; slice < 8; slice += 1) {
+  await runInDurableObject(stub, (instance) => {
+    (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+      [projectId]: "repair"
+    });
+  });
+  for (let slice = 0; slice < 64; slice += 1) {
     if (!await runDurableObjectAlarm(stub)) return;
   }
+}
+
+async function createSyntheticProject(projectId: string, slug: string, transactionId: string): Promise<Receipt> {
+  const receipt = await submit(projectId, createTx(projectId, slug, transactionId));
+  await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(receipt);
+  return receipt;
 }
 
 async function status(projectId: string) {
@@ -94,7 +107,7 @@ describe("ProjectGuard asynchronous materialization", () => {
     const projectStub = testEnv.PROJECT_GUARD.getByName(projectId);
     const projectionStub = materializationStub(projectId);
 
-    const create = await submit(projectId, createTx(projectId, slug, "TXN-MATERIAL-PG-3601-CREATE"));
+    const create = await createSyntheticProject(projectId, slug, "TXN-MATERIAL-PG-3601-CREATE");
     expect(create.status).toBe("committed");
     expect(create.new_revision).toBe(1);
     expect(dropbox.files.has(machineCommitRecordPath(projectId, 1))).toBe(true);
@@ -144,7 +157,7 @@ describe("ProjectGuard asynchronous materialization", () => {
     const projectionStub = materializationStub(projectId);
     const root = workspaceProjectRoot(projectId, slug);
 
-    await submit(projectId, createTx(projectId, slug, "TXN-MATERIAL-PG-3602-CREATE"));
+    await createSyntheticProject(projectId, slug, "TXN-MATERIAL-PG-3602-CREATE");
     await materializeThroughContinuations(projectId);
     expect(JSON.parse(dropbox.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(1);
 
@@ -175,7 +188,7 @@ describe("ProjectGuard asynchronous materialization", () => {
   it("exposes compact materialization status without file contents", async () => {
     const projectId = "PRJ-3603";
     const slug = "materialization-status";
-    await submit(projectId, createTx(projectId, slug, "TXN-MATERIAL-PG-3603-CREATE"));
+    await createSyntheticProject(projectId, slug, "TXN-MATERIAL-PG-3603-CREATE");
 
     const before = await status(projectId);
     expect(before).toMatchObject({
@@ -195,7 +208,7 @@ describe("ProjectGuard asynchronous materialization", () => {
   it("fails closed when the V2 admin writer is not activated", async () => {
     const projectId = "PRJ-3604";
     const slug = "sync-materialize";
-    await submit(projectId, createTx(projectId, slug, "TXN-MATERIAL-PG-3604-CREATE"));
+    await createSyntheticProject(projectId, slug, "TXN-MATERIAL-PG-3604-CREATE");
 
     const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
       "https://project-guard.internal/materialize",
@@ -215,7 +228,7 @@ describe("ProjectGuard asynchronous materialization", () => {
   it("reconcile-materialization requeues current canonical state without changing the business revision", async () => {
     const projectId = "PRJ-3605";
     const slug = "reconcile-materialization";
-    await submit(projectId, createTx(projectId, slug, "TXN-MATERIAL-PG-3605-CREATE"));
+    await createSyntheticProject(projectId, slug, "TXN-MATERIAL-PG-3605-CREATE");
 
     const stub = testEnv.PROJECT_GUARD.getByName(projectId);
     const response = await stub.fetch("https://project-guard.internal/reconcile-materialization", { method: "POST" });

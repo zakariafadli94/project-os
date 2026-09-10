@@ -143,6 +143,12 @@ export interface VerifiedCanonical {
   project_id: string;
   state: import("../domain/project-state").ProjectState;
   record: import("../domain/commit-record").CanonicalCommitRecord | null;
+  /**
+   * Immutable records read while discovering this contiguous window. Reusing
+   * them is required for bounded catch-up: rereading a long window would
+   * consume the entire slice before any repair can start.
+   */
+  records: readonly import("../domain/commit-record").CanonicalCommitRecord[];
   baseline_kind: "commit" | "pre_commit001";
   complete: boolean;
 }

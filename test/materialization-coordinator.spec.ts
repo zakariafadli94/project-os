@@ -20,6 +20,7 @@ import {
   type ProjectionWriterPort
 } from "../src/materialization/coordinator";
 import { projectionIndexRootHash } from "../src/materialization/hash";
+import type { FinalVerificationItem } from "../src/materialization/ledger";
 import type { ProjectionPlan } from "../src/materialization/planner";
 import { createSliceBudget } from "../src/convergence/budget";
 import type { SliceBudget } from "../src/convergence/contract";
@@ -113,6 +114,7 @@ class FakeRepository implements MaterializationRepositoryPort {
   recordReads = 0;
   failHeadOnce = false;
   headAfterWrite: MaterializationHead | null = null;
+  beforeRecordWrite: (() => void) | null = null;
 
   async readCommitRecord(_projectId: string, revision: number) { return this.commits.get(revision) ?? null; }
   async readMaterializationHead() { return this.head; }
@@ -131,6 +133,7 @@ class FakeRepository implements MaterializationRepositoryPort {
     const existing = this.records.get(key);
     if (existing && JSON.stringify(existing) !== JSON.stringify(record)) throw new Error("immutable conflict");
     if (!existing) {
+      this.beforeRecordWrite?.();
       this.records.set(key, record);
       this.recordWrites += 1;
       this.writeOrder.push("record");
@@ -155,6 +158,7 @@ class FakeLedger implements MaterializationLedgerPort {
   active: { revision: number; projection_version: number; coalesced_revisions: number[] } | null = null;
   baseline = new Map<string, ProjectionOutputEvidence>();
   attempts = new Map<string, ProjectionOutputEvidence>();
+  pendingFinalVerification: FinalVerificationItem[] | null = null;
   lastError: string | null = null;
   nextCoalesced: number[] = [];
 
@@ -175,6 +179,15 @@ class FakeLedger implements MaterializationLedgerPort {
   }
   recordVerifiedOutput(key: string, evidence: ProjectionOutputEvidence) { this.attempts.set(key, evidence); }
   attemptOutputs() { return new Map(this.attempts); }
+  finalVerificationActive() { return this.pendingFinalVerification !== null; }
+  beginFinalVerification(items: readonly FinalVerificationItem[]) {
+    if (this.pendingFinalVerification === null) this.pendingFinalVerification = [...items].sort((left, right) => left.key.localeCompare(right.key));
+  }
+  finalVerificationPending() { return [...(this.pendingFinalVerification ?? [])]; }
+  completeFinalVerification(keys: readonly string[]) {
+    const completed = new Set(keys);
+    this.pendingFinalVerification = (this.pendingFinalVerification ?? []).filter((item) => !completed.has(item.key));
+  }
   baselineOutputs() { return new Map(this.baseline); }
   failActive(message: string) { this.lastError = message; }
   completeTarget(input: { revision: number; projection_version: number; outputs: ReadonlyMap<string, ProjectionOutputEvidence>; removed_outputs: readonly string[] }) {
@@ -184,6 +197,7 @@ class FakeLedger implements MaterializationLedgerPort {
     if (this.requested?.projection_version === input.projection_version && this.requested.revision <= input.revision) this.requested = null;
     this.active = null;
     this.attempts.clear();
+    this.pendingFinalVerification = null;
     this.lastError = null;
   }
   restoreExternalBaseline(head: { revision: number; projection_version: number }, outputs: ReadonlyMap<string, ProjectionOutputEvidence>) {
@@ -192,13 +206,14 @@ class FakeLedger implements MaterializationLedgerPort {
     if (this.requested?.projection_version === head.projection_version && this.requested.revision <= head.revision) this.requested = null;
     this.active = null;
     this.attempts.clear();
+    this.pendingFinalVerification = null;
   }
   status() {
     return {
       head: this.head,
       requested: this.requested,
       active: this.active,
-      active_status: this.active ? "running" : null,
+      active_status: this.active ? (this.pendingFinalVerification === null ? "running" : "verifying") : null,
       last_error: this.lastError,
       output_count: this.baseline.size,
       attempt_output_count: this.attempts.size
@@ -215,6 +230,7 @@ class FakeWriter implements ProjectionWriterPort {
   verifyOutputCalls = 0;
   verifiedOutputKeys: string[][] = [];
   failVerificationOnCall: number | null = null;
+  onVerifyOutputs: (() => void) | null = null;
 
   async materialize(plan: ProjectionPlan, options: {
     workspaceRoot: string;
@@ -260,6 +276,7 @@ class FakeWriter implements ProjectionWriterPort {
     // coverage exercises the real writer against the Dropbox mock.
     this.verifyOutputCalls += 1;
     this.verifiedOutputKeys.push([...outputs.keys()].sort());
+    this.onVerifyOutputs?.();
   }
 }
 
@@ -305,6 +322,70 @@ describe("MaterializationCoordinator", () => {
     expect(Object.keys(completed.outputs).length).toBe(completed.total_output_count);
     expect(repo.writeOrder).toEqual(["record", "head"]);
     expect(repo.head?.target_revision).toBe(record.new_revision);
+  });
+
+  it("revalidates every changed output before a bounded slice publishes its generation", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const writer = new FakeWriter();
+    writer.onVerifyOutputs = () => expect(repo.recordWrites).toBe(0);
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, new FakeLedger(), writer, CURRENT_PROJECTION_VERSION, budget);
+
+    value.requestTarget(record.new_revision);
+    await value.runNext();
+
+    expect(writer.verifyOutputCalls).toBe(1);
+    expect(writer.verifiedOutputKeys[0]).toEqual([
+      "global:BRIEF",
+      "global:DISCOVERY",
+      "global:HANDOFF",
+      "global:OPERATING",
+      "global:PLAN",
+      "global:PROJECT",
+      "global:ROADMAP",
+      "global:STATE"
+    ]);
+    expect(repo.writeOrder).toEqual(["record", "head"]);
+  });
+
+  it("retains the last final-verification batch until record publication", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    const ledger = new FakeLedger();
+    repo.commits.set(record.new_revision, record);
+    repo.beforeRecordWrite = () => {
+      expect(ledger.finalVerificationPending()).toHaveLength(8);
+    };
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, ledger, new FakeWriter(), CURRENT_PROJECTION_VERSION, budget);
+
+    value.requestTarget(record.new_revision);
+    await value.runNext();
+
+    expect(ledger.finalVerificationPending()).toEqual([]);
+  });
+
+  it("revalidates the complete resulting index before a bounded delta publishes its head", async () => {
+    const first = createFixture();
+    const second = committed(first.state, "task.create", {
+      task_id: "TASK-3501",
+      title: "Fresh task"
+    });
+    const repo = new FakeRepository();
+    repo.commits.set(first.new_revision, first);
+    repo.commits.set(second.new_revision, second);
+    const writer = new FakeWriter();
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, new FakeLedger(), writer, CURRENT_PROJECTION_VERSION, budget);
+
+    value.requestTarget(first.new_revision);
+    await value.runNext();
+    value.requestTarget(second.new_revision);
+    await value.runNext();
+
+    expect(writer.verifiedOutputKeys.at(-1)).toEqual([...writer.plans.at(-1)!.expected_output_keys].sort());
   });
 
   it("does not re-materialize canonical derivatives when convergence already verified them", async () => {

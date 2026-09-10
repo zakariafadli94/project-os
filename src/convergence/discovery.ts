@@ -1,6 +1,7 @@
 import type { ProjectRepository } from "../persistence/repository";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { Progress, SliceBudget, VerifiedCanonical } from "./contract";
+import type { CanonicalCommitRecord } from "../domain/commit-record";
 
 const MAX_DISCOVERY_RECORDS = 128;
 
@@ -22,6 +23,7 @@ export async function discoverCanonical(
 ): Promise<VerifiedCanonical | null> {
   let cursor = progress.canonical_observed_revision;
   let latest: VerifiedCanonical | null = null;
+  const records: CanonicalCommitRecord[] = [];
 
   for (let read = 0; read < MAX_DISCOVERY_RECORDS; read += 1) {
     if (!budget.canStartEffect(1)) {
@@ -33,10 +35,12 @@ export async function discoverCanonical(
       throw new Error("canonical_commit_chain_gap");
     }
     cursor = record.new_revision;
+    records.push(record);
     latest = {
       project_id: record.project_id,
       state: record.state,
       record,
+      records,
       baseline_kind: "commit",
       complete: true
     };

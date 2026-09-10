@@ -36,6 +36,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
   const revisions = new Map<string, number>();
   const changeJournal: MockChangeEntry[] = [];
   const calls: string[] = [];
+  const providerCalls: Array<{ endpoint: string; paths: string[] }> = [];
   const uploadCalls: string[] = [];
   const downloadCalls: string[] = [];
   const conditionalDeleteCalls: Array<{ path: string; parent_rev?: string }> = [];
@@ -139,6 +140,10 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       } catch {
         // Non-JSON payloads are valid for Dropbox content endpoints and are ignored here.
       }
+    }
+
+    if (url.pathname.startsWith("/2/files/")) {
+      providerCalls.push({ endpoint: `${request.method} ${url.pathname}`, paths: [...requestPaths] });
     }
 
     if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/upload" && apiPath) {
@@ -380,6 +385,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
   return {
     files,
     calls,
+    providerCalls,
     spy,
     uploadCalls,
     downloadCalls,

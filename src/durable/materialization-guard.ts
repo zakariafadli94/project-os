@@ -558,3 +558,24 @@ export class MaterializationGuard extends DurableObject<Env> {
 }
 
 function isMaterializationTargetRequestBody(value: unknown): value is MaterializationTargetRequestBody {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<MaterializationTargetRequestBody>;
+  return typeof candidate.project_id === "string"
+    && /^PRJ-[0-9]{4,}$/.test(candidate.project_id)
+    && Number.isSafeInteger(candidate.revision)
+    && (candidate.revision as number) >= 0
+    && Number.isSafeInteger(candidate.projection_version)
+    && (candidate.projection_version as number) >= 1;
+}
+
+function structuredMaterializationError(projectId: string, error: unknown) {
+  return {
+    project_id: projectId,
+    projection_version: CURRENT_PROJECTION_VERSION,
+    error_name: error instanceof Error ? error.name : "UnknownError",
+    message: error instanceof Error ? error.message : String(error),
+    ...(error instanceof MaterializationOutputConflictError
+      ? { output_key: error.key, path: error.path }
+      : {})
+  };
+}

@@ -94,6 +94,7 @@ export interface MaterializationCoordinatorOptions {
   now?: () => string;
   sliceBudget?: SliceBudget;
   canonicalDerivativesAlreadyCurrent?: boolean;
+  verifyExistingCriticalPairOnly?: boolean;
 }
 
 export interface MaterializationRunResult {
@@ -121,6 +122,7 @@ export class MaterializationCoordinator {
   private readonly now: () => string;
   private readonly sliceBudget: SliceBudget | undefined;
   private readonly canonicalDerivativesAlreadyCurrent: boolean;
+  private readonly verifyExistingCriticalPairOnly: boolean;
 
   constructor(options: MaterializationCoordinatorOptions) {
     this.projectId = options.projectId;
@@ -135,6 +137,7 @@ export class MaterializationCoordinator {
     this.now = options.now ?? (() => new Date().toISOString());
     this.sliceBudget = options.sliceBudget;
     this.canonicalDerivativesAlreadyCurrent = options.canonicalDerivativesAlreadyCurrent ?? false;
+    this.verifyExistingCriticalPairOnly = options.verifyExistingCriticalPairOnly ?? false;
   }
 
   requestTarget(revision: number, projectionVersion = this.projectionVersion): void {
@@ -509,7 +512,10 @@ export class MaterializationCoordinator {
     if (!this.writer.verifyOutputs) {
       throw new Error("Completed materialization repair requires full-output verification");
     }
-    await this.writer.verifyOutputs(baseline.outputs, root);
+    const outputs = this.verifyExistingCriticalPairOnly
+      ? criticalPairEvidence(baseline.outputs)
+      : baseline.outputs;
+    await this.writer.verifyOutputs(outputs, root);
   }
 
   private async archiveWorkspaceOrConflict(state: ProjectState, activeRoot: string): Promise<void> {
@@ -534,6 +540,21 @@ export class MaterializationCoordinator {
     const status = this.ledger.status();
     return status.active !== null || status.requested !== null;
   }
+}
+
+function criticalPairEvidence(
+  outputs: ReadonlyMap<string, ProjectionOutputEvidence>
+): Map<string, ProjectionOutputEvidence> {
+  const pair = new Map(
+    [...outputs].filter(([, evidence]) =>
+      evidence.relative_path === "STATE.md" || evidence.relative_path === "HANDOFF.md"
+    )
+  );
+  const paths = new Set([...pair.values()].map((evidence) => evidence.relative_path));
+  if (pair.size !== 2 || paths.size !== 2 || !paths.has("STATE.md") || !paths.has("HANDOFF.md")) {
+    throw new Error("Completed materialization record is missing the critical STATE/HANDOFF pair");
+  }
+  return pair;
 }
 
 export async function rebuildProjectionBaseline(

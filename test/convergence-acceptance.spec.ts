@@ -87,6 +87,34 @@ describe("post-commit convergence acceptance", () => {
     });
   });
 
+  it("keeps a human projection pending when reconciliation reaches its slice boundary", async () => {
+    installDropboxMock();
+    const baseRuntime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9273", 1)[0];
+    const baseRepository = new ProjectRepository(baseRuntime, "v2");
+    await baseRepository.writeCommitRecord(record);
+    const constrainedRuntime = {
+      ...baseRuntime,
+      objects: {
+        ...baseRuntime.objects,
+        async readText(path: string) {
+          if (path === machineMaterializationHeadPath(record.project_id)) {
+            throw new Error("Dropbox read failed: slice_budget_exhausted");
+          }
+          return baseRuntime.objects.readText(path);
+        }
+      }
+    };
+
+    await expect(runHumanSlice({
+      record,
+      repository: new ProjectRepository(constrainedRuntime, "v2"),
+      runtime: constrainedRuntime,
+      ledger: new AcceptanceLedger(),
+      budget: createSliceBudget(() => 0, new AbortController().signal)
+    })).resolves.toEqual({ complete: false, more_work: true });
+  });
+
   it("marks the human pair current only after revision-258 generation and head are verified", async () => {
     const mock = installDropboxMock();
     const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));

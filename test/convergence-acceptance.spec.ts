@@ -216,6 +216,45 @@ describe("post-commit convergence acceptance", () => {
     expect(mock.files.get(`${workspaceProjectRoot(record.project_id, record.state.slug)}/HANDOFF.md`)).toContain("Revision: 258");
   });
 
+  it("reopens a completed human continuation when its published head is missing", async () => {
+    const mock = installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9276", 1)[0]!;
+    const repository = new ProjectRepository(runtime, "v2");
+    await repository.writeCommitRecord(record);
+    await repository.materializeCanonicalDerivatives(record);
+    await runHumanSlice({ record, repository, runtime, ledger: new AcceptanceLedger() });
+    mock.files.delete(machineMaterializationHeadPath(record.project_id));
+
+    const journal = new ConvergenceJournal(runtime, record.project_id);
+    const progress = initialProgress(record.project_id, "1970-01-01T00:00:00.000Z", "reopen-head");
+    progress.active = { revision: record.new_revision, projection_version: 3 };
+    progress.obligations["a".repeat(64)] = {
+      id: "a".repeat(64), layer: "human_handoff", from_revision: 0,
+      target: { revision: record.new_revision, projection_version: 3 }, incident: 1,
+      state: "verified", first_pending_at: "1970-01-01T00:00:00.000Z",
+      next_attempt_at: null, failure_count: 0, last_attempt_number: 1,
+      last_closed_attempt_number: 1, last_verified_at: "1970-01-01T00:00:00.000Z",
+      code: null, lease_until: null, continuation: "verify"
+    };
+    await journal.save(progress, null);
+    const engine = new ConvergenceEngine({
+      projectId: record.project_id, repository, runtime, journal,
+      ledger: new AcceptanceLedger() as never, now: () => 0, enableHuman: true
+    });
+
+    await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+
+    const saved = await journal.load();
+    expect(saved?.progress.obligations["a".repeat(64)]?.continuation).toBeNull();
+
+    await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+    expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
+      target_revision: record.new_revision,
+      projection_version: 3
+    });
+  });
+
   it("does not let a PRJ-0003-shaped coalesced 264 generation hide a missing 263 event or receipt", async () => {
     const projectId = "PRJ-9263";
     const records = commitFixture(projectId, 264);

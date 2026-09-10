@@ -185,6 +185,34 @@ describe("MaterializationGuard isolation boundary", () => {
     });
   });
 
+  it("inspects a pending projection without scheduling or reconciling it", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3911";
+    await createProject(projectId, "diagnostic-read-only", "TXN-MATISO-3911-CREATE");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.deleteAlarm();
+    });
+
+    const response = await guard.fetch(
+      "https://materialization-guard.internal/diagnostic-status",
+      { method: "GET" }
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      project_id: projectId,
+      canonical_revision: 1,
+      diagnostic: {
+        read_only: true,
+        final_verification_pending_count: 0,
+        managed_zones_ready: false
+      }
+    });
+    await runInDurableObject(guard, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
   it("hands a committed canonical revision to MaterializationGuard automatically", async () => {
     installDropboxMock();
     const projectId = "PRJ-3909";

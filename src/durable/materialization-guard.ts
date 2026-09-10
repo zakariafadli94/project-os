@@ -68,6 +68,9 @@ export class MaterializationGuard extends DurableObject<Env> {
     if (request.method === "GET" && url.pathname === "/status") {
       return this.serialize(() => this.handleStatus());
     }
+    if (request.method === "GET" && url.pathname === "/diagnostic-status") {
+      return this.serialize(() => this.handleDiagnosticStatus());
+    }
     if (request.method === "GET" && url.pathname === "/capacity") {
       return this.serialize(() => this.handleCapacity());
     }
@@ -161,6 +164,45 @@ export class MaterializationGuard extends DurableObject<Env> {
       ? await this.observeConvergence()
       : undefined;
     return Response.json(this.statusResponse(state, convergence));
+  }
+
+  /**
+   * Returns only durable convergence and materialization cursors. Unlike the
+   * operational status endpoint, this diagnostic path never reconciles,
+   * schedules, or repairs; it is safe to use while investigating a stalled
+   * writer without perturbing its next slice.
+   */
+  private async handleDiagnosticStatus(): Promise<Response> {
+    const { repository } = this.coordinatorForSlice(false);
+    const state = await this.canonicalState(repository);
+    if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+    const status = this.ledger.status();
+    const saved = await new ConvergenceJournal(
+      createProductionPersistence(this.env, this.projectId),
+      this.projectId
+    ).load();
+    const human = Object.values(saved?.progress.obligations ?? {}).find((obligation) =>
+      obligation.layer === "human_handoff" && obligation.target.revision === state.revision
+    );
+    return Response.json({
+      ...this.statusResponse(state),
+      diagnostic: {
+        read_only: true,
+        active_status: status.active_status,
+        final_verification_pending_count: this.ledger.finalVerificationPending().length,
+        managed_zones_ready: this.ledger.managedZoneBootstrapReady(),
+        human_handoff: human
+          ? {
+              state: human.state,
+              first_pending_at: human.first_pending_at,
+              next_attempt_at: human.next_attempt_at,
+              code: human.code,
+              last_attempt_number: human.last_attempt_number
+            }
+          : null,
+        next_alarm_at: saved?.progress.next_alarm_at ?? null
+      }
+    });
   }
 
   /**

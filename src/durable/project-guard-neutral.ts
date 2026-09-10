@@ -181,6 +181,10 @@ export class ProjectGuard extends DurableObject<Env> {
       return this.forwardMaterializationRequest(request, "/status");
     }
 
+    if (request.method === "GET" && pathname === "/materialization-diagnostic-status") {
+      return this.forwardMaterializationRequest(request, "/diagnostic-status");
+    }
+
     if (request.method === "POST" && pathname === "/reconcile-materialization") {
       return this.forwardMaterializationRequest(request, "/reconcile");
     }

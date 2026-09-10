@@ -82,3 +82,9 @@ Local convergence and admission tests are complete, and the production continuit
 The final local rectification gate at `b7bca495c4805256db49b8db937d4b4ffc133176` passed the complete 201-file / 971-test suite, static contracts, the 26-file / 148-test persistence gate, and a bundle-only Wrangler dry-run. It does not alter the continuity decision: owner-compatible promotion/fallback integration, monitoring ACK/recovery, and an isolated 24-hour canary are still absent. No activation, deployment, canonical Dropbox mutation, or PRJ-0003 repair occurred.
 
 The last local hardening SHA `d63578252e7d64329540ce001ad0dc908d906454` bounds a monitoring acknowledgement body that stalls after the HTTP response. The new regression was red before correction, then the full 201-file / 972-test suite, static gates, persistence gate, and direct bundle-only dry-run passed. Continuity remains `stable`: this local timeout proof is not an external monitoring ACK, canary, activation, deployment, or permission to repair PRJ-0003.
+
+## 2026-09-10 isolated canary state
+
+Continuity remains `stable` for every real project. The only enabled convergence writer is synthetic PRJ-0008 on Worker version `7e624e43-d288-4cf5-97bd-cbc43c11aa33`; its ordinary current-state materialization is verified at revision 2 / projection version 3. The live historical admission reader can now read PRJ-0003 revision 267, but PRJ-0003 remains in the stable path with no writer activation, canonical mutation, or repair.
+
+The new Worker deployment began the 24-hour isolated qualification window at `2026-09-10T17:26:03Z`. The deferred human-alert policy changes only the human-delivery ACK requirement. Reader compatibility, fencing, recovery, capacity, transport, rollback compatibility, and the full canary window remain mandatory before any extension.

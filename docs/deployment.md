@@ -534,3 +534,15 @@ Implementation SHA `d63578252e7d64329540ce001ad0dc908d906454` closes the final l
 The operator has deliberately deferred every human-facing notification channel. Implementation commit `de7cd36` adds an explicit `HumanAlertPolicy`: rollout evidence remains fail-closed by default, while an explicitly recorded `deferred` policy excludes only `notification_ack_proven` from `rolloutBlockers`. The acknowledgement field remains false; durable incidents, delivery retries, and structured metrics remain unchanged. No Cloudflare variable, notification provider, deployment, canary, canonical Dropbox mutation, merge, or PRJ-0003 repair was performed.
 
 This operational-policy exception supersedes only the previous requirement for a human-delivery ACK. Owner-compatible integration, complete transport, reader/writer compatibility, fencing, RegistryGuard continuation, qualified capacity and recovery, and isolated canary qualification remain production gates.
+
+## 22. Isolated canary evidence and remaining time gate (2026-09-10)
+
+The current production canary runs Worker version `7e624e43-d288-4cf5-97bd-cbc43c11aa33`, deployed at 100% at `2026-09-10T17:26:03.400882Z` with the deployment annotation `Preserve verified canary and legacy admission`. Its source archive was assembled from retained `main` `c9c9fde26daf7ea82db2503acfc7b52c573e3c47`; `/health` reports that exact Worker version but intentionally does not claim an embedded Git SHA.
+
+The sole active convergence writer configuration is `PRJ-0008: repair`. A real authenticated materialization request for this synthetic canary returned `materialized` at canonical revision 2. Its durable materialization head is revision 2 / projection version 3, and the corresponding human handoff is durably verified. The read-only diagnostic endpoint may still display bounded layer observations as `unknown`; it does not reconcile or repair, and it is not used as a false negative after the durable verified-target evidence has established currentness.
+
+The same deployment returned a fresh authenticated mutation context for PRJ-0003 at canonical revision 267. This proves the historical-snapshot admission reader is live; it does not enable a PRJ-0003 writer, start a repair, or alter Dropbox.
+
+GitHub Actions run `34507075052` passed its complete CI job on the merged source, and the exact source also passed the local full suite (203 files / 1,015 tests), static checks, and a Cloudflare dry run. Human-facing alert delivery remains deliberately deferred under the policy recorded above; immutable incidents, retry state, and payload-free metrics remain enabled.
+
+The isolated canary's required 24-hour qualification clock starts from this current deployment. No extension, PRJ-0003 activation, or canonical repair is permitted before `2026-09-11T17:26:03Z`, and it additionally requires the planned observation, recovery, capacity, and rollback evidence to remain satisfactory. No deliberate fault is injected into PRJ-0003.

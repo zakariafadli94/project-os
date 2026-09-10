@@ -66,3 +66,7 @@ The acceptance suite also models the observed PRJ-0003 263→264 shape under the
 At implementation SHA `b7bca495c4805256db49b8db937d4b4ffc133176`, this regression and the virtual capacity qualification ran inside the 201-file / 971-test local suite; the separate 26-file / 148-test persistence gate also passed. These results are deterministic fixture evidence only and do not authorize a real-project failpoint, canary, deployment, or PRJ-0003 repair.
 
 Implementation SHA `d63578252e7d64329540ce001ad0dc908d906454` adds a deterministic monitoring-boundary case: a successful HTTPS response with a body that never resolves must become an unacknowledged delivery at the same five-second deadline, not stall the serialized repair slice. It was red before the implementation and green after it; the complete local suite then passed 201 files / 972 tests. This fixture exercises no real endpoint or project.
+
+## 2026-09-10 canary boundary
+
+The production canary has not used fault injection. It is limited to synthetic PRJ-0008, where an ordinary authenticated materialization returned revision 2 as current after its durable human handoff was verified. The follow-up read-only admission check for PRJ-0003 returned its existing revision 267 and performed no mutation. Production fault, retry-exhaustion, rollback, or recovery exercises continue to use only synthetic fixtures; PRJ-0003 remains excluded.

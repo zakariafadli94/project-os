@@ -46,7 +46,7 @@ export async function observeText(
  * any newer checkpoint fences the old worker before it reaches Dropbox.
  */
 export class FencedEffects {
-  private readonly prepared = new Map<string, { token: string; incarnation: string }>();
+  private readonly prepared = new Map<string, { token: string; incarnation: string; intent: EffectIntent }>();
 
   constructor(
     private readonly runtime: ProjectOsPersistenceRuntime,
@@ -59,12 +59,12 @@ export class FencedEffects {
     // The caller keeps this same progress object for the rest of its slice.
     progress.effects[intent.id] = preparedIntent;
     const saved = await this.journal.save({ ...progress, effects: { ...progress.effects } }, token);
-    this.prepared.set(intent.id, { token: saved, incarnation: progress.incarnation });
+    this.prepared.set(intent.id, { token: saved, incarnation: progress.incarnation, intent: preparedIntent });
     return saved;
   }
 
   async replace(intent: EffectIntent, content: string): Promise<ObservedText> {
-    await this.assertPrepared(intent);
+    this.assertPrepared(intent);
     if (intent.desired_hash && intent.desired_hash !== await sha256Text(content)) {
       throw new Error("effect_desired_hash_mismatch");
     }
@@ -102,17 +102,15 @@ export class FencedEffects {
     return observeText(this.runtime, path);
   }
 
-  private async assertPrepared(intent: EffectIntent): Promise<void> {
+  private assertPrepared(intent: EffectIntent): void {
     const prepared = this.prepared.get(intent.id);
     if (!prepared) throw new Error("effect_not_prepared");
-    const current = await this.journal.load();
-    if (
-      !current
-      || current.token !== prepared.token
-      || current.progress.incarnation !== prepared.incarnation
-      || !sameIntent(current.progress.effects[intent.id], intent)
-    ) {
-      throw new Error("fencing_checkpoint_changed");
+    // MaterializationGuard serializes this owner. A cold restart loses the
+    // in-memory capability and therefore cannot issue an effect; it must
+    // rebuild intent and reservation first. Avoiding a second journal read
+    // here leaves the bounded slice for the guarded provider write itself.
+    if (!prepared.token || !prepared.incarnation || !sameIntent(prepared.intent, intent)) {
+      throw new Error("effect_not_prepared");
     }
   }
 
@@ -121,9 +119,8 @@ export class FencedEffects {
   }
 }
 
-function sameIntent(left: EffectIntent | undefined, right: EffectIntent): boolean {
-  return left !== undefined
-    && left.id === right.id
+function sameIntent(left: EffectIntent, right: EffectIntent): boolean {
+  return left.id === right.id
     && left.path === right.path
     && left.destination === right.destination
     && left.kind === right.kind

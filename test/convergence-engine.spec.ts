@@ -495,6 +495,43 @@ describe("convergence engine scheduling", () => {
     expect(obligation).toMatchObject({ state: "verified", failure_count: 1, last_attempt_number: 2 });
   });
 
+  it("resumes a due pending machine continuation before rediscovering the canonical log", async () => {
+    const record = commitFixture("PRJ-9271", 1)[0];
+    const mock = installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const repository = new ProjectRepository(runtime, "v2");
+    await repository.writeCommitRecord(record);
+    await repository.writeReceipt(record.receipt);
+    const journal = new ConvergenceJournal(runtime, record.project_id);
+    const progress = initialProgress(record.project_id, "1970-01-01T00:00:00.000Z", "writer-1");
+    const obligationId = await sha256Canonical({
+      project_id: record.project_id, layer: "event", revision: record.new_revision
+    });
+    progress.canonical_observed_revision = record.new_revision;
+    progress.obligations[obligationId] = {
+      id: obligationId, layer: "event", from_revision: record.previous_revision,
+      target: { revision: record.new_revision, projection_version: 3 }, incident: 1,
+      state: "pending", first_pending_at: "1970-01-01T00:00:00.000Z",
+      next_attempt_at: "1970-01-01T00:00:00.000Z", failure_count: 0,
+      last_attempt_number: 0, last_closed_attempt_number: 0, last_verified_at: null,
+      code: "slice_budget_pending", lease_until: null, continuation: null
+    };
+    await journal.save(progress, null);
+    const engine = new ConvergenceEngine({
+      projectId: record.project_id, repository, runtime, journal, ledger: {} as never, now: () => 0
+    });
+
+    const result = await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+
+    expect(result.health.layers.event.state).toBe("current");
+    expect(mock.files.get(machineEventPath(record.project_id, record.event.event_id))).toBe(
+      repository.canonicalDerivativeText("event", record)
+    );
+    expect((await journal.load())?.progress.obligations[obligationId]).toMatchObject({
+      state: "verified", code: null, last_attempt_number: 1
+    });
+  });
+
   it("checkpoints a bounded continuation before scoped provider capacity is exhausted", async () => {
     installDropboxMock();
     const record = commitFixture("PRJ-9269", 1)[0];

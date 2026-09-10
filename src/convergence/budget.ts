@@ -7,7 +7,7 @@ const CHECKPOINT_CALL_RESERVE = 4;
 // Stop starting multi-call effects early, allow an already-started Dropbox
 // operation to settle, then retain a separate window for durable checkpoints.
 const EFFECT_START_TIME_RESERVE_MS = 6_000;
-const CHECKPOINT_TIME_RESERVE_MS = 3_000;
+const CHECKPOINT_TIME_RESERVE_MS = 6_000;
 
 export function createSliceBudget(now: () => number, signal: AbortSignal): SliceBudget {
   const budget: SliceBudget = {

@@ -25,14 +25,14 @@ describe("convergence slice budget", () => {
 
     for (let index = 0; index < 32; index += 1) scope.beforeHttp();
     expect(() => scope.beforeHttp()).toThrow("slice_budget_exhausted");
-    expect(scope.deadlineMs).toBe(7_000);
+    expect(scope.deadlineMs).toBe(4_000);
   });
 
   it("stops provider work before the deadline reserved for the durable checkpoint", () => {
     let now = 0;
     const budget = createSliceBudget(() => now, new AbortController().signal);
 
-    expect(providerRequestScopeFor(budget).deadlineMs).toBe(7_000);
+    expect(providerRequestScopeFor(budget).deadlineMs).toBe(4_000);
     expect(providerCheckpointScopeFor(budget).deadlineMs).toBe(10_000);
     now = 4_000;
     expect(budget.canStartEffect(1)).toBe(false);

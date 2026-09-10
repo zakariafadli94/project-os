@@ -287,6 +287,12 @@ The final local code gate at `b7bca495c4805256db49b8db937d4b4ffc133176` adds the
 
 The follow-up implementation SHA `d63578252e7d64329540ce001ad0dc908d906454` keeps the monitoring receiver within its five-second bound even when its HTTP response arrives but its acknowledgement body stalls. The test was red before the fix and the full local suite then passed 201 files / 972 tests, with the same 26-file / 148-test persistence gate and a bundle-only Wrangler dry-run. No monitoring endpoint was configured or acknowledged in production.
 
+## 2026-09-10 production canary observation
+
+Worker version `7e624e43-d288-4cf5-97bd-cbc43c11aa33` is an isolated writer canary for synthetic PRJ-0008 only. A real authenticated materialization request returned revision 2 as materialized, with its durable head at projection version 3 and a verified human handoff. The response is based on durable target evidence rather than requiring a second unbounded provider scan: the separate diagnostic reader intentionally remains bounded and reports `unknown` when it cannot finish a fresh observation inside its read-only slice.
+
+This version also restored the read-only historical-snapshot admission path: PRJ-0003's authenticated mutation context reads canonical revision 267. It makes no mutation and does not authorize ProjectGuard to repair that project. The canary must run for the separately recorded 24-hour qualification period before any project extension. Human alert delivery is deferred only as documented above; it does not disable incident records, retry reservations, or structured metrics.
+
 ## User experience
 
 No normal user command is introduced.

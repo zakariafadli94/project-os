@@ -4,7 +4,10 @@ import type { ProviderRequestScope } from "../persistence/provider/contract";
 const MAX_PROVIDER_CALLS = 32;
 const SLICE_DURATION_MS = 10_000;
 const CHECKPOINT_CALL_RESERVE = 4;
-const CHECKPOINT_TIME_RESERVE_MS = 1_000;
+// Dropbox tail latency in production regularly exceeds one second.
+// Keep enough wall time for incident persistence plus the final conditional
+// progress checkpoint after ordinary repair work has yielded.
+const CHECKPOINT_TIME_RESERVE_MS = 4_000;
 
 export function createSliceBudget(now: () => number, signal: AbortSignal): SliceBudget {
   const budget: SliceBudget = {
@@ -38,7 +41,7 @@ export function providerRequestScopeFor(budget: SliceBudget): ProviderRequestSco
 }
 
 /**
- * Checkpoint writes use the final reserved second of the slice. Provider work
+ * Checkpoint writes use the final reserved window of the slice. Provider work
  * is aborted before this boundary so an unexpectedly slow Dropbox request
  * cannot consume the only window in which durable progress can be saved.
  */

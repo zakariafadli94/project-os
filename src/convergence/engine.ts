@@ -168,6 +168,7 @@ export class ConvergenceEngine {
       && Date.parse(checkpoint.progress.next_alarm_at) <= this.input.now()
     ) checkpoint.progress.next_alarm_at = null;
     const health = this.blankHealth(checkpoint.progress.first_observed_at);
+    try {
     const resumed = await this.resumeDueMachineObligation(checkpoint, budget, health);
     if (resumed) return finish(resumed);
     const resumedHuman = await this.resumePendingHumanSlice(checkpoint, budget, health);
@@ -451,6 +452,25 @@ export class ConvergenceEngine {
       next_alarm_at: progress.next_alarm_at,
       provider_calls: 32 - budget.calls_left
     }, true);
+    } catch (error) {
+      if (!isSliceBudgetExhaustion(error)) throw error;
+      const nextAlarmAt = new Date(this.input.now()).toISOString();
+      checkpoint.progress.next_alarm_at = nextAlarmAt;
+      try {
+        await this.input.journal.save(checkpoint.progress, checkpoint.token);
+      } catch (checkpointError) {
+        // Effects are always prepared and reserved before they are issued.
+        // If the final checkpoint itself reaches the deadline, a fresh slice
+        // reconstructs that durable reservation rather than guessing success.
+        if (!isSliceBudgetExhaustion(checkpointError)) throw checkpointError;
+      }
+      return finish({
+        health,
+        more_work: true,
+        next_alarm_at: nextAlarmAt,
+        provider_calls: 32 - budget.calls_left
+      });
+    }
   }
 
   private async ensureProgress() {
@@ -1066,6 +1086,10 @@ async function retryFromUncheckpointedAttempt(input: {
     lease_until: null,
     continuation: null
   };
+}
+
+function isSliceBudgetExhaustion(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("slice_budget_exhausted");
 }
 
 function markHumanLayersNotApplicable(health: ConvergenceHealth): void {

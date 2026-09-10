@@ -17,6 +17,10 @@ function resolutionRequest(token: string): Request {
   });
 }
 
+function withIngressToken(token: string | undefined): Env {
+  return { ...testEnv, INGRESS_TOKEN: token } as unknown as Env;
+}
+
 describe("MutationGate ephemeral operator authentication", () => {
   it("keeps the existing ingress token valid on candidate resolution", async () => {
     const response = await worker.fetch(
@@ -27,6 +31,32 @@ describe("MutationGate ephemeral operator authentication", () => {
 
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: "invalid_mutation_candidate_resolution" });
+  });
+
+  it("fails closed for absent, empty, and incorrect ingress tokens on candidate resolution", async () => {
+    const cases: Array<[Env, string]> = [
+      [withIngressToken(undefined), "undefined"],
+      [withIngressToken(""), ""],
+      [withIngressToken("configured-secret"), "wrong-secret"]
+    ];
+
+    for (const [candidateEnv, presentedToken] of cases) {
+      const response = await worker.fetch(
+        resolutionRequest(presentedToken),
+        candidateEnv,
+        createExecutionContext()
+      );
+      expect(response.status).toBe(401);
+    }
+
+    const configured = withIngressToken("configured-secret");
+    const accepted = await worker.fetch(
+      resolutionRequest("configured-secret"),
+      configured,
+      createExecutionContext()
+    );
+    expect(accepted.status).toBe(400);
+    expect(await accepted.json()).toMatchObject({ error: "invalid_mutation_candidate_resolution" });
   });
 
   it("accepts a current operator token only on candidate resolution", async () => {
@@ -53,6 +83,22 @@ describe("MutationGate ephemeral operator authentication", () => {
       body: "{}"
     }), operatorEnv, createExecutionContext());
     expect(transaction.status).toBe(401);
+  });
+
+  it("keeps a valid operator token usable when the ingress secret is absent", async () => {
+    const currentOperatorToken = `${Date.now()}.${"d".repeat(64)}`;
+    const operatorEnv = {
+      ...withIngressToken(undefined),
+      MUTATION_GATE_OPERATOR_TOKEN: currentOperatorToken
+    } as Env & { MUTATION_GATE_OPERATOR_TOKEN: string };
+
+    const response = await worker.fetch(
+      resolutionRequest(currentOperatorToken),
+      operatorEnv,
+      createExecutionContext()
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "invalid_mutation_candidate_resolution" });
   });
 
   it("rejects expired, future-skewed, and missing operator tokens", async () => {

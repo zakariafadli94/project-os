@@ -23,6 +23,28 @@ jobs:
             exit 1
           fi
       - run: npm ci
+      - name: Generate Worker types
+        run: npm run types
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Check persistence boundary
+        run: npm run check:persistence-boundary
+      - name: Check production promotion authority
+        run: npm run check:production-promotion-authority
+      - name: Check mutation gate repair workflow
+        run: npm run check:mutation-gate-repair-workflow
+      - name: Check INDEX001 remediation
+        run: npm run check:index001-remediation
+      - name: Check binary artifact ingress
+        run: npm run check:binary-artifact-ingress
+      - name: Check recovery workflow
+        run: npm run check:recover-inputs-workflow
+      - name: Test encrypted fallback ingress
+        run: npx vitest run test/fallback-ingress.spec.ts
+      - name: Test fallback relay workflow specification
+        run: npm run check:fallback-ingress-relay-workflow && npx vitest run test/fallback-ingress-relay-workflow.spec.ts
+      - name: Test fallback review remediation
+        run: npx vitest run test/mutation-gate-operator-auth.spec.ts test/fallback-ingress-sop.spec.ts
       - run: npm run test:index001
       - run: npm run check:persistence-boundary
       - run: npm run test:persistence-high-risk

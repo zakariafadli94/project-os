@@ -609,6 +609,23 @@ If Dropbox/ProjectGuard is unavailable:
 - refresh canonical state before retrying a durable canonical mutation;
 - refresh managed-document head/provider state before retrying a document mutation.
 
+### 25.1 Encrypted fallback ingress for ChatGPT Dropbox connector outages
+
+Use the encrypted fallback ingress only when the ChatGPT Dropbox connector is unavailable but GitHub and the production Project OS Worker remain available.
+
+- Dropbox and ProjectGuard remain canonical. GitHub is transport only.
+- Never place plaintext Project OS project data or transactions in GitHub issue comments. The relay may carry only the encrypted fallback envelope and encrypted response framing.
+- Retrieve the fallback public key and use the owner-only encrypted GitHub relay.
+- Small replies retain `PROJECT_OS_FALLBACK_RESPONSE_V1 <tag> <encrypted-json>`. Larger replies use `PROJECT_OS_FALLBACK_RESPONSE_PART_V1 <tag> <index>/<total> <fragment>`: collect exactly one of every index from the same relay run and unique request tag, require a consistent total, and concatenate fragments in index order before parsing and authenticated AES-GCM decryption. Verify the decrypted `request_id` against the original request. Missing, duplicate, mixed-run or unauthenticated parts are never usable canonical context or proof of a committed receipt; use a fresh request tag and key when retrying an incomplete exchange.
+- Relay responses are limited to 1 MiB of encrypted JSON, with at most 22 parts of 48,000 ASCII characters, paced between publications. `PROJECT_OS_FALLBACK_UNAVAILABLE_V1 <tag> response_too_large` means this transport cannot carry that context: do not repeat the same oversized request or treat a truncated context as authoritative; return to fail-closed non-durable work until a canonical read route is available. Requests must also fit GitHub's comment limit even though the Worker accepts envelopes up to 128 KiB.
+- First submit an encrypted `project_context` request to retrieve the current bounded canonical context and revision.
+- Construct any typed transaction using that current `base_revision` and a fresh unique `transaction_id`.
+- Submit the typed transaction through the encrypted `transaction` operation, which must route through the ordinary ProjectGuard transaction path.
+- Treat the mutation as durable only after decrypting and verifying a committed receipt/result from ProjectGuard; never infer persistence from relay delivery alone.
+- On retry, conflict, timeout, or uncertain result, refresh canonical context before retrying. Reuse the same transaction only when its idempotent `transaction_id` is intentionally being checked; never silently resolve a business-direction conflict.
+- If the encrypted fallback path itself is unavailable, remain in the fail-closed non-durable mode above and keep intended mutations separate from committed state.
+- when the ChatGPT Dropbox connector becomes available again, refresh HANDOFF.md and STATE.md and refresh canonical context before returning to normal Dropbox-backed work.
+
 If a business commit is already canonical but materialization is delayed:
 
 - do not call the business change uncommitted;

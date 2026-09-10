@@ -33,7 +33,8 @@
       { "name": "DROPBOX_CHANGE_GUARD", "class_name": "DropboxChangeGuard" },
       { "name": "MATERIALIZATION_GUARD", "class_name": "MaterializationGuard" },
       { "name": "SEARCH_SYNC_GUARD", "class_name": "SearchSyncGuard" },
-      { "name": "SEARCH_INDEX_GUARD", "class_name": "SearchIndexGuard" }
+      { "name": "SEARCH_INDEX_GUARD", "class_name": "SearchIndexGuard" },
+      { "name": "FALLBACK_INGRESS_GUARD", "class_name": "FallbackIngressGuard" }
     ]
   },
   "exports": {
@@ -63,6 +64,11 @@
       "storage": "sqlite"
     },
     "SearchIndexGuard": {
+      "type": "durable-object",
+      "state": "created",
+      "storage": "sqlite"
+    },
+    "FallbackIngressGuard": {
       "type": "durable-object",
       "state": "created",
       "storage": "sqlite"

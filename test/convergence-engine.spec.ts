@@ -5,7 +5,13 @@ import { createSliceBudget, providerRequestScopeFor } from "../src/convergence/b
 import { ConvergenceJournal } from "../src/convergence/journal";
 import { initialProgress } from "../src/convergence/journal";
 import { ProjectRepository } from "../src/persistence/repository";
-import { convergenceAttemptPath, convergenceProgressPath, machineEventPath, machineReceiptPath } from "../src/persistence/layout";
+import {
+  convergenceAttemptPath,
+  convergenceProgressPath,
+  machineCommitRecordPath,
+  machineEventPath,
+  machineReceiptPath
+} from "../src/persistence/layout";
 import { sha256Canonical } from "../src/materialization/hash";
 import { buildAlertRecord } from "../src/convergence/observability";
 import { DropboxClient } from "../src/persistence/providers/dropbox/client";
@@ -53,6 +59,40 @@ describe("convergence engine scheduling", () => {
       converged: true,
       layers: { event: { state: "current" }, receipt: { state: "current" } }
     });
+  });
+
+  it("turns an expired provider slice into a durable continuation", async () => {
+    installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9269", 1)[0]!;
+    const canonicalPath = machineCommitRecordPath(record.project_id, record.new_revision);
+    const repository = new ProjectRepository(runtime, "v2");
+    await repository.writeCommitRecord(record);
+    await repository.writeReceipt(record.receipt);
+    const constrainedRuntime = {
+      ...runtime,
+      objects: {
+        ...runtime.objects,
+        async readText(path: string) {
+          if (path === canonicalPath) throw new Error("Dropbox read failed: slice_budget_exhausted");
+          return runtime.objects.readText(path);
+        }
+      }
+    };
+    const journal = new ConvergenceJournal(runtime, record.project_id);
+    const engine = new ConvergenceEngine({
+      projectId: record.project_id,
+      repository: new ProjectRepository(constrainedRuntime, "v2"),
+      runtime: constrainedRuntime,
+      journal,
+      ledger: {} as never,
+      now: () => 0
+    });
+
+    const result = await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+
+    expect(result).toMatchObject({ more_work: true, next_alarm_at: "1970-01-01T00:00:00.000Z" });
+    expect((await journal.load())?.progress.next_alarm_at).toBe("1970-01-01T00:00:00.000Z");
   });
 
   it("emits a scrubbed metric snapshot when a convergence slice observes a commit", async () => {

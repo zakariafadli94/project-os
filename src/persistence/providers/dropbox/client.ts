@@ -601,17 +601,35 @@ export class DropboxClient implements DropboxTransport {
     path?: string
   ): Promise<Response> {
     const requestIndex = ++this.requestIndex;
+    const requestScope = this.options.requestScope;
+    const requestController = requestScope ? new AbortController() : null;
+    const abortFromScope = () => requestController?.abort(requestScope?.signal.reason);
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      this.options.requestScope?.beforeHttp();
+      requestScope?.beforeHttp();
+      if (requestScope) {
+        if (requestScope.signal.aborted) abortFromScope();
+        else requestScope.signal.addEventListener("abort", abortFromScope, { once: true });
+
+        const requestNow = requestScope.now?.() ?? Date.now();
+        const remainingMs = requestScope.deadlineMs - requestNow;
+        if (remainingMs <= 0) throw new Error("slice_budget_exhausted");
+        deadlineTimer = setTimeout(() => {
+          requestController?.abort(new Error("slice_budget_exhausted"));
+        }, remainingMs);
+      }
       return await fetch(input, {
         ...init,
-        signal: this.options.requestScope?.signal ?? init?.signal
+        signal: requestController?.signal ?? init?.signal
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const pathContext = path ? ` for ${path}` : "";
       const operationContext = this.requestOperation ? ` during ${this.requestOperation}` : "";
       throw new Error(`Dropbox HTTP ${endpoint} request #${requestIndex}${pathContext}${operationContext} failed: ${message}`);
+    } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      requestScope?.signal.removeEventListener("abort", abortFromScope);
     }
   }
 

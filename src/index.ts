@@ -1,9 +1,12 @@
 import type { Env } from "./env";
+import { runFleetWakePage, runMaintenanceJobs, type FleetCursor } from "./convergence/fleet";
 import type { DurableInboxProcessSummary } from "./inbox/runtime";
 import { artifactInboxPath, inboxPath } from "./inbox/processor";
-import neutralWorker, { reconcileMaterializations, reconcileSearchIndexes, searchProjectOs } from "./index-neutral";
+import neutralWorker, { reconcileMaterializationProject, reconcileSearchIndexes, searchProjectOs } from "./index-neutral";
 import { parseLayoutMode } from "./persistence/layout";
 import { verifyDropboxSignature } from "./webhook/dropbox";
+import { deploymentIdentity } from "./deployment/identity";
+import { fleetLastSuccessMetric, workerLogConvergenceTelemetry } from "./convergence/observability";
 
 export * from "./index-neutral";
 
@@ -80,11 +83,17 @@ const worker = {
 
     ctx.waitUntil((async () => {
       try {
-        const inbox = await processInboxThroughGuard(env);
-        const [materialization, search] = await Promise.all([
-          reconcileMaterializations(env),
-          reconcileSearchIndexes(env, controller.scheduledTime)
-        ]);
+        const results = await runMaintenanceJobs([
+          { name: "inbox", run: async () => processInboxThroughGuard(env) },
+          { name: "convergence", run: async (signal) => reconcileFleetMaterializations(env, signal) },
+          { name: "search", run: async () => reconcileSearchIndexes(env, controller.scheduledTime) }
+        ], 240_000);
+        const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (rejected) throw rejected.reason;
+        const [inbox, materialization, search] = results.map((result) => {
+          if (result.status !== "fulfilled") throw new Error("unreachable maintenance result");
+          return result.value;
+        });
         console.info("Project OS scheduled maintenance completed", { inbox, materialization, search });
       } catch (error) {
         console.error("Project OS scheduled maintenance failed", {
@@ -101,6 +110,55 @@ export default worker;
 
 interface RegistryProject {
   project_id: string;
+}
+
+async function reconcileFleetMaterializations(env: Env, signal?: AbortSignal): Promise<unknown> {
+  const registry = env.REGISTRY_GUARD.getByName("global");
+  const projectsResponse = await registry.fetch("https://registry-guard.internal/registry", { method: "GET" });
+  if (!projectsResponse.ok) throw new Error(`RegistryGuard fleet reconcile returned ${projectsResponse.status}`);
+  const projects = await projectsResponse.json<{ projects: RegistryProject[] }>();
+  let scheduled = 0;
+  let current = 0;
+  let failed = 0;
+  const fleet = await runFleetWakePage({
+    read: async () => {
+      const response = await registry.fetch("https://registry-guard.internal/convergence-fleet", { method: "GET" });
+      if (!response.ok) throw new Error(`RegistryGuard fleet read returned ${response.status}`);
+      return response.json<{ cursor: FleetCursor; token: string }>();
+    },
+    write: async (expected_token, cursor) => {
+      const response = await registry.fetch("https://registry-guard.internal/convergence-fleet", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expected_token, cursor })
+      });
+      if (!response.ok) throw new Error(`RegistryGuard fleet write returned ${response.status}`);
+      return response.json<{ cursor: FleetCursor; token: string }>();
+    }
+  }, projects.projects.map((project) => project.project_id), new Date().toISOString(), async (projectId, wakeSignal) => {
+    if (wakeSignal?.aborted) return false;
+    try {
+      const outcome = await reconcileMaterializationProject(env, projectId);
+      if (outcome === "scheduled") scheduled += 1;
+      else current += 1;
+      return true;
+    } catch (error) {
+      failed += 1;
+      console.error("Project OS fleet wake failed", { project_id: projectId, message: error instanceof Error ? error.message : String(error) });
+      return false;
+    }
+  }, { signal });
+  try {
+    workerLogConvergenceTelemetry().emit(fleetLastSuccessMetric({
+      lastSuccessAt: fleet.cursor.last_success_at,
+      nowMs: Date.now(),
+      deploymentSha: deploymentIdentity(env).git_sha ?? "unknown"
+    }));
+  } catch {
+    // The fleet cursor is already durably written; metrics cannot alter its
+    // acknowledgement or turn a successful maintenance cycle into failure.
+  }
+  return { scanned: projects.projects.length, scheduled, current, failed, fleet };
 }
 
 async function rebuildSearchIndexes(request: Request, env: Env): Promise<Response> {

@@ -29,6 +29,8 @@ interface ControlRow {
   active_revision: number | null;
   active_projection_version: number | null;
   active_coalesced_json: string;
+  active_immutable_revision: number | null;
+  active_verification_epoch: number;
   active_status: string | null;
   last_error: string | null;
 }
@@ -64,6 +66,8 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
       active_revision INTEGER,
       active_projection_version INTEGER,
       active_coalesced_json TEXT NOT NULL DEFAULT '[]',
+      active_immutable_revision INTEGER,
+      active_verification_epoch INTEGER NOT NULL DEFAULT 0,
       active_status TEXT,
       last_error TEXT
     );
@@ -85,6 +89,7 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
       input_hash TEXT NOT NULL,
       content_hash TEXT NOT NULL,
       source_revision INTEGER NOT NULL,
+      verification_epoch INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL
     );
 
@@ -101,6 +106,21 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
       PRIMARY KEY(obligation_id, attempt_number)
     );
   `);
+  try {
+    storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_immutable_revision INTEGER");
+  } catch (error) {
+    if (!String(error).includes("duplicate column name")) throw error;
+  }
+  try {
+    storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_verification_epoch INTEGER NOT NULL DEFAULT 0");
+  } catch (error) {
+    if (!String(error).includes("duplicate column name")) throw error;
+  }
+  try {
+    storage.sql.exec("ALTER TABLE materialization_attempt_outputs ADD COLUMN verification_epoch INTEGER NOT NULL DEFAULT 0");
+  } catch (error) {
+    if (!String(error).includes("duplicate column name")) throw error;
+  }
 }
 
 export class MaterializationLedger {
@@ -155,6 +175,14 @@ export class MaterializationLedger {
   beginNextTarget(): MaterializationTarget | null {
     const row = this.control();
     if (row.active_revision !== null && row.active_projection_version !== null) {
+      if (row.active_status === "failed") {
+        this.storage.sql.exec(
+          `UPDATE materialization_control
+           SET active_verification_epoch = active_verification_epoch + 1,
+               active_status = 'running', last_error = NULL
+           WHERE singleton = 1`
+        );
+      }
       return {
         revision: row.active_revision,
         projection_version: row.active_projection_version,
@@ -189,7 +217,8 @@ export class MaterializationLedger {
       this.storage.sql.exec("DELETE FROM materialization_attempt_outputs");
       this.storage.sql.exec(
         `UPDATE materialization_control
-         SET active_revision = ?, active_projection_version = ?, active_coalesced_json = ?, active_status = 'running', last_error = NULL
+         SET active_revision = ?, active_projection_version = ?, active_coalesced_json = ?, active_immutable_revision = NULL,
+             active_verification_epoch = active_verification_epoch + 1, active_status = 'running', last_error = NULL
          WHERE singleton = 1`,
         row.requested_revision,
         row.requested_projection_version,
@@ -211,8 +240,8 @@ export class MaterializationLedger {
     }
     this.storage.sql.exec(
       `INSERT INTO materialization_attempt_outputs (
-         output_key, revision, projection_version, relative_path, input_hash, content_hash, source_revision, status
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'verified')
+         output_key, revision, projection_version, relative_path, input_hash, content_hash, source_revision, verification_epoch, status
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'verified')
        ON CONFLICT(output_key) DO UPDATE SET
          revision = excluded.revision,
          projection_version = excluded.projection_version,
@@ -220,6 +249,7 @@ export class MaterializationLedger {
          input_hash = excluded.input_hash,
          content_hash = excluded.content_hash,
          source_revision = excluded.source_revision,
+         verification_epoch = excluded.verification_epoch,
          status = excluded.status`,
       key,
       row.active_revision,
@@ -227,7 +257,8 @@ export class MaterializationLedger {
       evidence.relative_path,
       evidence.input_hash,
       evidence.content_hash,
-      evidence.source_revision
+      evidence.source_revision,
+      row.active_verification_epoch
     );
   }
 
@@ -237,10 +268,11 @@ export class MaterializationLedger {
     const rows = this.storage.sql.exec<OutputRow>(
       `SELECT output_key, relative_path, input_hash, content_hash, source_revision
        FROM materialization_attempt_outputs
-       WHERE revision = ? AND projection_version = ? AND status = 'verified'
+       WHERE revision = ? AND projection_version = ? AND verification_epoch = ? AND status = 'verified'
        ORDER BY output_key`,
       row.active_revision,
-      row.active_projection_version
+      row.active_projection_version,
+      row.active_verification_epoch
     ).toArray();
     return outputMap(rows);
   }
@@ -257,6 +289,22 @@ export class MaterializationLedger {
     this.storage.sql.exec(
       `UPDATE materialization_control SET active_status = 'failed', last_error = ? WHERE singleton = 1`,
       message
+    );
+  }
+
+  immutableDerivativesThrough(): number | null {
+    return this.control().active_immutable_revision;
+  }
+
+  markImmutableDerivativesThrough(revision: number): void {
+    const row = this.control();
+    if (row.active_revision === null || !parseRevisionList(row.active_coalesced_json).includes(revision)) {
+      throw new Error("Immutable derivative checkpoint does not match active coalesced revision");
+    }
+    if (row.active_immutable_revision !== null && revision <= row.active_immutable_revision) return;
+    this.storage.sql.exec(
+      "UPDATE materialization_control SET active_immutable_revision = ? WHERE singleton = 1",
+      revision
     );
   }
 
@@ -296,7 +344,7 @@ export class MaterializationLedger {
              requested_revision = CASE WHEN ? THEN NULL ELSE requested_revision END,
              requested_projection_version = CASE WHEN ? THEN NULL ELSE requested_projection_version END,
              active_revision = NULL, active_projection_version = NULL,
-             active_coalesced_json = '[]', active_status = NULL, last_error = NULL
+             active_coalesced_json = '[]', active_immutable_revision = NULL, active_status = NULL, last_error = NULL
          WHERE singleton = 1`,
         input.revision,
         input.projection_version,
@@ -333,7 +381,7 @@ export class MaterializationLedger {
              requested_revision = CASE WHEN ? THEN NULL ELSE requested_revision END,
              requested_projection_version = CASE WHEN ? THEN NULL ELSE requested_projection_version END,
              active_revision = NULL, active_projection_version = NULL,
-             active_coalesced_json = '[]', active_status = NULL, last_error = NULL
+             active_coalesced_json = '[]', active_immutable_revision = NULL, active_status = NULL, last_error = NULL
          WHERE singleton = 1`,
         head.revision,
         head.projection_version,
@@ -394,7 +442,7 @@ export class MaterializationLedger {
   private control(): ControlRow {
     return this.storage.sql.exec<ControlRow>(
       `SELECT head_revision, head_projection_version, requested_revision, requested_projection_version,
-              active_revision, active_projection_version, active_coalesced_json, active_status, last_error
+              active_revision, active_projection_version, active_coalesced_json, active_immutable_revision, active_verification_epoch, active_status, last_error
        FROM materialization_control WHERE singleton = 1`
     ).one();
   }

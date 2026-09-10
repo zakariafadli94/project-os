@@ -33,6 +33,12 @@ export interface ProviderChangePage {
 export interface ProviderRequestScope {
   deadlineMs: number;
   signal: AbortSignal;
+  /**
+   * Uses the slice clock when it is supplied by a Durable Object test/runtime.
+   * This lets the transport derive the remaining time without assuming that
+   * wall-clock time is the source of truth for a bounded slice.
+   */
+  now?(): number;
   beforeHttp(): void;
 }
 

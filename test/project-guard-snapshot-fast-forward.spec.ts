@@ -54,7 +54,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       }
     });
     expect(created).toMatchObject({ status: "committed", new_revision: 1 });
-    for (let slice = 0; slice < 8; slice += 1) {
+    for (let slice = 0; slice < 16; slice += 1) {
       if (!await runDurableObjectAlarm(projectionStub)) break;
     }
 
@@ -204,7 +204,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       { method: "POST" }
     );
     expect(reconcileMaterialization.status).toBe(200);
-    for (let slice = 0; slice < 8; slice += 1) {
+    for (let slice = 0; slice < 16; slice += 1) {
       if (!await runDurableObjectAlarm(projectionStub)) break;
     }
     await mock.writeExternal(

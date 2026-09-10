@@ -1,6 +1,7 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import {
+  reconcileMaterializationProject,
   reconcileMaterializations,
   type MaterializationReconcileSummary
 } from "../src/index";
@@ -20,10 +21,26 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
   const searchCalls: string[] = [];
   let inFlight = 0;
   let maxInFlight = 0;
+  let fleetCursor = {
+    schema_version: "1.0" as const,
+    after_project_id: null,
+    pending_project_ids: [],
+    turn_started_at: "1970-01-01T00:00:00.000Z",
+    last_success_at: null
+  };
+  let fleetToken = "0";
 
   const registryStub = {
-    fetch: vi.fn(async (input: RequestInfo | URL) => {
+    fetch: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === "/convergence-fleet") {
+        if (init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as { cursor: typeof fleetCursor };
+          fleetCursor = body.cursor;
+          fleetToken = String(Number(fleetToken) + 1);
+        }
+        return Response.json({ cursor: fleetCursor, token: fleetToken });
+      }
       expect(url.pathname).toBe("/registry");
       return Response.json({
         schema_version: "1.0",
@@ -151,6 +168,24 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
 }
 
 describe("fleet materialization reconciliation", () => {
+  it("returns the individual wake outcome needed for fleet acknowledgement", async () => {
+    const { env } = fakeEnv(["PRJ-4100"], {
+      "PRJ-4100": {
+        body: {
+          project_id: "PRJ-4100",
+          canonical_revision: 4,
+          projection_version: 1,
+          materialized_head: { revision: 3, projection_version: 1 },
+          requested: { revision: 4, projection_version: 1 },
+          active: null,
+          blocked_error: null
+        }
+      }
+    });
+
+    await expect(reconcileMaterializationProject(env, "PRJ-4100")).resolves.toBe("scheduled");
+  });
+
   it("checks every registered project and distinguishes current from scheduled work", async () => {
     const { env, calls } = fakeEnv(["PRJ-4101", "PRJ-4102", "PRJ-4103"], {
       "PRJ-4102": {
@@ -225,6 +260,11 @@ describe("fleet materialization reconciliation", () => {
     expect(info).toHaveBeenCalledWith("Project OS scheduled maintenance completed", expect.objectContaining({
       inbox: expect.any(Object),
       materialization: expect.any(Object)
+    }));
+    expect(info).toHaveBeenCalledWith("Project OS convergence metric", expect.objectContaining({
+      name: "fleet_last_success_age",
+      kind: "gauge",
+      fields: expect.objectContaining({ project_id: null, provider_calls: 0 })
     }));
   });
 });

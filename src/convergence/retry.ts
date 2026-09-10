@@ -1,3 +1,13 @@
+import { sha256Canonical } from "../materialization/hash";
+
+export async function deterministicRetryJitter(obligationId: string, attemptNumber: number): Promise<number> {
+  if (!/^[a-f0-9]{64}$/.test(obligationId) || !Number.isSafeInteger(attemptNumber) || attemptNumber < 1) {
+    throw new Error("invalid_retry_jitter_input");
+  }
+  const hash = await sha256Canonical({ obligation_id: obligationId, attempt_number: attemptNumber });
+  return (Number.parseInt(hash.slice(0, 8), 16) / 0xffffffff) * 0.2;
+}
+
 export function nextRetryAt(input: {
   nowMs: number;
   failureCount: number;

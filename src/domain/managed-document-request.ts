@@ -5,6 +5,7 @@ const requestId = z.string().regex(/^DOCREQ-[A-Z0-9-]{8,}$/);
 const projectId = z.string().regex(/^PRJ-[0-9]{4,}$/);
 const documentId = z.string().regex(/^DOC-[A-F0-9]{24}$/);
 const versionId = z.string().regex(/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/);
+const candidateRequestId = z.string().regex(/^ART-[A-Z0-9-]{10,}$/);
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const createdAt = z.string().min(1).max(128);
 const logicalPath = z.string().min(1).transform((value, ctx) => {
@@ -54,6 +55,17 @@ const reviewWriteSchema = z.strictObject({
   content_sha256: hash
 });
 
+const reviewCandidatePromotionSchema = z.strictObject({
+  operation: z.literal("review_candidate.promote"),
+  request_id: requestId,
+  project_id: projectId,
+  candidate_request_id: candidateRequestId,
+  logical_path: logicalPath,
+  expected_project_revision: z.number().int().nonnegative().safe(),
+  accepted: z.literal(true),
+  created_at: createdAt
+});
+
 const referenceClassifySchema = z.strictObject({
   operation: z.literal("reference.classify"),
   ...lifecycleBase,
@@ -64,6 +76,7 @@ export const managedDocumentRequestSchema = z.discriminatedUnion("operation", [
   workingWriteSchema,
   reviewPromoteSchema,
   reviewWriteSchema,
+  reviewCandidatePromotionSchema,
   publishSchema,
   reopenSchema,
   referenceClassifySchema

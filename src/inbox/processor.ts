@@ -11,6 +11,8 @@ import {
 import { PROJECT_OS_ROOT, transactionPath } from "../persistence/paths";
 import type { ObjectPersistence, ProviderEntry } from "../persistence/provider/contract";
 import { ProviderConflictError } from "../persistence/provider/errors";
+import { AdmissionError, type MutationContext } from "../admission/mutation-context";
+import { decodeAdmission } from "../admission/transport";
 
 export interface InboxProcessSummary {
   scanned: number;
@@ -31,13 +33,14 @@ export const ARTIFACT_RETRY_FAST_ATTEMPT_LIMIT = 5;
 export const ARTIFACT_RETRY_FAST_DELAY_MS = 1_000;
 export const ARTIFACT_RETRY_DEFER_DELAY_MS = 300_000;
 
-export type ExecuteTransaction = (transaction: Transaction) => Promise<Receipt>;
-export type ExecuteArtifact = (artifact: ArtifactWriteRequest) => Promise<ArtifactWriteReceipt>;
+export type ExecuteTransaction = (transaction: Transaction, context?: MutationContext | null) => Promise<Receipt>;
+export type ExecuteArtifact = (artifact: ArtifactWriteRequest, context?: MutationContext | null) => Promise<ArtifactWriteReceipt>;
 
 interface PreparedTransactionInboxEntry {
   entry: ProviderEntry;
   raw?: string | null;
   transaction?: Transaction;
+  mutationContext?: MutationContext | null;
   loadError?: unknown;
 }
 
@@ -115,12 +118,28 @@ export async function processTransactionInbox(
 
       const filenameTransactionId = transactionIdFromFilename(entry.name);
       let transaction: Transaction;
+      let mutationContext: MutationContext | null;
       try {
-        transaction = prepared.transaction ?? parseTransaction(JSON.parse(raw));
+        if (prepared.transaction) {
+          transaction = prepared.transaction;
+          mutationContext = prepared.mutationContext ?? null;
+        } else {
+          const admission = decodeAdmission(JSON.parse(raw), parseTransaction);
+          transaction = admission.request;
+          mutationContext = admission.mutation_context;
+        }
         if (!filenameTransactionId || filenameTransactionId !== transaction.transaction_id) {
           throw new Error("Transaction filename must exactly match transaction_id");
         }
       } catch (error) {
+        if (error instanceof AdmissionError) {
+          summary.failed += 1;
+          console.error("Project OS transaction admission envelope requires refresh", {
+            transaction_id: filenameTransactionId,
+            code: error.code
+          });
+          continue;
+        }
         const fallbackId = filenameTransactionId ?? await syntheticInboxId("TXN-INVALID", entry.name, raw);
         const rejectedPath = terminalTransactionPath(mode, "rejected", fallbackId);
         await safeAdd(objects, rejectedPath, `${JSON.stringify({
@@ -136,9 +155,17 @@ export async function processTransactionInbox(
 
       let receipt: Receipt;
       try {
-        receipt = await executeTransaction(transaction);
+        receipt = await executeTransaction(transaction, mutationContext);
       } catch (error) {
         summary.failed += 1;
+        if (error instanceof AdmissionError) {
+          console.error("Project OS transaction admission requires refresh", {
+            transaction_id: transaction.transaction_id,
+            project_id: transaction.project_id,
+            code: error.code
+          });
+          continue;
+        }
         console.error("Project OS transaction processing failed", transaction.transaction_id, error);
         try {
           const diagnostic = await recordTransactionFailure(objects, mode, transaction, error);
@@ -241,12 +268,24 @@ export async function processArtifactInbox(
 
       const filenameRequestId = artifactRequestIdFromFilename(entry.name);
       let artifact: ArtifactWriteRequest;
+      let mutationContext: MutationContext | null;
       try {
-        artifact = parseArtifactWriteRequest(JSON.parse(raw));
+        const admission = decodeAdmission(JSON.parse(raw), parseArtifactWriteRequest);
+        artifact = admission.request;
+        mutationContext = admission.mutation_context;
         if (!filenameRequestId || filenameRequestId !== artifact.request_id) {
           throw new Error("Artifact filename must exactly match request_id");
         }
       } catch (error) {
+        if (error instanceof AdmissionError) {
+          workItems += 1;
+          summary.failed += 1;
+          console.error("Project OS artifact admission envelope requires refresh", {
+            request_id: filenameRequestId,
+            code: error.code
+          });
+          continue;
+        }
         workItems += 1;
         const fallbackId = filenameRequestId ?? await syntheticInboxId("ART-INVALID", entry.name, raw);
         const rejectedPath = terminalArtifactRequestPath(mode, "rejected", fallbackId);
@@ -274,9 +313,17 @@ export async function processArtifactInbox(
     workItems += 1;
       let receipt: ArtifactWriteReceipt;
       try {
-        receipt = await executeArtifact(artifact);
+        receipt = await executeArtifact(artifact, mutationContext);
       } catch (error) {
         summary.failed += 1;
+        if (error instanceof AdmissionError) {
+          console.error("Project OS artifact admission requires refresh", {
+            request_id: artifact.request_id,
+            project_id: artifact.project_id,
+            code: error.code
+          });
+          continue;
+        }
         console.error("Project OS artifact processing failed", artifact.request_id, error);
         try {
           const diagnostic = await recordArtifactFailure(objects, mode, artifact, error, previousFailure);
@@ -342,15 +389,20 @@ async function prepareTransactionInboxEntries(
     }
 
     let transaction: Transaction | undefined;
+    let mutationContext: MutationContext | null | undefined;
     if (raw !== null) {
       try {
-        const parsed = parseTransaction(JSON.parse(raw));
-        if (transactionIdFromFilename(entry.name) === parsed.transaction_id) transaction = parsed;
+        const admission = decodeAdmission(JSON.parse(raw), parseTransaction);
+        const parsed = admission.request;
+        if (transactionIdFromFilename(entry.name) === parsed.transaction_id) {
+          transaction = parsed;
+          mutationContext = admission.mutation_context;
+        }
       } catch {
         // Invalid entries remain eligible for rejection/cleanup after valid work is ordered.
       }
     }
-    prepared.push({ entry, raw, transaction });
+    prepared.push({ entry, raw, transaction, mutationContext });
   }
 
   return prepared.sort(comparePreparedTransactionEntries);

@@ -20,6 +20,7 @@ export function persistenceFromDropbox(input: DropboxTransport): ProjectOsPersis
       listChanges: missing("incremental-change-feed")
     },
     ...(runtime.pagedListing ? { pagedListing: runtime.pagedListing } : {}),
+    ...(runtime.directoryProvisioning ? { directoryProvisioning: runtime.directoryProvisioning } : {}),
     evidence: {
       stableObjectId: runtime.evidence?.stableObjectId ?? { semantics: "stable-through-move" },
       revisionToken: runtime.evidence?.revisionToken ?? { semantics: "opaque-object-revision" },
@@ -63,6 +64,9 @@ function forwardTransport(input: DropboxTransport): DropboxTransport {
           listFolderPage: (path: string, cursor: string | null, limit: number) =>
             input.listFolderPage!(path, cursor, limit)
         }
+      : {}),
+    ...(input.ensureDirectory
+      ? { ensureDirectory: (path: string) => input.ensureDirectory!(path) }
       : {})
   };
 }

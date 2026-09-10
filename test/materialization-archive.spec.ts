@@ -163,7 +163,7 @@ describe("archive-safe materialization", () => {
     mock.files.set(`${archiveRoot}/PROJECT.md`, mock.files.get(`${activeRoot}/PROJECT.md`) ?? "duplicate");
 
     await archiveProject(projectId, "TXN-MATARCH-ARCHIVE-000003");
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await materializeThroughContinuations(projectId);
 
     expect(mock.files.has(`${activeRoot}/PROJECT.md`)).toBe(true);
     expect(mock.files.has(`${archiveRoot}/PROJECT.md`)).toBe(true);

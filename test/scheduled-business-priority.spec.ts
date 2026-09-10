@@ -128,13 +128,13 @@ describe("business ingress priority", () => {
 
     const scheduledGate = blockNextInboxList(mock);
     const scheduledCtx = createExecutionContext();
+    const scheduledBaseline = mock.calls.length;
     await worker.scheduled?.({
       cron: "*/5 * * * *",
       scheduledTime: Date.now(),
       noRetry: () => undefined
     } as ScheduledController, testEnv, scheduledCtx);
 
-    const scheduledBaseline = mock.calls.length;
     const scheduledBlocked = await scheduledGate.waitUntilBlocked();
     const scheduledCallsWhileBlocked = maintenanceCallsWhileInboxBlocked(mock.calls.slice(scheduledBaseline));
 
@@ -173,7 +173,8 @@ describe("business ingress priority", () => {
     await waitOnExecutionContext(webhookCtx);
 
     expect.soft(scheduledBlocked, "scheduled inbox scan should block").toBe(true);
-    expect.soft(scheduledCallsWhileBlocked, "scheduled maintenance overtook inbox processing").toHaveLength(0);
+    expect.soft(scheduledCallsWhileBlocked, "scheduled convergence and search should not wait for inbox processing")
+      .not.toHaveLength(0);
     expect.soft(webhookBlocked, "webhook inbox scan should block").toBe(true);
     expect.soft(webhookCallsWhileBlocked, "webhook maintenance overtook inbox processing").toHaveLength(0);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${webhookTransaction.transaction_id}.json`)).toBe(true);

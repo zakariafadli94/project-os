@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectionOutputEvidence } from "../src/domain/materialization";
 import { sha256Text } from "../src/materialization/hash";
 import { createSliceBudget } from "../src/convergence/budget";
@@ -11,6 +11,11 @@ import {
 import type { ObjectPersistence, ProviderEntry, ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError } from "../src/persistence/provider/errors";
 import { MANAGED_NOTICE } from "../src/render/shared";
+import { DropboxClient } from "../src/persistence/providers/dropbox/client";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
+import { installDropboxMock } from "./helpers/mock-dropbox";
+
+afterEach(() => vi.restoreAllMocks());
 
 class InstrumentedObjects implements ObjectPersistence {
   files = new Map<string, string>();
@@ -165,6 +170,66 @@ describe("WorkspaceProjectionWriter", () => {
       currentHash: await sha256Text(humanEdit)
     }]);
     expect(objects.uploads.filter(({ path }) => path.startsWith("/workspace/"))).toHaveLength(0);
+  });
+
+  it("does not overwrite a managed projection that changes after observation", async () => {
+    const mock = installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const path = "/workspace/STATE.md";
+    const baselineContent = `${MANAGED_NOTICE}\nbaseline`;
+    const humanEdit = `${MANAGED_NOTICE}\nexternal edit after observation`;
+    await mock.writeExternal(path, baselineContent);
+    const baseline: ProjectionOutputEvidence = {
+      relative_path: "STATE.md",
+      input_hash: await sha256Text("baseline-state"),
+      content_hash: await sha256Text(baselineContent),
+      source_revision: 3
+    };
+    const originalWrite = runtime.conditionalWrite.writeTextConditional.bind(runtime.conditionalWrite);
+    runtime.conditionalWrite.writeTextConditional = async (writePath, content, token) => {
+      await mock.writeExternal(writePath, humanEdit);
+      return originalWrite(writePath, content, token);
+    };
+    const writer = new WorkspaceProjectionWriter(runtime, 1);
+    const item = await output("global:STATE", "STATE.md", `${MANAGED_NOTICE}\ncanonical state`, {
+      baseline, critical: true
+    });
+
+    await expect(writer.materialize(plan([item]), { workspaceRoot: "/workspace" })).rejects.toBeTruthy();
+    expect(mock.files.get(path)).toBe(humanEdit);
+  });
+
+  it("does not delete a removed deliverable that changes after its stable observation", async () => {
+    const mock = installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const path = "/workspace/DELIVERABLES/DEL-3301.md";
+    const generated = `${MANAGED_NOTICE}\nold deliverable`;
+    const external = `${MANAGED_NOTICE}\nexternal edit after observation`;
+    await mock.writeExternal(path, generated);
+    const evidence: ProjectionOutputEvidence = {
+      relative_path: "DELIVERABLES/DEL-3301.md",
+      input_hash: await sha256Text("legacy-input"),
+      content_hash: await sha256Text(generated),
+      source_revision: 3
+    };
+    let deleteCalled = false;
+    runtime.objects.deleteIfUnchanged = async (deletePath, expected) => {
+      deleteCalled = true;
+      expect(expected.revisionToken).toMatch(/^mock-rev-/);
+      await mock.writeExternal(deletePath, external);
+      return "changed";
+    };
+    const writer = new WorkspaceProjectionWriter(runtime, 1);
+    const removalPlan: ProjectionPlan = {
+      ...plan([]),
+      removed_outputs: ["deliverable:DEL-3301"],
+      removed_output_evidence: new Map([["deliverable:DEL-3301", evidence]])
+    };
+
+    await expect(writer.materialize(removalPlan, { workspaceRoot: "/workspace" }))
+      .rejects.toBeInstanceOf(MaterializationOutputConflictError);
+    expect(deleteCalled).toBe(true);
+    expect(mock.files.get(path)).toBe(external);
   });
 
   it("bootstrap may overwrite a known machine-managed note but quarantines and refuses an untracked human file", async () => {

@@ -1,6 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import { createSliceBudget, providerRequestScopeFor } from "../convergence/budget";
+import { ConvergenceEngine } from "../convergence/engine";
 import { unknownHealth } from "../convergence/health";
+import type { ConvergenceHealth } from "../convergence/contract";
+import { ConvergenceJournal } from "../convergence/journal";
+import { convergenceModeForProject, type CapacityObservation } from "../convergence/rollout";
+import { deploymentIdentity } from "../deployment/identity";
+import {
+  monitoringNotificationPort,
+  oldestPendingAgeMs,
+  workerLogConvergenceTelemetry
+} from "../convergence/observability";
 import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
 import type { Env } from "../env";
@@ -53,6 +63,9 @@ export class MaterializationGuard extends DurableObject<Env> {
     if (request.method === "GET" && url.pathname === "/status") {
       return this.serialize(() => this.handleStatus());
     }
+    if (request.method === "GET" && url.pathname === "/capacity") {
+      return this.serialize(() => this.handleCapacity());
+    }
     if (request.method === "POST" && url.pathname === "/reconcile") {
       return this.serialize(() => this.handleReconcile());
     }
@@ -65,6 +78,12 @@ export class MaterializationGuard extends DurableObject<Env> {
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
     return this.serialize(async () => {
       try {
+        if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, this.projectId) === "repair") {
+          const { engine, budget } = this.convergenceEngineForSlice();
+          const result = await engine.runSlice(budget);
+          await this.scheduleConvergenceContinuation(result.more_work, result.next_alarm_at);
+          return;
+        }
         const { coordinator } = this.coordinatorForSlice();
         const result = await coordinator.runNext(alarmInfo?.retryCount ?? 0);
         if (result.more_work) {
@@ -121,7 +140,44 @@ export class MaterializationGuard extends DurableObject<Env> {
     if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
     await coordinator.reconcile(state.revision);
     await this.ensureAlarmIfPending();
-    return Response.json(this.statusResponse(state));
+    const convergenceMode = convergenceModeForProject(
+      this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES,
+      this.projectId
+    );
+    const convergence = convergenceMode !== "off"
+      ? await this.observeConvergence()
+      : undefined;
+    return Response.json(this.statusResponse(state, convergence));
+  }
+
+  /**
+   * Internal, read-only admission probe. ProjectGuard uses it before a new
+   * canonical commit only for an explicitly enabled repair writer. A missing
+   * durable alarm while work is pending is an unavailable continuation.
+   */
+  private async handleCapacity(): Promise<Response> {
+    const status = this.ledger.status();
+    const saved = await new ConvergenceJournal(
+      createProductionPersistence(this.env, this.projectId),
+      this.projectId
+    ).load();
+    const pending = Object.values(saved?.progress.obligations ?? {})
+      .filter((obligation) => obligation.state !== "verified");
+    const continuationRequired = status.active !== null || status.requested !== null || pending.length > 0;
+    const alarm = await this.ctx.storage.getAlarm();
+    const queuedOutputs = pending.length
+      + (status.active === null ? 0 : status.attempt_output_count)
+      + (status.requested === null ? 0 : Math.max(1, status.output_count));
+    const oldestPendingSeconds = saved === null
+      ? 0
+      : oldestPendingAgeMs(saved.progress, Date.now()) / 1_000;
+    const observation: CapacityObservation = {
+      queued_outputs: queuedOutputs,
+      oldest_pending_seconds: oldestPendingSeconds,
+      continuation_available: !continuationRequired || alarm !== null,
+      within_qualified_envelope: queuedOutputs <= 200 && oldestPendingSeconds <= 600
+    };
+    return Response.json(observation);
   }
 
   private async handleReconcile(): Promise<Response> {
@@ -151,24 +207,71 @@ export class MaterializationGuard extends DurableObject<Env> {
     const record = state.revision > 0
       ? await repository.readCommitRecord(state.project_id, state.revision)
       : null;
+    const convergenceMode = convergenceModeForProject(
+      this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES,
+      this.projectId
+    );
+    if (this.layoutMode === "v2" && convergenceMode !== "repair") {
+      return Response.json({
+        error: "convergence_writer_inactive",
+        project_id: state.project_id,
+        mode: convergenceMode
+      }, { status: 409 });
+    }
     if (record) {
+      if (convergenceMode === "repair") {
+        const { engine, budget } = this.convergenceEngineForSlice();
+        const result = await engine.runSlice(budget);
+        if (result.more_work || !result.health.converged) {
+          await this.scheduleConvergenceContinuation(true, result.next_alarm_at);
+          return Response.json({
+            project_id: state.project_id,
+            revision: state.revision,
+            materialized: false,
+            status: "pending"
+          }, { status: 202 });
+        }
+        await this.ctx.storage.deleteAlarm();
+        return Response.json({
+          project_id: state.project_id,
+          revision: state.revision,
+          materialized: true,
+          status: "current"
+        });
+      }
       await coordinator.reconcile(state.revision);
       coordinator.requestTarget(state.revision, CURRENT_PROJECTION_VERSION);
       let result = await coordinator.runNext();
       for (let slice = 0; result.more_work && slice < 127; slice += 1) {
         result = await this.coordinatorForSlice().coordinator.runNext();
       }
-      if (result.more_work) await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
-      else await this.ctx.storage.deleteAlarm();
+      if (result.more_work) {
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+        return Response.json({
+          project_id: state.project_id,
+          revision: state.revision,
+          materialized: false,
+          status: "pending"
+        }, { status: 202 });
+      }
+      await this.ctx.storage.deleteAlarm();
     } else {
+      if (this.layoutMode === "v2" && convergenceMode === "repair") {
+        return Response.json({
+          error: "historical_baseline_unavailable",
+          project_id: state.project_id
+        }, { status: 409 });
+      }
       await repository.materializeV2(state);
     }
 
-    return Response.json({
+    const response: { project_id: string; revision: number; materialized: true; status?: "current" } = {
       project_id: state.project_id,
       revision: state.revision,
       materialized: true
-    });
+    };
+    if (convergenceMode === "repair") response.status = "current";
+    return Response.json(response);
   }
 
   /**
@@ -217,7 +320,7 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
   }
 
-  private statusResponse(state: ProjectState) {
+  private statusResponse(state: ProjectState, convergence?: ConvergenceHealth) {
     const status = this.ledger.status();
     return {
       project_id: state.project_id,
@@ -234,7 +337,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       blocked_error: status.last_error,
       output_count: status.output_count,
       attempt_output_count: status.attempt_output_count,
-      convergence: unknownHealth(state.project_id, new Date().toISOString())
+      convergence: convergence ?? unknownHealth(state.project_id, new Date().toISOString())
     };
   }
 
@@ -244,6 +347,36 @@ export class MaterializationGuard extends DurableObject<Env> {
     const existing = await this.ctx.storage.getAlarm();
     if (existing === null) {
       await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+    }
+  }
+
+  private async observeConvergence(): Promise<ConvergenceHealth> {
+    const { engine, budget } = this.convergenceEngineForSlice();
+    return engine.observe(budget);
+  }
+
+  /**
+   * Preserve the journal's earliest durable wake-up. A retry window is a
+   * provider-protection invariant, not a hint that may be shortened by an
+   * alarm invocation.
+   */
+  private async scheduleConvergenceContinuation(moreWork: boolean, nextAlarmAt: string | null): Promise<void> {
+    if (!moreWork) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const now = Date.now();
+    const requested = nextAlarmAt === null ? Number.NaN : Date.parse(nextAlarmAt);
+    const wakeAt = Number.isFinite(requested) && requested > now
+      ? requested
+      : now + MATERIALIZATION_ALARM_DELAY_MS;
+    const existing = await this.ctx.storage.getAlarm();
+    // `nextAlarmAt` is the journal's earliest durable deadline. An older
+    // generic materialization alarm must not shorten a retry/backoff window;
+    // if another durable concern were earlier it would already be reflected
+    // in that same minimum wake.
+    if (existing !== wakeAt) {
+      await this.ctx.storage.setAlarm(wakeAt);
     }
   }
 
@@ -279,6 +412,31 @@ export class MaterializationGuard extends DurableObject<Env> {
       })
     };
   }
+
+  private convergenceEngineForSlice(): { engine: ConvergenceEngine; budget: ReturnType<typeof createSliceBudget> } {
+    const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    const persistence = createProductionPersistence(this.env, this.projectId, providerRequestScopeFor(budget));
+    const repository = new ProjectRepository(persistence, this.layoutMode);
+    return {
+      budget,
+      engine: new ConvergenceEngine({
+        projectId: this.projectId,
+        repository,
+        runtime: persistence,
+        journal: new ConvergenceJournal(persistence, this.projectId),
+        ledger: this.ledger,
+        now: () => Date.now(),
+        deploymentSha: deploymentIdentity(this.env).git_sha ?? "unknown",
+        enableHuman: true,
+        notification: monitoringNotificationPort({
+          endpoint: this.env.PROJECT_OS_MONITORING_WEBHOOK_URL,
+          token: this.env.PROJECT_OS_MONITORING_WEBHOOK_TOKEN
+        }),
+        telemetry: workerLogConvergenceTelemetry()
+      })
+    };
+  }
+
 }
 
 function isMaterializationTargetRequestBody(value: unknown): value is MaterializationTargetRequestBody {

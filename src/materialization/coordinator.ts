@@ -34,6 +34,8 @@ export interface MaterializationRepositoryPort {
     record: CanonicalCommitRecord,
     options?: { publishReceipt?: boolean; projectionVersion?: number }
   ): Promise<void>;
+  writeCanonicalEvent?(record: CanonicalCommitRecord): Promise<void>;
+  writeReceipt?(receipt: CanonicalCommitRecord["receipt"]): Promise<void>;
   archiveHumanWorkspace?(state: ProjectState): Promise<void>;
 }
 
@@ -43,6 +45,8 @@ export interface MaterializationLedgerPort {
   recordVerifiedOutput(key: string, evidence: ProjectionOutputEvidence): void;
   attemptOutputs(): Map<string, ProjectionOutputEvidence>;
   baselineOutputs(): Map<string, ProjectionOutputEvidence>;
+  immutableDerivativesThrough(): number | null;
+  markImmutableDerivativesThrough(revision: number): void;
   failActive(message: string): void;
   completeTarget(input: {
     revision: number;
@@ -71,6 +75,7 @@ export interface ProjectionWriterPort {
     onOutputOutcome?: (key: string, outcome: ProjectionWriteOutcome) => void | Promise<void>;
   }, budget: SliceBudget): Promise<{ verified: Map<string, ProjectionOutputEvidence>; nextKey: string | null }>;
   verifyCritical?(plan: ProjectionPlan, workspaceRoot: string): Promise<void>;
+  verifyOutputs?(outputs: ReadonlyMap<string, ProjectionOutputEvidence>, workspaceRoot: string): Promise<void>;
 }
 
 export interface ProjectionBaseline {
@@ -88,6 +93,7 @@ export interface MaterializationCoordinatorOptions {
   workspaceRootFor?: (state: ProjectState) => string;
   now?: () => string;
   sliceBudget?: SliceBudget;
+  canonicalDerivativesAlreadyCurrent?: boolean;
 }
 
 export interface MaterializationRunResult {
@@ -114,6 +120,7 @@ export class MaterializationCoordinator {
   private readonly workspaceRootFor: (state: ProjectState) => string;
   private readonly now: () => string;
   private readonly sliceBudget: SliceBudget | undefined;
+  private readonly canonicalDerivativesAlreadyCurrent: boolean;
 
   constructor(options: MaterializationCoordinatorOptions) {
     this.projectId = options.projectId;
@@ -127,6 +134,7 @@ export class MaterializationCoordinator {
     this.workspaceRootFor = options.workspaceRootFor ?? ((state) => workspaceProjectRoot(state.project_id, state.slug));
     this.now = options.now ?? (() => new Date().toISOString());
     this.sliceBudget = options.sliceBudget;
+    this.canonicalDerivativesAlreadyCurrent = options.canonicalDerivativesAlreadyCurrent ?? false;
   }
 
   requestTarget(revision: number, projectionVersion = this.projectionVersion): void {
@@ -219,7 +227,18 @@ export class MaterializationCoordinator {
     const priorAttempts = this.ledger.attemptOutputs();
 
     try {
-      if (priorAttempts.size === 0) {
+      if (await this.materializeOneCoalescedImmutableDerivative(target)) {
+        return {
+          project_id: this.projectId,
+          target_revision: target.revision,
+          projection_version: target.projection_version,
+          completed: false,
+          repaired_head: false,
+          more_work: true
+        };
+      }
+
+      if (priorAttempts.size === 0 && !this.canonicalDerivativesAlreadyCurrent) {
         await this.repository.materializeCanonicalDerivatives(record, {
           ...(record.transaction.operation === "project.create" ? { publishReceipt: false } : {}),
           projectionVersion: target.projection_version
@@ -295,11 +314,12 @@ export class MaterializationCoordinator {
 
       if (archived) {
         if (moveAfterWrite) await this.archiveWorkspaceOrConflict(record.state, activeRoot);
-        if (!this.writer.verifyCritical) {
-          throw new Error("Archive materialization requires final critical-output verification");
-        }
-        await this.writer.verifyCritical(plan, archiveRoot);
       }
+
+      if (!this.writer.verifyCritical) {
+        throw new Error("Materialization requires final critical-output verification");
+      }
+      await this.writer.verifyCritical(plan, archived ? archiveRoot : activeRoot);
 
       const fullOutputs = applyPlanToBaseline(baseline?.outputs ?? new Map(), plan, verified);
       const resultRootHash = await projectionIndexRootHash(fullOutputs);
@@ -336,6 +356,11 @@ export class MaterializationCoordinator {
       await this.repository.writeCompletedMaterializationRecord(completedRecord);
       const head = headFor(completedRecord);
       await this.repository.writeMaterializationHead(head);
+      await this.writer.verifyCritical(plan, archived ? archiveRoot : activeRoot);
+      const publishedHead = await this.repository.readMaterializationHead(this.projectId);
+      if (!publishedHead || !samePublishedHead(publishedHead, head)) {
+        throw new Error(`Materialization head changed after publication for ${this.projectId}`);
+      }
       this.ledger.completeTarget({
         revision: target.revision,
         projection_version: target.projection_version,
@@ -365,6 +390,28 @@ export class MaterializationCoordinator {
       if (!result.more_work) return this.ledger.status();
     }
     throw new Error(`Materialization did not become idle after ${maxRuns} runs for ${this.projectId}`);
+  }
+
+  /**
+   * Coalescence skips redundant human views, never immutable evidence. These
+   * two writes deliberately avoid the workspace writer and its directory work.
+   */
+  private async materializeOneCoalescedImmutableDerivative(target: MaterializationTarget): Promise<boolean> {
+    if (!this.repository.writeCanonicalEvent || !this.repository.writeReceipt) return false;
+    const through = this.ledger.immutableDerivativesThrough();
+    const revision = [...target.coalesced_revisions]
+      .sort((left, right) => left - right)
+      .find((candidate) => through === null || candidate > through);
+    if (revision === undefined) return false;
+    if (this.sliceBudget && !this.sliceBudget.canStartEffect(4)) return true;
+    const record = await this.repository.readCommitRecord(this.projectId, revision);
+    if (!record) {
+      throw new Error(`Canonical coalesced commit record missing for ${this.projectId} revision ${revision}`);
+    }
+    await this.repository.writeCanonicalEvent(record);
+    await this.repository.writeReceipt(record.receipt);
+    this.ledger.markImmutableDerivativesThrough(revision);
+    return true;
   }
 
   private async loadExternalBaseline(canonicalRevision: number): Promise<ProjectionBaseline | null> {
@@ -407,7 +454,8 @@ export class MaterializationCoordinator {
       if (!record) continue;
       const candidateHead = headFor(record);
       try {
-        await rebuildProjectionBaseline(this.repository, candidateHead);
+        const baseline = await rebuildProjectionBaseline(this.repository, candidateHead);
+        await this.restoreAndVerifyCompletedProjection(record, baseline);
         await this.repository.writeMaterializationHead(candidateHead);
         return candidateHead;
       } catch {
@@ -420,17 +468,37 @@ export class MaterializationCoordinator {
   private async finishExistingCompletedRecord(record: CompletedMaterializationRecord): Promise<boolean> {
     const head = headFor(record);
     const baseline = await rebuildProjectionBaseline(this.repository, head);
+    await this.restoreAndVerifyCompletedProjection(record, baseline);
     const currentHead = await this.repository.readMaterializationHead(this.projectId);
     const needsRepair = !currentHead
-      || currentHead.target_revision !== record.target_revision
-      || currentHead.projection_version !== record.projection_version
-      || currentHead.result_root_hash !== record.result_root_hash;
+      || isHeadAheadOf(head, currentHead)
+      || (
+        sameHeadTarget(currentHead, head)
+        && currentHead.result_root_hash !== record.result_root_hash
+      );
     if (needsRepair) await this.repository.writeMaterializationHead(head);
     this.ledger.restoreExternalBaseline(
       { revision: record.target_revision, projection_version: record.projection_version },
       baseline.outputs
     );
     return needsRepair;
+  }
+
+  private async restoreAndVerifyCompletedProjection(
+    record: CompletedMaterializationRecord,
+    baseline: ProjectionBaseline
+  ): Promise<void> {
+    const canonical = await this.repository.readCommitRecord(this.projectId, record.target_revision);
+    if (!canonical) {
+      throw new Error(`Canonical commit record missing for completed materialization ${this.projectId} revision ${record.target_revision}`);
+    }
+    const root = record.workspace_location === "archive"
+      ? archiveProjectRoot(canonical.state.project_id, canonical.state.slug)
+      : this.workspaceRootFor(canonical.state);
+    if (!this.writer.verifyOutputs) {
+      throw new Error("Completed materialization repair requires full-output verification");
+    }
+    await this.writer.verifyOutputs(baseline.outputs, root);
   }
 
   private async archiveWorkspaceOrConflict(state: ProjectState, activeRoot: string): Promise<void> {
@@ -636,6 +704,27 @@ function logMaterializationAttempt(
 
 function generationId(projectId: string, revision: number, projectionVersion: number): string {
   return `${projectId}:REV-${revision.toString().padStart(6, "0")}:PV-${projectionVersion.toString().padStart(4, "0")}`;
+}
+
+function sameHeadTarget(left: MaterializationHead, right: MaterializationHead): boolean {
+  return left.target_revision === right.target_revision
+    && left.projection_version === right.projection_version;
+}
+
+function isHeadAheadOf(candidate: MaterializationHead, current: MaterializationHead): boolean {
+  return candidate.projection_version > current.projection_version
+    || (
+      candidate.projection_version === current.projection_version
+      && candidate.target_revision > current.target_revision
+    );
+}
+
+function samePublishedHead(left: MaterializationHead, right: MaterializationHead): boolean {
+  return left.target_revision === right.target_revision
+    && left.projection_version === right.projection_version
+    && left.workspace_location === right.workspace_location
+    && left.record_path === right.record_path
+    && left.result_root_hash === right.result_root_hash;
 }
 
 function headFor(record: CompletedMaterializationRecord): MaterializationHead {

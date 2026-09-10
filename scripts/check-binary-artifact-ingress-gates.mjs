@@ -21,7 +21,7 @@ const requireBefore = (value, first, second, message) => {
 
 requireMatch(config, /"PROJECT_OS_BINARY_ARTIFACT_INGRESS_MODE"\s*:\s*"off"/, "binary artifact ingress must remain disabled by default");
 requireMatch(config, /"PROJECT_OS_BINARY_ARTIFACT_MAX_BYTES"\s*:\s*"10485760"/, "binary artifact ingress must retain the reviewed 10 MiB default limit");
-requireBefore(publicIngress, "binaryArtifactPolicyViolation(env, artifact)", "routeArtifact(env, artifact)", "public ingress must enforce binary policy before ProjectGuard routing");
+requireBefore(publicIngress, "binaryArtifactPolicyViolation(env, artifact)", "routeArtifact(env, artifact, mutationContext)", "public ingress must enforce binary policy before ProjectGuard routing");
 requireBefore(inboxIngress, "binaryArtifactPolicyViolation(env, artifact)", "env.PROJECT_GUARD.getByName", "Dropbox inbox must enforce binary policy before ProjectGuard routing");
 requireMatch(operating, /OPERATING_CONTRACT_VERSION\s*=\s*3/, "operating contract version 3 must carry the persistence preflight");
 requireMatch(operating, /LOCAL_GENERATED → STAGED → SUBMITTED → COMMITTED → CANONICAL_VERIFIED → ACCEPTED/, "operating contract must expose the full artifact evidence chain");

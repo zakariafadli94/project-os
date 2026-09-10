@@ -167,8 +167,8 @@ describe("ProjectGuard data-preserving rollback", () => {
     expect(mock.files.has(machineCommitRecordPath(projectA, 3))).toBe(false);
     expect(mock.files.has(machineCommitRecordPath(projectB, 3))).toBe(false);
 
-    expect(await runDurableObjectAlarm(projectionStub(projectA))).toBe(true);
-    expect(await runDurableObjectAlarm(projectionStub(projectB))).toBe(true);
+    await materializeThroughContinuations(projectA);
+    await materializeThroughContinuations(projectB);
     const stateA = JSON.parse(mock.files.get(machineStatePath(projectA)) ?? "{}");
     const stateB = JSON.parse(mock.files.get(machineStatePath(projectB)) ?? "{}");
     expect(stateA.revision).toBe(2);

@@ -137,4 +137,104 @@ describe("RegistryGuard canonical recovery", () => {
       status: "paused"
     }));
   });
+
+  it("rejects a stale fleet cursor write without replacing the acknowledged wake queue", async () => {
+    const stub = testEnv.REGISTRY_GUARD.getByName("global");
+    const initialResponse = await stub.fetch("https://registry-guard.internal/convergence-fleet");
+    expect(initialResponse.status).toBe(200);
+    const initial = await initialResponse.json<{ token: string }>();
+
+    const cursor = {
+      schema_version: "1.0" as const,
+      after_project_id: "PRJ-0001",
+      pending_project_ids: ["PRJ-0002", "PRJ-0003"],
+      turn_started_at: "2026-09-09T07:00:00.000Z",
+      last_success_at: null
+    };
+    const accepted = await stub.fetch("https://registry-guard.internal/convergence-fleet", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected_token: initial.token, cursor })
+    });
+    expect(accepted.status).toBe(200);
+
+    const stale = await stub.fetch("https://registry-guard.internal/convergence-fleet", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected_token: initial.token, cursor: {
+        ...cursor,
+        pending_project_ids: []
+      } })
+    });
+    expect(stale.status).toBe(409);
+
+    const currentResponse = await stub.fetch("https://registry-guard.internal/convergence-fleet");
+    const current = await currentResponse.json<{ cursor: typeof cursor }>();
+    expect(current.cursor.pending_project_ids).toEqual(["PRJ-0002", "PRJ-0003"]);
+  });
+
+  it("recovers the fleet cursor from its Dropbox checkpoint after local loss", async () => {
+    const stub = testEnv.REGISTRY_GUARD.getByName("global");
+    const initial = await (await stub.fetch("https://registry-guard.internal/convergence-fleet"))
+      .json<{ token: string }>();
+    const cursor = {
+      schema_version: "1.0" as const,
+      after_project_id: "PRJ-0003",
+      pending_project_ids: ["PRJ-0004"],
+      turn_started_at: "2026-09-09T07:05:00.000Z",
+      last_success_at: "2026-09-09T07:05:01.000Z"
+    };
+    const written = await stub.fetch("https://registry-guard.internal/convergence-fleet", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected_token: initial.token, cursor })
+    });
+    expect(written.status).toBe(200);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM meta WHERE key IN ('fleet_cursor', 'fleet_cursor_token')");
+    });
+
+    const recovered = await (await stub.fetch("https://registry-guard.internal/convergence-fleet"))
+      .json<{ cursor: typeof cursor }>();
+    expect(recovered.cursor).toEqual(cursor);
+  });
+
+  it("reports an external conditional-write race as a fleet cursor conflict", async () => {
+    vi.restoreAllMocks();
+    installDropboxMock({ faults: [{
+      endpoint: "/2/files/upload",
+      occurrence: 2,
+      status: 409,
+      error_summary: "path/conflict/file/",
+      path: "/PROJECT_OS/.project-os/convergence/fleet.json"
+    }] });
+    const stub = testEnv.REGISTRY_GUARD.getByName("global");
+    const initial = await (await stub.fetch("https://registry-guard.internal/convergence-fleet"))
+      .json<{ token: string }>();
+    const cursor = {
+      schema_version: "1.0" as const,
+      after_project_id: null,
+      pending_project_ids: ["PRJ-0001"],
+      turn_started_at: "2026-09-09T07:10:00.000Z",
+      last_success_at: null
+    };
+    expect((await stub.fetch("https://registry-guard.internal/convergence-fleet", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected_token: initial.token, cursor })
+    })).status).toBe(200);
+
+    const current = await (await stub.fetch("https://registry-guard.internal/convergence-fleet"))
+      .json<{ token: string }>();
+    const raced = await stub.fetch("https://registry-guard.internal/convergence-fleet", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected_token: current.token, cursor: {
+        ...cursor,
+        pending_project_ids: []
+      } })
+    });
+    expect(raced.status).toBe(409);
+  });
 });

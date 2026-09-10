@@ -1,8 +1,9 @@
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, type Transaction } from "../domain/transaction";
 import type { ContinuityPath } from "./policy";
+import { AdmissionError, type MutationContext } from "../admission/mutation-context";
 
-export type TransactionExecutor = (transaction: Transaction) => Promise<unknown>;
+export type TransactionExecutor = (transaction: Transaction, context?: MutationContext | null) => Promise<unknown>;
 
 export interface RollbackExecution {
   receipt: Receipt;
@@ -15,6 +16,7 @@ export interface RollbackExecution {
 export interface RollbackExecutionInput {
   selectedPath: ContinuityPath;
   transaction: Transaction;
+  context?: MutationContext | null;
   stable: TransactionExecutor;
   candidate?: TransactionExecutor;
 }
@@ -22,7 +24,7 @@ export interface RollbackExecutionInput {
 export async function executeWithRollback(input: RollbackExecutionInput): Promise<RollbackExecution> {
   if (input.selectedPath === "stable") {
     return {
-      receipt: requireBusinessReceipt(await input.stable(input.transaction), input.transaction),
+      receipt: requireBusinessReceipt(await input.stable(input.transaction, input.context), input.transaction),
       selected_path: "stable",
       final_path: "stable",
       fallback_occurred: false
@@ -32,7 +34,7 @@ export async function executeWithRollback(input: RollbackExecutionInput): Promis
   let candidateFailure: RollbackExecution["candidate_failure"] = "technical";
   try {
     if (!input.candidate) throw new Error("Candidate executor unavailable");
-    const value = await input.candidate(input.transaction);
+    const value = await input.candidate(input.transaction, input.context);
     const candidateReceipt = businessReceiptOrNull(value, input.transaction);
     if (candidateReceipt) {
       return {
@@ -43,12 +45,13 @@ export async function executeWithRollback(input: RollbackExecutionInput): Promis
       };
     }
     candidateFailure = "malformed_result";
-  } catch {
+  } catch (error) {
+    if (error instanceof AdmissionError) throw error;
     candidateFailure = "technical";
   }
 
   return {
-    receipt: requireBusinessReceipt(await input.stable(input.transaction), input.transaction),
+    receipt: requireBusinessReceipt(await input.stable(input.transaction, input.context), input.transaction),
     selected_path: "candidate",
     final_path: "stable",
     fallback_occurred: true,

@@ -5,6 +5,7 @@ import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import {
   machineCommitRecordPath,
+  machineEventPath,
   machineMaterializationHeadPath,
   machineReceiptPath,
   machineStatePath
@@ -142,5 +143,13 @@ describe("ProjectGuard crash-safe canonical commits", () => {
     expect(state.tasks).toHaveProperty("TASK-COMMIT1702A");
     expect(state.tasks).toHaveProperty("TASK-COMMIT1702B");
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "{}").target_revision).toBe(3);
+    expect(first.event_id).toBeDefined();
+    expect(mock.files.has(machineEventPath(projectId, first.event_id!))).toBe(true);
+    expect(first.transaction_id).toBeDefined();
+    expect(mock.files.has(machineReceiptPath(first.transaction_id!))).toBe(true);
+    expect(next.event_id).toBeDefined();
+    expect(mock.files.has(machineEventPath(projectId, next.event_id!))).toBe(true);
+    expect(next.transaction_id).toBeDefined();
+    expect(mock.files.has(machineReceiptPath(next.transaction_id!))).toBe(true);
   });
 });

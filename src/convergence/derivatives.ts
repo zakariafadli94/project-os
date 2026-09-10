@@ -6,25 +6,35 @@ import {
   machineStatePath
 } from "../persistence/layout";
 import type { ProjectRepository } from "../persistence/repository";
-import type { EffectIntent, LayerHealth, Progress } from "./contract";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type { EffectIntent, LayerHealth } from "./contract";
 import { FencedEffects, observeText } from "./fenced-effects";
 
 type DerivativeLayer = "event" | "receipt" | "state" | "manifest";
 
-export async function repairDerivative(
+export interface DerivativeRepairInspection {
+  current: LayerHealth | null;
+  intent: EffectIntent | null;
+}
+
+/**
+ * Captures the exact path, desired bytes and provider precondition that a
+ * later durable effect is allowed to use. The engine checkpoints this intent
+ * before it reserves an attempt or performs any mutation.
+ */
+export async function inspectDerivativeRepair(
   layer: DerivativeLayer,
   record: CanonicalCommitRecord,
-  progress: Progress,
   effects: FencedEffects,
   repository: Pick<ProjectRepository, "canonicalDerivativeText">
-): Promise<LayerHealth> {
+): Promise<DerivativeRepairInspection> {
   const path = derivativePath(layer, record);
   const content = repository.canonicalDerivativeText(layer, record);
   const observed = await observeTextForEffects(effects, path);
   const expected = await textEvidence(content, record.new_revision);
 
-  if (observed?.content === content) return current(expected, observed, record.new_revision);
-  const intent: EffectIntent = {
+  if (observed?.content === content) return { current: current(expected, observed, record.new_revision), intent: null };
+  return { current: null, intent: {
     id: `${layer}:${record.new_revision}`,
     path,
     destination: path,
@@ -35,14 +45,48 @@ export async function repairDerivative(
     authorized_previous_hash: observed?.hash ?? null,
     state: "prepared",
     verified_token: null
-  };
-  if (progress.effects[intent.id]?.state !== "prepared") return pending(expected, observed, "effect_requires_reservation");
+  } };
+}
+
+export async function repairDerivative(
+  layer: DerivativeLayer,
+  record: CanonicalCommitRecord,
+  effects: FencedEffects,
+  repository: Pick<ProjectRepository, "canonicalDerivativeText">,
+  intent: EffectIntent
+): Promise<LayerHealth> {
+  const path = derivativePath(layer, record);
+  const content = repository.canonicalDerivativeText(layer, record);
+  const observed = await observeTextForEffects(effects, path);
+  const expected = await textEvidence(content, record.new_revision);
+  if (observed?.content === content) return current(expected, observed, record.new_revision);
+  if (
+    intent.id !== `${layer}:${record.new_revision}`
+    || intent.path !== path
+    || intent.desired_hash !== expected.hash
+  ) return pending(expected, observed, "effect_intent_mismatch");
   try {
     const after = await effects.replace(intent, content);
     return current(expected, after, record.new_revision);
   } catch (error) {
     return pending(expected, observed, error instanceof Error ? error.message : "effect_blocked");
   }
+}
+
+/** Reads one machine derivative without reserving or performing an effect. */
+export async function observeDerivative(
+  layer: DerivativeLayer,
+  record: CanonicalCommitRecord,
+  runtime: ProjectOsPersistenceRuntime,
+  repository: Pick<ProjectRepository, "canonicalDerivativeText">
+): Promise<LayerHealth> {
+  const path = derivativePath(layer, record);
+  const content = repository.canonicalDerivativeText(layer, record);
+  const observed = await observeText(runtime, path);
+  const expected = await textEvidence(content, record.new_revision);
+  return observed?.content === content
+    ? current(expected, observed, record.new_revision)
+    : pending(expected, observed, "derivative_not_current");
 }
 
 function derivativePath(layer: DerivativeLayer, record: CanonicalCommitRecord): string {

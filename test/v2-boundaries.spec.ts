@@ -68,7 +68,7 @@ describe("V2 persistence boundaries", () => {
     expect(transport.files.has(`/PROJECT_OS/TRANSACTIONS/rejected/${transaction.transaction_id}.json`)).toBe(false);
   });
 
-  it("materializes a V2 machine state snapshot without changing business revision", async () => {
+  it("blocks a V2 workspace writer until the convergence rollout activates it", async () => {
     const projectId = "PRJ-1198";
     const stub = testEnv.PROJECT_GUARD.getByName(projectId);
     const create = await stub.fetch("https://project-guard.internal/transaction", {
@@ -92,9 +92,11 @@ describe("V2 persistence boundaries", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ target: "workspace-v2" })
     });
-    expect(materialize.status).toBe(200);
-    await expect(materialize.json()).resolves.toEqual({ project_id: projectId, revision: 1, materialized: true });
-    expect(dropbox.files.has(machineStatePath(projectId))).toBe(true);
+    expect(materialize.status).toBe(409);
+    await expect(materialize.json()).resolves.toEqual({
+      error: "convergence_writer_inactive", project_id: projectId, mode: "off"
+    });
+    expect(dropbox.files.has(machineStatePath(projectId))).toBe(false);
 
     const task = await stub.fetch("https://project-guard.internal/transaction", {
       method: "POST",

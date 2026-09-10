@@ -1,11 +1,31 @@
 import { DurableObject } from "cloudflare:workers";
+import type { FleetCursor } from "../convergence/fleet";
 import type { Env } from "../env";
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
-import { parseLayoutMode } from "../persistence/layout";
+import { machineFleetCursorPath, parseLayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
+import { ProviderConflictError, ProviderPreconditionFailedError } from "../persistence/provider/errors";
+import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ProjectRepository } from "../persistence/repository";
 import { renderRegistry, type RegistryEntry } from "../render/registry";
+import {
+  FallbackContractError,
+  parseFallbackEncryptedRequestJson,
+  parseFallbackEncryptAndRotateInputJson
+} from "../fallback/contract";
+import {
+  FallbackCryptoError,
+  decryptFallbackPayload,
+  encryptFallbackPayload,
+  exportP256PrivateJwk,
+  exportP256PublicJwk,
+  generateP256EcdhKeyPair,
+  importP256PrivateJwk,
+  parseP256PublicJwk,
+  type FallbackOperation,
+  type P256PublicJwk
+} from "../fallback/crypto";
 
 interface RequestRow {
   [key: string]: SqlStorageValue;
@@ -36,8 +56,23 @@ interface CountRow {
   count: number;
 }
 
+interface FallbackKeySessionRow {
+  [key: string]: SqlStorageValue;
+  key_id: string;
+  private_jwk_json: string;
+  caller_public_jwk_json: string | null;
+  request_id: string | null;
+  operation: string | null;
+  created_at_ms: number;
+  retired_at_ms: number | null;
+}
+
+const FALLBACK_KEY_SESSION_TTL_MS = 5 * 60_000;
+const MAX_FALLBACK_KEY_SESSIONS = 32;
+
 export class RegistryGuard extends DurableObject<Env> {
   private readonly repository: ProjectRepository;
+  private readonly fleetPersistence: ProjectOsPersistenceRuntime;
   private queue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -63,10 +98,20 @@ export class RegistryGuard extends DurableObject<Env> {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS fallback_key_sessions (
+        key_id TEXT PRIMARY KEY,
+        private_jwk_json TEXT NOT NULL,
+        caller_public_jwk_json TEXT,
+        request_id TEXT,
+        operation TEXT,
+        created_at_ms INTEGER NOT NULL,
+        retired_at_ms INTEGER
+      );
       INSERT OR IGNORE INTO meta (key, value) VALUES ('next_project_number', '1');
     `);
     const persistence = createProductionPersistence(env);
     this.repository = new ProjectRepository(persistence, parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
+    this.fleetPersistence = persistence;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -83,7 +128,164 @@ export class RegistryGuard extends DurableObject<Env> {
     if (request.method === "POST" && path === "/sync-status") {
       return this.serialize(() => this.handleStatusSync(request));
     }
+    if (request.method === "GET" && path === "/convergence-fleet") {
+      return this.serialize(async () => Response.json(await this.fleetCursorState()));
+    }
+    if (request.method === "POST" && path === "/convergence-fleet") {
+      return this.serialize(() => this.handleFleetCursor(request));
+    }
+    if (request.method === "GET" && path === "/fallback/key") {
+      return this.serialize(() => this.handleFallbackKey());
+    }
+    if (request.method === "POST" && path === "/fallback/decrypt") {
+      return this.serialize(() => this.handleFallbackDecrypt(request));
+    }
+    if (request.method === "POST" && path === "/fallback/encrypt-and-rotate") {
+      return this.serialize(() => this.handleFallbackEncryptAndRotate(request));
+    }
     return Response.json({ error: "not_found" }, { status: 404 });
+  }
+
+  private async handleFallbackKey(): Promise<Response> {
+    try {
+      const keyPair = await generateP256EcdhKeyPair();
+      const keyId = `fkey_${crypto.randomUUID().replaceAll("-", "")}`;
+      const privateJwk = await exportP256PrivateJwk(keyPair.privateKey);
+      const serverPublicKey = await exportP256PublicJwk(keyPair.publicKey);
+      this.pruneFallbackSessions(Date.now());
+      this.ctx.storage.sql.exec(
+        `INSERT INTO fallback_key_sessions
+         (key_id, private_jwk_json, caller_public_jwk_json, request_id, operation, created_at_ms, retired_at_ms)
+         VALUES (?, ?, NULL, NULL, NULL, ?, NULL)`,
+        keyId,
+        JSON.stringify(privateJwk),
+        Date.now()
+      );
+      return fallbackJson({ schema_version: "1.0", key_id: keyId, server_public_key: serverPublicKey });
+    } catch {
+      return fallbackError("fallback_key_unavailable", 503);
+    }
+  }
+
+  private async handleFallbackDecrypt(request: Request): Promise<Response> {
+    let envelope;
+    try {
+      envelope = parseFallbackEncryptedRequestJson(await request.text());
+    } catch (error) {
+      return fallbackError(error instanceof FallbackContractError && error.code === "payload_too_large" ? "fallback_payload_too_large" : "invalid_fallback_envelope", 400);
+    }
+    const session = this.liveFallbackSession(envelope.key_id, Date.now());
+    if (!session) return fallbackError("fallback_key_retired", 409);
+    try {
+      const plaintext = new TextDecoder("utf-8", { fatal: true }).decode(await decryptFallbackPayload({
+        key_id: envelope.key_id,
+        request_id: envelope.request_id,
+        operation: envelope.operation,
+        direction: "client_to_server",
+        recipient_private_key: await importP256PrivateJwk(JSON.parse(session.private_jwk_json)),
+        sender_public_key: envelope.caller_public_key,
+        iv: envelope.iv,
+        ciphertext: envelope.ciphertext
+      }));
+      const caller = JSON.stringify(parseP256PublicJwk(envelope.caller_public_key));
+      if (
+        session.caller_public_jwk_json !== null
+        && (session.caller_public_jwk_json !== caller || session.request_id !== envelope.request_id || session.operation !== envelope.operation)
+      ) return fallbackError("fallback_key_retired", 409);
+      if (session.caller_public_jwk_json === null) {
+        this.ctx.storage.sql.exec(
+          `UPDATE fallback_key_sessions
+           SET caller_public_jwk_json = ?, request_id = ?, operation = ?
+           WHERE key_id = ? AND retired_at_ms IS NULL`,
+          caller,
+          envelope.request_id,
+          envelope.operation,
+          envelope.key_id
+        );
+      }
+      return fallbackJson({
+        key_id: envelope.key_id,
+        request_id: envelope.request_id,
+        operation: envelope.operation,
+        plaintext
+      });
+    } catch (error) {
+      const code = error instanceof FallbackCryptoError && error.code === "payload_too_large"
+        ? "fallback_payload_too_large"
+        : "invalid_fallback_envelope";
+      return fallbackError(code, 400);
+    }
+  }
+
+  private async handleFallbackEncryptAndRotate(request: Request): Promise<Response> {
+    let input;
+    try {
+      input = parseFallbackEncryptAndRotateInputJson(await request.text());
+    } catch (error) {
+      return fallbackError(error instanceof FallbackContractError && error.code === "payload_too_large" ? "fallback_payload_too_large" : "invalid_fallback_response", 400);
+    }
+    const session = this.liveFallbackSession(input.key_id, Date.now());
+    if (
+      !session
+      || !session.caller_public_jwk_json
+      || session.request_id !== input.request_id
+      || session.operation !== input.operation
+    ) return fallbackError("fallback_key_retired", 409);
+    try {
+      const encrypted = await encryptFallbackPayload({
+        key_id: input.key_id,
+        request_id: input.request_id,
+        operation: input.operation,
+        direction: "server_to_client",
+        sender_private_key: await importP256PrivateJwk(JSON.parse(session.private_jwk_json)),
+        recipient_public_key: parseP256PublicJwk(JSON.parse(session.caller_public_jwk_json)),
+        plaintext: new TextEncoder().encode(input.plaintext)
+      });
+      this.ctx.storage.sql.exec(
+        "UPDATE fallback_key_sessions SET retired_at_ms = ? WHERE key_id = ? AND retired_at_ms IS NULL",
+        Date.now(),
+        input.key_id
+      );
+      return fallbackJson({
+        schema_version: "1.0",
+        key_id: input.key_id,
+        request_id: input.request_id,
+        operation: input.operation,
+        ...encrypted
+      });
+    } catch (error) {
+      const code = error instanceof FallbackCryptoError && error.code === "payload_too_large"
+        ? "fallback_payload_too_large"
+        : "fallback_response_unavailable";
+      return fallbackError(code, 503);
+    }
+  }
+
+  private liveFallbackSession(keyId: string, nowMs: number): FallbackKeySessionRow | null {
+    const session = this.ctx.storage.sql.exec<FallbackKeySessionRow>(
+      "SELECT * FROM fallback_key_sessions WHERE key_id = ?",
+      keyId
+    ).toArray()[0] ?? null;
+    if (!session || session.retired_at_ms !== null) return null;
+    if (nowMs - session.created_at_ms > FALLBACK_KEY_SESSION_TTL_MS) {
+      this.ctx.storage.sql.exec("UPDATE fallback_key_sessions SET retired_at_ms = ? WHERE key_id = ?", nowMs, keyId);
+      return null;
+    }
+    return session;
+  }
+
+  private pruneFallbackSessions(nowMs: number): void {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM fallback_key_sessions WHERE created_at_ms < ? OR (retired_at_ms IS NOT NULL AND retired_at_ms < ?)",
+      nowMs - FALLBACK_KEY_SESSION_TTL_MS,
+      nowMs - FALLBACK_KEY_SESSION_TTL_MS
+    );
+    const sessions = this.ctx.storage.sql.exec<FallbackKeySessionRow>(
+      "SELECT * FROM fallback_key_sessions ORDER BY created_at_ms ASC"
+    ).toArray();
+    for (const session of sessions.slice(0, Math.max(0, sessions.length - MAX_FALLBACK_KEY_SESSIONS + 1))) {
+      this.ctx.storage.sql.exec("DELETE FROM fallback_key_sessions WHERE key_id = ?", session.key_id);
+    }
   }
 
   private async handleCreate(request: Request): Promise<Response> {
@@ -209,6 +411,92 @@ export class RegistryGuard extends DurableObject<Env> {
     const entries = this.registryEntries();
     await this.repository.writeRegistry({ schema_version: "1.0", projects: entries }, renderRegistry(entries));
     return Response.json({ status: "ok" });
+  }
+
+  private async handleFleetCursor(request: Request): Promise<Response> {
+    let body: { expected_token?: unknown; cursor?: unknown };
+    try {
+      body = await request.json() as { expected_token?: unknown; cursor?: unknown };
+    } catch {
+      return Response.json({ error: "invalid_fleet_cursor" }, { status: 400 });
+    }
+    if ((body.expected_token !== null && typeof body.expected_token !== "string") || body.cursor === undefined) {
+      return Response.json({ error: "invalid_fleet_cursor" }, { status: 400 });
+    }
+
+    let cursor: FleetCursor;
+    try {
+      cursor = parseFleetCursor(body.cursor);
+    } catch {
+      return Response.json({ error: "invalid_fleet_cursor" }, { status: 400 });
+    }
+
+    const current = await this.fleetCursorState();
+    if (body.expected_token !== current.token) {
+      return Response.json({ error: "fleet_cursor_conflict", cursor: current.cursor, token: current.token }, { status: 409 });
+    }
+    let token: string;
+    try {
+      token = await this.writeFleetCheckpoint(cursor, current.token === "0" ? null : current.token);
+    } catch (error) {
+      if (error instanceof ProviderConflictError || error instanceof ProviderPreconditionFailedError) {
+        const latest = await this.fleetCursorState();
+        return Response.json({ error: "fleet_cursor_conflict", cursor: latest.cursor, token: latest.token }, { status: 409 });
+      }
+      throw error;
+    }
+    this.persistFleetCursor(cursor, token);
+    return Response.json({ cursor, token });
+  }
+
+  private async fleetCursorState(): Promise<{ cursor: FleetCursor; token: string }> {
+    const checkpoint = await this.readFleetCheckpoint();
+    if (checkpoint) {
+      this.persistFleetCursor(checkpoint.cursor, checkpoint.token);
+      return checkpoint;
+    }
+    return { cursor: emptyFleetCursor(), token: "0" };
+  }
+
+  private async readFleetCheckpoint(): Promise<{ cursor: FleetCursor; token: string } | null> {
+    const path = machineFleetCursorPath();
+    const metadata = await this.fleetPersistence.objects.getMetadata(path);
+    if (!metadata) return null;
+    if (!metadata.revisionToken) throw new Error("Fleet cursor checkpoint is missing a revision token");
+    const text = await this.fleetPersistence.objects.readText(path);
+    if (text === null) throw new Error("Fleet cursor checkpoint disappeared during read");
+    const confirmation = await this.fleetPersistence.objects.getMetadata(path);
+    if (!confirmation || confirmation.revisionToken !== metadata.revisionToken) {
+      throw new ProviderConflictError("Fleet cursor checkpoint changed during read");
+    }
+    return { cursor: parseFleetCursor(JSON.parse(text)), token: metadata.revisionToken };
+  }
+
+  private async writeFleetCheckpoint(cursor: FleetCursor, expectedToken: string | null): Promise<string> {
+    const path = machineFleetCursorPath();
+    const content = JSON.stringify(cursor);
+    if (expectedToken === null) {
+      await this.fleetPersistence.objects.createText(path, content);
+      const metadata = await this.fleetPersistence.objects.getMetadata(path);
+      if (!metadata?.revisionToken) throw new Error("Fleet cursor checkpoint create has no revision token");
+      return metadata.revisionToken;
+    }
+    const metadata = await this.fleetPersistence.conditionalWrite.writeTextConditional(path, content, expectedToken);
+    if (!metadata.revisionToken) throw new Error("Fleet cursor checkpoint write has no revision token");
+    return metadata.revisionToken;
+  }
+
+  private persistFleetCursor(cursor: FleetCursor, token: string): void {
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO meta (key, value) VALUES ('fleet_cursor', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        JSON.stringify(cursor)
+      );
+      this.ctx.storage.sql.exec(
+        "INSERT INTO meta (key, value) VALUES ('fleet_cursor_token', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        token
+      );
+    });
   }
 
   private async ensureRegistryRecovered(): Promise<void> {
@@ -399,4 +687,54 @@ function parseCanonicalRegistry(value: unknown): RegistryEntry[] | null {
 
 function normalizeIdentity(value: string): string {
   return value.trim().toLocaleLowerCase("en-US").replace(/\s+/g, " ");
+}
+
+function emptyFleetCursor(): FleetCursor {
+  return {
+    schema_version: "1.0",
+    after_project_id: null,
+    pending_project_ids: [],
+    turn_started_at: "1970-01-01T00:00:00.000Z",
+    last_success_at: null
+  };
+}
+
+function parseFleetCursor(value: unknown): FleetCursor {
+  if (!value || typeof value !== "object") throw new Error("invalid fleet cursor");
+  const cursor = value as Record<string, unknown>;
+  if (
+    cursor.schema_version !== "1.0"
+    || (cursor.after_project_id !== null && !isProjectId(cursor.after_project_id))
+    || !Array.isArray(cursor.pending_project_ids)
+    || cursor.pending_project_ids.some((projectId) => !isProjectId(projectId))
+    || new Set(cursor.pending_project_ids).size !== cursor.pending_project_ids.length
+    || !isTimestamp(cursor.turn_started_at)
+    || (cursor.last_success_at !== null && !isTimestamp(cursor.last_success_at))
+  ) throw new Error("invalid fleet cursor");
+  return {
+    schema_version: "1.0",
+    after_project_id: cursor.after_project_id as string | null,
+    pending_project_ids: [...cursor.pending_project_ids] as string[],
+    turn_started_at: cursor.turn_started_at as string,
+    last_success_at: cursor.last_success_at as string | null
+  };
+}
+
+function isProjectId(value: unknown): value is string {
+  return typeof value === "string" && /^PRJ-\d{4,}$/.test(value);
+}
+
+function isTimestamp(value: unknown): value is string {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+function fallbackJson(body: unknown, status = 200): Response {
+  return Response.json(body, {
+    status,
+    headers: { "cache-control": "no-store" }
+  });
+}
+
+function fallbackError(error: string, status: number): Response {
+  return fallbackJson({ error }, status);
 }

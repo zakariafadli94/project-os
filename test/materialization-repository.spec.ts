@@ -3,7 +3,7 @@ import type {
   CompletedMaterializationRecord,
   MaterializationHead
 } from "../src/domain/materialization";
-import { DropboxConflictError, type DropboxEntry, type DropboxTransport } from "../src/dropbox/client";
+import { DropboxConflictError, type DropboxEntry, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import {
   machineMaterializationHeadPath,
   machineMaterializationRecordPath
@@ -13,16 +13,31 @@ import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
+  revisions = new Map<string, number>();
   uploads: Array<{ path: string; mode: "add" | "overwrite" }> = [];
 
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
     if (mode === "add" && this.files.has(path)) throw new DropboxConflictError("already exists", "req-materialization-test");
     this.files.set(path, content);
+    this.revisions.set(path, (this.revisions.get(path) ?? 0) + 1);
     this.uploads.push({ path, mode });
   }
 
   async download(path: string): Promise<string | null> {
     return this.files.get(path) ?? null;
+  }
+
+  async getMetadata(path: string): Promise<DropboxFileMetadata | null> {
+    if (!this.files.has(path)) return null;
+    const revision = String(this.revisions.get(path) ?? 1);
+    return { id: `id:${path}`, path, rev: revision, content_hash: "0".repeat(64), size: this.files.get(path)!.length };
+  }
+
+  async uploadConditional(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata> {
+    const current = await this.getMetadata(path);
+    if (!current || current.rev !== expectedRev) throw new DropboxConflictError("revision conflict", "req-materialization-test");
+    await this.upload(path, content, "overwrite");
+    return (await this.getMetadata(path))!;
   }
 
   async move(from: string, to: string): Promise<void> {

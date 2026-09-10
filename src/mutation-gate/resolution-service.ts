@@ -51,6 +51,31 @@ export class MutationCandidateResolutionService {
     this.repository = new MutationGateRepository(input);
   }
 
+  /**
+   * Exact terminal replay is safe without a fresh admission token: it cannot
+   * create a new candidate resolution and only repairs its existing evidence.
+   */
+  async replay(request: MutationCandidateResolutionRequest): Promise<MutationCandidateResolutionReceipt | null> {
+    const candidate = await this.repository.readCandidate(request.project_id, request.candidate_id);
+    if (!candidate) return null;
+
+    const terminalEvidence = await this.repository.readTerminalResolutionRecord(request.project_id, request.candidate_id);
+    if (!terminalEvidence || !terminalEvidence.resolution_request_sha256) return null;
+    if (
+      terminalEvidence.resolution_id !== request.resolution_id
+      || terminalEvidence.resolution.action !== actionFor(request)
+    ) return null;
+
+    const requestHash = await sha256Text(JSON.stringify(request));
+    if (terminalEvidence.resolution_request_sha256 !== requestHash) return null;
+
+    const repaired = await this.repository.writeResolution(
+      terminalEvidence.resolution,
+      terminalEvidence.resolution_request_sha256
+    );
+    return replayReceipt(request, repaired);
+  }
+
   async resolve(
     request: MutationCandidateResolutionRequest,
     state: ProjectState,
@@ -64,6 +89,9 @@ export class MutationCandidateResolutionService {
     if (!candidate) {
       return terminal(request, "rejected", "CANDIDATE_NOT_FOUND", "Mutation candidate does not exist");
     }
+
+    const replay = await this.replay(request);
+    if (replay) return replay;
 
     const resolutionRequestSha256 = await sha256Text(JSON.stringify(request));
     const terminalEvidence = await this.repository.readTerminalResolutionRecord(request.project_id, request.candidate_id);
@@ -82,20 +110,12 @@ export class MutationCandidateResolutionService {
           "Terminal mutation candidate evidence is missing its resolution request hash"
         );
       }
-      if (terminalEvidence.resolution_request_sha256 !== resolutionRequestSha256) {
-        return terminal(
-          request,
-          "conflict",
-          "IDEMPOTENCY_PAYLOAD_MISMATCH",
-          "The same resolution_id was reused with a different candidate resolution payload"
-        );
-      }
-
-      const repaired = await this.repository.writeResolution(
-        terminalEvidence.resolution,
-        terminalEvidence.resolution_request_sha256
+      return terminal(
+        request,
+        "conflict",
+        "IDEMPOTENCY_PAYLOAD_MISMATCH",
+        "The same resolution_id was reused with a different candidate resolution payload"
       );
-      return replayReceipt(request, repaired);
     }
 
     const resolutions = await this.repository.readResolutions(request.project_id, request.candidate_id);

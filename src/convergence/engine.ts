@@ -696,6 +696,18 @@ export class ConvergenceEngine {
         progress.active = null;
         progress.next_alarm_at = nextPendingWake(progress);
       } else {
+        // A completed generation can lose or fail to publish its head after
+        // the first human slice.  Verification must hand that target back to
+        // the fenced human recovery path; retaining `verify` would only
+        // re-observe the same stale head forever.
+        progress.obligations[existing.id] = {
+          ...existing,
+          state: "pending",
+          next_attempt_at: null,
+          last_verified_at: null,
+          code: "generation_or_head_not_current",
+          continuation: null
+        };
         progress.active = { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION };
         progress.next_alarm_at = new Date(this.input.now()).toISOString();
       }

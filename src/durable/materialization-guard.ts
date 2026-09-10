@@ -184,6 +184,36 @@ export class MaterializationGuard extends DurableObject<Env> {
     const { coordinator, repository } = this.coordinatorForSlice(false);
     const state = await this.canonicalState(repository);
     if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+    const convergenceMode = convergenceModeForProject(
+      this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES,
+      this.projectId
+    );
+    if (convergenceMode === "repair") {
+      const journal = new ConvergenceJournal(
+        createProductionPersistence(this.env, this.projectId),
+        this.projectId
+      );
+      const saved = await journal.load();
+      const hasPendingConvergence = saved !== null && (
+        saved.progress.active !== null
+        || saved.progress.requested !== null
+        || Object.values(saved.progress.obligations).some((obligation) => obligation.state !== "verified")
+      );
+      if (hasPendingConvergence) {
+        await this.scheduleConvergenceContinuation(true, saved.progress.next_alarm_at);
+      } else {
+        const head = await repository.readMaterializationHead(this.projectId);
+        const headCurrent = head !== null
+          && head.target_revision === state.revision
+          && head.projection_version === CURRENT_PROJECTION_VERSION;
+        if (!headCurrent) {
+          const { engine } = this.convergenceEngineForSlice();
+          await engine.requestTarget({ revision: state.revision, projection_version: CURRENT_PROJECTION_VERSION });
+          await this.scheduleConvergenceContinuation(true, new Date().toISOString());
+        }
+      }
+      return Response.json(this.statusResponse(state));
+    }
     await coordinator.reconcile(state.revision);
     await this.ensureAlarmIfPending();
     return Response.json(this.statusResponse(state));

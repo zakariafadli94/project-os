@@ -82,6 +82,7 @@ export class WorkspaceProjectionWriter {
     for (const output of plan.changed_outputs.values()) {
       const priorAttempt = options.alreadyVerified?.get(output.key);
       if (priorAttempt && sameEvidence(priorAttempt, output)) {
+        await this.reverifyReusedOutput(plan.project_id, output, root, priorAttempt, options);
         verified.set(output.key, priorAttempt);
         await options.onOutputOutcome?.(output.key, "attempt_reuse");
         await options.onOutputVerified?.(output.key, priorAttempt);
@@ -271,6 +272,31 @@ export class WorkspaceProjectionWriter {
       }
       await this.objects.delete(path);
     }
+  }
+
+  private async reverifyReusedOutput(
+    projectId: string,
+    output: PlannedProjectionOutput,
+    root: string,
+    evidence: ProjectionOutputEvidence,
+    options: WorkspaceProjectionWriterOptions
+  ): Promise<void> {
+    const path = joinWorkspacePath(root, output.relative_path);
+    const observed = await this.observeForWrite(path);
+    if (observed !== null && observed.hash === evidence.content_hash) return;
+    if (observed !== null) {
+      await this.preserveUnexpectedContent(projectId, {
+        key: output.key,
+        path,
+        currentContent: observed.content,
+        currentHash: observed.hash
+      }, options.onUnexpectedContent);
+    }
+    throw new MaterializationOutputConflictError(
+      output.key,
+      path,
+      `Materialization output changed after its prior attempt was verified: ${path}`
+    );
   }
 
   private async materializeOne(

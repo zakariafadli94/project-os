@@ -32,6 +32,15 @@ The production investigation found that repeated target registration could consu
 - Cloudflare bundle-only dry run: 1,788.03 KiB, 302.88 KiB gzip, exited before upload.
 - Production before the final global configuration already reported PRJ-0002 at 169/PV3, PRJ-0003 at 267/PV3 and PRJ-0007 at 33/PV3, each with no active/requested target, no blocked error, no pending final verification, no pending obligation and no alarm. PRJ-0008 separately reported 3/PV3 with the same empty pending state.
 
-The final deployment must use the exact reviewed SHA and the explicit active-project map `{PRJ-0002, PRJ-0003, PRJ-0007, PRJ-0008}: repair`, followed by a fresh status check for all four projects. No canonical business revision is introduced by this rollout.
+## Final integration and production proof
+
+- GitHub pull request #180 passed CI run `34546449751`, including the complete test, repository policy, persistence, recovery and Cloudflare dry-run gates.
+- GitHub merged the reviewed release as `4f4ff59e397a0a6bfbbaf85501bd090f4b46ebd9`.
+- Project Guard was deployed from the identical tree with tag `git-4f4ff59e397a0a6bfbbaf85501bd090f4b46ebd9` and the explicit active-project map `{PRJ-0002, PRJ-0003, PRJ-0007, PRJ-0008}: repair`.
+- Production health returned the exact merged SHA and tag.
+- A post-deployment materialization completed at PRJ-0002 revision 169, PRJ-0003 revision 267, PRJ-0007 revision 33 and PRJ-0008 revision 3.
+- The final authenticated status read found, for every active project, canonical revision equal to head revision, projection version 3, no requested or active target, no blocked error, zero pending final verification, no pending obligation, no alarm, and a verified human handoff.
+
+No canonical business revision was introduced by the rollout.
 
 Independent code review found and closed three activation defects before the final gate: provider head deletion could be hidden by a stale local ledger, deferred notification configuration also suppressed durable incident persistence, and the production fleet retained archived IDs from an older pending page. Fresh provider generation binding, durable incident retention, and active-scope fleet pruning now have direct regression coverage. The final re-review reported no remaining critical or important issue.

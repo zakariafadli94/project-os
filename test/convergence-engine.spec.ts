@@ -101,6 +101,34 @@ describe("convergence engine scheduling", () => {
     expect((await journal.load())?.progress.next_alarm_at).toBe("1970-01-01T00:00:00.000Z");
   });
 
+  it("reactivates a requested human target when canonical discovery is already current", async () => {
+    installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture("PRJ-9270", 1)[0]!;
+    const repository = new ProjectRepository(runtime, "v2");
+    await repository.writeCommitRecord(record);
+    await repository.materializeCanonicalDerivatives(record);
+    const journal = new ConvergenceJournal(runtime, record.project_id);
+    const progress = initialProgress(record.project_id, "1970-01-01T00:00:00.000Z", "writer-1");
+    progress.canonical_observed_revision = record.new_revision;
+    progress.baseline_revision = record.new_revision;
+    progress.requested = { revision: record.new_revision, projection_version: 3 };
+    await journal.save(progress, null);
+    const engine = new ConvergenceEngine({
+      projectId: record.project_id, repository, runtime, journal,
+      ledger: {} as never, now: () => 0, enableHuman: true
+    });
+
+    await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+
+    await expect(journal.load()).resolves.toMatchObject({
+      progress: {
+        active: { revision: record.new_revision, projection_version: 3 },
+        requested: null
+      }
+    });
+  });
+
   it("emits a scrubbed metric snapshot when a convergence slice observes a commit", async () => {
     installDropboxMock();
     const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
@@ -153,6 +181,8 @@ describe("convergence engine scheduling", () => {
       now: () => Date.parse("2026-09-08T00:00:00.000Z")
     });
 
+    await engine.runSlice(createSliceBudget(() => Date.now(), new AbortController().signal));
+    await engine.runSlice(createSliceBudget(() => Date.now(), new AbortController().signal));
     await engine.runSlice(createSliceBudget(() => Date.now(), new AbortController().signal));
 
     for (const record of records) {
@@ -328,6 +358,17 @@ describe("convergence engine scheduling", () => {
       last_attempt_number: 1, last_closed_attempt_number: 1, last_verified_at: null,
       code: "human_write_failed", lease_until: null, continuation: null
     };
+    const machineObligationId = await sha256Canonical({
+      project_id: record.project_id, layer: "event", revision: record.new_revision
+    });
+    progress.obligations[machineObligationId] = {
+      id: machineObligationId, layer: "event", from_revision: 0,
+      target: { revision: record.new_revision, projection_version: 3 }, incident: 1,
+      state: "pending", first_pending_at: "1970-01-01T00:00:00.000Z",
+      next_attempt_at: "1970-01-01T00:00:00.000Z", failure_count: 0,
+      last_attempt_number: 0, last_closed_attempt_number: 0, last_verified_at: null,
+      code: "event_missing", lease_until: null, continuation: null
+    };
     await journal.save(progress, null);
     const engine = new ConvergenceEngine({
       projectId: record.project_id, repository, runtime, journal,
@@ -340,7 +381,9 @@ describe("convergence engine scheduling", () => {
     expect(mock.files.get(machineEventPath(record.project_id, record.event.event_id))).toBe(
       repository.canonicalDerivativeText("event", record)
     );
-    expect((await journal.load())?.progress.next_alarm_at).toBe("1970-01-01T00:00:10.000Z");
+    const resumed = (await journal.load())?.progress;
+    expect(resumed?.next_alarm_at).toBe("1970-01-01T00:00:00.000Z");
+    expect(resumed?.last_queue).toBe("machine");
   });
 
   it("persists a retry obligation and wake when a machine derivative cannot be written", async () => {
@@ -493,12 +536,46 @@ describe("convergence engine scheduling", () => {
     const reverified = new ConvergenceEngine({
       projectId: record.project_id, repository, runtime, journal, ledger: {} as never, now: () => verificationAt
     });
+    await reverified.runSlice(createSliceBudget(() => verificationAt, new AbortController().signal));
     await expect(reverified.runSlice(createSliceBudget(() => verificationAt, new AbortController().signal))).resolves.toMatchObject({
       more_work: false, next_alarm_at: null
     });
     expect((await journal.load())?.progress.canonical_observed_revision).toBe(record.new_revision);
     const obligation = Object.values((await journal.load())?.progress.obligations ?? {}).find((candidate) => candidate.layer === "event");
     expect(obligation).toMatchObject({ state: "verified", failure_count: 1, last_attempt_number: 2 });
+  });
+
+  it("resumes canonical discovery from a verified materialization baseline without advancing audit cursors", async () => {
+    const projectId = "PRJ-9272";
+    installDropboxMock();
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const record = commitFixture(projectId, 267).at(-1)!;
+    const repository = new ProjectRepository(runtime, "v2");
+    await repository.writeCommitRecord(record);
+    await repository.writeReceipt(record.receipt);
+    const journal = new ConvergenceJournal(runtime, projectId);
+    const progress = initialProgress(projectId, "1970-01-01T00:00:00.000Z", "writer-1");
+    progress.canonical_observed_revision = 1;
+    progress.event_verified_through = 1;
+    progress.receipt_verified_through = 1;
+    await journal.save(progress, null);
+
+    await journal.resumeFromVerifiedMaterialization(266);
+
+    const engine = new ConvergenceEngine({
+      projectId, repository, runtime, journal, ledger: {} as never,
+      now: () => Date.parse("2026-09-10T00:00:00.000Z")
+    });
+    await expect(engine.runSlice(createSliceBudget(() => Date.now(), new AbortController().signal)))
+      .resolves.toMatchObject({ health: { layers: { canonical: { expected: { revision: 267 } } } } });
+
+    expect((await journal.load())?.progress).toMatchObject({
+      canonical_observed_revision: 267,
+      baseline_revision: 266,
+      baseline_kind: "commit",
+      event_verified_through: 1,
+      receipt_verified_through: 1
+    });
   });
 
   it("resumes a due pending machine continuation before rediscovering the canonical log", async () => {

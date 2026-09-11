@@ -70,3 +70,5 @@ Implementation SHA `d63578252e7d64329540ce001ad0dc908d906454` adds a determinist
 ## 2026-09-10 canary boundary
 
 The production canary has not used fault injection. It is limited to synthetic PRJ-0008, where an ordinary authenticated materialization returned revision 2 as current after its durable human handoff was verified. The follow-up read-only admission check for PRJ-0003 returned its existing revision 267 and performed no mutation. Production fault, retry-exhaustion, rollback, or recovery exercises continue to use only synthetic fixtures; PRJ-0003 remains excluded.
+
+The 2026-09-11 global rollout did not inject faults into any real project. Its production verification repaired only derived convergence state and compared each active canonical revision with its projection-v3 head. Regression and exhaustion faults remain synthetic test fixtures, including the revision-258 scenario; the live rollout did not create a business revision.

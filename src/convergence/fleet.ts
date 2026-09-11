@@ -47,6 +47,16 @@ export function prepareFleetPage(
   };
 }
 
+export function retainEligibleFleetProjects(
+  cursor: FleetCursor,
+  eligibleProjectIds: readonly string[]
+): FleetCursor {
+  const eligible = new Set(eligibleProjectIds);
+  const pendingProjectIds = cursor.pending_project_ids.filter((projectId) => eligible.has(projectId));
+  if (pendingProjectIds.length === cursor.pending_project_ids.length) return cursor;
+  return { ...cursor, pending_project_ids: pendingProjectIds };
+}
+
 export function acknowledgeFleetProjects(
   cursor: FleetCursor,
   acknowledgedProjectIds: readonly string[],

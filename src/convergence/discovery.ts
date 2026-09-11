@@ -19,13 +19,14 @@ export async function discoverCanonical(
   repository: ProjectRepository,
   _runtime: ProjectOsPersistenceRuntime,
   progress: Progress,
-  budget: SliceBudget
+  budget: SliceBudget,
+  maxRecords = MAX_DISCOVERY_RECORDS
 ): Promise<VerifiedCanonical | null> {
   let cursor = progress.canonical_observed_revision;
   let latest: VerifiedCanonical | null = null;
   const records: CanonicalCommitRecord[] = [];
 
-  for (let read = 0; read < MAX_DISCOVERY_RECORDS; read += 1) {
+  for (let read = 0; read < maxRecords; read += 1) {
     if (!budget.canStartEffect(1)) {
       return latest ? { ...latest, complete: false } : null;
     }

@@ -91,6 +91,11 @@ export class MaterializationGuard extends DurableObject<Env> {
           this.projectId
         );
         if (convergenceMode === "repair") {
+          await this.resumeConvergenceFromVerifiedHead();
+          if (await this.ensureConvergenceRequestedFromLedger()) {
+            await this.scheduleConvergenceContinuation(true, new Date().toISOString());
+            return;
+          }
           const { engine, budget } = this.convergenceEngineForSlice();
           const result = await engine.runSlice(budget);
           await this.scheduleConvergenceContinuation(result.more_work, result.next_alarm_at);
@@ -143,6 +148,10 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
 
     this.ledger.requestTarget({ revision: body.revision, projection_version: body.projection_version });
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, this.projectId) === "repair") {
+      const { engine } = this.convergenceEngineForSlice();
+      await engine.requestTarget({ revision: body.revision, projection_version: body.projection_version });
+    }
     await this.ensureAlarmIfPending();
     return Response.json({
       project_id: this.projectId,
@@ -190,6 +199,10 @@ export class MaterializationGuard extends DurableObject<Env> {
         read_only: true,
         active_status: status.active_status,
         final_verification_pending_count: this.ledger.finalVerificationPending().length,
+        final_verification_pending: this.ledger.finalVerificationPending().map((item) => ({
+          key: item.key,
+          expected: item.expected
+        })),
         managed_zones_ready: this.ledger.managedZoneBootstrapReady(),
         human_handoff: human
           ? {
@@ -200,6 +213,19 @@ export class MaterializationGuard extends DurableObject<Env> {
               last_attempt_number: human.last_attempt_number
             }
           : null,
+        last_queue: saved?.progress.last_queue ?? null,
+        convergence_canonical_observed_revision: saved?.progress.canonical_observed_revision ?? null,
+        convergence_requested: saved?.progress.requested ?? null,
+        convergence_active: saved?.progress.active ?? null,
+        pending_obligations: Object.values(saved?.progress.obligations ?? {})
+          .filter((obligation) => obligation.state !== "verified")
+          .map((obligation) => ({
+            layer: obligation.layer,
+            state: obligation.state,
+            target_revision: obligation.target.revision,
+            next_attempt_at: obligation.next_attempt_at,
+            code: obligation.code
+          })),
         next_alarm_at: saved?.progress.next_alarm_at ?? null
       }
     });
@@ -227,6 +253,33 @@ export class MaterializationGuard extends DurableObject<Env> {
       && progress.next_alarm_at === null
       && targetObligations.some((obligation) => obligation.layer === "human_handoff" && obligation.state === "verified")
       && targetObligations.every((obligation) => obligation.state === "verified");
+  }
+
+  private async hasCurrentDurableHead(record: import("../domain/commit-record").CanonicalCommitRecord): Promise<boolean> {
+    const localHead = this.ledger.status().head;
+    if (!localHead
+      || localHead.revision !== record.new_revision
+      || localHead.projection_version !== CURRENT_PROJECTION_VERSION) return false;
+    const runtime = createProductionPersistence(this.env, this.projectId);
+    const repository = new ProjectRepository(runtime, this.layoutMode);
+    const providerHead = await repository.readMaterializationHead(this.projectId);
+    if (!providerHead
+      || providerHead.target_revision !== record.new_revision
+      || providerHead.projection_version !== CURRENT_PROJECTION_VERSION
+      || providerHead.target_revision !== localHead.revision
+      || providerHead.projection_version !== localHead.projection_version) return false;
+    const completed = await repository.readMaterializationRecord(
+      this.projectId,
+      providerHead.target_revision,
+      providerHead.projection_version
+    );
+    if (!completed
+      || completed.result_root_hash !== providerHead.result_root_hash
+      || completed.workspace_location !== providerHead.workspace_location
+      || completed.completed_at !== providerHead.completed_at
+      || completed.source_event_id !== record.event.event_id) return false;
+    const saved = await new ConvergenceJournal(runtime, this.projectId).load();
+    return saved !== null && saved.progress.canonical_observed_revision >= record.new_revision;
   }
 
   /**
@@ -272,6 +325,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         createProductionPersistence(this.env, this.projectId),
         this.projectId
       );
+      await this.resumeConvergenceFromVerifiedHead();
       const saved = await journal.load();
       const hasPendingConvergence = saved !== null && (
         saved.progress.active !== null
@@ -338,7 +392,15 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
     if (record) {
       if (convergenceMode === "repair") {
-        if (await this.hasDurablyVerifiedCurrentTarget(record)) {
+        await this.resumeConvergenceFromVerifiedHead();
+        // A fully verified immutable head supersedes older human retry markers.
+        // Close them before the strict idle check so stale journal state cannot
+        // keep an already-current project permanently pending.
+        const providerHeadCurrent = await this.hasCurrentDurableHead(record);
+        if (providerHeadCurrent) {
+          await this.acknowledgeVerifiedHumanHead(state.revision);
+        }
+        if (providerHeadCurrent && await this.hasDurablyVerifiedCurrentTarget(record)) {
           await this.ctx.storage.deleteAlarm();
           return Response.json({
             project_id: state.project_id,
@@ -346,6 +408,22 @@ export class MaterializationGuard extends DurableObject<Env> {
             materialized: true,
             status: "current"
           });
+        }
+        const target = { revision: state.revision, projection_version: CURRENT_PROJECTION_VERSION };
+        const journal = new ConvergenceJournal(
+          createProductionPersistence(this.env, this.projectId),
+          this.projectId
+        );
+        const saved = await journal.load();
+        const targetKnown = [saved?.progress.active, saved?.progress.requested].some((candidate) =>
+          candidate !== null
+          && candidate !== undefined
+          && candidate.revision >= target.revision
+          && candidate.projection_version >= target.projection_version
+        );
+        if (!targetKnown) {
+          const requester = this.convergenceEngineForSlice();
+          await requester.engine.requestTarget(target);
         }
         const { engine, budget } = this.convergenceEngineForSlice();
         const result = await engine.runSlice(budget);
@@ -457,6 +535,84 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
   }
 
+  private async resumeConvergenceFromVerifiedHead(): Promise<void> {
+    const runtime = createProductionPersistence(this.env, this.projectId);
+    // Resume-point validation is activation admission, not convergence-slice
+    // work. Validate the immutable tip and its canonical source directly: a
+    // full baseline reconstruction can exceed the Worker subrequest ceiling
+    // on a long, already completed generation chain.
+    const repository = new ProjectRepository(runtime, this.layoutMode);
+    const journal = new ConvergenceJournal(runtime, this.projectId);
+    const saved = await journal.load();
+    const head = await repository.readMaterializationHead(this.projectId);
+    if (
+      head === null
+      || head.projection_version !== CURRENT_PROJECTION_VERSION
+      || (saved !== null && saved.progress.canonical_observed_revision >= head.target_revision)
+    ) return;
+    const tip = await repository.readMaterializationRecord(
+      this.projectId,
+      head.target_revision,
+      head.projection_version
+    );
+    if (
+      tip === null
+      || tip.result_root_hash !== head.result_root_hash
+      || tip.workspace_location !== head.workspace_location
+      || tip.completed_at !== head.completed_at
+    ) throw new Error(`Materialization resume point binding mismatch for ${this.projectId}`);
+    await journal.resumeFromVerifiedMaterialization(head.target_revision);
+  }
+
+  private async acknowledgeVerifiedHumanHead(revision: number): Promise<void> {
+    const runtime = createProductionPersistence(this.env, this.projectId);
+    const journal = new ConvergenceJournal(runtime, this.projectId);
+    const saved = await journal.load();
+    if (!saved) return;
+    const verifiedAt = new Date().toISOString();
+    for (const [id, obligation] of Object.entries(saved.progress.obligations)) {
+      if (obligation.layer !== "human_handoff" || obligation.target.revision > revision) continue;
+      saved.progress.obligations[id] = {
+        ...obligation,
+        state: "verified",
+        next_attempt_at: null,
+        last_verified_at: verifiedAt,
+        code: null,
+        lease_until: null,
+        continuation: null
+      };
+    }
+    if (saved.progress.active && saved.progress.active.revision <= revision) saved.progress.active = null;
+    if (saved.progress.requested && saved.progress.requested.revision <= revision) saved.progress.requested = null;
+    const remaining = Object.values(saved.progress.obligations).filter((obligation) => obligation.state !== "verified");
+    saved.progress.next_alarm_at = remaining.length === 0
+      ? null
+      : remaining.map((obligation) => obligation.next_attempt_at ?? verifiedAt).sort()[0] ?? verifiedAt;
+    await journal.save(saved.progress, saved.token);
+  }
+
+  private async ensureConvergenceRequestedFromLedger(): Promise<boolean> {
+    const status = this.ledger.status();
+    const target = status.requested ?? (status.active
+      ? { revision: status.active.revision, projection_version: status.active.projection_version }
+      : null);
+    if (!target) return false;
+    const saved = await new ConvergenceJournal(
+      createProductionPersistence(this.env, this.projectId),
+      this.projectId
+    ).load();
+    const known = [saved?.progress.active, saved?.progress.requested].some((candidate) =>
+      candidate !== null
+      && candidate !== undefined
+      && candidate.revision >= target.revision
+      && candidate.projection_version >= target.projection_version
+    );
+    if (known) return false;
+    const { engine } = this.convergenceEngineForSlice();
+    await engine.requestTarget(target);
+    return true;
+  }
+
   private statusResponse(state: ProjectState, convergence?: ConvergenceHealth) {
     const status = this.ledger.status();
     return {
@@ -529,7 +685,10 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
   }
 
-  private coordinatorForSlice(bounded = true): { coordinator: MaterializationCoordinator; repository: ProjectRepository } {
+  private coordinatorForSlice(
+    bounded = true,
+    convergenceOwned = false
+  ): { coordinator: MaterializationCoordinator; repository: ProjectRepository } {
     const budget = bounded ? createSliceBudget(() => Date.now(), new AbortController().signal) : undefined;
     const persistence = createProductionPersistence(
       this.env,
@@ -545,6 +704,9 @@ export class MaterializationGuard extends DurableObject<Env> {
         ledger: this.ledger,
         writer: new WorkspaceProjectionWriter(persistence, this.projectionConcurrency),
         projectionVersion: CURRENT_PROJECTION_VERSION,
+        canonicalDerivativesAlreadyCurrent: convergenceOwned,
+        verifyExistingCriticalPairOnly: convergenceOwned,
+        ...(convergenceOwned ? { finalVerificationBatchMax: 1 } : {}),
         ...(budget ? { sliceBudget: budget } : {})
       })
     };
@@ -579,6 +741,8 @@ export class MaterializationGuard extends DurableObject<Env> {
         now: () => Date.now(),
         deploymentSha: deploymentIdentity(this.env).git_sha ?? "unknown",
         enableHuman: true,
+        discoveryMaxRecords: 1,
+        finalVerificationBatchMax: 1,
         notification: monitoringNotificationPort({
           endpoint: this.env.PROJECT_OS_MONITORING_WEBHOOK_URL,
           token: this.env.PROJECT_OS_MONITORING_WEBHOOK_TOKEN

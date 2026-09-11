@@ -279,6 +279,7 @@ export default worker;
 interface RegistryProject {
   project_id: string;
   slug: string;
+  status?: "active" | "paused" | "completed" | "archived";
 }
 
 interface InputRecoveryProjectSummary {
@@ -689,21 +690,22 @@ export async function reconcileMaterializations(env: Env): Promise<Materializati
   const registryResponse = await registryStub.fetch("https://registry-guard.internal/registry", { method: "GET" });
   if (!registryResponse.ok) throw new Error(`RegistryGuard materialization reconcile returned ${registryResponse.status}`);
   const registry = await registryResponse.json<{ projects: RegistryProject[] }>();
+  const eligibleProjects = registry.projects.filter((project) => project.status !== "archived");
   const summary: MaterializationReconcileSummary = {
-    scanned: registry.projects.length,
+    scanned: eligibleProjects.length,
     scheduled: 0,
     current: 0,
     failed: 0
   };
 
   let cursor = 0;
-  const workerCount = Math.min(4, registry.projects.length);
+  const workerCount = Math.min(4, eligibleProjects.length);
   const worker = async () => {
     for (;;) {
       const index = cursor;
       cursor += 1;
-      if (index >= registry.projects.length) return;
-      const project = registry.projects[index];
+      if (index >= eligibleProjects.length) return;
+      const project = eligibleProjects[index];
       try {
         const outcome = await reconcileMaterializationProject(env, project.project_id);
         if (outcome === "scheduled") summary.scheduled += 1;

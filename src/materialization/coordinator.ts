@@ -106,6 +106,7 @@ export interface MaterializationCoordinatorOptions {
   sliceBudget?: SliceBudget;
   canonicalDerivativesAlreadyCurrent?: boolean;
   verifyExistingCriticalPairOnly?: boolean;
+  finalVerificationBatchMax?: number;
 }
 
 export interface MaterializationRunResult {
@@ -134,6 +135,7 @@ export class MaterializationCoordinator {
   private readonly sliceBudget: SliceBudget | undefined;
   private readonly canonicalDerivativesAlreadyCurrent: boolean;
   private readonly verifyExistingCriticalPairOnly: boolean;
+  private readonly finalVerificationBatchMax: number | undefined;
 
   constructor(options: MaterializationCoordinatorOptions) {
     this.projectId = options.projectId;
@@ -149,6 +151,7 @@ export class MaterializationCoordinator {
     this.sliceBudget = options.sliceBudget;
     this.canonicalDerivativesAlreadyCurrent = options.canonicalDerivativesAlreadyCurrent ?? false;
     this.verifyExistingCriticalPairOnly = options.verifyExistingCriticalPairOnly ?? false;
+    this.finalVerificationBatchMax = options.finalVerificationBatchMax;
   }
 
   requestTarget(revision: number, projectionVersion = this.projectionVersion): void {
@@ -241,7 +244,21 @@ export class MaterializationCoordinator {
     const priorAttempts = this.ledger.attemptOutputs();
 
     try {
-      if (await this.materializeOneCoalescedImmutableDerivative(target)) {
+      const pendingFinalVerification = this.sliceBudget
+        ? this.ledger.finalVerificationPending()
+        : [];
+      if (pendingFinalVerification.length > 1) {
+        const verificationRoot = record.state.status === "archived"
+          ? archiveProjectRoot(record.state.project_id, record.state.slug)
+          : this.workspaceRootFor(record.state);
+        await this.verifyFinalOutputBatch(verificationRoot);
+        return pendingMaterializationResult(this.projectId, target);
+      }
+
+      if (
+        !this.canonicalDerivativesAlreadyCurrent
+        && await this.materializeOneCoalescedImmutableDerivative(target)
+      ) {
         return {
           project_id: this.projectId,
           target_revision: target.revision,
@@ -510,6 +527,12 @@ export class MaterializationCoordinator {
       }
     }
 
+    // The convergence writer can safely emit a fresh full snapshot from the
+    // canonical state. Do that when its hot baseline is unavailable instead
+    // of replaying an arbitrarily long historical generation chain inside a
+    // bounded Worker invocation.
+    if (this.verifyExistingCriticalPairOnly) return null;
+
     return rebuildProjectionBaseline(this.repository, head);
   }
 
@@ -541,6 +564,46 @@ export class MaterializationCoordinator {
 
   private async finishExistingCompletedRecord(record: CompletedMaterializationRecord): Promise<boolean> {
     const head = headFor(record);
+    if (this.verifyExistingCriticalPairOnly) {
+      const local = this.ledger.status().head;
+      const outputs = record.record_kind === "snapshot"
+        ? new Map(Object.entries(record.outputs))
+        : (() => {
+            if (
+              !record.parent
+              || !local
+              || local.revision !== record.parent.target_revision
+              || local.projection_version !== record.parent.projection_version
+            ) throw new Error(`Materialization delta baseline mismatch for ${this.projectId}`);
+            const current = this.ledger.baselineOutputs();
+            for (const key of record.removed_outputs) current.delete(key);
+            for (const [key, evidence] of Object.entries(record.outputs)) current.set(key, evidence);
+            return current;
+          })();
+      if (
+        outputs.size !== record.total_output_count
+        || await projectionIndexRootHash(outputs) !== record.result_root_hash
+      ) throw new Error(`Materialization result root mismatch for ${this.projectId} revision ${record.target_revision}`);
+      const canonical = await this.repository.readCommitRecord(this.projectId, record.target_revision);
+      if (!canonical || record.source_event_id !== canonical.event.event_id) {
+        throw new Error(`Materialization source binding mismatch for ${this.projectId} revision ${record.target_revision}`);
+      }
+      if (!this.writer.verifyOutputs) throw new Error("Completed materialization repair requires output verification");
+      const root = record.workspace_location === "archive"
+        ? archiveProjectRoot(canonical.state.project_id, canonical.state.slug)
+        : this.workspaceRootFor(canonical.state);
+      await this.writer.verifyOutputs(criticalPairEvidence(outputs), root);
+      const currentHead = await this.repository.readMaterializationHead(this.projectId);
+      const needsRepair = !currentHead
+        || isHeadAheadOf(head, currentHead)
+        || (sameHeadTarget(currentHead, head) && currentHead.result_root_hash !== record.result_root_hash);
+      if (needsRepair) await this.repository.writeMaterializationHead(head);
+      this.ledger.restoreExternalBaseline(
+        { revision: record.target_revision, projection_version: record.projection_version },
+        outputs
+      );
+      return needsRepair;
+    }
     const baseline = await rebuildProjectionBaseline(this.repository, head);
     await this.restoreAndVerifyCompletedProjection(record, baseline);
     const currentHead = await this.repository.readMaterializationHead(this.projectId);
@@ -603,7 +666,11 @@ export class MaterializationCoordinator {
     const pending = this.ledger.finalVerificationPending();
     if (pending.length === 0) return true;
     const attempts = this.ledger.attemptOutputs();
-    const batchSize = selectFinalVerificationBatchSize(this.sliceBudget, pending.length);
+    const batchSize = selectFinalVerificationBatchSize(
+      this.sliceBudget,
+      pending.length,
+      this.finalVerificationBatchMax
+    );
     if (batchSize === 0) return false;
     const batch = pending.slice(0, batchSize);
     const present = new Map(batch
@@ -664,9 +731,17 @@ function finalVerificationItems(
  * post-publication checks. Earlier batches consume only provider reads, then
  * durably retain their remaining-key cursor for the next fresh slice.
  */
-function selectFinalVerificationBatchSize(budget: SliceBudget, pendingCount: number): number {
+export function selectFinalVerificationBatchSize(
+  budget: SliceBudget,
+  pendingCount: number,
+  configuredMaximum = pendingCount
+): number {
   const publicationCalls = 8;
-  for (let size = pendingCount; size >= 1; size -= 1) {
+  // Keep non-final verification deliberately small for real providers, while
+  // still guaranteeing that a maximum-size (200 output) project drains within
+  // the qualified 128-slice continuation envelope.
+  const maximumSize = Math.min(pendingCount, configuredMaximum);
+  for (let size = maximumSize; size >= 1; size -= 1) {
     const isFinalBatch = size === pendingCount;
     if (budget.canStartEffect(size + (isFinalBatch ? publicationCalls : 0))) return size;
   }

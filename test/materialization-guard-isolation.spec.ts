@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
+import { ConvergenceJournal } from "../src/convergence/journal";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import {
@@ -218,6 +219,71 @@ describe("MaterializationGuard isolation boundary", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ materialized: true, status: "current" });
+  });
+
+  it("closes stale human work after the current durable head is verified", async () => {
+    const mock = installDropboxMock();
+    const projectId = "PRJ-3914";
+    await createProject(projectId, "repair-stale-human", "TXN-MATISO-3914-CREATE");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    await guard.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
+      if (!await runDurableObjectAlarm(guard)) break;
+    }
+    expect(mock.files.has(machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION))).toBe(true);
+
+    const journal = new ConvergenceJournal(createProductionPersistence(testEnv, projectId), projectId);
+    const saved = await journal.load();
+    expect(saved).not.toBeNull();
+    if (!saved) throw new Error("missing convergence journal");
+    const human = Object.entries(saved.progress.obligations)
+      .find(([, obligation]) => obligation.layer === "human_handoff");
+    expect(human).toBeDefined();
+    if (!human) throw new Error("missing human obligation");
+    saved.progress.obligations[human[0]] = {
+      ...human[1],
+      state: "retry_wait",
+      next_attempt_at: at,
+      code: "human_internal_failure"
+    };
+    saved.progress.requested = { revision: 1, projection_version: CURRENT_PROJECTION_VERSION };
+    saved.progress.active = { revision: 1, projection_version: CURRENT_PROJECTION_VERSION };
+    saved.progress.next_alarm_at = at;
+    await journal.save(saved.progress, saved.token);
+
+    const response = await guard.fetch("https://materialization-guard.internal/materialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "workspace-v2" })
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ materialized: true, status: "current" });
+    const repaired = await journal.load();
+    expect(repaired?.progress).toMatchObject({ requested: null, active: null, next_alarm_at: null });
+    expect(Object.values(repaired?.progress.obligations ?? {}).every((obligation) => obligation.state === "verified")).toBe(true);
+
+    mock.files.delete(machineMaterializationHeadPath(projectId));
+    const withoutProviderHead = await guard.fetch("https://materialization-guard.internal/materialize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "workspace-v2" })
+    });
+    expect([200, 202]).toContain(withoutProviderHead.status);
+    const withoutProviderHeadBody = await withoutProviderHead.json<{ materialized: boolean; status: string }>();
+    if (withoutProviderHeadBody.materialized) {
+      expect(mock.files.has(machineMaterializationHeadPath(projectId))).toBe(true);
+      expect(withoutProviderHeadBody.status).toBe("current");
+    }
   });
 
   it("reconciles and reports projection status from canonical machine state", async () => {

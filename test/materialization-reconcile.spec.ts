@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   reconcileMaterializationProject,
   reconcileMaterializations,
+  reconcileFleetMaterializations,
   type MaterializationReconcileSummary
 } from "../src/index";
 import worker from "../src/index-mutation-gate";
@@ -16,7 +17,12 @@ interface FakeProjectBehavior {
   body?: Record<string, unknown>;
 }
 
-function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavior> = {}) {
+function fakeEnv(
+  projects: string[],
+  behavior: Record<string, FakeProjectBehavior> = {},
+  statuses: Record<string, "active" | "paused" | "completed" | "archived"> = {},
+  initialFleetPending: string[] = []
+) {
   const calls: string[] = [];
   const searchCalls: string[] = [];
   let inFlight = 0;
@@ -24,7 +30,7 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
   let fleetCursor = {
     schema_version: "1.0" as const,
     after_project_id: null,
-    pending_project_ids: [],
+    pending_project_ids: initialFleetPending,
     turn_started_at: "1970-01-01T00:00:00.000Z",
     last_success_at: null
   };
@@ -44,7 +50,11 @@ function fakeEnv(projects: string[], behavior: Record<string, FakeProjectBehavio
       expect(url.pathname).toBe("/registry");
       return Response.json({
         schema_version: "1.0",
-        projects: projects.map((project_id) => ({ project_id, slug: project_id.toLowerCase() }))
+        projects: projects.map((project_id) => ({
+          project_id,
+          slug: project_id.toLowerCase(),
+          status: statuses[project_id] ?? "active"
+        }))
       });
     })
   };
@@ -211,6 +221,34 @@ describe("fleet materialization reconciliation", () => {
       "PRJ-4102:/reconcile",
       "PRJ-4103:/reconcile"
     ]);
+  });
+
+  it("does not schedule archived projects for materialization", async () => {
+    const { env, calls } = fakeEnv(
+      ["PRJ-4104", "PRJ-4105"],
+      {},
+      { "PRJ-4104": "active", "PRJ-4105": "archived" }
+    );
+
+    await expect(reconcileMaterializations(env)).resolves.toEqual({
+      scanned: 1,
+      scheduled: 0,
+      current: 1,
+      failed: 0
+    });
+    expect(calls).toEqual(["PRJ-4104:/reconcile"]);
+  });
+
+  it("prunes an archived project from the persisted production fleet page", async () => {
+    const { env, calls } = fakeEnv(
+      ["PRJ-4106", "PRJ-4107"],
+      {},
+      { "PRJ-4106": "active", "PRJ-4107": "archived" },
+      ["PRJ-4106", "PRJ-4107"]
+    );
+
+    await expect(reconcileFleetMaterializations(env)).resolves.toMatchObject({ scanned: 1, current: 1, failed: 0 });
+    expect(calls).toEqual(["PRJ-4106:/reconcile"]);
   });
 
   it("isolates one project failure and continues checking the rest", async () => {

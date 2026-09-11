@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   acknowledgeFleetProjects,
+  retainEligibleFleetProjects,
   runFleetWakePage,
   prepareFleetPage,
   orderFleetProjects,
@@ -28,6 +29,16 @@ describe("convergence fleet maintenance", () => {
       "PRJ-0001",
       "PRJ-0002"
     ], null)).toEqual(["PRJ-0001", "PRJ-0002"]);
+  });
+
+  it("prunes a project archived while it is already pending", () => {
+    expect(retainEligibleFleetProjects({
+      schema_version: "1.0",
+      after_project_id: "PRJ-0001",
+      pending_project_ids: ["PRJ-0002", "PRJ-0003"],
+      turn_started_at: "2026-09-09T07:00:00.000Z",
+      last_success_at: null
+    }, ["PRJ-0002"])).toMatchObject({ pending_project_ids: ["PRJ-0002"] });
   });
 
   it("keeps an unacknowledged project pending while advancing acknowledged peers", () => {

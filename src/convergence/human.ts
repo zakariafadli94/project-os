@@ -17,6 +17,7 @@ export interface HumanSliceInput {
   budget?: SliceBudget;
   projectionConcurrency?: number;
   now?: () => string;
+  finalVerificationBatchMax?: number;
 }
 
 /**
@@ -33,6 +34,9 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
       projectionVersion: CURRENT_PROJECTION_VERSION,
       canonicalDerivativesAlreadyCurrent: true,
       verifyExistingCriticalPairOnly: true,
+      ...(input.finalVerificationBatchMax === undefined
+        ? {}
+        : { finalVerificationBatchMax: input.finalVerificationBatchMax }),
       ...(input.now ? { now: input.now } : {}),
       ...(input.budget ? { sliceBudget: input.budget } : {})
     });

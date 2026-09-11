@@ -15,6 +15,7 @@ import { machineMaterializationRecordPath, workspaceProjectRoot } from "../src/d
 import {
   MaterializationCoordinator,
   rebuildProjectionBaseline,
+  selectFinalVerificationBatchSize,
   type MaterializationLedgerPort,
   type MaterializationRepositoryPort,
   type ProjectionWriterPort
@@ -112,6 +113,7 @@ class FakeRepository implements MaterializationRepositoryPort {
   headWrites = 0;
   recordWrites = 0;
   recordReads = 0;
+  onRecordRead: ((count: number) => void) | null = null;
   failHeadOnce = false;
   headAfterWrite: MaterializationHead | null = null;
   beforeRecordWrite: (() => void) | null = null;
@@ -120,6 +122,7 @@ class FakeRepository implements MaterializationRepositoryPort {
   async readMaterializationHead() { return this.head; }
   async readMaterializationRecord(projectId: string, revision: number, pv: number) {
     this.recordReads += 1;
+    this.onRecordRead?.(this.recordReads);
     return this.records.get(`${projectId}:${revision}:${pv}`) ?? null;
   }
   async listMaterializationRecordRefs(projectId: string): Promise<MaterializationGenerationRef[]> {
@@ -306,6 +309,12 @@ function coordinator(
 }
 
 describe("MaterializationCoordinator", () => {
+  it("reserves the final verification item for a publication slice", () => {
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    expect(selectFinalVerificationBatchSize(budget, 6)).toBe(6);
+    expect(selectFinalVerificationBatchSize(budget, 6, 1)).toBe(1);
+    expect(selectFinalVerificationBatchSize(budget, 1)).toBe(1);
+  });
   it("publishes the first generation as a full snapshot and writes record before head", async () => {
     const record = createFixture();
     const repo = new FakeRepository();
@@ -331,13 +340,15 @@ describe("MaterializationCoordinator", () => {
     const writer = new FakeWriter();
     writer.onVerifyOutputs = () => expect(repo.recordWrites).toBe(0);
     const budget = createSliceBudget(() => 0, new AbortController().signal);
-    const { value } = coordinator(repo, new FakeLedger(), writer, CURRENT_PROJECTION_VERSION, budget);
+    const { value } = coordinator(repo, new FakeLedger(), writer, CURRENT_PROJECTION_VERSION, budget, {
+      finalVerificationBatchMax: 1
+    });
 
     value.requestTarget(record.new_revision);
-    await value.runNext();
+    await value.runUntilIdle();
 
-    expect(writer.verifyOutputCalls).toBe(1);
-    expect(writer.verifiedOutputKeys[0]).toEqual([
+    expect(writer.verifyOutputCalls).toBe(8);
+    expect(writer.verifiedOutputKeys.flat()).toEqual([
       "global:BRIEF",
       "global:DISCOVERY",
       "global:HANDOFF",
@@ -356,15 +367,45 @@ describe("MaterializationCoordinator", () => {
     const ledger = new FakeLedger();
     repo.commits.set(record.new_revision, record);
     repo.beforeRecordWrite = () => {
-      expect(ledger.finalVerificationPending()).toHaveLength(8);
+      expect(ledger.finalVerificationPending()).toHaveLength(1);
     };
     const budget = createSliceBudget(() => 0, new AbortController().signal);
-    const { value } = coordinator(repo, ledger, new FakeWriter(), CURRENT_PROJECTION_VERSION, budget);
+    const { value } = coordinator(repo, ledger, new FakeWriter(), CURRENT_PROJECTION_VERSION, budget, {
+      finalVerificationBatchMax: 1
+    });
 
     value.requestTarget(record.new_revision);
-    await value.runNext();
+    await value.runUntilIdle();
 
     expect(ledger.finalVerificationPending()).toEqual([]);
+  });
+
+  it("checkpoints an active final verification before rebuilding its baseline", async () => {
+    const first = createFixture();
+    const second = committed(first.state, "task.create", { task_id: "TASK-FASTVERIFY", title: "Fast verify" });
+    const repo = new FakeRepository();
+    repo.commits.set(first.new_revision, first);
+    repo.commits.set(second.new_revision, second);
+    const ledger = new FakeLedger();
+    const initial = coordinator(repo, ledger).value;
+    initial.requestTarget(first.new_revision);
+    await initial.runUntilIdle();
+
+    let now = 0;
+    const budget = createSliceBudget(() => now, new AbortController().signal);
+    const { value } = coordinator(repo, ledger, new FakeWriter(), CURRENT_PROJECTION_VERSION, budget, {
+      finalVerificationBatchMax: 1
+    });
+    value.requestTarget(second.new_revision);
+    await value.runNext();
+    const before = ledger.finalVerificationPending().length;
+    expect(before).toBeGreaterThan(1);
+
+    repo.recordReads = 0;
+    repo.onRecordRead = (count) => { if (count === 2) now = 8_000; };
+    await value.runNext();
+
+    expect(ledger.finalVerificationPending()).toHaveLength(before - 1);
   });
 
   it("revalidates the complete resulting index before a bounded delta publishes its head", async () => {
@@ -378,21 +419,29 @@ describe("MaterializationCoordinator", () => {
     repo.commits.set(second.new_revision, second);
     const writer = new FakeWriter();
     const budget = createSliceBudget(() => 0, new AbortController().signal);
-    const { value } = coordinator(repo, new FakeLedger(), writer, CURRENT_PROJECTION_VERSION, budget);
+    const { value } = coordinator(repo, new FakeLedger(), writer, CURRENT_PROJECTION_VERSION, budget, {
+      finalVerificationBatchMax: 1
+    });
 
     value.requestTarget(first.new_revision);
-    await value.runNext();
+    await value.runUntilIdle();
     value.requestTarget(second.new_revision);
-    await value.runNext();
+    await value.runUntilIdle();
 
-    expect(writer.verifiedOutputKeys.at(-1)).toEqual([...writer.plans.at(-1)!.expected_output_keys].sort());
+    const expected = [...writer.plans.at(-1)!.expected_output_keys].sort();
+    expect(writer.verifiedOutputKeys.slice(-expected.length).flat()).toEqual(expected);
   });
 
   it("does not re-materialize canonical derivatives when convergence already verified them", async () => {
     const record = createFixture();
-    const repo = new FakeRepository();
+    class CoalescedRepository extends FakeRepository {
+      async writeCanonicalEvent() { this.derivativeCalls += 1; }
+      async writeReceipt() { this.derivativeCalls += 1; }
+    }
+    const repo = new CoalescedRepository();
     repo.commits.set(record.new_revision, record);
     const ledger = new FakeLedger();
+    ledger.nextCoalesced = [42];
     const writer = new FakeWriter();
     const value = new MaterializationCoordinator({
       projectId: record.project_id,
@@ -528,9 +577,11 @@ describe("MaterializationCoordinator", () => {
       { verifyExistingCriticalPairOnly: true }
     );
     recovery.value.requestTarget(record.new_revision);
+    repo.recordReads = 0;
     await recovery.value.runNext();
 
     expect(recovery.writer.verifiedOutputKeys).toEqual([["global:HANDOFF", "global:STATE"]]);
+    expect(repo.recordReads).toBe(1);
     expect(repo.head?.target_revision).toBe(record.new_revision);
   });
 
@@ -686,7 +737,9 @@ describe("MaterializationCoordinator", () => {
     const ledger = new FakeLedger();
     const writer = new SliceWriter();
     const budget = createSliceBudget(() => 0, new AbortController().signal);
-    const { value } = coordinator(repo, ledger, writer, CURRENT_PROJECTION_VERSION, budget);
+    const { value } = coordinator(repo, ledger, writer, CURRENT_PROJECTION_VERSION, budget, {
+      finalVerificationBatchMax: 1
+    });
     value.requestTarget(record.new_revision);
 
     const first = await value.runNext();
@@ -695,7 +748,12 @@ describe("MaterializationCoordinator", () => {
     expect(ledger.attempts.size).toBe(1);
 
     const second = await value.runNext();
-    expect(second.completed).toBe(true);
+    expect(second.completed).toBe(false);
+    let completed = false;
+    for (let attempt = 0; attempt < 16 && !completed; attempt += 1) {
+      completed = (await value.runNext()).completed;
+    }
+    expect(completed).toBe(true);
     expect(repo.head?.target_revision).toBe(record.new_revision);
   });
 

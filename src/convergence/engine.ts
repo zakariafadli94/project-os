@@ -33,6 +33,7 @@ import {
 } from "./observability";
 import { runHumanSlice } from "./human";
 import { isConverged } from "./health";
+import { chooseQueue } from "./audit";
 
 export function nextConvergenceWake(existing: string | null, due: readonly (string | null)[]): string | null {
   return minimumWake([existing, ...due]);
@@ -58,6 +59,8 @@ export class ConvergenceEngine {
     enableHuman?: boolean;
     notification?: NotificationPort;
     telemetry?: ConvergenceTelemetry;
+    discoveryMaxRecords?: number;
+    finalVerificationBatchMax?: number;
   }) {}
 
   async requestTarget(target: Target): Promise<void> {
@@ -188,17 +191,55 @@ export class ConvergenceEngine {
     ) checkpoint.progress.next_alarm_at = null;
     const health = this.blankHealth(checkpoint.progress.first_observed_at);
     try {
-    const resumed = await this.resumeDueMachineObligation(checkpoint, budget, health);
-    if (resumed) return finish(resumed);
-    const resumedHuman = await this.resumePendingHumanSlice(checkpoint, budget, health);
-    if (resumedHuman) return finish(resumedHuman);
+    const machinePending = Object.values(checkpoint.progress.obligations).some((obligation) =>
+      isMachineLayer(obligation.layer)
+      && (obligation.state === "pending" || obligation.state === "retry_wait" || obligation.state === "exhausted")
+      && obligation.next_attempt_at !== null
+      && Date.parse(obligation.next_attempt_at) <= this.input.now()
+    );
+    const humanPending = checkpoint.progress.active !== null;
+    const preferredQueue = chooseQueue(checkpoint.progress.last_queue, machinePending, humanPending);
+    if (preferredQueue === "human") {
+      checkpoint.progress.last_queue = "human";
+      const resumedHuman = await this.resumePendingHumanSlice(checkpoint, budget, health);
+      if (resumedHuman) return finish(resumedHuman);
+    }
+    if (machinePending) {
+      checkpoint.progress.last_queue = "machine";
+      const resumed = await this.resumeDueMachineObligation(checkpoint, budget, health);
+      if (resumed) return finish(resumed);
+    }
+    if (humanPending && preferredQueue !== "human") {
+      checkpoint.progress.last_queue = "human";
+      const resumedHuman = await this.resumePendingHumanSlice(checkpoint, budget, health);
+      if (resumedHuman) return finish(resumedHuman);
+    }
     const discovered = await discoverCanonical(
       this.input.repository,
       this.input.runtime,
       checkpoint.progress,
-      budget
+      budget,
+      this.input.discoveryMaxRecords
     );
     if (!discovered?.record) {
+      const requested = checkpoint.progress.requested;
+      if (
+        this.input.enableHuman
+        && requested
+        && checkpoint.progress.active === null
+        && requested.revision <= checkpoint.progress.canonical_observed_revision
+      ) {
+        checkpoint.progress.active = requested;
+        checkpoint.progress.requested = null;
+        checkpoint.progress.next_alarm_at = new Date(this.input.now()).toISOString();
+        await this.input.journal.save(checkpoint.progress, checkpoint.token);
+        return finish({
+          health,
+          more_work: true,
+          next_alarm_at: checkpoint.progress.next_alarm_at,
+          provider_calls: 32 - budget.calls_left
+        });
+      }
       // Discovery only says that there is no *new* immutable commit. It is
       // not proof that the durable target is current, so re-observe it rather
       // than emitting a blank pending health record.
@@ -486,7 +527,12 @@ export class ConvergenceEngine {
       progress.canonical_observed_revision = discovered.record.new_revision;
     }
     let humanMoreWork = false;
-    if (this.input.enableHuman && machineLayersCurrent(health)) {
+    const supersededByRequestedTarget = progress.requested !== null
+      && progress.requested.revision > discovered.record.new_revision;
+    if (this.input.enableHuman && machineLayersCurrent(health) && !supersededByRequestedTarget) {
+      if (progress.requested && progress.requested.revision <= discovered.record.new_revision) {
+        progress.requested = null;
+      }
       progress.active = { revision: discovered.record.new_revision, projection_version: 3 };
       const waitingHuman = Object.values(progress.obligations).find((obligation) =>
         obligation.layer === "human_handoff"
@@ -844,6 +890,9 @@ export class ConvergenceEngine {
         ledger: this.input.ledger,
         budget: reserveCheckpointForJournal(budget),
         projectionConcurrency: this.input.humanProjectionConcurrency,
+        ...(this.input.finalVerificationBatchMax === undefined
+          ? {}
+          : { finalVerificationBatchMax: this.input.finalVerificationBatchMax }),
         now: () => new Date(this.input.now()).toISOString()
       });
       for (const currentLayerName of ["human_state", "human_handoff", "generation", "head"] as const) {

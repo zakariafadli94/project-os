@@ -535,6 +535,10 @@ The operator has deliberately deferred every human-facing notification channel. 
 
 This operational-policy exception supersedes only the previous requirement for a human-delivery ACK. Owner-compatible integration, complete transport, reader/writer compatibility, fencing, RegistryGuard continuation, qualified capacity and recovery, and isolated canary qualification remain production gates.
 
+### Global active-project rollout decision (2026-09-11)
+
+The operator explicitly replaced staged per-project activation with a complete rollout to every registry project still marked active. The effective set is PRJ-0002, PRJ-0003, PRJ-0007 and PRJ-0008; archived PRJ-0001, PRJ-0004, PRJ-0005 and PRJ-0006 remain excluded. Human notification delivery remains deferred under the policy above, while durable incidents, retry state, bounded alarms and structured metrics remain enabled. This decision does not relax transaction-only canonical writes or permit an archived project to be revived by materialization.
+
 ## 22. Isolated canary evidence and remaining time gate (2026-09-10)
 
 The current production canary runs Worker version `7e624e43-d288-4cf5-97bd-cbc43c11aa33`, deployed at 100% at `2026-09-10T17:26:03.400882Z` with the deployment annotation `Preserve verified canary and legacy admission`. Its source archive was assembled from retained `main` `c9c9fde26daf7ea82db2503acfc7b52c573e3c47`; `/health` reports that exact Worker version but intentionally does not claim an embedded Git SHA.
@@ -554,7 +558,6 @@ The separate Control Tower endpoint is `https://project-os-control-tower.zakaria
 Qualification first denies an unauthenticated MCP `tools/list`, then lists tools using an authenticated owner token and performs only a read-only `project_os_get_context` for synthetic `PRJ-0008`. A write, replay, or conflict proof is a later explicitly recorded production exercise and must use PRJ-0008. PRJ-0003 remains excluded.
 
 Rollback disables or removes only the `project-os-control-tower` route/deployment. It must not redeploy or reconfigure `project-os-guard`, touch the Dropbox inbox, or alter canonical project state. Restoration uses the same exact reviewed Control Tower Worker version, followed by the read-only PRJ-0008 check.
-
 ### Production qualification evidence (2026-09-10)
 
 The Control Tower source was merged as `ed572801a9a123a9efcd390e1be4241d3f9e5d5d`. GitHub OAuth authenticated the permitted owner identity, authenticated `tools/list` returned the governed Project OS tools, and authenticated `project_os_get_context` read synthetic `PRJ-0008`. Anonymous `tools/list` remained denied with HTTP 401.

@@ -1,5 +1,10 @@
 import type { Env } from "./env";
-import { runFleetWakePage, runMaintenanceJobs, type FleetCursor } from "./convergence/fleet";
+import {
+  retainEligibleFleetProjects,
+  runFleetWakePage,
+  runMaintenanceJobs,
+  type FleetCursor
+} from "./convergence/fleet";
 import type { DurableInboxProcessSummary } from "./inbox/runtime";
 import { artifactInboxPath, inboxPath } from "./inbox/processor";
 import neutralWorker, { reconcileMaterializationProject, reconcileSearchIndexes, searchProjectOs } from "./index-neutral";
@@ -110,13 +115,17 @@ export default worker;
 
 interface RegistryProject {
   project_id: string;
+  status?: "active" | "paused" | "completed" | "archived";
 }
 
-async function reconcileFleetMaterializations(env: Env, signal?: AbortSignal): Promise<unknown> {
+export async function reconcileFleetMaterializations(env: Env, signal?: AbortSignal): Promise<unknown> {
   const registry = env.REGISTRY_GUARD.getByName("global");
   const projectsResponse = await registry.fetch("https://registry-guard.internal/registry", { method: "GET" });
   if (!projectsResponse.ok) throw new Error(`RegistryGuard fleet reconcile returned ${projectsResponse.status}`);
   const projects = await projectsResponse.json<{ projects: RegistryProject[] }>();
+  const eligibleProjectIds = projects.projects
+    .filter((project) => project.status !== "archived")
+    .map((project) => project.project_id);
   let scheduled = 0;
   let current = 0;
   let failed = 0;
@@ -124,7 +133,11 @@ async function reconcileFleetMaterializations(env: Env, signal?: AbortSignal): P
     read: async () => {
       const response = await registry.fetch("https://registry-guard.internal/convergence-fleet", { method: "GET" });
       if (!response.ok) throw new Error(`RegistryGuard fleet read returned ${response.status}`);
-      return response.json<{ cursor: FleetCursor; token: string }>();
+      const current = await response.json<{ cursor: FleetCursor; token: string }>();
+      return {
+        ...current,
+        cursor: retainEligibleFleetProjects(current.cursor, eligibleProjectIds)
+      };
     },
     write: async (expected_token, cursor) => {
       const response = await registry.fetch("https://registry-guard.internal/convergence-fleet", {
@@ -135,7 +148,7 @@ async function reconcileFleetMaterializations(env: Env, signal?: AbortSignal): P
       if (!response.ok) throw new Error(`RegistryGuard fleet write returned ${response.status}`);
       return response.json<{ cursor: FleetCursor; token: string }>();
     }
-  }, projects.projects.map((project) => project.project_id), new Date().toISOString(), async (projectId, wakeSignal) => {
+  }, eligibleProjectIds, new Date().toISOString(), async (projectId, wakeSignal) => {
     if (wakeSignal?.aborted) return false;
     try {
       const outcome = await reconcileMaterializationProject(env, projectId);
@@ -158,7 +171,7 @@ async function reconcileFleetMaterializations(env: Env, signal?: AbortSignal): P
     // The fleet cursor is already durably written; metrics cannot alter its
     // acknowledgement or turn a successful maintenance cycle into failure.
   }
-  return { scanned: projects.projects.length, scheduled, current, failed, fleet };
+  return { scanned: eligibleProjectIds.length, scheduled, current, failed, fleet };
 }
 
 async function rebuildSearchIndexes(request: Request, env: Env): Promise<Response> {

@@ -10,6 +10,12 @@
 
 **Spec:** [Spécification v1.1 récupérée et amendée, en attente de revue](../specs/2026-09-07-post-commit-convergence-reliability-design.md), origine `97684d3e164d690bd7e54cf1aa50be41cab6cf10`, base de reprise runtime `a7b927499265c625ab3f5827f34d94235ea19d0b`.
 
+## Décision opérateur et clôture d'exécution — 2026-09-11
+
+L'opérateur a explicitement remplacé le canary projet-par-projet par une activation complète de tous les projets encore actifs, avec réparation automatique des anomalies après détection. La notification humaine reste volontairement différée et ne bloque pas la production ; les incidents durables, retries et métriques restent actifs. Cette décision ne réactive pas les projets archivés et ne permet toujours aucune écriture directe des fichiers canoniques.
+
+Le registre relu en production classe PRJ-0002, PRJ-0003, PRJ-0007 et PRJ-0008 comme actifs, et PRJ-0001, PRJ-0004, PRJ-0005 et PRJ-0006 comme archivés. Les quatre projets actifs sont donc le périmètre exact du writer unique en mode `repair`. Les preuves finales de code, build et production sont consignées dans `docs/superpowers/evidence/2026-09-11-global-active-project-rollout.md`.
+
 ## Amendement d’exécution — reprise du plan RECTIFY
 
 Le présent document demeure le plan technique détaillé de la convergence post-commit et ne doit pas être remplacé par un correctif ponctuel PRJ-0003. Il s’exécute sous le grand plan canonique PRJ-0002 révision 169 : intégrité/audit dans RECTIFY001, runtime de convergence et gouvernance dans RECTIFY002, continuité/Project Pulse dans RECTIFY003, rattrapage global et preuve dans RECTIFY004. RECTIFY005 reste hors périmètre jusqu’à clôture de la rectification.

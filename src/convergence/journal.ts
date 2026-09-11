@@ -48,6 +48,43 @@ export class ConvergenceJournal {
     return metadata.revisionToken;
   }
 
+  /**
+   * Resume discovery from a projection generation whose complete immutable
+   * chain has already been verified by MaterializationGuard. Immutable event
+   * and receipt audit cursors deliberately remain independent.
+   */
+  async resumeFromVerifiedMaterialization(revision: number): Promise<void> {
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new Error("invalid_verified_materialization_revision");
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const saved = await this.load();
+      if (saved === null) {
+        const now = new Date().toISOString();
+        const progress = initialProgress(this.projectId, now, crypto.randomUUID());
+        progress.canonical_observed_revision = revision;
+        progress.baseline_revision = revision;
+        try {
+          await this.save(progress, null);
+          return;
+        } catch {
+          continue;
+        }
+      }
+      if (saved.progress.canonical_observed_revision >= revision) return;
+      saved.progress.canonical_observed_revision = revision;
+      saved.progress.baseline_revision = Math.max(saved.progress.baseline_revision, revision);
+      saved.progress.baseline_kind = "commit";
+      try {
+        await this.save(saved.progress, saved.token);
+        return;
+      } catch {
+        continue;
+      }
+    }
+    throw new Error("verified_materialization_resume_conflict");
+  }
+
   async reserve(attempt: AttemptReservation): Promise<void> {
     assertAttempt(attempt, this.projectId);
     const path = convergenceAttemptPath(this.projectId, attempt.obligation_id, attempt.attempt_number);

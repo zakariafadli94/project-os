@@ -2,7 +2,7 @@ import { isReviewCandidate, type ArtifactWriteRequest } from "../domain/artifact
 import type { ArtifactRouteRecord, ProjectState } from "../domain/project-state";
 import { workspaceArtifactPath, workspaceProjectRoot } from "./layout";
 
-const ALLOWED_ROOTS = new Set(["DELIVERABLES", "ARCHIVES", "RESEARCH", "REFERENCES", "SPECS", "MEETINGS", "ARTIFACTS"]);
+const ALLOWED_ROOTS = new Set(["WORKING", "DELIVERABLES", "ARCHIVES", "RESEARCH", "REFERENCES", "SPECS", "MEETINGS", "ARTIFACTS"]);
 
 export class ArtifactGovernanceConflictError extends Error {
   constructor(message: string) {

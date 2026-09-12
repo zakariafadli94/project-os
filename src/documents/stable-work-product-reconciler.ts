@@ -33,6 +33,7 @@ export class StableWorkProductReconciler {
   }
 
   async reconcile(state: ProjectState, change: ProviderChangeEntry): Promise<StableWorkProductReconcileResult> {
+    if (await this.ledger.ownsPackageProjection(state, change.path)) return empty(true);
     const classified = classifyWorkZone(state, change.path);
     if (!classified) return empty(false);
 

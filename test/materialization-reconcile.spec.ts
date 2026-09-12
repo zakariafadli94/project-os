@@ -62,7 +62,7 @@ function fakeEnv(
   const materializationNamespace = {
     getByName(projectId: string) {
       return {
-        fetch: vi.fn(async (input: RequestInfo | URL) => {
+        fetch: vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
           const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
           calls.push(`${projectId}:${url.pathname}`);
           inFlight += 1;
@@ -106,6 +106,12 @@ function fakeEnv(
               conflicts: 0,
               cursor_reset: false
             });
+          }
+          if (url.pathname === "/reconcile-materialization") {
+            return materializationNamespace.getByName(projectId).fetch(
+              "https://materialization-guard.internal/reconcile",
+              { method: "POST" }
+            );
           }
           if (url.pathname === "/reconcile-search") {
             searchCalls.push(projectId);

@@ -5,6 +5,7 @@ import { InputRecoveryService } from "../documents/input-recovery";
 import { ReferralProvenanceRepository } from "../documents/referral-provenance";
 import { machineStatePath } from "../persistence/layout";
 import { resolveSchemaWriterStageForProject } from "../schema/writer-stage";
+import { normalizeSystemAdmission } from "../admission/operation-context";
 import { ProjectGuard as NeutralProjectGuard } from "./project-guard-neutral";
 
 export * from "./project-guard-neutral";
@@ -39,10 +40,10 @@ export class ProjectGuard extends NeutralProjectGuard {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/referral") {
-      return this.handleReferral(request);
+      return this.serialize(() => this.handleReferral(request)).catch((error) => this.admissionErrorResponse(error));
     }
     if (request.method === "POST" && url.pathname === "/recover-inputs") {
-      return this.handleInputRecovery();
+      return this.serialize(() => this.handleInputRecovery()).catch((error) => this.admissionErrorResponse(error));
     }
     if (request.method === "GET" && url.pathname === "/input-recovery-status") {
       return this.handleInputRecoveryStatus();
@@ -89,6 +90,12 @@ export class ProjectGuard extends NeutralProjectGuard {
       });
     }
 
+    const normalized = await normalizeSystemAdmission(
+      boundProjectId, "project.repair", "REFERENCES", referral.request_id, referral.content_sha256, referral
+    );
+    if (await this.ruleAdmissionRequired(state, normalized)) {
+      await this.persistAdmissionProof("referral", referral.request_id, await this.admitRules(state, normalized));
+    }
     return Response.json(await this.referralProvenance.deliver(state, referral));
   }
 
@@ -97,6 +104,10 @@ export class ProjectGuard extends NeutralProjectGuard {
     if (!boundProjectId) return Response.json({ error: "project_not_initialized" }, { status: 404 });
     const state = await this.loadBoundState(boundProjectId);
     if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+    const normalized = await normalizeSystemAdmission(boundProjectId, "input.recover", "INPUTS", "input-recovery", String(state.revision));
+    if (await this.ruleAdmissionRequired(state, normalized)) {
+      await this.persistAdmissionProof("recovery", `input-recovery@${state.revision}`, await this.admitRules(state, normalized));
+    }
     return Response.json({
       project_id: boundProjectId,
       ...await this.inputRecovery.recover(state)

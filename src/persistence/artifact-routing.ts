@@ -1,4 +1,4 @@
-import { isReviewCandidate, type ArtifactWriteRequest } from "../domain/artifact-write";
+import type { ArtifactWriteRequest } from "../domain/artifact-write";
 import type { ArtifactRouteRecord, ProjectState } from "../domain/project-state";
 import { workspaceArtifactPath, workspaceProjectRoot } from "./layout";
 
@@ -17,9 +17,11 @@ export interface ResolvedArtifactDestination {
   archive_path?: string;
 }
 
-export function resolveArtifactDestination(state: ProjectState, relativePath: string, request?: ArtifactWriteRequest): ResolvedArtifactDestination {
-  if (request && isReviewCandidate(request)) {
+export type ArtifactDestinationIntent = Pick<ArtifactWriteRequest, "project_id" | "request_id" | "mode"> & { operation?: "REVIEW_CANDIDATE" };
+export function resolveArtifactDestination(state: ProjectState, relativePath: string, request?: ArtifactDestinationIntent): ResolvedArtifactDestination {
+  if (request?.operation === "REVIEW_CANDIDATE") {
     if (request.project_id !== state.project_id) throw new ArtifactGovernanceConflictError("Review project binding mismatch");
+    if (!/^ART-[A-Z0-9-]{10,}$/.test(request.request_id)) throw new ArtifactGovernanceConflictError("Review request identity is invalid");
     const file = safeRelative(relativePath, "review filename");
     if (file.includes("/") || request.mode !== "create") throw new ArtifactGovernanceConflictError("Review candidates are create-only files");
     return { path: `${workspaceProjectRoot(state.project_id, state.slug)}/REVIEW/CANDIDATES/${request.request_id}/${file}` };

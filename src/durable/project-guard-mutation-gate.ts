@@ -16,6 +16,7 @@ import {
 import { ProviderOperationError } from "../persistence/provider/errors";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
 import { AdmissionError, type MutationContext } from "../admission/mutation-context";
+import { normalizeArtifactAdmission, normalizeCandidateResolutionAdmission } from "../admission/operation-context";
 import { decodeAdmission, encodeAdmission } from "../admission/transport";
 import {
   MutationCandidateResolutionService,
@@ -179,11 +180,14 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
 
       const state = await this.loadResolutionState();
       if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
-      await this.verifyEffectAdmission(mutationContext, resolution.project_id, state);
+      const normalized = await normalizeCandidateResolutionAdmission(resolution);
+      const rulesRequired = await this.ruleAdmissionRequired(state, normalized);
+      await this.verifyEffectAdmission(mutationContext, resolution.project_id, state, rulesRequired);
+      if (rulesRequired) await this.persistAdmissionProof("candidate", resolution.resolution_id, await this.admitRules(state, normalized, mutationContext!.actor));
 
       const receipt = await this.resolutionService.resolve(resolution, state, {
         artifact: (adoption, currentState, candidatePath) =>
-          this.executeArtifactAdoption(adoption, currentState, candidatePath),
+          this.executeArtifactAdoption(adoption, currentState, candidatePath, mutationContext),
         working: (adoption, currentState) =>
           this.executeWorkingAdoption(adoption, currentState, mutationContext)
       });
@@ -193,14 +197,15 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
       if (error instanceof ProviderOperationError && error.retryable) {
         return providerUnavailableResponse(error);
       }
-      throw error;
+      return this.admissionErrorResponse(error);
     }
   }
 
   private async executeArtifactAdoption(
     adoption: MutationCandidateAdoptArtifactRequest,
     state: ProjectState,
-    candidatePath: string
+    candidatePath: string,
+    mutationContext: MutationContext | null
   ): Promise<ArtifactWriteReceipt> {
     const artifact = adoption.artifact_request;
     const serialized = JSON.stringify(artifact);
@@ -219,6 +224,12 @@ export class MutationGateProjectGuard extends BaseProjectGuard {
 
     const context = createCandidateResolutionContext(adoption.candidate_id, candidatePath);
     try {
+      const normalized = await normalizeArtifactAdmission(artifact, state);
+      const rulesRequired = await this.ruleAdmissionRequired(state, normalized);
+      await this.verifyEffectAdmission(mutationContext, artifact.project_id, state, rulesRequired);
+      if (rulesRequired) {
+        await this.persistAdmissionProof("candidate-artifact", artifact.request_id, await this.admitRules(state, normalized, mutationContext!.actor));
+      }
       await this.resolutionRepository.writeArtifact(state, artifact, undefined, context);
     } catch (error) {
       if (error instanceof ArtifactContentConflictError) {

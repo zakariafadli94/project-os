@@ -101,7 +101,8 @@ const worker = {
       }
 
       const canonicalResponse = await env.PROJECT_GUARD.getByName(fallbackRequest.project_id).fetch(
-        "https://project-guard.internal/mutation-context"
+        "https://project-guard.internal/mutation-context",
+        { headers: { authorization: `Bearer ${env.INGRESS_TOKEN}` } }
       );
       if (!canonicalResponse.ok) {
         return encryptFallbackResult(registry, exchange, {

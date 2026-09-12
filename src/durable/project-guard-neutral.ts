@@ -22,17 +22,25 @@ import { normalizeProjectState } from "../domain/project-state-normalizer";
 import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
+import { ruleVersionKey } from "../domain/rule-governance";
+import { unavailableQualificationResolver, type RuleQualificationEvidenceResolver } from "../rules/qualification";
+import { prepareLocalRuleActivation, type LocalRuleActivationCapability } from "../rules/local-rule-qualification";
+import { createProductionRuleQualificationResolver } from "../rules/production-qualification";
 import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinator";
 import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
+import { DocumentLedgerRepository } from "../documents/repository";
+import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError } from "../mutation-gate/repository";
-import { parseLayoutMode, type LayoutMode } from "../persistence/layout";
+import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
 import { parseMutationGateMode } from "../mutation-gate/service";
 import { AdmissionError, issueMutationContext, verifyMutationContext, type MutationContext } from "../admission/mutation-context";
+import { normalizeArtifactAdmission, normalizeDocumentAdmission, normalizeSystemAdmission, normalizeTransactionAdmission, type NormalizedAdmissionOperation } from "../admission/operation-context";
+import { RuleAdmissionError, verifyRuleAdmissionPermit, type RuleAdmissionInput, type RuleAdmissionPermit } from "../admission/rule-admission";
 import { decodeAdmission } from "../admission/transport";
 import { discoverCanonical } from "../convergence/discovery";
 import { initialProgress } from "../convergence/journal";
@@ -45,6 +53,15 @@ import {
 } from "../convergence/rollout";
 import { freshnessRejectionMetric, workerLogConvergenceTelemetry } from "../convergence/observability";
 import { deploymentIdentity } from "../deployment/identity";
+import { evaluateRules } from "../rules/evaluator";
+import type { EvaluationResult, RuleObservation } from "../rules/contract";
+import type { GlobalGovernanceState } from "../domain/rule-governance";
+import { ruleVersionSchema } from "../domain/rule-governance";
+import { matchesResource } from "../rules/resolution";
+import { ExecutionJournal } from "../execution/journal";
+import type { ExecutionAdmission, ExecutionAdapter, ExecutionPlan } from "../execution/contract";
+import { ExecutionCoordinator } from "../execution/coordinator";
+import { authorizeRepair, normalizeRepairAdmission, parseRepairIntent, unavailableRepairEvidence, type RepairEvidenceResolver } from "../execution/repair";
 
 interface TransactionRow {
   [key: string]: SqlStorageValue;
@@ -101,7 +118,33 @@ const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
   "project.archive"
 ]);
 
+class RuleAdmissionRejection extends Error {
+  constructor(readonly evaluation: EvaluationResult) {
+    super(evaluation.code);
+  }
+}
+
+interface AdmissionProof {
+  project_id: string;
+  operation: string;
+  resources: NormalizedAdmissionOperation["resources"];
+  diagnosed_drift_refs?: string[];
+  request_hash: string;
+  actor: { actor_id: string; authority: string };
+  global_revision: number;
+  project_revision: number;
+  ruleset: EvaluationResult["ruleset"];
+  verdict: EvaluationResult["verdict"];
+  results: EvaluationResult["results"];
+  gaps: EvaluationResult["gaps"];
+  deferred_rules: EvaluationResult["deferred_rules"];
+}
+
 export class ProjectGuard extends DurableObject<Env> {
+  protected repairEvidenceResolver: RepairEvidenceResolver = unavailableRepairEvidence;
+  protected executionAdapterResolver: (admission: ExecutionAdmission) => Promise<ExecutionAdapter | null> = async () => null;
+  protected executionPlanResolver: (admission: ExecutionAdmission) => Promise<ExecutionPlan | null> = async () => null;
+  protected ruleQualificationResolver: RuleQualificationEvidenceResolver = unavailableQualificationResolver;
   protected readonly persistence: ProjectOsPersistenceRuntime;
   private readonly repository: ProjectRepository;
   private readonly managedDocumentService: ManagedDocumentService;
@@ -140,15 +183,26 @@ export class ProjectGuard extends DurableObject<Env> {
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         strict INTEGER NOT NULL CHECK (strict = 1)
       );
+      CREATE TABLE IF NOT EXISTS admission_proofs (
+        kind TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        proof_json TEXT NOT NULL,
+        PRIMARY KEY (kind, request_id)
+      );
     `);
     this.layoutMode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
     this.persistence = createProductionPersistence(env);
+    this.ruleQualificationResolver = createProductionRuleQualificationResolver(this.persistence, env);
     this.repository = new ProjectRepository(this.persistence, this.layoutMode);
     this.managedDocumentService = new ManagedDocumentService(this.persistence);
     this.managedDocumentChanges = new ManagedDocumentChangeCoordinator(
       this.persistence,
       this.ctx.storage,
-      parseMutationGateMode(env.PROJECT_OS_MUTATION_GATE_MODE)
+      parseMutationGateMode(env.PROJECT_OS_MUTATION_GATE_MODE),
+      async (state, operation, findingId) => {
+        if (!await this.ruleAdmissionRequired(state, operation)) return;
+        await this.persistAdmissionProof("document-drift", findingId, await this.admitRules(state, operation));
+      }
     );
     this.managedDocumentRequests = new ManagedDocumentRequestLedger(this.persistence.objects);
   }
@@ -169,12 +223,37 @@ export class ProjectGuard extends DurableObject<Env> {
       return this.serialize(() => this.handleManagedDocumentStatus(url));
     }
 
+    if (request.method === "GET" && pathname === "/execution-status") {
+      return this.serialize(async () => {
+        const projectId = this.ctx.id.name;
+        const kind = url.searchParams.get("kind");
+        const requestId = url.searchParams.get("request_id");
+        if (!projectId || !kind || !requestId) return Response.json({ error: "execution_identity_required" }, { status: 400 });
+        const status = await new ExecutionJournal(this.persistence, projectId, kind, requestId).status();
+        return status ? Response.json(status) : Response.json({ error: "execution_not_found" }, { status: 404 });
+      }).catch((error) => this.admissionErrorResponse(error));
+    }
+
     if (request.method === "POST" && pathname === "/reconcile-documents") {
       return this.serialize(async () => {
         const state = await this.loadOrRecoverState();
         if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
-        return Response.json(await this.managedDocumentChanges.reconcile(state));
-      });
+        // A supplied body is always a typed repair request.  It must not be
+        // ignored merely because this project is still in the legacy rollout:
+        // repair authorization is bound to the signed intent and exact
+        // server-side diagnosis below.
+        if (request.body) return this.handleTypedRepair(request, state);
+        const normalized = await normalizeSystemAdmission(
+          state.project_id, "project.repair", "DOCUMENTS", `document-reconcile@${state.revision}`, String(state.revision)
+        );
+        if (await this.ruleAdmissionRequired(state, normalized)) {
+          const proof = await this.admitRules(state, normalized);
+          await this.persistAdmissionProof("document-reconcile", `document-reconcile@${state.revision}`, proof);
+        }
+        return Response.json(await this.managedDocumentChanges.reconcile(state, {
+          scheduled: url.searchParams.get("scheduled") === "1"
+        }));
+      }).catch((error) => this.admissionErrorResponse(error));
     }
 
     if (request.method === "GET" && pathname === "/materialization-status") {
@@ -186,15 +265,15 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "POST" && pathname === "/reconcile-materialization") {
-      return this.forwardMaterializationRequest(request, "/reconcile");
+      return this.handleMaterializationMutation(request, "/reconcile", "project.repair");
     }
 
     if (request.method === "POST" && pathname === "/materialize") {
-      return this.forwardMaterializationRequest(request, "/materialize");
+      return this.handleMaterializationMutation(request, "/materialize", "project.materialize");
     }
 
     if (request.method === "GET" && pathname === "/mutation-context") {
-      return this.serialize(() => this.handleMutationContextRead());
+      return this.serialize(() => this.handleMutationContextRead(request));
     }
 
     if (request.method === "GET" && pathname === "/receipt") {
@@ -219,8 +298,6 @@ export class ProjectGuard extends DurableObject<Env> {
           message: error instanceof Error ? error.message : "Invalid transaction"
         }, { status: 400 });
       }
-
-      await this.ensureTransactionIntent(tx);
 
       const existing = this.findReceipt(tx.transaction_id);
       if (existing) {
@@ -258,12 +335,6 @@ export class ProjectGuard extends DurableObject<Env> {
         }
       }
 
-
-      if (this.strictAdmissionEnabled(tx.project_id)) {
-        if (!reconciledState) throw new AdmissionError("canonical_unavailable", 503);
-        await this.verifyAdmission(mutationContext, tx, reconciledState);
-      }
-
       const canonicalReceipt = await this.repository.readReceipt(tx.transaction_id);
       if (canonicalReceipt) {
         if (canonicalReceipt.project_id !== tx.project_id) {
@@ -275,11 +346,33 @@ export class ProjectGuard extends DurableObject<Env> {
         return Response.json(canonicalReceipt);
       }
 
+      const admissionState = reconciledState ?? await this.loadOrRecoverState();
+      const normalized = await normalizeTransactionAdmission(tx);
+      if (!admissionState && this.strictAdmissionEnabled(tx.project_id)) throw new AdmissionError("canonical_unavailable", 503);
+      if (admissionState && await this.ruleAdmissionRequired(admissionState, normalized)) {
+        await this.verifyAdmission(mutationContext, tx, admissionState);
+        const proof = await this.admitRules(admissionState, normalized, mutationContext!.actor);
+        await this.persistAdmissionProof("transaction", tx.transaction_id, proof);
+      }
+
+      // A refused strict admission must not reserve an idempotency key.  Only
+      // bind this intent after the verified permit and second rules evaluation.
+      await this.ensureTransactionIntent(tx);
+
       const state = this.layoutMode === "v2"
         ? reconciledState
         : await this.loadOrRecoverState();
       await this.assertCommitCapacity(tx.project_id);
-      const result = applyTransaction(state, tx);
+      let localRuleActivation: LocalRuleActivationCapability | undefined;
+      if (tx.operation === "rule.activate" && state) {
+        try {
+          localRuleActivation = await prepareLocalRuleActivation(state, tx, this.ruleQualificationResolver, new Date().toISOString());
+        } catch (error) {
+          const code = error instanceof Error ? error.message : "LOCAL_RULE_QUALIFICATION_UNAVAILABLE";
+          return Response.json({ error: code }, { status: code.endsWith("MISMATCH") ? 409 : 503 });
+        }
+      }
+      const result = applyTransaction(state, tx, { localRuleActivation });
 
       if (result.kind === "rejected" || result.kind === "conflict") {
         const receipt = this.terminalReceipt(tx, result.kind, result.code, result.message, state?.revision ?? 0);
@@ -324,11 +417,9 @@ export class ProjectGuard extends DurableObject<Env> {
       if (PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
         await this.syncRegistryStatus(result.state);
       }
+      await this.recordTransactionExecutionReceipt(tx, receipt);
       return Response.json(receipt);
-    }).catch((error) => {
-      if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
-      throw error;
-    });
+    }).catch((error) => this.admissionErrorResponse(error));
   }
 
   async alarm(): Promise<void> {
@@ -376,14 +467,6 @@ export class ProjectGuard extends DurableObject<Env> {
       }
     }
 
-    if (isReviewCandidate(artifact)) {
-      const violation = binaryArtifactPolicyViolation(this.env, artifact);
-      if (violation) return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "rejected", violation.code, violation.message));
-      if (this.env.PROJECT_OS_LAYOUT_MODE !== "v2" || this.env.PROJECT_OS_MUTATION_GATE_MODE !== "enforce") {
-        return Response.json(this.artifactReceipt(artifact, "rejected", "REVIEW_GOVERNANCE_REQUIRED", "Review requires V2 layout and enforced MutationGate"));
-      }
-    }
-
     if (this.ctx.id.name && this.ctx.id.name !== artifact.project_id) {
       return this.finalizeArtifact(
         artifact,
@@ -399,7 +482,27 @@ export class ProjectGuard extends DurableObject<Env> {
       );
     }
 
-    await this.verifyEffectAdmission(mutationContext, artifact.project_id, state);
+    const normalized = await normalizeArtifactAdmission(artifact, state);
+    const strictRules = await this.ruleAdmissionRequired(state, normalized);
+    // The legacy review capability is only a pre-activation rollout channel.
+    // Once a canonical rule applies (or the project is floored), its signed
+    // admission is the governing authorization; an old env mode cannot veto
+    // or substitute for that rule.
+    if (isReviewCandidate(artifact) && !strictRules) {
+      if (this.env.PROJECT_OS_LAYOUT_MODE !== "v2" || this.env.PROJECT_OS_MUTATION_GATE_MODE !== "enforce") {
+        return Response.json(this.artifactReceipt(artifact, "rejected", "REVIEW_GOVERNANCE_REQUIRED", "Review requires V2 layout and enforced MutationGate before rule activation"));
+      }
+      const violation = binaryArtifactPolicyViolation(this.env, artifact);
+      if (violation) return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "rejected", violation.code, violation.message));
+    }
+    await this.verifyEffectAdmission(mutationContext, artifact.project_id, state, strictRules);
+    if (strictRules) {
+      const proof = await this.admitRules(state, normalized, mutationContext!.actor);
+      if (isReviewCandidate(artifact) && proof.ruleset.rules.length === 0) {
+        return this.finalizeArtifact(artifact, this.artifactReceipt(artifact, "rejected", "REVIEW_CANDIDATE_DISABLED", "Review candidate ingress requires an applicable active canonical rule"));
+      }
+      await this.persistAdmissionProof("artifact", artifact.request_id, proof);
+    }
 
     if (!isStagedArtifactWriteRequest(artifact) && await sha256Hex(artifact.content) !== artifact.content_sha256) {
       return this.finalizeArtifact(
@@ -410,7 +513,7 @@ export class ProjectGuard extends DurableObject<Env> {
 
     try {
       await this.repository.writeArtifact(state, artifact, undefined, undefined, isReviewCandidate(artifact) ? () => {
-        if (binaryArtifactPolicyViolation(this.env, artifact)) throw new ReviewCapabilityExpiredError();
+        if (!strictRules && binaryArtifactPolicyViolation(this.env, artifact)) throw new ReviewCapabilityExpiredError();
       } : undefined);
     } catch (error) {
       if (error instanceof ReviewCapabilityExpiredError) {
@@ -492,8 +595,37 @@ export class ProjectGuard extends DurableObject<Env> {
       ));
     }
 
-
-    await this.verifyEffectAdmission(mutationContext, operation.project_id, state);
+    const normalized = await normalizeDocumentAdmission(operation);
+    const rulesRequired = await this.ruleAdmissionRequired(state, normalized);
+    await this.verifyEffectAdmission(mutationContext, operation.project_id, state, rulesRequired);
+    if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
+      if (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext) return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "rejected", code: "PACKAGE_GOVERNANCE_REQUIRED" });
+      const proof = await this.admitRules(state, normalized, mutationContext.actor);
+      if (operation.expected_project_revision !== state.revision) return Response.json({ status: "conflict", code: "PACKAGE_PROJECT_REVISION_CONFLICT" });
+      await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
+      const durable = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
+      if (durable) return Response.json(JSON.parse(durable.receipt_json));
+      try {
+        let receipt: unknown;
+        if (operation.operation === "package.freeze") {
+          await this.persistAdmissionProof("document", operation.request_id, proof);
+          const candidate = await this.managedDocumentService.freezePackageDocument(operation, state);
+          receipt = { request_id: operation.request_id, project_id: operation.project_id, status: "committed", candidate };
+        } else {
+          const global = await this.readGlobalGovernance();
+          if (global.revision !== proof.global_revision) throw new Error("package_ruleset_changed");
+          const progress = await this.managedDocumentService.replacePackage(operation, state, { ...proof, kind: "document", request_id: operation.request_id }, { effectBudget: 20, postcheckRules: [...Object.values(global.rules), ...Object.values(state.local_rules)] });
+          if (progress.status !== "finalized") return Response.json(progress);
+          receipt = { request_id: operation.request_id, project_id: operation.project_id, status: "committed", execution_status: "finalized", candidate: operation.candidate, finalization_ref: progress.finalization_ref };
+        }
+        await this.managedDocumentRequests.writeReceipt(operation.project_id, operation.request_id, serialized, JSON.stringify(receipt));
+        return Response.json(receipt);
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("package_")) return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "conflict", code: error.message });
+        throw error;
+      }
+    }
+    if (rulesRequired) await this.persistAdmissionProof("document", operation.request_id, await this.admitRules(state, normalized, mutationContext!.actor));
 
     try {
       await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
@@ -554,6 +686,9 @@ export class ProjectGuard extends DurableObject<Env> {
     state: ProjectState
   ): Promise<ManagedDocumentReceipt> {
     switch (request.operation) {
+      case "package.freeze":
+      case "package.replace":
+        throw new Error("package_governance_dispatch_required");
       case "working.write":
         return this.managedDocumentService.writeWorking(request, state);
       case "review.write":
@@ -574,6 +709,7 @@ export class ProjectGuard extends DurableObject<Env> {
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
     if (isReviewCandidate(request)) await this.repository.reviewJournal.recordTerminal(request, receipt);
     await this.repository.writeArtifactReceipt(receipt);
+    if (this.strictAdmissionEnabled(request.project_id)) await new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id).recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
     this.persistArtifact(request, receipt);
     if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
     return Response.json(receipt);
@@ -591,6 +727,7 @@ export class ProjectGuard extends DurableObject<Env> {
       requestJson,
       receiptJson
     );
+    if (this.strictAdmissionEnabled(request.project_id)) await new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id).recordReceipt(receipt.status, `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`);
     this.persistDocumentRequest(request, receipt);
     return Response.json(receipt);
   }
@@ -602,7 +739,7 @@ export class ProjectGuard extends DurableObject<Env> {
     return row ? normalizeProjectState(JSON.parse(row.state_json)) : null;
   }
 
-  private async handleMutationContextRead(): Promise<Response> {
+  private async handleMutationContextRead(request: Request): Promise<Response> {
     const projectId = this.ctx.id.name;
     const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
     if (!projectId || projectId === AUTO_PROJECT_ID || !secret) {
@@ -632,17 +769,24 @@ export class ProjectGuard extends DurableObject<Env> {
       const discovered = await discoverCanonical(this.repository, this.persistence, progress, budget);
       if (!discovered) {
         if (!latest) return Response.json({ error: "canonical_unavailable" }, { status: 503 });
-        const context = await issueMutationContext(latest, secret, Date.now());
+        const context = await issueMutationContext(latest, secret, Date.now(), this.contextActor(request));
         return Response.json({ context, canonical_state: latest });
       }
       latest = discovered.state;
       progress.canonical_observed_revision = discovered.state.revision;
       if (discovered.complete) {
-        const context = await issueMutationContext(discovered.state, secret, Date.now());
+        const context = await issueMutationContext(discovered.state, secret, Date.now(), this.contextActor(request));
         return Response.json({ context, canonical_state: discovered.state });
       }
     }
     return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+  }
+
+  private contextActor(request: Request): { actor_id: string; authority: string } {
+    const authorization = request.headers.get("authorization") ?? "";
+    if (this.env.CONTROL_TOWER_OPERATOR_TOKEN && authorization === `Bearer ${this.env.CONTROL_TOWER_OPERATOR_TOKEN}`) return { actor_id: "control_tower", authority: "control_tower_operator" };
+    if (this.env.INGRESS_TOKEN && authorization === `Bearer ${this.env.INGRESS_TOKEN}`) return { actor_id: "ingress", authority: "ingress_token" };
+    return { actor_id: "project_guard", authority: "durable_object" };
   }
 
   protected strictAdmissionEnabled(projectId: string): boolean {
@@ -651,14 +795,46 @@ export class ProjectGuard extends DurableObject<Env> {
       projectId
     ) === "strict";
     if (configuredStrict && this.ctx.id.name === projectId) {
-      this.ctx.storage.sql.exec(
-        "INSERT INTO admission_floor (singleton, strict) VALUES (1, 1) ON CONFLICT(singleton) DO NOTHING"
-      );
+      this.persistAdmissionFloor();
       return true;
     }
     return this.ctx.storage.sql.exec<{ strict: number }>(
       "SELECT strict FROM admission_floor WHERE singleton = 1"
     ).toArray()[0]?.strict === 1;
+  }
+
+  /** A project which has ever observed an applicable active rule is never
+   * permitted to fall back to legacy admission.  The floor deliberately uses
+   * the existing per-project storage, so an unavailable global reader after
+   * activation fails closed in admitRules rather than selecting a client rule
+   * subset or silently returning to observe mode. */
+  protected async ruleAdmissionRequired(state: ProjectState, normalized: NormalizedAdmissionOperation): Promise<boolean> {
+    if (this.strictAdmissionEnabled(state.project_id)) return true;
+    const global = await this.readGlobalGovernanceSnapshot();
+    if (this.hasApplicableActiveRule(state.local_rules, normalized)) {
+      this.persistAdmissionFloor();
+      return true;
+    }
+    if (this.hasApplicableActiveRule(global.rules, normalized)) {
+      this.persistAdmissionFloor();
+      return true;
+    }
+    return false;
+  }
+
+  private persistAdmissionFloor(): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO admission_floor (singleton, strict) VALUES (1, 1) ON CONFLICT(singleton) DO NOTHING"
+    );
+  }
+
+  private hasApplicableActiveRule(rules: Record<string, unknown>, normalized: NormalizedAdmissionOperation): boolean {
+    return Object.values(rules).some(value => {
+      const parsed = ruleVersionSchema.safeParse(value);
+      return parsed.success && parsed.data.status === "active"
+        && parsed.data.operations.includes(normalized.operation)
+        && normalized.resources.some(resource => matchesResource(parsed.data, resource));
+    });
   }
 
   /**
@@ -710,9 +886,10 @@ export class ProjectGuard extends DurableObject<Env> {
   protected async verifyEffectAdmission(
     context: MutationContext | null,
     projectId: string,
-    state: ProjectState
+    state: ProjectState,
+    required = this.strictAdmissionEnabled(projectId)
   ): Promise<void> {
-    if (!this.strictAdmissionEnabled(projectId)) return;
+    if (!required) return;
     const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
     if (!secret) {
       const error = new AdmissionError("canonical_unavailable", 503);
@@ -748,9 +925,177 @@ export class ProjectGuard extends DurableObject<Env> {
     }
   }
 
-  private admissionErrorResponse(error: unknown): Response {
+  protected admissionErrorResponse(error: unknown): Response {
+    if (error instanceof Error && error.message === "repair_diagnosed_drift_required") return Response.json({ error: "REPAIR_INTENT_REQUIRED" }, { status: 409 });
+    if (error instanceof Error && error.message.startsWith("execution_")) return Response.json({ error: error.message }, { status: error.message.endsWith("conflict") ? 409 : 503 });
+    if (error instanceof Error && error.message.startsWith("repair_")) return Response.json({ error: error.message }, { status: error.message.endsWith("unavailable") ? 503 : 409 });
     if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+    if (error instanceof RuleAdmissionError) return Response.json({ error: error.code }, { status: error.code === "rule_admission_expired" ? 409 : 503 });
+    if (error instanceof RuleAdmissionRejection) {
+      const result = error.evaluation;
+      return Response.json({ error: result.code, rule: result.rule, expected: result.expected, observed: result.observed, required_action: result.required_action }, { status: result.verdict === "unavailable" ? 503 : 409 });
+    }
     throw error;
+  }
+
+  protected async admitRules(state: ProjectState, normalized: NormalizedAdmissionOperation, actor = { actor_id: "project_guard", authority: "durable_object" }): Promise<AdmissionProof> {
+    const global = await this.readGlobalGovernance();
+    const evaluate = async (global_governance: GlobalGovernanceState): Promise<EvaluationResult> => evaluateRules({
+      actor,
+      project_id: normalized.project_id,
+      operation: normalized.operation,
+      expected_project_revision: state.revision,
+      stage: "pre_admission",
+      now: new Date().toISOString(),
+      state,
+      global_governance,
+      resources: normalized.resources,
+      observations: await this.resolveServerObservations(state, normalized),
+      approvals: []
+    });
+    const first = await evaluate(global);
+    if (first.verdict !== "allow") throw new RuleAdmissionRejection(first);
+    const input: RuleAdmissionInput = {
+      actor,
+      project_id: normalized.project_id,
+      operation: normalized.operation,
+      resources: normalized.resources,
+      request_hash: normalized.request_hash,
+      global_revision: global.revision,
+      ruleset: first.ruleset
+    };
+    const permit = await this.requestRulePermit(input);
+    const secret = this.env.RULE_ADMISSION_SIGNING_KEY;
+    if (!secret) throw new RuleAdmissionRejection({ ...first, verdict: "unavailable", code: "GLOBAL_GOVERNANCE_UNAVAILABLE", expected: "Rule admission signing key", observed: "Missing signing key", required_action: "Restore rule-admission authority" });
+    await verifyRuleAdmissionPermit(permit, input, secret, Date.now());
+    const currentGlobal = await this.readGlobalGovernance();
+    const final = await evaluate(currentGlobal);
+    if (final.verdict !== "allow" || final.ruleset.digest !== permit.ruleset.digest || currentGlobal.revision !== permit.global_revision) {
+      throw new RuleAdmissionRejection(final.verdict === "allow"
+        ? { ...final, verdict: "unavailable", code: "RULE_ADMISSION_STALE", expected: permit.ruleset.digest, observed: final.ruleset.digest, required_action: "Refresh the operation under the current ruleset" }
+        : final);
+    }
+    return {
+      project_id: normalized.project_id,
+      operation: normalized.operation,
+      resources: normalized.resources,
+      request_hash: normalized.request_hash,
+      actor: input.actor,
+      global_revision: currentGlobal.revision,
+      project_revision: state.revision,
+      ruleset: final.ruleset,
+      verdict: final.verdict,
+      results: final.results,
+      gaps: final.gaps,
+      deferred_rules: final.deferred_rules
+    };
+  }
+
+  /** Only registered document controls may contribute objective observations.
+   * The request contributes no evidence: both the current version and its
+   * immutable version-record reference are read from the canonical ledger. */
+  private async resolveServerObservations(state: ProjectState, normalized: NormalizedAdmissionOperation): Promise<RuleObservation[]> {
+    if (normalized.operation !== "working.write") return [];
+    const resources = normalized.resources.filter(resource => resource.resource_type === "document" && resource.expected_version !== undefined);
+    if (!resources.length) return [];
+    const ledger = new DocumentLedgerRepository(this.persistence);
+    const now = new Date();
+    const expires = new Date(now.getTime() + 300_000).toISOString();
+    const observations: RuleObservation[] = [];
+    for (const resource of resources) {
+      try {
+        const headPath = machineDocumentHeadPath(state.project_id, resource.resource_id);
+        const before = await this.persistence.objects.getMetadata(headPath);
+        if (!before?.revisionToken) continue;
+        const head = await ledger.readHead(state.project_id, resource.resource_id);
+        const currentVersion = head?.working_version_id ?? head?.published_version_id;
+        if (!currentVersion) continue;
+        const versionPath = machineDocumentVersionPath(state.project_id, resource.resource_id, currentVersion);
+        const versionBefore = await this.persistence.objects.getMetadata(versionPath);
+        if (!versionBefore) continue;
+        const version = await ledger.readVersion(state.project_id, resource.resource_id, currentVersion);
+        const versionAfter = await this.persistence.objects.getMetadata(versionPath);
+        const after = await this.persistence.objects.getMetadata(headPath);
+        if (!version || !after || !sameProviderObject(before, after) || !versionAfter || !sameProviderObject(versionBefore, versionAfter)) continue;
+        const headEvidence = providerEvidenceReference(before);
+        const versionEvidence = providerEvidenceReference(versionBefore);
+        if (!headEvidence || !versionEvidence) continue;
+        observations.push({
+          project_id: state.project_id,
+          resource_id: resource.resource_id,
+          resource_version: resource.version,
+          current_version: currentVersion,
+          observed_at: now.toISOString(),
+          expires_at: expires,
+          evidence_refs: [headEvidence, versionEvidence]
+        });
+      } catch {
+        // Partial, unstable and unavailable reads remain no evidence; the
+        // common evaluator consequently fails closed for a rule that needs it.
+      }
+    }
+    return observations;
+  }
+
+  protected async persistAdmissionProof(kind: string, requestId: string, proof: AdmissionProof): Promise<void> {
+    const admission: ExecutionAdmission = { ...proof, kind, request_id: requestId };
+    // The canonical journal is authority. SQL is only a cache; awaiting this
+    // boundary is mandatory before every admitted family starts an effect.
+    try {
+      await new ExecutionJournal(this.persistence, proof.project_id, kind, requestId).commit(admission, await this.executionPlanResolver(admission));
+    } catch (error) {
+      if (error instanceof Error && (error.message.startsWith("execution_") || error.message === "repair_diagnosed_drift_required")) throw error;
+      throw new Error("execution_evidence_unavailable");
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO admission_proofs (kind, request_id, proof_json) VALUES (?, ?, ?)
+       ON CONFLICT(kind, request_id) DO UPDATE SET proof_json = excluded.proof_json`,
+      kind, requestId, JSON.stringify(proof)
+    );
+  }
+
+  private async readGlobalGovernance(): Promise<GlobalGovernanceState> {
+    return this.readGlobalGovernanceSnapshot();
+  }
+
+  /** The Registry alone can attest that no governance history exists.  A
+   * missing/invalid snapshot is not an empty ruleset: callers suspend until
+   * they can read this canonical distinction. */
+  private async readGlobalGovernanceSnapshot(): Promise<GlobalGovernanceState> {
+    let response: Response;
+    try { response = await this.env.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/governance", { method: "GET" }); }
+    catch { throw new RuleAdmissionRejection(this.unavailableGlobalResult()); }
+    if (response.status === 404) {
+      try {
+        const body = await response.json<{ error?: unknown }>();
+        if (body.error === "governance_not_initialized") return { revision: 0, rules: {}, exceptions: {} };
+      } catch {
+        // A malformed 404 is not a canonical absence proof.
+      }
+      throw new RuleAdmissionRejection(this.unavailableGlobalResult());
+    }
+    if (!response.ok) throw new RuleAdmissionRejection(this.unavailableGlobalResult());
+    try {
+      const state = await response.json<GlobalGovernanceState>();
+      if (!Number.isSafeInteger(state.revision) || state.revision < 0 || !state.rules || !state.exceptions) throw new Error("invalid governance");
+      return state;
+    } catch { throw new RuleAdmissionRejection(this.unavailableGlobalResult()); }
+  }
+
+  private async requestRulePermit(input: RuleAdmissionInput): Promise<RuleAdmissionPermit> {
+    let response: Response;
+    try {
+      response = await this.env.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/rule-admission", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input)
+      });
+    } catch { throw new RuleAdmissionRejection(this.unavailableGlobalResult()); }
+    if (!response.ok) throw new RuleAdmissionRejection(this.unavailableGlobalResult());
+    try { return await response.json<RuleAdmissionPermit>(); }
+    catch { throw new RuleAdmissionRejection(this.unavailableGlobalResult()); }
+  }
+
+  private unavailableGlobalResult(): EvaluationResult {
+    return { verdict: "unavailable", code: "GLOBAL_GOVERNANCE_UNAVAILABLE", rule: null, expected: "Fresh canonical global governance", observed: "Global governance unavailable", required_action: "Restore the canonical governance reader; do not bypass global rules", ruleset: { digest: "", rules: [], global_revision: null, project_revision: 0 }, results: [], gaps: [], deferred_rules: [] };
   }
 
   private async ensureTransactionIntent(tx: Transaction): Promise<void> {
@@ -856,14 +1201,57 @@ export class ProjectGuard extends DurableObject<Env> {
     );
   }
 
-  private async forwardMaterializationRequest(request: Request, targetPath: string): Promise<Response> {
+  private async handleMaterializationMutation(request: Request, targetPath: string, operation: "project.materialize" | "project.repair"): Promise<Response> {
+    const body = await request.text();
+    return this.serialize(async () => {
+      const projectId = this.ctx.id.name;
+      if (!projectId || projectId === AUTO_PROJECT_ID) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+      const state = await this.loadOrRecoverState();
+      if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+      if (operation === "project.repair" && body) {
+        return this.handleTypedRepair(new Request(request.url, { method: "POST", body }), state);
+      }
+      const normalized = await normalizeSystemAdmission(
+        projectId, operation, "MATERIALIZATION", `${targetPath}@${state.revision}`, String(state.revision), { target_path: targetPath, body }
+      );
+      if (await this.ruleAdmissionRequired(state, normalized)) {
+        const proof = await this.admitRules(state, normalized);
+        await this.persistAdmissionProof("materialization", `${targetPath}@${state.revision}`, proof);
+      }
+      return this.forwardMaterializationRequest(request, targetPath, body);
+    }).catch((error) => this.admissionErrorResponse(error));
+  }
+
+  private async handleTypedRepair(request: Request, state: ProjectState): Promise<Response> {
+    let decoded;
+    try { decoded = decodeAdmission(await request.json(), parseRepairIntent); }
+    catch (error) {
+      if (error instanceof AdmissionError) throw error;
+      return Response.json({ error: "REPAIR_INTENT_REQUIRED" }, { status: 409 });
+    }
+    const intent = decoded.request;
+    // Repair is never an observe-only effect.  Even for a legacy project the
+    // resume authority must come from the server-signed context, not payload.
+    await this.verifyEffectAdmission(decoded.mutation_context, intent.project_id, state, true);
+    if (intent.project_id !== state.project_id || intent.project_id !== this.ctx.id.name) throw new Error("repair_project_conflict");
+    const journal = new ExecutionJournal(this.persistence, intent.project_id, intent.action.original_kind, intent.action.original_request_id);
+    const original = await journal.readAdmission();
+    if (!original) throw new Error("repair_original_evidence_unavailable");
+    const refs = await authorizeRepair(intent, state.revision, original, this.repairEvidenceResolver);
+    const proof = await this.admitRules(state, await normalizeRepairAdmission(intent), decoded.mutation_context!.actor);
+    proof.diagnosed_drift_refs = refs;
+    await this.persistAdmissionProof("repair", intent.request_id, proof);
+    const adapter = await this.executionAdapterResolver(original.admission);
+    if (!original.plan || !adapter) throw new Error("repair_finalization_adapter_unavailable");
+    return Response.json(await new ExecutionCoordinator(journal).resume(original.plan, adapter));
+  }
+
+  private async forwardMaterializationRequest(request: Request, targetPath: string, suppliedBody?: string): Promise<Response> {
     const projectId = this.ctx.id.name;
     if (!projectId || projectId === AUTO_PROJECT_ID) {
       return Response.json({ error: "project_not_initialized" }, { status: 404 });
     }
-    const body = request.method === "GET" || request.method === "HEAD"
-      ? undefined
-      : await request.text();
+    const body = suppliedBody ?? (request.method === "GET" || request.method === "HEAD" ? undefined : await request.text());
     return this.env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
       `https://materialization-guard.internal${targetPath}`,
       {
@@ -921,10 +1309,19 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<void> {
+    await this.recordTransactionExecutionReceipt(tx, receipt);
     if (receipt.status !== "committed" || !PROJECT_STATUS_OPERATIONS.has(tx.operation)) return;
     const currentState = await this.loadOrRecoverState();
     if (!currentState) return;
     await this.syncRegistryStatus(currentState);
+  }
+
+  private async recordTransactionExecutionReceipt(tx: Transaction, receipt: Receipt): Promise<void> {
+    if (!this.strictAdmissionEnabled(tx.project_id)) return;
+    const ref = receipt.status === "committed" && this.layoutMode === "v2"
+      ? `${machineCommitRecordPath(tx.project_id, receipt.new_revision)}#receipt`
+      : machineReceiptPath(tx.transaction_id);
+    await new ExecutionJournal(this.persistence, tx.project_id, "transaction", tx.transaction_id).recordReceipt(receipt.status, ref);
   }
 
   private async syncRegistryStatus(state: ProjectState): Promise<void> {
@@ -1043,7 +1440,7 @@ export class ProjectGuard extends DurableObject<Env> {
     };
   }
 
-  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+  protected async serialize<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.queue;
     let release!: () => void;
     this.queue = new Promise<void>((resolve) => { release = resolve; });
@@ -1054,6 +1451,19 @@ export class ProjectGuard extends DurableObject<Env> {
       release();
     }
   }
+}
+
+function sameProviderObject(left: ProviderObjectMetadata, right: ProviderObjectMetadata): boolean {
+  return left.path === right.path && left.objectId === right.objectId && left.revisionToken === right.revisionToken
+    && left.integrityHash?.algorithm === right.integrityHash?.algorithm && left.integrityHash?.value === right.integrityHash?.value;
+}
+
+/** Carries each immutable object identity on its own canonical path.  In
+ * particular, a head revision is never presented as evidence for a version
+ * record, even when both records point at the same document lifecycle state. */
+function providerEvidenceReference(metadata: ProviderObjectMetadata): string | null {
+  if (!metadata.path || !metadata.objectId || !metadata.revisionToken || !metadata.integrityHash?.algorithm || !metadata.integrityHash.value) return null;
+  return `${metadata.path}#object_id=${encodeURIComponent(metadata.objectId)}&revision_token=${encodeURIComponent(metadata.revisionToken)}&integrity_hash_algorithm=${encodeURIComponent(metadata.integrityHash.algorithm)}&integrity_hash=${encodeURIComponent(metadata.integrityHash.value)}`;
 }
 
 async function sha256Hex(value: string): Promise<string> {

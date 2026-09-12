@@ -87,6 +87,7 @@ export class ManagedDocumentReconciler {
 
     for (const changeInput of changes) {
       const change = toProviderChangeEntry(changeInput);
+      if (await this.ledger.ownsPackageProjection(state, change.path)) { summary.ignored += 1; continue; }
       const classified = classifyManagedPath(state, change.path);
       if (!classified) {
         summary.ignored += 1;

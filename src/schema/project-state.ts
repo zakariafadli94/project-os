@@ -4,6 +4,7 @@ import type { ProjectState } from "../domain/project-state";
 import type { SchemaWriterStage } from "./writer-stage";
 import { writesCoreV2 } from "./writer-stage";
 import { unsupportedSchemaVersion } from "./version";
+import { localRuleQualificationsSchema } from "../domain/local-rule-qualification";
 
 const projectId = z.string().regex(/^PRJ-[0-9]{4,}$/);
 const timestamp = z.string().datetime({ offset: true });
@@ -23,6 +24,9 @@ const projectStateV1Schema = z.strictObject({
   revision: z.number().int().nonnegative(),
   current_phase_id: z.string().nullable(),
   artifact_routes: recordUnknown.optional(),
+  local_rules: recordUnknown.optional(),
+  local_rule_qualifications: localRuleQualificationsSchema.optional(),
+  rule_exceptions: recordUnknown.optional(),
   constraints: recordUnknown,
   tasks: recordUnknown,
   plan_phases: recordUnknown,
@@ -156,6 +160,9 @@ const projectStateV2Schema = z.strictObject({
   revision: z.number().int().nonnegative(),
   current_phase_id: z.string().nullable(),
   artifact_routes: z.record(z.string(), artifactRouteV2Schema),
+  local_rules: recordUnknown.optional(),
+  local_rule_qualifications: localRuleQualificationsSchema.optional(),
+  rule_exceptions: recordUnknown.optional(),
   constraints: z.record(z.string(), constraintV2Schema),
   tasks: z.record(z.string(), taskV2Schema),
   plan_phases: z.record(z.string(), phaseV2Schema),

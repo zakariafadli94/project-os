@@ -115,7 +115,7 @@ describe("post-commit convergence acceptance", () => {
     expect(mock.files.get(`${root}/HANDOFF.md`)).toContain("Revision: 258");
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
       target_revision: 258,
-      projection_version: 3
+      projection_version: 4
     });
   });
 
@@ -164,7 +164,7 @@ describe("post-commit convergence acceptance", () => {
 
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
       target_revision: 1,
-      projection_version: 3
+      projection_version: 4
     });
   });
 
@@ -191,10 +191,10 @@ describe("post-commit convergence acceptance", () => {
     };
     const journal = new ConvergenceJournal(effectRuntime, record.project_id);
     const progress = initialProgress(record.project_id, "1970-01-01T00:00:00.000Z", "effect-verification");
-    progress.active = { revision: record.new_revision, projection_version: 3 };
+    progress.active = { revision: record.new_revision, projection_version: 4 };
     progress.obligations["b".repeat(64)] = {
       id: "b".repeat(64), layer: "human_handoff", from_revision: 0,
-      target: { revision: record.new_revision, projection_version: 3 }, incident: 1,
+      target: { revision: record.new_revision, projection_version: 4 }, incident: 1,
       state: "verified", first_pending_at: "1970-01-01T00:00:00.000Z",
       next_attempt_at: null, failure_count: 0, last_attempt_number: 1,
       last_closed_attempt_number: 1, last_verified_at: "1970-01-01T00:00:00.000Z",
@@ -239,7 +239,7 @@ describe("post-commit convergence acceptance", () => {
     expect(resumed).toEqual({ complete: true, more_work: false });
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
       target_revision: record.new_revision,
-      projection_version: 3
+      projection_version: 4
     });
   });
 
@@ -250,7 +250,7 @@ describe("post-commit convergence acceptance", () => {
     const repository = new ProjectRepository(runtime, "v2");
     await repository.writeCommitRecord(record);
     const ledger = new AcceptanceLedger();
-    ledger.requestTarget({ revision: record.new_revision, projection_version: 3 });
+    ledger.requestTarget({ revision: record.new_revision, projection_version: 4 });
     const engine = new ConvergenceEngine({
       projectId: record.project_id,
       repository,
@@ -301,11 +301,11 @@ describe("post-commit convergence acceptance", () => {
     const record = commitFixture("PRJ-9274", 1)[0];
     const repository = new ProjectRepository(runtime, "v2");
     const ledger = new AcceptanceLedger();
-    ledger.requestTarget({ revision: record.new_revision, projection_version: 3 });
+    ledger.requestTarget({ revision: record.new_revision, projection_version: 4 });
     ledger.beginNextTarget();
     const reconcile = vi.spyOn(MaterializationCoordinator.prototype, "reconcile");
     const runNext = vi.spyOn(MaterializationCoordinator.prototype, "runNext").mockResolvedValue({
-      project_id: record.project_id, target_revision: record.new_revision, projection_version: 3,
+      project_id: record.project_id, target_revision: record.new_revision, projection_version: 4,
       completed: false, repaired_head: false, more_work: true
     });
 
@@ -357,10 +357,10 @@ describe("post-commit convergence acceptance", () => {
 
     const journal = new ConvergenceJournal(runtime, record.project_id);
     const progress = initialProgress(record.project_id, "1970-01-01T00:00:00.000Z", "reopen-head");
-    progress.active = { revision: record.new_revision, projection_version: 3 };
+    progress.active = { revision: record.new_revision, projection_version: 4 };
     progress.obligations["a".repeat(64)] = {
       id: "a".repeat(64), layer: "human_handoff", from_revision: 0,
-      target: { revision: record.new_revision, projection_version: 3 }, incident: 1,
+      target: { revision: record.new_revision, projection_version: 4 }, incident: 1,
       state: "verified", first_pending_at: "1970-01-01T00:00:00.000Z",
       next_attempt_at: null, failure_count: 0, last_attempt_number: 1,
       last_closed_attempt_number: 1, last_verified_at: "1970-01-01T00:00:00.000Z",
@@ -380,7 +380,7 @@ describe("post-commit convergence acceptance", () => {
     await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
       target_revision: record.new_revision,
-      projection_version: 3
+      projection_version: 4
     });
   });
 
@@ -620,7 +620,7 @@ describe("post-commit convergence acceptance", () => {
     expect(mock.files.get(`${root}/HANDOFF.md`)).toContain("Revision: 258");
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record258.project_id)) ?? "{}")).toMatchObject({
       target_revision: 258,
-      projection_version: 3
+      projection_version: 4
     });
     expect(mock.files.get(machineReceiptPath(record258.receipt.transaction_id))).toBe(originalReceipt);
     expect(completed?.progress.alerts[exhaustedIncidentId!]?.resolved_at).toBeTruthy();

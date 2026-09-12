@@ -31,6 +31,8 @@ function modernV1() {
     status: "active" as const,
     revision: 4,
     current_phase_id: "PHASE-9001",
+    local_rules: {},
+    rule_exceptions: {},
     artifact_routes: {
       "ROUTE-9001": {
         route_id: "ROUTE-9001",

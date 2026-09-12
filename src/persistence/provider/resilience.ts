@@ -120,6 +120,7 @@ export function withProviderResilience(
     } : {}),
     ...(runtime.serverSideCopy ? {
       serverSideCopy: {
+        ...(runtime.serverSideCopy.copyObjectVersion ? { copyObjectVersion: runtime.serverSideCopy.copyObjectVersion.bind(runtime.serverSideCopy) } : {}),
         copyObject: (from, to) => retry(
           "copy",
           `${from} -> ${to}`,

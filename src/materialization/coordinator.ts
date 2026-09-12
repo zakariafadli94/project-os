@@ -18,8 +18,10 @@ import {
 import type { FinalVerificationItem, MaterializationLedgerStatus, MaterializationTarget } from "./ledger";
 import { MaterializationOutputConflictError, type ProjectionWriteOutcome } from "./writer";
 import type { SliceBudget } from "../convergence/contract";
+import type { PackageNavigation } from "../domain/document-package";
 
 export interface MaterializationRepositoryPort {
+  readPackageNavigation?(projectId: string): Promise<PackageNavigation>;
   readCommitRecord(projectId: string, revision: number): Promise<CanonicalCommitRecord | null>;
   readMaterializationHead(projectId: string): Promise<MaterializationHead | null>;
   readMaterializationRecord(
@@ -323,7 +325,7 @@ export class MaterializationCoordinator {
       const plannerBaseline: PlannerBaseline | null = baseline
         ? { projection_version: baseline.head.projection_version, outputs: baseline.outputs }
         : null;
-      plan = await planProjection(record, plannerBaseline, target.projection_version);
+      plan = await planProjection(record, plannerBaseline, target.projection_version, await this.repository.readPackageNavigation?.(this.projectId) ?? {});
       const attempts = this.ledger.attemptOutputs();
       const archived = record.state.status === "archived";
       const activeRoot = this.workspaceRootFor(record.state);

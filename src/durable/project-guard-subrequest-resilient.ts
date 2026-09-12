@@ -17,6 +17,7 @@ import { ProjectRepository } from "../persistence/repository";
 import { MutationGateProjectGuard } from "./project-guard-mutation-gate";
 import type { MutationContext } from "../admission/mutation-context";
 import { decodeAdmission } from "../admission/transport";
+import { normalizeWorkingHeadAdmission } from "../admission/operation-context";
 
 interface StateRow {
   [key: string]: SqlStorageValue;
@@ -153,7 +154,12 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       ));
     }
 
-    await this.verifyEffectAdmission(context, operation.project_id, state);
+    const normalized = await normalizeWorkingHeadAdmission(operation);
+    const rulesRequired = await this.ruleAdmissionRequired(state, normalized);
+    await this.verifyEffectAdmission(context, operation.project_id, state, rulesRequired);
+    if (rulesRequired) {
+      await this.persistAdmissionProof("working-head", operation.request_id, await this.admitRules(state, normalized, context!.actor));
+    }
 
     const serialized = JSON.stringify(operation);
     try {

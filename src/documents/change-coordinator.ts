@@ -1,4 +1,6 @@
 import type { ProjectState } from "../domain/project-state";
+import type { NormalizedAdmissionOperation } from "../admission/operation-context";
+import { sha256Canonical } from "../materialization/hash";
 import { MutationGateClassifier } from "../mutation-gate/classifier";
 import { MutationGateService, type MutationGateMode, type MutationGateProcessSummary } from "../mutation-gate/service";
 import { workspaceProjectRoot } from "../persistence/layout";
@@ -22,6 +24,8 @@ import {
   type ManagedDocumentDetectionSource
 } from "./change-job-store";
 import { sha256Text } from "./hash";
+import { DocumentLedgerRepository } from "./repository";
+import { PackageExternalDriftObserver } from "./external-drift";
 import {
   ManagedDocumentReconciler,
   type ManagedDocumentReconcileSummary
@@ -49,7 +53,24 @@ export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSu
   jobs_completed: number;
   jobs_pending: number;
   job_failures: number;
+  drift_findings: number;
+  expected_changes: number;
+  scheduled: boolean;
+  scheduled_due: boolean;
+  late_since: string | null;
+  last_scheduled_verified_at: string | null;
 }
+
+export interface ManagedDocumentReconcileOptions {
+  scheduled?: boolean;
+  now?: string;
+}
+
+export type ObservedPackageDriftAdmission = (
+  state: ProjectState,
+  operation: NormalizedAdmissionOperation,
+  findingId: string
+) => Promise<void>;
 
 interface BootstrapCandidate {
   change: ProviderChangeEntry;
@@ -74,13 +95,15 @@ export class ManagedDocumentChangeCoordinator {
   private readonly bootstrapper: ManagedDocumentBootstrapper;
   private readonly mutationClassifier: MutationGateClassifier;
   private readonly mutationGate: MutationGateService;
+  private readonly packageDrift: PackageExternalDriftObserver;
   private readonly jobs: ManagedDocumentChangeJobStore | null;
   private readonly legacyCursorStore: ManagedDocumentCursorStore | null;
 
   constructor(
     input: PersistenceInput,
     storage: DurableObjectStorage | ManagedDocumentCursorStore,
-    private readonly gateMode: MutationGateMode = "observe"
+    private readonly gateMode: MutationGateMode = "observe",
+    private readonly admitObservedPackageDrift?: ObservedPackageDriftAdmission
   ) {
     this.runtime = asProjectOsPersistence(input);
     this.reconciler = new ManagedDocumentReconciler(this.runtime);
@@ -88,6 +111,7 @@ export class ManagedDocumentChangeCoordinator {
     this.bootstrapper = new ManagedDocumentBootstrapper(this.runtime);
     this.mutationClassifier = new MutationGateClassifier(this.runtime);
     this.mutationGate = new MutationGateService(this.runtime, gateMode);
+    this.packageDrift = new PackageExternalDriftObserver(this.runtime);
 
     if (isDurableObjectStorage(storage)) {
       initializeManagedDocumentChangeJobSchema(storage);
@@ -102,11 +126,19 @@ export class ManagedDocumentChangeCoordinator {
     }
   }
 
-  async reconcile(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
+  async reconcile(state: ProjectState, options: ManagedDocumentReconcileOptions = {}): Promise<ManagedDocumentChangeSummary> {
     if (!this.jobs) return this.reconcileLegacyTestSeam(state);
 
     const summary = emptySummary({ archived: state.status === "archived" }, this.mutationGateMode());
     if (state.status === "archived") return summary;
+    if (options.scheduled) {
+      const verification = this.jobs.scheduledVerification(options.now ?? new Date().toISOString());
+      summary.scheduled = true;
+      summary.scheduled_due = verification.due;
+      summary.late_since = verification.late_since;
+      summary.last_scheduled_verified_at = verification.last_verified_at;
+      if (!verification.due) return summary;
+    }
 
     // Retry durable work first. A failed job remains pending, but never prevents
     // healthy siblings or later provider pages from being durably registered.
@@ -151,6 +183,12 @@ export class ManagedDocumentChangeCoordinator {
     // the ProjectGuard SQLite store. Execution may fail safely after this point.
     await this.drainPending(state, summary);
     summary.jobs_pending = this.jobs.pendingCount();
+    if (options.scheduled && summary.jobs_pending === 0 && summary.job_failures === 0) {
+      const completedAt = options.now ?? new Date().toISOString();
+      this.jobs.completeScheduledVerification(completedAt);
+      summary.late_since = null;
+      summary.last_scheduled_verified_at = new Date(Date.parse(completedAt)).toISOString();
+    }
     return summary;
   }
 
@@ -261,6 +299,8 @@ export class ManagedDocumentChangeCoordinator {
     const gate = await this.mutationGate.processChanges(state, [job.change], job.detection_source);
     accumulateGate(summary, gate);
 
+    if (await this.observePackageDrift(state, job.change, summary, job.job_id)) return;
+
     const stable = await this.stableWorkProducts.reconcile(state, job.change);
     if (stable.handled) {
       accumulateStable(summary, stable);
@@ -284,11 +324,63 @@ export class ManagedDocumentChangeCoordinator {
   ): Promise<ProviderChangeEntry[]> {
     const unhandled: ProviderChangeEntry[] = [];
     for (const change of changes) {
+      if (await this.observePackageDrift(state, change, summary)) continue;
       const stable = await this.stableWorkProducts.reconcile(state, change);
       if (stable.handled) accumulateStable(summary, stable);
       else unhandled.push(change);
     }
     return unhandled;
+  }
+
+  private async observePackageDrift(
+    state: ProjectState,
+    change: ProviderChangeEntry,
+    summary: ManagedDocumentChangeSummary,
+    jobId?: string
+  ): Promise<boolean> {
+    const drift = await this.packageDrift.observe(state, change);
+    if (!drift.handled) return false;
+    summary.drift_findings += 1;
+    if (drift.status === "expected_reconciled") summary.expected_changes += 1;
+    else if (drift.status === "unexpected_conflict") summary.conflicts += 1;
+    else summary.ignored += 1;
+    if (drift.status && drift.code) {
+      const findingId = `DRIFT-${(await sha256Text(JSON.stringify({
+        project_id: state.project_id,
+        job_id: jobId ?? "legacy",
+        path: change.path,
+        status: drift.status,
+        code: drift.code
+      }))).slice(0, 24).toUpperCase()}`;
+      if (this.jobs && jobId) {
+        this.jobs.recordDriftFinding({
+          finding_id: findingId,
+          job_id: jobId,
+          path: change.path,
+          change_kind: change.kind,
+          status: drift.status,
+          code: drift.code,
+          ...(drift.request_id ? { request_id: drift.request_id } : {}),
+          ...(drift.resource ? { resource: drift.resource } : {}),
+          observed_at: new Date().toISOString()
+        });
+      }
+      if (drift.resource && this.admitObservedPackageDrift) {
+        await this.admitObservedPackageDrift(state, {
+          project_id: state.project_id,
+          operation: "package.drift.observe",
+          resources: [drift.resource],
+          request_hash: await sha256Canonical({
+            project_id: state.project_id,
+            finding_id: findingId,
+            change,
+            resource: drift.resource,
+            expected_request_id: drift.request_id ?? null
+          })
+        }, findingId);
+      }
+    }
+    return true;
   }
 
   private async bootstrapBaseline(
@@ -310,6 +402,7 @@ export class ManagedDocumentChangeCoordinator {
   }
 
   private async bootstrapOne(state: ProjectState, change: ProviderChangeEntry): Promise<BootstrapResult> {
+    if (await new DocumentLedgerRepository(this.runtime).ownsPackageProjection(state, change.path)) return { adopted: 0 };
     const candidate = this.bootstrapCandidate(state, change);
     if (!candidate) return { adopted: 0 };
     const metadata = await this.metadataFor(candidate.change);
@@ -434,7 +527,13 @@ function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): Man
     jobs_registered: 0,
     jobs_completed: 0,
     jobs_pending: 0,
-    job_failures: 0
+    job_failures: 0,
+    drift_findings: 0,
+    expected_changes: 0,
+    scheduled: false,
+    scheduled_due: false,
+    late_since: null,
+    last_scheduled_verified_at: null
   };
 }
 

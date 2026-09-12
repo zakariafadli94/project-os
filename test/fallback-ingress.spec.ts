@@ -16,6 +16,7 @@ import worker from "../src/index-mutation-gate";
 import { machineCommitRecordPath } from "../src/dropbox/layout";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 
 const testEnv = env as unknown as Env;
 
@@ -256,9 +257,11 @@ describe("encrypted fallback ingress", () => {
     await runInDurableObject(testEnv.PROJECT_GUARD.getByName(projectId), (instance) => {
       Object.assign((instance as unknown as { env: Env }).env, {
         PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }),
-        MUTATION_CONTEXT_SIGNING_KEY: "synthetic-context-secret-for-vitest-only"
+        MUTATION_CONTEXT_SIGNING_KEY: "synthetic-context-secret-for-vitest-only",
+        RULE_ADMISSION_SIGNING_KEY: "synthetic-context-secret-for-vitest-only"
       });
     });
+    await bootstrapRuleAdmissionGovernance(testEnv, "synthetic-context-secret-for-vitest-only", projectId);
     const contextRequestId = "fallback-request-20260909-transaction-context";
     const contextExchange = await encryptedContextRequest(projectId, contextRequestId);
     const contextResponse = await worker.fetch(new Request("https://example.com/v1/fallback-ingress", {
@@ -331,7 +334,8 @@ describe("encrypted fallback ingress", () => {
       await runInDurableObject(testEnv.PROJECT_GUARD.getByName(id), (instance) => {
         Object.assign((instance as unknown as { env: Env }).env, {
           PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [id]: "strict" }),
-          MUTATION_CONTEXT_SIGNING_KEY: "synthetic-context-secret-for-vitest-only"
+          MUTATION_CONTEXT_SIGNING_KEY: "synthetic-context-secret-for-vitest-only",
+          RULE_ADMISSION_SIGNING_KEY: "synthetic-context-secret-for-vitest-only"
         });
       });
     }
@@ -406,9 +410,11 @@ describe("encrypted fallback ingress", () => {
     await runInDurableObject(testEnv.PROJECT_GUARD.getByName(projectId), (instance) => {
       Object.assign((instance as unknown as { env: Env }).env, {
         PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }),
-        MUTATION_CONTEXT_SIGNING_KEY: "synthetic-context-secret-for-vitest-only"
+        MUTATION_CONTEXT_SIGNING_KEY: "synthetic-context-secret-for-vitest-only",
+        RULE_ADMISSION_SIGNING_KEY: "synthetic-context-secret-for-vitest-only"
       });
     });
+    await bootstrapRuleAdmissionGovernance(testEnv, "synthetic-context-secret-for-vitest-only", projectId);
     const context = await submitFallbackRequest(
       "project_context",
       "fallback-request-20260909-replay-context",

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { governanceOperationSchemas, governanceOperationValues } from "./rule-governance";
 
 const projectId = z.string().regex(/^PRJ-[0-9]{4,}$/);
 const transactionId = z.string().regex(/^TXN-[A-Z0-9-]{10,}$/);
@@ -18,6 +19,7 @@ const governedTargetPrefix = safeRelativePrefix.refine(
 export const AUTO_PROJECT_ID = "PRJ-AUTO" as const;
 
 export const operationValues = [
+  ...governanceOperationValues,
   "project.create",
   "project.pause",
   "project.resume",
@@ -202,6 +204,7 @@ const deliverableAdd = z.strictObject({
 const deliverableComplete = z.strictObject({ ...common, operation: z.literal("deliverable.complete"), payload: z.strictObject({ deliverable_id: stableId("DEL"), outcome: nonEmpty.optional() }) });
 
 export const transactionSchema = z.discriminatedUnion("operation", [
+  ...governanceOperationSchemas(common),
   projectCreate,
   projectPause,
   projectResume,

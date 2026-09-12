@@ -13,7 +13,6 @@ it("does not let a managed document claim the candidate namespace", () => {
   expect(() => assertManagedRelativePath("CANDIDATES/ART-REVIEW-CANDIDATE-0001/example.pdf")).toThrow();
 });
 
-
 it("routes an unvalidated binary attachment into WORKING only through an accepted governed route", () => {
   const workingState = emptyProjectState("PRJ-0007", "Programme 1", "programme-1", "Test");
   workingState.decisions["DEC-C2ATTACH001"] = {

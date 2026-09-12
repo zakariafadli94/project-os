@@ -5,6 +5,7 @@ import { ProviderConflictError } from "../persistence/provider/errors";
 import { machineArtifactReceiptPath } from "../persistence/layout";
 import { MutationIntentConflictError } from "../mutation-gate/repository";
 import { reviewReceiptMatchesObservation } from "./review-receipt";
+import { canonicalJson } from "../rules/contract";
 
 type Observation = NonNullable<ArtifactWriteReceipt["final_observation"]>;
 
@@ -17,6 +18,11 @@ export class ReviewCandidateEvidenceChangedError extends Error {
 
 export class ReviewCandidateJournal {
   constructor(private readonly runtime: ProjectOsPersistenceRuntime) {}
+  async classifyStaging(request: ReviewCandidateRequest) {
+    const receipt = await this.terminal(request);
+    const metadata = await this.runtime.objects.getMetadata(request.source.path);
+    return { terminal: !!receipt, classification: receipt ? `${receipt.status}_preserved` : "pending", staging: metadata ? "present" : "absent", evidence_ref: receipt ? this.path(request, "terminals") : null };
+  }
   private path(request: ReviewCandidateRequest, kind: "observations" | "terminals"): string {
     return this.pathFor(request.request_id, kind);
   }
@@ -58,7 +64,7 @@ export class ReviewCandidateJournal {
     const raw = await this.runtime.objects.readText(this.path(request,"terminals"));
     if (raw === null) return null;
     const record = JSON.parse(raw) as {request:unknown;receipt:ArtifactWriteReceipt};
-    if (JSON.stringify(parseArtifactWriteRequest(record.request)) !== JSON.stringify(request)) throw new MutationIntentConflictError(request.request_id);
+    if (canonicalJson(parseArtifactWriteRequest(record.request)) !== canonicalJson(parseArtifactWriteRequest(request))) throw new MutationIntentConflictError(request.request_id);
     const receipt = record.receipt;
     if (!receipt || receipt.request_id !== request.request_id || receipt.project_id !== request.project_id || receipt.content_sha256 !== request.content_sha256 || receipt.relative_path !== request.relative_path || receipt.operation !== "REVIEW_CANDIDATE" || receipt.accepted !== false || receipt.published !== false || !["committed","conflict","rejected"].includes(receipt.status)) throw new Error("Invalid review terminal record");
     return receipt;

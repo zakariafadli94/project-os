@@ -71,6 +71,8 @@ export interface Obligation {
   code: string | null;
   lease_until: string | null;
   continuation: string | null;
+  internal_failure?: import("../execution/contract").FailureStreak & { verified_output_count: number };
+  internal_incident_ref?: string;
 }
 
 export interface AttemptReservation {

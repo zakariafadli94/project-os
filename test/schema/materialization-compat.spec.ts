@@ -100,7 +100,7 @@ function comparableOutputs(plan: ProjectionPlan) {
 }
 
 describe("ProjectState schema evolution vs materialization", () => {
-  it("keeps the current projection at v3 and produces identical projection semantics from V1 or V2 nested state", async () => {
+  it("keeps the current projection at v4 and produces identical projection semantics from V1 or V2 nested state", async () => {
     sequence = 0;
     const created = commit(null, "project.create", {
       name: "Schema Materialization",
@@ -114,9 +114,9 @@ describe("ProjectState schema evolution vs materialization", () => {
     const planV1 = await planProjection(fromV1, null, CURRENT_PROJECTION_VERSION);
     const planV2 = await planProjection(fromV2, null, CURRENT_PROJECTION_VERSION);
 
-    expect(CURRENT_PROJECTION_VERSION).toBe(3);
-    expect(planV1.projection_version).toBe(3);
-    expect(planV2.projection_version).toBe(3);
+    expect(CURRENT_PROJECTION_VERSION).toBe(4);
+    expect(planV1.projection_version).toBe(4);
+    expect(planV2.projection_version).toBe(4);
     expect(planV2.changed_outputs.has("global:OPERATING")).toBe(true);
     expect(planV2.changed_outputs.get("global:HANDOFF")?.content).toMatch(/Operating contract/i);
     expect(comparableOutputs(planV2)).toEqual(comparableOutputs(planV1));
@@ -140,7 +140,7 @@ describe("ProjectState schema evolution vs materialization", () => {
     const nextPlan = await planProjection(research, baselineFrom(baselinePlan), CURRENT_PROJECTION_VERSION);
 
     expect(nextPlan.target_revision).toBe(2);
-    expect(nextPlan.projection_version).toBe(3);
+    expect(nextPlan.projection_version).toBe(4);
     expect(nextPlan.changed_outputs.has("research:RES-MATCOMPAT9011")).toBe(true);
     for (const key of ["global:BRIEF", "global:DISCOVERY", "global:PROJECT", "global:PLAN", "global:ROADMAP"]) {
       expect(nextPlan.changed_outputs.has(key), key).toBe(false);
@@ -162,7 +162,7 @@ describe("ProjectState schema evolution vs materialization", () => {
     }, "core_v2");
     const plan = await planProjection(created, null, CURRENT_PROJECTION_VERSION);
 
-    expect(plan.projection_version).toBe(3);
+    expect(plan.projection_version).toBe(4);
     expect(plan.expected_output_keys).toContain("global:OPERATING");
     expect(plan.expected_output_keys).toContain("global:HANDOFF");
     expect(plan.expected_output_keys).not.toContain("global:PROJECTION_V4");

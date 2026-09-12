@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseManagedDocumentRequest } from "../src/domain/managed-document-request";
+import { normalizeDocumentAdmission } from "../src/admission/operation-context";
 
 const project_id = "PRJ-0002";
 const document_id = "DOC-0123456789ABCDEF01234567";
@@ -7,6 +8,21 @@ const expected_version_id = "VER-REQ-111111111111111111111111";
 const created_at = "2026-08-24T19:30:00+01:00";
 
 describe("managed document API request", () => {
+  it("transports a hash-bound manifest reference without embedded members or client effect paths", async () => {
+    const candidate = { project_id, package_id: `PKG-${"A".repeat(64)}`, version: 2, manifest_sha256: "b".repeat(64) };
+    const request = { operation: "package.replace", request_id: "DOCREQ-PACKAGE-0001", project_id, candidate, zone: "WORKING", expected_navigation_generation: 1, expected_project_revision: 42, created_at };
+    const parsed = parseManagedDocumentRequest(request);
+    expect(parsed).toEqual(request);
+    expect(await normalizeDocumentAdmission(parsed)).toMatchObject({ operation: "package.replace", resources: [{ resource_id: candidate.package_id, resource_type: "package", zone: "WORKING", version: `2:${"b".repeat(64)}` }] });
+    expect(() => parseManagedDocumentRequest({ ...request, members: [] })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, resource_effect_scopes: [] })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, archive_path: "WORKING/ARCHIVE" })).toThrow();
+  });
+  it("freezes a package only from an existing exact DOC/VER manifest payload reference", () => {
+    const request = { operation: "package.freeze", request_id: "DOCREQ-FREEZE-0001", project_id, document_id, expected_version_id, content_sha256: "c".repeat(64), expected_project_revision: 42, created_at };
+    expect(parseManagedDocumentRequest(request)).toEqual(request);
+    expect(() => parseManagedDocumentRequest({ ...request, content: "uncommitted payload" })).toThrow();
+  });
   it("parses working writes with an optional invisible base-version token", () => {
     expect(parseManagedDocumentRequest({
       operation: "working.write",

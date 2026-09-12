@@ -73,3 +73,11 @@ it("labels a changed frozen review observation with a stable evidence error", as
     name: "ReviewCandidateEvidenceChangedError"
   });
 });
+
+it("classifies rejected staged candidates as terminal while retaining exact immutable rejection evidence", async () => {
+  const journal: any = new ReviewCandidateJournal(runtimeWithFiles());
+  const receipt = { request_id: candidate.request_id, project_id: candidate.project_id, relative_path: candidate.relative_path, content_sha256: candidate.content_sha256, status: "rejected", operation: "REVIEW_CANDIDATE", accepted: false, published: false, code: "CONTENT_VALIDATION_FAILED" };
+  await journal.recordTerminal(candidate, receipt);
+  expect(await journal.classifyStaging(candidate)).toMatchObject({ terminal: true, classification: "rejected_preserved", staging: "absent", evidence_ref: expect.stringContaining("review-terminals") });
+  expect(await journal.terminal(candidate)).toEqual(receipt);
+});

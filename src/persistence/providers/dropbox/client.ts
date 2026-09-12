@@ -2,6 +2,7 @@ import { ProviderBinaryReadLimitError } from "../../provider/errors";
 import type { ProviderRequestScope } from "../../provider/contract";
 export interface DropboxTransport {
   upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void>;
+  uploadBytes?(path: string, content: Uint8Array): Promise<DropboxFileMetadata>;
   download(path: string): Promise<string | null>;
   downloadBytes?(path: string, maxBytes: number): Promise<Uint8Array | null>;
   move(from: string, to: string): Promise<void>;
@@ -149,15 +150,25 @@ export class DropboxClient implements DropboxTransport {
   }
 
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
+    await this.uploadContent(path, content, mode);
+  }
+
+  async uploadBytes(path: string, content: Uint8Array): Promise<DropboxFileMetadata> {
+    if (content.byteLength > 10 * 1024 * 1024) throw new ProviderBinaryReadLimitError();
+    const response = await this.uploadContent(path, content, "add");
+    return parseFileMetadata(await response.json() as RawDropboxMetadata, path);
+  }
+
+  private async uploadContent(path: string, content: string | Uint8Array, mode: "add" | "overwrite"): Promise<Response> {
     const token = await this.accessToken();
     let response = await this.uploadRequest(token, path, content, mode, mode === "add");
-    if (response.ok) return;
+    if (response.ok) return response;
 
     let text = await response.text();
     if (response.status === 409 && text.includes("not_found")) {
       await this.ensureParentFolders(token, path);
       response = await this.uploadRequest(token, path, content, mode, mode === "add");
-      if (response.ok) return;
+      if (response.ok) return response;
       text = await response.text();
     }
 
@@ -472,7 +483,7 @@ export class DropboxClient implements DropboxTransport {
   private async uploadRequest(
     token: string,
     path: string,
-    content: string,
+    content: string | Uint8Array,
     mode: DropboxUploadMode,
     strictConflict: boolean
   ): Promise<Response> {
@@ -489,7 +500,7 @@ export class DropboxClient implements DropboxTransport {
           strict_conflict: strictConflict
         })
       },
-      body: content
+      body: content as BodyInit
     }, path);
   }
 

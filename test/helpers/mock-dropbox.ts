@@ -14,6 +14,7 @@ export interface DropboxMockFault {
 
 export interface DropboxMockOptions {
   realContentHash?: boolean;
+  immutableRevisions?: boolean;
   transientUploadFailures?: number;
   faults?: DropboxMockFault[];
 }
@@ -34,6 +35,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
   const fileIds = new Map<string, string>();
   const revisions = new Map<string, number>();
+  const revisionContents = new Map<string, { content: string; metadata: MockChangeEntry }>();
   const changeJournal: MockChangeEntry[] = [];
   const calls: string[] = [];
   const providerCalls: Array<{ endpoint: string; paths: string[] }> = [];
@@ -73,17 +75,19 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     const content = files.get(path);
     if (content === undefined) return null;
     const bytes = new TextEncoder().encode(content);
-    return {
+    const metadata = {
       ".tag": "file" as const,
       id: ensureIdentity(path),
       name: path.split("/").at(-1) ?? path,
       path_display: path,
       path_lower: path.toLowerCase(),
-      rev: `mock-rev-${revisions.get(path) ?? 1}`,
+      rev: options.immutableRevisions ? `${ensureIdentity(path).replace(/\D/g, "")}a${(revisions.get(path) ?? 1).toString(16)}` : `mock-rev-${revisions.get(path) ?? 1}`,
       content_hash: await contentHash(content),
       size: bytes.byteLength,
       server_modified: "2026-08-24T22:00:00Z"
     };
+    if (options.immutableRevisions) revisionContents.set(`rev:${metadata.rev}`, { content, metadata });
+    return metadata;
   };
 
   const recordFileChange = async (path: string): Promise<void> => {
@@ -245,6 +249,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
 
     if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/download") {
       const arg = JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}") as { path?: string };
+      if (arg.path && revisionContents.has(arg.path)) return respond(new Response(revisionContents.get(arg.path)!.content));
       if (!arg.path || !files.has(arg.path)) {
         return respond(new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 }));
       }
@@ -253,6 +258,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/get_metadata") {
       const body = JSON.parse(await request.text()) as { path?: string };
+      if (body.path && revisionContents.has(body.path)) return respond(Response.json(revisionContents.get(body.path)!.metadata));
       if (!body.path || !files.has(body.path)) {
         return respond(new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 }));
       }
@@ -334,7 +340,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       if (directContent === undefined && descendants.length === 0) {
         return respond(new Response(JSON.stringify({ error_summary: "path_lookup/not_found/" }), { status: 409 }));
       }
-      if (body.parent_rev && body.parent_rev !== `mock-rev-${revisions.get(resolvedPath) ?? 1}`) {
+      if (body.parent_rev && body.parent_rev !== (await metadataFor(resolvedPath))?.rev) {
         return respond(new Response(JSON.stringify({ error_summary: "path_lookup/conflict/file/" }), { status: 409 }));
       }
       if (directContent !== undefined) recordDeletedChange(resolvedPath);

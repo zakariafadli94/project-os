@@ -11,7 +11,7 @@ import { ProviderConflictError, ProviderPreconditionFailedError } from "../persi
 import { sha256Text } from "./hash";
 import { enforceManagedMarkdownIdentity } from "./identity-frontmatter";
 import { DocumentLedgerRepository } from "./repository";
-import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "./service";
+import { assertManagedDocumentExpectedVersion, ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "./service";
 
 export class ManagedWorkingHeadService {
   private readonly runtime: ProjectOsPersistenceRuntime;
@@ -332,13 +332,7 @@ export class ManagedWorkingHeadService {
   }
 
   private assertExpectedVersion(expected: string, current: string | undefined, documentId: string): void {
-    if (expected !== current) {
-      throw new ManagedDocumentConflictError(
-        "STALE_DOCUMENT_VERSION",
-        `Managed document changed since the requested base version: expected ${expected}, current ${current ?? "none"}`,
-        documentId
-      );
-    }
+    assertManagedDocumentExpectedVersion(expected, current, documentId);
   }
 
   private assertMutableProject(projectId: string, state: ProjectState): void {

@@ -240,7 +240,7 @@ describe("MODEL001 phase lifecycle", () => {
     expect(state.current_phase_id).toBeNull();
   });
 
-  it("does not fabricate child completion when the current phase completes", () => {
+  it.each(["pending", "active", "blocked"] as const)("rejects phase completion with an attached %s task without fabricating child completion", (status) => {
     let state = emptyProjectState("PRJ-4205", "Phases", "phases");
     state = commit(state, tx(state.project_id, state.revision, "plan.phase.create", {
       phase_id: "PHASE-4220", title: "Current"
@@ -251,10 +251,13 @@ describe("MODEL001 phase lifecycle", () => {
     state = commit(state, tx(state.project_id, state.revision, "deliverable.create", {
       deliverable_id: "DEL-4220", title: "Still planned", version: "v1", phase_id: "PHASE-4220"
     }));
-    state = commit(state, tx(state.project_id, state.revision, "plan.phase.complete", {
+    state.tasks["TASK-4220"].status = status;
+    const before = structuredClone(state);
+    const result = applyTransaction(state, tx(state.project_id, state.revision, "plan.phase.complete", {
       phase_id: "PHASE-4220"
     }));
-    expect(state.tasks["TASK-4220"].status).toBe("pending");
+    expect(result).toMatchObject({ kind: "rejected", code: "PHASE_HAS_UNFINISHED_TASKS" });
+    expect(state).toEqual(before);
     expect(state.deliverables["DEL-4220"].status).toBe("planned");
   });
 });

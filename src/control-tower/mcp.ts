@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
-export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace }) {
+export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }) {
   const server = new McpServer({ name: "project-os-control-tower", version: "1.0.0" });
   server.registerTool("project_os_get_context", { description: "Read canonical Project OS context", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/) } }, async ({ project_id }) => {
     const response = await env.PROJECT_GUARD.getByName(project_id).fetch("https://project-guard.internal/mutation-context");
@@ -19,9 +19,9 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
   return server;
 }
 
-async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace }, projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>) {
+async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }, projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>) {
   if (!request || typeof request !== "object" || request.project_id !== projectId) return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({ status: "rejected", code: "project_binding_mismatch" }) }] };
-  const contextResponse = await env.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/mutation-context");
+  const contextResponse = await env.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/mutation-context", { headers: env.CONTROL_TOWER_OPERATOR_TOKEN ? { authorization: `Bearer ${env.CONTROL_TOWER_OPERATOR_TOKEN}` } : {} });
   if (!contextResponse.ok) return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
   const canonical = await contextResponse.json<{ context?: unknown }>();
   const owner = kind === "transaction" && request.operation === "project.create" ? env.REGISTRY_GUARD.getByName("global") : env.PROJECT_GUARD.getByName(projectId);

@@ -89,6 +89,23 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
         await call("copy", `${from} -> ${to}`, () => raw.copy!(from, to))
       )
     };
+    if (raw.downloadBytes && raw.uploadBytes) runtime.serverSideCopy.copyObjectVersion = async (_from, to, expected) => {
+      if (!/^id:[A-Za-z0-9_-]+$/.test(expected.objectId) || !/^[a-f0-9]+$/.test(expected.revisionToken) || !/^[a-f0-9]{64}$/.test(expected.contentSha256)) throw new ProviderConflictError("Invalid exact copy identity");
+      // Dropbox ReadPath supports rev:<revision>. This immutable address, not
+      // the mutable source path, selects both metadata and downloaded bytes.
+      const revision = `rev:${expected.revisionToken}`;
+      const source = await call("metadata", revision, () => raw.getMetadata!(revision));
+      if (!source || source.id !== expected.objectId || source.rev !== expected.revisionToken) throw new ProviderConflictError("Exact copy source identity mismatch");
+      if (!Number.isSafeInteger(source.size) || source.size < 0 || source.size > 10 * 1024 * 1024) throw new ProviderBinaryReadLimitError();
+      const bytes = await call("read", revision, () => raw.downloadBytes!(revision, Math.max(1, source.size)));
+      if (!bytes || bytes.length !== source.size) throw new ProviderConflictError("Exact copy bytes unavailable");
+      const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+      const hash = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+      if (hash !== expected.contentSha256) throw new ProviderConflictError("Exact copy content mismatch");
+      const destination = await call("create", to, () => raw.uploadBytes!(to, bytes));
+      if (!destination?.id || !destination.rev || destination.path !== to || destination.size !== source.size) throw new ProviderConflictError("Exact copy destination unavailable");
+      return { source: { ...expected }, destination: mapMetadata(destination) };
+    };
   }
 
   if (raw.listFolderChanges) {

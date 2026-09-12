@@ -28,6 +28,9 @@ import { sha256Text } from "./hash";
 import { enforceManagedMarkdownIdentity } from "./identity-frontmatter";
 import { DocumentLedgerRepository } from "./repository";
 import { ManagedDocumentPromotionJournal } from "./promotion-journal";
+import { DocumentPackageReplacement, type PackageReplaceRequest, type PackageExecutionOptions } from "./package-replacement";
+import type { ExecutionAdmission } from "../execution/contract";
+import type { ManagedDocumentRequest } from "../domain/managed-document-request";
 
 export interface ManagedTextWriteRequest {
   request_id: string;
@@ -98,6 +101,19 @@ export class ManagedDocumentConflictError extends Error {
 }
 
 export class ManagedDocumentService {
+  async freezePackageDocument(request: Extract<ManagedDocumentRequest, { operation: "package.freeze" }>, state: ProjectState) {
+    if (request.project_id !== state.project_id || request.expected_project_revision !== state.revision) throw new Error("package_manifest_document_binding");
+    const version = await this.ledger.readVersion(request.project_id, request.document_id, request.expected_version_id);
+    if (!version || version.content_sha256 !== request.content_sha256) throw new Error("package_manifest_document_binding");
+    const content = await this.ledger.readSearchableTextPayload(version);
+    if (content === null || await sha256Text(content) !== request.content_sha256) throw new Error("package_manifest_document_binding");
+    const manifest = JSON.parse(content);
+    if (manifest.project_id !== request.project_id) throw new Error("package_manifest_document_binding");
+    return this.ledger.freezePackage(manifest);
+  }
+  async replacePackage(request: PackageReplaceRequest, state: ProjectState, admission: ExecutionAdmission, options: PackageExecutionOptions = {}) {
+    return new DocumentPackageReplacement(this.runtime).resume(request, state, admission, options);
+  }
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly ledger: DocumentLedgerRepository;
   private readonly reviewCandidates: ReviewCandidateJournal;
@@ -727,13 +743,7 @@ export class ManagedDocumentService {
   }
 
   private assertExpectedVersion(expected: string | undefined, current: string | undefined, documentId: string): void {
-    if (expected !== undefined && expected !== current) {
-      throw new ManagedDocumentConflictError(
-        "STALE_DOCUMENT_VERSION",
-        `Managed document changed since the requested base version: expected ${expected}, current ${current ?? "none"}`,
-        documentId
-      );
-    }
+    assertManagedDocumentExpectedVersion(expected, current, documentId);
   }
 
   private async readOrRestoreHead(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
@@ -822,6 +832,13 @@ export class ManagedDocumentService {
       if (!(error instanceof ProviderPreconditionFailedError)) throw error;
       throw new ManagedDocumentConflictError("PROVIDER_CAS_CONFLICT", `Managed document changed concurrently during update: ${path}`, documentId);
     }
+  }
+}
+
+/** Shared deterministic comparison; callers remain responsible for loading a fresh canonical version. */
+export function assertManagedDocumentExpectedVersion(expected: string | undefined, current: string | undefined, documentId: string): void {
+  if (expected !== undefined && expected !== current) {
+    throw new ManagedDocumentConflictError("STALE_DOCUMENT_VERSION", `Managed document changed since the requested base version: expected ${expected}, current ${current ?? "none"}`, documentId);
   }
 }
 

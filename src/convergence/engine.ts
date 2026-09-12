@@ -34,6 +34,9 @@ import {
 import { runHumanSlice } from "./human";
 import { isConverged } from "./health";
 import { chooseQueue } from "./audit";
+import { executionHash } from "../execution/journal";
+import { buildAlertRecord } from "./observability";
+import { ProviderOperationError } from "../persistence/provider/errors";
 
 export function nextConvergenceWake(existing: string | null, due: readonly (string | null)[]): string | null {
   return minimumWake([existing, ...due]);
@@ -443,7 +446,7 @@ export class ConvergenceEngine {
         obligation_id: obligationId,
         layer,
         from_revision: record.previous_revision,
-        target: { revision: record.new_revision, projection_version: 3 },
+        target: { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION },
         attempt_number: (existingObligation?.last_attempt_number ?? 0) + 1,
         incident: existingObligation?.incident ?? 1,
         incarnation: progress.incarnation,
@@ -533,7 +536,7 @@ export class ConvergenceEngine {
       if (progress.requested && progress.requested.revision <= discovered.record.new_revision) {
         progress.requested = null;
       }
-      progress.active = { revision: discovered.record.new_revision, projection_version: 3 };
+      progress.active = { revision: discovered.record.new_revision, projection_version: CURRENT_PROJECTION_VERSION };
       const waitingHuman = Object.values(progress.obligations).find((obligation) =>
         obligation.layer === "human_handoff"
         && obligation.target.revision === discoveredRecord.new_revision
@@ -864,6 +867,14 @@ export class ConvergenceEngine {
       revision: record.new_revision
     });
     const existing = progress.obligations[obligationId];
+    const verifiedOutputCount = this.input.ledger.attemptOutputs().size;
+    if (existing?.code === "identical_internal_failure_limit" && verifiedOutputCount <= (existing.internal_failure?.verified_output_count ?? verifiedOutputCount)) {
+      for (const name of ["human_state", "human_handoff", "generation", "head"] as const) {
+        health.layers[name] = { ...pendingLayer(record.new_revision, this.input.now(), existing.code), state: "blocked", failure_count: existing.failure_count, next_attempt_at: null };
+      }
+      progress.next_alarm_at = nextPendingWake(progress);
+      return false;
+    }
     const attemptNumber = (existing?.last_attempt_number ?? 0) + 1;
     const reservation = await this.reserveAttempt({
       schema_version: "1.0",
@@ -871,7 +882,7 @@ export class ConvergenceEngine {
       obligation_id: obligationId,
       layer,
       from_revision: record.previous_revision,
-      target: { revision: record.new_revision, projection_version: 3 },
+      target: { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION },
       attempt_number: attemptNumber,
       incident: existing?.incident ?? 1,
       incarnation: progress.incarnation,
@@ -904,7 +915,7 @@ export class ConvergenceEngine {
         id: obligationId,
         layer,
         from_revision: record.previous_revision,
-        target: { revision: record.new_revision, projection_version: 3 },
+        target: { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION },
         incident: existing?.incident ?? 1,
         state: human.complete ? "verified" : "pending",
         first_pending_at: existing?.first_pending_at ?? reservedAt,
@@ -936,31 +947,61 @@ export class ConvergenceEngine {
         jitter: await deterministicRetryJitter(obligationId, attemptNumber),
         retryAfterMs: 0
       });
+      // An internal diagnostic is fingerprinted independently of time, attempt,
+      // transport request IDs and heartbeats. Verified output hashes are the
+      // progress marker; the existing transient/budget backoff is untouched.
+      let internalFailure = existing?.internal_failure;
+      let internalIncidentRef = existing?.internal_incident_ref;
+      if (code === "human_internal_failure") {
+        const diagnostic = stableHumanFailureIdentity(error);
+        const fingerprint = await executionHash({ project_id: this.input.projectId, obligation_id: obligationId, target_revision: record.new_revision, stage: "human_projection", diagnostic });
+        const verifiedOutputs = this.input.ledger.attemptOutputs();
+        const currentProgress = await executionHash([...verifiedOutputs.entries()].map(([key, value]) => [key, value.content_hash]).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+        // Losing/replacing a cached output is not forward progress. A newer
+        // target has its own obligation; this target advances only when the
+        // verified output set grows beyond its prior durable high-water mark.
+        const forwardProgress = verifiedOutputs.size > (internalFailure?.verified_output_count ?? verifiedOutputs.size);
+        const count = internalFailure?.fingerprint === fingerprint && !forwardProgress ? internalFailure.count + 1 : 1;
+        internalFailure = { fingerprint, progress_digest: currentProgress, count, verified_output_count: Math.max(verifiedOutputs.size, internalFailure?.verified_output_count ?? 0) };
+        if (count >= 6) {
+          const alert = await buildAlertRecord({ projectId: this.input.projectId, layer, incident: existing?.incident ?? 1,
+            createdAt: new Date(this.input.now()).toISOString(), code: "identical_internal_failure_limit", relativePath: `internal/${fingerprint}`,
+            expected: { revision: record.new_revision, identity: obligationId, hash: null, projection_version: CURRENT_PROJECTION_VERSION, root_hash: null },
+            observed: { revision: record.new_revision, identity: fingerprint, hash: currentProgress, projection_version: CURRENT_PROJECTION_VERSION, root_hash: null },
+            lastSuccessAt: existing?.last_verified_at ?? null, deploymentSha: this.input.deploymentSha ?? "unknown" });
+          const prior = await this.input.journal.readIncident(alert.incident_id);
+          if (!prior) await this.input.journal.recordIncident(alert);
+          internalIncidentRef = alert.diagnostic_path;
+        }
+      }
+      const stopped = code === "human_internal_failure" && (internalFailure?.count ?? 0) >= 6;
       progress.obligations[obligationId] = {
         id: obligationId,
         layer,
         from_revision: record.previous_revision,
-        target: { revision: record.new_revision, projection_version: 3 },
+        target: { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION },
         incident: existing?.incident ?? 1,
-        state: retry.state,
+        state: stopped ? "blocked" : retry.state,
         first_pending_at: existing?.first_pending_at ?? reservedAt,
-        next_attempt_at: retry.at,
+        next_attempt_at: stopped ? null : retry.at,
         failure_count: failureCount,
         last_attempt_number: attemptNumber,
         last_closed_attempt_number: attemptNumber,
         last_verified_at: null,
-        code,
+        code: stopped ? "identical_internal_failure_limit" : code,
         lease_until: null,
-        continuation: null
+        continuation: null,
+        ...(internalFailure ? { internal_failure: internalFailure } : {}),
+        ...(internalIncidentRef ? { internal_incident_ref: internalIncidentRef } : {})
       };
-      progress.active = { revision: record.new_revision, projection_version: 3 };
-      progress.next_alarm_at = minimumWake([nextPendingWake(progress), retry.at]);
+      progress.active = { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION };
+      progress.next_alarm_at = minimumWake([nextPendingWake(progress), stopped ? null : retry.at]);
       for (const pendingLayerName of ["human_state", "human_handoff", "generation", "head"] as const) {
         health.layers[pendingLayerName] = {
           ...pendingLayer(record.new_revision, this.input.now(), code),
-          state: retry.state,
+          state: stopped ? "blocked" : retry.state,
           failure_count: failureCount,
-          next_attempt_at: retry.at
+          next_attempt_at: stopped ? null : retry.at
         };
       }
       return true;
@@ -1050,7 +1091,7 @@ export class ConvergenceEngine {
       markHumanLayersPending(health, record.new_revision, this.input.now(), "generation_or_head_not_current");
       return false;
     }
-    const fullPlan = await planProjection(record, null, CURRENT_PROJECTION_VERSION);
+    const fullPlan = await planProjection(record, null, CURRENT_PROJECTION_VERSION, await repository.readPackageNavigation?.(this.input.projectId) ?? {});
     const criticalPlan: ProjectionPlan = {
       ...fullPlan,
       changed_outputs: new Map([...fullPlan.changed_outputs].filter(([, output]) => output.critical)),
@@ -1164,7 +1205,7 @@ function machineLayersCurrent(health: ConvergenceHealth): boolean {
 }
 
 function currentLayer(revision: number, nowMs: number): ConvergenceHealth["layers"][Layer] {
-  const evidence = { revision, identity: null, hash: null, projection_version: 3, root_hash: null };
+  const evidence = { revision, identity: null, hash: null, projection_version: CURRENT_PROJECTION_VERSION, root_hash: null };
   return {
     state: "current", applicable: true, expected: evidence, observed: evidence,
     last_verified_at: new Date(nowMs).toISOString(), first_pending_at: null,
@@ -1174,7 +1215,7 @@ function currentLayer(revision: number, nowMs: number): ConvergenceHealth["layer
 }
 
 function pendingLayer(revision: number, nowMs: number, code: string): ConvergenceHealth["layers"][Layer] {
-  const evidence = { revision, identity: null, hash: null, projection_version: 3, root_hash: null };
+  const evidence = { revision, identity: null, hash: null, projection_version: CURRENT_PROJECTION_VERSION, root_hash: null };
   return {
     state: "pending", applicable: true, expected: evidence,
     observed: { revision: null, identity: null, hash: null, projection_version: null, root_hash: null },
@@ -1255,8 +1296,22 @@ function isSliceBudgetExhaustion(error: unknown): boolean {
 export function classifyHumanFailure(error: unknown):
   "human_slice_budget_exhausted" | "human_provider_failure" | "human_internal_failure" {
   if (isSliceBudgetExhaustion(error)) return "human_slice_budget_exhausted";
+  if (error instanceof ProviderOperationError) return "human_provider_failure";
   if (error instanceof Error && /^(Dropbox|provider)/i.test(error.message)) return "human_provider_failure";
   return "human_internal_failure";
+}
+
+/** Prefer typed diagnostics. For legacy Error instances, code-shaped messages
+ * are stable; free-form text is replaced with the error's source site so clock,
+ * request identifiers and arbitrary provider details cannot reset the streak. */
+export function stableHumanFailureIdentity(error: unknown): string {
+  const stableCode = /^[A-Za-z][A-Za-z0-9_]{2,100}$/;
+  if (error && typeof error === "object" && "code" in error && typeof error.code === "string" && stableCode.test(error.code)) return error.code;
+  if (error instanceof Error) {
+    if (stableCode.test(error.message)) return error.message;
+    return `${error.name}:${(error.stack?.split("\n")[1] ?? "unknown_source").replace(/:\d+:\d+\)?$/, "")}`;
+  }
+  return "unknown_internal_failure";
 }
 
 function markHumanLayersNotApplicable(health: ConvergenceHealth): void {

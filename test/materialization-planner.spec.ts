@@ -15,6 +15,23 @@ import {
 const at = "2026-08-24T17:05:00+01:00";
 let txSequence = 0;
 
+it("rematerialization preserves the same canonical package navigation in STATE and HANDOFF", async () => {
+  const { record } = fixture();
+  const navigation: any = { WORKING: { schema_version: "1.0", project_id: record.project_id, zone: "WORKING", generation: 7, source_request_id: "DOCREQ-PACKAGE-0007", packages: [{ ref: { project_id: record.project_id, package_id: `PKG-${"A".repeat(64)}`, version: 3, manifest_sha256: "b".repeat(64) }, root: `WORKING/PACKAGES/PKG-${"A".repeat(64)}/3` }] } };
+  const plan = await (planProjection as any)(record, null, 4, navigation);
+  const expected = "- [[WORKING/CURRENT|WORKING current packages]]";
+  expect(plan.changed_outputs.get("global:STATE").content).toContain(expected);
+  expect(plan.changed_outputs.get("global:HANDOFF").content).toContain(expected);
+  const rebuilt = await (planProjection as any)(record, baselineFrom(plan), 4, navigation);
+  expect(rebuilt.changed_outputs.get("global:STATE").content).toContain(expected);
+  expect(rebuilt.changed_outputs.get("global:HANDOFF").content).toContain(expected);
+  expect(rebuilt.changed_outputs.get("global:STATE").input_hash).toBe(plan.changed_outputs.get("global:STATE").input_hash);
+  expect(rebuilt.changed_outputs.get("global:HANDOFF").input_hash).toBe(plan.changed_outputs.get("global:HANDOFF").input_hash);
+  const changed = await (planProjection as any)(record, baselineFrom(plan), 4, { ...navigation, REVIEW: { ...navigation.WORKING, zone: "REVIEW" } });
+  expect(changed.changed_outputs.get("global:STATE").content).toContain("[[REVIEW/CURRENT");
+  expect(changed.changed_outputs.get("global:HANDOFF").content).toContain("[[REVIEW/CURRENT");
+});
+
 function commit(
   state: ProjectState,
   operation: Transaction["operation"],

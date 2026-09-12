@@ -18,6 +18,8 @@ import { renderProject } from "../render/project";
 import { renderResearch } from "../render/research";
 import { renderRoadmap } from "../render/roadmap";
 import { renderState } from "../render/state";
+import type { PackageNavigation } from "../domain/document-package";
+import { renderPackageNavigationLinks } from "../render/package-navigation";
 import { renderTask } from "../render/task";
 import { sha256Canonical, sha256Text } from "./hash";
 
@@ -323,7 +325,8 @@ async function semanticHash(value: unknown, projectionVersion: number): Promise<
 export async function planProjection(
   record: CanonicalCommitRecord,
   baseline: ProjectionBaseline | null,
-  projectionVersion: number
+  projectionVersion: number,
+  navigation: PackageNavigation = {}
 ): Promise<ProjectionPlan> {
   if (!Number.isSafeInteger(projectionVersion) || projectionVersion < 1) {
     throw new Error(`Invalid projection version: ${projectionVersion}`);
@@ -333,6 +336,13 @@ export async function planProjection(
   const changed_outputs = new Map<string, PlannedProjectionOutput>();
   const carried_forward = new Map<string, ProjectionOutputEvidence>();
   const globals = globalDescriptors(state, record.new_revision, projectionVersion);
+  if (projectionVersion >= 4 && Object.keys(navigation).length) for (const descriptor of globals) {
+    if (descriptor.key === "global:STATE" || descriptor.key === "global:HANDOFF") {
+      const original = descriptor.render;
+      descriptor.render = () => original() + renderPackageNavigationLinks(navigation);
+      descriptor.semantic_input = { base: descriptor.semantic_input, package_navigation: navigation };
+    }
+  }
   const entities = entityDescriptors(state);
   const descriptors = [...globals, ...entities];
   const expected = new Set(descriptors.map((item) => item.key));

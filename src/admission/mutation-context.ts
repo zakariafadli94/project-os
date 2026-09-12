@@ -6,6 +6,7 @@ import { normalizeProjectState } from "../domain/project-state-normalizer";
 const CONTEXT_TTL_MS = 300_000;
 
 const claimsSchema = z.strictObject({
+  actor: z.strictObject({ actor_id: z.string().min(1), authority: z.string().min(1) }),
   project_id: z.string().regex(/^PRJ-[0-9]{4,}$/),
   canonical_revision: z.number().int().nonnegative(),
   state_hash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -18,6 +19,7 @@ const contextSchema = claimsSchema.extend({
 }).strict();
 
 export interface MutationContext {
+  actor: { actor_id: string; authority: string };
   project_id: string;
   canonical_revision: number;
   state_hash: string;
@@ -43,6 +45,9 @@ export type AdmissionCode =
   | "mutation_context_invalid"
   | "mutation_context_stale"
   | "canonical_unavailable"
+  | "GLOBAL_GOVERNANCE_UNAVAILABLE"
+  | "RULE_ADMISSION_STALE"
+  | "ARTIFACT_DESTINATION_FORBIDDEN"
   | "idempotency_payload_mismatch"
   | "convergence_capacity_exceeded";
 
@@ -63,9 +68,10 @@ export function parseMutationContextOrNull(value: unknown): MutationContext | nu
 export async function issueMutationContext(
   state: ProjectState,
   secret: string,
-  nowMs: number
+  nowMs: number,
+  actor = { actor_id: "ingress", authority: "ingress_token" }
 ): Promise<MutationContext> {
-  const claims = await contextClaims(state, nowMs);
+  const claims = await contextClaims(state, nowMs, actor);
   const bytes = new TextEncoder().encode(canonicalJson(claims));
   const signature = new Uint8Array(await crypto.subtle.sign("HMAC", await key(secret, ["sign"]), bytes));
   return { ...claims, token: `${base64url(bytes)}.${base64url(signature)}` };
@@ -106,7 +112,7 @@ export async function verifyMutationContext(
     throw new AdmissionError("mutation_context_invalid", 428);
   }
   if (nowMs >= expiry) throw new AdmissionError("mutation_context_expired", 428);
-  const expected = await contextClaims(state, observedAt);
+  const expected = await contextClaims(state, observedAt, parsed.actor);
   if (
     baseRevision !== state.revision
     || parsed.project_id !== expected.project_id
@@ -131,8 +137,9 @@ export function unbase64url(value: string): Uint8Array {
   }
 }
 
-async function contextClaims(state: ProjectState, nowMs: number) {
+async function contextClaims(state: ProjectState, nowMs: number, actor = { actor_id: "ingress", authority: "ingress_token" }) {
   return {
+    actor,
     project_id: state.project_id,
     canonical_revision: state.revision,
     state_hash: await sha256Canonical(normalizeProjectState(state)),

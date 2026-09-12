@@ -363,7 +363,15 @@ function isObligations(value: unknown): value is Record<string, Obligation> {
       && isNullableString(obligation.last_verified_at)
       && isNullableString(obligation.code)
       && isNullableString(obligation.lease_until)
-      && isNullableString(obligation.continuation);
+      && isNullableString(obligation.continuation)
+      && (obligation.internal_failure === undefined || (
+        typeof obligation.internal_failure === "object" && obligation.internal_failure !== null
+        && "fingerprint" in obligation.internal_failure && typeof obligation.internal_failure.fingerprint === "string" && /^[a-f0-9]{64}$/.test(obligation.internal_failure.fingerprint)
+        && "progress_digest" in obligation.internal_failure && typeof obligation.internal_failure.progress_digest === "string" && /^[a-f0-9]{64}$/.test(obligation.internal_failure.progress_digest)
+        && "count" in obligation.internal_failure && isNonNegativeInteger(obligation.internal_failure.count) && obligation.internal_failure.count > 0
+        && "verified_output_count" in obligation.internal_failure && isNonNegativeInteger(obligation.internal_failure.verified_output_count)
+      ))
+      && (obligation.internal_incident_ref === undefined || typeof obligation.internal_incident_ref === "string");
   });
 }
 

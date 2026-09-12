@@ -117,6 +117,15 @@ it("reports a conditional delete revision conflict without deleting", async () =
   })).resolves.toBe("changed");
 });
 
+it("preserves missing as an unproven deletion rather than a successful conditional delete", async () => {
+  const runtime = createDropboxPersistence(rawTransport({ deleteIfRevision: async () => false }));
+
+  await expect(runtime.objects.deleteIfUnchanged!(metadata.path, {
+    objectId: metadata.id,
+    revisionToken: metadata.rev
+  })).resolves.toBe("missing");
+});
+
 it("maps incremental changes and embedded file metadata", async () => {
   const runtime = createDropboxPersistence(rawTransport({
     listFolderChanges: async () => ({

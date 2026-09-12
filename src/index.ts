@@ -152,6 +152,7 @@ export async function reconcileFleetMaterializations(env: Env, signal?: AbortSig
     if (wakeSignal?.aborted) return false;
     try {
       const outcome = await reconcileMaterializationProject(env, projectId);
+      await reconcileScheduledDocumentsProject(env, projectId);
       if (outcome === "scheduled") scheduled += 1;
       else current += 1;
       return true;
@@ -172,6 +173,16 @@ export async function reconcileFleetMaterializations(env: Env, signal?: AbortSig
     // acknowledgement or turn a successful maintenance cycle into failure.
   }
   return { scanned: eligibleProjectIds.length, scheduled, current, failed, fleet };
+}
+
+async function reconcileScheduledDocumentsProject(env: Env, projectId: string): Promise<void> {
+  const stub = env.PROJECT_GUARD.getByName(projectId);
+  const response = await stub.fetch(
+    "https://project-guard.internal/reconcile-documents?scheduled=1",
+    { method: "POST" }
+  );
+  if (!response.ok) throw new Error(`ProjectGuard scheduled document reconcile returned ${response.status}`);
+  await response.text();
 }
 
 async function rebuildSearchIndexes(request: Request, env: Env): Promise<Response> {

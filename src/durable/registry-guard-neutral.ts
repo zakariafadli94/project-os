@@ -1,7 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
+import { issueRuleAdmissionPermit, parseRuleAdmissionInput } from "../admission/rule-admission";
+import { canonicalJson, compareCodePoints, ruleReference } from "../rules/contract";
+import { matchesResource } from "../rules/resolution";
+import { ruleVersionSchema } from "../domain/rule-governance";
 import type { FleetCursor } from "../convergence/fleet";
 import type { Env } from "../env";
 import type { Receipt } from "../domain/receipt";
+import { eventIdForRevision } from "../domain/event";
+import { applyRuleGovernance, globalGovernanceTransactionSchema, ruleVersionKey, type GlobalGovernanceTransaction } from "../domain/rule-governance";
+import { resolveAndQualifyRuleActivation, unavailableQualificationResolver, type RuleQualificationEvidenceResolver } from "../rules/qualification";
+import { createProductionRuleQualificationResolver } from "../rules/production-qualification";
+import { createGovernanceQualification, type GovernanceQualification } from "../rules/qualification-record";
+import { RuleGovernanceRepository, type CanonicalGovernance, type GovernanceJournalEntry } from "../persistence/rule-governance-repository";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { machineFleetCursorPath, parseLayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
@@ -69,10 +79,22 @@ interface FallbackKeySessionRow {
 
 const FALLBACK_KEY_SESSION_TTL_MS = 5 * 60_000;
 const MAX_FALLBACK_KEY_SESSIONS = 32;
+class GovernanceNotInitializedError extends Error {}
+
+function governanceTokenMatches(left: string, right: string): boolean {
+  const encoder = new TextEncoder();
+  const a = encoder.encode(left);
+  const b = encoder.encode(right);
+  let difference = a.length ^ b.length;
+  for (let index = 0; index < Math.max(a.length, b.length); index++) difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
+  return difference === 0;
+}
 
 export class RegistryGuard extends DurableObject<Env> {
+  protected ruleQualificationResolver: RuleQualificationEvidenceResolver = unavailableQualificationResolver;
   private readonly repository: ProjectRepository;
   private readonly fleetPersistence: ProjectOsPersistenceRuntime;
+  private readonly governanceRepository: RuleGovernanceRepository;
   private queue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -108,14 +130,38 @@ export class RegistryGuard extends DurableObject<Env> {
         retired_at_ms INTEGER
       );
       INSERT OR IGNORE INTO meta (key, value) VALUES ('next_project_number', '1');
+      CREATE TABLE IF NOT EXISTS governance_events (
+        revision INTEGER PRIMARY KEY,
+        event_json TEXT NOT NULL
+      );
     `);
     const persistence = createProductionPersistence(env);
     this.repository = new ProjectRepository(persistence, parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
     this.fleetPersistence = persistence;
+    this.governanceRepository = new RuleGovernanceRepository(persistence);
+    this.ruleQualificationResolver = createProductionRuleQualificationResolver(persistence, env);
   }
 
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    if (request.method === "GET" && path === "/governance") {
+      return this.serialize(async () => {
+        const { state } = await this.globalGovernanceState(undefined, true);
+        const unavailable = this.unqualifiedGovernanceResponse(state);
+        if (unavailable) return unavailable;
+        return Response.json({ revision: state.revision, rules: state.rules, exceptions: state.exceptions });
+      }).catch(error => error instanceof GovernanceNotInitializedError
+        ? Response.json({ error: "governance_not_initialized" }, { status: 404 })
+        : Response.json({ error: "governance_unavailable" }, { status: 503 }));
+    }
+    if (request.method === "POST" && path === "/governance/transaction") {
+      return this.serialize(() => this.handleGovernanceTransaction(request))
+        .catch(() => Response.json({ error: "governance_unavailable" }, { status: 503 }));
+    }
+    if (request.method === "POST" && path === "/rule-admission") {
+      return this.serialize(() => this.handleRuleAdmission(request))
+        .catch(() => Response.json({ error: "governance_unavailable" }, { status: 503 }));
+    }
     if (request.method === "POST" && path === "/create") {
       return this.serialize(() => this.handleCreate(request));
     }
@@ -144,6 +190,127 @@ export class RegistryGuard extends DurableObject<Env> {
       return this.serialize(() => this.handleFallbackEncryptAndRotate(request));
     }
     return Response.json({ error: "not_found" }, { status: 404 });
+  }
+
+  private async globalGovernanceState(initialTransaction?: GlobalGovernanceTransaction, allowNeverInitialized = false): Promise<{ state: CanonicalGovernance; token: string | null }> {
+    const canonical = await this.governanceRepository.read();
+    const row = this.ctx.storage.sql.exec<MetaRow>("SELECT value FROM meta WHERE key = 'rule_governance'").toArray()[0];
+    if (!canonical) {
+      const cached = this.ctx.storage.sql.exec<CountRow>("SELECT (SELECT COUNT(*) FROM governance_events) + (SELECT COUNT(*) FROM requests WHERE project_id = 'GLOBAL') AS count").one().count;
+      if (!row && !cached && allowNeverInitialized && await this.governanceRepository.isNeverInitialized()) throw new GovernanceNotInitializedError();
+      if (row || cached || !initialTransaction) throw new Error("Canonical global governance unavailable");
+      await this.governanceRepository.authorizeBootstrap(initialTransaction);
+      return { state: { revision: 0, rules: {}, exceptions: {}, journal: {} }, token: null };
+    }
+    if (row && JSON.parse(row.value).revision > canonical.state.revision) throw new Error("Canonical global governance regressed");
+    this.persistGovernanceCache(canonical.state);
+    return canonical;
+  }
+
+  private persistGovernanceCache(state: CanonicalGovernance): void {
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("INSERT INTO meta (key, value) VALUES ('rule_governance', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ revision: state.revision }));
+      for (const entry of Object.values(state.journal)) {
+        if (entry.event) this.ctx.storage.sql.exec("INSERT OR IGNORE INTO governance_events (revision, event_json) VALUES (?, ?)", entry.event.revision, JSON.stringify(entry.event));
+        this.ctx.storage.sql.exec("INSERT OR IGNORE INTO requests (transaction_id, transaction_json, project_id, status, receipt_json) VALUES (?, ?, 'GLOBAL', ?, ?)", entry.transaction.transaction_id, JSON.stringify(entry.transaction), entry.receipt.status, JSON.stringify(entry.receipt));
+      }
+    });
+  }
+
+  private async handleGovernanceTransaction(request: Request): Promise<Response> {
+    const token = this.env.RULE_GOVERNANCE_TOKEN;
+    const ordinaryAuthorities = [this.env.INGRESS_TOKEN, this.env.CONTROL_TOWER_OPERATOR_TOKEN,
+      this.env.INPUT_RECOVERY_OPERATOR_TOKEN, this.env.MUTATION_GATE_OPERATOR_TOKEN, this.env.MUTATION_CONTEXT_SIGNING_KEY];
+    if (!token || !token.trim() || ordinaryAuthorities.some(value => value && governanceTokenMatches(token, value)) || !governanceTokenMatches(request.headers.get("authorization") ?? "", `Bearer ${token}`)) {
+      return Response.json({ error: "governance_authority_required" }, { status: 403 });
+    }
+    let tx: GlobalGovernanceTransaction;
+    try { tx = globalGovernanceTransactionSchema.parse(await request.json()); }
+    catch { return Response.json({ error: "invalid_governance_transaction" }, { status: 400 }); }
+    const { state, token: canonicalToken } = await this.globalGovernanceState(tx);
+    const receiptBase = {
+      schema_version: "1.0" as const, transaction_id: tx.transaction_id, project_id: "GLOBAL",
+      previous_revision: state.revision, new_revision: state.revision
+    };
+    const existing = state.journal[tx.transaction_id];
+    if (existing) {
+      if (JSON.stringify(existing.transaction) !== JSON.stringify(tx)) return Response.json({ ...receiptBase, status: "rejected", code: "IDEMPOTENCY_PAYLOAD_MISMATCH", message: "The same transaction_id was reused with different content" });
+      return Response.json(existing.receipt);
+    }
+    if (this.requestRow(tx.transaction_id)) return Response.json({ ...receiptBase, status: "rejected", code: "IDEMPOTENCY_PAYLOAD_MISMATCH", message: "Transaction ID already exists outside this canonical governance history" });
+    const result = tx.base_revision !== state.revision
+      ? { kind: "conflict" as const, code: "STALE_REVISION", message: "Global governance requires the current revision" }
+      : applyRuleGovernance(state, tx, "GLOBAL");
+    let qualificationRecord: GovernanceQualification | undefined;
+    if (result.kind === "commit" && tx.operation === "rule.activate") {
+      const rule = state.rules[ruleVersionKey(tx.payload.rule_id, tx.payload.version)];
+      const qualification = await resolveAndQualifyRuleActivation(this.ruleQualificationResolver, {
+        rule, known_active_rules: Object.values(state.rules), requested_evidence_refs: tx.payload.activation_evidence, now: new Date().toISOString()
+      });
+      if (qualification.verdict !== "allow") return Response.json({ error: qualification.code, qualification }, { status: qualification.verdict === "unavailable" ? 503 : 409 });
+      if (!qualification.qualification_proof) return Response.json({ error: "QUALIFICATION_EVIDENCE_UNAVAILABLE" }, { status: 503 });
+      qualificationRecord = await createGovernanceQualification(tx, rule, qualification.qualification_proof);
+    }
+    const revision = state.revision + 1;
+    const eventId = eventIdForRevision(revision);
+    const receipt: Receipt = result.kind === "commit"
+      ? { ...receiptBase, status: "committed", new_revision: revision, event_id: eventId, committed_at: tx.created_at }
+      : { ...receiptBase, status: result.kind, code: result.code, message: result.message };
+    const entry: GovernanceJournalEntry = { transaction: tx, receipt, ...(qualificationRecord ? { qualification: qualificationRecord, qualification_required: true } : {}) };
+    if (result.kind === "commit") entry.event = {
+      schema_version: "1.0", event_id: eventId, project_id: "GLOBAL", revision,
+      transaction_id: tx.transaction_id, type: tx.operation, timestamp: tx.created_at, payload: tx.payload
+    };
+    const next: CanonicalGovernance = {
+      ...(result.kind === "commit" ? { ...result.state, revision } : state),
+      journal: { ...state.journal, [tx.transaction_id]: entry }
+    };
+    await this.governanceRepository.write(next, canonicalToken);
+    this.persistGovernanceCache(next);
+    return Response.json(receipt);
+  }
+
+  private async handleRuleAdmission(request: Request): Promise<Response> {
+    const secret = this.env.RULE_ADMISSION_SIGNING_KEY;
+    if (!secret) return Response.json({ error: "governance_unavailable" }, { status: 503 });
+    let input;
+    try {
+      input = parseRuleAdmissionInput(await request.json());
+    } catch {
+      return Response.json({ error: "invalid_rule_admission" }, { status: 400 });
+    }
+    const { state } = await this.globalGovernanceState();
+    const unavailable = this.unqualifiedGovernanceResponse(state);
+    if (unavailable) return unavailable;
+    if (input.global_revision !== state.revision || input.ruleset.global_revision !== state.revision) {
+      return Response.json({ error: "global_governance_stale" }, { status: 409 });
+    }
+    const canonicalGlobalRules = Object.values(state.rules)
+      .map(rule => ruleVersionSchema.safeParse(rule))
+      .filter((result): result is { success: true; data: ReturnType<typeof ruleVersionSchema.parse> } => result.success)
+      .map(result => result.data)
+      .filter(rule => rule.status === "active" && rule.operations.includes(input.operation) && input.resources.some(resource => matchesResource(rule, resource)))
+      .map(ruleReference)
+      .sort((left, right) => compareCodePoints(canonicalJson(left), canonicalJson(right)));
+    const requestedGlobalRules = input.ruleset.rules.filter(rule => rule.scope.kind === "global");
+    if (canonicalJson(requestedGlobalRules) !== canonicalJson(canonicalGlobalRules)) {
+      return Response.json({ error: "global_ruleset_mismatch" }, { status: 409 });
+    }
+    return Response.json(await issueRuleAdmissionPermit(input, secret, Date.now()));
+  }
+
+  /** History remains replayable for migration; only an activation with a canonical
+   * attestation verified by the repository may contribute effective authority. */
+  private unqualifiedGovernanceResponse(state: CanonicalGovernance): Response | null {
+    const entries = Object.values(state.journal);
+    const unqualified = Object.values(state.rules).filter(rule => rule.status === "active" && !entries.some(entry =>
+      entry.receipt.status === "committed" && entry.transaction.operation === "rule.activate" &&
+      entry.transaction.payload.rule_id === rule.rule_id && entry.transaction.payload.version === rule.version && entry.qualification
+    ));
+    return unqualified.length ? Response.json({
+      error: "governance_qualification_unavailable", rules: unqualified.map(ruleReference),
+      required_action: "Propose and explicitly qualify a successor for each legacy activation; canonical history alone is not active authority"
+    }, { status: 503 }) : null;
   }
 
   private async handleFallbackKey(): Promise<Response> {

@@ -8,6 +8,7 @@ import type { Env } from "../src/env";
 import { machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 
 const baseEnv = env as unknown as Env;
 const signingKey = "synthetic-context-secret-for-vitest-only";
@@ -17,7 +18,8 @@ function strictEnv(projectId: string): Env {
     ...baseEnv,
     PROJECT_OS_LAYOUT_MODE: "v2",
     PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }),
-    MUTATION_CONTEXT_SIGNING_KEY: signingKey
+    MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+    RULE_ADMISSION_SIGNING_KEY: signingKey
   };
 }
 
@@ -107,6 +109,7 @@ describe("canonical mutation-context admission", () => {
 
     const contextResponse = await readContext(projectId, testEnv);
     const { context } = await contextResponse.json<MutationContextResponse>();
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
     const accepted = await worker.fetch(new Request("https://example.com/v1/transactions", {
       method: "POST",
       headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
@@ -117,7 +120,7 @@ describe("canonical mutation-context admission", () => {
     expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(true);
   });
 
-  it("does not let a transaction id rebind its payload after an admission rejection", async () => {
+  it("does not reserve an intent on a refused strict admission, so a corrected request can proceed", async () => {
     const projectId = "PRJ-9983";
     const mock = installDropboxMock();
     seed(mock, projectId, 1);
@@ -143,8 +146,19 @@ describe("canonical mutation-context admission", () => {
       headers,
       body: JSON.stringify({ ...original, payload: { ...original.payload, title: "Rebound intent" } })
     }), testEnv, createExecutionContext());
-    expect(changed.status).toBe(409);
-    await expect(changed.json()).resolves.toEqual({ error: "idempotency_payload_mismatch" });
+    expect(changed.status).toBe(428);
+    await expect(changed.json()).resolves.toEqual({ error: "mutation_context_missing" });
+
+    const contextResponse = await readContext(projectId, testEnv);
+    const { context } = await contextResponse.json<MutationContextResponse>();
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
+    const corrected = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(encodeAdmission({ ...original, payload: { ...original.payload, title: "Corrected intent" } }, context))
+    }), testEnv, createExecutionContext());
+    expect(corrected.status).toBe(200);
+    await expect(corrected.json()).resolves.toMatchObject({ status: "committed", new_revision: 2 });
   });
 
   it("forwards a fresh signed context to governed review-candidate promotion before recording its terminal result", async () => {
@@ -156,7 +170,8 @@ describe("canonical mutation-context admission", () => {
     await runInDurableObject(guard, (instance) => {
       Object.assign((instance as unknown as { env: Env }).env, {
         PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }),
-        MUTATION_CONTEXT_SIGNING_KEY: signingKey
+        MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+        RULE_ADMISSION_SIGNING_KEY: signingKey
       });
     });
     const promotion = {
@@ -181,6 +196,8 @@ describe("canonical mutation-context admission", () => {
 
     const contextResponse = await readContext(projectId, testEnv);
     const { context } = await contextResponse.json<MutationContextResponse>();
+
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
 
     const response = await worker.fetch(new Request("https://example.com/v1/documents", {
       method: "POST",

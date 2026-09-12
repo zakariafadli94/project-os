@@ -76,7 +76,7 @@ async function routeArtifact(env: Env, artifact: ArtifactWriteRequest, context: 
   });
   if (!response.ok) {
     const body: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
-    if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
+    if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
       throw new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"]);
     }
     throw new Error(`ProjectGuard artifact route returned ${response.status}`);

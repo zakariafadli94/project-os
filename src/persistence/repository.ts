@@ -1,4 +1,5 @@
 import { ReviewCandidateJournal } from "../artifacts/review-journal";
+import { DocumentLedgerRepository } from "../documents/repository";
 import { isReviewCandidate } from "../domain/artifact-write";
 export * from "./repository-core";
 
@@ -54,6 +55,7 @@ type ActivationDerivativeOptions = CommitWriteOptions & {
 };
 
 export class ProjectRepository extends CoreProjectRepository {
+  async readPackageNavigation(projectId: string) { return new DocumentLedgerRepository(this.runtime).readPackageNavigation(projectId); }
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;

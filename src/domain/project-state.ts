@@ -1,3 +1,5 @@
+import type { RuleVersion, RuleException } from "./rule-governance";
+
 export type ProjectStatus = "active" | "paused" | "completed" | "archived";
 export type TaskStatus = "pending" | "active" | "blocked" | "completed";
 export type PhaseStatus = "pending" | "active" | "completed";
@@ -113,6 +115,7 @@ export interface DeliverableRecord {
   updated_at: string;
 }
 
+import type { LocalRuleQualification } from "./local-rule-qualification";
 export interface ProjectState {
   schema_version: "1.0" | "2.0";
   project_id: string;
@@ -126,6 +129,9 @@ export interface ProjectState {
   revision: number;
   current_phase_id: string | null;
   artifact_routes: Record<string, ArtifactRouteRecord>;
+  local_rules: Record<string, RuleVersion>;
+  local_rule_qualifications?: Record<string, LocalRuleQualification>;
+  rule_exceptions: Record<string, RuleException>;
   constraints: Record<string, ConstraintRecord>;
   tasks: Record<string, TaskRecord>;
   plan_phases: Record<string, PlanPhaseRecord>;

@@ -10,8 +10,21 @@ import type { Env } from "../src/env";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { machineCommitRecordPath } from "../src/dropbox/layout";
 import { sha256Text } from "../src/documents/hash";
+import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
+import { MutationGateService } from "../src/mutation-gate/service";
+import { DropboxClient } from "../src/persistence/providers/dropbox/client";
+import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 const testEnv = env as unknown as Env;
+
+async function seedCandidate(record: ReturnType<typeof commitFixture>[number], path: string): Promise<void> {
+  const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+  const metadata = await runtime.objects.getMetadata(path);
+  if (!metadata) throw new Error("candidate_fixture_missing");
+  // Fixture creation is not an implicit strict project.repair authorization.
+  // Transport assertions below still exercise the real authenticated route.
+  await new MutationGateService(runtime, "enforce").captureExternalCandidate(record.state, path, metadata, "incremental");
+}
 
 describe("mutation context transport", () => {
   it("round-trips the exact request and signed context without adding claims", async () => {
@@ -39,12 +52,13 @@ describe("mutation context transport", () => {
   it("requires fresh context and permits exact replay for strict mutation-candidate resolution", async () => {
     const projectId = "PRJ-9986";
     const mock = installDropboxMock();
+    await bootstrapRuleAdmissionGovernance(testEnv, "synthetic-context-secret-for-vitest-only", projectId);
     const record = commitFixture(projectId, 1)[0];
     mock.files.set(machineCommitRecordPath(projectId, 1), `${JSON.stringify(record, null, 2)}\n`);
     const guard = testEnv.PROJECT_GUARD.getByName(projectId);
     const candidatePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-9986-synthetic-convergence/ARTIFACTS/strict-context.md";
     await mock.writeExternal(candidatePath, "# strict candidate context");
-    expect((await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+    await seedCandidate(record, candidatePath);
     const candidates = await (await guard.fetch("https://project-guard.internal/mutation-candidates", { method: "GET" }))
       .json<{ candidates: Array<{ candidate_id: string }> }>();
     expect(candidates.candidates).toHaveLength(1);
@@ -83,13 +97,14 @@ describe("mutation context transport", () => {
   it("forwards fresh context to strict working adoption", async () => {
     const projectId = "PRJ-9987";
     const mock = installDropboxMock();
+    await bootstrapRuleAdmissionGovernance(testEnv, "synthetic-context-secret-for-vitest-only", projectId);
     const record = commitFixture(projectId, 1)[0];
     mock.files.set(machineCommitRecordPath(projectId, 1), `${JSON.stringify(record, null, 2)}\n`);
     const guard = testEnv.PROJECT_GUARD.getByName(projectId);
     const content = "# strict working candidate";
     const candidatePath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-9987-synthetic-convergence/DELIVERABLES/strict-working.md";
     await mock.writeExternal(candidatePath, content);
-    expect((await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+    await seedCandidate(record, candidatePath);
     const candidates = await (await guard.fetch("https://project-guard.internal/mutation-candidates", { method: "GET" }))
       .json<{ candidates: Array<{ candidate_id: string }> }>();
     expect(candidates.candidates).toHaveLength(1);
@@ -127,6 +142,7 @@ describe("mutation context transport", () => {
   it("preserves the signed context from incoming storage through execution", async () => {
     const projectId = "PRJ-9986";
     const mock = installDropboxMock();
+    await bootstrapRuleAdmissionGovernance(testEnv, "synthetic-context-secret-for-vitest-only", projectId);
     const record = commitFixture(projectId, 1)[0];
     mock.files.set(machineCommitRecordPath(projectId, 1), `${JSON.stringify(record, null, 2)}\n`);
     const context = await issueMutationContext(record.state, "synthetic-context-secret-for-vitest-only", Date.now());

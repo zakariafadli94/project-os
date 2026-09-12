@@ -1,4 +1,5 @@
 import { isReviewCandidate } from "./domain/artifact-write";
+import { checkCatalogue } from "./rules/check-catalogue";
 import { ARTIFACT_INGRESS_SCAN_BUDGET_PER_INVOCATION, ARTIFACT_INGRESS_WORK_ITEM_BUDGET_PER_INVOCATION } from "./inbox/runtime";
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "./domain/artifact-write";
 import { parseArtifactWriteRequest } from "./domain/artifact-write";
@@ -169,7 +170,8 @@ const worker = {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
       const projectId = mutationContextMatch[1];
       const response = await env.PROJECT_GUARD.getByName(projectId).fetch(
-        "https://project-guard.internal/mutation-context"
+        "https://project-guard.internal/mutation-context",
+        { headers: { authorization: request.headers.get("authorization") ?? "" } }
       );
       if (!response.ok) {
         const error: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
@@ -498,8 +500,8 @@ async function materializeExistingProjects(request: Request, env: Env): Promise<
 
     await mirrorLegacyEvents(persistence.objects, projectId, project.slug);
 
-    const guard = env.MATERIALIZATION_GUARD.getByName(projectId);
-    const response = await guard.fetch("https://materialization-guard.internal/materialize", {
+    const guard = env.PROJECT_GUARD.getByName(projectId);
+    const response = await guard.fetch("https://project-guard.internal/materialize", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ target: "workspace-v2" })
@@ -624,7 +626,7 @@ async function routeStableTransaction(env: Env, transaction: Transaction, contex
   });
   if (!response.ok) {
     const body: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
-    if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
+    if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
       throw new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"]);
     }
     throw new Error(`ProjectGuard returned ${response.status}`);
@@ -658,7 +660,7 @@ export async function routeManagedDocument(env: Env, document: ManagedDocumentRe
 
 async function projectGuardRouteError(response: Response, route: string): Promise<Error> {
   const body: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
-  if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
+  if (body.error && [409, 428, 503].includes(response.status) && (["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "ARTIFACT_DESTINATION_FORBIDDEN", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error) || Object.values(checkCatalogue).some(check => check.result_codes.includes(body.error!)))) {
     return new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"]);
   }
   return new Error(`ProjectGuard ${route} route returned ${response.status}`);
@@ -728,9 +730,9 @@ export async function reconcileMaterializationProject(
   env: Env,
   projectId: string
 ): Promise<"scheduled" | "current"> {
-  const stub = env.MATERIALIZATION_GUARD.getByName(projectId);
-  const response = await stub.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
-  if (!response.ok) throw new Error(`MaterializationGuard returned ${response.status}`);
+  const stub = env.PROJECT_GUARD.getByName(projectId);
+  const response = await stub.fetch("https://project-guard.internal/reconcile-materialization", { method: "POST" });
+  if (!response.ok) throw new Error(`ProjectGuard returned ${response.status}`);
   const status = await response.json<MaterializationStatusResponse>();
   const headCurrent = status.materialized_head !== null
     && status.materialized_head.revision === status.canonical_revision

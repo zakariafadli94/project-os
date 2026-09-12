@@ -72,6 +72,8 @@ export interface ConditionalWritePort {
 
 export interface ServerSideCopyPort {
   copyObject(from: string, to: string): Promise<ProviderObjectMetadata>;
+  /** Exact immutable source revision, create-only destination; never path-based optimistic copy. */
+  copyObjectVersion?(from: string, to: string, expected: { objectId: string; revisionToken: string; contentSha256: string }): Promise<{ source: { objectId: string; revisionToken: string; contentSha256: string }; destination: ProviderObjectMetadata }>;
 }
 
 export interface IncrementalChangeFeedPort {

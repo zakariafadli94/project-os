@@ -1,8 +1,10 @@
 import type { DomainEvent } from "./event";
+import { applyRuleGovernance } from "./rule-governance";
 import { eventIdForRevision } from "./event";
 import { mayRebaseStaleOperation } from "./concurrency-policy";
 import type { ProjectState } from "./project-state";
 import type { Transaction } from "./transaction";
+import { localRuleQualificationForTransition, type LocalRuleActivationCapability } from "../rules/local-rule-qualification";
 
 export type TransitionResult =
   | { kind: "commit"; state: ProjectState; event: DomainEvent }
@@ -42,6 +44,8 @@ export function emptyProjectState(
     revision: 0,
     current_phase_id: null,
     artifact_routes: {},
+    local_rules: {},
+    rule_exceptions: {},
     constraints: {},
     tasks: {},
     plan_phases: {},
@@ -84,7 +88,7 @@ function commit(state: ProjectState, tx: Transaction): TransitionResult {
   return { kind: "commit", state: next, event };
 }
 
-export function applyTransaction(state: ProjectState | null, tx: Transaction): TransitionResult {
+export function applyTransaction(state: ProjectState | null, tx: Transaction, options: { localRuleActivation?: LocalRuleActivationCapability } = {}): TransitionResult {
   if (tx.operation === "project.create") {
     if (state !== null) return rejected("PROJECT_EXISTS", "Project already exists");
     if (tx.base_revision !== 0) return conflict("REVISION_MISMATCH", "Project creation requires base revision 0");
@@ -116,6 +120,23 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
   const next = structuredClone(state);
 
   switch (tx.operation) {
+    case "rule.propose":
+    case "rule.accept":
+    case "rule.activate":
+    case "rule.retire":
+    case "rule.exception.grant":
+    case "rule.exception.revoke": {
+      const result = applyRuleGovernance({ rules: next.local_rules ?? {}, exceptions: next.rule_exceptions ?? {} }, tx, next.project_id);
+      if (result.kind !== "commit") return result;
+      next.local_rules = result.state.rules;
+      next.rule_exceptions = result.state.exceptions;
+      if (options.localRuleActivation !== undefined) {
+        const proof = tx.operation === "rule.activate" ? localRuleQualificationForTransition(options.localRuleActivation, state, tx) : null;
+        if (!proof) return rejected("LOCAL_RULE_QUALIFICATION_MISMATCH", "Server qualification capability does not match the exact transaction and state");
+        next.local_rule_qualifications = { ...next.local_rule_qualifications, [`${proof.activation.payload.rule_id}@${proof.activation.payload.version}`]: proof };
+      }
+      return commit(next, tx);
+    }
     case "project.pause":
       if (next.status !== "active") return rejected("INVALID_PROJECT_TRANSITION", "Only active projects can be paused");
       next.status = "paused";
@@ -319,6 +340,9 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction): T
       );
       if (otherActive) {
         return rejected("PHASE_STATE_INCONSISTENT", `Multiple active phases exist: ${phase.phase_id}, ${otherActive.phase_id}`);
+      }
+      if (Object.values(next.tasks).some((task) => task.phase_id === phase.phase_id && task.status !== "completed")) {
+        return rejected("PHASE_HAS_UNFINISHED_TASKS", `Phase ${phase.phase_id} has unfinished attached tasks`);
       }
       phase.status = "completed";
       phase.updated_at = tx.created_at;

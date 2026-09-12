@@ -253,9 +253,9 @@ describe("DropboxChangeGuard", () => {
     });
   });
 
-  it("scheduled maintenance does not reconcile managed-document provider roots", async () => {
+  it("scheduled maintenance performs one bounded due managed-document verification", async () => {
     const mock = installDropboxMock();
-    await createProject("TXN-CHANGE-GUARD-0004", "change-guard-four");
+    const projectId = await createProject("TXN-CHANGE-GUARD-0004", "change-guard-four");
     const projectListPaths: string[] = [];
     interceptProjectList(mock, async (path) => {
       projectListPaths.push(path);
@@ -270,6 +270,8 @@ describe("DropboxChangeGuard", () => {
     } as ScheduledController, testEnv, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(projectListPaths).toEqual([]);
+    expect(projectListPaths).toEqual([
+      `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-change-guard-four`
+    ]);
   });
 });

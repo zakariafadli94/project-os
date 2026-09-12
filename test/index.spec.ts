@@ -274,7 +274,7 @@ describe("Worker routing", () => {
       project_id: project.project_id,
       canonical_revision: 1,
       materialized_head: null,
-      requested: { revision: 1, projection_version: 3 },
+      requested: { revision: 1, projection_version: 4 },
       diagnostic: {
         read_only: true,
         final_verification_pending_count: 0,

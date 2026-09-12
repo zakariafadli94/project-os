@@ -6,7 +6,8 @@ import type { Receipt } from "../src/domain/receipt";
 import {
   initializeManagedDocumentChangeJobSchema,
   ManagedDocumentChangeJobStore,
-  type ManagedDocumentChangeJobInput
+  type ManagedDocumentChangeJobInput,
+  type ManagedDocumentDriftFinding
 } from "../src/documents/change-job-store";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
@@ -227,5 +228,64 @@ describe("durable managed-document change jobs", () => {
         "CHGJOB-DDDDDDDDDDDDDDDDDDDDDDDD"
       ]);
     });
+  });
+
+  it("persists an external drift conflict without replacing its first observation", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-0004", "change-job-drift-finding");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    let findings: ManagedDocumentDriftFinding[] = [];
+
+    await runInDurableObject(guard, async (_instance, state) => {
+      initializeManagedDocumentChangeJobSchema(state.storage);
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      const finding = {
+        finding_id: "DRIFT-AAAAAAAAAAAAAAAAAAAAAAAA",
+        job_id: "CHGJOB-AAAAAAAAAAAAAAAAAAAAAAAA",
+        path: `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-change-job-drift-finding/WORKING/PACKAGES/PKG-${"A".repeat(64)}/1/a.md`,
+        change_kind: "deleted" as const,
+        status: "unexpected_conflict" as const,
+        code: "PACKAGE_UNEXPECTED_DISAPPEARANCE",
+        request_id: "DOCREQ-DRIFT-0001",
+        resource: { resource_id: `PKG-${"A".repeat(64)}`, resource_type: "package", zone: "WORKING", version: `1:${"b".repeat(64)}` },
+        observed_at: "2026-09-12T00:00:00.000Z"
+      };
+      store.recordDriftFinding(finding);
+      store.recordDriftFinding({ ...finding, observed_at: "2026-09-12T01:00:00.000Z", code: "PACKAGE_EXPECTED_EFFECT_DIVERGED" });
+      findings = store.driftFindings();
+    });
+
+    expect(findings).toEqual([expect.objectContaining({
+      finding_id: "DRIFT-AAAAAAAAAAAAAAAAAAAAAAAA",
+      status: "unexpected_conflict",
+      code: "PACKAGE_EXPECTED_EFFECT_DIVERGED",
+      opened_at: "2026-09-12T00:00:00.000Z",
+      observed_at: "2026-09-12T01:00:00.000Z"
+    })]);
+  });
+
+  it("persists daily verification lateness until a later successful verification", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-0005", "change-job-lateness");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    let first: unknown;
+    let early: unknown;
+    let late: unknown;
+    let cleared: unknown;
+    await runInDurableObject(guard, async (_instance, state) => {
+      initializeManagedDocumentChangeJobSchema(state.storage);
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      first = store.scheduledVerification("2026-09-12T00:00:00.000Z");
+      store.completeScheduledVerification("2026-09-12T00:00:00.000Z");
+      early = store.scheduledVerification("2026-09-12T23:59:59.000Z");
+      late = store.scheduledVerification("2026-09-13T00:00:01.000Z");
+      store.completeScheduledVerification("2026-09-13T00:00:01.000Z");
+      cleared = store.scheduledVerification("2026-09-13T00:00:02.000Z");
+    });
+
+    expect(first).toMatchObject({ due: true, late_since: null });
+    expect(early).toMatchObject({ due: false, late_since: null });
+    expect(late).toMatchObject({ due: true, late_since: "2026-09-13T00:00:00.000Z" });
+    expect(cleared).toMatchObject({ due: false, late_since: null, last_verified_at: "2026-09-13T00:00:01.000Z" });
   });
 });

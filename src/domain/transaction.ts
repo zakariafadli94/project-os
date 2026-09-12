@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { governanceOperationSchemas, governanceOperationValues } from "./rule-governance";
 
 const projectId = z.string().regex(/^PRJ-[0-9]{4,}$/);
 const transactionId = z.string().regex(/^TXN-[A-Z0-9-]{10,}$/);
@@ -11,13 +12,14 @@ const safeRelativePrefix = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/).ref
   { message: "unsafe relative prefix" }
 );
 const governedTargetPrefix = safeRelativePrefix.refine(
-  (value) => ["DELIVERABLES", "ARCHIVES", "RESEARCH", "REFERENCES", "SPECS", "MEETINGS", "ARTIFACTS"].includes(value.split("/")[0] ?? ""),
+  (value) => ["WORKING", "DELIVERABLES", "ARCHIVES", "RESEARCH", "REFERENCES", "SPECS", "MEETINGS", "ARTIFACTS"].includes(value.split("/")[0] ?? ""),
   { message: "target_prefix must use an allowed human workspace root" }
 );
 
 export const AUTO_PROJECT_ID = "PRJ-AUTO" as const;
 
 export const operationValues = [
+  ...governanceOperationValues,
   "project.create",
   "project.pause",
   "project.resume",
@@ -202,6 +204,7 @@ const deliverableAdd = z.strictObject({
 const deliverableComplete = z.strictObject({ ...common, operation: z.literal("deliverable.complete"), payload: z.strictObject({ deliverable_id: stableId("DEL"), outcome: nonEmpty.optional() }) });
 
 export const transactionSchema = z.discriminatedUnion("operation", [
+  ...governanceOperationSchemas(common),
   projectCreate,
   projectPause,
   projectResume,

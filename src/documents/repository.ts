@@ -47,9 +47,20 @@ import { upcastDropboxV1Observation, type ProviderObservation } from "../schema/
 import { schemaWriterStageFor } from "../schema/runtime-policy";
 import { writesProviderV2, type SchemaWriterStage } from "../schema/writer-stage";
 import { sha256Text } from "./hash";
+import { packageIdFor, packageManifestPath, packageRefSchema, parsePackageManifest, packageNavigationPath, packageNavigationLedgerSchema, type PackageNavigation, type FrozenPackageManifest, type PackageRef } from "../domain/document-package";
+import { renderPackageIndex } from "../render/package-navigation";
+import { canonicalJson } from "../rules/contract";
+import { ExecutionJournal, executionHash } from "../execution/journal";
+import type { ProjectState } from "../domain/project-state";
+import { workspaceProjectRoot } from "../persistence/layout";
 
 const DROPBOX_PROVIDER_ID = "dropbox";
 const DROPBOX_CONTENT_HASH_ALGORITHM = "dropbox-content-hash";
+
+async function sha256Bytes(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 export interface ReferenceFingerprintRecord {
   schema_version: "1.0";
@@ -76,6 +87,119 @@ export class DocumentLedgerRepository {
   ) {
     this.runtime = asProjectOsPersistence(input);
     this.schemaWriterStage = schemaWriterStageFor(this.runtime, schemaWriterStage);
+  }
+
+  async freezePackage(value: unknown): Promise<PackageRef> {
+    const manifest = parsePackageManifest(value);
+    const package_id = await packageIdFor(manifest.project_id, manifest.creation_request_id);
+    if (manifest.version === 1 ? !!manifest.predecessor : !manifest.predecessor || manifest.predecessor.version !== manifest.version - 1 || manifest.predecessor.package_id !== package_id || manifest.predecessor.project_id !== manifest.project_id) throw new Error("package_predecessor_conflict");
+    if (manifest.predecessor) await this.readPackage(manifest.predecessor);
+    for (const member of manifest.members) {
+      const version = await this.readVersion(manifest.project_id, member.document_id, member.document_version_id);
+      if (!version || version.immutable_payload_path !== member.immutable_payload_path || (version.content_sha256 && version.content_sha256 !== member.content_sha256) || (version.size !== undefined && version.size !== member.size)) throw new Error("package_member_version_conflict");
+      const bytes = await this.runtime.objects.readBytes?.(member.immutable_payload_path, member.size + 1);
+      const text = bytes ? null : await this.runtime.objects.readText(member.immutable_payload_path);
+      const payload = bytes ?? (text === null ? null : new TextEncoder().encode(text));
+      if (!payload || payload.length !== member.size || await sha256Bytes(payload) !== member.content_sha256) throw new Error("package_member_payload_conflict");
+    }
+    const content = canonicalJson(manifest);
+    const ref: PackageRef = { project_id: manifest.project_id, package_id, version: manifest.version, manifest_sha256: await sha256Text(content) };
+    const path = packageManifestPath(ref);
+    try { await this.runtime.objects.createText(path, content); }
+    catch (error) { if (!(error instanceof ProviderConflictError)) throw error; if (await this.runtime.objects.readText(path) !== content) throw new Error("package_version_conflict"); }
+    return ref;
+  }
+
+  async readPackage(value: PackageRef): Promise<FrozenPackageManifest> {
+    const ref = packageRefSchema.parse(value);
+    const raw = await this.runtime.objects.readText(packageManifestPath(ref));
+    if (raw === null || await sha256Text(raw) !== ref.manifest_sha256) throw new Error("package_manifest_binding");
+    const manifest = parsePackageManifest(JSON.parse(raw));
+    if (manifest.project_id !== ref.project_id || manifest.version !== ref.version || await packageIdFor(manifest.project_id, manifest.creation_request_id) !== ref.package_id || canonicalJson(manifest) !== raw) throw new Error("package_manifest_binding");
+    return manifest;
+  }
+
+  async readPackageNavigation(projectId: string): Promise<PackageNavigation> {
+    return this.readNavigation(projectId, true);
+  }
+
+  /** Drift/audit expectations ONLY. Proves canonical ledger/finalization,
+   * deliberately does not attest current visible targets. Never render from it. */
+  async readCanonicalPackageNavigationForAudit(projectId: string): Promise<PackageNavigation> {
+    return this.readNavigation(projectId, false);
+  }
+
+  private async readNavigation(projectId: string, verifyVisibility: boolean): Promise<PackageNavigation> {
+    const path = packageNavigationPath(projectId);
+    const raw = await this.runtime.objects.readText(path);
+    if (raw === null) return {};
+    const ledger = packageNavigationLedgerSchema.parse(JSON.parse(raw));
+    if (ledger.project_id !== projectId) throw new Error("package_navigation_binding");
+    const { admitted } = await this.readPackageExecutionEvidence(projectId, "document", ledger.source_request_id);
+    const stateWrite = admitted.plan!.steps.find(s => s.action.kind === "write_if_unchanged" && s.action.destination.logical_path === "STATE.md");
+    if (stateWrite?.action.kind !== "write_if_unchanged") throw new Error("package_navigation_visible_unavailable");
+    const base = stateWrite.action.destination.path.slice(0, -"/STATE.md".length);
+    const verifyVisible = async (path: string, hash: string) => {
+      const before = await this.runtime.objects.getMetadata(path);
+      if (!before?.objectId || !before.revisionToken) throw new Error("package_navigation_visible_missing");
+      const bytes = await this.runtime.objects.readBytes?.(path, Math.max(1, before.size));
+      const content = bytes ? null : await this.runtime.objects.readText(path);
+      const data = bytes ?? (content === null ? null : new TextEncoder().encode(content));
+      const after = await this.runtime.objects.getMetadata(path);
+      if (!data || data.length !== before.size || after?.objectId !== before.objectId || after.revisionToken !== before.revisionToken || await sha256Bytes(data) !== hash) throw new Error("package_navigation_visible_changed");
+    };
+    const headHash = await sha256Text(raw);
+    if (!admitted.plan!.steps.some((step) => step.action.kind === "write_if_unchanged" && step.action.destination.path === path && step.action.desired.content_sha256 === headHash)) throw new Error("package_navigation_unproven");
+    if (verifyVisibility && !ledger.visible_members) throw new Error("package_navigation_visible_evidence_unavailable");
+    const navigation: PackageNavigation = {};
+    for (const zone of ["WORKING", "REVIEW", "DELIVERABLES"] as const) {
+      const head = ledger.heads[zone];
+      if (!head) continue;
+      if (head.project_id !== projectId || head.zone !== zone || new Set(head.packages.map((p) => p.ref.package_id)).size !== head.packages.length || head.packages.some((p) => p.ref.project_id !== projectId || p.root !== `${zone}/PACKAGES/${p.ref.package_id}/${p.ref.version}`)) throw new Error("package_navigation_binding");
+      if (verifyVisibility) await verifyVisible(`${base}/${zone}/CURRENT.md`, await sha256Text(renderPackageIndex(head)));
+      for (const entry of head.packages) {
+        const manifest = await this.readPackage(entry.ref);
+        if (!verifyVisibility) continue;
+        const index = `# ${entry.ref.package_id} v${entry.ref.version}\n\n${manifest.members.map((m) => `- [[${entry.root}/${m.relative_path}]]`).join("\n")}\n`;
+        await verifyVisible(`${base}/${entry.root}/INDEX.md`, await sha256Text(index));
+        for (const member of manifest.members) {
+          const path = `${base}/${entry.root}/${member.relative_path}`;
+          const expected = ledger.visible_members!.filter(m => m.path === path);
+          const observed = await this.runtime.objects.getMetadata(path);
+          if (expected.length !== 1 || expected[0].provider_id !== this.runtime.providerId || expected[0].content_sha256 !== member.content_sha256 || !observed || observed.objectId !== expected[0].object_id || observed.revisionToken !== expected[0].revision_token || observed.size !== member.size) throw new Error("package_navigation_visible_changed");
+        }
+      }
+      navigation[zone] = head;
+    }
+    return navigation;
+  }
+
+  async readPackageExecutionEvidence(projectId: string, kind: string, requestId: string) {
+    const journal = new ExecutionJournal(this.runtime, projectId, kind, requestId);
+    const admitted = await journal.readAdmission(), progress = await journal.status();
+    if (!admitted?.plan || progress?.status !== "finalized" || !progress.terminal || !progress.finalization_ref) throw new Error("package_navigation_unfinalized");
+    const plan = admitted.plan;
+    if (progress.completed_steps.length !== plan.steps.length || plan.steps.some((s) => !progress.completed_steps.some((c) => c.step_id === s.step_id && c.evidence_refs.length)) || progress.postchecks.length !== plan.postchecks.length || plan.postchecks.some((id) => !progress.postchecks.some((c) => c.check_id === id && c.verdict === "allow" && c.evidence_refs.length))) throw new Error("package_execution_unproven");
+    const proof = { schema_version: "1.0", project_id: projectId, kind, request_id: progress.request_id, request_hash: progress.request_hash, effect_plan_hash: progress.effect_plan_hash, target_revision: plan.target_revision, completed_steps: progress.completed_steps, postchecks: progress.postchecks };
+    if (progress.finalization_ref !== `${await journal.root()}/finalizations/${await executionHash(proof)}.json` || await this.runtime.objects.readText(progress.finalization_ref) !== canonicalJson(proof)) throw new Error("package_execution_unproven");
+    return { admitted, progress };
+  }
+
+  /** Package members are immutable DOC/VER projections governed by package
+   * heads, not a second mutable working-document identity. Recognition includes
+   * historical versions so the legacy restorer cannot recreate an obsolete one. */
+  async ownsPackageProjection(state: ProjectState, path: string): Promise<boolean> {
+    const base = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
+    if (!path.startsWith(base)) return false;
+    const relative = path.slice(base.length);
+    const current = /^(WORKING|REVIEW|DELIVERABLES)\/CURRENT\.md$/.exec(relative);
+    if (current) return Boolean((await this.readPackageNavigation(state.project_id))[current[1] as "WORKING" | "REVIEW" | "DELIVERABLES"]);
+    const member = /^(?:WORKING|REVIEW|DELIVERABLES)\/PACKAGES\/(PKG-[A-F0-9]{64})\/([1-9][0-9]*)\/(.+)$/.exec(relative);
+    if (!member) return false;
+    const raw = await this.runtime.objects.readText(packageManifestPath({ project_id: state.project_id, package_id: member[1], version: Number(member[2]) }));
+    if (raw === null) return false;
+    const manifest = await this.readPackage({ project_id: state.project_id, package_id: member[1], version: Number(member[2]), manifest_sha256: await sha256Text(raw) });
+    return member[3] === "INDEX.md" || manifest.members.some((m) => m.relative_path === member[3]);
   }
 
   async readHead(projectId: string, documentId: string): Promise<CurrentManagedDocumentHead | null> {

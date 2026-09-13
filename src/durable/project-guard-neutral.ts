@@ -33,7 +33,7 @@ import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError } from "../mutation-gate/repository";
-import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, type LayoutMode } from "../persistence/layout";
+import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
@@ -229,7 +229,9 @@ export class ProjectGuard extends DurableObject<Env> {
         const kind = url.searchParams.get("kind");
         const requestId = url.searchParams.get("request_id");
         if (!projectId || !kind || !requestId) return Response.json({ error: "execution_identity_required" }, { status: 400 });
-        const status = await new ExecutionJournal(this.persistence, projectId, kind, requestId).status();
+        const journal = new ExecutionJournal(this.persistence, projectId, kind, requestId);
+        await this.finalizeMaterializedTransaction(journal);
+        const status = await journal.status();
         return status ? Response.json(status) : Response.json({ error: "execution_not_found" }, { status: 404 });
       }).catch((error) => this.admissionErrorResponse(error));
     }
@@ -1334,6 +1336,63 @@ export class ProjectGuard extends DurableObject<Env> {
       ? `${machineCommitRecordPath(tx.project_id, receipt.new_revision)}#receipt`
       : machineReceiptPath(tx.transaction_id);
     await new ExecutionJournal(this.persistence, tx.project_id, "transaction", tx.transaction_id).recordReceipt(receipt.status, ref);
+  }
+
+  /** Transaction commits have no independent provider effect plan. They become
+   * finalized only when the same immutable commit is the current, completed
+   * materialization generation. Absence or any binding mismatch leaves the
+   * execution in finalizing state for a later read/replay. */
+  private async finalizeMaterializedTransaction(journal: ExecutionJournal): Promise<void> {
+    const admitted = await journal.readAdmission();
+    const progress = await journal.status();
+    if (
+      !admitted
+      || admitted.admission.kind !== "transaction"
+      || admitted.plan !== null
+      || !progress
+      || progress.terminal
+      || progress.status !== "finalizing"
+    ) return;
+    const targetRevision = admitted.admission.project_revision + 1;
+    const commitRef = machineCommitRecordPath(admitted.admission.project_id, targetRevision);
+    const receiptRef = `${commitRef}#receipt`;
+    if (progress.receipt_ref !== receiptRef) return;
+    const record = await this.repository.readCommitRecord(admitted.admission.project_id, targetRevision);
+    if (
+      !record
+      || record.transaction.transaction_id !== admitted.admission.request_id
+      || record.receipt.transaction_id !== admitted.admission.request_id
+      || record.receipt.status !== "committed"
+      || record.receipt.new_revision !== targetRevision
+      || await sha256Canonical(record.transaction) !== admitted.admission.request_hash
+    ) return;
+    const head = await this.repository.readMaterializationHead(admitted.admission.project_id);
+    if (
+      !head
+      || head.target_revision !== targetRevision
+      || head.projection_version !== CURRENT_PROJECTION_VERSION
+    ) return;
+    const materialization = await this.repository.readMaterializationRecord(
+      admitted.admission.project_id,
+      head.target_revision,
+      head.projection_version
+    );
+    if (
+      !materialization
+      || materialization.source_event_id !== record.event.event_id
+      || materialization.result_root_hash !== head.result_root_hash
+      || materialization.workspace_location !== head.workspace_location
+      || materialization.completed_at !== head.completed_at
+    ) return;
+    await journal.finalizeMaterializedTransaction({
+      canonical_commit_ref: commitRef,
+      receipt_ref: receiptRef,
+      materialization_head_ref: machineMaterializationHeadPath(admitted.admission.project_id),
+      materialization_record_ref: head.record_path,
+      target_revision: targetRevision,
+      source_event_id: record.event.event_id,
+      result_root_hash: materialization.result_root_hash
+    });
   }
 
   private async syncRegistryStatus(state: ProjectState): Promise<void> {

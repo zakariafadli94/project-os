@@ -139,7 +139,7 @@ export class RegistryGuard extends DurableObject<Env> {
     this.repository = new ProjectRepository(persistence, parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
     this.fleetPersistence = persistence;
     this.governanceRepository = new RuleGovernanceRepository(persistence);
-    this.ruleQualificationResolver = createProductionRuleQualificationResolver(persistence, env);
+    this.ruleQualificationResolver = createProductionRuleQualificationResolver(persistence, env, { projectGuardStateReads: true });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -245,7 +245,7 @@ export class RegistryGuard extends DurableObject<Env> {
     if (result.kind === "commit" && tx.operation === "rule.activate") {
       const rule = state.rules[ruleVersionKey(tx.payload.rule_id, tx.payload.version)];
       const qualification = await resolveAndQualifyRuleActivation(this.ruleQualificationResolver, {
-        rule, known_active_rules: Object.values(state.rules), requested_evidence_refs: tx.payload.activation_evidence, now: new Date().toISOString()
+        rule, known_active_rules: Object.values(state.rules), ...(canonicalToken ? { known_global_governance: { state, token: canonicalToken } } : {}), requested_evidence_refs: tx.payload.activation_evidence, now: new Date().toISOString()
       });
       if (qualification.verdict !== "allow") return Response.json({ error: qualification.code, qualification }, { status: qualification.verdict === "unavailable" ? 503 : 409 });
       if (!qualification.qualification_proof) return Response.json({ error: "QUALIFICATION_EVIDENCE_UNAVAILABLE" }, { status: 503 });

@@ -3,6 +3,7 @@ import { ruleScopeSchema, type RuleVersion } from "../domain/rule-governance";
 import { checkCatalogue, validateCheck } from "./check-catalogue";
 import { liveAt, sameScope, verdict, type RuleResult } from "./contract";
 import { conflictVerdict, findRuleConflict } from "./resolution";
+import type { CanonicalGovernance } from "../persistence/rule-governance-repository";
 
 export const qualificationEntries = ["API", "CT", "FB", "IN", "CF", "AD", "RP", "GI"] as const;
 const text = z.string().trim().min(1);
@@ -26,6 +27,7 @@ export const qualificationAuditSchema = z.strictObject({
   catalogue_version: text, catalogue_sha256: z.string().regex(/^[a-f0-9]{64}$/),
   objects: z.array(z.strictObject({ path: text, object_id: text, revision_token: text, size: z.number().int().nonnegative(), content_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional() })).min(1),
   directories: z.array(z.strictObject({ path: text, listing_sha256: z.string().regex(/^[a-f0-9]{64}$/) })),
+  project_states: z.array(z.strictObject({ project_id: text, revision: z.number().int().nonnegative(), state_hash: z.string().regex(/^[a-f0-9]{64}$/), observed_at: z.string().datetime({ offset: true }), authority: z.literal("ProjectGuard") })).optional(),
   probes: z.array(z.strictObject({ project_id: text, relative_path: text, artifact_operation: z.literal("REVIEW_CANDIDATE").optional(), code: text, verdict: z.enum(["allow", "deny"]), evidence_ref: text })).min(2),
   active_rules_sha256: z.string().regex(/^[a-f0-9]{64}$/)
 });
@@ -35,6 +37,8 @@ export type QualificationAudit = z.infer<typeof qualificationAuditSchema>;
 export interface QualificationRequest {
   rule: RuleVersion; requested_evidence_refs: string[]; now: string;
   known_active_rules?: RuleVersion[];
+  /** Server-only: the exact canonical snapshot already verified by RegistryGuard for this transaction. */
+  known_global_governance?: { state: CanonicalGovernance; token: string };
 }
 /** A trusted server resolver must verify canonical provenance of every referenced item, including each check_evidence key's evidence and verification record, and return the complete live conflicting scope, including other projects for global activation. A verified slot attests that the referenced observation/control evidence satisfies that named catalogue requirement for this exact rule qualification; client declarations are never accepted here. */
 export interface RuleQualificationEvidenceResolver {

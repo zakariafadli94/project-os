@@ -284,6 +284,36 @@ describe("Worker routing", () => {
     });
   });
 
+  it("forwards authenticated execution status reads without accepting malformed execution identities", async () => {
+    const path = "/v1/projects/PRJ-8341/execution-status?kind=transaction&request_id=TXN-EXECUTION-STATUS-0001";
+    const unauthorized = await worker.fetch(new Request(`https://example.com${path}`), testEnv, createExecutionContext());
+    expect(unauthorized.status).toBe(401);
+
+    const invalidProject = await worker.fetch(new Request("https://example.com/v1/projects/not-a-project/execution-status?kind=transaction&request_id=TXN-EXECUTION-STATUS-0001", {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    }), testEnv, createExecutionContext());
+    expect(invalidProject.status).toBe(400);
+    await expect(invalidProject.json()).resolves.toEqual({ error: "invalid_project_id" });
+
+    const invalidKind = await worker.fetch(new Request("https://example.com/v1/projects/PRJ-8341/execution-status?kind=Transaction&request_id=TXN-EXECUTION-STATUS-0001", {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    }), testEnv, createExecutionContext());
+    expect(invalidKind.status).toBe(400);
+    await expect(invalidKind.json()).resolves.toEqual({ error: "invalid_execution_kind" });
+
+    const invalidRequest = await worker.fetch(new Request("https://example.com/v1/projects/PRJ-8341/execution-status?kind=transaction&request_id=not%2Fsafe", {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    }), testEnv, createExecutionContext());
+    expect(invalidRequest.status).toBe(400);
+    await expect(invalidRequest.json()).resolves.toEqual({ error: "invalid_execution_request_id" });
+
+    const missing = await worker.fetch(new Request(`https://example.com${path}`, {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    }), testEnv, createExecutionContext());
+    expect(missing.status).toBe(404);
+    await expect(missing.json()).resolves.toEqual({ error: "execution_not_found" });
+  });
+
   it("rejects staged artifacts before Durable Object routing while binary ingress is disabled", async () => {
     const ctx = createExecutionContext();
     const artifact = {

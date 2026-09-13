@@ -322,7 +322,7 @@ export class ProjectGuard extends DurableObject<Env> {
 
       let reconciledState: ProjectState | null = null;
       if (this.layoutMode === "v2") {
-        reconciledState = await this.reconcileCanonicalCommits();
+        reconciledState = await this.reconcileCanonicalCommits(mutationContext?.state_hash);
         const reconciled = this.findReceipt(tx.transaction_id);
         if (reconciled) {
           await this.verifyCommittedReplayPayload(tx, reconciled);
@@ -1133,16 +1133,16 @@ export class ProjectGuard extends DurableObject<Env> {
     return recovered;
   }
 
-  private async reconcileCanonicalCommits(): Promise<ProjectState | null> {
+  private async reconcileCanonicalCommits(expectedContextStateHash?: string): Promise<ProjectState | null> {
     const projectId = this.ctx.id.name;
     if (!projectId) return this.loadState();
 
     let recoveredCanonicalState = false;
     let state = this.loadState();
-    if (state && state.revision > 0) {
-      // A local SQL row is only a cache.  A context is issued from immutable
-      // commits, so a cache that claims the same revision must still agree
-      // with that commit before it can be used for admission or intent work.
+    if (state && state.revision > 0 && expectedContextStateHash && await sha256Canonical(state) !== expectedContextStateHash) {
+      // A local SQL row is only a cache. A signed context is issued from
+      // immutable canonical state, so a same-revision hash mismatch requires
+      // rebuilding the cache before the context is verified for admission.
       const currentRecord = await this.repository.readCommitRecord(projectId, state.revision);
       if (currentRecord) {
         if (currentRecord.previous_revision !== state.revision - 1) {

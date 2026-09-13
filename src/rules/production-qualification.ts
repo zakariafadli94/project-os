@@ -6,7 +6,8 @@ import { ruleVersionSchema, ruleVersionKey, type RuleVersion } from "../domain/r
 import { deploymentIdentity } from "../deployment/identity";
 import { sha256Text } from "../documents/hash";
 import { normalizeArtifactAdmission, type ArtifactAdmissionIntent } from "../admission/operation-context";
-import { AdmissionError } from "../admission/mutation-context";
+import { AdmissionError, parseMutationContextOrNull, verifyMutationContext } from "../admission/mutation-context";
+import { readProjectState } from "../schema/project-state";
 import { admissionModeForProject } from "../convergence/rollout";
 import { archiveProjectRoot, machineCommitRecordPath, machineRegistryJsonPath, workspaceProjectRoot } from "../persistence/layout";
 import { globalGovernancePath, RuleGovernanceRepository } from "../persistence/rule-governance-repository";
@@ -40,7 +41,7 @@ const registrySchema = z.object({ schema_version: z.literal("1.0"), projects: z.
  * exercise the deployed normalizer/evaluator. No caller-selected proof or new evidence store. */
 const productionResolvers = new WeakSet<RuleQualificationEvidenceResolver>();
 export function isProductionQualificationResolver(resolver: RuleQualificationEvidenceResolver): boolean { return productionResolvers.has(resolver); }
-export function createProductionRuleQualificationResolver(runtime: ProjectOsPersistenceRuntime, env: Env): RuleQualificationEvidenceResolver {
+export function createProductionRuleQualificationResolver(runtime: ProjectOsPersistenceRuntime, env: Env, options: { projectGuardStateReads?: boolean } = {}): RuleQualificationEvidenceResolver {
   const resolver: RuleQualificationEvidenceResolver = { async resolve(request) {
     const { rule, now } = request;
     const fail = (code: string, observed: string): never => { throw new QualificationResolutionFailure(verdict("unavailable", code, rule, "Complete verified production qualification", observed, "Keep accepted_unenforced; restore or supply the exact canonical prerequisite")); };
@@ -83,7 +84,9 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
       hashes.set(path, await sha256Text(raw!));
       return raw!;
     };
-    const governance = await io("governance_read", globalGovernancePath, () => new RuleGovernanceRepository(runtime).read());
+    const governance = options.projectGuardStateReads && request.known_global_governance
+      ? request.known_global_governance
+      : await io("governance_read", globalGovernancePath, () => new RuleGovernanceRepository(runtime).read());
     if (!governance) fail("QUALIFICATION_REFERENCE_UNVERIFIED", "Canonical governance unavailable");
     if (!request.requested_evidence_refs.length) fail("QUALIFICATION_REFERENCE_UNVERIFIED", "No acceptance reference");
     if (rule.scope.kind === "global") {
@@ -100,9 +103,27 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     catch (error) { if (error instanceof QualificationResolutionFailure) throw error; return fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Registry is malformed"); }
     if (!registry.projects.length || new Set(registry.projects.map(p => p.project_id)).size !== registry.projects.length) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Registry is empty or ambiguous");
     const states: ProjectState[] = [];
+    const projectStates: NonNullable<QualificationAudit["project_states"]> = [];
+    const stateReferences = new Map<string, string>();
     // Archived projects are terminal: they cannot receive new admissions.
     for (const project of registry.projects.filter(project => project.status !== "archived")) {
       try {
+        if (options.projectGuardStateReads) {
+          // One fresh serialized observation per project. Later project mutations belong to
+          // the activation window; RegistryGuard/source/listing freshness is rechecked below.
+          const started = Date.now();
+          const response = await io("project_state", `project-guard:${project.project_id}`, () => env.PROJECT_GUARD.getByName(project.project_id).fetch("https://project-guard.internal/mutation-context"));
+          if (!response.ok || !env.MUTATION_CONTEXT_SIGNING_KEY) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Fresh ProjectGuard canonical state unavailable");
+          const body = z.strictObject({ context: z.unknown(), canonical_state: z.unknown() }).parse(await response.json());
+          const state = readProjectState(body.canonical_state).state;
+          const context = parseMutationContextOrNull(body.context);
+          if (!context || Date.parse(context.observed_at) < started || state.project_id !== project.project_id || state.slug !== project.slug || state.status !== project.status) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "ProjectGuard canonical identity/freshness mismatch");
+          await verifyMutationContext(context, state, state.revision, env.MUTATION_CONTEXT_SIGNING_KEY!, Date.now());
+          projectStates.push({ project_id: state.project_id, revision: state.revision, state_hash: context!.state_hash, observed_at: context!.observed_at, authority: "ProjectGuard" });
+          stateReferences.set(state.project_id, `project-guard:${state.project_id}:revision=${state.revision}:sha256=${context!.state_hash}`);
+          states.push(state);
+          continue;
+        }
         const root = machineCommitRecordPath(project.project_id, 1).slice(0, -"REV-000001.json".length - 1);
         const entries = await list(root);
         const revisions = entries.map(entry => entry.kind === "file" && entry.path?.startsWith(`${root}/`) ? Number(entry.name.match(/^REV-([0-9]{6,})\.json$/)?.[1]) : NaN).sort((a, b) => a - b);
@@ -163,9 +184,9 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
         else {
           if (++count > 256) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Synchronous inventory limit reached; no partial qualification");
           if (!(rule.parameters.allowed_zones as string[]).includes(zone)) fail("QUALIFICATION_HISTORICAL_DRIFT", "Existing scoped files violate the proposed destination rule");
-          const fileMetadata = await metadata(child!);
-          if (!identity(fileMetadata)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Historical file identity unavailable");
-          observed.set(child!, fileMetadata!);
+          // allowed_destination checks membership/path, not file content or version.
+          // These recursive listings are signed and revalidated below; canonical proof objects
+          // remain separately identity-bound. Avoid two redundant metadata calls per member.
         }
       }
     };
@@ -189,7 +210,7 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
           // in the isolated global slot, so a not-yet-issued local attestation cannot authorize itself.
           const result = await evaluateRules({ actor: { actor_id: "qualification", authority: "server" }, project_id: state.project_id, operation: normalized.operation, expected_project_revision: state.revision, stage: "pre_admission", now, state: { ...state, local_rules: {} }, global_governance: { revision: governance!.state.revision, rules: { [ruleVersionKey(rule.rule_id, rule.version)]: { ...rule, scope: { kind: "global" }, status: "active" } }, exceptions: {} }, resources: normalized.resources, observations: [], approvals: [] });
           const exact = result.results.find(result => result.rule?.rule_id === rule.rule_id && result.rule.version === rule.version);
-          const ref = `${machineCommitRecordPath(state.project_id, state.revision)}#probe=${await sha256Text(canonicalJson({ intent, rule, result, coverage: deployedQualificationCoverage.version }))}`;
+          const ref = `${stateReferences.get(state.project_id) ?? machineCommitRecordPath(state.project_id, state.revision)}#probe=${await sha256Text(canonicalJson({ intent, rule, result, coverage: deployedQualificationCoverage.version }))}`;
           if (exact?.code === "DESTINATION_ALLOWED") positive.push(ref);
           if (exact?.code === "DESTINATION_FORBIDDEN") negative.push(ref);
           if (exact && (exact.verdict === "allow" || exact.verdict === "deny")) probes.push({ project_id: state.project_id, relative_path, ...(intent.operation ? { artifact_operation: intent.operation } : {}), code: exact.code, verdict: exact.verdict, evidence_ref: ref });
@@ -199,7 +220,7 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
           // boundary's exact refusal counts; unavailable/network/arbitrary errors never do.
           if (intent === reviewNegative && error instanceof AdmissionError && error.code === "ARTIFACT_DESTINATION_FORBIDDEN") {
             const result = { verdict: "deny" as const, code: error.code };
-            const ref = `${machineCommitRecordPath(state.project_id, state.revision)}#probe=${await sha256Text(canonicalJson({ intent, rule, result, coverage: deployedQualificationCoverage.version }))}`;
+            const ref = `${stateReferences.get(state.project_id) ?? machineCommitRecordPath(state.project_id, state.revision)}#probe=${await sha256Text(canonicalJson({ intent, rule, result, coverage: deployedQualificationCoverage.version }))}`;
             negative.push(ref);
             probes.push({ project_id: state.project_id, relative_path, artifact_operation: "REVIEW_CANDIDATE", ...result, evidence_ref: ref });
           } else if (intent === reviewNegative) {
@@ -213,7 +234,7 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     for (const path of listings.keys()) await list(path);
     const current = await io("governance_revalidation", globalGovernancePath, () => new RuleGovernanceRepository(runtime).read());
     if (current?.token !== governance!.token) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Global governance changed during qualification");
-    const snapshot = await sha256Text(canonicalJson({ observed: [...observed], listings: [...listings], active_rules }));
+    const snapshot = await sha256Text(canonicalJson({ observed: [...observed], listings: [...listings], active_rules, ...(projectStates.length ? { project_states: projectStates } : {}) }));
     const build = `deployment:${deployment.worker_version_id}:${deployment.git_sha}:${deployedQualificationCoverage.version}`;
     const evidence: QualificationEvidence = {
       rule_id: rule.rule_id, rule_version: rule.version, rule_scope: rule.scope, evidence_refs: request.requested_evidence_refs,
@@ -231,6 +252,7 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
       catalogue_version: deployedQualificationCoverage.version, catalogue_sha256: await sha256Text(canonicalJson(deployedQualificationCoverage)),
       objects: [...observed].map(([path, metadata]) => ({ path, object_id: metadata.objectId!, revision_token: metadata.revisionToken!, size: metadata.size, ...(hashes.has(path) ? { content_sha256: hashes.get(path)! } : {}) })),
       directories: await Promise.all([...listings].map(async ([path, signature]) => ({ path, listing_sha256: await sha256Text(signature) }))),
+      ...(projectStates.length ? { project_states: projectStates } : {}),
       probes, active_rules_sha256: await sha256Text(canonicalJson(active_rules))
     };
     return { evidence, active_rules, audit };

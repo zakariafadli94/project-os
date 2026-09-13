@@ -9,11 +9,14 @@ import { globalGovernancePath, RuleGovernanceRepository } from "../src/persisten
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { applyRuleGovernance } from "../src/domain/rule-governance";
 import { eventIdForRevision } from "../src/domain/event";
-import { archiveProjectRoot, machineCommitRecordPath, machineRegistryJsonPath } from "../src/persistence/layout";
+import { archiveProjectRoot, machineCommitRecordPath, machineRegistryJsonPath, machineStatePath } from "../src/persistence/layout";
 import { encodeAdmission } from "../src/admission/transport";
 import { sha256Text } from "../src/documents/hash";
 import * as artifactAdmission from "../src/admission/operation-context";
 import { commitFixture } from "./helpers/convergence-fixture";
+import { issueMutationContext } from "../src/admission/mutation-context";
+import { createProductionRuleQualificationResolver } from "../src/rules/production-qualification";
+import { resolveAndQualifyRuleActivation } from "../src/rules/qualification";
 
 const testEnv = env as unknown as Env;
 let projectNumber = 9600;
@@ -50,14 +53,133 @@ async function fixture(overrides: Record<string, unknown> = {}, realContentHash 
   return { mock, project, guard, registry, environment, rule, activate, submit };
 }
 
+async function qualifyViaCommitInventory(f: Awaited<ReturnType<typeof fixture>>) {
+  const governance = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+  const acceptance: any = Object.values(governance.journal).find((entry: any) => entry.transaction.operation === "rule.accept");
+  return resolveAndQualifyRuleActivation(createProductionRuleQualificationResolver(createProductionPersistence(f.environment), f.environment), {
+    rule: governance.rules[`${f.rule.rule_id}@1`], requested_evidence_refs: [`${globalGovernancePath}#transaction=${acceptance.transaction.transaction_id}`], now: new Date().toISOString()
+  });
+}
+
+async function reviewInventoryFixture(filesPerProject: number) {
+  const f = await fixture({ resource_scope: { resource_types: ["artifact"], zones: ["REVIEW"] }, parameters: { allowed_zones: ["REVIEW"] } });
+  const registry = JSON.parse(f.mock.files.get(machineRegistryJsonPath())!);
+  for (const project_id of ["PRJ-0002", "PRJ-0003", "PRJ-0007"]) {
+    registry.projects.push({ project_id, slug: "synthetic-convergence", status: "active" });
+    for (const commit of commitFixture(project_id, 2)) await f.mock.writeExternal(machineCommitRecordPath(project_id, commit.new_revision), JSON.stringify(commit));
+  }
+  await f.mock.writeExternal(machineRegistryJsonPath(), JSON.stringify(registry));
+  const roots = registry.projects.map((project: any) => `/PROJECT_OS/WORKSPACE/PROJECTS/${project.project_id}-${project.slug}/REVIEW`);
+  for (const root of roots) for (let i = 0; i < filesPerProject; i++) await f.mock.writeExternal(`${root}/00-CURRENT/file-${i}.md`, "review member");
+  f.environment.PROJECT_OS_ADMISSION_PROJECT_MODES = JSON.stringify(Object.fromEntries(registry.projects.map((project: any) => [project.project_id, "strict"])));
+  await runInDurableObject(f.registry, instance => Object.assign((instance as any).env, f.environment));
+  // The shared fake lists files only; expose the real immediate folder entry for this nested inventory.
+  const outbound = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    const request = new Request(input, init);
+    const path = request.url.endsWith("/2/files/list_folder") ? (await request.clone().json() as any).path : undefined;
+    const response = await outbound(input, init);
+    if (!roots.includes(path)) return response;
+    const listing = await response.json() as any;
+    return Response.json({ ...listing, entries: [...listing.entries, { ".tag": "folder", name: "00-CURRENT", path_display: `${path}/00-CURRENT` }] });
+  });
+  return { ...f, roots: roots as string[] };
+}
+
+async function interceptProjectStateReads(f: Awaited<ReturnType<typeof fixture>>, run: () => Promise<void>, alter?: (body: any) => Promise<void>) {
+  const namespace = f.environment.PROJECT_GUARD;
+  const metrics = { calls: 0, delegatedHttpCalls: 0, maxDelegatedHttpCalls: 0 };
+  await runInDurableObject(f.registry, instance => {
+    (instance as any).env.PROJECT_GUARD = { getByName(projectId: string) {
+      const stub = namespace.getByName(projectId);
+      return { fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        metrics.calls++;
+        const before = f.mock.calls.length;
+        const response = await stub.fetch(input, init);
+        const count = f.mock.calls.length - before;
+        metrics.delegatedHttpCalls += count;
+        metrics.maxDelegatedHttpCalls = Math.max(metrics.maxDelegatedHttpCalls, count);
+        if (!alter || response.status !== 200) return response;
+        const body = await response.json();
+        await alter(body);
+        return Response.json(body);
+      } };
+    } };
+  });
+  try { await run(); } finally { await runInDurableObject(f.registry, instance => { (instance as any).env.PROJECT_GUARD = namespace; }); }
+  return metrics;
+}
+
+it("keeps four-project qualification I/O independent of the number of REVIEW files", async () => {
+  const counts: number[] = [];
+  for (const filesPerProject of [1, 40]) {
+    const f = await reviewInventoryFixture(filesPerProject);
+    const start = f.mock.calls.length;
+    const providerStart = f.mock.providerCalls.length;
+    const metrics = await interceptProjectStateReads(f, async () => { expect(await (await f.activate()).json()).toMatchObject({ status: "committed" }); });
+    const calls = f.mock.providerCalls.slice(providerStart);
+    counts.push(f.mock.calls.length - start - metrics.delegatedHttpCalls + metrics.calls);
+    expect(metrics.calls).toBe(4);
+    expect(metrics.maxDelegatedHttpCalls).toBeLessThanOrEqual(50);
+    expect(calls.some(call => call.endpoint.endsWith("/files/get_metadata") && call.paths.some(path => path.includes("/REVIEW/")))).toBe(false);
+    const proof: any = Object.values(JSON.parse(f.mock.files.get(globalGovernancePath)!).journal).find((entry: any) => entry.qualification);
+    expect(proof.qualification.proof.audit.project_states).toHaveLength(4);
+    expect(proof.qualification.proof.audit.directories.map((entry: any) => entry.path)).toEqual(expect.arrayContaining(f.roots.flatMap(root => [root, `${root}/00-CURRENT`])));
+  }
+  expect(counts[1], `provider request counts for 4 vs 160 files: ${counts.join(", ")}`).toBe(counts[0]);
+  expect(counts[1]).toBeLessThanOrEqual(50);
+});
+
+it.each(["project", "slug", "status", "revision", "hash", "stale"])("refuses mismatched or stale ProjectGuard authority: %s", async fault => {
+  const f = await fixture();
+  await interceptProjectStateReads(f, async () => {
+    expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_INVENTORY_UNAVAILABLE" });
+  }, async body => {
+    if (fault === "project") body.canonical_state.project_id = "PRJ-9999";
+    if (fault === "slug") body.canonical_state.slug = "other-project";
+    if (fault === "status") body.canonical_state.status = "archived";
+    if (fault === "revision") body.canonical_state.revision++;
+    if (fault === "hash") body.context.state_hash = "f".repeat(64);
+    if (fault === "stale") body.context = await issueMutationContext(body.canonical_state, f.environment.MUTATION_CONTEXT_SIGNING_KEY!, Date.now() - 60_000);
+  });
+});
+
+it.each(["source", "global"])("still refuses canonical %s changes during destination inventory", async changed => {
+  const f = await reviewInventoryFixture(3);
+  const path = changed === "source" ? machineCommitRecordPath(f.project, 2) : globalGovernancePath;
+  const outbound = vi.mocked(fetch).getMockImplementation()!;
+  let altered = false;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    const request = new Request(input, init);
+    if (!altered && request.url.endsWith("/2/files/list_folder") && (await request.clone().json() as any).path.endsWith("/REVIEW")) {
+      altered = true;
+      await f.mock.writeExternal(path, f.mock.files.get(path)!);
+    }
+    return outbound(input, init);
+  });
+  expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_INVENTORY_UNAVAILABLE" });
+});
+
+it("rejects a REVIEW listing changed before final inventory revalidation", async () => {
+  const f = await reviewInventoryFixture(3);
+  const outbound = vi.mocked(fetch).getMockImplementation()!;
+  const target = `${f.roots[0]}/00-CURRENT`;
+  let lists = 0;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url.endsWith("/2/files/list_folder") && (await request.clone().json() as any).path === target && ++lists === 2) await f.mock.writeExternal(`${target}/late-member.md`, "new membership");
+    return outbound(input, init);
+  });
+  expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_INVENTORY_UNAVAILABLE", qualification: { observed: "Directory inventory changed during qualification" } });
+});
+
 it.each(["list", "metadata", "metadata_revalidation"])("diagnoses canonical qualification I/O without exposing provider response secrets: %s", async operation => {
   const faults: DropboxMockFault[] = [];
   const f = await fixture({}, false, faults);
   const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${f.project}-qualification/WORKING`;
-  const file = `${root}/existing.md`;
-  await f.mock.writeExternal(file, "allowed existing file");
+  const file = machineCommitRecordPath(f.project, 2);
   const path = operation === "list" ? root : file;
-  faults.push({ endpoint: operation === "list" ? "/2/files/list_folder" : "/2/files/get_metadata", path, occurrence: operation === "metadata_revalidation" ? 2 : 1, status: 403, error_summary: "secret-provider-body-DO-NOT-EXPOSE" });
+  faults.push({ endpoint: operation === "list" ? "/2/files/list_folder" : "/2/files/get_metadata", path, occurrence: operation === "metadata_revalidation" ? 3 : 1, status: 403, error_summary: "secret-provider-body-DO-NOT-EXPOSE" });
   const response = await f.activate();
   expect(response.status).toBe(503);
   const result = await response.json() as any;
@@ -245,10 +367,10 @@ it("rejects client assertions in place of the exact canonical rule-accept receip
   expect(await (await f.activate(["client:positive-negative-tests-passed"])).json()).toMatchObject({ error: "QUALIFICATION_REFERENCE_UNVERIFIED" });
 });
 
-it("fails closed when a registered project's canonical inventory has an internal hole", async () => {
+it("the direct commit-inventory fallback fails closed on an internal history hole", async () => {
   const f = await fixture();
   f.mock.files.delete(machineCommitRecordPath(f.project, 2));
-  expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_INVENTORY_UNAVAILABLE" });
+  expect(await qualifyViaCommitInventory(f)).toMatchObject({ code: "QUALIFICATION_INVENTORY_UNAVAILABLE" });
 });
 
 it("refuses historical files already outside the rule's allowed zones", async () => {
@@ -262,7 +384,9 @@ async function migratedRegistryFixture() {
   const registry = JSON.parse(f.mock.files.get(machineRegistryJsonPath())!);
   registry.projects.push({ project_id: "PRJ-0001", slug: "legacy-archive-one", status: "archived" }, { project_id: "PRJ-0004", slug: "legacy-archive-four", status: "archived" }, { project_id: "PRJ-0002", slug: "synthetic-convergence", status: "active" });
   await f.mock.writeExternal(machineRegistryJsonPath(), JSON.stringify(registry));
-  for (const commit of commitFixture("PRJ-0002", 169).slice(51)) await f.mock.writeExternal(machineCommitRecordPath("PRJ-0002", commit.new_revision), JSON.stringify(commit));
+  const commits = commitFixture("PRJ-0002", 169);
+  for (const commit of commits.slice(51)) await f.mock.writeExternal(machineCommitRecordPath("PRJ-0002", commit.new_revision), JSON.stringify(commit));
+  await f.mock.writeExternal(machineStatePath("PRJ-0002"), JSON.stringify(commits.at(-1)!.state));
   await f.mock.writeExternal(`${archiveProjectRoot("PRJ-0001", "legacy-archive-one")}/ARTIFACTS/legacy.md`, "Terminal archive is outside admission scope");
   f.environment.PROJECT_OS_ADMISSION_PROJECT_MODES = JSON.stringify({ [f.project]: "strict", "PRJ-0002": "strict" });
   await runInDurableObject(f.registry, instance => Object.assign((instance as any).env, f.environment));
@@ -271,19 +395,22 @@ async function migratedRegistryFixture() {
 
 it("qualifies a contiguous migrated 52..169 suffix and ignores terminal archives without machine history", async () => {
   const f = await migratedRegistryFixture();
+  const fallback = await qualifyViaCommitInventory(f);
+  expect(fallback.verdict).toBe("allow");
+  const paths = fallback.qualification_proof!.audit!.objects.map(object => object.path);
+  expect(paths).toContain(machineCommitRecordPath("PRJ-0002", 52));
+  expect(paths).toContain(machineCommitRecordPath("PRJ-0002", 169));
   const response = await f.activate();
   expect(await response.json()).toMatchObject({ status: "committed" });
   const governance = JSON.parse(f.mock.files.get(globalGovernancePath)!);
   const activation: any = Object.values(governance.journal).find((entry: any) => entry.transaction.operation === "rule.activate");
-  const paths = activation.qualification.proof.audit.objects.map((object: any) => object.path);
-  expect(paths).toContain(machineCommitRecordPath("PRJ-0002", 52));
-  expect(paths).toContain(machineCommitRecordPath("PRJ-0002", 169));
+  expect(activation.qualification.proof.audit.project_states).toEqual(expect.arrayContaining([expect.objectContaining({ project_id: "PRJ-0002", revision: 169, authority: "ProjectGuard" })]));
   expect(activation.qualification.proof.audit.directories.some((entry: any) => entry.path.includes("/PRJ-0001/") || entry.path.includes("/PRJ-0004/"))).toBe(false);
   expect(f.mock.files.has(machineCommitRecordPath("PRJ-0002", 1))).toBe(false);
   expect(f.mock.files.has(machineCommitRecordPath("PRJ-0001", 1))).toBe(false);
 });
 
-it.each(["internal_hole", "first_previous_revision", "first_filename_binding", "latest_filename_binding"])("refuses an unverified migrated suffix: %s", async fault => {
+it.each(["internal_hole", "first_previous_revision", "first_filename_binding", "latest_filename_binding"])("direct commit-inventory fallback refuses an unverified migrated suffix: %s", async fault => {
   const f = await migratedRegistryFixture();
   if (fault === "internal_hole") f.mock.files.delete(machineCommitRecordPath("PRJ-0002", 100));
   else {
@@ -293,7 +420,7 @@ it.each(["internal_hole", "first_previous_revision", "first_filename_binding", "
     else Object.assign(commit, JSON.parse(f.mock.files.get(machineCommitRecordPath("PRJ-0002", 53))!));
     await f.mock.writeExternal(path, JSON.stringify(commit));
   }
-  expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_INVENTORY_UNAVAILABLE" });
+  expect(await qualifyViaCommitInventory(f)).toMatchObject({ code: "QUALIFICATION_INVENTORY_UNAVAILABLE" });
 });
 
 it("journals the verified production qualification and refuses tampering with its bound proof", async () => {

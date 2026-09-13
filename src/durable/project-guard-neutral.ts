@@ -15,7 +15,7 @@ import {
 } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
-import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
+import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH } from "../domain/materialization";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
@@ -33,7 +33,7 @@ import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError } from "../mutation-gate/repository";
-import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, type LayoutMode } from "../persistence/layout";
+import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
@@ -1339,9 +1339,8 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   /** Transaction commits have no independent provider effect plan. They become
-   * finalized only when the same immutable commit is the current, completed
-   * materialization generation. Absence or any binding mismatch leaves the
-   * execution in finalizing state for a later read/replay. */
+   * finalized only when the immutable commit is covered by the current,
+   * completed materialization ancestry. */
   private async finalizeMaterializedTransaction(journal: ExecutionJournal): Promise<void> {
     const admitted = await journal.readAdmission();
     const progress = await journal.status();
@@ -1367,28 +1366,41 @@ export class ProjectGuard extends DurableObject<Env> {
       || await sha256Canonical(record.transaction) !== admitted.admission.request_hash
     ) return;
     const head = await this.repository.readMaterializationHead(admitted.admission.project_id);
-    if (
-      !head
-      || head.target_revision !== targetRevision
-      || head.projection_version !== CURRENT_PROJECTION_VERSION
-    ) return;
-    const materialization = await this.repository.readMaterializationRecord(
-      admitted.admission.project_id,
-      head.target_revision,
-      head.projection_version
-    );
-    if (
-      !materialization
-      || materialization.source_event_id !== record.event.event_id
-      || materialization.result_root_hash !== head.result_root_hash
-      || materialization.workspace_location !== head.workspace_location
-      || materialization.completed_at !== head.completed_at
-    ) return;
+    if (!head || head.target_revision < targetRevision || head.projection_version !== CURRENT_PROJECTION_VERSION) return;
+    let generation = { target_revision: head.target_revision, projection_version: head.projection_version };
+    let materialization = null;
+    for (let depth = 0; depth <= MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH; depth += 1) {
+      const candidate = await this.repository.readMaterializationRecord(
+        admitted.admission.project_id,
+        generation.target_revision,
+        generation.projection_version
+      );
+      if (!candidate) return;
+      if (depth === 0 && (
+        candidate.result_root_hash !== head.result_root_hash
+        || candidate.workspace_location !== head.workspace_location
+        || candidate.completed_at !== head.completed_at
+      )) return;
+      if (
+        (candidate.target_revision === targetRevision && candidate.source_event_id === record.event.event_id)
+        || candidate.coalesced_revisions.includes(targetRevision)
+      ) {
+        materialization = candidate;
+        break;
+      }
+      if (!candidate.parent || candidate.parent.target_revision < targetRevision) return;
+      generation = candidate.parent;
+    }
+    if (!materialization) return;
     await journal.finalizeMaterializedTransaction({
       canonical_commit_ref: commitRef,
       receipt_ref: receiptRef,
       materialization_head_ref: machineMaterializationHeadPath(admitted.admission.project_id),
-      materialization_record_ref: head.record_path,
+      materialization_record_ref: machineMaterializationRecordPath(
+        admitted.admission.project_id,
+        materialization.target_revision,
+        materialization.projection_version
+      ),
       target_revision: targetRevision,
       source_event_id: record.event.event_id,
       result_root_hash: materialization.result_root_hash

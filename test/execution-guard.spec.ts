@@ -190,5 +190,50 @@ describe("canonical execution boundary in ProjectGuard", () => {
       result_root_hash: materialization.result_root_hash
     });
     expect(mock.uploadCalls.slice(writesBeforeFinalization).every((path) => path.includes("/executions/"))).toBe(true);
+
+    const context270Response = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context: context270 } = await context270Response.json<{ context: never }>();
+    const transaction270 = {
+      schema_version: "1.0", transaction_id: "TXN-PRJ0003-TASK-A03RESEARCHFINAL-CREATE-20260913T160300Z-Q7N5",
+      project_id: projectId, base_revision: 269, operation: "task.create", created_at: "2026-09-13T16:03:00.000Z",
+      payload: { task_id: "TASK-A03RESEARCHFINAL", title: "Finalize research" }
+    };
+    const committed270 = await guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", body: JSON.stringify(encodeAdmission(transaction270, context270))
+    });
+    expect(await committed270.json()).toMatchObject({ status: "committed", new_revision: 270 });
+
+    const context271Response = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context: context271 } = await context271Response.json<{ context: never }>();
+    const transaction271 = {
+      schema_version: "1.0", transaction_id: "TXN-PRJ0003-TASK-A03RESEARCHFINAL-START-20260913T160450Z-H9C2",
+      project_id: projectId, base_revision: 270, operation: "task.start", created_at: "2026-09-13T16:04:50.000Z",
+      payload: { task_id: "TASK-A03RESEARCHFINAL" }
+    };
+    const committed271 = await guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", body: JSON.stringify(encodeAdmission(transaction271, context271))
+    });
+    expect(await committed271.json()).toMatchObject({ status: "committed", new_revision: 271 });
+
+    const record271 = await repository.readCommitRecord(projectId, 271);
+    if (!record271) throw new Error("expected_coalesced_successor_record");
+    const successor: CompletedMaterializationRecord = {
+      schema_version: "1.0", project_id: projectId, target_revision: 271, projection_version: CURRENT_PROJECTION_VERSION,
+      record_kind: "delta", parent: { target_revision: 269, projection_version: CURRENT_PROJECTION_VERSION },
+      chain_depth: 1, workspace_location: "active", outputs: {}, removed_outputs: [], total_output_count: 0,
+      result_root_hash: "b".repeat(64), coalesced_revisions: [270],
+      source_event_id: record271.event.event_id, completed_at: "2026-09-13T16:05:00.000Z"
+    };
+    await repository.writeCompletedMaterializationRecord(successor);
+    await repository.writeMaterializationHead({
+      schema_version: "1.0", project_id: projectId, target_revision: 271, projection_version: CURRENT_PROJECTION_VERSION,
+      workspace_location: "active", record_path: machineMaterializationRecordPath(projectId, 271, CURRENT_PROJECTION_VERSION),
+      result_root_hash: successor.result_root_hash, completed_at: successor.completed_at
+    });
+
+    for (const requestId of [transaction270.transaction_id, transaction271.transaction_id]) {
+      const response = await guard.fetch(`https://project-guard.internal/execution-status?kind=transaction&request_id=${requestId}`);
+      expect(await response.json()).toMatchObject({ status: "finalized", terminal: true, code: null });
+    }
   });
 });

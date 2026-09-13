@@ -84,7 +84,10 @@ export async function resolveAndQualifyRuleActivation(resolver: RuleQualificatio
   try {
     const resolved = await resolver.resolve(structuredClone(request));
     const result = qualifyRuleActivation({ ...request, evidence: resolved?.evidence ?? null, active_rules: [...(request.known_active_rules ?? []), ...(resolved?.active_rules ?? [])] });
-    return result.verdict === "allow" && resolved ? { ...result, qualification_proof: resolvedQualificationProofSchema.parse({ evidence: resolved.evidence, ...(resolved.audit ? { audit: resolved.audit } : {}) }) } : result;
+    if (result.verdict !== "allow" || !resolved) return result;
+    const proof = resolvedQualificationProofSchema.safeParse({ evidence: resolved.evidence, ...(resolved.audit ? { audit: resolved.audit } : {}) });
+    if (!proof.success) return verdict("unavailable", "QUALIFICATION_PROOF_MALFORMED", request.rule, "Schema-valid server qualification proof", proof.error.issues.map(issue => issue.path.join(".")).slice(0, 8).join(", "), "Repair the server proof producer; keep accepted_unenforced");
+    return { ...result, qualification_proof: proof.data };
   } catch (error) {
     if (error instanceof QualificationResolutionFailure) return error.result;
     return verdict("unavailable", "QUALIFICATION_EVIDENCE_UNAVAILABLE", request.rule, "Available canonical qualification reader", "Server qualification evidence could not be verified", "Restore the canonical evidence reader and retry");

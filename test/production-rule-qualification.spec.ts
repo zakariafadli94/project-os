@@ -13,6 +13,7 @@ import { archiveProjectRoot, machineCommitRecordPath, machineRegistryJsonPath } 
 import { encodeAdmission } from "../src/admission/transport";
 import { sha256Text } from "../src/documents/hash";
 import * as artifactAdmission from "../src/admission/operation-context";
+import { commitFixture } from "./helpers/convergence-fixture";
 
 const testEnv = env as unknown as Env;
 let projectNumber = 9600;
@@ -188,9 +189,9 @@ it("rejects client assertions in place of the exact canonical rule-accept receip
   expect(await (await f.activate(["client:positive-negative-tests-passed"])).json()).toMatchObject({ error: "QUALIFICATION_REFERENCE_UNVERIFIED" });
 });
 
-it("fails closed when a registered project's canonical inventory is missing", async () => {
+it("fails closed when a registered project's canonical inventory has an internal hole", async () => {
   const f = await fixture();
-  f.mock.files.delete(machineCommitRecordPath(f.project, 1));
+  f.mock.files.delete(machineCommitRecordPath(f.project, 2));
   expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_INVENTORY_UNAVAILABLE" });
 });
 
@@ -200,18 +201,43 @@ it("refuses historical files already outside the rule's allowed zones", async ()
   expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_HISTORICAL_DRIFT" });
 });
 
-it("does not omit an archived project's physical inventory", async () => {
+async function migratedRegistryFixture() {
   const f = await fixture();
-  // Canonical archived-project fixture; no public write/deployment is performed.
-  const path = machineCommitRecordPath(f.project, 3);
-  const commit = JSON.parse(f.mock.files.get(path)!);
-  commit.state.status = "archived";
-  await f.mock.writeExternal(path, JSON.stringify(commit));
   const registry = JSON.parse(f.mock.files.get(machineRegistryJsonPath())!);
-  registry.projects[0].status = "archived";
+  registry.projects.push({ project_id: "PRJ-0001", slug: "legacy-archive-one", status: "archived" }, { project_id: "PRJ-0004", slug: "legacy-archive-four", status: "archived" }, { project_id: "PRJ-0002", slug: "synthetic-convergence", status: "active" });
   await f.mock.writeExternal(machineRegistryJsonPath(), JSON.stringify(registry));
-  await f.mock.writeExternal(`${archiveProjectRoot(f.project, "qualification")}/ARTIFACTS/legacy.md`, "historical conflict");
-  expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_HISTORICAL_DRIFT" });
+  for (const commit of commitFixture("PRJ-0002", 169).slice(51)) await f.mock.writeExternal(machineCommitRecordPath("PRJ-0002", commit.new_revision), JSON.stringify(commit));
+  await f.mock.writeExternal(`${archiveProjectRoot("PRJ-0001", "legacy-archive-one")}/ARTIFACTS/legacy.md`, "Terminal archive is outside admission scope");
+  f.environment.PROJECT_OS_ADMISSION_PROJECT_MODES = JSON.stringify({ [f.project]: "strict", "PRJ-0002": "strict" });
+  await runInDurableObject(f.registry, instance => Object.assign((instance as any).env, f.environment));
+  return f;
+}
+
+it("qualifies a contiguous migrated 52..169 suffix and ignores terminal archives without machine history", async () => {
+  const f = await migratedRegistryFixture();
+  const response = await f.activate();
+  expect(await response.json()).toMatchObject({ status: "committed" });
+  const governance = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+  const activation: any = Object.values(governance.journal).find((entry: any) => entry.transaction.operation === "rule.activate");
+  const paths = activation.qualification.proof.audit.objects.map((object: any) => object.path);
+  expect(paths).toContain(machineCommitRecordPath("PRJ-0002", 52));
+  expect(paths).toContain(machineCommitRecordPath("PRJ-0002", 169));
+  expect(activation.qualification.proof.audit.directories.some((entry: any) => entry.path.includes("/PRJ-0001/") || entry.path.includes("/PRJ-0004/"))).toBe(false);
+  expect(f.mock.files.has(machineCommitRecordPath("PRJ-0002", 1))).toBe(false);
+  expect(f.mock.files.has(machineCommitRecordPath("PRJ-0001", 1))).toBe(false);
+});
+
+it.each(["internal_hole", "first_previous_revision", "first_filename_binding", "latest_filename_binding"])("refuses an unverified migrated suffix: %s", async fault => {
+  const f = await migratedRegistryFixture();
+  if (fault === "internal_hole") f.mock.files.delete(machineCommitRecordPath("PRJ-0002", 100));
+  else {
+    const path = machineCommitRecordPath("PRJ-0002", fault === "latest_filename_binding" ? 169 : 52);
+    const commit = JSON.parse(f.mock.files.get(path)!);
+    if (fault === "first_previous_revision") commit.previous_revision = 0;
+    else Object.assign(commit, JSON.parse(f.mock.files.get(machineCommitRecordPath("PRJ-0002", 53))!));
+    await f.mock.writeExternal(path, JSON.stringify(commit));
+  }
+  expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_INVENTORY_UNAVAILABLE" });
 });
 
 it("journals the verified production qualification and refuses tampering with its bound proof", async () => {

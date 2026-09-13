@@ -192,6 +192,10 @@ export class ConvergenceEngine {
       checkpoint.progress.next_alarm_at !== null
       && Date.parse(checkpoint.progress.next_alarm_at) <= this.input.now()
     ) checkpoint.progress.next_alarm_at = null;
+    // A terminal human handoff cannot own the queue forever once a newer
+    // canonical target has been requested. Keep its obligation as historical
+    // evidence, but release `active` so discovery can reach the newer record.
+    this.supersedeTerminalHumanActive(checkpoint.progress);
     const health = this.blankHealth(checkpoint.progress.first_observed_at);
     try {
     const machinePending = Object.values(checkpoint.progress.obligations).some((obligation) =>
@@ -854,6 +858,19 @@ export class ConvergenceEngine {
     };
   }
 
+  private supersedeTerminalHumanActive(progress: Progress): void {
+    const active = progress.active;
+    const requested = progress.requested;
+    if (!active || !requested || !isStrictlyNewerTarget(requested, active)) return;
+    const existing = Object.values(progress.obligations).find((obligation) =>
+      obligation.layer === "human_handoff"
+      && obligation.target.revision === active.revision
+      && obligation.target.projection_version === active.projection_version
+    );
+    if (!existing || !isTerminalHumanObligation(existing)) return;
+    progress.active = null;
+  }
+
   private async runHumanWithRetry(
     record: import("../domain/commit-record").CanonicalCommitRecord,
     progress: Progress,
@@ -1197,6 +1214,16 @@ function nextPendingWake(progress: Progress): string | null {
   return minimumWake(Object.values(progress.obligations)
     .filter((obligation) => obligation.state !== "verified" && obligation.next_attempt_at !== null)
     .map((obligation) => obligation.next_attempt_at));
+}
+
+function isStrictlyNewerTarget(candidate: Target, current: Target): boolean {
+  return candidate.revision > current.revision
+    || (candidate.revision === current.revision && candidate.projection_version > current.projection_version);
+}
+
+function isTerminalHumanObligation(obligation: Obligation): boolean {
+  return obligation.state === "blocked"
+    || (obligation.state === "exhausted" && obligation.next_attempt_at === null);
 }
 
 function machineLayersCurrent(health: ConvergenceHealth): boolean {

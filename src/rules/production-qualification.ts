@@ -12,6 +12,7 @@ import { archiveProjectRoot, machineCommitRecordPath, machineRegistryJsonPath, w
 import { globalGovernancePath, RuleGovernanceRepository } from "../persistence/rule-governance-repository";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import { ProviderOperationError } from "../persistence/provider/errors";
 import { canonicalJson, compareCodePoints, sameScope, verdict } from "./contract";
 import { checkCatalogue, normalizedMutationOperations, validateCheck } from "./check-catalogue";
 import { evaluateRules } from "./evaluator";
@@ -52,8 +53,20 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     const observed = new Map<string, ProviderObjectMetadata>();
     const hashes = new Map<string, string>();
     const listings = new Map<string, string>();
+    const io = async <T>(operation: string, path: string, run: () => Promise<T>): Promise<T> => {
+      try { return await run(); }
+      catch (error) {
+        const status = error instanceof ProviderOperationError ? error.diagnostics?.status : undefined;
+        // Never return arbitrary exception messages, response bodies, headers or credentials.
+        const failure = error instanceof Error && error.message.includes("Too many subrequests") ? "subrequest_limit"
+          : error instanceof Error && error.message.includes("slice_budget_exhausted") ? "request_budget"
+          : error instanceof ProviderOperationError ? "provider" : "unclassified";
+        return fail("QUALIFICATION_IO_UNAVAILABLE", `operation=${operation}; path=${path}; failure=${failure}; status=${Number.isInteger(status) && status! >= 100 && status! <= 599 ? status : "unknown"}`);
+      }
+    };
+    const metadata = (path: string, operation = "metadata") => io(operation, path, () => runtime.objects.getMetadata(path));
     const list = async (path: string) => {
-      const entries = await runtime.objects.listChildren(path);
+      const entries = await io("list", path, () => runtime.objects.listChildren(path));
       const signature = canonicalJson(entries.slice().sort((a, b) => compareCodePoints(a.path ?? a.name, b.path ?? b.name)));
       if (listings.has(path) && listings.get(path) !== signature) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Directory inventory changed during qualification");
       listings.set(path, signature);
@@ -61,16 +74,16 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     };
     const identity = (metadata: ProviderObjectMetadata | null) => metadata?.objectId && metadata.revisionToken ? canonicalJson([metadata.objectId, metadata.revisionToken, metadata.size]) : null;
     const read = async (path: string, code: string): Promise<string> => {
-      const before = await runtime.objects.getMetadata(path);
+      const before = await metadata(path);
       if (!identity(before)) fail(code, `Canonical object unavailable: ${path}`);
-      const raw = await runtime.objects.readText(path);
-      const after = await runtime.objects.getMetadata(path);
+      const raw = await io("read", path, () => runtime.objects.readText(path));
+      const after = await metadata(path);
       if (raw === null || identity(before) !== identity(after)) fail(code, `Canonical object changed: ${path}`);
       observed.set(path, after!);
       hashes.set(path, await sha256Text(raw!));
       return raw!;
     };
-    const governance = await new RuleGovernanceRepository(runtime).read();
+    const governance = await io("governance_read", globalGovernancePath, () => new RuleGovernanceRepository(runtime).read());
     if (!governance) fail("QUALIFICATION_REFERENCE_UNVERIFIED", "Canonical governance unavailable");
     if (!request.requested_evidence_refs.length) fail("QUALIFICATION_REFERENCE_UNVERIFIED", "No acceptance reference");
     if (rule.scope.kind === "global") {
@@ -150,9 +163,9 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
         else {
           if (++count > 256) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Synchronous inventory limit reached; no partial qualification");
           if (!(rule.parameters.allowed_zones as string[]).includes(zone)) fail("QUALIFICATION_HISTORICAL_DRIFT", "Existing scoped files violate the proposed destination rule");
-          const metadata = await runtime.objects.getMetadata(child!);
-          if (!identity(metadata)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Historical file identity unavailable");
-          observed.set(child!, metadata!);
+          const fileMetadata = await metadata(child!);
+          if (!identity(fileMetadata)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Historical file identity unavailable");
+          observed.set(child!, fileMetadata!);
         }
       }
     };
@@ -196,9 +209,9 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
       }
     }
     if (!positive.length || !negative.length) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", "Live deployed-rule probes did not establish both positive and negative outcomes");
-    for (const [path, metadata] of observed) if (identity(await runtime.objects.getMetadata(path)) !== identity(metadata)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Canonical evidence changed before qualification completed");
+    for (const [path, priorMetadata] of observed) if (identity(await metadata(path, "metadata_revalidation")) !== identity(priorMetadata)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Canonical evidence changed before qualification completed");
     for (const path of listings.keys()) await list(path);
-    const current = await new RuleGovernanceRepository(runtime).read();
+    const current = await io("governance_revalidation", globalGovernancePath, () => new RuleGovernanceRepository(runtime).read());
     if (current?.token !== governance!.token) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Global governance changed during qualification");
     const snapshot = await sha256Text(canonicalJson({ observed: [...observed], listings: [...listings], active_rules }));
     const build = `deployment:${deployment.worker_version_id}:${deployment.git_sha}:${deployedQualificationCoverage.version}`;

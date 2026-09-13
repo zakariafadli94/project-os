@@ -25,6 +25,15 @@ async function qualify(rule = candidate(), evidence: unknown = proof(), active_r
   return (await qualification()).qualifyRuleActivation({ rule, evidence, active_rules, requested_evidence_refs: ["qualification:7101"], now: ruleAt });
 }
 describe("activation qualification", () => {
+  it("distinguishes malformed server audit from an unavailable canonical reader without disclosing values", async () => {
+    const module = await qualification();
+    const result = await module.resolveAndQualifyRuleActivation({ resolve: async () => ({ evidence: proof(), active_rules: [], audit: { objects: "secret-malformed-audit-value" } }) }, {
+      rule: candidate(), requested_evidence_refs: ["qualification:7101"], now: ruleAt
+    });
+    expect(result).toMatchObject({ verdict: "unavailable", code: "QUALIFICATION_PROOF_MALFORMED" });
+    expect(result.observed).toContain("audit.objects");
+    expect(JSON.stringify(result)).not.toContain("secret-malformed-audit-value");
+  });
   it("refuses opaque qualification references without per-check evidence bindings", async () => {
     const { check_evidence: _removed, ...opaque } = proof();
     expect(await qualify(candidate(), opaque)).toMatchObject({ verdict: "deny", code: "INVALID_QUALIFICATION_EVIDENCE" });

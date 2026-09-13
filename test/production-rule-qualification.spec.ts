@@ -3,7 +3,7 @@ import { createExecutionContext, runInDurableObject } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/env";
-import { installDropboxMock } from "./helpers/mock-dropbox";
+import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 import { governanceTx, ruleFixture } from "./helpers/rule-fixtures";
 import { globalGovernancePath, RuleGovernanceRepository } from "../src/persistence/rule-governance-repository";
 import { createProductionPersistence } from "../src/persistence/production-factory";
@@ -19,8 +19,8 @@ const testEnv = env as unknown as Env;
 let projectNumber = 9600;
 afterEach(() => vi.restoreAllMocks());
 
-async function fixture(overrides: Record<string, unknown> = {}, realContentHash = false) {
-  const mock = installDropboxMock({ realContentHash });
+async function fixture(overrides: Record<string, unknown> = {}, realContentHash = false, faults: DropboxMockFault[] = []) {
+  const mock = installDropboxMock({ realContentHash, faults });
   const registry = testEnv.REGISTRY_GUARD.getByName("global");
   const environment = { ...testEnv, RULE_GOVERNANCE_TOKEN: "qualification-production-authority", RULE_ADMISSION_SIGNING_KEY: "qualification-production-signing", CF_VERSION_METADATA: { id: "production-wiring-test-version", tag: `git-${"a".repeat(40)}` }, PROJECT_OS_LAYOUT_MODE: "v2" } as Env;
   // Configure bindings only: the production constructor owns the resolver. No protected resolver replacement.
@@ -49,6 +49,41 @@ async function fixture(overrides: Record<string, unknown> = {}, realContentHash 
   const activate = (refs = [`${globalGovernancePath}#transaction=${acceptance.transaction_id}`]) => submit(governanceTx("rule.activate", { rule_id: rule.rule_id, version: 1, activation_evidence: refs }, 2, "GLOBAL"));
   return { mock, project, guard, registry, environment, rule, activate, submit };
 }
+
+it.each(["list", "metadata", "metadata_revalidation"])("diagnoses canonical qualification I/O without exposing provider response secrets: %s", async operation => {
+  const faults: DropboxMockFault[] = [];
+  const f = await fixture({}, false, faults);
+  const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${f.project}-qualification/WORKING`;
+  const file = `${root}/existing.md`;
+  await f.mock.writeExternal(file, "allowed existing file");
+  const path = operation === "list" ? root : file;
+  faults.push({ endpoint: operation === "list" ? "/2/files/list_folder" : "/2/files/get_metadata", path, occurrence: operation === "metadata_revalidation" ? 2 : 1, status: 403, error_summary: "secret-provider-body-DO-NOT-EXPOSE" });
+  const response = await f.activate();
+  expect(response.status).toBe(503);
+  const result = await response.json() as any;
+  expect(result).toMatchObject({ error: "QUALIFICATION_IO_UNAVAILABLE", qualification: { verdict: "unavailable" } });
+  expect(result.qualification.observed).toContain(`operation=${operation}`);
+  expect(result.qualification.observed).toContain(`path=${path}`);
+  expect(result.qualification.observed).toContain("status=403");
+  expect(JSON.stringify(result)).not.toContain("secret-provider-body");
+  expect(JSON.parse(f.mock.files.get(globalGovernancePath)!).rules["RULE-PRODUCTION01@1"].status).toBe("accepted_unenforced");
+});
+
+it.each([["Too many subrequests", "subrequest_limit"], ["slice_budget_exhausted", "request_budget"], ["unexpected transport error", "unclassified"]])("classifies a transport failure without returning its raw message: %s", async (message, failure) => {
+  const f = await fixture();
+  const outbound = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url.endsWith("/2/files/list_folder") && (await request.clone().json() as any).path.endsWith("/WORKING")) throw new Error(`${message}: secret-transport-value`);
+    return outbound(input, init);
+  });
+  const response = await f.activate();
+  const result = await response.json() as any;
+  expect(response.status).toBe(503);
+  expect(result.error).toBe("QUALIFICATION_IO_UNAVAILABLE");
+  expect(result.qualification.observed).toContain(`failure=${failure}`);
+  expect(JSON.stringify(result)).not.toContain("secret-transport-value");
+});
 
 it("activates from canonical acceptance evidence through production wiring and enforces the data-only rule", async () => {
   const f = await fixture();

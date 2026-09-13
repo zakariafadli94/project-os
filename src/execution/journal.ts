@@ -148,6 +148,65 @@ export class ExecutionJournal {
     return path;
   }
 
+  /** A typed transaction has no independent provider effect plan: its physical
+   * completion is the immutable canonical commit rendered by the verified
+   * materialization generation. This certificate is intentionally separate
+   * from effect-plan finalization, so it can never replay a transaction. */
+  async finalizeMaterializedTransaction(input: {
+    canonical_commit_ref: string;
+    receipt_ref: string;
+    materialization_head_ref: string;
+    materialization_record_ref: string;
+    target_revision: number;
+    source_event_id: string;
+    result_root_hash: string;
+  }): Promise<ExecutionProgress> {
+    const admitted = await this.readAdmission();
+    if (!admitted || admitted.plan !== null || admitted.admission.kind !== "transaction") {
+      throw new Error("execution_transaction_finalization_invalid");
+    }
+    const saved = await this.load();
+    if (!saved) throw new Error("execution_progress_unavailable");
+    const progress = saved.progress;
+    if (progress.terminal) return progress;
+    if (
+      progress.status !== "finalizing"
+      || progress.receipt_ref !== input.receipt_ref
+      || progress.request_hash !== admitted.admission.request_hash
+      || input.target_revision !== admitted.admission.project_revision + 1
+      || !input.canonical_commit_ref
+      || !input.materialization_head_ref
+      || !input.materialization_record_ref
+      || !input.source_event_id
+      || !/^[a-f0-9]{64}$/.test(input.result_root_hash)
+    ) throw new Error("execution_transaction_finalization_invalid");
+    const record = {
+      schema_version: "1.0",
+      project_id: progress.project_id,
+      kind: progress.kind,
+      request_id: progress.request_id,
+      request_hash: progress.request_hash,
+      target_revision: input.target_revision,
+      canonical_commit_ref: input.canonical_commit_ref,
+      receipt_ref: input.receipt_ref,
+      materialization_head_ref: input.materialization_head_ref,
+      materialization_record_ref: input.materialization_record_ref,
+      source_event_id: input.source_event_id,
+      result_root_hash: input.result_root_hash
+    };
+    const finalizationRef = `${await this.root()}/finalizations/${await executionHash(record)}.json`;
+    await this.immutable(finalizationRef, record);
+    progress.status = "finalized";
+    progress.terminal = true;
+    progress.code = null;
+    progress.finalization_ref = finalizationRef;
+    progress.next_attempt_at = null;
+    progress.lease = null;
+    progress.sequence++;
+    await this.save(progress, saved.token);
+    return progress;
+  }
+
   /** Read the actual successor's canonical records, not an adapter's assurance.
    * Compatibility is a frozen predecessor binding plus identical effects and
    * postchecks. No arbitrary evidence URL is read and no client proof is trusted. */

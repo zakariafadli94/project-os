@@ -2,12 +2,23 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
-import { machineCommitRecordPath, machineStatePath } from "../src/persistence/layout";
+import type { CanonicalCommitRecord } from "../src/domain/commit-record";
+import type { CompletedMaterializationRecord } from "../src/domain/materialization";
+import { applyTransaction } from "../src/domain/transitions";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
+import type { ProjectState } from "../src/domain/project-state";
+import {
+  machineCommitRecordPath,
+  machineMaterializationRecordPath,
+  machineStatePath
+} from "../src/persistence/layout";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import { encodeAdmission } from "../src/admission/transport";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
 
 const testEnv = env as unknown as Env;
 afterEach(() => vi.restoreAllMocks());
@@ -22,6 +33,56 @@ async function setup(projectId: string) {
   }));
   await bootstrapRuleAdmissionGovernance(testEnv, "exec-guard-admission", projectId);
   return { mock, guard };
+}
+
+function taskCompletionBaseline(projectId: string): CanonicalCommitRecord {
+  let state: ProjectState | null = null;
+  for (let revision = 1; revision <= 268; revision += 1) {
+    const transaction = revision === 1
+      ? {
+          schema_version: "1.0" as const,
+          transaction_id: `TXN-EXECUTION-${projectId}-CREATE`,
+          project_id: projectId,
+          base_revision: 0,
+          operation: "project.create" as const,
+          created_at: "2026-09-13T14:00:00.000Z",
+          payload: { name: "Execution finalization", slug: "execution-finalization", aliases: [], objective: "Prove typed receipt finalization" }
+        }
+      : revision === 268
+        ? {
+            schema_version: "1.0" as const,
+            transaction_id: "TXN-PRJ0003-TASK-A02S2DEV-RETIRE-20260913T140100Z-L4T7",
+            project_id: projectId,
+            base_revision: 267,
+            operation: "task.create" as const,
+            created_at: "2026-09-13T14:01:00.000Z",
+            payload: { task_id: "TASK-A02S2DEV", title: "Retire obsolete execution" }
+          }
+        : {
+            schema_version: "1.0" as const,
+            transaction_id: `TXN-EXECUTION-${projectId}-RESEARCH-${String(revision).padStart(4, "0")}`,
+            project_id: projectId,
+            base_revision: revision - 1,
+            operation: "research.add" as const,
+            created_at: "2026-09-13T14:00:00.000Z",
+            payload: { research_id: `RES-EXEC${String(revision).padStart(4, "0")}`, title: `Evidence ${revision}`, body: "Synthetic canonical history" }
+          };
+    const result = applyTransaction(state, transaction);
+    if (result.kind !== "commit") throw new Error(`task_completion_baseline_${result.kind}`);
+    state = result.state;
+    if (revision === 268) {
+      return {
+        schema_version: "1.0", project_id: projectId, previous_revision: 267, new_revision: 268,
+        transaction, state: result.state, event: result.event,
+        receipt: {
+          schema_version: "1.0", transaction_id: transaction.transaction_id, status: "committed",
+          project_id: projectId, previous_revision: 267, new_revision: 268,
+          event_id: result.event.event_id, committed_at: transaction.created_at
+        }
+      };
+    }
+  }
+  throw new Error("task_completion_baseline_missing");
 }
 
 describe("canonical execution boundary in ProjectGuard", () => {
@@ -72,5 +133,62 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await response.json()).toMatchObject({ status: "committed", new_revision: 2 });
     const status = await guard.fetch("https://project-guard.internal/execution-status?kind=transaction&request_id=TXN-8298000001");
     expect(await status.json()).toMatchObject({ status: "finalizing", terminal: false, receipt_ref: expect.any(String) });
+  });
+
+  it("finalizes task.complete 268 to 269 only from its committed record and current materialization proof", async () => {
+    const projectId = "PRJ-8301";
+    const mock = installDropboxMock();
+    const baseline = taskCompletionBaseline(projectId);
+    mock.files.set(machineCommitRecordPath(projectId, 268), JSON.stringify(baseline));
+    mock.files.set(machineStatePath(projectId), JSON.stringify(baseline.state));
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(guard, (instance) => Object.assign((instance as unknown as { env: Env }).env, {
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }), MUTATION_CONTEXT_SIGNING_KEY: "execution-finalization-context", RULE_ADMISSION_SIGNING_KEY: "execution-finalization-admission"
+    }));
+    await bootstrapRuleAdmissionGovernance(testEnv, "execution-finalization-admission", projectId);
+
+    const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context } = await contextResponse.json<{ context: never }>();
+    const transaction = {
+      schema_version: "1.0", transaction_id: "TXN-PRJ0003-TASK-A02S2DEV-RETIRE-20260913T140200Z-L4T7",
+      project_id: projectId, base_revision: 268, operation: "task.complete", created_at: "2026-09-13T14:02:00.000Z",
+      payload: { task_id: "TASK-A02S2DEV", result: "retired" }
+    };
+    const committed = await guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", body: JSON.stringify(encodeAdmission(transaction, context))
+    });
+    expect(await committed.json()).toMatchObject({ status: "committed", previous_revision: 268, new_revision: 269 });
+
+    const pending = await guard.fetch("https://project-guard.internal/execution-status?kind=transaction&request_id=TXN-PRJ0003-TASK-A02S2DEV-RETIRE-20260913T140200Z-L4T7");
+    expect(await pending.json()).toMatchObject({ status: "finalizing", terminal: false, code: "FINALIZATION_ADAPTER_UNAVAILABLE" });
+
+    const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
+    const record = await repository.readCommitRecord(projectId, 269);
+    if (!record) throw new Error("expected_task_complete_record");
+    const materialization: CompletedMaterializationRecord = {
+      schema_version: "1.0", project_id: projectId, target_revision: 269, projection_version: CURRENT_PROJECTION_VERSION,
+      record_kind: "snapshot", parent: null, chain_depth: 0, workspace_location: "active",
+      outputs: {}, removed_outputs: [], total_output_count: 0, result_root_hash: "a".repeat(64),
+      coalesced_revisions: [], source_event_id: record.event.event_id, completed_at: "2026-09-13T14:03:00.000Z"
+    };
+    await repository.writeCompletedMaterializationRecord(materialization);
+    await repository.writeMaterializationHead({
+      schema_version: "1.0", project_id: projectId, target_revision: 269, projection_version: CURRENT_PROJECTION_VERSION,
+      workspace_location: "active", record_path: machineMaterializationRecordPath(projectId, 269, CURRENT_PROJECTION_VERSION),
+      result_root_hash: materialization.result_root_hash, completed_at: materialization.completed_at
+    });
+    const writesBeforeFinalization = mock.uploadCalls.length;
+
+    const finalized = await guard.fetch("https://project-guard.internal/execution-status?kind=transaction&request_id=TXN-PRJ0003-TASK-A02S2DEV-RETIRE-20260913T140200Z-L4T7");
+    const execution = await finalized.json<{ finalization_ref: string }>();
+    expect(execution).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
+    expect(JSON.parse(mock.files.get(execution.finalization_ref) ?? "{}")).toMatchObject({
+      canonical_commit_ref: machineCommitRecordPath(projectId, 269),
+      receipt_ref: `${machineCommitRecordPath(projectId, 269)}#receipt`,
+      materialization_record_ref: machineMaterializationRecordPath(projectId, 269, CURRENT_PROJECTION_VERSION),
+      source_event_id: record.event.event_id,
+      result_root_hash: materialization.result_root_hash
+    });
+    expect(mock.uploadCalls.slice(writesBeforeFinalization).every((path) => path.includes("/executions/"))).toBe(true);
   });
 });

@@ -72,6 +72,27 @@ it("activates from canonical acceptance evidence through production wiring and e
   expect(f.mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${f.project}-qualification/WORKING/attachments/allowed.md`)).toBe("qualified content");
 });
 
+it("qualifies a corrected successor without activating its accepted unenforced predecessor", async () => {
+  const f = await fixture({ source_refs: ["generated-view:revision-112"] });
+  expect(await (await f.activate()).json()).toMatchObject({ error: "QUALIFICATION_SOURCE_UNVERIFIED" });
+  const original = JSON.parse(f.mock.files.get(globalGovernancePath)!).rules["RULE-PRODUCTION01@1"];
+  const rule = { ...f.rule, version: 2, supersedes: 1, source_refs: [machineCommitRecordPath(f.project, 2)] };
+  expect(await (await f.submit(governanceTx("rule.propose", { rule }, 2, "GLOBAL"))).json()).toMatchObject({ status: "committed" });
+  const acceptance = governanceTx("rule.accept", { rule_id: rule.rule_id, version: 2 }, 3, "GLOBAL");
+  expect(await (await f.submit(acceptance)).json()).toMatchObject({ status: "committed" });
+  const activate = (refs: string[]) => f.submit(governanceTx("rule.activate", { rule_id: rule.rule_id, version: 2, activation_evidence: refs }, 4, "GLOBAL"));
+  expect(await (await activate(["client:corrected-source-approved"])).json()).toMatchObject({ error: "QUALIFICATION_REFERENCE_UNVERIFIED" });
+  expect(await (await activate([`${globalGovernancePath}#transaction=${acceptance.transaction_id}`])).json()).toMatchObject({ status: "committed" });
+  const governance = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+  expect(governance.rules["RULE-PRODUCTION01@1"]).toEqual({ ...original, status: "superseded" });
+  expect(governance.rules["RULE-PRODUCTION01@1"].activation_evidence).toEqual([]);
+  expect(governance.rules["RULE-PRODUCTION01@2"].status).toBe("active");
+  const activations: any[] = Object.values(governance.journal).filter((entry: any) => entry.transaction.operation === "rule.activate" && entry.receipt.status === "committed");
+  expect(activations).toHaveLength(1);
+  expect(activations[0].transaction.payload.version).toBe(2);
+  expect(activations[0].qualification.proof.evidence.rule_version).toBe(2);
+});
+
 it("extends production enforcement data-only with cumulative global and local allowed_destination rules", async () => {
   const f = await fixture({
     resource_scope: { resource_types: ["artifact"], zones: ["WORKING", "ARTIFACTS", "RESEARCH"] },

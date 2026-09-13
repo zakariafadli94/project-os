@@ -220,7 +220,7 @@ export class RegistryGuard extends DurableObject<Env> {
   private async handleGovernanceTransaction(request: Request): Promise<Response> {
     const token = this.env.RULE_GOVERNANCE_TOKEN;
     const ordinaryAuthorities = [this.env.INGRESS_TOKEN, this.env.CONTROL_TOWER_OPERATOR_TOKEN,
-      this.env.INPUT_RECOVERY_OPERATOR_TOKEN, this.env.MUTATION_GATE_OPERATOR_TOKEN, this.env.MUTATION_CONTEXT_SIGNING_KEY];
+      this.env.INPUT_RECOVERY_OPERATOR_TOKEN, this.env.MUTATION_GATE_OPERATOR_TOKEN, this.env.MUTATION_CONTEXT_SIGNING_KEY, this.env.RULE_ADMISSION_SIGNING_KEY];
     if (!token || !token.trim() || ordinaryAuthorities.some(value => value && governanceTokenMatches(token, value)) || !governanceTokenMatches(request.headers.get("authorization") ?? "", `Bearer ${token}`)) {
       return Response.json({ error: "governance_authority_required" }, { status: 403 });
     }

@@ -322,10 +322,6 @@ export class ProjectGuard extends DurableObject<Env> {
 
       let reconciledState: ProjectState | null = null;
       if (this.layoutMode === "v2") {
-        const localState = this.loadState();
-        if (this.strictAdmissionEnabled(tx.project_id) && localState) {
-          await this.verifyAdmission(mutationContext, tx, localState);
-        }
         reconciledState = await this.reconcileCanonicalCommits();
         const reconciled = this.findReceipt(tx.transaction_id);
         if (reconciled) {

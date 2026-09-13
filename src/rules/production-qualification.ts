@@ -87,13 +87,23 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     catch (error) { if (error instanceof QualificationResolutionFailure) throw error; return fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Registry is malformed"); }
     if (!registry.projects.length || new Set(registry.projects.map(p => p.project_id)).size !== registry.projects.length) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Registry is empty or ambiguous");
     const states: ProjectState[] = [];
-    for (const project of registry.projects) {
+    // Archived projects are terminal: they cannot receive new admissions.
+    for (const project of registry.projects.filter(project => project.status !== "archived")) {
       try {
         const root = machineCommitRecordPath(project.project_id, 1).slice(0, -"REV-000001.json".length - 1);
         const entries = await list(root);
         const revisions = entries.map(entry => entry.kind === "file" && entry.path?.startsWith(`${root}/`) ? Number(entry.name.match(/^REV-([0-9]{6,})\.json$/)?.[1]) : NaN).sort((a, b) => a - b);
-        if (!revisions.length || revisions.some((revision, index) => revision !== index + 1)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Canonical commit history is missing or noncontiguous");
-        const commit = parseCanonicalCommitRecord(JSON.parse(await read(machineCommitRecordPath(project.project_id, revisions.at(-1)!), "QUALIFICATION_INVENTORY_UNAVAILABLE")));
+        // Migration may preserve only a contiguous suffix; never fabricate its missing prefix.
+        const firstRevision = revisions[0];
+        if (!revisions.length || revisions.some((revision, index) => !Number.isSafeInteger(revision) || revision < 1 || revision !== firstRevision + index)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Canonical commit history is missing or noncontiguous");
+        const readBoundCommit = async (revision: number) => {
+          const commit = parseCanonicalCommitRecord(JSON.parse(await read(machineCommitRecordPath(project.project_id, revision), "QUALIFICATION_INVENTORY_UNAVAILABLE")));
+          if (commit.project_id !== project.project_id || commit.new_revision !== revision || commit.previous_revision !== revision - 1) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Canonical commit does not match its project/revision address");
+          return commit;
+        };
+        const first = await readBoundCommit(firstRevision);
+        const latestRevision = revisions.at(-1)!;
+        const commit = latestRevision === firstRevision ? first : await readBoundCommit(latestRevision);
         const state = commit.state;
         if (state.project_id !== project.project_id || state.slug !== project.slug || state.status !== project.status) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Registry and canonical project identity differ");
         states.push(state);

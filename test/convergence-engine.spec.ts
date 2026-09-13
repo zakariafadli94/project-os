@@ -129,6 +129,57 @@ describe("convergence engine scheduling", () => {
     });
   });
 
+  it("supersedes a terminal older human active target before discovering a newer request", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-9272";
+    const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));
+    const records = commitFixture(projectId, 39);
+    const blockedRecord = records[36]!;
+    const requestedRecord = records[38]!;
+    const repository = new ProjectRepository(runtime, "v2");
+    await repository.writeCommitRecord(blockedRecord);
+    await repository.writeCommitRecord(requestedRecord);
+    const journal = new ConvergenceJournal(runtime, projectId);
+    const progress = initialProgress(projectId, "1970-01-01T00:00:00.000Z", "writer-1");
+    progress.canonical_observed_revision = 38;
+    progress.baseline_revision = 38;
+    progress.event_verified_through = 38;
+    progress.receipt_verified_through = 38;
+    progress.active = { revision: 37, projection_version: 4 };
+    progress.requested = { revision: 39, projection_version: 4 };
+    const blockedId = await sha256Canonical({ project_id: projectId, layer: "human_handoff", revision: 37 });
+    progress.obligations[blockedId] = {
+      id: blockedId, layer: "human_handoff", from_revision: 36,
+      target: { revision: 37, projection_version: 4 }, incident: 1,
+      state: "blocked", first_pending_at: "1970-01-01T00:00:00.000Z",
+      next_attempt_at: null, failure_count: 6, last_attempt_number: 673,
+      last_closed_attempt_number: 673, last_verified_at: null,
+      code: "identical_internal_failure_limit", lease_until: null, continuation: null,
+      internal_failure: { fingerprint: "c".repeat(64), progress_digest: "b".repeat(64), count: 6, verified_output_count: 0 }
+    };
+    await journal.save(progress, null);
+    const engine = new ConvergenceEngine({
+      projectId, repository, runtime, journal,
+      ledger: { attemptOutputs: () => new Map() } as never,
+      now: () => 0, enableHuman: true, discoveryMaxRecords: 1
+    });
+
+    await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
+
+    const checkpoint = await journal.load();
+    expect(checkpoint).toMatchObject({
+      progress: {
+        canonical_observed_revision: 39,
+        active: { revision: 39, projection_version: 4 },
+        requested: null,
+        obligations: {
+          [blockedId]: { state: "blocked", code: "identical_internal_failure_limit", last_attempt_number: 673 }
+        }
+      }
+    });
+    expect(checkpoint?.progress.obligations[blockedId]).toEqual(progress.obligations[blockedId]);
+  });
+
   it("emits a scrubbed metric snapshot when a convergence slice observes a commit", async () => {
     installDropboxMock();
     const runtime = persistenceFromDropbox(new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" }));

@@ -263,4 +263,64 @@ describe("canonical mutation-context admission", () => {
     expect(JSON.stringify(metrics)).not.toContain("Must refresh after advance");
     metricLog.mockRestore();
   });
+
+  it("reconciles a lagging V2 cache before verifying a newly issued context", async () => {
+    const projectId = "PRJ-9986";
+    const mock = installDropboxMock();
+    const records = seed(mock, projectId, 2);
+    const testEnv = strictEnv(projectId);
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+
+    // The public context reader discovers revision 2 from canonical commits,
+    // while this worker's durable SQL cache is still at revision 1.
+    await runInDurableObject(guard, (_instance, durableState) => {
+      durableState.storage.sql.exec(
+        "INSERT INTO project_state (singleton, state_json) VALUES (1, ?)",
+        JSON.stringify(records[0].state)
+      );
+    });
+    const contextResponse = await readContext(projectId, testEnv);
+    const { context } = await contextResponse.json<MutationContextResponse>();
+    expect(context).toMatchObject({ project_id: projectId, canonical_revision: 2 });
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
+
+    const headers = { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" };
+    const fresh = {
+      schema_version: "1.0" as const,
+      transaction_id: "TXN-CONTEXT-9986-FRESH-0001",
+      project_id: projectId,
+      base_revision: 2,
+      operation: "research.add" as const,
+      created_at: "2026-09-09T10:00:00.000Z",
+      payload: { research_id: "RES-CONTEXT9986", title: "Fresh after catch-up", body: "Fresh context must verify against reconciled state." }
+    };
+    const accepted = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST", headers, body: JSON.stringify(encodeAdmission(fresh, context))
+    }), testEnv, createExecutionContext());
+    expect(accepted.status).toBe(200);
+    await expect(accepted.json()).resolves.toMatchObject({ status: "committed", previous_revision: 2, new_revision: 3 });
+
+    const stale = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(encodeAdmission({ ...fresh, transaction_id: "TXN-CONTEXT-9986-STALE-0001", payload: { ...fresh.payload, research_id: "RES-CONTEXT9986S" } }, context))
+    }), testEnv, createExecutionContext());
+    expect(stale.status).toBe(409);
+    await expect(stale.json()).resolves.toEqual({ error: "mutation_context_stale" });
+
+    const refreshed = await readContext(projectId, testEnv);
+    const { context: current } = await refreshed.json<MutationContextResponse>();
+    const tampered = {
+      ...current,
+      actor: { ...current.actor, actor_id: "client-spoofed-actor" }
+    };
+    const rejected = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(encodeAdmission({ ...fresh, transaction_id: "TXN-CONTEXT-9986-TAMPER-0001", base_revision: 3, payload: { ...fresh.payload, research_id: "RES-CONTEXT9986T" } }, tampered))
+    }), testEnv, createExecutionContext());
+    expect(rejected.status).toBe(428);
+    await expect(rejected.json()).resolves.toEqual({ error: "mutation_context_invalid" });
+    expect(mock.files.has(machineCommitRecordPath(projectId, 4))).toBe(false);
+  });
 });

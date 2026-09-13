@@ -12,6 +12,7 @@ import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "./doma
 import { countProjectInputFiles } from "./documents/input-recovery";
 import type { Receipt } from "./domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "./domain/transaction";
+import { globalGovernanceTransactionSchema, type GlobalGovernanceTransaction } from "./domain/rule-governance";
 import {
   artifactInboxPath,
   inboxPath,
@@ -53,6 +54,28 @@ const worker = {
 
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({ status: "ok" });
+    }
+
+    if ((request.method === "POST" && url.pathname === "/v1/rule-governance/transactions") ||
+        (request.method === "GET" && url.pathname === "/v1/rule-governance")) {
+      if (!governanceAuthorized(request, env)) return Response.json({ error: "governance_authority_required" }, { status: 403 });
+      let transaction: GlobalGovernanceTransaction | undefined;
+      if (request.method === "POST") {
+        try { transaction = globalGovernanceTransactionSchema.parse(await request.json()); }
+        catch { return Response.json({ error: "invalid_governance_transaction" }, { status: 400 }); }
+      }
+      try {
+        const response = await env.REGISTRY_GUARD.getByName("global").fetch(
+          `https://registry-guard.internal/governance${transaction ? "/transaction" : ""}`,
+          { method: request.method, headers: { "content-type": "application/json", authorization: request.headers.get("authorization")! },
+            ...(transaction ? { body: JSON.stringify(transaction) } : {}) }
+        );
+        const headers = new Headers(response.headers);
+        headers.set("cache-control", "no-store");
+        return new Response(response.body, { status: response.status, headers });
+      } catch {
+        return Response.json({ error: "governance_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+      }
     }
 
     if (request.method === "GET" && url.pathname === "/v1/admin/continuity") {
@@ -884,6 +907,15 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
 
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return summary;
+}
+
+function governanceAuthorized(request: Request, env: Env): boolean {
+  const token = env.RULE_GOVERNANCE_TOKEN;
+  const ordinaryAuthorities = [env.INGRESS_TOKEN, env.CONTROL_TOWER_OPERATOR_TOKEN,
+    env.INPUT_RECOVERY_OPERATOR_TOKEN, env.MUTATION_GATE_OPERATOR_TOKEN, env.MUTATION_CONTEXT_SIGNING_KEY, env.RULE_ADMISSION_SIGNING_KEY];
+  return typeof token === "string" && token.trim().length > 0 &&
+    !ordinaryAuthorities.some(value => value && secureStringEqual(token, value)) &&
+    secureStringEqual(request.headers.get("authorization") ?? "", `Bearer ${token}`);
 }
 
 function authorized(request: Request, env: Env): boolean {

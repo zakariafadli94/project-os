@@ -43,7 +43,7 @@ describe("RegistryGuard global governance", () => {
     expect(await response.json()).toMatchObject({ error: "governance_unavailable" });
     expect((await submit(governanceTx("rule.propose", { rule: ruleFixture("GLOBAL", { rule_id: "RULE-NOT-NEW" }) }, 0, "GLOBAL"))).status).toBe(503);
   });
-  it.each(["CONTROL_TOWER_OPERATOR_TOKEN", "INPUT_RECOVERY_OPERATOR_TOKEN", "MUTATION_GATE_OPERATOR_TOKEN", "MUTATION_CONTEXT_SIGNING_KEY"] as const)("refuses shared authority with %s", async (binding) => {
+  it.each(["CONTROL_TOWER_OPERATOR_TOKEN", "INPUT_RECOVERY_OPERATOR_TOKEN", "MUTATION_GATE_OPERATOR_TOKEN", "MUTATION_CONTEXT_SIGNING_KEY", "RULE_ADMISSION_SIGNING_KEY"] as const)("refuses shared authority with %s", async (binding) => {
     await configure(authority);
     const previous = await runInDurableObject(stub(), instance => {
       const bindings = (instance as unknown as { env: Env }).env;

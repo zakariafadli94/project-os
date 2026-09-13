@@ -103,7 +103,8 @@ export function applyRuleGovernance(state: RuleGovernanceState, tx: Command, pro
       if (rule.supersedes !== undefined) {
         const priorKey = ruleVersionKey(rule.rule_id, rule.supersedes);
         const prior = next.rules[priorKey];
-        if (!prior || prior.version >= rule.version || prior.status !== "active" || !scopeMatches(prior.scope, project)) return reject("INVALID_RULE_VERSION", "Activation must supersede the exact active predecessor");
+        if (!prior || prior.version >= rule.version || !["active", "accepted_unenforced"].includes(prior.status) || !scopeMatches(prior.scope, project)) return reject("INVALID_RULE_VERSION", "Activation must supersede the exact active or accepted unenforced predecessor");
+        if (Object.values(next.rules).some(item => item.rule_id === rule.rule_id && item.status === "active" && item.version !== prior.version)) return reject("INVALID_RULE_VERSION", "Activation cannot bypass another active version");
         next.rules[priorKey] = { ...prior, status: "superseded" };
       } else if (Object.values(next.rules).some(item => item.rule_id === rule.rule_id && item.status === "active")) {
         return reject("INVALID_RULE_VERSION", "Activation cannot implicitly override an active version");

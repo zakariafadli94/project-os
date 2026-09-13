@@ -4,6 +4,7 @@ import { parseTransaction } from "../src/domain/transaction";
 import type { ProjectState } from "../src/domain/project-state";
 import { readProjectState, encodeProjectState } from "../src/schema/project-state";
 import { exceptionFixture, governanceTx, ruleFixture } from "./helpers/rule-fixtures";
+import { applyRuleGovernance, globalGovernanceTransactionSchema, type RuleGovernanceState } from "../src/domain/rule-governance";
 
 function transition(state: ProjectState, operation: string, payload: unknown, revision = state.revision) {
   return applyTransaction(state, parseTransaction(governanceTx(operation, payload, revision)));
@@ -24,6 +25,41 @@ function active(overrides: Record<string, unknown> = {}) {
 }
 
 describe("canonical rule governance", () => {
+  it.each(["GLOBAL", "PRJ-7101"])("supersedes an accepted unenforced predecessor without activating it: %s", project => {
+    let state: RuleGovernanceState = { rules: {}, exceptions: {} };
+    const step = (operation: string, payload: unknown) => {
+      const tx = governanceTx(operation, payload, 0, project);
+      const parsed = project === "GLOBAL" ? globalGovernanceTransactionSchema.parse(tx) : parseTransaction(tx);
+      const result = applyRuleGovernance(state, parsed as Parameters<typeof applyRuleGovernance>[1], project);
+      expect(result.kind).toBe("commit");
+      if (result.kind !== "commit") throw new Error(JSON.stringify(result));
+      state = result.state;
+    };
+    step("rule.propose", { rule: ruleFixture(project, { source_refs: ["wrong-view-revision"] }) });
+    step("rule.accept", { rule_id: "RULE-7101", version: 1 });
+    const original = structuredClone(state.rules["RULE-7101@1"]);
+    step("rule.propose", { rule: ruleFixture(project, { version: 2, supersedes: 1, source_refs: ["exact-decision-accept-commit"] }) });
+    step("rule.accept", { rule_id: "RULE-7101", version: 2 });
+    step("rule.activate", { rule_id: "RULE-7101", version: 2, activation_evidence: ["qualified-successor"] });
+    expect(state.rules["RULE-7101@1"]).toEqual({ ...original, status: "superseded" });
+    expect(state.rules["RULE-7101@1"].activation_evidence).toEqual([]);
+    expect(state.rules["RULE-7101@2"]).toMatchObject({ status: "active", source_refs: ["exact-decision-accept-commit"] });
+    expect(original.status).toBe("accepted_unenforced");
+  });
+  it.each(["draft", "retired", "superseded"])("never bypasses an ineligible predecessor: %s", status => {
+    let state = commit(accepted(), "rule.propose", { rule: ruleFixture("PRJ-7101", { version: 2, supersedes: 1 }) });
+    state = commit(state, "rule.accept", { rule_id: "RULE-7101", version: 2 });
+    state.local_rules["RULE-7101@1"].status = status as "draft" | "retired" | "superseded";
+    expect(transition(state, "rule.activate", { rule_id: "RULE-7101", version: 2, activation_evidence: ["q"] })).toMatchObject({ kind: "rejected", code: "INVALID_RULE_VERSION" });
+  });
+  it("does not use an accepted intermediate version to bypass a still-active older version", () => {
+    let state = commit(active(), "rule.propose", { rule: ruleFixture("PRJ-7101", { version: 2, supersedes: 1 }) });
+    state = commit(state, "rule.accept", { rule_id: "RULE-7101", version: 2 });
+    state = commit(state, "rule.propose", { rule: ruleFixture("PRJ-7101", { version: 3, supersedes: 2 }) });
+    state = commit(state, "rule.accept", { rule_id: "RULE-7101", version: 3 });
+    expect(transition(state, "rule.activate", { rule_id: "RULE-7101", version: 3, activation_evidence: ["q"] })).toMatchObject({ kind: "rejected", code: "INVALID_RULE_VERSION" });
+    expect(state.local_rules["RULE-7101@1"].status).toBe("active");
+  });
   it("canonicalizes duplicate and differently ordered normalized operations", () => {
     const rule = ruleFixture("PRJ-7101", { operations: ["task.start", "deliverable.create", "task.start"] });
     const proposed = parseTransaction(governanceTx("rule.propose", { rule }));

@@ -1,11 +1,11 @@
 import { env } from "cloudflare:workers";
-import { createExecutionContext, runInDurableObject } from "cloudflare:test";
+import { createExecutionContext, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/env";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 import { governanceTx, ruleFixture } from "./helpers/rule-fixtures";
-import { globalGovernancePath, RuleGovernanceRepository } from "../src/persistence/rule-governance-repository";
+import { globalGovernanceBootstrapPath, globalGovernancePath, RuleGovernanceRepository } from "../src/persistence/rule-governance-repository";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { applyRuleGovernance } from "../src/domain/rule-governance";
 import { eventIdForRevision } from "../src/domain/event";
@@ -61,8 +61,8 @@ async function qualifyViaCommitInventory(f: Awaited<ReturnType<typeof fixture>>)
   });
 }
 
-async function reviewInventoryFixture(filesPerProject: number) {
-  const f = await fixture({ resource_scope: { resource_types: ["artifact"], zones: ["REVIEW"] }, parameters: { allowed_zones: ["REVIEW"] } });
+async function reviewInventoryFixture(filesPerProject: number, faults: DropboxMockFault[] = []) {
+  const f = await fixture({ resource_scope: { resource_types: ["artifact"], zones: ["REVIEW"] }, parameters: { allowed_zones: ["REVIEW"] } }, false, faults);
   const registry = JSON.parse(f.mock.files.get(machineRegistryJsonPath())!);
   for (const project_id of ["PRJ-0002", "PRJ-0003", "PRJ-0007"]) {
     registry.projects.push({ project_id, slug: "synthetic-convergence", status: "active" });
@@ -86,16 +86,23 @@ async function reviewInventoryFixture(filesPerProject: number) {
   return { ...f, roots: roots as string[] };
 }
 
-async function interceptProjectStateReads(f: Awaited<ReturnType<typeof fixture>>, run: () => Promise<void>, alter?: (body: any) => Promise<void>) {
+async function interceptProjectStateReads(f: Awaited<ReturnType<typeof fixture>>, run: () => Promise<void>, alter?: (body: any) => Promise<void>, budget?: { used: number; limit: number }) {
   const namespace = f.environment.PROJECT_GUARD;
   const metrics = { calls: 0, delegatedHttpCalls: 0, maxDelegatedHttpCalls: 0 };
+  const outbound = vi.mocked(fetch).getMockImplementation()!;
+  let childDepth = 0;
+  const spend = () => { if (budget && ++budget.used > budget.limit) throw new Error("Too many subrequests"); };
+  if (budget) vi.mocked(fetch).mockImplementation((input, init) => { if (!childDepth) spend(); return outbound(input, init); });
   await runInDurableObject(f.registry, instance => {
     (instance as any).env.PROJECT_GUARD = { getByName(projectId: string) {
       const stub = namespace.getByName(projectId);
       return { fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         metrics.calls++;
+        spend();
         const before = f.mock.calls.length;
-        const response = await stub.fetch(input, init);
+        childDepth++;
+        let response: Response;
+        try { response = await stub.fetch(input, init); } finally { childDepth--; }
         const count = f.mock.calls.length - before;
         metrics.delegatedHttpCalls += count;
         metrics.maxDelegatedHttpCalls = Math.max(metrics.maxDelegatedHttpCalls, count);
@@ -106,9 +113,83 @@ async function interceptProjectStateReads(f: Awaited<ReturnType<typeof fixture>>
       } };
     } };
   });
-  try { await run(); } finally { await runInDurableObject(f.registry, instance => { (instance as any).env.PROJECT_GUARD = namespace; }); }
+  try { await run(); } finally {
+    await runInDurableObject(f.registry, instance => { (instance as any).env.PROJECT_GUARD = namespace; });
+    if (budget) vi.mocked(fetch).mockImplementation(outbound);
+  }
   return metrics;
 }
+
+it.each(["acknowledged", "lost_ack"])("returns the committed v2 receipt with recovery headroom for the entire cold four-project activation: %s", async outcome => {
+  const faults: DropboxMockFault[] = [];
+  const f = await reviewInventoryFixture(40, faults);
+  const rule = { ...f.rule, version: 2, supersedes: 1 };
+  expect(await (await f.submit(governanceTx("rule.propose", { rule }, 2, "GLOBAL"))).json()).toMatchObject({ status: "committed" });
+  const accept = governanceTx("rule.accept", { rule_id: rule.rule_id, version: 2 }, 3, "GLOBAL");
+  expect(await (await f.submit(accept)).json()).toMatchObject({ status: "committed" });
+  await evictDurableObject(f.registry);
+  await runInDurableObject(f.registry, instance => Object.assign((instance as any).env, f.environment));
+  if (outcome === "lost_ack") faults.push({ endpoint: "/2/files/upload", path: globalGovernancePath, occurrence: 1, phase: "after", status: 409, error_summary: "conflict/lost-ack" });
+  const budget = { used: 0, limit: 50 };
+  await interceptProjectStateReads(f, async () => {
+    const tx = governanceTx("rule.activate", { rule_id: rule.rule_id, version: 2, activation_evidence: [`${globalGovernancePath}#transaction=${accept.transaction_id}`] }, 4, "GLOBAL");
+    const response = await f.submit(tx);
+    expect(response.status).toBe(200);
+    const receipt = await response.json();
+    expect(receipt).toMatchObject({ status: "committed", new_revision: 5 });
+    const canonical = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+    expect(canonical.journal[tx.transaction_id].receipt).toEqual(receipt);
+  }, undefined, budget);
+  expect(budget.used, "Includes OAuth, delegated calls, final canonical write/recovery and return").toBeLessThanOrEqual(outcome === "lost_ack" ? 49 : 43);
+});
+
+it.each(["unread_bootstrap_missing", "changed_initial_transaction", "wrong_token_bootstrap_missing", "consumed_read"])("verifies initialization before publishing when no exact read proof authorizes the write: %s", async fault => {
+  const f = await fixture();
+  const runtime = createProductionPersistence(f.environment);
+  const repository = new RuleGovernanceRepository(runtime);
+  let state = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+  let token = (await runtime.objects.getMetadata(globalGovernancePath))!.revisionToken!;
+  if (fault === "unread_bootstrap_missing") f.mock.files.delete(globalGovernanceBootstrapPath);
+  else {
+    const verified = (await repository.read())!;
+    state = structuredClone(verified.state); token = verified.token;
+    if (fault === "changed_initial_transaction") {
+      const initial = Object.values(state.journal)[0] as any;
+      initial.transaction.payload.rule.source_refs = ["changed-initial-authority"];
+      initial.event.payload = structuredClone(initial.transaction.payload);
+      state.rules["RULE-PRODUCTION01@1"].source_refs = ["changed-initial-authority"];
+    } else {
+      if (fault === "consumed_read") await repository.write(state, token);
+      else await f.mock.writeExternal(globalGovernancePath, f.mock.files.get(globalGovernancePath)!);
+      token = (await runtime.objects.getMetadata(globalGovernancePath))!.revisionToken!;
+      f.mock.files.delete(globalGovernanceBootstrapPath);
+    }
+  }
+  const before = f.mock.files.get(globalGovernancePath);
+  const uploads = f.mock.uploadCalls.length;
+  await expect(repository.write(state, token)).rejects.toThrow(/initialization evidence/);
+  expect(f.mock.uploadCalls.slice(uploads)).toEqual([]);
+  expect(f.mock.files.get(globalGovernancePath)).toBe(before);
+});
+
+it("does not turn an acknowledged canonical activation into unavailable by reading bootstrap afterwards", async () => {
+  const f = await fixture();
+  const outbound = vi.mocked(fetch).getMockImplementation()!;
+  let acknowledged = false;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    if (acknowledged) throw new Error("Too many subrequests after canonical acknowledgement");
+    const request = new Request(input, init);
+    const response = await outbound(input, init);
+    if (request.url.endsWith("/2/files/upload") && JSON.parse(request.headers.get("Dropbox-API-Arg") ?? "{}").path === globalGovernancePath && response.ok) acknowledged = true;
+    return response;
+  });
+  const response = await f.activate();
+  const body = await response.json() as any;
+  expect.soft(body).toMatchObject({ status: "committed", new_revision: 3 });
+  const canonical = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+  expect(canonical.revision).toBe(3);
+  expect(Object.values(canonical.journal).some((entry: any) => entry.transaction.operation === "rule.activate" && entry.receipt.status === "committed")).toBe(true);
+});
 
 it("keeps four-project qualification I/O independent of the number of REVIEW files", async () => {
   const counts: number[] = [];

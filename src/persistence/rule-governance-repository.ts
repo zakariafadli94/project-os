@@ -25,6 +25,7 @@ const receiptSchema = z.strictObject({
 
 /** One conditional canonical object keeps state, history and receipts in the same commit boundary. */
 export class RuleGovernanceRepository {
+  private verifiedBootstrap: { canonicalToken: string; initialTransaction: string } | null = null;
   constructor(private readonly runtime: ProjectOsPersistenceRuntime) {}
 
   /** Absence is usable only before any canonical initialization evidence exists. Read faults propagate. */
@@ -76,6 +77,7 @@ export class RuleGovernanceRepository {
   }
 
   async read(): Promise<{ state: CanonicalGovernance; token: string } | null> {
+    this.verifiedBootstrap = null;
     const before = await this.runtime.objects.getMetadata(globalGovernancePath);
     if (!before) return null;
     if (!before.revisionToken) throw new Error("Global governance revision token missing");
@@ -84,21 +86,36 @@ export class RuleGovernanceRepository {
     if (text === null || !after || before.revisionToken !== after.revisionToken) throw new ProviderConflictError("Global governance changed during read");
     const state = await parseCanonicalGovernance(JSON.parse(text));
     await this.confirmBootstrap(state);
+    this.verifiedBootstrap = { canonicalToken: before.revisionToken, initialTransaction: JSON.stringify(Object.values(state.journal)[0].transaction) };
     return { state, token: before.revisionToken };
   }
 
   async write(state: CanonicalGovernance, expectedToken: string | null): Promise<void> {
-    const content = JSON.stringify(await parseCanonicalGovernance(state));
-    if (expectedToken === null) await this.ensureBootstrapIntent(Object.values(state.journal)[0].transaction);
-    try {
-      if (expectedToken === null) await this.runtime.objects.createText(globalGovernancePath, content);
-      else await this.runtime.conditionalWrite.writeTextConditional(globalGovernancePath, content, expectedToken);
-    } catch (error) {
-      // A provider failure after upload is ambiguous: only exact durable content proves success.
-      const durable = await this.read();
-      if (!durable || JSON.stringify(durable.state) !== content) throw error;
+    const verified = this.verifiedBootstrap;
+    this.verifiedBootstrap = null;
+    const canonical = await parseCanonicalGovernance(state);
+    const content = JSON.stringify(canonical);
+    const initial = Object.values(canonical.journal)[0]?.transaction;
+    if (expectedToken === null) await this.ensureBootstrapIntent(initial!);
+    else if (!verified || verified.canonicalToken !== expectedToken || verified.initialTransaction !== JSON.stringify(initial)) {
+      // Validate before publication when this write cannot consume an exact verified read.
+      await this.confirmBootstrap(canonical);
     }
-    await this.confirmBootstrap(state);
+    try {
+      try {
+        if (expectedToken === null) await this.runtime.objects.createText(globalGovernancePath, content);
+        else await this.runtime.conditionalWrite.writeTextConditional(globalGovernancePath, content, expectedToken);
+      } catch (error) {
+        // A provider failure after upload is ambiguous: only exact durable content proves success.
+        const durable = await this.read();
+        if (!durable || JSON.stringify(durable.state) !== content) throw error;
+      }
+      // Only first initialization still needs a post-create bootstrap transition.
+      // Established writes return immediately after their canonical ACK/recovery.
+      if (expectedToken === null) await this.confirmBootstrap(canonical);
+    } finally {
+      this.verifiedBootstrap = null;
+    }
   }
 }
 

@@ -1139,6 +1139,22 @@ export class ProjectGuard extends DurableObject<Env> {
 
     let recoveredCanonicalState = false;
     let state = this.loadState();
+    if (state && state.revision > 0) {
+      // A local SQL row is only a cache.  A context is issued from immutable
+      // commits, so a cache that claims the same revision must still agree
+      // with that commit before it can be used for admission or intent work.
+      const currentRecord = await this.repository.readCommitRecord(projectId, state.revision);
+      if (currentRecord) {
+        if (currentRecord.previous_revision !== state.revision - 1) {
+          throw new Error(`Canonical commit record for ${projectId} revision ${state.revision} is not revision-contiguous`);
+        }
+        if (await sha256Canonical(state) !== await sha256Canonical(currentRecord.state)) {
+          await this.recoverCommittedRecord(currentRecord);
+          state = currentRecord.state;
+          recoveredCanonicalState = true;
+        }
+      }
+    }
     if (!state) {
       const snapshot = await this.repository.readProjectState(projectId);
       if (snapshot) {

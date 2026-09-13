@@ -323,4 +323,46 @@ describe("canonical mutation-context admission", () => {
     await expect(rejected.json()).resolves.toEqual({ error: "mutation_context_invalid" });
     expect(mock.files.has(machineCommitRecordPath(projectId, 4))).toBe(false);
   });
+
+  it("rebuilds a same-revision divergent V2 cache before verifying a fresh context", async () => {
+    const projectId = "PRJ-9987";
+    const mock = installDropboxMock();
+    const records = seed(mock, projectId, 2);
+    const testEnv = strictEnv(projectId);
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const divergentState = structuredClone(records[1].state);
+    divergentState.research = {};
+
+    // The public reader reconstructs the immutable revision-2 commit, while
+    // the local SQL cache claims revision 2 with different state content.
+    await runInDurableObject(guard, (_instance, durableState) => {
+      durableState.storage.sql.exec(
+        "INSERT INTO project_state (singleton, state_json) VALUES (1, ?)",
+        JSON.stringify(divergentState)
+      );
+    });
+    const contextResponse = await readContext(projectId, testEnv);
+    const { context } = await contextResponse.json<MutationContextResponse>();
+    expect(context).toMatchObject({ project_id: projectId, canonical_revision: 2 });
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
+
+    const transaction = {
+      schema_version: "1.0" as const,
+      transaction_id: "TXN-CONTEXT-9987-FRESH-0001",
+      project_id: projectId,
+      base_revision: 2,
+      operation: "research.add" as const,
+      created_at: "2026-09-09T10:00:00.000Z",
+      payload: { research_id: "RES-CONTEXT9987", title: "Rebuilt canonical cache", body: "Fresh context must use the immutable canonical state." }
+    };
+    const accepted = await worker.fetch(new Request("https://example.com/v1/transactions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(encodeAdmission(transaction, context))
+    }), testEnv, createExecutionContext());
+
+    expect(accepted.status).toBe(200);
+    await expect(accepted.json()).resolves.toMatchObject({ status: "committed", previous_revision: 2, new_revision: 3 });
+    expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(true);
+  });
 });

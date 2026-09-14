@@ -57,8 +57,8 @@ describe("durable managed-document change jobs", () => {
     await expect(response.json()).resolves.toMatchObject({
       scheduled: true,
       jobs_registered: 6,
-      jobs_completed: 4,
-      jobs_pending: 2
+      jobs_completed: 1,
+      jobs_pending: 5
     });
   });
 

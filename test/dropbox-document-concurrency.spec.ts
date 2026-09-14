@@ -146,6 +146,27 @@ describe("Dropbox managed-document concurrency primitives", () => {
     expect(page.entries).toHaveLength(1);
   });
 
+  it("returns one bounded provider page instead of draining the complete change backlog", async () => {
+    let calls = 0;
+    mockTokenAnd(async (request) => {
+      calls += 1;
+      expect(new URL(request.url).pathname).toBe("/2/files/list_folder");
+      expect(JSON.parse(await request.text())).toMatchObject({
+        path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-project",
+        recursive: true,
+        include_deleted: true,
+        limit: 32
+      });
+      return Response.json({ entries: [metadata], cursor: "cursor-next-page", has_more: true });
+    });
+
+    const page = await client().listFolderChanges("/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0003-project");
+
+    expect(calls).toBe(1);
+    expect(page.cursor).toBe("cursor-next-page");
+    expect(page.entries).toHaveLength(1);
+  });
+
   it("surfaces Dropbox cursor reset as a distinct rebuild signal", async () => {
     mockTokenAnd(() => new Response(JSON.stringify({ error_summary: "reset/" }), {
       status: 409,

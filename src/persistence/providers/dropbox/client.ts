@@ -446,38 +446,30 @@ export class DropboxClient implements DropboxTransport {
       throw new Error("Dropbox change listing requires exactly one of root or cursor");
     }
     const token = await this.accessToken();
-    const entries: DropboxChangeEntry[] = [];
-    let response = cursor
+    const response = cursor
       ? await this.listFolderContinueRequest(token, cursor)
       : await this.listFolderChangeRequest(token, root!);
-    let currentCursor = cursor ?? "";
-
-    for (;;) {
-      const text = await response.text();
-      if (!response.ok) {
-        if (response.status === 409 && text.includes("reset")) {
-          throw new DropboxCursorResetError(
-            "Dropbox change cursor must be rebuilt",
-            response.headers.get("x-dropbox-request-id"),
-            text
-          );
-        }
-        if (response.status === 409 && text.includes("not_found") && root) {
-          return { entries: [], cursor: currentCursor };
-        }
-        throw this.errorFromResponse("Dropbox change listing failed", response, text);
+    const text = await response.text();
+    if (!response.ok) {
+      if (response.status === 409 && text.includes("reset")) {
+        throw new DropboxCursorResetError(
+          "Dropbox change cursor must be rebuilt",
+          response.headers.get("x-dropbox-request-id"),
+          text
+        );
       }
-
-      const parsed = JSON.parse(text) as {
-        entries: RawDropboxMetadata[];
-        cursor: string;
-        has_more: boolean;
-      };
-      currentCursor = parsed.cursor;
-      entries.push(...parsed.entries.map(parseChangeEntry));
-      if (!parsed.has_more) return { entries, cursor: currentCursor };
-      response = await this.listFolderContinueRequest(token, currentCursor);
+      if (response.status === 409 && text.includes("not_found") && root) {
+        return { entries: [], cursor: cursor ?? "" };
+      }
+      throw this.errorFromResponse("Dropbox change listing failed", response, text);
     }
+
+    const parsed = JSON.parse(text) as {
+      entries: RawDropboxMetadata[];
+      cursor: string;
+      has_more: boolean;
+    };
+    return { entries: parsed.entries.map(parseChangeEntry), cursor: parsed.cursor };
   }
 
   private async uploadRequest(
@@ -539,7 +531,7 @@ export class DropboxClient implements DropboxTransport {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ path: root, recursive: true, include_deleted: true })
+      body: JSON.stringify({ path: root, recursive: true, include_deleted: true, limit: 32 })
     }, root);
   }
 

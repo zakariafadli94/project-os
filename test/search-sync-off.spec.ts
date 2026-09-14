@@ -149,7 +149,7 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE real off environment", () => {
         getByName: (projectId: string) => ({
           fetch: async (input: RequestInfo | URL) => {
             const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
-            if (url.pathname === "/reconcile-materialization") {
+            if (url.pathname === "/scheduled-reconcile-materialization") {
               return maintenanceEnv.MATERIALIZATION_GUARD.getByName(projectId).fetch(
                 "https://materialization-guard.internal/reconcile",
                 { method: "POST" }

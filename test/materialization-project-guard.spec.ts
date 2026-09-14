@@ -239,4 +239,20 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(dropbox.files.has(machineCommitRecordPath(projectId, 2))).toBe(false);
     await materializeThroughContinuations(projectId);
   });
+
+  it("keeps the fleet wake distinct from a typed business repair when the runtime supplies an empty body", async () => {
+    const projectId = "PRJ-3606";
+    await createSyntheticProject(projectId, "fleet-empty-body", "TXN-MATERIAL-PG-3606-CREATE");
+
+    const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
+      "https://project-guard.internal/reconcile-materialization",
+      {
+        method: "POST",
+        headers: { "x-project-os-maintenance": "fleet-materialization-reconcile" },
+        body: " "
+      }
+    );
+
+    expect(response.status).toBe(200);
+  });
 });

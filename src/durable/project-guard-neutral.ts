@@ -1227,7 +1227,8 @@ export class ProjectGuard extends DurableObject<Env> {
       if (!projectId || projectId === AUTO_PROJECT_ID) return Response.json({ error: "project_not_initialized" }, { status: 404 });
       const state = await this.loadOrRecoverState();
       if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
-      if (operation === "project.repair" && body) {
+      const fleetReconcile = request.headers.get("x-project-os-maintenance") === "fleet-materialization-reconcile";
+      if (operation === "project.repair" && body && !fleetReconcile) {
         return this.handleTypedRepair(new Request(request.url, { method: "POST", body }), state);
       }
       const normalized = await normalizeSystemAdmission(

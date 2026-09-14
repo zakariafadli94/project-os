@@ -520,6 +520,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       }
     );
     if (!response.ok) throw new Error(`ProjectGuard finalization notification returned ${response.status}`);
+    await this.acknowledgeVerifiedHumanHead(head.target_revision);
   }
 
   /**

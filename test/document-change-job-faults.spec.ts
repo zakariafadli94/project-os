@@ -36,6 +36,32 @@ async function createProject(transactionId: string, slug: string): Promise<Recei
 describe("durable managed-document change jobs", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("bounds a scheduled document slice and leaves durable work for the next cron", async () => {
+    const mock = installDropboxMock();
+    const slug = "scheduled-document-budget";
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-SCHEDULED-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
+    for (let index = 0; index < 6; index += 1) {
+      await mock.writeExternal(`${root}/INPUTS/scheduled-${index}.pdf`, `%PDF scheduled ${index}`);
+    }
+
+    const response = await guard.fetch(
+      "https://project-guard.internal/reconcile-documents?scheduled=1",
+      { method: "POST" }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      scheduled: true,
+      jobs_registered: 6,
+      jobs_completed: 4,
+      jobs_pending: 2
+    });
+  });
+
   it("advances the provider cursor after durable registration while isolating a failed job from a healthy sibling", async () => {
     const faults: DropboxMockFault[] = [];
     const mock = installDropboxMock({ faults });

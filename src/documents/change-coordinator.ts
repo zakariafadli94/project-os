@@ -36,6 +36,7 @@ import {
 } from "./stable-work-product-reconciler";
 
 const LEGACY_CURSOR_KEY = "managed-document-change-cursor-v1";
+export const SCHEDULED_DOCUMENT_JOB_LIMIT = 4;
 
 export interface ManagedDocumentCursorStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -142,7 +143,8 @@ export class ManagedDocumentChangeCoordinator {
 
     // Retry durable work first. A failed job remains pending, but never prevents
     // healthy siblings or later provider pages from being durably registered.
-    await this.drainPending(state, summary);
+    const jobLimit = options.scheduled ? SCHEDULED_DOCUMENT_JOB_LIMIT : 256;
+    await this.drainPending(state, summary, jobLimit);
 
     const root = workspaceProjectRoot(state.project_id, state.slug);
     let existingCursor = this.jobs.cursor();
@@ -181,7 +183,8 @@ export class ManagedDocumentChangeCoordinator {
 
     // The cursor now represents only work that has already been journaled in
     // the ProjectGuard SQLite store. Execution may fail safely after this point.
-    await this.drainPending(state, summary);
+    const remainingJobBudget = Math.max(0, jobLimit - summary.jobs_completed - summary.job_failures);
+    if (remainingJobBudget > 0) await this.drainPending(state, summary, remainingJobBudget);
     summary.jobs_pending = this.jobs.pendingCount();
     if (options.scheduled && summary.jobs_pending === 0 && summary.job_failures === 0) {
       const completedAt = options.now ?? new Date().toISOString();
@@ -267,10 +270,14 @@ export class ManagedDocumentChangeCoordinator {
     return this.bootstrapCandidate(state, change)?.priority ?? 10;
   }
 
-  private async drainPending(state: ProjectState, summary: ManagedDocumentChangeSummary): Promise<void> {
+  private async drainPending(
+    state: ProjectState,
+    summary: ManagedDocumentChangeSummary,
+    limit = 256
+  ): Promise<void> {
     const jobs = this.jobs;
     if (!jobs) return;
-    const pending = jobs.pending();
+    const pending = jobs.pending(limit);
     for (const job of pending) {
       try {
         await this.processJob(state, job, summary);

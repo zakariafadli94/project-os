@@ -165,7 +165,7 @@ describe("durable governed execution", () => {
   it("refuses unsupported families' finalization without a postcheck adapter", async () => {
     const { journal } = setup();
     await journal.commit(admission(), null);
-    expect(await journal.status()).toMatchObject({ status: "committed", terminal: false, code: "FINALIZATION_ADAPTER_UNAVAILABLE" });
+    expect(await journal.status()).toMatchObject({ status: "committed", terminal: false, code: "MATERIALIZATION_PENDING" });
   });
 
   it("a stopped operation can resume after new verified progress, never merely because time passed", async () => {

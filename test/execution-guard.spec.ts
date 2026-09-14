@@ -19,6 +19,7 @@ import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/ca
 import { encodeAdmission } from "../src/admission/transport";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
+import { ExecutionJournal } from "../src/execution/journal";
 
 const testEnv = env as unknown as Env;
 afterEach(() => vi.restoreAllMocks());
@@ -95,7 +96,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(JSON.parse(evidence![1]).admission).toMatchObject({ project_id: "PRJ-8291", operation: "input.recover", actor: { authority: "durable_object" }, verdict: "allow" });
     const status = await guard.fetch("https://project-guard.internal/execution-status?kind=recovery&request_id=input-recovery%401");
     expect(status.status).toBe(200);
-    expect(await status.json()).toMatchObject({ status: "committed", terminal: false, code: "FINALIZATION_ADAPTER_UNAVAILABLE" });
+    expect(await status.json()).toMatchObject({ status: "committed", terminal: false, code: "MATERIALIZATION_PENDING" });
   });
 
   it("fails closed when the canonical admission cannot commit; no discovery/effect runs", async () => {
@@ -160,7 +161,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await committed.json()).toMatchObject({ status: "committed", previous_revision: 268, new_revision: 269 });
 
     const pending = await guard.fetch("https://project-guard.internal/execution-status?kind=transaction&request_id=TXN-PRJ0003-TASK-A02S2DEV-RETIRE-20260913T140200Z-L4T7");
-    expect(await pending.json()).toMatchObject({ status: "finalizing", terminal: false, code: "FINALIZATION_ADAPTER_UNAVAILABLE" });
+    expect(await pending.json()).toMatchObject({ status: "finalizing", terminal: false, code: "MATERIALIZATION_PENDING" });
 
     const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
     const record = await repository.readCommitRecord(projectId, 269);
@@ -231,9 +232,17 @@ describe("canonical execution boundary in ProjectGuard", () => {
       result_root_hash: successor.result_root_hash, completed_at: successor.completed_at
     });
 
+    const wake = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target_revision: 271, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    expect(wake.status).toBe(200);
+    expect(await wake.json()).toMatchObject({ finalized_revisions: [270, 271] });
+
     for (const requestId of [transaction270.transaction_id, transaction271.transaction_id]) {
-      const response = await guard.fetch(`https://project-guard.internal/execution-status?kind=transaction&request_id=${requestId}`);
-      expect(await response.json()).toMatchObject({ status: "finalized", terminal: true, code: null });
+      const journal = new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "transaction", requestId);
+      expect(await journal.status()).toMatchObject({ status: "finalized", terminal: true, code: null });
     }
   });
 });

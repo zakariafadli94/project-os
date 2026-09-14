@@ -44,6 +44,24 @@ describe("Worker routing", () => {
     await expect(response.json()).resolves.toEqual({ status: "ok" });
   });
 
+  it("publishes one read-only capability manifest without credentials", async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request("https://example.com/v1/capabilities"), {
+      ...testEnv,
+      CF_VERSION_METADATA: { id: "worker-version", tag: `git-${"a".repeat(40)}` }
+    } as Env, ctx);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toEqual({
+      canonical_read: true,
+      typed_transactions: true,
+      receipt_tracking: true,
+      finalization_tracking: true,
+      fallback_ingress: true,
+      deployment_sha: "a".repeat(40)
+    });
+  });
+
   it("returns the exact Dropbox webhook challenge", async () => {
     const ctx = createExecutionContext();
     const response = await worker.fetch(new Request("https://example.com/dropbox/webhook?challenge=abc123"), testEnv, ctx);

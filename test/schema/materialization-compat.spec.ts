@@ -142,11 +142,11 @@ describe("ProjectState schema evolution vs materialization", () => {
     expect(nextPlan.target_revision).toBe(2);
     expect(nextPlan.projection_version).toBe(4);
     expect(nextPlan.changed_outputs.has("research:RES-MATCOMPAT9011")).toBe(true);
-    for (const key of ["global:BRIEF", "global:DISCOVERY", "global:PROJECT", "global:PLAN", "global:ROADMAP"]) {
+    for (const key of ["global:BRIEF", "global:DISCOVERY", "global:ROADMAP"]) {
       expect(nextPlan.changed_outputs.has(key), key).toBe(false);
       expect(nextPlan.carried_forward.get(key)?.source_revision, key).toBe(1);
     }
-    for (const key of ["global:STATE", "global:HANDOFF", "global:OPERATING"]) {
+    for (const key of ["global:PROJECT", "global:PLAN", "global:STATE", "global:HANDOFF", "global:OPERATING"]) {
       expect(nextPlan.changed_outputs.has(key), key).toBe(true);
       expect(nextPlan.changed_outputs.get(key)?.source_revision, key).toBe(2);
     }

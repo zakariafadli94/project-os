@@ -98,6 +98,7 @@ export class MaterializationGuard extends DurableObject<Env> {
           }
           const { engine, budget } = this.convergenceEngineForSlice();
           const result = await engine.runSlice(budget);
+          if (!result.more_work && result.health.converged) await this.notifyProjectGuardOfCurrentHead();
           await this.scheduleConvergenceContinuation(result.more_work, result.next_alarm_at);
           return;
         }
@@ -107,6 +108,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         if (this.layoutMode === "v2") return;
         const { coordinator } = this.coordinatorForSlice();
         const result = await coordinator.runNext(alarmInfo?.retryCount ?? 0);
+        if (result.completed) await this.notifyProjectGuardOfCurrentHead();
         if (result.more_work) {
           await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
         }
@@ -401,6 +403,7 @@ export class MaterializationGuard extends DurableObject<Env> {
           await this.acknowledgeVerifiedHumanHead(state.revision);
         }
         if (providerHeadCurrent && await this.hasDurablyVerifiedCurrentTarget(record)) {
+          await this.notifyProjectGuardOfCurrentHead();
           await this.ctx.storage.deleteAlarm();
           return Response.json({
             project_id: state.project_id,
@@ -447,6 +450,7 @@ export class MaterializationGuard extends DurableObject<Env> {
           }, { status: 202 });
         }
         await this.ctx.storage.deleteAlarm();
+        await this.notifyProjectGuardOfCurrentHead();
         return Response.json({
           project_id: state.project_id,
           revision: state.revision,
@@ -470,6 +474,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         }, { status: 202 });
       }
       await this.ctx.storage.deleteAlarm();
+      await this.notifyProjectGuardOfCurrentHead();
     } else {
       if (this.layoutMode === "v2" && convergenceMode === "repair") {
         return Response.json({
@@ -487,6 +492,27 @@ export class MaterializationGuard extends DurableObject<Env> {
     };
     if (convergenceMode === "repair") response.status = "current";
     return Response.json(response);
+  }
+
+  private async notifyProjectGuardOfCurrentHead(): Promise<void> {
+    const repository = new ProjectRepository(
+      createProductionPersistence(this.env, this.projectId),
+      this.layoutMode
+    );
+    const head = await repository.readMaterializationHead(this.projectId);
+    if (!head) return;
+    const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
+      "https://project-guard.internal/finalize-materialization",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          target_revision: head.target_revision,
+          projection_version: head.projection_version
+        })
+      }
+    );
+    if (!response.ok) throw new Error(`ProjectGuard finalization notification returned ${response.status}`);
   }
 
   /**
@@ -706,7 +732,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         projectionVersion: CURRENT_PROJECTION_VERSION,
         canonicalDerivativesAlreadyCurrent: convergenceOwned,
         verifyExistingCriticalPairOnly: convergenceOwned,
-        ...(convergenceOwned ? { finalVerificationBatchMax: 1 } : {}),
+        ...(convergenceOwned ? { finalVerificationBatchMax: 8 } : {}),
         ...(budget ? { sliceBudget: budget } : {})
       })
     };
@@ -742,7 +768,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         deploymentSha: deploymentIdentity(this.env).git_sha ?? "unknown",
         enableHuman: true,
         discoveryMaxRecords: 1,
-        finalVerificationBatchMax: 1,
+        finalVerificationBatchMax: 8,
         notification: monitoringNotificationPort({
           endpoint: this.env.PROJECT_OS_MONITORING_WEBHOOK_URL,
           token: this.env.PROJECT_OS_MONITORING_WEBHOOK_TOKEN

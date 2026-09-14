@@ -4,6 +4,7 @@ import type { Transaction } from "../src/domain/transaction";
 import { processTransactionInbox } from "../src/inbox/processor";
 import type { ObjectPersistence, ProviderEntry, ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError } from "../src/persistence/provider/errors";
+import { AdmissionError } from "../src/admission/mutation-context";
 
 class FakeObjects implements ObjectPersistence {
   files = new Map<string, string>();
@@ -126,6 +127,27 @@ it("persists a retryable diagnostic when transaction execution throws", async ()
   });
   expect(typeof diagnostic.first_failed_at).toBe("string");
   expect(typeof diagnostic.last_failed_at).toBe("string");
+});
+
+it("terminally rejects an inbox transaction whose admission context cannot be refreshed", async () => {
+  const objects = new FakeObjects();
+  const transaction = tx("TXN-INBOX-NEUTRAL-ADMISSION-0001", 7, "2026-09-01T11:06:00+01:00");
+  const incoming = `/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`;
+  const rejected = `/PROJECT_OS/.project-os/transactions/rejected/${transaction.transaction_id}.json`;
+  objects.files.set(incoming, JSON.stringify(transaction));
+
+  const summary = await processTransactionInbox(objects, "v2", async () => {
+    throw new AdmissionError("mutation_context_missing", 428);
+  });
+
+  expect(summary).toEqual({ scanned: 1, processed: 1, failed: 0 });
+  expect(objects.files.has(incoming)).toBe(false);
+  expect(JSON.parse(objects.files.get(rejected) ?? "null")).toMatchObject({
+    status: "rejected",
+    code: "mutation_context_missing",
+    transaction_id: transaction.transaction_id
+  });
+  expect(objects.files.has(rejected.replace(/\.json$/, ".source.json"))).toBe(true);
 });
 
 it("increments retry diagnostics and removes them after successful recovery", async () => {

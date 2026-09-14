@@ -133,11 +133,12 @@ export async function processTransactionInbox(
         }
       } catch (error) {
         if (error instanceof AdmissionError) {
-          summary.failed += 1;
-          console.error("Project OS transaction admission envelope requires refresh", {
-            transaction_id: filenameTransactionId,
+          const fallbackId = filenameTransactionId ?? await syntheticInboxId("TXN-INVALID", entry.name, raw);
+          await rejectAdmissionSource(objects, sourcePath, terminalTransactionPath(mode, "rejected", fallbackId), {
+            transaction_id: fallbackId,
             code: error.code
           });
+          summary.processed += 1;
           continue;
         }
         const fallbackId = filenameTransactionId ?? await syntheticInboxId("TXN-INVALID", entry.name, raw);
@@ -157,15 +158,21 @@ export async function processTransactionInbox(
       try {
         receipt = await executeTransaction(transaction, mutationContext);
       } catch (error) {
-        summary.failed += 1;
         if (error instanceof AdmissionError) {
-          console.error("Project OS transaction admission requires refresh", {
+          await rejectAdmissionSource(
+            objects,
+            sourcePath,
+            terminalTransactionPath(mode, "rejected", transaction.transaction_id),
+            {
             transaction_id: transaction.transaction_id,
             project_id: transaction.project_id,
             code: error.code
-          });
+            }
+          );
+          summary.processed += 1;
           continue;
         }
+        summary.failed += 1;
         console.error("Project OS transaction processing failed", transaction.transaction_id, error);
         try {
           const diagnostic = await recordTransactionFailure(objects, mode, transaction, error);
@@ -279,11 +286,12 @@ export async function processArtifactInbox(
       } catch (error) {
         if (error instanceof AdmissionError) {
           workItems += 1;
-          summary.failed += 1;
-          console.error("Project OS artifact admission envelope requires refresh", {
-            request_id: filenameRequestId,
+          const fallbackId = filenameRequestId ?? await syntheticInboxId("ART-INVALID", entry.name, raw);
+          await rejectAdmissionSource(objects, sourcePath, terminalArtifactRequestPath(mode, "rejected", fallbackId), {
+            request_id: fallbackId,
             code: error.code
           });
+          summary.processed += 1;
           continue;
         }
         workItems += 1;
@@ -315,15 +323,21 @@ export async function processArtifactInbox(
       try {
         receipt = await executeArtifact(artifact, mutationContext);
       } catch (error) {
-        summary.failed += 1;
         if (error instanceof AdmissionError) {
-          console.error("Project OS artifact admission requires refresh", {
+          await rejectAdmissionSource(
+            objects,
+            sourcePath,
+            terminalArtifactRequestPath(mode, "rejected", artifact.request_id),
+            {
             request_id: artifact.request_id,
             project_id: artifact.project_id,
             code: error.code
-          });
+            }
+          );
+          summary.processed += 1;
           continue;
         }
+        summary.failed += 1;
         console.error("Project OS artifact processing failed", artifact.request_id, error);
         try {
           const diagnostic = await recordArtifactFailure(objects, mode, artifact, error, previousFailure);
@@ -365,6 +379,21 @@ export async function processArtifactInbox(
   if (options.rotateScan && lastScanned) await objects.upsertText(cursorPath, lastScanned);
 
   return summary;
+}
+
+async function rejectAdmissionSource(
+  objects: ObjectPersistence,
+  sourcePath: string,
+  rejectedPath: string,
+  diagnostic: { code: string; transaction_id?: string; request_id?: string; project_id?: string }
+): Promise<void> {
+  await safeAdd(objects, rejectedPath, `${JSON.stringify({
+    schema_version: "1.0",
+    status: "rejected",
+    ...diagnostic,
+    message: "Admission context is missing, invalid, expired, or stale; submit again through the authenticated Project OS facade"
+  }, null, 2)}\n`);
+  await archiveSource(objects, sourcePath, rejectedPath.replace(/\.json$/, ".source.json"));
 }
 
 async function prepareTransactionInboxEntries(

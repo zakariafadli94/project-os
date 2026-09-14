@@ -329,32 +329,39 @@ export class MaterializationGuard extends DurableObject<Env> {
       );
       await this.resumeConvergenceFromVerifiedHead();
       const saved = await journal.load();
+      const head = await repository.readMaterializationHead(this.projectId);
+      const headCurrent = head !== null
+        && head.target_revision === state.revision
+        && head.projection_version === CURRENT_PROJECTION_VERSION;
       const hasPendingConvergence = saved !== null && (
         saved.progress.active !== null
         || saved.progress.requested !== null
         || Object.values(saved.progress.obligations).some((obligation) => obligation.state !== "verified")
       );
-      if (hasPendingConvergence) {
+      // A stale obligation can only be verified against a current physical
+      // generation. Always request that generation first; otherwise the
+      // verifier can keep retrying an old head forever without doing the work
+      // that would make its own condition true.
+      if (!headCurrent) {
+        const { engine } = this.convergenceEngineForSlice();
+        await engine.requestTarget({ revision: state.revision, projection_version: CURRENT_PROJECTION_VERSION });
+        await this.scheduleConvergenceContinuation(
+          true,
+          hasPendingConvergence && saved?.progress.next_alarm_at
+            ? saved.progress.next_alarm_at
+            : new Date().toISOString()
+        );
+      } else if (hasPendingConvergence) {
         await this.scheduleConvergenceContinuation(true, saved.progress.next_alarm_at);
-      } else {
-        const head = await repository.readMaterializationHead(this.projectId);
-        const headCurrent = head !== null
-          && head.target_revision === state.revision
-          && head.projection_version === CURRENT_PROJECTION_VERSION;
-        if (headCurrent && head) {
-          // SQLite is only a projection accelerator.  Once a complete,
-          // immutable generation is already current, reconstruct the local
-          // baseline from it without invoking the retired coordinator writer.
-          const baseline = await rebuildProjectionBaseline(repository, head);
-          this.ledger.restoreExternalBaseline(
-            { revision: head.target_revision, projection_version: head.projection_version },
-            baseline.outputs
-          );
-        } else {
-          const { engine } = this.convergenceEngineForSlice();
-          await engine.requestTarget({ revision: state.revision, projection_version: CURRENT_PROJECTION_VERSION });
-          await this.scheduleConvergenceContinuation(true, new Date().toISOString());
-        }
+      } else if (head) {
+        // SQLite is only a projection accelerator. Once a complete,
+        // immutable generation is already current, reconstruct the local
+        // baseline from it without invoking the retired coordinator writer.
+        const baseline = await rebuildProjectionBaseline(repository, head);
+        this.ledger.restoreExternalBaseline(
+          { revision: head.target_revision, projection_version: head.projection_version },
+          baseline.outputs
+        );
       }
       return Response.json(this.statusResponse(state));
     }

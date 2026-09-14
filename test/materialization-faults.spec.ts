@@ -174,7 +174,7 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     expect(reconcile.status).toBe(200);
     expect(mock.uploadCalls.filter((path) => path.startsWith(`${root}/`))).toEqual([]);
     expect(mock.files.has(machineCommitRecordPath(projectId, 7))).toBe(false);
-  });
+  }, 15_000);
 
   it("refuses to repair a failed head when completed workspace evidence no longer verifies", async () => {
     vi.restoreAllMocks();

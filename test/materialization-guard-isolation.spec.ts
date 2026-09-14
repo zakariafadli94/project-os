@@ -260,6 +260,13 @@ describe("MaterializationGuard isolation boundary", () => {
     saved.progress.next_alarm_at = at;
     await journal.save(saved.progress, saved.token);
 
+    await runInDurableObject(guard, (instance) =>
+      (instance as unknown as { notifyProjectGuardOfCurrentHead(): Promise<void> })
+        .notifyProjectGuardOfCurrentHead()
+    );
+    const acknowledged = await journal.load();
+    expect(acknowledged?.progress).toMatchObject({ requested: null, active: null, next_alarm_at: null });
+
     const response = await guard.fetch("https://materialization-guard.internal/materialize", {
       method: "POST",
       headers: { "content-type": "application/json" },

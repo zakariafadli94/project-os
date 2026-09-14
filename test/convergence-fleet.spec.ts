@@ -59,6 +59,18 @@ describe("convergence fleet maintenance", () => {
       });
   });
 
+  it("adds independent projects to a turn even when one failed project remains pending", () => {
+    const page = prepareFleetPage({
+      schema_version: "1.0",
+      after_project_id: "PRJ-0002",
+      pending_project_ids: ["PRJ-0003"],
+      turn_started_at: "2026-09-09T07:00:00.000Z",
+      last_success_at: "2026-09-09T07:00:00.000Z"
+    }, ["PRJ-0001", "PRJ-0002", "PRJ-0003", "PRJ-0007"], "2026-09-09T07:05:00.000Z");
+
+    expect(page.pending_project_ids).toEqual(["PRJ-0003", "PRJ-0007", "PRJ-0001", "PRJ-0002"]);
+  });
+
   it("persists a page before waking projects and retains only failed wakes", async () => {
     const writes: Array<{ token: string | null; cursor: { pending_project_ids: string[] } }> = [];
     let current: { cursor: FleetCursor; token: string } = {

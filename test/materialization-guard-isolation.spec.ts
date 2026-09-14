@@ -286,6 +286,54 @@ describe("MaterializationGuard isolation boundary", () => {
     }
   });
 
+  it("requeues the current projection version even when an older obligation is still pending", async () => {
+    const mock = installDropboxMock();
+    const projectId = "PRJ-3915";
+    await createProject(projectId, "repair-stale-generation", "TXN-MATISO-3915-CREATE");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    await guard.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
+      if (!await runDurableObjectAlarm(guard)) break;
+    }
+
+    const journal = new ConvergenceJournal(createProductionPersistence(testEnv, projectId), projectId);
+    const saved = await journal.load();
+    expect(saved).not.toBeNull();
+    if (!saved) throw new Error("missing convergence journal");
+    const human = Object.entries(saved.progress.obligations)
+      .find(([, obligation]) => obligation.layer === "human_handoff");
+    expect(human).toBeDefined();
+    if (!human) throw new Error("missing human obligation");
+    saved.progress.obligations[human[0]] = {
+      ...human[1],
+      state: "retry_wait",
+      next_attempt_at: at,
+      code: "generation_or_head_not_current"
+    };
+    saved.progress.requested = null;
+    saved.progress.active = null;
+    saved.progress.next_alarm_at = at;
+    await journal.save(saved.progress, saved.token);
+    mock.files.delete(machineMaterializationHeadPath(projectId));
+
+    const response = await guard.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    expect(response.status).toBe(200);
+    const repaired = await journal.load();
+    expect(repaired?.progress.requested).toEqual({
+      revision: 1,
+      projection_version: CURRENT_PROJECTION_VERSION
+    });
+  });
+
   it("reconciles and reports projection status from canonical machine state", async () => {
     installDropboxMock();
     const projectId = "PRJ-3907";

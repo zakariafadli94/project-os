@@ -333,20 +333,20 @@ export class MaterializationGuard extends DurableObject<Env> {
       const headCurrent = head !== null
         && head.target_revision === state.revision
         && head.projection_version === CURRENT_PROJECTION_VERSION;
-      const currentRecord = state.revision > 0
-        ? await repository.readCommitRecord(this.projectId, state.revision)
-        : null;
-      if (headCurrent && currentRecord && await this.hasCurrentDurableHead(currentRecord)) {
-        await this.acknowledgeVerifiedHumanHead(state.revision);
-        await this.notifyProjectGuardOfCurrentHead();
-        await this.ctx.storage.deleteAlarm();
-        return Response.json(this.statusResponse(state));
-      }
       const hasPendingConvergence = saved !== null && (
         saved.progress.active !== null
         || saved.progress.requested !== null
         || Object.values(saved.progress.obligations).some((obligation) => obligation.state !== "verified")
       );
+      const currentRecord = headCurrent && hasPendingConvergence && state.revision > 0
+        ? await repository.readCommitRecord(this.projectId, state.revision)
+        : null;
+      if (currentRecord && await this.hasCurrentDurableHead(currentRecord)) {
+        await this.acknowledgeVerifiedHumanHead(state.revision);
+        await this.notifyProjectGuardOfCurrentHead();
+        await this.ctx.storage.deleteAlarm();
+        return Response.json(this.statusResponse(state));
+      }
       // A stale obligation can only be verified against a current physical
       // generation. Always request that generation first; otherwise the
       // verifier can keep retrying an old head forever without doing the work

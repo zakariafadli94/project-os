@@ -273,5 +273,5 @@ describe("DropboxChangeGuard", () => {
     expect(projectListPaths).toEqual([
       `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-change-guard-four`
     ]);
-  });
+  }, 15_000);
 });

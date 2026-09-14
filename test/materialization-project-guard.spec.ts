@@ -245,10 +245,9 @@ describe("ProjectGuard asynchronous materialization", () => {
     await createSyntheticProject(projectId, "fleet-empty-body", "TXN-MATERIAL-PG-3606-CREATE");
 
     const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
-      "https://project-guard.internal/reconcile-materialization",
+      "https://project-guard.internal/scheduled-reconcile-materialization",
       {
         method: "POST",
-        headers: { "x-project-os-maintenance": "fleet-materialization-reconcile" },
         body: " "
       }
     );

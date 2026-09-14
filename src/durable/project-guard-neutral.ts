@@ -275,6 +275,10 @@ export class ProjectGuard extends DurableObject<Env> {
       return this.handleMaterializationMutation(request, "/reconcile", "project.repair");
     }
 
+    if (request.method === "POST" && pathname === "/scheduled-reconcile-materialization") {
+      return this.handleMaterializationMutation(request, "/reconcile", "project.repair", true);
+    }
+
     if (request.method === "POST" && pathname === "/materialize") {
       return this.handleMaterializationMutation(request, "/materialize", "project.materialize");
     }
@@ -1220,14 +1224,13 @@ export class ProjectGuard extends DurableObject<Env> {
     );
   }
 
-  private async handleMaterializationMutation(request: Request, targetPath: string, operation: "project.materialize" | "project.repair"): Promise<Response> {
+  private async handleMaterializationMutation(request: Request, targetPath: string, operation: "project.materialize" | "project.repair", fleetReconcile = false): Promise<Response> {
     const body = await request.text();
     return this.serialize(async () => {
       const projectId = this.ctx.id.name;
       if (!projectId || projectId === AUTO_PROJECT_ID) return Response.json({ error: "project_not_initialized" }, { status: 404 });
       const state = await this.loadOrRecoverState();
       if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
-      const fleetReconcile = request.headers.get("x-project-os-maintenance") === "fleet-materialization-reconcile";
       if (operation === "project.repair" && body && !fleetReconcile) {
         return this.handleTypedRepair(new Request(request.url, { method: "POST", body }), state);
       }

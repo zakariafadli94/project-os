@@ -107,7 +107,7 @@ function fakeEnv(
               cursor_reset: false
             });
           }
-          if (url.pathname === "/reconcile-materialization") {
+          if (url.pathname === "/scheduled-reconcile-materialization") {
             return materializationNamespace.getByName(projectId).fetch(
               "https://materialization-guard.internal/reconcile",
               { method: "POST" }

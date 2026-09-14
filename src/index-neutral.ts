@@ -793,10 +793,10 @@ export async function reconcileMaterializationProject(
   projectId: string
 ): Promise<"scheduled" | "current"> {
   const stub = env.PROJECT_GUARD.getByName(projectId);
-  const response = await stub.fetch("https://project-guard.internal/reconcile-materialization", {
-    method: "POST",
-    headers: { "x-project-os-maintenance": "fleet-materialization-reconcile" }
-  });
+  const response = await stub.fetch(
+    "https://project-guard.internal/scheduled-reconcile-materialization",
+    { method: "POST" }
+  );
   if (!response.ok) {
     const diagnostic = (await response.text()).slice(0, 512);
     throw new Error(`ProjectGuard returned ${response.status}: ${diagnostic}`);

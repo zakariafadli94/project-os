@@ -112,7 +112,7 @@ describe("convergence engine scheduling", () => {
     const progress = initialProgress(record.project_id, "1970-01-01T00:00:00.000Z", "writer-1");
     progress.canonical_observed_revision = record.new_revision;
     progress.baseline_revision = record.new_revision;
-    progress.requested = { revision: record.new_revision, projection_version: 4 };
+    progress.requested = { revision: record.new_revision, projection_version: 5 };
     await journal.save(progress, null);
     const engine = new ConvergenceEngine({
       projectId: record.project_id, repository, runtime, journal,
@@ -123,7 +123,7 @@ describe("convergence engine scheduling", () => {
 
     await expect(journal.load()).resolves.toMatchObject({
       progress: {
-        active: { revision: record.new_revision, projection_version: 4 },
+        active: { revision: record.new_revision, projection_version: 5 },
         requested: null
       }
     });
@@ -145,12 +145,12 @@ describe("convergence engine scheduling", () => {
     progress.baseline_revision = 38;
     progress.event_verified_through = 38;
     progress.receipt_verified_through = 38;
-    progress.active = { revision: 37, projection_version: 4 };
-    progress.requested = { revision: 39, projection_version: 4 };
+    progress.active = { revision: 37, projection_version: 5 };
+    progress.requested = { revision: 39, projection_version: 5 };
     const blockedId = await sha256Canonical({ project_id: projectId, layer: "human_handoff", revision: 37 });
     progress.obligations[blockedId] = {
       id: blockedId, layer: "human_handoff", from_revision: 36,
-      target: { revision: 37, projection_version: 4 }, incident: 1,
+      target: { revision: 37, projection_version: 5 }, incident: 1,
       state: "blocked", first_pending_at: "1970-01-01T00:00:00.000Z",
       next_attempt_at: null, failure_count: 6, last_attempt_number: 673,
       last_closed_attempt_number: 673, last_verified_at: null,
@@ -170,7 +170,7 @@ describe("convergence engine scheduling", () => {
     expect(checkpoint).toMatchObject({
       progress: {
         canonical_observed_revision: 39,
-        active: { revision: 39, projection_version: 4 },
+        active: { revision: 39, projection_version: 5 },
         requested: null,
         obligations: {
           [blockedId]: { state: "blocked", code: "identical_internal_failure_limit", last_attempt_number: 673 }
@@ -294,7 +294,7 @@ describe("convergence engine scheduling", () => {
     const progress = initialProgress(projectId, "2026-09-08T00:00:00.000Z", "writer-1");
     progress.obligations["e".repeat(64)] = {
       id: "e".repeat(64), layer: "human_handoff", from_revision: 257,
-      target: { revision: 258, projection_version: 4 }, incident: 6,
+      target: { revision: 258, projection_version: 5 }, incident: 6,
       state: "exhausted", first_pending_at: "2026-09-08T00:00:00.000Z",
       next_attempt_at: "2026-09-08T00:15:00.000Z", failure_count: 6,
       last_attempt_number: 6, last_closed_attempt_number: 6, last_verified_at: null,
@@ -323,7 +323,7 @@ describe("convergence engine scheduling", () => {
     const progress = initialProgress(projectId, "2026-09-08T00:00:00.000Z", "writer-1");
     progress.obligations["f".repeat(64)] = {
       id: "f".repeat(64), layer: "human_handoff", from_revision: 257,
-      target: { revision: 258, projection_version: 4 }, incident: 6,
+      target: { revision: 258, projection_version: 5 }, incident: 6,
       state: "exhausted", first_pending_at: "2026-09-08T00:00:00.000Z",
       next_attempt_at: "2026-09-08T00:15:00.000Z", failure_count: 6,
       last_attempt_number: 6, last_closed_attempt_number: 6, last_verified_at: null,
@@ -359,7 +359,7 @@ describe("convergence engine scheduling", () => {
     const progress = initialProgress(projectId, "2026-09-08T00:00:00.000Z", "writer-1");
     progress.obligations["a".repeat(64)] = {
       id: "a".repeat(64), layer: "human_handoff", from_revision: 0,
-      target: { revision: 1, projection_version: 4 }, incident: 1,
+      target: { revision: 1, projection_version: 5 }, incident: 1,
       state: "exhausted", first_pending_at: "2026-09-08T00:00:00.000Z",
       next_attempt_at: "2026-09-08T00:15:00.000Z", failure_count: 6,
       last_attempt_number: 6, last_closed_attempt_number: 6, last_verified_at: null,
@@ -399,11 +399,11 @@ describe("convergence engine scheduling", () => {
     const humanObligationId = await sha256Canonical({
       project_id: record.project_id, layer: "human_handoff", revision: record.new_revision
     });
-    progress.active = { revision: record.new_revision, projection_version: 4 };
+    progress.active = { revision: record.new_revision, projection_version: 5 };
     progress.next_alarm_at = "1970-01-01T00:00:10.000Z";
     progress.obligations[humanObligationId] = {
       id: humanObligationId, layer: "human_handoff", from_revision: 0,
-      target: { revision: record.new_revision, projection_version: 4 }, incident: 1,
+      target: { revision: record.new_revision, projection_version: 5 }, incident: 1,
       state: "retry_wait", first_pending_at: "1970-01-01T00:00:00.000Z",
       next_attempt_at: "1970-01-01T00:00:10.000Z", failure_count: 1,
       last_attempt_number: 1, last_closed_attempt_number: 1, last_verified_at: null,
@@ -414,7 +414,7 @@ describe("convergence engine scheduling", () => {
     });
     progress.obligations[machineObligationId] = {
       id: machineObligationId, layer: "event", from_revision: 0,
-      target: { revision: record.new_revision, projection_version: 4 }, incident: 1,
+      target: { revision: record.new_revision, projection_version: 5 }, incident: 1,
       state: "pending", first_pending_at: "1970-01-01T00:00:00.000Z",
       next_attempt_at: "1970-01-01T00:00:00.000Z", failure_count: 0,
       last_attempt_number: 0, last_closed_attempt_number: 0, last_verified_at: null,
@@ -644,7 +644,7 @@ describe("convergence engine scheduling", () => {
     progress.canonical_observed_revision = record.new_revision;
     progress.obligations[obligationId] = {
       id: obligationId, layer: "event", from_revision: record.previous_revision,
-      target: { revision: record.new_revision, projection_version: 4 }, incident: 1,
+      target: { revision: record.new_revision, projection_version: 5 }, incident: 1,
       state: "pending", first_pending_at: "1970-01-01T00:00:00.000Z",
       next_attempt_at: "1970-01-01T00:00:00.000Z", failure_count: 0,
       last_attempt_number: 0, last_closed_attempt_number: 0, last_verified_at: null,

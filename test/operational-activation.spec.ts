@@ -84,7 +84,7 @@ describe("Operational Activation Contract", () => {
 
   it("uses projection version 4 and includes OPERATING.md in a full projection", async () => {
     const record = projectRecord();
-    expect(CURRENT_PROJECTION_VERSION).toBe(4);
+    expect(CURRENT_PROJECTION_VERSION).toBe(5);
 
     const plan = await planProjection(record, null, CURRENT_PROJECTION_VERSION);
     const operating = plan.changed_outputs.get("global:OPERATING");

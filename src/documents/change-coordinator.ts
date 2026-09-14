@@ -36,7 +36,7 @@ import {
 } from "./stable-work-product-reconciler";
 
 const LEGACY_CURSOR_KEY = "managed-document-change-cursor-v1";
-export const SCHEDULED_DOCUMENT_JOB_LIMIT = 4;
+export const SCHEDULED_DOCUMENT_JOB_LIMIT = 1;
 
 export interface ManagedDocumentCursorStore {
   get<T = unknown>(key: string): Promise<T | undefined>;

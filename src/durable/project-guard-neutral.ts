@@ -276,7 +276,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "POST" && pathname === "/scheduled-reconcile-materialization") {
-      return this.handleMaterializationMutation(request, "/reconcile", "project.repair", true);
+      return this.handleMaterializationMutation(request, "/reconcile", "project.materialize", true);
     }
 
     if (request.method === "POST" && pathname === "/materialize") {

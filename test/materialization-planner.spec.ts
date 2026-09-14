@@ -252,7 +252,8 @@ describe("projection hashing and incremental planning", () => {
     expect(plan.changed_outputs.has("global:ROADMAP")).toBe(true);
     expect(plan.changed_outputs.has("global:BRIEF")).toBe(false);
     expect(plan.changed_outputs.has("global:DISCOVERY")).toBe(false);
-    expect(plan.changed_outputs.has("global:PROJECT")).toBe(false);
+    expect(plan.changed_outputs.has("global:PROJECT")).toBe(true);
+    expect(plan.changed_outputs.has("global:PLAN")).toBe(true);
   });
 
   it("projection-version change rematerializes every legacy output plus OPERATING at the same business revision", async () => {

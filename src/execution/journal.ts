@@ -69,7 +69,7 @@ export class ExecutionJournal {
     const progress: ExecutionProgress = {
       schema_version: "1.0", project_id: this.projectId, request_id: this.requestId, kind: this.kind,
       request_hash: admission.request_hash, admission_ref: path, effect_plan_hash: record.effect_plan_hash, sequence: 0,
-      status: "committed", terminal: false, code: plan ? null : "FINALIZATION_ADAPTER_UNAVAILABLE",
+      status: "committed", terminal: false, code: plan ? null : "MATERIALIZATION_PENDING",
       completed_steps: [], postchecks: [], failure_streak: null, next_attempt_at: null, incident_ref: null,
       superseded_by: null, finalization_ref: null, receipt_ref: null, lease: null
     };

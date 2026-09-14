@@ -674,7 +674,31 @@ export class MaterializationCoordinator {
       this.finalVerificationBatchMax
     );
     if (batchSize === 0) return false;
-    const batch = pending.slice(0, batchSize);
+    // Keep one final item for the publication slice. Larger batches are
+    // checkpointed item-by-item; the last item and head publication remain
+    // atomic under the existing publication reserve.
+    const batch = pending.slice(0, batchSize === pending.length && pending.length > 1 ? batchSize - 1 : batchSize);
+    if (batch.length < pending.length) {
+      for (const item of batch) {
+        const one = new Map([[item.key, item.evidence]]);
+        if (item.expected === "present") {
+          const attempt = attempts.get(item.key);
+          if (attempt && attempt.content_hash !== item.evidence.content_hash) {
+            throw new Error(`Final materialization verification evidence diverged for ${item.key}`);
+          }
+          await this.writer.verifyOutputs(one, workspaceRoot);
+        } else {
+          if (!this.writer.verifyAbsentOutputs) {
+            throw new Error("Bounded materialization requires final removed-output verification");
+          }
+          await this.writer.verifyAbsentOutputs(one, workspaceRoot);
+        }
+        // SQLite is the durable local cursor. Persist each successful item so
+        // a variable-cost provider call cannot force the whole batch to repeat.
+        this.ledger.completeFinalVerification([item.key]);
+      }
+      return false;
+    }
     const present = new Map(batch
       .filter((item) => item.expected === "present")
       .map((item) => [item.key, item.evidence] as const));
@@ -697,9 +721,7 @@ export class MaterializationCoordinator {
     // Do not clear the last batch before record/head publication. A cold
     // restart in this interval will observe it again rather than trust a
     // completed cursor with no published generation.
-    if (batch.length === pending.length) return true;
-    this.ledger.completeFinalVerification(batch.map((item) => item.key));
-    return false;
+    return true;
   }
 
   private hasMoreWork(): boolean {
@@ -745,6 +767,9 @@ export function selectFinalVerificationBatchSize(
   const maximumSize = Math.min(pendingCount, configuredMaximum);
   for (let size = maximumSize; size >= 1; size -= 1) {
     const isFinalBatch = size === pendingCount;
+    // The batch starts at the configured maximum. Per-item durable cursor
+    // updates below make variable provider cost safe: an exhausted slice
+    // resumes after the last verified file instead of repeating the batch.
     if (budget.canStartEffect(size + (isFinalBatch ? publicationCalls : 0))) return size;
   }
   return 0;

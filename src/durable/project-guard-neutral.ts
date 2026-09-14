@@ -236,6 +236,11 @@ export class ProjectGuard extends DurableObject<Env> {
       }).catch((error) => this.admissionErrorResponse(error));
     }
 
+    if (request.method === "POST" && pathname === "/finalize-materialization") {
+      return this.serialize(() => this.finalizeCurrentMaterialization(request))
+        .catch((error) => this.admissionErrorResponse(error));
+    }
+
     if (request.method === "POST" && pathname === "/reconcile-documents") {
       return this.serialize(async () => {
         const state = await this.loadOrRecoverState();
@@ -1404,6 +1409,50 @@ export class ProjectGuard extends DurableObject<Env> {
       target_revision: targetRevision,
       source_event_id: record.event.event_id,
       result_root_hash: materialization.result_root_hash
+    });
+  }
+
+  private async finalizeCurrentMaterialization(request: Request): Promise<Response> {
+    const body: { target_revision?: unknown; projection_version?: unknown } = await request
+      .json<{ target_revision?: unknown; projection_version?: unknown }>()
+      .catch(() => ({}));
+    if (!Number.isSafeInteger(body.target_revision) || !Number.isSafeInteger(body.projection_version)) {
+      return Response.json({ error: "invalid_materialization_finalization_request" }, { status: 400 });
+    }
+    const projectId = this.ctx.id.name;
+    if (!projectId) return Response.json({ error: "project_binding_required" }, { status: 400 });
+    const head = await this.repository.readMaterializationHead(projectId);
+    if (!head
+      || head.target_revision !== body.target_revision
+      || head.projection_version !== body.projection_version) {
+      return Response.json({ error: "materialization_head_mismatch" }, { status: 409 });
+    }
+    const record = await this.repository.readMaterializationRecord(
+      projectId,
+      head.target_revision,
+      head.projection_version
+    );
+    if (!record
+      || record.result_root_hash !== head.result_root_hash
+      || record.workspace_location !== head.workspace_location
+      || record.completed_at !== head.completed_at) {
+      return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
+    }
+    const finalizedRevisions: number[] = [];
+    for (const revision of [...record.coalesced_revisions, record.target_revision].sort((a, b) => a - b)) {
+      const commit = await this.repository.readCommitRecord(projectId, revision);
+      if (!commit || commit.receipt.status !== "committed" || commit.receipt.new_revision !== revision) continue;
+      const journal = new ExecutionJournal(this.persistence, projectId, "transaction", commit.transaction.transaction_id);
+      const before = await journal.status();
+      if (!before) continue;
+      await this.finalizeMaterializedTransaction(journal);
+      const after = await journal.status();
+      if (after?.terminal && after.status === "finalized") finalizedRevisions.push(revision);
+    }
+    return Response.json({
+      project_id: projectId,
+      target_revision: head.target_revision,
+      finalized_revisions: finalizedRevisions
     });
   }
 

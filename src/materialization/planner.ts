@@ -196,7 +196,7 @@ function globalDescriptors(state: ProjectState, targetRevision: number, projecti
       key: "global:PROJECT",
       relative_path: GLOBAL_PATHS.PROJECT,
       critical: false,
-      semantic_input: projectInput(state),
+      semantic_input: { target_revision: targetRevision, project: projectInput(state) },
       render: () => renderProject(state),
       entity: false
     },
@@ -204,7 +204,7 @@ function globalDescriptors(state: ProjectState, targetRevision: number, projecti
       key: "global:PLAN",
       relative_path: GLOBAL_PATHS.PLAN,
       critical: false,
-      semantic_input: planInput(state),
+      semantic_input: { target_revision: targetRevision, plan: planInput(state) },
       render: () => renderPlan(state),
       entity: false
     }

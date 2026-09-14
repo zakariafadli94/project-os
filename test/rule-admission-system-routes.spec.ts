@@ -122,4 +122,17 @@ describe("strict system mutation routes", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ project_id: projectId, scanned: 0 });
   });
+
+  it("does not mistake a scheduled document scan body for a typed business repair", async () => {
+    const projectId = "PRJ-8193";
+    const { guard } = await strictGuard(projectId);
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
+
+    const response = await guard.fetch(
+      "https://project-guard.internal/reconcile-documents?scheduled=1",
+      { method: "POST", body: " " }
+    );
+
+    expect(response.status).toBe(200);
+  });
 });

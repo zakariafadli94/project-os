@@ -249,9 +249,16 @@ export class ProjectGuard extends DurableObject<Env> {
         // ignored merely because this project is still in the legacy rollout:
         // repair authorization is bound to the signed intent and exact
         // server-side diagnosis below.
-        if (request.body) return this.handleTypedRepair(request, state);
+        if (request.body && url.searchParams.get("scheduled") !== "1") {
+          return this.handleTypedRepair(request, state);
+        }
+        const scheduled = url.searchParams.get("scheduled") === "1";
         const normalized = await normalizeSystemAdmission(
-          state.project_id, "project.repair", "DOCUMENTS", `document-reconcile@${state.revision}`, String(state.revision)
+          state.project_id,
+          scheduled ? "project.materialize" : "project.repair",
+          "DOCUMENTS",
+          `document-reconcile@${state.revision}`,
+          String(state.revision)
         );
         if (await this.ruleAdmissionRequired(state, normalized)) {
           const proof = await this.admitRules(state, normalized);

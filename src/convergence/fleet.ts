@@ -39,10 +39,13 @@ export function prepareFleetPage(
   projectIds: readonly string[],
   now: string
 ): FleetCursor {
-  if (cursor.pending_project_ids.length > 0) return cursor;
+  const pending = new Set(cursor.pending_project_ids);
+  const missing = orderFleetProjects(projectIds, cursor.after_project_id)
+    .filter((projectId) => !pending.has(projectId));
+  if (missing.length === 0) return cursor;
   return {
     ...cursor,
-    pending_project_ids: orderFleetProjects(projectIds, cursor.after_project_id),
+    pending_project_ids: [...cursor.pending_project_ids, ...missing],
     turn_started_at: now
   };
 }

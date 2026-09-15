@@ -432,6 +432,34 @@ describe("MaterializationCoordinator", () => {
     expect(writer.verifiedOutputKeys.slice(-expected.length).flat()).toEqual(expected);
   });
 
+  it("revalidates only changed outputs when convergence already monitors carried-forward files", async () => {
+    const first = createFixture();
+    const second = committed(first.state, "task.create", {
+      task_id: "TASK-FASTCONVERGENCE",
+      title: "Fast convergence"
+    });
+    const repo = new FakeRepository();
+    repo.commits.set(first.new_revision, first);
+    repo.commits.set(second.new_revision, second);
+    const ledger = new FakeLedger();
+    const writer = new FakeWriter();
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, ledger, writer, CURRENT_PROJECTION_VERSION, budget, {
+      verifyExistingCriticalPairOnly: true,
+      finalVerificationBatchMax: 8
+    });
+
+    value.requestTarget(first.new_revision);
+    await value.runUntilIdle();
+    writer.verifiedOutputKeys = [];
+    value.requestTarget(second.new_revision);
+    await value.runUntilIdle();
+
+    const changed = [...writer.plans.at(-1)!.changed_outputs.keys()].sort();
+    expect(writer.verifiedOutputKeys.flat().sort()).toEqual(changed);
+    expect(repo.head?.target_revision).toBe(second.new_revision);
+  });
+
   it("does not re-materialize canonical derivatives when convergence already verified them", async () => {
     const record = createFixture();
     class CoalescedRepository extends FakeRepository {
@@ -559,7 +587,7 @@ describe("MaterializationCoordinator", () => {
     expect(repo.recordWrites).toBe(1);
   });
 
-  it("revalidates only the critical pair before convergence republishes a stale head", async () => {
+  it("revalidates a complete snapshot before convergence republishes a stale head", async () => {
     const record = createFixture();
     const repo = new FakeRepository();
     repo.commits.set(record.new_revision, record);
@@ -568,21 +596,57 @@ describe("MaterializationCoordinator", () => {
     initial.value.requestTarget(record.new_revision);
     await expect(initial.value.runNext()).rejects.toThrow(/head failure/);
 
-    const recovery = coordinator(
-      repo,
-      new FakeLedger(),
-      new FakeWriter(),
-      CURRENT_PROJECTION_VERSION,
-      undefined,
-      { verifyExistingCriticalPairOnly: true }
-    );
+    const recovery = coordinator(repo, initial.ledger, new FakeWriter(), CURRENT_PROJECTION_VERSION, undefined, {
+      verifyExistingCriticalPairOnly: true
+    });
     recovery.value.requestTarget(record.new_revision);
     repo.recordReads = 0;
     await recovery.value.runNext();
 
-    expect(recovery.writer.verifiedOutputKeys).toEqual([["global:HANDOFF", "global:STATE"]]);
+    expect(recovery.writer.verifiedOutputKeys).toEqual([[
+      "global:BRIEF",
+      "global:DISCOVERY",
+      "global:HANDOFF",
+      "global:OPERATING",
+      "global:PLAN",
+      "global:PROJECT",
+      "global:ROADMAP",
+      "global:STATE"
+    ]]);
     expect(repo.recordReads).toBe(1);
     expect(repo.head?.target_revision).toBe(record.new_revision);
+  });
+
+  it("revalidates every changed delta output before convergence repairs a failed head write", async () => {
+    const first = createFixture();
+    const second = committed(first.state, "task.create", {
+      task_id: "TASK-HEADRECOVERY",
+      title: "Head recovery"
+    });
+    const repo = new FakeRepository();
+    repo.commits.set(first.new_revision, first);
+    repo.commits.set(second.new_revision, second);
+    const initial = coordinator(repo);
+    initial.value.requestTarget(first.new_revision);
+    await initial.value.runUntilIdle();
+    repo.failHeadOnce = true;
+    initial.value.requestTarget(second.new_revision);
+    await expect(initial.value.runNext()).rejects.toThrow(/head failure/);
+    const completed = repo.records.get(`PRJ-3501:${second.new_revision}:${CURRENT_PROJECTION_VERSION}`)!;
+    expect(completed.record_kind).toBe("delta");
+    expect(initial.ledger.status().head).toEqual({
+      revision: completed.parent!.target_revision,
+      projection_version: completed.parent!.projection_version
+    });
+
+    const recovery = coordinator(repo, initial.ledger, new FakeWriter(), CURRENT_PROJECTION_VERSION, undefined, {
+      verifyExistingCriticalPairOnly: true
+    });
+    recovery.value.requestTarget(second.new_revision);
+    await recovery.value.runNext();
+
+    expect(recovery.writer.verifiedOutputKeys.flat().sort()).toEqual(Object.keys(completed.outputs).sort());
+    expect(repo.head?.target_revision).toBe(second.new_revision);
   });
 
   it("does not regress a newer head while resuming an older completed record", async () => {

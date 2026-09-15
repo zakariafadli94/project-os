@@ -1452,7 +1452,7 @@ export class ProjectGuard extends DurableObject<Env> {
       || receipt.relative_path !== request.relative_path
       || receipt.content_sha256 !== request.content_sha256
       || progress.receipt_ref !== receiptRef) return;
-    const status = await this.repository.artifactStatus(request.project_id, request.request_id);
+    const status = await this.repository.artifactStatus(request);
     if (!status || status.verification_state !== "canonical_verified" || status.receipt_status !== "committed") return;
     await journal.finalizeVerifiedArtifact({
       receipt_ref: receiptRef,

@@ -68,6 +68,28 @@ export class LegacyArtifactDocumentWriter {
     return this.writeReference(state, request, managed, payloadPath);
   }
 
+  /** Verify the managed projection produced from an inline legacy artifact.
+   * Published Markdown gains machine identity frontmatter, so its visible hash
+   * intentionally differs from the raw request hash. The immutable version and
+   * current provider observation prove the exact transformation instead. */
+  async verifyManagedEffect(request: InlineArtifactWriteRequest, destinationPath: string): Promise<boolean> {
+    const deliverables = /\/DELIVERABLES\/(.+)$/.exec(destinationPath);
+    if (!deliverables) return false;
+    const documentId = await documentIdFor(request.project_id, deliverables[1]!);
+    const versionId = await legacyVersionIdFor(request.request_id, "published");
+    const version = await this.ledger.readVersion(request.project_id, documentId, versionId);
+    const head = await this.ledger.readHead(request.project_id, documentId);
+    const metadata = await this.runtime.objects.getMetadata(destinationPath);
+    const visible = await this.runtime.objects.readText(destinationPath);
+    if (!version || !head || !metadata || visible === null) return false;
+    return version.source === "legacy_artifact_api"
+      && version.request_id === request.request_id
+      && version.provider_path === destinationPath
+      && head.published_version_id === versionId
+      && sameObservation(head.provider?.published, metadata)
+      && version.content_sha256 === await sha256Text(visible);
+  }
+
   private async writePublished(
     state: ProjectState,
     request: InlineArtifactWriteRequest,

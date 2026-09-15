@@ -139,6 +139,9 @@ describe("legacy artifact managed-document compatibility", () => {
     const head = JSON.parse(dropbox.files.get(heads[0])!);
     const version = await ledger.readVersion("PRJ-0003", head.document_id, head.published_version_id);
     expect(version).toMatchObject({ stage: "published", source: "legacy_artifact_api", request_id: "ART-LEGACY-000001" });
+    expect(await writer.verifyManagedEffect(await request("published v1", "create", "ART-LEGACY-000001"), visible)).toBe(true);
+    dropbox.files.set(visible, "external edit");
+    expect(await writer.verifyManagedEffect(await request("published v1", "create", "ART-LEGACY-000001"), visible)).toBe(false);
   });
 
   it("replaces a governed deliverable through provider CAS and keeps the legacy archive", async () => {

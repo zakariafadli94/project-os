@@ -56,7 +56,14 @@ type ActivationDerivativeOptions = CommitWriteOptions & {
 
 export class ProjectRepository extends CoreProjectRepository {
   async readPackageNavigation(projectId: string) { return new DocumentLedgerRepository(this.runtime).readPackageNavigation(projectId); }
-  async artifactStatus(projectId: string, requestId: string) { return this.mutationGate.artifactStatus(projectId, requestId); }
+  async artifactStatus(request: ArtifactWriteRequest) {
+    const status = await this.mutationGate.artifactStatus(request.project_id, request.request_id);
+    if (!status || status.verification_state === "canonical_verified" || isStagedArtifactWriteRequest(request)) return status;
+    if (await new LegacyArtifactDocumentWriter(this.runtime).verifyManagedEffect(request, status.destination_path)) {
+      return { ...status, verification_state: "canonical_verified" as const };
+    }
+    return status;
+  }
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;

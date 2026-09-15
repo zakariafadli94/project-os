@@ -18,6 +18,29 @@ const artifact = {
 };
 
 describe("Control Tower governed artifact submission", () => {
+  it("resumes governed finalization before returning an artifact receipt", async () => {
+    const calls: string[] = [];
+    const stub = {
+      fetch: async (input: string) => {
+        const url = new URL(input);
+        calls.push(`${url.pathname}${url.search}`);
+        if (url.pathname === "/execution-status") return Response.json({ status: "finalized", terminal: true, finalization_ref: "proof:artifact" });
+        return Response.json({ status: "committed", request_id: artifact.request_id });
+      }
+    };
+    const server = createControlTowerServer({
+      PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
+      REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
+    }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ content: Array<{ text: string }> }> }> };
+
+    const result = await server._registeredTools.project_os_get_receipt.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
+    expect(calls).toEqual([
+      `/execution-status?request_id=${artifact.request_id}&kind=artifact`,
+      `/receipt?request_id=${artifact.request_id}&kind=artifact`
+    ]);
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ status: "committed", execution: { status: "finalized", terminal: true, finalization_ref: "proof:artifact" } });
+  });
+
   it("sends a staged artifact with fresh signed admission to ProjectGuard", async () => {
     const calls: Array<{ path: string; body?: unknown }> = [];
     const stub = {

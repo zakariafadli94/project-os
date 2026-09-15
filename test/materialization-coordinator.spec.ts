@@ -187,6 +187,13 @@ class FakeLedger implements MaterializationLedgerPort {
     if (this.pendingFinalVerification === null) this.pendingFinalVerification = [...items].sort((left, right) => left.key.localeCompare(right.key));
   }
   finalVerificationPending() { return [...(this.pendingFinalVerification ?? [])]; }
+  narrowFinalVerification(items: readonly FinalVerificationItem[]) {
+    if (this.pendingFinalVerification === null) return;
+    const allowed = new Set(items.map((item) => item.key));
+    if (this.pendingFinalVerification.some((item) => !allowed.has(item.key))) {
+      this.pendingFinalVerification = [...items].sort((left, right) => left.key.localeCompare(right.key));
+    }
+  }
   completeFinalVerification(keys: readonly string[]) {
     const completed = new Set(keys);
     this.pendingFinalVerification = (this.pendingFinalVerification ?? []).filter((item) => !completed.has(item.key));
@@ -457,6 +464,37 @@ describe("MaterializationCoordinator", () => {
 
     const changed = [...writer.plans.at(-1)!.changed_outputs.keys()].sort();
     expect(writer.verifiedOutputKeys.flat().sort()).toEqual(changed);
+    expect(repo.head?.target_revision).toBe(second.new_revision);
+  });
+
+  it("narrows an inherited full verification pass after the convergence optimization is deployed", async () => {
+    const first = createFixture();
+    const second = committed(first.state, "task.create", {
+      task_id: "TASK-INFLIGHTNARROW",
+      title: "In-flight verification"
+    });
+    const repo = new FakeRepository();
+    repo.commits.set(first.new_revision, first);
+    repo.commits.set(second.new_revision, second);
+    const ledger = new FakeLedger();
+    const writer = new FakeWriter();
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, ledger, writer, CURRENT_PROJECTION_VERSION, budget, {
+      verifyExistingCriticalPairOnly: true,
+      finalVerificationBatchMax: 1
+    });
+
+    value.requestTarget(first.new_revision);
+    await value.runUntilIdle();
+    writer.verifiedOutputKeys = [];
+    value.requestTarget(second.new_revision);
+    await value.runNext();
+
+    const carried = ledger.baseline.get("global:BRIEF")!;
+    ledger.pendingFinalVerification!.push({ key: "global:BRIEF", evidence: carried, expected: "present" });
+    await value.runUntilIdle();
+
+    expect(writer.verifiedOutputKeys.flat()).not.toContain("global:BRIEF");
     expect(repo.head?.target_revision).toBe(second.new_revision);
   });
 

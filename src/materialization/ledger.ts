@@ -342,6 +342,22 @@ export class MaterializationLedger {
     );
   }
 
+  narrowFinalVerification(items: readonly FinalVerificationItem[]): void {
+    const row = this.control();
+    if (row.active_status !== "verifying") return;
+    const desired = normalizeFinalVerificationItems(items);
+    if (desired.length === 0) {
+      throw new Error("Final materialization verification requires at least one changed output");
+    }
+    const desiredKeys = new Set(desired.map((item) => item.key));
+    const pending = parseFinalVerificationItems(row.active_final_verification_json);
+    if (!pending.some((item) => !desiredKeys.has(item.key))) return;
+    this.storage.sql.exec(
+      "UPDATE materialization_control SET active_final_verification_json = ? WHERE singleton = 1",
+      JSON.stringify(desired)
+    );
+  }
+
   finalVerificationPending(): FinalVerificationItem[] {
     const row = this.control();
     if (row.active_status !== "verifying") return [];

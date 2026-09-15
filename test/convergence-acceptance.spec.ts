@@ -51,6 +51,13 @@ class AcceptanceLedger implements MaterializationLedgerPort {
   beginFinalVerification(items: readonly FinalVerificationItem[]) {
     if (this.pendingFinalVerification === null) this.pendingFinalVerification = [...items].sort((left, right) => left.key.localeCompare(right.key));
   }
+  narrowFinalVerification(items: readonly FinalVerificationItem[]) {
+    if (this.pendingFinalVerification === null) return;
+    const allowed = new Set(items.map((item) => item.key));
+    if (this.pendingFinalVerification.some((item) => !allowed.has(item.key))) {
+      this.pendingFinalVerification = [...items].sort((left, right) => left.key.localeCompare(right.key));
+    }
+  }
   finalVerificationPending() { return [...(this.pendingFinalVerification ?? [])]; }
   completeFinalVerification(keys: readonly string[]) {
     const completed = new Set(keys);

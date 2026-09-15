@@ -52,6 +52,7 @@ export interface MaterializationLedgerPort {
   attemptOutputs(): Map<string, ProjectionOutputEvidence>;
   finalVerificationActive(): boolean;
   beginFinalVerification(items: readonly FinalVerificationItem[]): void;
+  narrowFinalVerification(items: readonly FinalVerificationItem[]): void;
   finalVerificationPending(): FinalVerificationItem[];
   completeFinalVerification(keys: readonly string[]): void;
   baselineOutputs(): Map<string, ProjectionOutputEvidence>;
@@ -396,6 +397,10 @@ export class MaterializationCoordinator {
       }
 
       if (this.sliceBudget) {
+        if (this.verifyExistingCriticalPairOnly && this.ledger.finalVerificationActive()) {
+          fullOutputs ??= applyPlanToBaseline(baseline?.outputs ?? new Map(), plan, verified);
+          this.ledger.narrowFinalVerification(finalVerificationItems(fullOutputs, plan, true));
+        }
         const finalVerificationComplete = await this.verifyFinalOutputBatch(archived ? archiveRoot : workspaceRoot);
         if (!finalVerificationComplete) return pendingMaterializationResult(this.projectId, target);
         verified = this.ledger.attemptOutputs();

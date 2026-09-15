@@ -20,6 +20,7 @@ import { encodeAdmission } from "../src/admission/transport";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
 import { ExecutionJournal } from "../src/execution/journal";
+import { sha256Text } from "../src/documents/hash";
 
 const testEnv = env as unknown as Env;
 afterEach(() => vi.restoreAllMocks());
@@ -87,6 +88,83 @@ function taskCompletionBaseline(projectId: string): CanonicalCommitRecord {
 }
 
 describe("canonical execution boundary in ProjectGuard", () => {
+  it("finalizes a committed artifact from its frozen intent and verified provider effect, including exact replay", async () => {
+    const projectId = "PRJ-8288";
+    const { guard, mock } = await setup(projectId);
+    const content = "# Verified artifact\n";
+    const request = {
+      request_id: "ART-EXECUTION-FINAL-0001",
+      project_id: projectId,
+      relative_path: "proofs/verified.md",
+      content,
+      content_sha256: await sha256Text(content),
+      mode: "create"
+    };
+    const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context } = await contextResponse.json<{ context: never }>();
+    const first = await guard.fetch("https://project-guard.internal/artifact", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await first.json()).toMatchObject({ status: "committed", request_id: request.request_id });
+    expect([...mock.files.keys()].some((path) => path.includes("/executions/") && path.includes("/finalizations/"))).toBe(true);
+
+    const status = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
+    const finalized = await status.json<{ finalization_ref: string }>();
+    expect(finalized).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
+    expect(JSON.parse(mock.files.get(finalized.finalization_ref) ?? "{}")).toMatchObject({
+      request_id: request.request_id,
+      content_sha256: request.content_sha256,
+      receipt_ref: `/PROJECT_OS/.project-os/artifacts/receipts/${request.request_id}.json`,
+      mutation_intent_ref: `/PROJECT_OS/.project-os/projects/${projectId}/mutation-gate/intents/artifacts/${request.request_id}.json`
+    });
+
+    const replay = await guard.fetch("https://project-guard.internal/artifact", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await replay.json()).toMatchObject({ status: "committed", request_id: request.request_id });
+    const replayStatus = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
+    expect(await replayStatus.json()).toMatchObject({ status: "finalized", terminal: true, finalization_ref: finalized.finalization_ref });
+  });
+
+  it("keeps a committed artifact pending while its exact provider effect is absent, then resumes without replay", async () => {
+    const projectId = "PRJ-8289";
+    const { guard, mock } = await setup(projectId);
+    const content = "# Recoverable proof\n";
+    const request = {
+      request_id: "ART-EXECUTION-PENDING-0001",
+      project_id: projectId,
+      relative_path: "proofs/pending.md",
+      content,
+      content_sha256: await sha256Text(content),
+      mode: "create"
+    };
+    let restoreStatus!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const repository = (instance as unknown as { repository: ProjectRepository }).repository;
+      const spy = vi.spyOn(repository, "artifactStatus").mockResolvedValue({
+        request_id: request.request_id, project_id: projectId, intent_id: "intent:pending",
+        destination_path: "/pending", gate_mode: "enforce", verification_state: "committed", receipt_status: "committed"
+      });
+      restoreStatus = () => spy.mockRestore();
+    });
+    const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context } = await contextResponse.json<{ context: never }>();
+    const response = await guard.fetch("https://project-guard.internal/artifact", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await response.json()).toMatchObject({ status: "committed" });
+    restoreStatus();
+    const visiblePath = [...mock.files.keys()].find((path) => path.endsWith("/ARTIFACTS/proofs/pending.md"));
+    expect(visiblePath).toBeDefined();
+    mock.files.delete(visiblePath!);
+
+    const pending = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
+    expect(await pending.json()).toMatchObject({ status: "finalizing", terminal: false, code: "MATERIALIZATION_PENDING", finalization_ref: null });
+    mock.files.set(visiblePath!, content);
+    const resumed = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
+    expect(await resumed.json()).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
+  });
+
   it("persists server admission before recovery and exposes incomplete execution independently of historical receipts", async () => {
     const { guard, mock } = await setup("PRJ-8291");
     const response = await guard.fetch("https://project-guard.internal/recover-inputs", { method: "POST" });

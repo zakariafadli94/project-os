@@ -56,6 +56,7 @@ type ActivationDerivativeOptions = CommitWriteOptions & {
 
 export class ProjectRepository extends CoreProjectRepository {
   async readPackageNavigation(projectId: string) { return new DocumentLedgerRepository(this.runtime).readPackageNavigation(projectId); }
+  async artifactStatus(projectId: string, requestId: string) { return this.mutationGate.artifactStatus(projectId, requestId); }
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly artifactMutationIntents: ArtifactMutationIntentService;
   private readonly mutationGate: MutationGateService;

@@ -207,6 +207,57 @@ export class ExecutionJournal {
     return progress;
   }
 
+  /** Artifact effects are finalized from their frozen mutation intent and the
+   * provider verification recorded by MutationGate. This never writes or
+   * replays the artifact itself. */
+  async finalizeVerifiedArtifact(input: {
+    receipt_ref: string;
+    mutation_intent_ref: string;
+    destination_path: string;
+    content_sha256: string;
+  }): Promise<ExecutionProgress> {
+    const admitted = await this.readAdmission();
+    if (!admitted || admitted.plan !== null || admitted.admission.kind !== "artifact") {
+      throw new Error("execution_artifact_finalization_invalid");
+    }
+    const saved = await this.load();
+    if (!saved) throw new Error("execution_progress_unavailable");
+    const progress = saved.progress;
+    if (progress.terminal) return progress;
+    const resource = admitted.admission.resources.find((candidate) => candidate.resource_id === progress.request_id);
+    if (
+      progress.status !== "finalizing"
+      || progress.receipt_ref !== input.receipt_ref
+      || progress.request_hash !== admitted.admission.request_hash
+      || resource?.version !== input.content_sha256
+      || !/^[a-f0-9]{64}$/.test(input.content_sha256)
+      || !input.mutation_intent_ref
+      || !input.destination_path
+    ) throw new Error("execution_artifact_finalization_invalid");
+    const record = {
+      schema_version: "1.0",
+      project_id: progress.project_id,
+      kind: progress.kind,
+      request_id: progress.request_id,
+      request_hash: progress.request_hash,
+      receipt_ref: input.receipt_ref,
+      mutation_intent_ref: input.mutation_intent_ref,
+      destination_path: input.destination_path,
+      content_sha256: input.content_sha256
+    };
+    const finalizationRef = `${await this.root()}/finalizations/${await executionHash(record)}.json`;
+    await this.immutable(finalizationRef, record);
+    progress.status = "finalized";
+    progress.terminal = true;
+    progress.code = null;
+    progress.finalization_ref = finalizationRef;
+    progress.next_attempt_at = null;
+    progress.lease = null;
+    progress.sequence++;
+    await this.save(progress, saved.token);
+    return progress;
+  }
+
   /** Read the actual successor's canonical records, not an adapter's assurance.
    * Compatibility is a frozen predecessor binding plus identical effects and
    * postchecks. No arbitrary evidence URL is read and no client proof is trusted. */

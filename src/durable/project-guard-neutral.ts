@@ -33,7 +33,7 @@ import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError } from "../mutation-gate/repository";
-import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, type LayoutMode } from "../persistence/layout";
+import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
@@ -230,7 +230,8 @@ export class ProjectGuard extends DurableObject<Env> {
         const requestId = url.searchParams.get("request_id");
         if (!projectId || !kind || !requestId) return Response.json({ error: "execution_identity_required" }, { status: 400 });
         const journal = new ExecutionJournal(this.persistence, projectId, kind, requestId);
-        await this.finalizeMaterializedTransaction(journal);
+        if (kind === "artifact") await this.finalizeVerifiedArtifact(journal);
+        else await this.finalizeMaterializedTransaction(journal);
         const status = await journal.status();
         return status ? Response.json(status) : Response.json({ error: "execution_not_found" }, { status: 404 });
       }).catch((error) => this.admissionErrorResponse(error));
@@ -467,7 +468,10 @@ export class ProjectGuard extends DurableObject<Env> {
         ));
       }
       const existingReceipt = JSON.parse(existing.receipt_json) as ArtifactWriteReceipt;
-      if (existingReceipt.status === "committed") await this.repository.cleanupStagedArtifact(artifact);
+      if (existingReceipt.status === "committed") {
+        await this.finalizeVerifiedArtifact(new ExecutionJournal(this.persistence, artifact.project_id, "artifact", artifact.request_id));
+        await this.repository.cleanupStagedArtifact(artifact);
+      }
       return Response.json(existingReceipt);
     }
 
@@ -723,8 +727,15 @@ export class ProjectGuard extends DurableObject<Env> {
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
     if (isReviewCandidate(request)) await this.repository.reviewJournal.recordTerminal(request, receipt);
     await this.repository.writeArtifactReceipt(receipt);
-    if (this.strictAdmissionEnabled(request.project_id)) await new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id).recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
+    // Persist the family cache before attempting certification so the normal
+    // write path can resolve the same frozen request as later status/replay
+    // recovery. The canonical intent and receipt remain the authority.
     this.persistArtifact(request, receipt);
+    if (this.strictAdmissionEnabled(request.project_id)) {
+      const journal = new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id);
+      await journal.recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
+      if (receipt.status === "committed") await this.finalizeVerifiedArtifact(journal);
+    }
     if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
     return Response.json(receipt);
   }
@@ -1420,6 +1431,34 @@ export class ProjectGuard extends DurableObject<Env> {
       target_revision: targetRevision,
       source_event_id: record.event.event_id,
       result_root_hash: materialization.result_root_hash
+    });
+  }
+
+  private async finalizeVerifiedArtifact(journal: ExecutionJournal): Promise<void> {
+    const admitted = await journal.readAdmission();
+    const progress = await journal.status();
+    if (!admitted || admitted.admission.kind !== "artifact" || admitted.plan !== null || !progress
+      || progress.terminal || progress.status !== "finalizing") return;
+    const row = this.findArtifact(admitted.admission.request_id);
+    if (!row) return;
+    const request = parseArtifactWriteRequest(JSON.parse(row.request_json));
+    const receipt = JSON.parse(row.receipt_json) as ArtifactWriteReceipt;
+    const receiptRef = machineArtifactReceiptPath(request.request_id);
+    if (request.project_id !== admitted.admission.project_id
+      || await sha256Canonical(request) !== admitted.admission.request_hash
+      || receipt.status !== "committed"
+      || receipt.request_id !== request.request_id
+      || receipt.project_id !== request.project_id
+      || receipt.relative_path !== request.relative_path
+      || receipt.content_sha256 !== request.content_sha256
+      || progress.receipt_ref !== receiptRef) return;
+    const status = await this.repository.artifactStatus(request.project_id, request.request_id);
+    if (!status || status.verification_state !== "canonical_verified" || status.receipt_status !== "committed") return;
+    await journal.finalizeVerifiedArtifact({
+      receipt_ref: receiptRef,
+      mutation_intent_ref: machineMutationIntentPath(request.project_id, request.request_id),
+      destination_path: status.destination_path,
+      content_sha256: request.content_sha256
     });
   }
 

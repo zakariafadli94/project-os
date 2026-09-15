@@ -10,8 +10,15 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
     return { content: [{ type: "text", text: JSON.stringify({ status: "ok", project_id, context: body }) }] };
   });
   server.registerTool("project_os_get_receipt", { description: "Read a terminal receipt", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) } }, async ({ project_id, request_id, kind }) => {
-    const response = await env.PROJECT_GUARD.getByName(project_id).fetch(`https://project-guard.internal/receipt?request_id=${encodeURIComponent(request_id)}&kind=${kind}`);
-    return { isError: !response.ok, content: [{ type: "text", text: JSON.stringify(await response.json()) }] };
+    const guard = env.PROJECT_GUARD.getByName(project_id);
+    // A receipt lookup is also the universal, idempotent recovery point for a
+    // committed execution. ProjectGuard only certifies already verified
+    // effects; this call never replays the business mutation.
+    const executionResponse = await guard.fetch(`https://project-guard.internal/execution-status?request_id=${encodeURIComponent(request_id)}&kind=${kind}`);
+    const execution = executionResponse.ok ? await executionResponse.json() : null;
+    const response = await guard.fetch(`https://project-guard.internal/receipt?request_id=${encodeURIComponent(request_id)}&kind=${kind}`);
+    const receipt = await response.json<Record<string, unknown>>();
+    return { isError: !response.ok, content: [{ type: "text", text: JSON.stringify(execution ? { ...receipt, execution } : receipt) }] };
   });
   server.registerTool("project_os_submit_transaction", { description: "Submit one typed Project OS transaction", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request: z.any() } }, async ({ project_id, request }) => submitGuarded(env, project_id, "transaction", request));
   server.registerTool("project_os_write_working_document", { description: "Submit one typed working document request", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request: z.any() } }, async ({ project_id, request }) => submitGuarded(env, project_id, "document", request));

@@ -387,7 +387,11 @@ export class MaterializationCoordinator {
             throw new Error(`Final materialization verification is missing changed outputs: ${missing.join(", ")}`);
           }
           fullOutputs = applyPlanToBaseline(baseline?.outputs ?? new Map(), plan, verified);
-          this.ledger.beginFinalVerification(finalVerificationItems(fullOutputs, plan));
+          this.ledger.beginFinalVerification(finalVerificationItems(
+            fullOutputs,
+            plan,
+            this.verifyExistingCriticalPairOnly
+          ));
         }
       }
 
@@ -568,6 +572,7 @@ export class MaterializationCoordinator {
     const head = headFor(record);
     if (this.verifyExistingCriticalPairOnly) {
       const local = this.ledger.status().head;
+      const removed = new Map<string, ProjectionOutputEvidence>();
       const outputs = record.record_kind === "snapshot"
         ? new Map(Object.entries(record.outputs))
         : (() => {
@@ -578,7 +583,12 @@ export class MaterializationCoordinator {
               || local.projection_version !== record.parent.projection_version
             ) throw new Error(`Materialization delta baseline mismatch for ${this.projectId}`);
             const current = this.ledger.baselineOutputs();
-            for (const key of record.removed_outputs) current.delete(key);
+            for (const key of record.removed_outputs) {
+              const evidence = current.get(key);
+              if (!evidence) throw new Error(`Materialization removed-output baseline mismatch for ${key}`);
+              removed.set(key, evidence);
+              current.delete(key);
+            }
             for (const [key, evidence] of Object.entries(record.outputs)) current.set(key, evidence);
             return current;
           })();
@@ -594,7 +604,17 @@ export class MaterializationCoordinator {
       const root = record.workspace_location === "archive"
         ? archiveProjectRoot(canonical.state.project_id, canonical.state.slug)
         : this.workspaceRootFor(canonical.state);
-      await this.writer.verifyOutputs(criticalPairEvidence(outputs), root);
+      const changed = record.record_kind === "snapshot"
+        ? outputs
+        : new Map(Object.entries(record.outputs));
+      const publicationFence = new Map([...criticalPairEvidence(outputs), ...changed]);
+      await this.writer.verifyOutputs(publicationFence, root);
+      if (removed.size > 0) {
+        if (!this.writer.verifyAbsentOutputs) {
+          throw new Error("Completed materialization repair requires removed-output verification");
+        }
+        await this.writer.verifyAbsentOutputs(removed, root);
+      }
       const currentHead = await this.repository.readMaterializationHead(this.projectId);
       const needsRepair = !currentHead
         || isHeadAheadOf(head, currentHead)
@@ -732,13 +752,17 @@ export class MaterializationCoordinator {
 
 function finalVerificationItems(
   outputs: ReadonlyMap<string, ProjectionOutputEvidence>,
-  plan: ProjectionPlan
+  plan: ProjectionPlan,
+  changedOnly = false
 ): FinalVerificationItem[] {
-  const items: FinalVerificationItem[] = [...outputs.entries()].map(([key, evidence]) => ({
-    key,
-    expected: "present",
-    evidence
-  }));
+  const presentKeys = changedOnly ? [...plan.changed_outputs.keys()] : [...outputs.keys()];
+  const items: FinalVerificationItem[] = presentKeys.map((key) => {
+    const evidence = outputs.get(key);
+    if (!evidence) {
+      throw new Error(`Final materialization verification is missing changed-output evidence for ${key}`);
+    }
+    return { key, expected: "present", evidence };
+  });
   for (const key of plan.removed_outputs) {
     const evidence = plan.removed_output_evidence?.get(key);
     if (!evidence) {

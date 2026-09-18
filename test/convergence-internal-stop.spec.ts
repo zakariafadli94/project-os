@@ -19,7 +19,18 @@ function setup() {
   const progress = initialProgress(projectId, new Date(0).toISOString(), "writer-test");
   const outputs = new Map();
   let now = 0;
-  const engine = new ConvergenceEngine({ projectId, runtime, journal, repository: {} as never, ledger: { attemptOutputs: () => outputs } as never, now: () => now, enableHuman: true });
+  const engine = new ConvergenceEngine({
+    projectId,
+    runtime,
+    journal,
+    repository: {} as never,
+    ledger: {
+      attemptOutputs: () => outputs,
+      finalVerificationPending: () => []
+    } as never,
+    now: () => now,
+    enableHuman: true
+  });
   const run = async () => {
     now += 1_000_000;
     await (engine as any).runHumanWithRetry(commitFixture(projectId, 1)[0], progress, { deadline_ms: now + 1000, calls_left: 100, now: () => now, signal: new AbortController().signal, beforeHttp: () => {}, canStartEffect: () => true }, unknownHealth(projectId, new Date(now).toISOString()));

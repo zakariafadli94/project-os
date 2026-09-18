@@ -110,6 +110,7 @@ export interface MaterializationCoordinatorOptions {
   canonicalDerivativesAlreadyCurrent?: boolean;
   verifyExistingCriticalPairOnly?: boolean;
   finalVerificationBatchMax?: number;
+  knownCanonicalRecord?: CanonicalCommitRecord;
 }
 
 export interface MaterializationRunResult {
@@ -139,6 +140,7 @@ export class MaterializationCoordinator {
   private readonly canonicalDerivativesAlreadyCurrent: boolean;
   private readonly verifyExistingCriticalPairOnly: boolean;
   private readonly finalVerificationBatchMax: number | undefined;
+  private readonly knownCanonicalRecord: CanonicalCommitRecord | undefined;
 
   constructor(options: MaterializationCoordinatorOptions) {
     this.projectId = options.projectId;
@@ -155,6 +157,7 @@ export class MaterializationCoordinator {
     this.canonicalDerivativesAlreadyCurrent = options.canonicalDerivativesAlreadyCurrent ?? false;
     this.verifyExistingCriticalPairOnly = options.verifyExistingCriticalPairOnly ?? false;
     this.finalVerificationBatchMax = options.finalVerificationBatchMax;
+    this.knownCanonicalRecord = options.knownCanonicalRecord;
   }
 
   requestTarget(revision: number, projectionVersion = this.projectionVersion): void {
@@ -220,7 +223,9 @@ export class MaterializationCoordinator {
       ? this.ledger.finalVerificationPending()
       : [];
     if (earlyFinalVerification.length === 1) {
-      const canonical = await this.repository.readCommitRecord(this.projectId, target.revision);
+      const canonical = this.knownCanonicalRecord?.new_revision === target.revision
+        ? this.knownCanonicalRecord
+        : await this.repository.readCommitRecord(this.projectId, target.revision);
       if (!canonical) {
         const message = `Canonical commit record missing for ${this.projectId} revision ${target.revision}`;
         this.ledger.failActive(message);
@@ -250,7 +255,9 @@ export class MaterializationCoordinator {
       };
     }
 
-    const record = await this.repository.readCommitRecord(this.projectId, target.revision);
+    const record = this.knownCanonicalRecord?.new_revision === target.revision
+      ? this.knownCanonicalRecord
+      : await this.repository.readCommitRecord(this.projectId, target.revision);
     if (!record) {
       const message = `Canonical commit record missing for ${this.projectId} revision ${target.revision}`;
       this.ledger.failActive(message);

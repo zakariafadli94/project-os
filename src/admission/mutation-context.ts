@@ -52,7 +52,11 @@ export type AdmissionCode =
   | "convergence_capacity_exceeded";
 
 export class AdmissionError extends Error {
-  constructor(readonly code: AdmissionCode, readonly status: 409 | 428 | 503) {
+  constructor(
+    readonly code: AdmissionCode,
+    readonly status: 409 | 428 | 503,
+    readonly detail?: Record<string, unknown>
+  ) {
     super(code);
     this.name = "AdmissionError";
   }

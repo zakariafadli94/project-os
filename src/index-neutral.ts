@@ -187,7 +187,10 @@ const worker = {
         transaction = admission.request;
         mutationContext = admission.mutation_context;
       } catch (error) {
-        if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+        if (error instanceof AdmissionError) return Response.json({
+          error: error.code,
+          ...(error.detail === undefined ? {} : { detail: error.detail })
+        }, { status: error.status });
         return Response.json({
           error: "invalid_transaction",
           message: error instanceof Error ? error.message : "Invalid transaction"
@@ -197,7 +200,10 @@ const worker = {
       try {
         return Response.json(await executeTransactionWithContinuity(env, transaction, undefined, mutationContext));
       } catch (error) {
-        if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+        if (error instanceof AdmissionError) return Response.json({
+          error: error.code,
+          ...(error.detail === undefined ? {} : { detail: error.detail })
+        }, { status: error.status });
         throw error;
       }
     }
@@ -687,9 +693,9 @@ async function routeStableTransaction(env: Env, transaction: Transaction, contex
     body: JSON.stringify({ admission_version: "1.0", request: transaction, mutation_context: context })
   });
   if (!response.ok) {
-    const body: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+    const body: { error?: string; detail?: Record<string, unknown> } = await response.json<{ error?: string; detail?: Record<string, unknown> }>().catch(() => ({}));
     if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
-      throw new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"]);
+      throw new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"], body.detail);
     }
     throw new Error(`ProjectGuard returned ${response.status}`);
   }
@@ -721,9 +727,9 @@ export async function routeManagedDocument(env: Env, document: ManagedDocumentRe
 }
 
 async function projectGuardRouteError(response: Response, route: string): Promise<Error> {
-  const body: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+    const body: { error?: string; detail?: Record<string, unknown> } = await response.json<{ error?: string; detail?: Record<string, unknown> }>().catch(() => ({}));
   if (body.error && [409, 428, 503].includes(response.status) && (["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "ARTIFACT_DESTINATION_FORBIDDEN", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error) || Object.values(checkCatalogue).some(check => check.result_codes.includes(body.error!)))) {
-    return new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"]);
+    return new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"], body.detail);
   }
   return new Error(`ProjectGuard ${route} route returned ${response.status}`);
 }
@@ -734,7 +740,8 @@ async function processInbox(env: Env): Promise<InboxProcessSummary> {
   const transactionSummary = await processTransactionInbox(
     persistence.objects,
     mode,
-    (transaction, context) => executeTransactionWithContinuity(env, transaction, undefined, context)
+    (transaction, context) => executeTransactionWithContinuity(env, transaction, undefined, context),
+    { respectRetryBackoff: true }
   );
   const artifactSummary = await processArtifactInbox(
     persistence.objects,

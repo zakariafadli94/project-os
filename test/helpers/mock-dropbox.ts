@@ -20,7 +20,7 @@ export interface DropboxMockOptions {
 }
 
 interface MockChangeEntry {
-  ".tag": "file" | "deleted";
+  ".tag": "file" | "folder" | "deleted";
   name: string;
   path_display: string;
   path_lower: string;
@@ -33,6 +33,7 @@ interface MockChangeEntry {
 
 export function installDropboxMock(options: DropboxMockOptions = {}) {
   const files = new Map<string, string>();
+  const folders = new Set<string>();
   const fileIds = new Map<string, string>();
   const revisions = new Map<string, number>();
   const revisionContents = new Map<string, { content: string; metadata: MockChangeEntry }>();
@@ -110,6 +111,16 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     bumpRevision(path);
     await recordFileChange(path);
     return metadataFor(path);
+  };
+
+  const writeExternalFolder = (path: string) => {
+    folders.add(path);
+    changeJournal.push({
+      ".tag": "folder",
+      name: path.split("/").at(-1) ?? path,
+      path_display: path,
+      path_lower: path.toLowerCase()
+    });
   };
 
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -259,6 +270,15 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/get_metadata") {
       const body = JSON.parse(await request.text()) as { path?: string };
       if (body.path && revisionContents.has(body.path)) return respond(Response.json(revisionContents.get(body.path)!.metadata));
+      if (body.path && folders.has(body.path)) {
+        return respond(Response.json({
+          ".tag": "folder",
+          id: ensureIdentity(body.path),
+          name: body.path.split("/").at(-1) ?? body.path,
+          path_display: body.path,
+          path_lower: body.path.toLowerCase()
+        }));
+      }
       if (!body.path || !files.has(body.path)) {
         return respond(new Response(JSON.stringify({ error_summary: "path/not_found/" }), { status: 409 }));
       }
@@ -359,11 +379,22 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder") {
       const body = JSON.parse(await request.text()) as { path: string; recursive?: boolean; include_deleted?: boolean };
       const prefix = `${body.path}/`;
-      const entries = (await Promise.all([...files.keys()]
+      const fileEntries = (await Promise.all([...files.keys()]
         .filter((path) => path.startsWith(prefix) && (body.recursive || !path.slice(prefix.length).includes("/")))
         .sort()
         .map((path) => metadataFor(path))))
         .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+      const folderEntries = [...folders]
+        .filter((path) => path.startsWith(prefix) && (body.recursive || !path.slice(prefix.length).includes("/")))
+        .sort()
+        .map((path) => ({
+          ".tag": "folder",
+          id: ensureIdentity(path),
+          name: path.split("/").at(-1) ?? path,
+          path_display: path,
+          path_lower: path.toLowerCase()
+        }));
+      const entries = [...folderEntries, ...fileEntries];
       return respond(Response.json({ entries, cursor: `cursor-${changeJournal.length}`, has_more: false }));
     }
 
@@ -390,6 +421,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
 
   return {
     files,
+    folders,
     calls,
     providerCalls,
     spy,
@@ -397,6 +429,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     downloadCalls,
     conditionalDeleteCalls,
     writeExternal,
+    writeExternalFolder,
     currentCursor: () => `cursor-${changeJournal.length}`,
     maxConcurrentUploads: () => maxConcurrentUploadCount
   };

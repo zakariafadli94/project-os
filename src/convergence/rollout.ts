@@ -19,11 +19,19 @@ export interface CapacityObservation {
   oldest_pending_seconds: number;
   continuation_available: boolean;
   within_qualified_envelope: boolean;
+  reason?: "continuation_unavailable" | "queued_outputs_exceeded" | "oldest_pending_exceeded" | "blocked_obligation" | "repair_required";
+  canonical_revision?: number | null;
+  materialized_revision?: number | null;
+  blocking_obligation?: { layer: string; target_revision: number; code: string | null } | null;
+  retry_after_seconds?: number | null;
 }
 
 export class ConvergenceAdmissionError extends Error {
   readonly status = 503;
-  constructor(readonly code: "convergence_capacity_exceeded") {
+  constructor(
+    readonly code: "convergence_capacity_exceeded",
+    readonly detail: CapacityObservation
+  ) {
     super(code);
   }
 }
@@ -106,6 +114,6 @@ export function admissionModeForProject(raw: string | undefined, projectId: stri
 /** Admission is protected; durable repair work itself is never rejected here. */
 export function assertCapacity(value: CapacityObservation): void {
   if (!value.continuation_available || !value.within_qualified_envelope) {
-    throw new ConvergenceAdmissionError("convergence_capacity_exceeded");
+    throw new ConvergenceAdmissionError("convergence_capacity_exceeded", value);
   }
 }

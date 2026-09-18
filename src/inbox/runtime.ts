@@ -30,7 +30,8 @@ export async function processDurableInbox(env: Env): Promise<DurableInboxProcess
   const transactionSummary = await processTransactionInbox(
     persistence.objects,
     mode,
-    (transaction, context) => executeTransactionWithContinuity(env, transaction, undefined, context)
+    (transaction, context) => executeTransactionWithContinuity(env, transaction, undefined, context),
+    { respectRetryBackoff: true }
   );
   const artifactSummary = await processArtifactInbox(
     persistence.objects,
@@ -75,9 +76,9 @@ async function routeArtifact(env: Env, artifact: ArtifactWriteRequest, context: 
     body: JSON.stringify({ admission_version: "1.0", request: artifact, mutation_context: context })
   });
   if (!response.ok) {
-    const body: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+    const body: { error?: string; detail?: Record<string, unknown> } = await response.json<{ error?: string; detail?: Record<string, unknown> }>().catch(() => ({}));
     if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
-      throw new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"]);
+      throw new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"], body.detail);
     }
     throw new Error(`ProjectGuard artifact route returned ${response.status}`);
   }

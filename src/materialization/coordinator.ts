@@ -743,10 +743,13 @@ export class MaterializationCoordinator {
       }
       await this.writer.verifyAbsentOutputs(absent, workspaceRoot);
     }
-    // Do not clear the last batch before record/head publication. A cold
-    // restart in this interval will observe it again rather than trust a
-    // completed cursor with no published generation.
-    return true;
+    // Checkpoint the last provider read before publication. Large projections
+    // can consume the remainder of a slice while rebuilding their baseline;
+    // retrying this last read together with publication then loops forever.
+    // The following fresh slice still verifies the critical pair immediately
+    // before publishing the immutable record and head.
+    this.ledger.completeFinalVerification(batch.map((item) => item.key));
+    return false;
   }
 
   private hasMoreWork(): boolean {

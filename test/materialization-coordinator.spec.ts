@@ -316,11 +316,19 @@ function coordinator(
 }
 
 describe("MaterializationCoordinator", () => {
-  it("reserves the final verification item for a publication slice", () => {
+  it("sizes final verification independently from the following publication slice", () => {
     const budget = createSliceBudget(() => 0, new AbortController().signal);
     expect(selectFinalVerificationBatchSize(budget, 6)).toBe(6);
     expect(selectFinalVerificationBatchSize(budget, 6, 1)).toBe(1);
     expect(selectFinalVerificationBatchSize(budget, 1)).toBe(1);
+    expect(selectFinalVerificationBatchSize({
+      deadline_ms: 1,
+      calls_left: 1,
+      now: () => 0,
+      signal: new AbortController().signal,
+      beforeHttp: () => undefined,
+      canStartEffect: (requiredCalls) => requiredCalls <= 1
+    }, 1)).toBe(1);
   });
   it("publishes the first generation as a full snapshot and writes record before head", async () => {
     const record = createFixture();

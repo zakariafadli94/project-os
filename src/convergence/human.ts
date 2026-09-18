@@ -26,6 +26,7 @@ export interface HumanSliceInput {
  */
 export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete: boolean; more_work: boolean }> {
   try {
+    const pendingBefore = input.ledger.finalVerificationPending().length;
     const coordinator = new MaterializationCoordinator({
       projectId: input.record.project_id,
       repository: input.repository,
@@ -51,6 +52,15 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
     coordinator.requestTarget(input.record.new_revision, CURRENT_PROJECTION_VERSION);
     const result = await coordinator.runNext();
     const status = coordinator.status();
+    console.info("Project OS human materialization cursor", {
+      project_id: input.record.project_id,
+      target_revision: input.record.new_revision,
+      pending_before: pendingBefore,
+      pending_after: input.ledger.finalVerificationPending().length,
+      active: status.active,
+      completed: result.completed,
+      more_work: result.more_work
+    });
     // A cold ledger can reconcile an already-published generation and find
     // no local target to run. That is a completed human handoff, not an idle
     // pending slice: the engine will immediately perform its independent

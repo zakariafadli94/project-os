@@ -258,6 +258,56 @@ export class ExecutionJournal {
     return progress;
   }
 
+  /** Managed-document receipts include the exact durable version and provider
+   * revision produced by the governed document service. Certification records
+   * that evidence; it never rewrites or promotes the document again. */
+  async finalizeVerifiedDocument(input: {
+    receipt_ref: string;
+    document_id: string;
+    version_id: string;
+    stage: string;
+    logical_path: string;
+    provider_rev: string;
+  }): Promise<ExecutionProgress> {
+    const admitted = await this.readAdmission();
+    if (!admitted || admitted.plan !== null || admitted.admission.kind !== "document") {
+      throw new Error("execution_document_finalization_invalid");
+    }
+    const saved = await this.load();
+    if (!saved) throw new Error("execution_progress_unavailable");
+    const progress = saved.progress;
+    if (progress.terminal) return progress;
+    if (
+      progress.status !== "finalizing"
+      || progress.receipt_ref !== input.receipt_ref
+      || progress.request_hash !== admitted.admission.request_hash
+      || !input.document_id
+      || !input.version_id
+      || !input.stage
+      || !input.logical_path
+      || !input.provider_rev
+    ) throw new Error("execution_document_finalization_invalid");
+    const record = {
+      schema_version: "1.0",
+      project_id: progress.project_id,
+      kind: progress.kind,
+      request_id: progress.request_id,
+      request_hash: progress.request_hash,
+      ...input
+    };
+    const finalizationRef = `${await this.root()}/finalizations/${await executionHash(record)}.json`;
+    await this.immutable(finalizationRef, record);
+    progress.status = "finalized";
+    progress.terminal = true;
+    progress.code = null;
+    progress.finalization_ref = finalizationRef;
+    progress.next_attempt_at = null;
+    progress.lease = null;
+    progress.sequence++;
+    await this.save(progress, saved.token);
+    return progress;
+  }
+
   /** Read the actual successor's canonical records, not an adapter's assurance.
    * Compatibility is a frozen predecessor binding plus identical effects and
    * postchecks. No arbitrary evidence URL is read and no client proof is trusted. */

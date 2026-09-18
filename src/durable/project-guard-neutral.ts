@@ -232,6 +232,7 @@ export class ProjectGuard extends DurableObject<Env> {
         if (!projectId || !kind || !requestId) return Response.json({ error: "execution_identity_required" }, { status: 400 });
         const journal = new ExecutionJournal(this.persistence, projectId, kind, requestId);
         if (kind === "artifact") await this.finalizeVerifiedArtifact(journal);
+        else if (kind === "document") await this.finalizeVerifiedDocument(journal);
         else await this.finalizeMaterializedTransaction(journal);
         const status = await journal.status();
         return status ? Response.json(status) : Response.json({ error: "execution_not_found" }, { status: 404 });
@@ -756,7 +757,11 @@ export class ProjectGuard extends DurableObject<Env> {
       requestJson,
       receiptJson
     );
-    if (this.strictAdmissionEnabled(request.project_id)) await new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id).recordReceipt(receipt.status, `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`);
+    if (this.strictAdmissionEnabled(request.project_id)) {
+      const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
+      await journal.recordReceipt(receipt.status, `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`);
+      if (receipt.status === "committed") await this.finalizeVerifiedDocument(journal);
+    }
     this.persistDocumentRequest(request, receipt);
     return Response.json(receipt);
   }
@@ -1470,6 +1475,33 @@ export class ProjectGuard extends DurableObject<Env> {
       mutation_intent_ref: machineMutationIntentPath(request.project_id, request.request_id),
       destination_path: status.destination_path,
       content_sha256: request.content_sha256
+    });
+  }
+
+  private async finalizeVerifiedDocument(journal: ExecutionJournal): Promise<void> {
+    const admitted = await journal.readAdmission();
+    const progress = await journal.status();
+    if (!admitted || admitted.admission.kind !== "document" || admitted.plan !== null || !progress
+      || progress.terminal || progress.status !== "finalizing") return;
+    const row = this.findDocumentRequest(admitted.admission.request_id);
+    if (!row) return;
+    const request = parseManagedDocumentRequest(JSON.parse(row.request_json));
+    const receipt = JSON.parse(row.receipt_json) as ManagedDocumentOperationReceipt;
+    const receiptRef = `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`;
+    if (request.project_id !== admitted.admission.project_id
+      || await sha256Canonical(request) !== admitted.admission.request_hash
+      || receipt.status !== "committed"
+      || receipt.request_id !== request.request_id
+      || receipt.project_id !== request.project_id
+      || !receipt.provider_rev
+      || progress.receipt_ref !== receiptRef) return;
+    await journal.finalizeVerifiedDocument({
+      receipt_ref: receiptRef,
+      document_id: receipt.document_id,
+      version_id: receipt.version_id,
+      stage: receipt.stage,
+      logical_path: receipt.logical_path,
+      provider_rev: receipt.provider_rev
     });
   }
 

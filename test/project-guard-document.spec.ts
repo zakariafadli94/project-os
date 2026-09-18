@@ -86,11 +86,19 @@ describe("ProjectGuard managed documents", () => {
   it("writes a working document and exposes compact logical status", async () => {
     const created = await createProject("TXN-DOCUMENT-PROJECT-0001");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const signing = "document-execution-finalization";
+    await bootstrapRuleAdmissionGovernance(testEnv, signing, created.project_id);
+    await runInDurableObject(guard, (instance) => Object.assign((instance as unknown as { env: Env }).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: signing,
+      RULE_ADMISSION_SIGNING_KEY: signing,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    const { context } = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
     const content = "# Commercial strategy";
     const write = await guard.fetch("https://project-guard.internal/document", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
+      body: JSON.stringify(encodeAdmission({
         operation: "working.write",
         request_id: "DOCREQ-WORK-36010001",
         project_id: created.project_id,
@@ -98,11 +106,21 @@ describe("ProjectGuard managed documents", () => {
         content,
         content_sha256: await sha256Text(content),
         created_at: at
-      })
+      }, context))
     });
     expect(write.status).toBe(200);
     const receipt = await write.json<{ status: string; document_id: string; version_id: string; stage: string }>();
     expect(receipt).toMatchObject({ status: "committed", stage: "working" });
+
+    const execution = await guard.fetch(
+      "https://project-guard.internal/execution-status?kind=document&request_id=DOCREQ-WORK-36010001"
+    );
+    expect(await execution.json()).toMatchObject({
+      status: "finalized",
+      terminal: true,
+      code: null,
+      finalization_ref: expect.any(String)
+    });
 
     const status = await guard.fetch(
       `https://project-guard.internal/document-status?document_id=${encodeURIComponent(receipt.document_id)}`,

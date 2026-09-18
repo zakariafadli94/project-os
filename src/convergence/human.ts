@@ -25,8 +25,8 @@ export interface HumanSliceInput {
  * but retain the existing generation/head fencing in MaterializationCoordinator.
  */
 export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete: boolean; more_work: boolean }> {
+  const pendingBefore = input.ledger.finalVerificationPending().length;
   try {
-    const pendingBefore = input.ledger.finalVerificationPending().length;
     const coordinator = new MaterializationCoordinator({
       projectId: input.record.project_id,
       repository: input.repository,
@@ -70,7 +70,19 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
       && status.head.projection_version === CURRENT_PROJECTION_VERSION;
     return { complete: result.completed || alreadyPublished, more_work: result.more_work };
   } catch (error) {
-    if (input.budget && isSliceBudgetExhaustion(error)) return { complete: false, more_work: true };
+    if (input.budget && isSliceBudgetExhaustion(error)) {
+      console.info("Project OS human materialization cursor", {
+        project_id: input.record.project_id,
+        target_revision: input.record.new_revision,
+        pending_before: pendingBefore,
+        pending_after: input.ledger.finalVerificationPending().length,
+        active: null,
+        completed: false,
+        more_work: true,
+        exit: "slice_budget_exhausted"
+      });
+      return { complete: false, more_work: true };
+    }
     throw error;
   }
 }

@@ -2,7 +2,10 @@ import type { SliceBudget } from "./contract";
 import type { ProviderRequestScope } from "../persistence/provider/contract";
 
 const MAX_PROVIDER_CALLS = 32;
-const SLICE_DURATION_MS = 10_000;
+// Paid Workers have enough wall-clock allowance for the slowest observed
+// Dropbox publication round trip. Keep the slice bounded, but do not abort a
+// correctly fenced publication at the former free-tier 10-second boundary.
+export const SLICE_DURATION_MS = 25_000;
 const CHECKPOINT_CALL_RESERVE = 4;
 // Stop starting multi-call effects early, allow an already-started Dropbox
 // operation to settle, then retain a separate window for durable checkpoints.

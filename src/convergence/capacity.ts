@@ -3,7 +3,7 @@ import type { CapacityObservation } from "./rollout";
 const MAX_PROVIDER_CALLS_PER_SLICE = 32;
 const RESERVED_CHECKPOINT_CALLS = 4;
 const USABLE_EFFECT_CALLS = MAX_PROVIDER_CALLS_PER_SLICE - RESERVED_CHECKPOINT_CALLS;
-const MAX_SLICE_DURATION_MS = 10_000;
+const MAX_SLICE_DURATION_MS = 25_000;
 
 export interface VirtualCapacityInput {
   duration_minutes: number;

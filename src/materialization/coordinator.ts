@@ -216,6 +216,23 @@ export class MaterializationCoordinator {
       };
     }
 
+    const earlyFinalVerification = this.sliceBudget
+      ? this.ledger.finalVerificationPending()
+      : [];
+    if (earlyFinalVerification.length === 1) {
+      const canonical = await this.repository.readCommitRecord(this.projectId, target.revision);
+      if (!canonical) {
+        const message = `Canonical commit record missing for ${this.projectId} revision ${target.revision}`;
+        this.ledger.failActive(message);
+        throw new Error(message);
+      }
+      const verificationRoot = canonical.state.status === "archived"
+        ? archiveProjectRoot(canonical.state.project_id, canonical.state.slug)
+        : this.workspaceRootFor(canonical.state);
+      await this.verifyFinalOutputBatch(verificationRoot);
+      return pendingMaterializationResult(this.projectId, target);
+    }
+
     const existingRecord = await this.repository.readMaterializationRecord(
       this.projectId,
       target.revision,
@@ -250,7 +267,9 @@ export class MaterializationCoordinator {
       const pendingFinalVerification = this.sliceBudget
         ? this.ledger.finalVerificationPending()
         : [];
-      if (pendingFinalVerification.length > 1 && !this.verifyExistingCriticalPairOnly) {
+      if (
+        pendingFinalVerification.length > 1 && !this.verifyExistingCriticalPairOnly
+      ) {
         const verificationRoot = record.state.status === "archived"
           ? archiveProjectRoot(record.state.project_id, record.state.slug)
           : this.workspaceRootFor(record.state);

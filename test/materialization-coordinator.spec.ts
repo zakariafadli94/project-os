@@ -515,11 +515,17 @@ describe("MaterializationCoordinator", () => {
     value.requestTarget(second.new_revision);
     await value.runNext();
 
-    const carried = ledger.baseline.get("global:BRIEF")!;
-    ledger.pendingFinalVerification!.push({ key: "global:BRIEF", evidence: carried, expected: "present" });
+    for (const key of ["global:OPERATING", "global:DISCOVERY", "global:BRIEF"]) {
+      const carried = ledger.baseline.get(key)!;
+      ledger.pendingFinalVerification!.unshift({ key, evidence: carried, expected: "present" });
+    }
     await value.runUntilIdle();
 
-    expect(writer.verifiedOutputKeys.flat()).not.toContain("global:BRIEF");
+    expect(writer.verifiedOutputKeys.flat()).not.toEqual(expect.arrayContaining([
+      "global:BRIEF",
+      "global:DISCOVERY",
+      "global:OPERATING"
+    ]));
     expect(repo.head?.target_revision).toBe(second.new_revision);
   });
 

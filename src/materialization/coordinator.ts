@@ -250,7 +250,7 @@ export class MaterializationCoordinator {
       const pendingFinalVerification = this.sliceBudget
         ? this.ledger.finalVerificationPending()
         : [];
-      if (pendingFinalVerification.length > 1) {
+      if (pendingFinalVerification.length > 1 && !this.verifyExistingCriticalPairOnly) {
         const verificationRoot = record.state.status === "archived"
           ? archiveProjectRoot(record.state.project_id, record.state.slug)
           : this.workspaceRootFor(record.state);

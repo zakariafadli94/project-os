@@ -892,6 +892,49 @@ export class ConvergenceEngine {
       progress.next_alarm_at = nextPendingWake(progress);
       return false;
     }
+    if (this.input.ledger.finalVerificationPending().length > 0) {
+      // Final verification is read-only at the provider boundary and advances
+      // only a local Durable Object cursor. Do not spend the fresh slice on a
+      // second external attempt reservation; the following publication slice
+      // still uses the normal fenced reservation path.
+      const human = await runHumanSlice({
+        record,
+        repository: this.input.humanRepository ?? this.input.repository,
+        runtime: this.effectRuntime(),
+        ledger: this.input.ledger,
+        budget: reserveCheckpointForJournal(budget),
+        projectionConcurrency: this.input.humanProjectionConcurrency,
+        ...(this.input.finalVerificationBatchMax === undefined
+          ? {}
+          : { finalVerificationBatchMax: this.input.finalVerificationBatchMax }),
+        now: () => new Date(this.input.now()).toISOString()
+      });
+      for (const currentLayerName of ["human_state", "human_handoff", "generation", "head"] as const) {
+        health.layers[currentLayerName] = human.complete
+          ? currentLayer(record.new_revision, this.input.now())
+          : pendingLayer(record.new_revision, this.input.now(), "human_slice_pending");
+      }
+      progress.obligations[obligationId] = {
+        id: obligationId,
+        layer,
+        from_revision: record.previous_revision,
+        target: { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION },
+        incident: existing?.incident ?? 1,
+        state: human.complete ? "verified" : "pending",
+        first_pending_at: existing?.first_pending_at ?? new Date(this.input.now()).toISOString(),
+        next_attempt_at: null,
+        failure_count: existing?.failure_count ?? 0,
+        last_attempt_number: existing?.last_attempt_number ?? 0,
+        last_closed_attempt_number: existing?.last_closed_attempt_number ?? 0,
+        last_verified_at: human.complete ? new Date(this.input.now()).toISOString() : null,
+        code: human.complete ? null : "human_slice_pending",
+        lease_until: null,
+        continuation: human.complete ? "verify" : null
+      };
+      progress.active = { revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION };
+      progress.next_alarm_at = new Date(this.input.now()).toISOString();
+      return human.complete || human.more_work;
+    }
     const attemptNumber = (existing?.last_attempt_number ?? 0) + 1;
     const reservation = await this.reserveAttempt({
       schema_version: "1.0",

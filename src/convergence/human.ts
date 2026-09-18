@@ -35,6 +35,7 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
       projectionVersion: CURRENT_PROJECTION_VERSION,
       canonicalDerivativesAlreadyCurrent: true,
       verifyExistingCriticalPairOnly: true,
+      knownCanonicalRecord: input.record,
       ...(input.finalVerificationBatchMax === undefined
         ? {}
         : { finalVerificationBatchMax: input.finalVerificationBatchMax }),

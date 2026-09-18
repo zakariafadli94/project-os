@@ -774,6 +774,7 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!projectId || projectId === AUTO_PROJECT_ID || !secret) {
       return Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
+    const includeState = new URL(request.url).searchParams.get("include_state") !== "false";
     const progress = initialProgress(projectId, new Date().toISOString(), crypto.randomUUID());
     let latest: ProjectState | null = null;
     const historicalSnapshot = await this.repository.readProjectState(projectId);
@@ -799,13 +800,13 @@ export class ProjectGuard extends DurableObject<Env> {
       if (!discovered) {
         if (!latest) return Response.json({ error: "canonical_unavailable" }, { status: 503 });
         const context = await issueMutationContext(latest, secret, Date.now(), this.contextActor(request));
-        return Response.json({ context, canonical_state: latest });
+        return Response.json(includeState ? { context, canonical_state: latest } : { context });
       }
       latest = discovered.state;
       progress.canonical_observed_revision = discovered.state.revision;
       if (discovered.complete) {
         const context = await issueMutationContext(discovered.state, secret, Date.now(), this.contextActor(request));
-        return Response.json({ context, canonical_state: discovered.state });
+        return Response.json(includeState ? { context, canonical_state: discovered.state } : { context });
       }
     }
     return Response.json({ error: "canonical_unavailable" }, { status: 503 });

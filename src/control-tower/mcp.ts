@@ -6,8 +6,8 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
   server.registerTool("project_os_get_context", { description: "Read canonical Project OS context", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/) } }, async ({ project_id }) => {
     const response = await env.PROJECT_GUARD.getByName(project_id).fetch("https://project-guard.internal/mutation-context");
     if (!response.ok) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
-    const body = await response.json();
-    return { content: [{ type: "text", text: JSON.stringify({ status: "ok", project_id, context: body }) }] };
+    const body = await response.json<{ context: unknown; canonical_state?: Record<string, unknown> }>();
+    return { content: [{ type: "text", text: JSON.stringify({ status: "ok", project_id, ...boundedContext(body) }) }] };
   });
   server.registerTool("project_os_get_receipt", { description: "Read a terminal receipt", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) } }, async ({ project_id, request_id, kind }) => {
     const guard = env.PROJECT_GUARD.getByName(project_id);
@@ -28,7 +28,7 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
 
 async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }, projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>) {
   if (!request || typeof request !== "object" || request.project_id !== projectId) return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({ status: "rejected", code: "project_binding_mismatch" }) }] };
-  const contextResponse = await env.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/mutation-context", { headers: env.CONTROL_TOWER_OPERATOR_TOKEN ? { authorization: `Bearer ${env.CONTROL_TOWER_OPERATOR_TOKEN}` } : {} });
+  const contextResponse = await env.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/mutation-context?include_state=false", { headers: env.CONTROL_TOWER_OPERATOR_TOKEN ? { authorization: `Bearer ${env.CONTROL_TOWER_OPERATOR_TOKEN}` } : {} });
   if (!contextResponse.ok) return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
   const canonical = await contextResponse.json<{ context?: unknown }>();
   const owner = kind === "transaction" && request.operation === "project.create" ? env.REGISTRY_GUARD.getByName("global") : env.PROJECT_GUARD.getByName(projectId);
@@ -36,4 +36,29 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
   const response = await owner.fetch(`https://project-guard.internal${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ admission_version: "1.0", request, mutation_context: request.operation === "project.create" ? null : canonical.context }) });
   const payload = { content: [{ type: "text" as const, text: JSON.stringify(await response.json()) }] };
   return response.ok ? payload : { ...payload, isError: true as const };
+}
+
+function boundedContext(body: { context: unknown; canonical_state?: Record<string, unknown> }) {
+  const state = body.canonical_state ?? {};
+  const phases = recordValues(state.phases);
+  const tasks = recordValues(state.tasks);
+  const currentPhaseId = typeof state.current_phase_id === "string" ? state.current_phase_id : null;
+  return {
+    context: body.context,
+    project: pick(state, ["project_id", "name", "slug", "status", "revision", "current_phase_id"]),
+    current_phase: phases.find((phase) => phase.phase_id === currentPhaseId) ?? null,
+    active_tasks: tasks
+      .filter((task) => task.status !== "completed" && task.status !== "cancelled")
+      .slice(0, 50)
+      .map((task) => pick(task, ["task_id", "title", "status", "phase_id", "blocked_reason", "updated_at"]))
+  };
+}
+
+function recordValues(value: unknown): Array<Record<string, unknown>> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.values(value).filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object" && !Array.isArray(entry));
+}
+
+function pick(value: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
+  return Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, value[key]]));
 }

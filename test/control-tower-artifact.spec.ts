@@ -45,8 +45,9 @@ describe("Control Tower governed artifact submission", () => {
     const calls: Array<{ path: string; body?: unknown }> = [];
     const stub = {
       fetch: async (input: string, init?: RequestInit) => {
-        calls.push({ path: new URL(input).pathname, body: init?.body ? JSON.parse(String(init.body)) : undefined });
-        if (new URL(input).pathname === "/mutation-context") {
+        const url = new URL(input);
+        calls.push({ path: `${url.pathname}${url.search}`, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        if (url.pathname === "/mutation-context") {
           return Response.json({ context: { project_id: "PRJ-0007", token: "signed" } });
         }
         return Response.json({ status: "committed", request_id: artifact.request_id });
@@ -64,7 +65,7 @@ describe("Control Tower governed artifact submission", () => {
 
     expect(result).not.toMatchObject({ isError: true });
     expect(calls).toEqual([
-      { path: "/mutation-context" },
+      { path: "/mutation-context?include_state=false" },
       {
         path: "/artifact",
         body: {
@@ -74,5 +75,48 @@ describe("Control Tower governed artifact submission", () => {
         }
       }
     ]);
+  });
+
+  it("returns bounded operational context instead of the complete project history", async () => {
+    const canonicalState = {
+      project_id: "PRJ-0007",
+      name: "Atlantic Machinery",
+      slug: "atlantic-machinery",
+      status: "active",
+      revision: 76,
+      current_phase_id: "PHASE-CURRENT",
+      phases: {
+        "PHASE-CURRENT": { phase_id: "PHASE-CURRENT", title: "Current", status: "active" },
+        "PHASE-HISTORY": { phase_id: "PHASE-HISTORY", title: "History", status: "completed", payload: "x".repeat(200_000) }
+      },
+      tasks: {
+        "TASK-ACTIVE": { task_id: "TASK-ACTIVE", title: "Continue", status: "in_progress" },
+        "TASK-DONE": { task_id: "TASK-DONE", title: "Old", status: "completed", payload: "x".repeat(200_000) }
+      }
+    };
+    const stub = {
+      fetch: async () => Response.json({
+        context: { project_id: "PRJ-0007", canonical_revision: 76, token: "signed" },
+        canonical_state: canonicalState
+      })
+    };
+    const server = createControlTowerServer({
+      PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
+      REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
+    }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ content: Array<{ text: string }> }> }> };
+
+    const result = await server._registeredTools.project_os_get_context.handler({ project_id: "PRJ-0007" });
+    const body = JSON.parse(result.content[0]!.text);
+
+    expect(body).toMatchObject({
+      status: "ok",
+      project_id: "PRJ-0007",
+      context: { project_id: "PRJ-0007", canonical_revision: 76, token: "signed" },
+      project: { name: "Atlantic Machinery", revision: 76, current_phase_id: "PHASE-CURRENT" },
+      current_phase: { phase_id: "PHASE-CURRENT", status: "active" },
+      active_tasks: [{ task_id: "TASK-ACTIVE", status: "in_progress" }]
+    });
+    expect(body).not.toHaveProperty("canonical_state");
+    expect(result.content[0]!.text.length).toBeLessThan(10_000);
   });
 });

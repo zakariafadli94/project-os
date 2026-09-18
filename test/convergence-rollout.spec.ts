@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { createExecutionContext, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import type { Env } from "../src/env";
+import worker from "../src/index-mutation-gate";
 import { ConvergenceJournal, initialProgress } from "../src/convergence/journal";
 import { machineCommitRecordPath, machineReceiptPath } from "../src/dropbox/layout";
 import { sha256Text } from "../src/documents/hash";
@@ -57,8 +58,21 @@ describe("convergence rollout gates", () => {
   it("rejects new commits when the qualified continuation envelope is unavailable", () => {
     expect(() => assertCapacity({
       queued_outputs: 3, oldest_pending_seconds: 601,
-      continuation_available: false, within_qualified_envelope: true
-    })).toThrow(expect.objectContaining({ code: "convergence_capacity_exceeded", status: 503 }));
+      continuation_available: false, within_qualified_envelope: true,
+      reason: "continuation_unavailable",
+      canonical_revision: 312,
+      materialized_revision: 310,
+      blocking_obligation: null,
+      retry_after_seconds: null
+    })).toThrow(expect.objectContaining({
+      code: "convergence_capacity_exceeded",
+      status: 503,
+      detail: expect.objectContaining({
+        reason: "continuation_unavailable",
+        canonical_revision: 312,
+        materialized_revision: 310
+      })
+    }));
   });
 
   it("rejects a repair-mode commit before allocating a revision when continuation is missing", async () => {
@@ -115,9 +129,44 @@ describe("convergence rollout gates", () => {
     });
 
     expect(blocked.status).toBe(503);
-    await expect(blocked.json()).resolves.toEqual({ error: "convergence_capacity_exceeded" });
+    await expect(blocked.json()).resolves.toMatchObject({
+      error: "convergence_capacity_exceeded",
+      detail: {
+        reason: "continuation_unavailable",
+        canonical_revision: 1,
+        materialized_revision: null,
+        queued_outputs: 1,
+        blocking_obligation: {
+          layer: "human_handoff",
+          target_revision: 1,
+          code: "human_write_failed"
+        }
+      }
+    });
+    const publicBlocked = await worker.fetch(new Request("https://project-os.test/v1/transactions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${testEnv.INGRESS_TOKEN}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        schema_version: "1.0",
+        transaction_id: "TXN-ROLLOUT-9977-TASK-0003",
+        project_id: projectId,
+        base_revision: 1,
+        operation: "task.create",
+        created_at: "2026-09-09T10:01:30.000Z",
+        payload: { task_id: "TASK-9978", title: "Public capacity detail" }
+      })
+    }), testEnv, createExecutionContext());
+    expect(publicBlocked.status).toBe(503);
+    await expect(publicBlocked.json()).resolves.toMatchObject({
+      error: "convergence_capacity_exceeded",
+      detail: { reason: "continuation_unavailable", canonical_revision: 1 }
+    });
     expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(false);
     expect(mock.files.has(machineReceiptPath("TXN-ROLLOUT-9977-TASK-0002"))).toBe(false);
+    expect([...mock.files.keys()].some((path) => path.includes("/transactions/incoming/"))).toBe(false);
 
     await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), async (_instance, state) => {
       await state.storage.setAlarm(Date.now() + 60_000);

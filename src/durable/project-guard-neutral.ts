@@ -48,6 +48,7 @@ import { sha256Canonical } from "../materialization/hash";
 import {
   admissionModeForProject,
   assertCapacity,
+  ConvergenceAdmissionError,
   convergenceModeForProject,
   type CapacityObservation
 } from "../convergence/rollout";
@@ -370,6 +371,10 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.persistAdmissionProof("transaction", tx.transaction_id, proof);
       }
 
+      // Capacity refusal is pre-admission: it must not reserve an idempotency
+      // intent that can serialize or conflict with otherwise independent work.
+      await this.assertCommitCapacity(tx.project_id);
+
       // A refused strict admission must not reserve an idempotency key.  Only
       // bind this intent after the verified permit and second rules evaluation.
       await this.ensureTransactionIntent(tx);
@@ -377,7 +382,6 @@ export class ProjectGuard extends DurableObject<Env> {
       const state = this.layoutMode === "v2"
         ? reconciledState
         : await this.loadOrRecoverState();
-      await this.assertCommitCapacity(tx.project_id);
       let localRuleActivation: LocalRuleActivationCapability | undefined;
       if (tx.operation === "rule.activate" && state) {
         try {
@@ -886,8 +890,11 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!isCapacityObservation(observation)) throw new AdmissionError("convergence_capacity_exceeded", 503);
     try {
       assertCapacity(observation);
-    } catch {
-      throw new AdmissionError("convergence_capacity_exceeded", 503);
+    } catch (error) {
+      if (error instanceof ConvergenceAdmissionError) {
+        throw new AdmissionError("convergence_capacity_exceeded", 503, error.detail as unknown as Record<string, unknown>);
+      }
+      throw error;
     }
   }
 
@@ -954,7 +961,10 @@ export class ProjectGuard extends DurableObject<Env> {
     if (error instanceof Error && error.message === "repair_diagnosed_drift_required") return Response.json({ error: "REPAIR_INTENT_REQUIRED" }, { status: 409 });
     if (error instanceof Error && error.message.startsWith("execution_")) return Response.json({ error: error.message }, { status: error.message.endsWith("conflict") ? 409 : 503 });
     if (error instanceof Error && error.message.startsWith("repair_")) return Response.json({ error: error.message }, { status: error.message.endsWith("unavailable") ? 503 : 409 });
-    if (error instanceof AdmissionError) return Response.json({ error: error.code }, { status: error.status });
+    if (error instanceof AdmissionError) return Response.json({
+      error: error.code,
+      ...(error.detail === undefined ? {} : { detail: error.detail })
+    }, { status: error.status });
     if (error instanceof RuleAdmissionError) return Response.json({ error: error.code }, { status: error.code === "rule_admission_expired" ? 409 : 503 });
     if (error instanceof RuleAdmissionRejection) {
       const result = error.evaluation;

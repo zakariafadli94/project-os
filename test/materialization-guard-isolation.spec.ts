@@ -13,6 +13,7 @@ import {
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { commitFixture } from "./helpers/convergence-fixture";
 
 const testEnv = env as unknown as Env;
 const at = "2026-09-02T07:20:00+01:00";
@@ -291,6 +292,103 @@ describe("MaterializationGuard isolation boundary", () => {
       expect(mock.files.has(machineMaterializationHeadPath(projectId))).toBe(true);
       expect(withoutProviderHeadBody.status).toBe("current");
     }
+  });
+
+  it("retires a covered blocked human obligation before rearming a newer canonical target", async () => {
+    const mock = installDropboxMock();
+    const projectId = "PRJ-3916";
+    await createProject(projectId, "repair-covered-human", "TXN-MATISO-3916-CREATE");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    await guard.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
+      if (!await runDurableObjectAlarm(guard)) break;
+    }
+
+    const persistence = createProductionPersistence(testEnv, projectId);
+    const repository = new ProjectRepository(persistence, "v2");
+    await repository.writeCommitRecord(commitFixture(projectId, 2)[1]!);
+    const journal = new ConvergenceJournal(persistence, projectId);
+    const saved = await journal.load();
+    expect(saved).not.toBeNull();
+    if (!saved) throw new Error("missing convergence journal");
+    const human = Object.entries(saved.progress.obligations)
+      .find(([, obligation]) => obligation.layer === "human_handoff" && obligation.target.revision === 1);
+    expect(human).toBeDefined();
+    if (!human) throw new Error("missing human obligation");
+    saved.progress.obligations[human[0]] = {
+      ...human[1],
+      state: "blocked",
+      next_attempt_at: null,
+      code: "identical_internal_failure_limit",
+      failure_count: 6
+    };
+    const futureProjectionId = "c".repeat(64);
+    saved.progress.obligations[futureProjectionId] = {
+      ...human[1],
+      id: futureProjectionId,
+      target: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION + 1 },
+      state: "blocked",
+      next_attempt_at: null,
+      code: "future_projection_not_materialized"
+    };
+    const olderFutureProjectionId = "d".repeat(64);
+    saved.progress.obligations[olderFutureProjectionId] = {
+      ...human[1],
+      id: olderFutureProjectionId,
+      target: { revision: 0, projection_version: CURRENT_PROJECTION_VERSION + 1 },
+      state: "blocked",
+      next_attempt_at: null,
+      code: "older_future_projection_not_materialized"
+    };
+    saved.progress.canonical_observed_revision = 2;
+    saved.progress.active = { revision: 1, projection_version: CURRENT_PROJECTION_VERSION };
+    saved.progress.requested = { revision: 2, projection_version: CURRENT_PROJECTION_VERSION };
+    saved.progress.next_alarm_at = null;
+    await journal.save(saved.progress, saved.token);
+
+    const recordPath = machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION);
+    const originalRecord = mock.files.get(recordPath);
+    expect(originalRecord).toBeDefined();
+    if (!originalRecord) throw new Error("missing materialization record");
+    const corruptRecord = JSON.parse(originalRecord) as Record<string, unknown>;
+    corruptRecord.source_event_id = "EVT-999999";
+    mock.files.set(recordPath, JSON.stringify(corruptRecord));
+    await expect(guard.fetch("https://materialization-guard.internal/reconcile", { method: "POST" }))
+      .rejects.toThrow("Materialization resume point canonical binding mismatch");
+    expect((await journal.load())?.progress.obligations[human[0]].state).toBe("blocked");
+
+    mock.files.set(recordPath, originalRecord);
+    const response = await guard.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    expect(response.status).toBe(200);
+    const repaired = await journal.load();
+    expect(repaired?.progress.obligations[human[0]]).toMatchObject({
+      state: "verified",
+      code: null,
+      next_attempt_at: null,
+      continuation: null
+    });
+    expect(repaired?.progress.obligations[futureProjectionId]).toMatchObject({
+      state: "blocked",
+      code: "future_projection_not_materialized"
+    });
+    expect(repaired?.progress.obligations[olderFutureProjectionId]).toMatchObject({
+      state: "blocked",
+      code: "older_future_projection_not_materialized"
+    });
+    expect(repaired?.progress.requested).toEqual({
+      revision: 2,
+      projection_version: CURRENT_PROJECTION_VERSION
+    });
+    expect(repaired?.progress.active?.revision).not.toBe(1);
   });
 
   it("requeues the current projection version even when an older obligation is still pending", async () => {

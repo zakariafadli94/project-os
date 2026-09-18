@@ -782,27 +782,24 @@ function finalVerificationItems(
 }
 
 /**
- * Final output reads must never take the journal reserve. If this is the last
- * batch, also reserve the immutable record/head publication and its critical
- * post-publication checks. Earlier batches consume only provider reads, then
- * durably retain their remaining-key cursor for the next fresh slice.
+ * Final output reads must never take the journal reserve. Publication happens
+ * in the following fresh slice after the final read is checkpointed, so this
+ * batch reserves only the provider reads it actually performs.
  */
 export function selectFinalVerificationBatchSize(
   budget: SliceBudget,
   pendingCount: number,
   configuredMaximum = pendingCount
 ): number {
-  const publicationCalls = 8;
   // Keep non-final verification deliberately small for real providers, while
   // still guaranteeing that a maximum-size (200 output) project drains within
   // the qualified 128-slice continuation envelope.
   const maximumSize = Math.min(pendingCount, configuredMaximum);
   for (let size = maximumSize; size >= 1; size -= 1) {
-    const isFinalBatch = size === pendingCount;
     // The batch starts at the configured maximum. Per-item durable cursor
     // updates below make variable provider cost safe: an exhausted slice
     // resumes after the last verified file instead of repeating the batch.
-    if (budget.canStartEffect(size + (isFinalBatch ? publicationCalls : 0))) return size;
+    if (budget.canStartEffect(size)) return size;
   }
   return 0;
 }

@@ -368,13 +368,13 @@ describe("MaterializationCoordinator", () => {
     expect(repo.writeOrder).toEqual(["record", "head"]);
   });
 
-  it("retains the last final-verification batch until record publication", async () => {
+  it("publishes only after the final-verification cursor was checkpointed", async () => {
     const record = createFixture();
     const repo = new FakeRepository();
     const ledger = new FakeLedger();
     repo.commits.set(record.new_revision, record);
     repo.beforeRecordWrite = () => {
-      expect(ledger.finalVerificationPending()).toHaveLength(1);
+      expect(ledger.finalVerificationPending()).toHaveLength(0);
     };
     const budget = createSliceBudget(() => 0, new AbortController().signal);
     const { value } = coordinator(repo, ledger, new FakeWriter(), CURRENT_PROJECTION_VERSION, budget, {
@@ -465,6 +465,31 @@ describe("MaterializationCoordinator", () => {
     const changed = [...writer.plans.at(-1)!.changed_outputs.keys()].sort();
     expect(writer.verifiedOutputKeys.flat().sort()).toEqual(changed);
     expect(repo.head?.target_revision).toBe(second.new_revision);
+  });
+
+  it("checkpoints the last final verification before publishing in a fresh slice", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const ledger = new FakeLedger();
+    const writer = new FakeWriter();
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, ledger, writer, CURRENT_PROJECTION_VERSION, budget, {
+      verifyExistingCriticalPairOnly: true,
+      finalVerificationBatchMax: 1
+    });
+
+    value.requestTarget(record.new_revision);
+    while ((ledger.pendingFinalVerification?.length ?? 0) !== 1) {
+      await value.runNext();
+    }
+
+    await value.runNext();
+    expect(ledger.pendingFinalVerification).toEqual([]);
+    expect(repo.head).toBeNull();
+
+    await value.runNext();
+    expect(repo.head?.target_revision).toBe(record.new_revision);
   });
 
   it("narrows an inherited full verification pass after the convergence optimization is deployed", async () => {

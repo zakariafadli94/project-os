@@ -28,10 +28,15 @@ export interface ArtifactInboxProcessOptions {
   rotateScan?: boolean;
 }
 
+export interface TransactionInboxProcessOptions {
+  respectRetryBackoff?: boolean;
+}
+
 export const MAX_RETRYABLE_INBOX_ATTEMPTS = 8;
 export const ARTIFACT_RETRY_FAST_ATTEMPT_LIMIT = 5;
 export const ARTIFACT_RETRY_FAST_DELAY_MS = 1_000;
 export const ARTIFACT_RETRY_DEFER_DELAY_MS = 300_000;
+export const TRANSACTION_RETRY_DELAY_MS = 60_000;
 
 export type ExecuteTransaction = (transaction: Transaction, context?: MutationContext | null) => Promise<Receipt>;
 export type ExecuteArtifact = (artifact: ArtifactWriteRequest, context?: MutationContext | null) => Promise<ArtifactWriteReceipt>;
@@ -78,7 +83,8 @@ export function artifactInboxPath(mode: LayoutMode): string {
 export async function processTransactionInbox(
   objects: ObjectPersistence,
   mode: LayoutMode,
-  executeTransaction: ExecuteTransaction
+  executeTransaction: ExecuteTransaction,
+  options: TransactionInboxProcessOptions = {}
 ): Promise<InboxProcessSummary> {
   const listedEntries = await objects.listChildren(inboxPath(mode));
   const transactionEntries = listedEntries
@@ -154,11 +160,28 @@ export async function processTransactionInbox(
         continue;
       }
 
+      const priorFailure = await readTransactionFailure(
+        objects,
+        transactionFailurePath(mode, transaction.transaction_id),
+        transaction
+      );
+      if (options.respectRetryBackoff && priorFailure && !transactionRetryDue(priorFailure)) {
+        continue;
+      }
+
       let receipt: Receipt;
       try {
         receipt = await executeTransaction(transaction, mutationContext);
       } catch (error) {
         if (error instanceof AdmissionError) {
+          if (error.code === "convergence_capacity_exceeded") {
+            summary.failed += 1;
+            const diagnostic = await recordTransactionFailure(objects, mode, transaction, error);
+            if (diagnostic.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {
+              await archiveSource(objects, sourcePath, transactionQuarantinePath(mode, transaction.transaction_id));
+            }
+            continue;
+          }
           await rejectAdmissionSource(
             objects,
             sourcePath,
@@ -622,6 +645,12 @@ function artifactRetryDue(failure: ArtifactFailureDiagnostic, now = Date.now()):
     ? ARTIFACT_RETRY_FAST_DELAY_MS
     : ARTIFACT_RETRY_DEFER_DELAY_MS;
   return now >= lastFailedAt + delay;
+}
+
+function transactionRetryDue(failure: TransactionFailureDiagnostic, now = Date.now()): boolean {
+  const lastFailedAt = Date.parse(failure.last_failed_at);
+  if (!Number.isFinite(lastFailedAt)) return true;
+  return now >= lastFailedAt + TRANSACTION_RETRY_DELAY_MS;
 }
 
 function boundedArtifactEntries(entries: ProviderEntry[], maxEntries: number | undefined): ProviderEntry[] {

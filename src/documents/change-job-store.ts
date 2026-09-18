@@ -16,6 +16,14 @@ export interface ManagedDocumentChangeJob extends ManagedDocumentChangeJobInput 
   last_error: string | null;
 }
 
+export interface ManagedDocumentChangeQuarantine {
+  job_id: string;
+  path: string;
+  code: string;
+  attempts: number;
+  quarantined_at: string;
+}
+
 export interface ManagedDocumentDriftFinding {
   finding_id: string;
   job_id: string;
@@ -102,6 +110,14 @@ interface ScheduledVerificationRow {
   late_since: string | null;
 }
 
+interface QuarantineRow extends Record<string, SqlStorageValue> {
+  job_id: string;
+  path: string;
+  code: string;
+  attempts: number;
+  quarantined_at: string;
+}
+
 export function initializeManagedDocumentChangeJobSchema(storage: DurableObjectStorage): void {
   storage.sql.exec(`
     CREATE TABLE IF NOT EXISTS managed_document_change_control (
@@ -122,6 +138,14 @@ export function initializeManagedDocumentChangeJobSchema(storage: DurableObjectS
     );
     CREATE INDEX IF NOT EXISTS idx_managed_document_change_jobs_pending
       ON managed_document_change_jobs(status, priority, ordinal);
+
+    CREATE TABLE IF NOT EXISTS managed_document_change_quarantine (
+      job_id TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      code TEXT NOT NULL,
+      attempts INTEGER NOT NULL,
+      quarantined_at TEXT NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS managed_document_drift_findings (
       finding_id TEXT PRIMARY KEY,
@@ -240,6 +264,35 @@ export class ManagedDocumentChangeJobStore {
       safeError(message),
       jobId
     );
+  }
+
+  markQuarantined(job: ManagedDocumentChangeJob, code: string, quarantinedAt = new Date().toISOString()): void {
+    assertJobId(job.job_id);
+    this.storage.transactionSync(() => {
+      this.storage.sql.exec(
+        `INSERT OR IGNORE INTO managed_document_change_quarantine
+           (job_id, path, code, attempts, quarantined_at) VALUES (?, ?, ?, ?, ?)`,
+        job.job_id,
+        job.change.path,
+        safeError(code),
+        job.attempts + 1,
+        quarantinedAt
+      );
+      this.storage.sql.exec(
+        `UPDATE managed_document_change_jobs
+         SET status = 'completed', attempts = attempts + 1, last_error = ?
+         WHERE job_id = ? AND status = 'pending'`,
+        safeError(code),
+        job.job_id
+      );
+    });
+  }
+
+  quarantines(): ManagedDocumentChangeQuarantine[] {
+    return this.storage.sql.exec<QuarantineRow>(
+      `SELECT job_id, path, code, attempts, quarantined_at
+       FROM managed_document_change_quarantine ORDER BY quarantined_at, job_id`
+    ).toArray();
   }
 
   pendingCount(): number {

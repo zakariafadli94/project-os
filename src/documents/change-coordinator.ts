@@ -54,6 +54,7 @@ export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSu
   jobs_completed: number;
   jobs_pending: number;
   job_failures: number;
+  jobs_quarantined: number;
   drift_findings: number;
   expected_changes: number;
   scheduled: boolean;
@@ -280,6 +281,17 @@ export class ManagedDocumentChangeCoordinator {
     const pending = jobs.pending(limit);
     for (const job of pending) {
       try {
+        const actualKind = await this.actualChangeKind(job.change);
+        if (actualKind === "folder") {
+          if (job.change.kind === "file") {
+            jobs.markQuarantined(job, "directory_used_as_file_target");
+            summary.jobs_quarantined += 1;
+          } else {
+            jobs.markCompleted(job.job_id);
+            summary.jobs_completed += 1;
+          }
+          continue;
+        }
         await this.processJob(state, job, summary);
         jobs.markCompleted(job.job_id);
         summary.jobs_completed += 1;
@@ -295,6 +307,15 @@ export class ManagedDocumentChangeCoordinator {
         });
       }
     }
+  }
+
+  private async actualChangeKind(change: ProviderChangeEntry): Promise<ProviderChangeEntry["kind"]> {
+    if (change.kind !== "file") return change.kind;
+    const separator = change.path.lastIndexOf("/");
+    if (separator <= 0) return change.kind;
+    const parent = change.path.slice(0, separator);
+    const entry = (await this.runtime.objects.listChildren(parent)).find((candidate) => candidate.path === change.path);
+    return entry?.kind ?? change.kind;
   }
 
   private async processJob(
@@ -535,6 +556,7 @@ function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): Man
     jobs_completed: 0,
     jobs_pending: 0,
     job_failures: 0,
+    jobs_quarantined: 0,
     drift_findings: 0,
     expected_changes: 0,
     scheduled: false,

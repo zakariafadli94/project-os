@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
 import type { Receipt } from "../src/domain/receipt";
 import type { Transaction } from "../src/domain/transaction";
-import { processTransactionInbox } from "../src/inbox/processor";
+import { MAX_RETRYABLE_INBOX_ATTEMPTS, processTransactionInbox } from "../src/inbox/processor";
 import type { ObjectPersistence, ProviderEntry, ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError } from "../src/persistence/provider/errors";
 import { AdmissionError } from "../src/admission/mutation-context";
@@ -148,6 +148,89 @@ it("terminally rejects an inbox transaction whose admission context cannot be re
     transaction_id: transaction.transaction_id
   });
   expect(objects.files.has(rejected.replace(/\.json$/, ".source.json"))).toBe(true);
+});
+
+it("keeps one inbox envelope pending when convergence capacity is temporarily exhausted", async () => {
+  const objects = new FakeObjects();
+  const transaction = tx("TXN-INBOX-NEUTRAL-CAPACITY-0001", 7, "2026-09-01T11:06:00+01:00");
+  const incoming = `/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`;
+  const failure = `/PROJECT_OS/.project-os/transactions/failures/${transaction.transaction_id}.json`;
+  const rejected = `/PROJECT_OS/.project-os/transactions/rejected/${transaction.transaction_id}.json`;
+  objects.files.set(incoming, JSON.stringify(transaction));
+
+  const summary = await processTransactionInbox(objects, "v2", async () => {
+    throw new AdmissionError("convergence_capacity_exceeded", 503);
+  });
+
+  expect(summary).toEqual({ scanned: 1, processed: 0, failed: 1 });
+  expect(objects.files.get(incoming)).toBe(JSON.stringify(transaction));
+  expect(objects.files.has(rejected)).toBe(false);
+  expect(JSON.parse(objects.files.get(failure) ?? "null")).toMatchObject({
+    transaction_id: transaction.transaction_id,
+    project_id: transaction.project_id,
+    status: "retryable_failure",
+    attempt_count: 1,
+    message: "convergence_capacity_exceeded"
+  });
+});
+
+it("quarantines a capacity-blocked inbox envelope after the bounded retry limit", async () => {
+  const objects = new FakeObjects();
+  const transaction = tx("TXN-INBOX-NEUTRAL-CAPACITY-0002", 8, "2026-09-01T11:07:00+01:00");
+  const incoming = `/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`;
+  const failure = `/PROJECT_OS/.project-os/transactions/failures/${transaction.transaction_id}.json`;
+  const quarantine = `/PROJECT_OS/.project-os/transactions/quarantine/${transaction.transaction_id}.json`;
+  objects.files.set(incoming, JSON.stringify(transaction));
+
+  for (let attempt = 1; attempt <= MAX_RETRYABLE_INBOX_ATTEMPTS; attempt += 1) {
+    await processTransactionInbox(objects, "v2", async () => {
+      throw new AdmissionError("convergence_capacity_exceeded", 503);
+    });
+  }
+
+  expect(objects.files.has(incoming)).toBe(false);
+  expect(objects.files.get(quarantine)).toBe(JSON.stringify(transaction));
+  expect(JSON.parse(objects.files.get(failure) ?? "null")).toMatchObject({
+    status: "retryable_failure",
+    attempt_count: MAX_RETRYABLE_INBOX_ATTEMPTS,
+    message: "convergence_capacity_exceeded"
+  });
+
+  let executions = 0;
+  const afterBound = await processTransactionInbox(objects, "v2", async () => {
+    executions += 1;
+    throw new Error("must not execute");
+  });
+  expect(afterBound).toEqual({ scanned: 0, processed: 0, failed: 0 });
+  expect(executions).toBe(0);
+});
+
+it("does not hammer Project Guard again while a capacity retry backoff is active", async () => {
+  const objects = new FakeObjects();
+  const transaction = tx("TXN-INBOX-NEUTRAL-CAPACITY-0003", 8, "2026-09-01T11:08:00+01:00");
+  const incoming = `/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`;
+  const failure = `/PROJECT_OS/.project-os/transactions/failures/${transaction.transaction_id}.json`;
+  objects.files.set(incoming, JSON.stringify(transaction));
+  objects.files.set(failure, JSON.stringify({
+    schema_version: "1.0",
+    transaction_id: transaction.transaction_id,
+    project_id: transaction.project_id,
+    status: "retryable_failure",
+    attempt_count: 1,
+    first_failed_at: new Date().toISOString(),
+    last_failed_at: new Date().toISOString(),
+    message: "convergence_capacity_exceeded"
+  }));
+  let executions = 0;
+
+  const summary = await processTransactionInbox(objects, "v2", async () => {
+    executions += 1;
+    throw new Error("must not execute during backoff");
+  }, { respectRetryBackoff: true });
+
+  expect(summary).toEqual({ scanned: 1, processed: 0, failed: 0 });
+  expect(executions).toBe(0);
+  expect(objects.files.has(incoming)).toBe(true);
 });
 
 it("increments retry diagnostics and removes them after successful recovery", async () => {

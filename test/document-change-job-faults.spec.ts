@@ -7,7 +7,8 @@ import {
   initializeManagedDocumentChangeJobSchema,
   ManagedDocumentChangeJobStore,
   type ManagedDocumentChangeJobInput,
-  type ManagedDocumentDriftFinding
+  type ManagedDocumentDriftFinding,
+  type ManagedDocumentChangeQuarantine
 } from "../src/documents/change-job-store";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 
@@ -113,6 +114,67 @@ describe("durable managed-document change jobs", () => {
     expect(mock.files.has(badInput)).toBe(false);
     expect(mock.files.get(`${root}/REFERENCES/UNCLASSIFIED/bad.pdf`)).toBe("%PDF poison job");
     expect(mock.files.get(`${root}/REFERENCES/UNCLASSIFIED/good.pdf`)).toBe("%PDF healthy job");
+  });
+
+  it("routes a folder change without requesting file metadata", async () => {
+    const mock = installDropboxMock();
+    const slug = "change-job-folder-routing";
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-FOLDER-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+
+    const folder = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}/DELIVERABLES/REVENUE-OS`;
+    mock.writeExternalFolder(folder);
+
+    const response = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      jobs_registered: 1,
+      jobs_completed: 1,
+      jobs_pending: 0,
+      job_failures: 0
+    });
+    expect(mock.providerCalls).not.toContainEqual({ endpoint: "POST /2/files/get_metadata", paths: [folder] });
+  });
+
+  it("terminally quarantines a legacy file job whose target is now a folder", async () => {
+    const mock = installDropboxMock();
+    const slug = "change-job-folder-quarantine";
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-FOLDER-0002", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const folder = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}/DELIVERABLES/REVENUE-OS`;
+    mock.writeExternalFolder(folder);
+
+    let quarantines: ManagedDocumentChangeQuarantine[] = [];
+    await runInDurableObject(guard, async (_instance, state) => {
+      initializeManagedDocumentChangeJobSchema(state.storage);
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      store.registerPage({
+        expected_cursor: store.cursor(),
+        next_cursor: "legacy-folder-cursor",
+        jobs: [{
+          job_id: "CHGJOB-EEEEEEEEEEEEEEEEEEEEEEEE",
+          change: { kind: "file", name: "REVENUE-OS", path: folder },
+          detection_source: "incremental",
+          priority: 10
+        }]
+      });
+    });
+
+    const first = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({ jobs_pending: 0, jobs_quarantined: 1, job_failures: 0 });
+
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    await runInDurableObject(guard, async (_instance, state) => {
+      quarantines = new ManagedDocumentChangeJobStore(state.storage).quarantines();
+    });
+    expect(quarantines).toEqual([expect.objectContaining({
+      job_id: "CHGJOB-EEEEEEEEEEEEEEEEEEEEEEEE",
+      path: folder,
+      code: "directory_used_as_file_target",
+      attempts: 1
+    })]);
   });
 
   it("keeps the old durable cursor when cursor-reset baseline fetch fails before atomic page registration", async () => {

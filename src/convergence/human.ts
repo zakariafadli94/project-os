@@ -42,15 +42,17 @@ export async function runHumanSlice(input: HumanSliceInput): Promise<{ complete:
       ...(input.now ? { now: input.now } : {}),
       ...(input.budget ? { sliceBudget: input.budget } : {})
     });
-    const active = coordinator.status().active;
-    if (
-      !active
-      || active.revision !== input.record.new_revision
-      || active.projection_version !== CURRENT_PROJECTION_VERSION
-    ) {
-      await coordinator.reconcile(input.record.new_revision);
+    if (pendingBefore === 0) {
+      const active = coordinator.status().active;
+      if (
+        !active
+        || active.revision !== input.record.new_revision
+        || active.projection_version !== CURRENT_PROJECTION_VERSION
+      ) {
+        await coordinator.reconcile(input.record.new_revision);
+      }
+      coordinator.requestTarget(input.record.new_revision, CURRENT_PROJECTION_VERSION);
     }
-    coordinator.requestTarget(input.record.new_revision, CURRENT_PROJECTION_VERSION);
     const result = await coordinator.runNext();
     const status = coordinator.status();
     console.info("Project OS human materialization cursor", {

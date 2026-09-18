@@ -492,7 +492,13 @@ describe("MaterializationCoordinator", () => {
       await value.runNext();
     }
 
+    repo.recordReads = 0;
+    repo.onRecordRead = (count) => {
+      if (count > 1) throw new Error("baseline rebuilt before the last verification checkpoint");
+    };
     await value.runNext();
+    repo.onRecordRead = undefined;
+    expect(repo.recordReads).toBe(0);
     expect(ledger.pendingFinalVerification).toEqual([]);
     expect(repo.head).toBeNull();
 

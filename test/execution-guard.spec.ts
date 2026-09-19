@@ -171,6 +171,95 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await finalized.json()).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
   });
 
+  it("keeps artifact finalization recoverable when receipt persistence is interrupted", async () => {
+    const projectId = "PRJ-8290";
+    const { guard } = await setup(projectId);
+    const content = "# Receipt recovery\n";
+    const request = {
+      request_id: "ART-EXECUTION-RECEIPT-0001",
+      project_id: projectId,
+      relative_path: "proofs/receipt-recovery.md",
+      content,
+      content_sha256: await sha256Text(content),
+      mode: "create"
+    };
+    let restoreReceipt!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const repository = (instance as unknown as { repository: ProjectRepository }).repository;
+      const writeReceipt = vi.spyOn(repository, "writeArtifactReceipt")
+        .mockRejectedValueOnce(new Error("receipt_store_temporarily_unavailable"));
+      restoreReceipt = () => writeReceipt.mockRestore();
+    });
+    const { context } = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const interrupted = await guard.fetch("https://project-guard.internal/artifact", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(interrupted.status).toBe(503);
+    await expect(interrupted.json()).resolves.toMatchObject({
+      status: "pending",
+      code: "ARTIFACT_FINALIZATION_SCHEDULED",
+      request_id: request.request_id
+    });
+    restoreReceipt();
+
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const finalized = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
+    await expect(finalized.json()).resolves.toMatchObject({ status: "finalized", terminal: true, code: null });
+  });
+
+  it("does not expose a global receipt through another project status view", async () => {
+    const leftProjectId = "PRJ-8294";
+    const rightProjectId = "PRJ-8295";
+    const { guard: left } = await setup(leftProjectId);
+    const record = commitFixture(rightProjectId, 1)[0]!;
+    const runtime = createProductionPersistence(testEnv);
+    await runtime.objects.upsertText(machineCommitRecordPath(rightProjectId, 1), JSON.stringify(record));
+    await runtime.objects.upsertText(machineStatePath(rightProjectId), JSON.stringify(record.state));
+    const right = testEnv.PROJECT_GUARD.getByName(rightProjectId);
+    await runInDurableObject(right, (instance) => Object.assign((instance as unknown as { env: Env }).env, {
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [rightProjectId]: "strict" }), MUTATION_CONTEXT_SIGNING_KEY: "exec-guard-context", RULE_ADMISSION_SIGNING_KEY: "exec-guard-admission"
+    }));
+
+    const { context } = await (await left.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const transactionId = "TXN-8294000001";
+    const committed = await left.fetch("https://project-guard.internal/transaction", {
+      method: "POST",
+      body: JSON.stringify(encodeAdmission({
+        schema_version: "1.0", transaction_id: transactionId, project_id: leftProjectId, base_revision: 1,
+        operation: "task.create", created_at: "2026-09-12T00:00:00.000Z", payload: { task_id: "TASK-8294", title: "Private receipt" }
+      }, context))
+    });
+    expect(await committed.json()).toMatchObject({ status: "committed", project_id: leftProjectId });
+
+    const hidden = await right.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${transactionId}`);
+    await expect(hidden.json()).resolves.toMatchObject({
+      project_id: rightProjectId,
+      status: "not_received"
+    });
+
+    const content = "private artifact receipt";
+    const { context: artifactContext } = await (await left.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const artifact = {
+      request_id: "ART-EXECUTION-PRIVATE-8294",
+      project_id: leftProjectId,
+      relative_path: "proofs/private-receipt.md",
+      content,
+      content_sha256: await sha256Text(content),
+      mode: "create"
+    };
+    const artifactCommitted = await left.fetch("https://project-guard.internal/artifact", {
+      method: "POST", body: JSON.stringify(encodeAdmission(artifact, artifactContext))
+    });
+    await expect(artifactCommitted.json()).resolves.toMatchObject({ status: "committed", project_id: leftProjectId });
+    const hiddenArtifact = await right.fetch(
+      `https://project-guard.internal/request-status?kind=artifact&request_id=${artifact.request_id}`
+    );
+    await expect(hiddenArtifact.json()).resolves.toMatchObject({
+      project_id: rightProjectId,
+      status: "not_received"
+    });
+  });
+
   it("persists server admission before recovery and exposes incomplete execution independently of historical receipts", async () => {
     const { guard, mock } = await setup("PRJ-8291");
     const response = await guard.fetch("https://project-guard.internal/recover-inputs", { method: "POST" });

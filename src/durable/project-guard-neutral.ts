@@ -15,6 +15,7 @@ import {
 } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
+import type { PackageRef } from "../domain/document-package";
 import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH } from "../domain/materialization";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
@@ -87,6 +88,12 @@ interface RecoveryRequestRow {
   request_id: string;
 }
 
+interface RecoveryCursorRow {
+  [key: string]: SqlStorageValue;
+  kind: string;
+  request_id: string;
+}
+
 interface StateRow {
   [key: string]: SqlStorageValue;
   state_json: string;
@@ -116,7 +123,18 @@ interface ManagedDocumentTerminalReceipt {
   document_id?: string;
 }
 
+interface PackageDocumentReceipt {
+  request_id: string;
+  project_id: string;
+  status: "committed" | "conflict";
+  candidate?: PackageRef;
+  execution_status?: "finalized";
+  finalization_ref?: string | null;
+  code?: string;
+}
+
 type ManagedDocumentOperationReceipt = ManagedDocumentReceipt | ManagedDocumentTerminalReceipt;
+type StoredDocumentReceipt = ManagedDocumentOperationReceipt | PackageDocumentReceipt;
 
 const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
   "project.pause",
@@ -193,6 +211,11 @@ export class ProjectGuard extends DurableObject<Env> {
         kind TEXT NOT NULL,
         request_id TEXT NOT NULL,
         PRIMARY KEY (kind, request_id)
+      );
+      CREATE TABLE IF NOT EXISTS request_recovery_cursor (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        kind TEXT NOT NULL,
+        request_id TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS project_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -493,10 +516,7 @@ export class ProjectGuard extends DurableObject<Env> {
         ));
       }
       const existingReceipt = JSON.parse(existing.receipt_json) as ArtifactWriteReceipt;
-      if (existingReceipt.status === "committed") {
-        await this.finalizeVerifiedArtifact(new ExecutionJournal(this.persistence, artifact.project_id, "artifact", artifact.request_id));
-        await this.repository.cleanupStagedArtifact(artifact);
-      }
+      if (existingReceipt.status === "committed") return this.finalizeArtifact(artifact, existingReceipt);
       return Response.json(existingReceipt);
     }
 
@@ -643,29 +663,48 @@ export class ProjectGuard extends DurableObject<Env> {
     await this.verifyEffectAdmission(mutationContext, operation.project_id, state, rulesRequired);
     if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
       if (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext) return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "rejected", code: "PACKAGE_GOVERNANCE_REQUIRED" });
-      const proof = await this.admitRules(state, normalized, mutationContext.actor);
       if (operation.expected_project_revision !== state.revision) return Response.json({ status: "conflict", code: "PACKAGE_PROJECT_REVISION_CONFLICT" });
-      await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
+      try {
+        await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
+      } catch (error) {
+        if (error instanceof ManagedDocumentRequestIntentConflictError) {
+          return Response.json(this.documentTerminalReceipt(
+            operation,
+            "rejected",
+            "IDEMPOTENCY_PAYLOAD_MISMATCH",
+            "The same request_id was reused with a different managed-document payload"
+          ));
+        }
+        throw error;
+      }
       const durable = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
       if (durable) return Response.json(JSON.parse(durable.receipt_json));
+      const existingProof = await this.readPackageAdmissionProof(operation);
+      const proof = existingProof ?? await this.admitRules(state, normalized, mutationContext.actor);
+      if (!existingProof) this.persistPackageAdmissionProof(operation.request_id, proof);
+      await this.enqueueRequestRecovery("document", operation.request_id);
       try {
-        let receipt: unknown;
-        if (operation.operation === "package.freeze") {
-          await this.persistAdmissionProof("document", operation.request_id, proof);
-          const candidate = await this.managedDocumentService.freezePackageDocument(operation, state);
-          receipt = { request_id: operation.request_id, project_id: operation.project_id, status: "committed", candidate };
-        } else {
-          const global = await this.readGlobalGovernance();
-          if (global.revision !== proof.global_revision) throw new Error("package_ruleset_changed");
-          const progress = await this.managedDocumentService.replacePackage(operation, state, { ...proof, kind: "document", request_id: operation.request_id }, { effectBudget: 20, postcheckRules: [...Object.values(global.rules), ...Object.values(state.local_rules)] });
-          if (progress.status !== "finalized") return Response.json(progress);
-          receipt = { request_id: operation.request_id, project_id: operation.project_id, status: "committed", execution_status: "finalized", candidate: operation.candidate, finalization_ref: progress.finalization_ref };
-        }
-        await this.managedDocumentRequests.writeReceipt(operation.project_id, operation.request_id, serialized, JSON.stringify(receipt));
-        return Response.json(receipt);
+        return Response.json(await this.resumePackageManagedDocument(operation));
       } catch (error) {
-        if (error instanceof Error && error.message.startsWith("package_")) return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "conflict", code: error.message });
-        throw error;
+        if (error instanceof Error && error.message.startsWith("package_")) {
+          return Response.json(await this.finalizePackageDocument(operation, {
+            request_id: operation.request_id,
+            project_id: operation.project_id,
+            status: "conflict",
+            code: error.message
+          }));
+        }
+        // The complete request and its server-owned admission proof exist
+        // before package effects begin. A transient provider failure therefore
+        // resumes automatically from the same package request and never asks
+        // a founder to submit or validate it again.
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        return Response.json({
+          request_id: operation.request_id,
+          project_id: operation.project_id,
+          status: "pending",
+          code: "DOCUMENT_RECOVERY_SCHEDULED"
+        }, { status: 503 });
       }
     }
     if (rulesRequired) await this.persistAdmissionProof("document", operation.request_id, await this.admitRules(state, normalized, mutationContext!.actor));
@@ -766,14 +805,29 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
     if (isReviewCandidate(request)) await this.repository.reviewJournal.recordTerminal(request, receipt);
-    await this.repository.writeArtifactReceipt(receipt);
-    // Persist the family cache before attempting certification so the normal
-    // write path can resolve the same frozen request as later status/replay
-    // recovery. The canonical intent and receipt remain the authority.
+    // Store the frozen family record and its wake signal *before* the
+    // canonical receipt. If a provider acknowledgement is interrupted after
+    // the physical artifact exists, the alarm can safely write the same
+    // immutable receipt and certify it without replaying the artifact effect.
     this.persistArtifact(request, receipt);
-    await this.settleArtifactReceipt(request, receipt);
-    if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
-    return Response.json(receipt);
+    if (receipt.status === "committed") {
+      await this.enqueueRequestRecovery("artifact", request.request_id);
+    }
+    try {
+      await this.repository.writeArtifactReceipt(receipt);
+      await this.settleArtifactReceipt(request, receipt);
+      if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
+      return Response.json(receipt);
+    } catch (error) {
+      if (receipt.status !== "committed") throw error;
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({
+        request_id: request.request_id,
+        project_id: request.project_id,
+        status: "pending",
+        code: "ARTIFACT_FINALIZATION_SCHEDULED"
+      }, { status: 503 });
+    }
   }
 
   private async finalizeDocument(
@@ -819,8 +873,10 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async settleArtifactReceipt(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<void> {
-    if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") return;
-    await this.enqueueRequestRecovery("artifact", request.request_id);
+    if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
+      this.clearRequestRecovery("artifact", request.request_id);
+      return;
+    }
     const journal = new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id);
     await journal.recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
     await this.finalizeVerifiedArtifact(journal);
@@ -848,10 +904,37 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private pendingRequestRecovery(): RecoveryRequestRow[] {
-    return this.ctx.storage.sql.exec<RecoveryRequestRow>(
-      "SELECT kind, request_id FROM request_recovery ORDER BY kind, request_id LIMIT ?",
-      REQUEST_RECOVERY_BATCH_SIZE
-    ).toArray();
+    const cursor = this.ctx.storage.sql.exec<RecoveryCursorRow>(
+      "SELECT kind, request_id FROM request_recovery_cursor WHERE singleton = 1"
+    ).toArray()[0];
+    const rows = cursor
+      ? this.ctx.storage.sql.exec<RecoveryRequestRow>(
+          `SELECT kind, request_id FROM request_recovery
+           WHERE kind > ? OR (kind = ? AND request_id > ?)
+           ORDER BY kind, request_id LIMIT ?`,
+          cursor.kind, cursor.kind, cursor.request_id, REQUEST_RECOVERY_BATCH_SIZE
+        ).toArray()
+      : this.ctx.storage.sql.exec<RecoveryRequestRow>(
+          "SELECT kind, request_id FROM request_recovery ORDER BY kind, request_id LIMIT ?",
+          REQUEST_RECOVERY_BATCH_SIZE
+        ).toArray();
+    if (cursor && rows.length < REQUEST_RECOVERY_BATCH_SIZE) {
+      rows.push(...this.ctx.storage.sql.exec<RecoveryRequestRow>(
+        `SELECT kind, request_id FROM request_recovery
+         WHERE kind < ? OR (kind = ? AND request_id <= ?)
+         ORDER BY kind, request_id LIMIT ?`,
+        cursor.kind, cursor.kind, cursor.request_id, REQUEST_RECOVERY_BATCH_SIZE - rows.length
+      ).toArray());
+    }
+    const last = rows.at(-1);
+    if (last) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO request_recovery_cursor (singleton, kind, request_id) VALUES (1, ?, ?)
+         ON CONFLICT(singleton) DO UPDATE SET kind = excluded.kind, request_id = excluded.request_id`,
+        last.kind, last.request_id
+      );
+    }
+    return rows;
   }
 
   private hasPendingRequestRecovery(): boolean {
@@ -883,6 +966,100 @@ export class ProjectGuard extends DurableObject<Env> {
     }
   }
 
+  /** Package replacement owns a separate effect journal. Keep the admission
+   * proof in the ProjectGuard's durable storage so an interruption before
+   * that journal is prepared can still resume the exact already-admitted
+   * request. This record is server-authored; no client proof is accepted. */
+  private persistPackageAdmissionProof(requestId: string, proof: AdmissionProof): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO admission_proofs (kind, request_id, proof_json) VALUES (?, ?, ?)
+       ON CONFLICT(kind, request_id) DO UPDATE SET proof_json = excluded.proof_json`,
+      "package", requestId, JSON.stringify(proof)
+    );
+  }
+
+  private async readPackageAdmissionProof(operation: Extract<ManagedDocumentRequest, {
+    operation: "package.freeze" | "package.replace";
+  }>): Promise<AdmissionProof | null> {
+    const row = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; proof_json: string }>(
+      "SELECT proof_json FROM admission_proofs WHERE kind = ? AND request_id = ?",
+      "package", operation.request_id
+    ).toArray()[0];
+    if (!row) return null;
+    const proof = JSON.parse(row.proof_json) as Partial<AdmissionProof>;
+    if (
+      proof.project_id !== operation.project_id
+      || proof.operation !== operation.operation
+      || proof.project_revision !== operation.expected_project_revision
+      || proof.verdict !== "allow"
+      || !proof.actor
+      || !proof.ruleset
+      || proof.request_hash !== await sha256Canonical(operation)
+    ) {
+      throw new Error("package_admission_binding");
+    }
+    return proof as AdmissionProof;
+  }
+
+  private async finalizePackageDocument(
+    operation: Extract<ManagedDocumentRequest, { operation: "package.freeze" | "package.replace" }>,
+    receipt: PackageDocumentReceipt
+  ): Promise<PackageDocumentReceipt> {
+    const serialized = JSON.stringify(operation);
+    await this.managedDocumentRequests.writeReceipt(
+      operation.project_id,
+      operation.request_id,
+      serialized,
+      JSON.stringify(receipt)
+    );
+    this.persistDocumentRequest(operation, receipt);
+    this.clearRequestRecovery("document", operation.request_id);
+    return receipt;
+  }
+
+  private async resumePackageManagedDocument(
+    operation: Extract<ManagedDocumentRequest, { operation: "package.freeze" | "package.replace" }>
+  ): Promise<unknown> {
+    const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
+    if (durableReceipt) {
+      const receipt = JSON.parse(durableReceipt.receipt_json) as PackageDocumentReceipt;
+      this.persistDocumentRequest(operation, receipt);
+      this.clearRequestRecovery("document", operation.request_id);
+      return receipt;
+    }
+    const state = await this.loadOrRecoverState();
+    if (!state || state.project_id !== operation.project_id) throw new Error("package_project_not_initialized");
+    if (state.revision !== operation.expected_project_revision) throw new Error("package_project_revision_conflict");
+    const proof = await this.readPackageAdmissionProof(operation);
+    if (!proof) throw new Error("package_admission_unavailable");
+    if (operation.operation === "package.freeze") {
+      const candidate = await this.managedDocumentService.freezePackageDocument(operation, state);
+      return this.finalizePackageDocument(operation, {
+        request_id: operation.request_id,
+        project_id: operation.project_id,
+        status: "committed",
+        candidate
+      });
+    }
+    const global = await this.readGlobalGovernance();
+    if (global.revision !== proof.global_revision) throw new Error("package_ruleset_changed");
+    const progress = await this.managedDocumentService.replacePackage(
+      operation,
+      state,
+      { ...proof, kind: "document", request_id: operation.request_id },
+      { effectBudget: 20, postcheckRules: [...Object.values(global.rules), ...Object.values(state.local_rules)] }
+    );
+    if (progress.status !== "finalized") return progress;
+    return this.finalizePackageDocument(operation, {
+      request_id: operation.request_id,
+      project_id: operation.project_id,
+      status: "committed",
+      execution_status: "finalized",
+      candidate: operation.candidate,
+      finalization_ref: progress.finalization_ref
+    });
+  }
+
   private async resumeManagedDocument(requestId: string): Promise<void> {
     const projectId = this.ctx.id.name;
     if (!projectId) {
@@ -902,16 +1079,32 @@ export class ProjectGuard extends DurableObject<Env> {
       this.clearRequestRecovery("document", requestId);
       return;
     }
-    const operation = parseManagedDocumentRequest(JSON.parse(intent.request_json));
+    let operation: ManagedDocumentRequest;
+    try {
+      operation = parseManagedDocumentRequest(JSON.parse(intent.request_json));
+    } catch {
+      this.clearRequestRecovery("document", requestId);
+      return;
+    }
     if (operation.project_id !== projectId || operation.request_id !== requestId) {
       this.clearRequestRecovery("document", requestId);
       return;
     }
-    // Package replacement carries an exact project-revision contract and its
-    // own governed execution boundary. It is intentionally not replayed here
-    // under a potentially newer project state.
     if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
-      this.clearRequestRecovery("document", requestId);
+      try {
+        await this.resumePackageManagedDocument(operation);
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("package_")) {
+          await this.finalizePackageDocument(operation, {
+            request_id: operation.request_id,
+            project_id: operation.project_id,
+            status: "conflict",
+            code: error.message
+          });
+          return;
+        }
+        throw error;
+      }
       return;
     }
     const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, requestId);
@@ -950,6 +1143,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     const request = parseArtifactWriteRequest(JSON.parse(row.request_json));
     const receipt = JSON.parse(row.receipt_json) as ArtifactWriteReceipt;
+    await this.repository.writeArtifactReceipt(receipt);
     await this.settleArtifactReceipt(request, receipt);
   }
 
@@ -1568,7 +1762,22 @@ export class ProjectGuard extends DurableObject<Env> {
       const receiptStatus = receipt && typeof receipt === "object" && "status" in receipt && typeof receipt.status === "string"
         ? receipt.status
         : null;
-      const recoverableIntent = typeof intent?.request_json === "string";
+      let recoverableIntent = false;
+      let recoveryCode: string | null = null;
+      if (intent) {
+        try {
+          const recoverable = await this.managedDocumentRequests.readRecoverableIntent(projectId, requestId);
+          if (recoverable) {
+            // A digest alone is insufficient: malformed bytes cannot be
+            // presented as scheduled work when they cannot be parsed into a
+            // governed request. Status remains read-only throughout.
+            parseManagedDocumentRequest(JSON.parse(recoverable.request_json));
+            recoverableIntent = true;
+          }
+        } catch {
+          recoveryCode = "intent_payload_invalid";
+        }
+      }
       const status = execution?.status === "finalized"
         ? "finalized"
         : receiptStatus === "committed"
@@ -1587,7 +1796,13 @@ export class ProjectGuard extends DurableObject<Env> {
         status,
         ...(receipt ? { receipt } : {}),
         ...(execution ? { execution } : {}),
-        ...(intent ? { recovery: { durable_intent: true, recoverable: recoverableIntent } } : {})
+        ...(intent ? {
+          recovery: {
+            durable_intent: true,
+            recoverable: recoverableIntent,
+            ...(recoveryCode ? { code: recoveryCode } : {})
+          }
+        } : {})
       });
     } catch {
       return Response.json({
@@ -1605,15 +1820,19 @@ export class ProjectGuard extends DurableObject<Env> {
     kind: "transaction" | "document" | "artifact",
     requestId: string
   ): Promise<unknown | null> {
-    if (kind === "transaction") return await this.repository.readReceipt(requestId);
+    if (kind === "transaction") {
+      const receipt = await this.repository.readReceipt(requestId);
+      return receipt?.project_id === projectId ? receipt : null;
+    }
     if (kind === "document") {
       const durable = await this.managedDocumentRequests.readReceipt(projectId, requestId);
       return durable ? JSON.parse(durable.receipt_json) : null;
     }
     const raw = await this.persistence.objects.readText(machineArtifactReceiptPath(requestId));
     if (raw === null) return null;
-    const receipt = JSON.parse(raw) as { request_id?: unknown };
+    const receipt = JSON.parse(raw) as { request_id?: unknown; project_id?: unknown };
     if (receipt.request_id !== requestId) throw new Error("artifact_receipt_identity_conflict");
+    if (receipt.project_id !== projectId) return null;
     return receipt;
   }
 
@@ -1828,7 +2047,7 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private persistArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): void {
     this.ctx.storage.sql.exec(
-      "INSERT INTO artifact_requests (request_id, request_json, receipt_json) VALUES (?, ?, ?)",
+      "INSERT INTO artifact_requests (request_id, request_json, receipt_json) VALUES (?, ?, ?) ON CONFLICT(request_id) DO NOTHING",
       request.request_id,
       JSON.stringify(request),
       JSON.stringify(receipt)
@@ -1837,10 +2056,10 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private persistDocumentRequest(
     request: ManagedDocumentRequest,
-    receipt: ManagedDocumentOperationReceipt
+    receipt: StoredDocumentReceipt
   ): void {
     this.ctx.storage.sql.exec(
-      "INSERT INTO document_requests (request_id, request_json, receipt_json) VALUES (?, ?, ?)",
+      "INSERT INTO document_requests (request_id, request_json, receipt_json) VALUES (?, ?, ?) ON CONFLICT(request_id) DO NOTHING",
       request.request_id,
       JSON.stringify(request),
       JSON.stringify(receipt)

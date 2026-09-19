@@ -12,7 +12,7 @@ import { createProductionPersistence } from "../src/persistence/production-facto
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { documentIdFor } from "../src/domain/managed-document";
 import { ruleFixture } from "./helpers/rule-fixtures";
-import { machineDocumentHeadPath, machineDocumentVersionPath, machineStatePath } from "../src/persistence/layout";
+import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineStatePath } from "../src/persistence/layout";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-24T19:35:00+01:00";
@@ -64,9 +64,40 @@ describe("ProjectGuard managed documents", () => {
     await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, { MUTATION_CONTEXT_SIGNING_KEY: key, RULE_ADMISSION_SIGNING_KEY: key, PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" }) }));
     const { context }: any = await (await guard.fetch("https://internal/mutation-context")).json();
     const submit = async (request: unknown) => (await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, context)) })).json<any>();
-    const frozen = await submit({ operation: "package.freeze", request_id: "DOCREQ-PACKAGE-FREEZE-0092", project_id: created.project_id, document_id: descriptor.document_id, expected_version_id: descriptor.version_id, content_sha256: await sha256Text(content), expected_project_revision: 1, created_at: at });
+    const freezeRequest = { operation: "package.freeze" as const, request_id: "DOCREQ-PACKAGE-FREEZE-0092", project_id: created.project_id, document_id: descriptor.document_id, expected_version_id: descriptor.version_id, content_sha256: await sha256Text(content), expected_project_revision: 1, created_at: at };
+    let restoreFreeze!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const service = (instance as any).managedDocumentService;
+      const freeze = vi.spyOn(service, "freezePackageDocument").mockRejectedValueOnce(new Error("temporary_provider_failure"));
+      restoreFreeze = () => freeze.mockRestore();
+    });
+    const freezeInterrupted = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(freezeRequest, context))
+    });
+    expect(freezeInterrupted.status).toBe(503);
+    await expect(freezeInterrupted.json()).resolves.toMatchObject({
+      status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED", request_id: freezeRequest.request_id
+    });
+    restoreFreeze();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const frozen = await submit(freezeRequest);
     expect(frozen).toMatchObject({ status: "committed", candidate: { version: 1 } });
     const request = { operation: "package.replace", request_id: "DOCREQ-PACKAGE-REPLACE-0092", project_id: created.project_id, candidate: frozen.candidate, zone: "WORKING", expected_navigation_generation: 0, expected_project_revision: 1, created_at: at };
+    let restorePackage!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const service = (instance as any).managedDocumentService;
+      const replace = vi.spyOn(service, "replacePackage").mockRejectedValueOnce(new Error("temporary_provider_failure"));
+      restorePackage = () => replace.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(interrupted.status).toBe(503);
+    await expect(interrupted.json()).resolves.toMatchObject({
+      status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED", request_id: request.request_id
+    });
+    restorePackage();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
     let result = await submit(request);
     for (let count = 0; count < 5 && result.status === "finalizing"; count++) result = await submit(request);
     expect(result).toMatchObject({ status: "committed", execution_status: "finalized" });
@@ -244,6 +275,80 @@ describe("ProjectGuard managed documents", () => {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(blockedRequest)
     });
     await expect(recovered.json()).resolves.toMatchObject({ status: "committed", request_id: blockedRequest.request_id });
+  });
+
+  it("rotates recoverable work so repeated failures cannot starve a later request", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-FAIR-0045");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const seen: string[] = [];
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockImplementation(async (...args: unknown[]) => {
+        const request = args[0] as { request_id: string };
+        seen.push(request.request_id);
+        throw new Error("temporary_provider_unavailable");
+      });
+    });
+    const requests = await Promise.all([1, 2, 3, 4, 5].map(async (number) => {
+      const content = `retry ${number}`;
+      return {
+        operation: "working.write" as const,
+        request_id: `DOCREQ-RECOVERY-FAIR-000${number}`,
+        project_id: created.project_id,
+        logical_path: `strategy/retry-${number}.md`,
+        content,
+        content_sha256: await sha256Text(content),
+        created_at: at
+      };
+    }));
+    for (const request of requests) {
+      const response = await guard.fetch("https://project-guard.internal/document", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request)
+      });
+      expect(response.status).toBe(503);
+    }
+    expect(seen).toHaveLength(5);
+
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    expect(seen.slice(5)).toEqual(requests.slice(0, 4).map((request) => request.request_id));
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    expect(seen.slice(9)).toContain(requests[4]!.request_id);
+  });
+
+  it("does not advertise malformed durable intent as automatically recoverable", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-CORRUPT-0046");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "writeWorking")
+        .mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+    });
+    const content = "corrupt recovery status";
+    const request = {
+      operation: "working.write" as const,
+      request_id: "DOCREQ-RECOVERY-CORRUPT-0046",
+      project_id: created.project_id,
+      logical_path: "strategy/corrupt.md",
+      content,
+      content_sha256: await sha256Text(content),
+      created_at: at
+    };
+    const pending = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request)
+    });
+    expect(pending.status).toBe(503);
+    const runtime = createProductionPersistence(testEnv);
+    const intentPath = `${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/intent.json`;
+    const stored = JSON.parse((await runtime.objects.readText(intentPath))!);
+    stored.request_json = "{not-valid-json";
+    stored.request_sha256 = await sha256Text(stored.request_json);
+    await runtime.objects.upsertText(intentPath, JSON.stringify(stored));
+
+    const status = await guard.fetch(
+      `https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`
+    );
+    await expect(status.json()).resolves.toMatchObject({
+      status: "recovery_unavailable",
+      recovery: { durable_intent: true, recoverable: false, code: "intent_payload_invalid" }
+    });
   });
 
   it("keeps an unqualified local expected-version rule unavailable", async () => {

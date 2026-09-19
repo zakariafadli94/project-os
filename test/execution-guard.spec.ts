@@ -126,7 +126,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await replayStatus.json()).toMatchObject({ status: "finalized", terminal: true, finalization_ref: finalized.finalization_ref });
   });
 
-  it("keeps a committed artifact pending while its exact provider effect is absent, then resumes without replay", async () => {
+  it("keeps a committed artifact pending when a status read observes a newly restored effect", async () => {
     const projectId = "PRJ-8289";
     const { guard, mock } = await setup(projectId);
     const content = "# Recoverable proof\n";
@@ -161,8 +161,8 @@ describe("canonical execution boundary in ProjectGuard", () => {
     const pending = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
     expect(await pending.json()).toMatchObject({ status: "finalizing", terminal: false, code: "MATERIALIZATION_PENDING", finalization_ref: null });
     mock.files.set(visiblePath!, content);
-    const resumed = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
-    expect(await resumed.json()).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
+    const observed = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
+    expect(await observed.json()).toMatchObject({ status: "finalizing", terminal: false, code: "MATERIALIZATION_PENDING", finalization_ref: null });
   });
 
   it("persists server admission before recovery and exposes incomplete execution independently of historical receipts", async () => {
@@ -258,6 +258,12 @@ describe("canonical execution boundary in ProjectGuard", () => {
     });
     const writesBeforeFinalization = mock.uploadCalls.length;
 
+    const finalization = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target_revision: 269, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    expect(finalization.status).toBe(200);
     const finalized = await guard.fetch("https://project-guard.internal/execution-status?kind=transaction&request_id=TXN-PRJ0003-TASK-A02S2DEV-RETIRE-20260913T140200Z-L4T7");
     const execution = await finalized.json<{ finalization_ref: string }>();
     expect(execution).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });

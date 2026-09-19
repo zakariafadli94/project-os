@@ -9,17 +9,16 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
     const body = await response.json<{ context: unknown; canonical_state?: Record<string, unknown> }>();
     return { content: [{ type: "text", text: JSON.stringify({ status: "ok", project_id, ...boundedContext(body) }) }] };
   });
-  server.registerTool("project_os_get_receipt", { description: "Read a terminal receipt", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) } }, async ({ project_id, request_id, kind }) => {
-    const guard = env.PROJECT_GUARD.getByName(project_id);
-    // A receipt lookup is also the universal, idempotent recovery point for a
-    // committed execution. ProjectGuard only certifies already verified
-    // effects; this call never replays the business mutation.
-    const executionResponse = await guard.fetch(`https://project-guard.internal/execution-status?request_id=${encodeURIComponent(request_id)}&kind=${kind}`);
-    const execution = executionResponse.ok ? await executionResponse.json() : null;
-    const response = await guard.fetch(`https://project-guard.internal/receipt?request_id=${encodeURIComponent(request_id)}&kind=${kind}`);
-    const receipt = await response.json<Record<string, unknown>>();
-    return { isError: !response.ok, content: [{ type: "text", text: JSON.stringify(execution ? { ...receipt, execution } : receipt) }] };
-  });
+  const requestStatus = async ({ project_id, request_id, kind }: { project_id: string; request_id: string; kind: "transaction" | "document" | "artifact" }) => {
+    const response = await env.PROJECT_GUARD.getByName(project_id).fetch(`https://project-guard.internal/request-status?request_id=${encodeURIComponent(request_id)}&kind=${kind}`);
+    const body = await response.json<Record<string, unknown>>();
+    return response.ok
+      ? { content: [{ type: "text" as const, text: JSON.stringify(body) }] }
+      : { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(body) }] };
+  };
+  const requestStatusSchema = { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) };
+  server.registerTool("project_os_get_receipt", { description: "Read receipt and finalization status without triggering recovery", inputSchema: requestStatusSchema }, requestStatus);
+  server.registerTool("project_os_get_request_status", { description: "Read Project OS request recovery status without triggering recovery", inputSchema: requestStatusSchema }, requestStatus);
   server.registerTool("project_os_submit_transaction", { description: "Submit one typed Project OS transaction", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request: z.any() } }, async ({ project_id, request }) => submitGuarded(env, project_id, "transaction", request));
   server.registerTool("project_os_write_working_document", { description: "Submit one typed working document request", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request: z.any() } }, async ({ project_id, request }) => submitGuarded(env, project_id, "document", request));
   server.registerTool("project_os_submit_artifact", { description: "Submit one governed Project OS artifact manifest", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request: z.any() } }, async ({ project_id, request }) => submitGuarded(env, project_id, "artifact", request));

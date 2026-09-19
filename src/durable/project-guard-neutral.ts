@@ -231,12 +231,13 @@ export class ProjectGuard extends DurableObject<Env> {
         const requestId = url.searchParams.get("request_id");
         if (!projectId || !kind || !requestId) return Response.json({ error: "execution_identity_required" }, { status: 400 });
         const journal = new ExecutionJournal(this.persistence, projectId, kind, requestId);
-        if (kind === "artifact") await this.finalizeVerifiedArtifact(journal);
-        else if (kind === "document") await this.finalizeVerifiedDocument(journal);
-        else await this.finalizeMaterializedTransaction(journal);
         const status = await journal.status();
         return status ? Response.json(status) : Response.json({ error: "execution_not_found" }, { status: 404 });
       }).catch((error) => this.admissionErrorResponse(error));
+    }
+
+    if (request.method === "GET" && pathname === "/request-status") {
+      return this.serialize(() => this.handleRequestStatus(url));
     }
 
     if (request.method === "POST" && pathname === "/finalize-materialization") {
@@ -1363,6 +1364,68 @@ export class ProjectGuard extends DurableObject<Env> {
       ? JSON.parse(row.receipt_json)
       : row;
     return receipt ? Response.json(receipt) : Response.json({ error: "receipt_not_found" }, { status: 404 });
+  }
+
+  /** A read-only recovery view. In particular, it must not certify an effect,
+   * replay a write, or create a receipt merely because a chat asked about it. */
+  private async handleRequestStatus(url: URL): Promise<Response> {
+    const projectId = this.ctx.id.name;
+    const requestId = url.searchParams.get("request_id");
+    const kind = url.searchParams.get("kind");
+    if (!projectId || !requestId || !kind || !["transaction", "document", "artifact"].includes(kind)) {
+      return Response.json({ error: "request_identity_required" }, { status: 400 });
+    }
+    try {
+      const execution = await new ExecutionJournal(this.persistence, projectId, kind, requestId).status();
+      const receipt = await this.readRequestStatusReceipt(projectId, kind as "transaction" | "document" | "artifact", requestId);
+      const intent = kind === "document" ? await this.managedDocumentRequests.readIntent(projectId, requestId) : null;
+      const receiptStatus = receipt && typeof receipt === "object" && "status" in receipt && typeof receipt.status === "string"
+        ? receipt.status
+        : null;
+      const status = execution?.status === "finalized"
+        ? "finalized"
+        : receiptStatus === "committed"
+          ? "committed"
+          : receiptStatus === "rejected" || receiptStatus === "conflict"
+            ? receiptStatus
+            : intent
+              ? "recovery_scheduled"
+              : "not_received";
+      return Response.json({
+        project_id: projectId,
+        kind,
+        request_id: requestId,
+        status,
+        ...(receipt ? { receipt } : {}),
+        ...(execution ? { execution } : {}),
+        ...(intent ? { recovery: { durable_intent: true, recoverable: typeof intent.request_json === "string" } } : {})
+      });
+    } catch {
+      return Response.json({
+        project_id: projectId,
+        kind,
+        request_id: requestId,
+        status: "unknown",
+        code: "request_status_unavailable"
+      }, { status: 503 });
+    }
+  }
+
+  private async readRequestStatusReceipt(
+    projectId: string,
+    kind: "transaction" | "document" | "artifact",
+    requestId: string
+  ): Promise<unknown | null> {
+    if (kind === "transaction") return await this.repository.readReceipt(requestId);
+    if (kind === "document") {
+      const durable = await this.managedDocumentRequests.readReceipt(projectId, requestId);
+      return durable ? JSON.parse(durable.receipt_json) : null;
+    }
+    const raw = await this.persistence.objects.readText(machineArtifactReceiptPath(requestId));
+    if (raw === null) return null;
+    const receipt = JSON.parse(raw) as { request_id?: unknown };
+    if (receipt.request_id !== requestId) throw new Error("artifact_receipt_identity_conflict");
+    return receipt;
   }
 
   private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<void> {

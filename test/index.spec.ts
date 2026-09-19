@@ -332,6 +332,23 @@ describe("Worker routing", () => {
     await expect(missing.json()).resolves.toEqual({ error: "execution_not_found" });
   });
 
+  it("forwards authenticated request-status reads without invoking a recovery action", async () => {
+    const path = "/v1/projects/PRJ-8341/request-status?kind=document&request_id=DOCREQ-REQUEST-STATUS-0001";
+    const unauthorized = await worker.fetch(new Request(`https://example.com${path}`), testEnv, createExecutionContext());
+    expect(unauthorized.status).toBe(401);
+
+    const response = await worker.fetch(new Request(`https://example.com${path}`, {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    }), testEnv, createExecutionContext());
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      project_id: "PRJ-8341",
+      kind: "document",
+      request_id: "DOCREQ-REQUEST-STATUS-0001",
+      status: "not_received"
+    });
+  });
+
   it("rejects staged artifacts before Durable Object routing while binary ingress is disabled", async () => {
     const ctx = createExecutionContext();
     const artifact = {

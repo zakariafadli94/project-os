@@ -10,6 +10,7 @@ import { encodeAdmission } from "../src/admission/transport";
 import { normalizeDocumentAdmission } from "../src/admission/operation-context";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { DocumentLedgerRepository } from "../src/documents/repository";
+import { ExecutionJournal } from "../src/execution/journal";
 import { documentIdFor } from "../src/domain/managed-document";
 import { ruleFixture } from "./helpers/rule-fixtures";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineStatePath } from "../src/persistence/layout";
@@ -82,6 +83,19 @@ describe("ProjectGuard managed documents", () => {
     expect(await runDurableObjectAlarm(guard)).toBe(true);
     const frozen = await submit(freezeRequest);
     expect(frozen).toMatchObject({ status: "committed", candidate: { version: 1 } });
+    const freezeAdmission = await new ExecutionJournal(createProductionPersistence(testEnv), created.project_id, "document", freezeRequest.request_id).readAdmission();
+    expect(freezeAdmission?.admission).toMatchObject({ operation: "package.freeze", request_id: freezeRequest.request_id, verdict: "allow" });
+    const freezeJournal = new ExecutionJournal(createProductionPersistence(testEnv), created.project_id, "document", freezeRequest.request_id);
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO admission_proofs (kind, request_id, proof_json) VALUES (?, ?, ?)",
+        "package", freezeRequest.request_id, JSON.stringify(freezeAdmission!.admission));
+    });
+    await createProductionPersistence(testEnv).objects.delete(`${await freezeJournal.root()}/admission.json`);
+    await createProductionPersistence(testEnv).objects.delete(`${await freezeJournal.root()}/progress.json`);
+    await runInDurableObject(guard, async (instance) => {
+      await (instance as any).readPackageAdmissionProof(freezeRequest);
+    });
+    expect((await freezeJournal.readAdmission())?.admission.request_id).toBe(freezeRequest.request_id);
     const request = { operation: "package.replace", request_id: "DOCREQ-PACKAGE-REPLACE-0092", project_id: created.project_id, candidate: frozen.candidate, zone: "WORKING", expected_navigation_generation: 0, expected_project_revision: 1, created_at: at };
     let restorePackage!: () => void;
     await runInDurableObject(guard, (instance) => {
@@ -103,6 +117,17 @@ describe("ProjectGuard managed documents", () => {
     expect(result).toMatchObject({ status: "committed", execution_status: "finalized" });
     expect((await repository.readPackageNavigation(created.project_id)).WORKING?.packages[0].ref).toEqual(frozen.candidate);
     expect(await submit(request)).toEqual(result);
+
+    const terminalRequest = { ...request, request_id: "DOCREQ-PACKAGE-CONFLICT-0092", expected_navigation_generation: 1 };
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "replacePackage").mockResolvedValueOnce({
+        status: "conflict", terminal: true, code: "EXECUTION_RESOURCE_CHANGED"
+      });
+    });
+    const terminal = await submit(terminalRequest);
+    expect(terminal).toMatchObject({ status: "conflict", code: "EXECUTION_RESOURCE_CHANGED" });
+    const terminalStatus = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${terminalRequest.request_id}`);
+    await expect(terminalStatus.json()).resolves.toMatchObject({ status: "conflict" });
   });
 
   it("package transport refuses legacy ungoverned execution even with a well-formed manifest reference", async () => {
@@ -235,6 +260,93 @@ describe("ProjectGuard managed documents", () => {
       request_id: request.request_id,
       logical_path: request.logical_path
     });
+  });
+
+  it("recovers a request interrupted before its canonical intent was written", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-GAP-0047");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Staged before provider intent";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-GAP-0047", project_id: created.project_id,
+      logical_path: "strategy/staged.md", content, content_sha256: await sha256Text(content), created_at: at };
+    let restore!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const spy = vi.spyOn((instance as any).managedDocumentRequests, "ensureIntent").mockRejectedValueOnce(new Error("temporary_intent_write_failure"));
+      restore = () => spy.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    expect(interrupted.status).toBe(503);
+    await expect(interrupted.json()).resolves.toMatchObject({ status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED" });
+    restore();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "committed", receipt: { request_id: request.request_id } });
+  });
+
+  it("continues a matching legacy hash-only intent using the server-staged request", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-LEGACY-0051");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Legacy intent";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-LEGACY-0051", project_id: created.project_id,
+      logical_path: "strategy/legacy.md", content, content_sha256: await sha256Text(content), created_at: at };
+    await createProductionPersistence(testEnv).objects.createText(
+      `${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/intent.json`,
+      JSON.stringify({ schema_version: "1.0", project_id: created.project_id, request_id: request.request_id,
+        request_sha256: await sha256Text(JSON.stringify(request)) })
+    );
+    let restore!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const spy = vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+      restore = () => spy.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    expect(interrupted.status).toBe(503);
+    restore();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "committed", receipt: { request_id: request.request_id } });
+  });
+
+  it("does not call an unqueued intent scheduled for recovery", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-STATUS-0048");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Intentionally unqueued";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-STATUS-0048", project_id: created.project_id,
+      logical_path: "strategy/unqueued.md", content, content_sha256: await sha256Text(content), created_at: at };
+    await new (await import("../src/documents/request-ledger")).ManagedDocumentRequestLedger(createProductionPersistence(testEnv))
+      .ensureIntent(created.project_id, request.request_id, JSON.stringify(request));
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "recovery_unavailable" });
+  });
+
+  it("does not advertise a queued request without an alarm as scheduled", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-WAKE-0050");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Wake missing";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-WAKE-0050", project_id: created.project_id,
+      logical_path: "strategy/wake.md", content, content_sha256: await sha256Text(content), created_at: at };
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+    });
+    await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    await runInDurableObject(guard, async (_instance, state) => state.storage.deleteAlarm());
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "recovery_unavailable", recovery: { scheduled: false } });
+  });
+
+  it("bounds identical recovery failures and exposes the stalled request", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-FAIL-0049");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Repeated failure";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-FAIL-0049", project_id: created.project_id,
+      logical_path: "strategy/stalled.md", content, content_sha256: await sha256Text(content), created_at: at };
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockRejectedValue(new Error("persistent_internal_failure"));
+    });
+    await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    for (let attempt = 0; attempt < 6; attempt++) expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "recovery_blocked", recovery: { code: "identical_internal_failure_limit" } });
+    expect(await runDurableObjectAlarm(guard)).toBe(false);
   });
 
   it("recovers one project without delaying an independent project", async () => {

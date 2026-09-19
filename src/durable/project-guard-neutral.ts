@@ -46,6 +46,7 @@ import { decodeAdmission } from "../admission/transport";
 import { discoverCanonical } from "../convergence/discovery";
 import { initialProgress } from "../convergence/journal";
 import { sha256Canonical } from "../materialization/hash";
+import { sha256Text } from "../documents/hash";
 import {
   admissionModeForProject,
   assertCapacity,
@@ -143,10 +144,8 @@ const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
   "project.archive"
 ]);
 
-/** Recovery is intentionally per-project and bounded. The immutable document
- * intent remains the authority; this local queue is only a durable wake-up
- * signal telling the owning ProjectGuard which admitted work still needs a
- * technical continuation. */
+/** Recovery is per-project and bounded. The local queue temporarily retains
+ * an admitted request until its immutable Dropbox intent and receipt exist. */
 const REQUEST_RECOVERY_BATCH_SIZE = 4;
 const REQUEST_RECOVERY_RETRY_DELAY_MS = 30_000;
 
@@ -210,6 +209,22 @@ export class ProjectGuard extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS request_recovery (
         kind TEXT NOT NULL,
         request_id TEXT NOT NULL,
+        PRIMARY KEY (kind, request_id)
+      );
+      CREATE TABLE IF NOT EXISTS request_recovery_payload (
+        kind TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        PRIMARY KEY (kind, request_id)
+      );
+      CREATE TABLE IF NOT EXISTS request_recovery_failures (
+        kind TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        stopped INTEGER NOT NULL DEFAULT 0,
+        message TEXT NOT NULL,
         PRIMARY KEY (kind, request_id)
       );
       CREATE TABLE IF NOT EXISTS request_recovery_cursor (
@@ -485,7 +500,6 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    await this.ctx.storage.deleteAlarm();
     await this.serialize(() => this.resumePendingRequestRecovery());
   }
 
@@ -664,6 +678,17 @@ export class ProjectGuard extends DurableObject<Env> {
     if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
       if (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext) return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "rejected", code: "PACKAGE_GOVERNANCE_REQUIRED" });
       if (operation.expected_project_revision !== state.revision) return Response.json({ status: "conflict", code: "PACKAGE_PROJECT_REVISION_CONFLICT" });
+      const existingProof = await this.readPackageAdmissionProof(operation);
+      const proof = existingProof ?? await this.admitRules(state, normalized, mutationContext.actor);
+      if (!existingProof) await this.persistAdmissionProof(operation.operation === "package.freeze" ? "document" : "package-admission", operation.request_id, proof);
+      try {
+        await this.enqueueRequestRecovery("document", operation.request_id, serialized);
+      } catch (error) {
+        if (error instanceof ManagedDocumentRequestIntentConflictError) {
+          return Response.json(this.documentTerminalReceipt(operation, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH", "The same request_id was reused with a different managed-document payload"));
+        }
+        throw error;
+      }
       try {
         await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
       } catch (error) {
@@ -675,14 +700,14 @@ export class ProjectGuard extends DurableObject<Env> {
             "The same request_id was reused with a different managed-document payload"
           ));
         }
-        throw error;
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED" }, { status: 503 });
       }
       const durable = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
-      if (durable) return Response.json(JSON.parse(durable.receipt_json));
-      const existingProof = await this.readPackageAdmissionProof(operation);
-      const proof = existingProof ?? await this.admitRules(state, normalized, mutationContext.actor);
-      if (!existingProof) this.persistPackageAdmissionProof(operation.request_id, proof);
-      await this.enqueueRequestRecovery("document", operation.request_id);
+      if (durable) {
+        this.clearRequestRecovery("document", operation.request_id);
+        return Response.json(JSON.parse(durable.receipt_json));
+      }
       try {
         return Response.json(await this.resumePackageManagedDocument(operation));
       } catch (error) {
@@ -710,6 +735,15 @@ export class ProjectGuard extends DurableObject<Env> {
     if (rulesRequired) await this.persistAdmissionProof("document", operation.request_id, await this.admitRules(state, normalized, mutationContext!.actor));
 
     try {
+      await this.enqueueRequestRecovery("document", operation.request_id, serialized);
+    } catch (error) {
+      if (error instanceof ManagedDocumentRequestIntentConflictError) {
+        return Response.json(this.documentTerminalReceipt(operation, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH", "The same request_id was reused with a different managed-document payload"));
+      }
+      throw error;
+    }
+
+    try {
       await this.managedDocumentRequests.ensureIntent(operation.project_id, operation.request_id, serialized);
     } catch (error) {
       if (error instanceof ManagedDocumentRequestIntentConflictError) {
@@ -720,7 +754,8 @@ export class ProjectGuard extends DurableObject<Env> {
           "The same request_id was reused with a different managed-document payload"
         ));
       }
-      throw error;
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED" }, { status: 503 });
     }
 
     const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
@@ -733,8 +768,6 @@ export class ProjectGuard extends DurableObject<Env> {
     // This is written after admission and before the provider effect. It is
     // therefore safe to resume exactly this immutable request after a Worker
     // interruption, without asking a chat to submit or approve it again.
-    await this.enqueueRequestRecovery("document", operation.request_id);
-
     try {
       const receipt = await this.executeManagedDocument(operation, state);
       return this.finalizeDocument(operation, receipt);
@@ -883,16 +916,29 @@ export class ProjectGuard extends DurableObject<Env> {
     if ((await journal.status())?.terminal) this.clearRequestRecovery("artifact", request.request_id);
   }
 
-  private async enqueueRequestRecovery(kind: "artifact" | "document", requestId: string): Promise<void> {
+  private async enqueueRequestRecovery(kind: "artifact" | "document", requestId: string, requestJson?: string): Promise<void> {
+    if (kind === "document" && requestJson) {
+      const digest = await sha256Text(requestJson);
+      const canonical = this.ctx.id.name ? await this.managedDocumentRequests.readIntent(this.ctx.id.name, requestId) : null;
+      if (canonical && canonical.request_sha256 !== digest) throw new ManagedDocumentRequestIntentConflictError(requestId);
+      const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
+        "SELECT request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
+      ).toArray()[0];
+      if (staged && staged.request_sha256 !== digest) throw new ManagedDocumentRequestIntentConflictError(requestId);
+      this.ctx.storage.sql.exec(
+        "INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES (?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING",
+        kind, requestId, requestJson, digest
+      );
+    }
     this.ctx.storage.sql.exec(
       "INSERT INTO request_recovery (kind, request_id) VALUES (?, ?) ON CONFLICT(kind, request_id) DO NOTHING",
       kind,
       requestId
     );
-    // A short delay lets the current request finish and its durable intent
-    // settle before recovery starts; alarm retries remain automatic and do
-    // not require a caller to poll or resubmit.
-    await this.armRequestRecoveryAlarm(1_000);
+    // Keep the queue write and wake-up adjacent storage operations. Cloudflare
+    // batches them without an intervening external await, so a committed
+    // staged request cannot be left without its initial alarm.
+    await this.ctx.storage.setAlarm(Date.now() + 1_000);
   }
 
   private clearRequestRecovery(kind: "artifact" | "document", requestId: string): void {
@@ -901,6 +947,8 @@ export class ProjectGuard extends DurableObject<Env> {
       kind,
       requestId
     );
+    this.ctx.storage.sql.exec("DELETE FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId);
+    this.ctx.storage.sql.exec("DELETE FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId);
   }
 
   private pendingRequestRecovery(): RecoveryRequestRow[] {
@@ -909,20 +957,24 @@ export class ProjectGuard extends DurableObject<Env> {
     ).toArray()[0];
     const rows = cursor
       ? this.ctx.storage.sql.exec<RecoveryRequestRow>(
-          `SELECT kind, request_id FROM request_recovery
-           WHERE kind > ? OR (kind = ? AND request_id > ?)
-           ORDER BY kind, request_id LIMIT ?`,
+          `SELECT r.kind, r.request_id FROM request_recovery r
+           LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
+           WHERE COALESCE(f.stopped, 0) = 0 AND (r.kind > ? OR (r.kind = ? AND r.request_id > ?))
+           ORDER BY r.kind, r.request_id LIMIT ?`,
           cursor.kind, cursor.kind, cursor.request_id, REQUEST_RECOVERY_BATCH_SIZE
         ).toArray()
       : this.ctx.storage.sql.exec<RecoveryRequestRow>(
-          "SELECT kind, request_id FROM request_recovery ORDER BY kind, request_id LIMIT ?",
+          `SELECT r.kind, r.request_id FROM request_recovery r
+           LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
+           WHERE COALESCE(f.stopped, 0) = 0 ORDER BY r.kind, r.request_id LIMIT ?`,
           REQUEST_RECOVERY_BATCH_SIZE
         ).toArray();
     if (cursor && rows.length < REQUEST_RECOVERY_BATCH_SIZE) {
       rows.push(...this.ctx.storage.sql.exec<RecoveryRequestRow>(
-        `SELECT kind, request_id FROM request_recovery
-         WHERE kind < ? OR (kind = ? AND request_id <= ?)
-         ORDER BY kind, request_id LIMIT ?`,
+        `SELECT r.kind, r.request_id FROM request_recovery r
+         LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
+         WHERE COALESCE(f.stopped, 0) = 0 AND (r.kind < ? OR (r.kind = ? AND r.request_id <= ?))
+         ORDER BY r.kind, r.request_id LIMIT ?`,
         cursor.kind, cursor.kind, cursor.request_id, REQUEST_RECOVERY_BATCH_SIZE - rows.length
       ).toArray());
     }
@@ -939,7 +991,9 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private hasPendingRequestRecovery(): boolean {
     return this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; pending: number }>(
-      "SELECT COUNT(*) AS pending FROM request_recovery"
+      `SELECT COUNT(*) AS pending FROM request_recovery r
+       LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
+       WHERE COALESCE(f.stopped, 0) = 0`
     ).toArray()[0]?.pending > 0;
   }
 
@@ -955,10 +1009,21 @@ export class ProjectGuard extends DurableObject<Env> {
         if (recovery.kind === "document") await this.resumeManagedDocument(recovery.request_id);
         else if (recovery.kind === "artifact") await this.resumeArtifactFinalization(recovery.request_id);
         else this.clearRequestRecovery("document", recovery.request_id);
-      } catch {
-        // A transient provider or Worker failure keeps the immutable intent and
-        // its local wake signal intact. The next bounded alarm resumes it with
-        // the identical request rather than asking for a new submission.
+      } catch (error) {
+        const message = error instanceof Error ? `${error.name}: ${error.message}` : "unknown_recovery_failure";
+        const fingerprint = await sha256Text(message);
+        const previous = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; fingerprint: string; count: number }>(
+          "SELECT fingerprint, count FROM request_recovery_failures WHERE kind = ? AND request_id = ?",
+          recovery.kind, recovery.request_id
+        ).toArray()[0];
+        const count = previous?.fingerprint === fingerprint ? previous.count + 1 : 1;
+        this.ctx.storage.sql.exec(
+          `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(kind, request_id) DO UPDATE SET fingerprint = excluded.fingerprint,
+             count = excluded.count, stopped = excluded.stopped, message = excluded.message`,
+          recovery.kind, recovery.request_id, fingerprint, count, count >= 6 ? 1 : 0, message
+        );
       }
     }
     if (this.hasPendingRequestRecovery()) {
@@ -966,27 +1031,16 @@ export class ProjectGuard extends DurableObject<Env> {
     }
   }
 
-  /** Package replacement owns a separate effect journal. Keep the admission
-   * proof in the ProjectGuard's durable storage so an interruption before
-   * that journal is prepared can still resume the exact already-admitted
-   * request. This record is server-authored; no client proof is accepted. */
-  private persistPackageAdmissionProof(requestId: string, proof: AdmissionProof): void {
-    this.ctx.storage.sql.exec(
-      `INSERT INTO admission_proofs (kind, request_id, proof_json) VALUES (?, ?, ?)
-       ON CONFLICT(kind, request_id) DO UPDATE SET proof_json = excluded.proof_json`,
-      "package", requestId, JSON.stringify(proof)
-    );
-  }
-
   private async readPackageAdmissionProof(operation: Extract<ManagedDocumentRequest, {
     operation: "package.freeze" | "package.replace";
   }>): Promise<AdmissionProof | null> {
-    const row = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; proof_json: string }>(
-      "SELECT proof_json FROM admission_proofs WHERE kind = ? AND request_id = ?",
-      "package", operation.request_id
-    ).toArray()[0];
-    if (!row) return null;
-    const proof = JSON.parse(row.proof_json) as Partial<AdmissionProof>;
+    const kind = operation.operation === "package.freeze" ? "document" : "package-admission";
+    const record = await new ExecutionJournal(this.persistence, operation.project_id, kind, operation.request_id).readAdmission();
+    const legacy = !record ? this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; proof_json: string }>(
+      "SELECT proof_json FROM admission_proofs WHERE kind = ? AND request_id = ?", "package", operation.request_id
+    ).toArray()[0] : null;
+    if (!record && !legacy) return null;
+    const proof = record ? record.admission as Partial<AdmissionProof> : JSON.parse(legacy!.proof_json) as Partial<AdmissionProof>;
     if (
       proof.project_id !== operation.project_id
       || proof.operation !== operation.operation
@@ -998,6 +1052,9 @@ export class ProjectGuard extends DurableObject<Env> {
     ) {
       throw new Error("package_admission_binding");
     }
+    // Previous deployments kept package proof only in DO SQLite. Promote a
+    // validated legacy proof to the canonical journal before continuing it.
+    if (!record) await this.persistAdmissionProof(kind, operation.request_id, proof as AdmissionProof);
     return proof as AdmissionProof;
   }
 
@@ -1049,6 +1106,14 @@ export class ProjectGuard extends DurableObject<Env> {
       { ...proof, kind: "document", request_id: operation.request_id },
       { effectBudget: 20, postcheckRules: [...Object.values(global.rules), ...Object.values(state.local_rules)] }
     );
+    if (progress.status === "conflict" || progress.status === "failed" || progress.status === "rejected") {
+      return this.finalizePackageDocument(operation, {
+        request_id: operation.request_id,
+        project_id: operation.project_id,
+        status: "conflict",
+        code: progress.code ?? (progress.status === "failed" ? "PACKAGE_EXECUTION_FAILED" : "PACKAGE_EXECUTION_CONFLICT")
+      });
+    }
     if (progress.status !== "finalized") return progress;
     return this.finalizePackageDocument(operation, {
       request_id: operation.request_id,
@@ -1076,8 +1141,29 @@ export class ProjectGuard extends DurableObject<Env> {
       return;
     }
     if (!intent) {
-      this.clearRequestRecovery("document", requestId);
-      return;
+      const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+        "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?",
+        "document", requestId
+      ).toArray()[0];
+      if (!staged) {
+        this.clearRequestRecovery("document", requestId);
+        return;
+      }
+      if (await sha256Text(staged.request_json) !== staged.request_sha256) {
+        this.clearRequestRecovery("document", requestId);
+        return;
+      }
+      const parsed = parseManagedDocumentRequest(JSON.parse(staged.request_json));
+      if (parsed.project_id !== projectId || parsed.request_id !== requestId) {
+        this.clearRequestRecovery("document", requestId);
+        return;
+      }
+      await this.managedDocumentRequests.ensureIntent(projectId, requestId, staged.request_json);
+      const persisted = await this.managedDocumentRequests.readIntent(projectId, requestId);
+      if (!persisted || persisted.request_sha256 !== staged.request_sha256) throw new Error("document_intent_unavailable_after_stage");
+      // Legacy hash-only intents cannot be rewritten, but their digest still
+      // binds the exact server-staged payload used by this continuation.
+      intent = { ...persisted, request_json: staged.request_json };
     }
     let operation: ManagedDocumentRequest;
     try {
@@ -1759,6 +1845,16 @@ export class ProjectGuard extends DurableObject<Env> {
       const execution = await new ExecutionJournal(this.persistence, projectId, kind, requestId).status();
       const receipt = await this.readRequestStatusReceipt(projectId, kind as "transaction" | "document" | "artifact", requestId);
       const intent = kind === "document" ? await this.managedDocumentRequests.readIntent(projectId, requestId) : null;
+      const queued = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_id: string }>(
+        "SELECT request_id FROM request_recovery WHERE kind = ? AND request_id = ?", kind, requestId
+      ).toArray().length > 0;
+      const wakeScheduled = queued && await this.ctx.storage.getAlarm() !== null;
+      const staged = kind === "document" ? this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+        "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
+      ).toArray()[0] : undefined;
+      const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; count: number; stopped: number }>(
+        "SELECT count, stopped FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
+      ).toArray()[0];
       const receiptStatus = receipt && typeof receipt === "object" && "status" in receipt && typeof receipt.status === "string"
         ? receipt.status
         : null;
@@ -1778,15 +1874,28 @@ export class ProjectGuard extends DurableObject<Env> {
           recoveryCode = "intent_payload_invalid";
         }
       }
+      if (!recoverableIntent && staged && !recoveryCode) {
+        try {
+          if (await sha256Text(staged.request_json) !== staged.request_sha256) throw new Error("staged_request_hash_invalid");
+          if (intent && intent.request_sha256 !== staged.request_sha256) throw new Error("staged_request_binding_invalid");
+          const parsed = parseManagedDocumentRequest(JSON.parse(staged.request_json));
+          if (parsed.project_id !== projectId || parsed.request_id !== requestId) throw new Error("staged_request_identity_invalid");
+          recoverableIntent = true;
+        } catch {
+          recoveryCode = "staged_payload_invalid";
+        }
+      }
       const status = execution?.status === "finalized"
         ? "finalized"
         : receiptStatus === "committed"
           ? "committed"
           : receiptStatus === "rejected" || receiptStatus === "conflict"
             ? receiptStatus
-            : recoverableIntent
-              ? "recovery_scheduled"
-              : intent
+            : queued && failure?.stopped
+              ? "recovery_blocked"
+              : wakeScheduled && recoverableIntent
+                ? "recovery_scheduled"
+              : intent || staged || queued
                 ? "recovery_unavailable"
               : "not_received";
       return Response.json({
@@ -1796,11 +1905,12 @@ export class ProjectGuard extends DurableObject<Env> {
         status,
         ...(receipt ? { receipt } : {}),
         ...(execution ? { execution } : {}),
-        ...(intent ? {
+        ...(intent || staged || queued ? {
           recovery: {
-            durable_intent: true,
+            durable_intent: Boolean(intent),
             recoverable: recoverableIntent,
-            ...(recoveryCode ? { code: recoveryCode } : {})
+            scheduled: wakeScheduled && !failure?.stopped,
+            ...(failure?.stopped ? { code: "identical_internal_failure_limit", attempts: failure.count } : recoveryCode ? { code: recoveryCode } : {})
           }
         } : {})
       });

@@ -678,6 +678,14 @@ export class ProjectGuard extends DurableObject<Env> {
     if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
       if (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext) return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "rejected", code: "PACKAGE_GOVERNANCE_REQUIRED" });
       if (operation.expected_project_revision !== state.revision) return Response.json({ status: "conflict", code: "PACKAGE_PROJECT_REVISION_CONFLICT" });
+      const digest = await sha256Text(serialized);
+      const existingIntent = await this.managedDocumentRequests.readIntent(operation.project_id, operation.request_id);
+      const stagedRequest = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
+        "SELECT request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", "document", operation.request_id
+      ).toArray()[0];
+      if ((existingIntent && existingIntent.request_sha256 !== digest) || (stagedRequest && stagedRequest.request_sha256 !== digest)) {
+        return Response.json(this.documentTerminalReceipt(operation, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH", "The same request_id was reused with a different managed-document payload"));
+      }
       const existingProof = await this.readPackageAdmissionProof(operation);
       const proof = existingProof ?? await this.admitRules(state, normalized, mutationContext.actor);
       if (!existingProof) await this.persistAdmissionProof(operation.operation === "package.freeze" ? "document" : "package-admission", operation.request_id, proof);
@@ -951,6 +959,16 @@ export class ProjectGuard extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId);
   }
 
+  private async blockRequestRecovery(kind: "artifact" | "document", requestId: string, code: string): Promise<void> {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
+       VALUES (?, ?, ?, 1, 1, ?)
+       ON CONFLICT(kind, request_id) DO UPDATE SET fingerprint = excluded.fingerprint,
+         count = excluded.count, stopped = 1, message = excluded.message`,
+      kind, requestId, await sha256Text(code), code
+    );
+  }
+
   private pendingRequestRecovery(): RecoveryRequestRow[] {
     const cursor = this.ctx.storage.sql.exec<RecoveryCursorRow>(
       "SELECT kind, request_id FROM request_recovery_cursor WHERE singleton = 1"
@@ -1131,6 +1149,10 @@ export class ProjectGuard extends DurableObject<Env> {
       this.clearRequestRecovery("document", requestId);
       return;
     }
+    const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+      "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?",
+      "document", requestId
+    ).toArray()[0];
     let intent;
     try {
       intent = await this.managedDocumentRequests.readRecoverableIntent(projectId, requestId);
@@ -1140,11 +1162,11 @@ export class ProjectGuard extends DurableObject<Env> {
       this.clearRequestRecovery("document", requestId);
       return;
     }
+    if (intent && staged && intent.request_sha256 !== staged.request_sha256) {
+      await this.blockRequestRecovery("document", requestId, "document_intent_binding_mismatch");
+      return;
+    }
     if (!intent) {
-      const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
-        "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?",
-        "document", requestId
-      ).toArray()[0];
       if (!staged) {
         this.clearRequestRecovery("document", requestId);
         return;
@@ -1852,8 +1874,8 @@ export class ProjectGuard extends DurableObject<Env> {
       const staged = kind === "document" ? this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
         "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray()[0] : undefined;
-      const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; count: number; stopped: number }>(
-        "SELECT count, stopped FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
+      const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; count: number; stopped: number; message: string }>(
+        "SELECT count, stopped, message FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray()[0];
       const receiptStatus = receipt && typeof receipt === "object" && "status" in receipt && typeof receipt.status === "string"
         ? receipt.status
@@ -1885,6 +1907,7 @@ export class ProjectGuard extends DurableObject<Env> {
           recoveryCode = "staged_payload_invalid";
         }
       }
+      if (intent && staged && intent.request_sha256 !== staged.request_sha256) recoverableIntent = false;
       const status = execution?.status === "finalized"
         ? "finalized"
         : receiptStatus === "committed"
@@ -1910,7 +1933,7 @@ export class ProjectGuard extends DurableObject<Env> {
             durable_intent: Boolean(intent),
             recoverable: recoverableIntent,
             scheduled: wakeScheduled && !failure?.stopped,
-            ...(failure?.stopped ? { code: "identical_internal_failure_limit", attempts: failure.count } : recoveryCode ? { code: recoveryCode } : {})
+            ...(failure?.stopped ? { code: failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit", attempts: failure.count } : recoveryCode ? { code: recoveryCode } : {})
           }
         } : {})
       });

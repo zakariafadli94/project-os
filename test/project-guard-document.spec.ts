@@ -10,6 +10,7 @@ import { encodeAdmission } from "../src/admission/transport";
 import { normalizeDocumentAdmission } from "../src/admission/operation-context";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { DocumentLedgerRepository } from "../src/documents/repository";
+import { ManagedDocumentRequestLedger } from "../src/documents/request-ledger";
 import { ExecutionJournal } from "../src/execution/journal";
 import { documentIdFor } from "../src/domain/managed-document";
 import { ruleFixture } from "./helpers/rule-fixtures";
@@ -96,6 +97,11 @@ describe("ProjectGuard managed documents", () => {
       await (instance as any).readPackageAdmissionProof(freezeRequest);
     });
     expect((await freezeJournal.readAdmission())?.admission.request_id).toBe(freezeRequest.request_id);
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM document_requests WHERE request_id = ?", freezeRequest.request_id);
+    });
+    const mismatchedFreeze = await submit({ ...freezeRequest, content_sha256: "f".repeat(64) });
+    expect(mismatchedFreeze).toMatchObject({ status: "rejected", code: "IDEMPOTENCY_PAYLOAD_MISMATCH" });
     const request = { operation: "package.replace", request_id: "DOCREQ-PACKAGE-REPLACE-0092", project_id: created.project_id, candidate: frozen.candidate, zone: "WORKING", expected_navigation_generation: 0, expected_project_revision: 1, created_at: at };
     let restorePackage!: () => void;
     await runInDurableObject(guard, (instance) => {
@@ -306,13 +312,35 @@ describe("ProjectGuard managed documents", () => {
     await expect(status.json()).resolves.toMatchObject({ status: "committed", receipt: { request_id: request.request_id } });
   });
 
+  it("never executes a canonical intent that differs from the admitted staged request", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-BIND-0052");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-BIND-0052", project_id: created.project_id,
+      logical_path: "strategy/bound.md", content: "admitted", content_sha256: await sha256Text("admitted"), created_at: at };
+    let restore!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const spy = vi.spyOn((instance as any).managedDocumentRequests, "ensureIntent").mockRejectedValueOnce(new Error("temporary_intent_write_failure"));
+      restore = () => spy.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    expect(interrupted.status).toBe(503);
+    restore();
+    const different = { ...request, content: "different", content_sha256: await sha256Text("different") };
+    await new ManagedDocumentRequestLedger(createProductionPersistence(testEnv))
+      .ensureIntent(created.project_id, request.request_id, JSON.stringify(different));
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "recovery_blocked", recovery: { code: "document_intent_binding_mismatch" } });
+    expect(await new ManagedDocumentRequestLedger(createProductionPersistence(testEnv)).readReceipt(created.project_id, request.request_id)).toBeNull();
+  });
+
   it("does not call an unqueued intent scheduled for recovery", async () => {
     const created = await createProject("TXN-DOCUMENT-RECOVERY-STATUS-0048");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     const content = "# Intentionally unqueued";
     const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-STATUS-0048", project_id: created.project_id,
       logical_path: "strategy/unqueued.md", content, content_sha256: await sha256Text(content), created_at: at };
-    await new (await import("../src/documents/request-ledger")).ManagedDocumentRequestLedger(createProductionPersistence(testEnv))
+    await new ManagedDocumentRequestLedger(createProductionPersistence(testEnv))
       .ensureIntent(created.project_id, request.request_id, JSON.stringify(request));
     const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
     await expect(status.json()).resolves.toMatchObject({ status: "recovery_unavailable" });

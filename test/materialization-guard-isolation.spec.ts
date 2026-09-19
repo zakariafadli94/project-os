@@ -190,6 +190,50 @@ describe("MaterializationGuard isolation boundary", () => {
     });
   });
 
+  it("keeps a retry wake when a verified head cannot notify ProjectGuard", async () => {
+    const mock = installDropboxMock();
+    const projectId = "PRJ-3917";
+    await createProject(projectId, "finalization-retry", "TXN-MATISO-3917-CREATE");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({ [projectId]: "repair" });
+    });
+    await guard.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
+      if (!await runDurableObjectAlarm(guard)) break;
+    }
+    expect(mock.files.has(machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION))).toBe(true);
+    await runInDurableObject(guard, async (instance, state) => {
+      await state.storage.deleteAlarm();
+      vi.spyOn(instance as any, "notifyProjectGuardOfCurrentHead").mockRejectedValue(new Error("temporary_project_guard_unavailable"));
+    });
+
+    const response = await guard.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    expect(response.status).toBe(200);
+    await runInDurableObject(guard, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("notifies ProjectGuard from a legacy alarm even when the synchronous materialization left no queued target", async () => {
+    const guard = materializationNamespace().getByName("PRJ-3918");
+    let notify!: ReturnType<typeof vi.fn>;
+    await runInDurableObject(guard, async (instance, state) => {
+      (instance as any).layoutMode = "legacy";
+      (instance as any).coordinatorForSlice = () => ({
+        coordinator: { runNext: async () => ({ completed: false, more_work: false }) }
+      });
+      notify = vi.spyOn(instance as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(undefined);
+      await state.storage.setAlarm(Date.now() + 1_000);
+    });
+
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    expect(notify).toHaveBeenCalledOnce();
+  });
+
   it("keeps an idle verified canary current when bounded verification reads are slow", async () => {
     const mock = installDropboxMock();
     const projectId = "PRJ-3913";

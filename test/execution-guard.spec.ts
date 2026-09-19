@@ -88,6 +88,17 @@ function taskCompletionBaseline(projectId: string): CanonicalCommitRecord {
 }
 
 describe("canonical execution boundary in ProjectGuard", () => {
+  it("serves fresh canonical context while a separate serialized operation is waiting", async () => {
+    const projectId = "PRJ-8310";
+    const { guard } = await setup(projectId);
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn(instance as any, "serialize").mockRejectedValue(new Error("serialized_operation_busy"));
+    });
+    const response = await guard.fetch("https://project-guard.internal/mutation-context");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ canonical_state: { project_id: projectId, revision: 1 } });
+  });
+
   it("finalizes a committed artifact from its frozen intent and verified provider effect, including exact replay", async () => {
     const projectId = "PRJ-8288";
     const { guard, mock } = await setup(projectId);

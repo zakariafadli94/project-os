@@ -108,7 +108,10 @@ export class MaterializationGuard extends DurableObject<Env> {
         if (this.layoutMode === "v2") return;
         const { coordinator } = this.coordinatorForSlice();
         const result = await coordinator.runNext(alarmInfo?.retryCount ?? 0);
-        if (result.completed) await this.notifyProjectGuardOfCurrentHead();
+        // A synchronous /materialize can finish the target before this alarm
+        // runs. In that case runNext reports idle, not completed, but the
+        // already-published head still needs its deferred finalization.
+        if (result.completed || !result.more_work) await this.notifyProjectGuardOfCurrentHead();
         if (result.more_work) {
           await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
         }
@@ -377,13 +380,15 @@ export class MaterializationGuard extends DurableObject<Env> {
         || saved.progress.requested !== null
         || Object.values(saved.progress.obligations).some((obligation) => obligation.state !== "verified")
       );
-      const currentRecord = headCurrent && hasPendingConvergence && state.revision > 0
+      const currentRecord = headCurrent && state.revision > 0
         ? await repository.readCommitRecord(this.projectId, state.revision)
         : null;
       if (currentRecord && await this.hasCurrentDurableHead(currentRecord)) {
         await this.acknowledgeVerifiedHumanHead(state.revision, CURRENT_PROJECTION_VERSION);
-        await this.notifyProjectGuardOfCurrentHead();
-        await this.ctx.storage.deleteAlarm();
+        // This request may have come through ProjectGuard. Notify from the
+        // alarm after the response, so the two Durable Objects cannot wait
+        // synchronously on each other.
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
         return Response.json(this.statusResponse(state));
       }
       // A stale obligation can only be verified against a current physical
@@ -458,8 +463,7 @@ export class MaterializationGuard extends DurableObject<Env> {
           await this.acknowledgeVerifiedHumanHead(state.revision, CURRENT_PROJECTION_VERSION);
         }
         if (providerHeadCurrent && await this.hasDurablyVerifiedCurrentTarget(record)) {
-          await this.notifyProjectGuardOfCurrentHead();
-          await this.ctx.storage.deleteAlarm();
+          await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
           return Response.json({
             project_id: state.project_id,
             revision: state.revision,
@@ -504,8 +508,7 @@ export class MaterializationGuard extends DurableObject<Env> {
             status: "pending"
           }, { status: 202 });
         }
-        await this.ctx.storage.deleteAlarm();
-        await this.notifyProjectGuardOfCurrentHead();
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
         return Response.json({
           project_id: state.project_id,
           revision: state.revision,
@@ -528,8 +531,7 @@ export class MaterializationGuard extends DurableObject<Env> {
           status: "pending"
         }, { status: 202 });
       }
-      await this.ctx.storage.deleteAlarm();
-      await this.notifyProjectGuardOfCurrentHead();
+      await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
     } else {
       if (this.layoutMode === "v2" && convergenceMode === "repair") {
         return Response.json({

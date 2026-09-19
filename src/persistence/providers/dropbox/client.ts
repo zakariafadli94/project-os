@@ -217,7 +217,7 @@ export class DropboxClient implements DropboxTransport {
     const response = await this.runtimeFetch("files/download", "https://content.dropboxapi.com/2/files/download", {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Dropbox-API-Arg": JSON.stringify({ path }) }
-    }, path);
+    }, path, false);
     if (!response.ok) {
       const text = await response.text();
       if (response.status === 409 && text.includes("not_found")) return null;
@@ -227,15 +227,28 @@ export class DropboxClient implements DropboxTransport {
     if (!reader) return new Uint8Array();
     const chunks: Uint8Array[] = [];
     let size = 0;
+    const remainingMs = this.options.requestScope
+      ? this.options.requestScope.deadlineMs - (this.options.requestScope.now?.() ?? Date.now())
+      : 30_000;
+    if (remainingMs <= 0) throw new Error("slice_budget_exhausted");
+    let rejectDeadline!: (reason: Error) => void;
+    const deadline = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
+    const timer = setTimeout(() => {
+      rejectDeadline(new Error(this.options.requestScope && remainingMs < 30_000
+        ? "slice_budget_exhausted" : "dropbox_request_timeout"));
+    }, Math.min(remainingMs, 30_000));
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await Promise.race([reader.read(), deadline]);
         if (done) break;
         size += value.byteLength;
         if (size > maxBytes) { await reader.cancel(); throw new ProviderBinaryReadLimitError(); }
         chunks.push(value);
       }
-    } finally { reader.releaseLock(); }
+    } catch (error) {
+      void reader.cancel().catch(() => undefined);
+      throw error;
+    } finally { clearTimeout(timer); reader.releaseLock(); }
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
@@ -601,15 +614,21 @@ export class DropboxClient implements DropboxTransport {
     endpoint: string,
     input: RequestInfo | URL,
     init?: RequestInit,
-    path?: string
+    path?: string,
+    bufferBody = true
   ): Promise<Response> {
     const requestIndex = ++this.requestIndex;
     const requestScope = this.options.requestScope;
-    const requestController = requestScope ? new AbortController() : null;
-    const abortFromScope = () => requestController?.abort(requestScope?.signal.reason);
+    const requestController = new AbortController();
+    const abortFromScope = () => requestController.abort(requestScope?.signal.reason);
+    const abortFromInput = () => requestController.abort(init?.signal?.reason);
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let rejectDeadline: ((reason: Error) => void) | undefined;
     try {
       requestScope?.beforeHttp();
+      if (init?.signal?.aborted) abortFromInput();
+      else init?.signal?.addEventListener("abort", abortFromInput, { once: true });
+      let timeoutMs = 30_000;
       if (requestScope) {
         if (requestScope.signal.aborted) abortFromScope();
         else requestScope.signal.addEventListener("abort", abortFromScope, { once: true });
@@ -617,13 +636,24 @@ export class DropboxClient implements DropboxTransport {
         const requestNow = requestScope.now?.() ?? Date.now();
         const remainingMs = requestScope.deadlineMs - requestNow;
         if (remainingMs <= 0) throw new Error("slice_budget_exhausted");
-        deadlineTimer = setTimeout(() => {
-          requestController?.abort(new Error("slice_budget_exhausted"));
-        }, remainingMs);
+        timeoutMs = Math.min(timeoutMs, remainingMs);
       }
-      return await fetch(input, {
+      const deadline = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
+      deadlineTimer = setTimeout(() => {
+        const error = new Error(requestScope && timeoutMs < 30_000 ? "slice_budget_exhausted" : "dropbox_request_timeout");
+        requestController.abort(error);
+        rejectDeadline?.(error);
+      }, timeoutMs);
+      const response = await Promise.race([fetch(input, {
         ...init,
-        signal: requestController?.signal ?? init?.signal
+        signal: requestController.signal
+      }), deadline]);
+      if (!bufferBody && response.ok) return response;
+      const bytes = await Promise.race([response.arrayBuffer(), deadline]);
+      return new Response([204, 205, 304].includes(response.status) ? null : bytes, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -633,6 +663,7 @@ export class DropboxClient implements DropboxTransport {
     } finally {
       if (deadlineTimer) clearTimeout(deadlineTimer);
       requestScope?.signal.removeEventListener("abort", abortFromScope);
+      init?.signal?.removeEventListener("abort", abortFromInput);
     }
   }
 

@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { CanonicalCommitRecord } from "../src/domain/commit-record";
@@ -163,6 +163,12 @@ describe("canonical execution boundary in ProjectGuard", () => {
     mock.files.set(visiblePath!, content);
     const observed = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
     expect(await observed.json()).toMatchObject({ status: "finalizing", terminal: false, code: "MATERIALIZATION_PENDING", finalization_ref: null });
+
+    // Reading stays observational. The existing committed effect is certified
+    // by the ProjectGuard alarm, without another artifact submission.
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const finalized = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
+    expect(await finalized.json()).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
   });
 
   it("persists server admission before recovery and exposes incomplete execution independently of historical receipts", async () => {

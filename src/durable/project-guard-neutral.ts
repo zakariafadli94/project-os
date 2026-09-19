@@ -81,6 +81,12 @@ interface DocumentRequestRow {
   receipt_json: string;
 }
 
+interface RecoveryRequestRow {
+  [key: string]: SqlStorageValue;
+  kind: string;
+  request_id: string;
+}
+
 interface StateRow {
   [key: string]: SqlStorageValue;
   state_json: string;
@@ -118,6 +124,13 @@ const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
   "project.complete",
   "project.archive"
 ]);
+
+/** Recovery is intentionally per-project and bounded. The immutable document
+ * intent remains the authority; this local queue is only a durable wake-up
+ * signal telling the owning ProjectGuard which admitted work still needs a
+ * technical continuation. */
+const REQUEST_RECOVERY_BATCH_SIZE = 4;
+const REQUEST_RECOVERY_RETRY_DELAY_MS = 30_000;
 
 class RuleAdmissionRejection extends Error {
   constructor(readonly evaluation: EvaluationResult) {
@@ -175,6 +188,11 @@ export class ProjectGuard extends DurableObject<Env> {
         request_id TEXT PRIMARY KEY,
         request_json TEXT NOT NULL,
         receipt_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS request_recovery (
+        kind TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        PRIMARY KEY (kind, request_id)
       );
       CREATE TABLE IF NOT EXISTS project_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -445,6 +463,7 @@ export class ProjectGuard extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     await this.ctx.storage.deleteAlarm();
+    await this.serialize(() => this.resumePendingRequestRecovery());
   }
 
   private async handleArtifact(request: Request): Promise<Response> {
@@ -668,9 +687,14 @@ export class ProjectGuard extends DurableObject<Env> {
     const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
     if (durableReceipt) {
       const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
-      this.persistDocumentRequest(operation, receipt);
+      await this.settleDocumentReceipt(operation, receipt);
       return Response.json(receipt);
     }
+
+    // This is written after admission and before the provider effect. It is
+    // therefore safe to resume exactly this immutable request after a Worker
+    // interruption, without asking a chat to submit or approve it again.
+    await this.enqueueRequestRecovery("document", operation.request_id);
 
     try {
       const receipt = await this.executeManagedDocument(operation, state);
@@ -688,7 +712,17 @@ export class ProjectGuard extends DurableObject<Env> {
           this.documentTerminalReceipt(operation, "rejected", "CONTENT_HASH_MISMATCH", error.message)
         );
       }
-      throw error;
+      // The intent and wake signal were persisted before the provider effect.
+      // Return an explicit temporary state so Durable Object storage commits;
+      // throwing here would roll back the wake signal and force a caller to
+      // recreate the same request manually.
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({
+        request_id: operation.request_id,
+        project_id: operation.project_id,
+        status: "pending",
+        code: "DOCUMENT_RECOVERY_SCHEDULED"
+      }, { status: 503 });
     }
   }
 
@@ -737,11 +771,7 @@ export class ProjectGuard extends DurableObject<Env> {
     // write path can resolve the same frozen request as later status/replay
     // recovery. The canonical intent and receipt remain the authority.
     this.persistArtifact(request, receipt);
-    if (this.strictAdmissionEnabled(request.project_id)) {
-      const journal = new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id);
-      await journal.recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
-      if (receipt.status === "committed") await this.finalizeVerifiedArtifact(journal);
-    }
+    await this.settleArtifactReceipt(request, receipt);
     if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
     return Response.json(receipt);
   }
@@ -758,13 +788,169 @@ export class ProjectGuard extends DurableObject<Env> {
       requestJson,
       receiptJson
     );
-    if (this.strictAdmissionEnabled(request.project_id)) {
-      const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
-      await journal.recordReceipt(receipt.status, `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`);
-      if (receipt.status === "committed") await this.finalizeVerifiedDocument(journal);
-    }
-    this.persistDocumentRequest(request, receipt);
+    // The family cache must be available before certification. Certification
+    // is deliberately a separate retryable step and can now be resumed by the
+    // alarm if the initial invocation ends between receipt and certificate.
+    await this.settleDocumentReceipt(request, receipt);
     return Response.json(receipt);
+  }
+
+  /** Store the response cache before verification, then keep a wake signal
+   * until the independent execution certificate has actually become terminal.
+   * The alarm never invents a request: it only follows an immutable intent
+   * already accepted by this guard. */
+  private async settleDocumentReceipt(
+    request: ManagedDocumentRequest,
+    receipt: ManagedDocumentOperationReceipt
+  ): Promise<void> {
+    this.persistDocumentRequest(request, receipt);
+    if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
+      this.clearRequestRecovery("document", request.request_id);
+      return;
+    }
+    await this.enqueueRequestRecovery("document", request.request_id);
+    const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
+    await journal.recordReceipt(
+      receipt.status,
+      `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`
+    );
+    await this.finalizeVerifiedDocument(journal);
+    if ((await journal.status())?.terminal) this.clearRequestRecovery("document", request.request_id);
+  }
+
+  private async settleArtifactReceipt(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<void> {
+    if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") return;
+    await this.enqueueRequestRecovery("artifact", request.request_id);
+    const journal = new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id);
+    await journal.recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
+    await this.finalizeVerifiedArtifact(journal);
+    if ((await journal.status())?.terminal) this.clearRequestRecovery("artifact", request.request_id);
+  }
+
+  private async enqueueRequestRecovery(kind: "artifact" | "document", requestId: string): Promise<void> {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO request_recovery (kind, request_id) VALUES (?, ?) ON CONFLICT(kind, request_id) DO NOTHING",
+      kind,
+      requestId
+    );
+    // A short delay lets the current request finish and its durable intent
+    // settle before recovery starts; alarm retries remain automatic and do
+    // not require a caller to poll or resubmit.
+    await this.armRequestRecoveryAlarm(1_000);
+  }
+
+  private clearRequestRecovery(kind: "artifact" | "document", requestId: string): void {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM request_recovery WHERE kind = ? AND request_id = ?",
+      kind,
+      requestId
+    );
+  }
+
+  private pendingRequestRecovery(): RecoveryRequestRow[] {
+    return this.ctx.storage.sql.exec<RecoveryRequestRow>(
+      "SELECT kind, request_id FROM request_recovery ORDER BY kind, request_id LIMIT ?",
+      REQUEST_RECOVERY_BATCH_SIZE
+    ).toArray();
+  }
+
+  private hasPendingRequestRecovery(): boolean {
+    return this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; pending: number }>(
+      "SELECT COUNT(*) AS pending FROM request_recovery"
+    ).toArray()[0]?.pending > 0;
+  }
+
+  private async armRequestRecoveryAlarm(delayMs: number): Promise<void> {
+    const dueAt = Date.now() + delayMs;
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing == null || existing > dueAt) await this.ctx.storage.setAlarm(dueAt);
+  }
+
+  private async resumePendingRequestRecovery(): Promise<void> {
+    for (const recovery of this.pendingRequestRecovery()) {
+      try {
+        if (recovery.kind === "document") await this.resumeManagedDocument(recovery.request_id);
+        else if (recovery.kind === "artifact") await this.resumeArtifactFinalization(recovery.request_id);
+        else this.clearRequestRecovery("document", recovery.request_id);
+      } catch {
+        // A transient provider or Worker failure keeps the immutable intent and
+        // its local wake signal intact. The next bounded alarm resumes it with
+        // the identical request rather than asking for a new submission.
+      }
+    }
+    if (this.hasPendingRequestRecovery()) {
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+    }
+  }
+
+  private async resumeManagedDocument(requestId: string): Promise<void> {
+    const projectId = this.ctx.id.name;
+    if (!projectId) {
+      this.clearRequestRecovery("document", requestId);
+      return;
+    }
+    let intent;
+    try {
+      intent = await this.managedDocumentRequests.readRecoverableIntent(projectId, requestId);
+    } catch {
+      // Corrupt evidence is never replayed. It remains observable through the
+      // read-only status endpoint instead of creating an untrusted effect.
+      this.clearRequestRecovery("document", requestId);
+      return;
+    }
+    if (!intent) {
+      this.clearRequestRecovery("document", requestId);
+      return;
+    }
+    const operation = parseManagedDocumentRequest(JSON.parse(intent.request_json));
+    if (operation.project_id !== projectId || operation.request_id !== requestId) {
+      this.clearRequestRecovery("document", requestId);
+      return;
+    }
+    // Package replacement carries an exact project-revision contract and its
+    // own governed execution boundary. It is intentionally not replayed here
+    // under a potentially newer project state.
+    if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
+      this.clearRequestRecovery("document", requestId);
+      return;
+    }
+    const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, requestId);
+    if (durableReceipt) {
+      await this.settleDocumentReceipt(operation, JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt);
+      return;
+    }
+    const state = await this.loadOrRecoverState();
+    if (!state) throw new Error("project_not_initialized");
+    try {
+      await this.finalizeDocument(operation, await this.executeManagedDocument(operation, state));
+    } catch (error) {
+      if (error instanceof ManagedDocumentConflictError) {
+        await this.finalizeDocument(
+          operation,
+          this.documentTerminalReceipt(operation, "conflict", error.code, error.message, error.documentId)
+        );
+        return;
+      }
+      if (error instanceof Error && error.message.startsWith("Managed document content SHA-256 mismatch:")) {
+        await this.finalizeDocument(
+          operation,
+          this.documentTerminalReceipt(operation, "rejected", "CONTENT_HASH_MISMATCH", error.message)
+        );
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async resumeArtifactFinalization(requestId: string): Promise<void> {
+    const row = this.findArtifact(requestId);
+    if (!row) {
+      this.clearRequestRecovery("artifact", requestId);
+      return;
+    }
+    const request = parseArtifactWriteRequest(JSON.parse(row.request_json));
+    const receipt = JSON.parse(row.receipt_json) as ArtifactWriteReceipt;
+    await this.settleArtifactReceipt(request, receipt);
   }
 
   private loadState(): ProjectState | null {
@@ -1382,14 +1568,17 @@ export class ProjectGuard extends DurableObject<Env> {
       const receiptStatus = receipt && typeof receipt === "object" && "status" in receipt && typeof receipt.status === "string"
         ? receipt.status
         : null;
+      const recoverableIntent = typeof intent?.request_json === "string";
       const status = execution?.status === "finalized"
         ? "finalized"
         : receiptStatus === "committed"
           ? "committed"
           : receiptStatus === "rejected" || receiptStatus === "conflict"
             ? receiptStatus
-            : intent
+            : recoverableIntent
               ? "recovery_scheduled"
+              : intent
+                ? "recovery_unavailable"
               : "not_received";
       return Response.json({
         project_id: projectId,
@@ -1398,7 +1587,7 @@ export class ProjectGuard extends DurableObject<Env> {
         status,
         ...(receipt ? { receipt } : {}),
         ...(execution ? { execution } : {}),
-        ...(intent ? { recovery: { durable_intent: true, recoverable: typeof intent.request_json === "string" } } : {})
+        ...(intent ? { recovery: { durable_intent: true, recoverable: recoverableIntent } } : {})
       });
     } catch {
       return Response.json({

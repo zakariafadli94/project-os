@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -138,6 +138,54 @@ describe("ProjectGuard managed documents", () => {
     });
     expect(JSON.stringify(body)).not.toContain(content);
     expect(body).not.toHaveProperty("provider");
+  });
+
+  it("resumes an interrupted working write from its durable intent without a client replay", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-0042");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Resume without re-review";
+    let failure: ReturnType<typeof vi.spyOn>;
+    await runInDurableObject(guard, (instance) => {
+      failure = vi.spyOn((instance as any).managedDocumentService, "writeWorking")
+        .mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+    });
+
+    const request = {
+      operation: "working.write",
+      request_id: "DOCREQ-RECOVERY-36010001",
+      project_id: created.project_id,
+      logical_path: "strategy/resumed.md",
+      content,
+      content_sha256: await sha256Text(content),
+      created_at: at
+    } as const;
+    const interrupted = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request)
+    });
+    expect(interrupted.status).toBe(503);
+    await expect(interrupted.json()).resolves.toMatchObject({
+      status: "pending",
+      code: "DOCUMENT_RECOVERY_SCHEDULED",
+      request_id: request.request_id
+    });
+    failure!.mockRestore();
+
+    await expect(runInDurableObject(guard, async (_instance, state) => state.storage.getAlarm()))
+      .resolves.toEqual(expect.any(Number));
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+
+    const recovered = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request)
+    });
+    await expect(recovered.json()).resolves.toMatchObject({
+      status: "committed",
+      request_id: request.request_id,
+      logical_path: request.logical_path
+    });
   });
 
   it("keeps an unqualified local expected-version rule unavailable", async () => {

@@ -18,14 +18,18 @@ const artifact = {
 };
 
 describe("Control Tower governed artifact submission", () => {
-  it("resumes governed finalization before returning an artifact receipt", async () => {
+  it("returns an observational artifact request status without triggering finalization", async () => {
     const calls: string[] = [];
     const stub = {
       fetch: async (input: string) => {
         const url = new URL(input);
         calls.push(`${url.pathname}${url.search}`);
-        if (url.pathname === "/execution-status") return Response.json({ status: "finalized", terminal: true, finalization_ref: "proof:artifact" });
-        return Response.json({ status: "committed", request_id: artifact.request_id });
+        if (url.pathname === "/request-status") return Response.json({
+          status: "committed",
+          receipt: { status: "committed", request_id: artifact.request_id },
+          execution: { status: "finalizing", terminal: false }
+        });
+        return Response.json({ error: "unexpected_route" }, { status: 500 });
       }
     };
     const server = createControlTowerServer({
@@ -34,11 +38,8 @@ describe("Control Tower governed artifact submission", () => {
     }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ content: Array<{ text: string }> }> }> };
 
     const result = await server._registeredTools.project_os_get_receipt.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
-    expect(calls).toEqual([
-      `/execution-status?request_id=${artifact.request_id}&kind=artifact`,
-      `/receipt?request_id=${artifact.request_id}&kind=artifact`
-    ]);
-    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ status: "committed", execution: { status: "finalized", terminal: true, finalization_ref: "proof:artifact" } });
+    expect(calls).toEqual([`/request-status?request_id=${artifact.request_id}&kind=artifact`]);
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ status: "committed", execution: { status: "finalizing", terminal: false } });
   });
 
   it("sends a staged artifact with fresh signed admission to ProjectGuard", async () => {

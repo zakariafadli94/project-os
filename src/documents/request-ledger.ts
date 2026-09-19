@@ -12,10 +12,18 @@ export interface ManagedDocumentRequestIntentRecord {
   project_id: string;
   request_id: string;
   request_sha256: string;
+  /** New intents retain their exact request so automatic recovery never
+   * depends on a chat replay. Hash-only records from prior versions stay
+   * readable but are intentionally not recoverable. */
+  request_json?: string;
 }
 
 export interface ManagedDocumentRequestReceiptRecord extends ManagedDocumentRequestIntentRecord {
   receipt_json: string;
+}
+
+export interface RecoverableManagedDocumentRequestIntent extends ManagedDocumentRequestIntentRecord {
+  request_json: string;
 }
 
 export class ManagedDocumentRequestIntentConflictError extends Error {
@@ -45,10 +53,23 @@ export class ManagedDocumentRequestLedger {
       || parsed.request_id !== requestId
       || typeof parsed.request_sha256 !== "string"
       || !/^[a-f0-9]{64}$/.test(parsed.request_sha256)
+      || (parsed.request_json !== undefined && typeof parsed.request_json !== "string")
     ) {
       throw new Error(`Invalid durable managed-document request intent: ${projectId}/${requestId}`);
     }
     return parsed as ManagedDocumentRequestIntentRecord;
+  }
+
+  /** Returns an exact, digest-verified request only for intents written by
+   * the recoverable format. A legacy hash-only intent remains historical
+   * evidence, never permission to invent a replay payload. */
+  async readRecoverableIntent(projectId: string, requestId: string): Promise<RecoverableManagedDocumentRequestIntent | null> {
+    const intent = await this.readIntent(projectId, requestId);
+    if (!intent?.request_json) return null;
+    if (await sha256Text(intent.request_json) !== intent.request_sha256) {
+      throw new Error(`Durable managed-document request intent payload mismatch: ${projectId}/${requestId}`);
+    }
+    return intent as RecoverableManagedDocumentRequestIntent;
   }
 
   async ensureIntent(projectId: string, requestId: string, requestJson: string): Promise<ManagedDocumentRequestIntentRecord> {
@@ -58,7 +79,8 @@ export class ManagedDocumentRequestLedger {
       schema_version: "1.0",
       project_id: projectId,
       request_id: requestId,
-      request_sha256: requestSha256
+      request_sha256: requestSha256,
+      request_json: requestJson
     };
     const content = pretty(record);
     try {

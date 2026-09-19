@@ -170,6 +170,24 @@ describe("ProjectGuard managed documents", () => {
       code: "DOCUMENT_RECOVERY_SCHEDULED",
       request_id: request.request_id
     });
+
+    const changed = { ...request, content: "# Different bytes", content_sha256: await sha256Text("# Different bytes") };
+    const mismatch = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(changed)
+    });
+    await expect(mismatch.json()).resolves.toMatchObject({
+      status: "rejected",
+      code: "IDEMPOTENCY_PAYLOAD_MISMATCH"
+    });
+    const statusBeforeRecovery = await guard.fetch(
+      `https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`
+    );
+    await expect(statusBeforeRecovery.json()).resolves.toMatchObject({
+      status: "recovery_scheduled",
+      recovery: { durable_intent: true, recoverable: true }
+    });
     failure!.mockRestore();
 
     await expect(runInDurableObject(guard, async (_instance, state) => state.storage.getAlarm()))
@@ -186,6 +204,46 @@ describe("ProjectGuard managed documents", () => {
       request_id: request.request_id,
       logical_path: request.logical_path
     });
+  });
+
+  it("recovers one project without delaying an independent project", async () => {
+    const blocked = await createProject("TXN-DOCUMENT-RECOVERY-0043");
+    const independent = await createProject("TXN-DOCUMENT-RECOVERY-0044");
+    const blockedGuard = testEnv.PROJECT_GUARD.getByName(blocked.project_id);
+    const independentGuard = testEnv.PROJECT_GUARD.getByName(independent.project_id);
+    let failure: ReturnType<typeof vi.spyOn>;
+    await runInDurableObject(blockedGuard, (instance) => {
+      failure = vi.spyOn((instance as any).managedDocumentService, "writeWorking")
+        .mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+    });
+    const blockedContent = "blocked temporarily";
+    const blockedRequest = {
+      operation: "working.write", request_id: "DOCREQ-RECOVERY-36010043", project_id: blocked.project_id,
+      logical_path: "strategy/blocked.md", content: blockedContent,
+      content_sha256: await sha256Text(blockedContent), created_at: at
+    } as const;
+    const pending = await blockedGuard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(blockedRequest)
+    });
+    expect(pending.status).toBe(503);
+
+    const readyContent = "continues independently";
+    const independentRequest = {
+      operation: "working.write", request_id: "DOCREQ-RECOVERY-36010044", project_id: independent.project_id,
+      logical_path: "strategy/ready.md", content: readyContent,
+      content_sha256: await sha256Text(readyContent), created_at: at
+    } as const;
+    const unaffected = await independentGuard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(independentRequest)
+    });
+    await expect(unaffected.json()).resolves.toMatchObject({ status: "committed", request_id: independentRequest.request_id });
+
+    failure!.mockRestore();
+    expect(await runDurableObjectAlarm(blockedGuard)).toBe(true);
+    const recovered = await blockedGuard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(blockedRequest)
+    });
+    await expect(recovered.json()).resolves.toMatchObject({ status: "committed", request_id: blockedRequest.request_id });
   });
 
   it("keeps an unqualified local expected-version rule unavailable", async () => {

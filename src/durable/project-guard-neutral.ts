@@ -351,7 +351,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "GET" && pathname === "/mutation-context") {
-      return this.serialize(() => this.handleMutationContextRead(request));
+      return this.handleMutationContextRead(request);
     }
 
     if (request.method === "GET" && pathname === "/receipt") {

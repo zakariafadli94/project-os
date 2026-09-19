@@ -68,4 +68,74 @@ describe("DropboxClient bounded request scope", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it("bounds an unscoped Dropbox request so one stalled call cannot hold ProjectGuard forever", async () => {
+    vi.useFakeTimers();
+    let metadataRequestStarted!: () => void;
+    const metadataRequest = new Promise<void>((resolve) => { metadataRequestStarted = resolve; });
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/oauth2/token") {
+        return Promise.resolve(Response.json({ access_token: "test-access-token", expires_in: 14_400 }));
+      }
+      metadataRequestStarted();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    });
+    const client = new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" });
+
+    const pending = client.getMetadata("/slow.txt");
+    const rejection = expect(pending).rejects.toThrow("dropbox_request_timeout");
+    await metadataRequest;
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    await rejection;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("also bounds a stalled response body after Dropbox sends headers", async () => {
+    vi.useFakeTimers();
+    let bodyStarted!: () => void;
+    const started = new Promise<void>((resolve) => { bodyStarted = resolve; });
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/oauth2/token") {
+        return Promise.resolve(Response.json({ access_token: "test-access-token", expires_in: 14_400 }));
+      }
+      const stream = new ReadableStream<Uint8Array>({ start() { bodyStarted(); } });
+      return Promise.resolve(new Response(stream, { status: 200 }));
+    });
+    const client = new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" });
+
+    const pending = client.download("/slow-body.txt");
+    const rejection = expect(pending).rejects.toThrow("dropbox_request_timeout");
+    await started;
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    await rejection;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounds a stalled binary stream without prebuffering it", async () => {
+    vi.useFakeTimers();
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => { streamStarted = resolve; });
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/oauth2/token") {
+        return Promise.resolve(Response.json({ access_token: "test-access-token", expires_in: 14_400 }));
+      }
+      return Promise.resolve(new Response(new ReadableStream<Uint8Array>({ start() { streamStarted(); } })));
+    });
+    const client = new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" });
+
+    const pending = client.downloadBytes("/slow-binary.bin", 1024);
+    const rejection = expect(pending).rejects.toThrow("dropbox_request_timeout");
+    await started;
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    await rejection;
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });

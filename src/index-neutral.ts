@@ -257,6 +257,27 @@ const worker = {
       }
     }
 
+    const requestStatusMatch = url.pathname.match(/^\/v1\/projects\/([^/]+)\/request-status$/);
+    if (request.method === "GET" && requestStatusMatch) {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const projectId = requestStatusMatch[1];
+      if (!/^PRJ-[0-9]{4,}$/.test(projectId)) return Response.json({ error: "invalid_project_id" }, { status: 400 });
+      const kinds = url.searchParams.getAll("kind");
+      if (kinds.length !== 1 || !EXECUTION_KIND.test(kinds[0]!)) return Response.json({ error: "invalid_execution_kind" }, { status: 400 });
+      const requestIds = url.searchParams.getAll("request_id");
+      if (requestIds.length !== 1 || !EXECUTION_REQUEST_ID.test(requestIds[0]!)) return Response.json({ error: "invalid_execution_request_id" }, { status: 400 });
+      try {
+        const response = await env.PROJECT_GUARD.getByName(projectId).fetch(
+          `https://project-guard.internal/request-status?kind=${encodeURIComponent(kinds[0]!)}&request_id=${encodeURIComponent(requestIds[0]!)}`
+        );
+        const headers = new Headers(response.headers);
+        headers.set("cache-control", "no-store");
+        return new Response(response.body, { status: response.status, headers });
+      } catch {
+        return Response.json({ error: "request_status_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/artifacts") {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
 

@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -10,9 +10,11 @@ import { encodeAdmission } from "../src/admission/transport";
 import { normalizeDocumentAdmission } from "../src/admission/operation-context";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { DocumentLedgerRepository } from "../src/documents/repository";
+import { ManagedDocumentRequestLedger } from "../src/documents/request-ledger";
+import { ExecutionJournal } from "../src/execution/journal";
 import { documentIdFor } from "../src/domain/managed-document";
 import { ruleFixture } from "./helpers/rule-fixtures";
-import { machineDocumentHeadPath, machineDocumentVersionPath, machineStatePath } from "../src/persistence/layout";
+import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineStatePath } from "../src/persistence/layout";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-24T19:35:00+01:00";
@@ -64,14 +66,74 @@ describe("ProjectGuard managed documents", () => {
     await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, { MUTATION_CONTEXT_SIGNING_KEY: key, RULE_ADMISSION_SIGNING_KEY: key, PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" }) }));
     const { context }: any = await (await guard.fetch("https://internal/mutation-context")).json();
     const submit = async (request: unknown) => (await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, context)) })).json<any>();
-    const frozen = await submit({ operation: "package.freeze", request_id: "DOCREQ-PACKAGE-FREEZE-0092", project_id: created.project_id, document_id: descriptor.document_id, expected_version_id: descriptor.version_id, content_sha256: await sha256Text(content), expected_project_revision: 1, created_at: at });
+    const freezeRequest = { operation: "package.freeze" as const, request_id: "DOCREQ-PACKAGE-FREEZE-0092", project_id: created.project_id, document_id: descriptor.document_id, expected_version_id: descriptor.version_id, content_sha256: await sha256Text(content), expected_project_revision: 1, created_at: at };
+    let restoreFreeze!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const service = (instance as any).managedDocumentService;
+      const freeze = vi.spyOn(service, "freezePackageDocument").mockRejectedValueOnce(new Error("temporary_provider_failure"));
+      restoreFreeze = () => freeze.mockRestore();
+    });
+    const freezeInterrupted = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(freezeRequest, context))
+    });
+    expect(freezeInterrupted.status).toBe(503);
+    await expect(freezeInterrupted.json()).resolves.toMatchObject({
+      status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED", request_id: freezeRequest.request_id
+    });
+    restoreFreeze();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const frozen = await submit(freezeRequest);
     expect(frozen).toMatchObject({ status: "committed", candidate: { version: 1 } });
+    const freezeAdmission = await new ExecutionJournal(createProductionPersistence(testEnv), created.project_id, "document", freezeRequest.request_id).readAdmission();
+    expect(freezeAdmission?.admission).toMatchObject({ operation: "package.freeze", request_id: freezeRequest.request_id, verdict: "allow" });
+    const freezeJournal = new ExecutionJournal(createProductionPersistence(testEnv), created.project_id, "document", freezeRequest.request_id);
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO admission_proofs (kind, request_id, proof_json) VALUES (?, ?, ?)",
+        "package", freezeRequest.request_id, JSON.stringify(freezeAdmission!.admission));
+    });
+    await createProductionPersistence(testEnv).objects.delete(`${await freezeJournal.root()}/admission.json`);
+    await createProductionPersistence(testEnv).objects.delete(`${await freezeJournal.root()}/progress.json`);
+    await runInDurableObject(guard, async (instance) => {
+      await (instance as any).readPackageAdmissionProof(freezeRequest);
+    });
+    expect((await freezeJournal.readAdmission())?.admission.request_id).toBe(freezeRequest.request_id);
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM document_requests WHERE request_id = ?", freezeRequest.request_id);
+    });
+    const mismatchedFreeze = await submit({ ...freezeRequest, content_sha256: "f".repeat(64) });
+    expect(mismatchedFreeze).toMatchObject({ status: "rejected", code: "IDEMPOTENCY_PAYLOAD_MISMATCH" });
     const request = { operation: "package.replace", request_id: "DOCREQ-PACKAGE-REPLACE-0092", project_id: created.project_id, candidate: frozen.candidate, zone: "WORKING", expected_navigation_generation: 0, expected_project_revision: 1, created_at: at };
+    let restorePackage!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const service = (instance as any).managedDocumentService;
+      const replace = vi.spyOn(service, "replacePackage").mockRejectedValueOnce(new Error("temporary_provider_failure"));
+      restorePackage = () => replace.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(interrupted.status).toBe(503);
+    await expect(interrupted.json()).resolves.toMatchObject({
+      status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED", request_id: request.request_id
+    });
+    restorePackage();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
     let result = await submit(request);
     for (let count = 0; count < 5 && result.status === "finalizing"; count++) result = await submit(request);
     expect(result).toMatchObject({ status: "committed", execution_status: "finalized" });
     expect((await repository.readPackageNavigation(created.project_id)).WORKING?.packages[0].ref).toEqual(frozen.candidate);
     expect(await submit(request)).toEqual(result);
+
+    const terminalRequest = { ...request, request_id: "DOCREQ-PACKAGE-CONFLICT-0092", expected_navigation_generation: 1 };
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "replacePackage").mockResolvedValueOnce({
+        status: "conflict", terminal: true, code: "EXECUTION_RESOURCE_CHANGED"
+      });
+    });
+    const terminal = await submit(terminalRequest);
+    expect(terminal).toMatchObject({ status: "conflict", code: "EXECUTION_RESOURCE_CHANGED" });
+    const terminalStatus = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${terminalRequest.request_id}`);
+    await expect(terminalStatus.json()).resolves.toMatchObject({ status: "conflict" });
   });
 
   it("package transport refuses legacy ungoverned execution even with a well-formed manifest reference", async () => {
@@ -138,6 +200,295 @@ describe("ProjectGuard managed documents", () => {
     });
     expect(JSON.stringify(body)).not.toContain(content);
     expect(body).not.toHaveProperty("provider");
+  });
+
+  it("resumes an interrupted working write from its durable intent without a client replay", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-0042");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Resume without re-review";
+    let failure: ReturnType<typeof vi.spyOn>;
+    await runInDurableObject(guard, (instance) => {
+      failure = vi.spyOn((instance as any).managedDocumentService, "writeWorking")
+        .mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+    });
+
+    const request = {
+      operation: "working.write",
+      request_id: "DOCREQ-RECOVERY-36010001",
+      project_id: created.project_id,
+      logical_path: "strategy/resumed.md",
+      content,
+      content_sha256: await sha256Text(content),
+      created_at: at
+    } as const;
+    const interrupted = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request)
+    });
+    expect(interrupted.status).toBe(503);
+    await expect(interrupted.json()).resolves.toMatchObject({
+      status: "pending",
+      code: "DOCUMENT_RECOVERY_SCHEDULED",
+      request_id: request.request_id
+    });
+
+    const changed = { ...request, content: "# Different bytes", content_sha256: await sha256Text("# Different bytes") };
+    const mismatch = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(changed)
+    });
+    await expect(mismatch.json()).resolves.toMatchObject({
+      status: "rejected",
+      code: "IDEMPOTENCY_PAYLOAD_MISMATCH"
+    });
+    const statusBeforeRecovery = await guard.fetch(
+      `https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`
+    );
+    await expect(statusBeforeRecovery.json()).resolves.toMatchObject({
+      status: "recovery_scheduled",
+      recovery: { durable_intent: true, recoverable: true }
+    });
+    failure!.mockRestore();
+
+    await expect(runInDurableObject(guard, async (_instance, state) => state.storage.getAlarm()))
+      .resolves.toEqual(expect.any(Number));
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+
+    const recovered = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request)
+    });
+    await expect(recovered.json()).resolves.toMatchObject({
+      status: "committed",
+      request_id: request.request_id,
+      logical_path: request.logical_path
+    });
+  });
+
+  it("recovers a request interrupted before its canonical intent was written", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-GAP-0047");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Staged before provider intent";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-GAP-0047", project_id: created.project_id,
+      logical_path: "strategy/staged.md", content, content_sha256: await sha256Text(content), created_at: at };
+    let restore!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const spy = vi.spyOn((instance as any).managedDocumentRequests, "ensureIntent").mockRejectedValueOnce(new Error("temporary_intent_write_failure"));
+      restore = () => spy.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    expect(interrupted.status).toBe(503);
+    await expect(interrupted.json()).resolves.toMatchObject({ status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED" });
+    restore();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "committed", receipt: { request_id: request.request_id } });
+  });
+
+  it("continues a matching legacy hash-only intent using the server-staged request", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-LEGACY-0051");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Legacy intent";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-LEGACY-0051", project_id: created.project_id,
+      logical_path: "strategy/legacy.md", content, content_sha256: await sha256Text(content), created_at: at };
+    await createProductionPersistence(testEnv).objects.createText(
+      `${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/intent.json`,
+      JSON.stringify({ schema_version: "1.0", project_id: created.project_id, request_id: request.request_id,
+        request_sha256: await sha256Text(JSON.stringify(request)) })
+    );
+    let restore!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const spy = vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+      restore = () => spy.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    expect(interrupted.status).toBe(503);
+    restore();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "committed", receipt: { request_id: request.request_id } });
+  });
+
+  it("never executes a canonical intent that differs from the admitted staged request", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-BIND-0052");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-BIND-0052", project_id: created.project_id,
+      logical_path: "strategy/bound.md", content: "admitted", content_sha256: await sha256Text("admitted"), created_at: at };
+    let restore!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const spy = vi.spyOn((instance as any).managedDocumentRequests, "ensureIntent").mockRejectedValueOnce(new Error("temporary_intent_write_failure"));
+      restore = () => spy.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    expect(interrupted.status).toBe(503);
+    restore();
+    const different = { ...request, content: "different", content_sha256: await sha256Text("different") };
+    await new ManagedDocumentRequestLedger(createProductionPersistence(testEnv))
+      .ensureIntent(created.project_id, request.request_id, JSON.stringify(different));
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "recovery_blocked", recovery: { code: "document_intent_binding_mismatch" } });
+    expect(await new ManagedDocumentRequestLedger(createProductionPersistence(testEnv)).readReceipt(created.project_id, request.request_id)).toBeNull();
+  });
+
+  it("does not call an unqueued intent scheduled for recovery", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-STATUS-0048");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Intentionally unqueued";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-STATUS-0048", project_id: created.project_id,
+      logical_path: "strategy/unqueued.md", content, content_sha256: await sha256Text(content), created_at: at };
+    await new ManagedDocumentRequestLedger(createProductionPersistence(testEnv))
+      .ensureIntent(created.project_id, request.request_id, JSON.stringify(request));
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "recovery_unavailable" });
+  });
+
+  it("does not advertise a queued request without an alarm as scheduled", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-WAKE-0050");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Wake missing";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-WAKE-0050", project_id: created.project_id,
+      logical_path: "strategy/wake.md", content, content_sha256: await sha256Text(content), created_at: at };
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+    });
+    await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    await runInDurableObject(guard, async (_instance, state) => state.storage.deleteAlarm());
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "recovery_unavailable", recovery: { scheduled: false } });
+  });
+
+  it("bounds identical recovery failures and exposes the stalled request", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-FAIL-0049");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const content = "# Repeated failure";
+    const request = { operation: "working.write" as const, request_id: "DOCREQ-RECOVERY-FAIL-0049", project_id: created.project_id,
+      logical_path: "strategy/stalled.md", content, content_sha256: await sha256Text(content), created_at: at };
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockRejectedValue(new Error("persistent_internal_failure"));
+    });
+    await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
+    for (let attempt = 0; attempt < 6; attempt++) expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    await expect(status.json()).resolves.toMatchObject({ status: "recovery_blocked", recovery: { code: "identical_internal_failure_limit" } });
+    expect(await runDurableObjectAlarm(guard)).toBe(false);
+  });
+
+  it("recovers one project without delaying an independent project", async () => {
+    const blocked = await createProject("TXN-DOCUMENT-RECOVERY-0043");
+    const independent = await createProject("TXN-DOCUMENT-RECOVERY-0044");
+    const blockedGuard = testEnv.PROJECT_GUARD.getByName(blocked.project_id);
+    const independentGuard = testEnv.PROJECT_GUARD.getByName(independent.project_id);
+    let failure: ReturnType<typeof vi.spyOn>;
+    await runInDurableObject(blockedGuard, (instance) => {
+      failure = vi.spyOn((instance as any).managedDocumentService, "writeWorking")
+        .mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+    });
+    const blockedContent = "blocked temporarily";
+    const blockedRequest = {
+      operation: "working.write", request_id: "DOCREQ-RECOVERY-36010043", project_id: blocked.project_id,
+      logical_path: "strategy/blocked.md", content: blockedContent,
+      content_sha256: await sha256Text(blockedContent), created_at: at
+    } as const;
+    const pending = await blockedGuard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(blockedRequest)
+    });
+    expect(pending.status).toBe(503);
+
+    const readyContent = "continues independently";
+    const independentRequest = {
+      operation: "working.write", request_id: "DOCREQ-RECOVERY-36010044", project_id: independent.project_id,
+      logical_path: "strategy/ready.md", content: readyContent,
+      content_sha256: await sha256Text(readyContent), created_at: at
+    } as const;
+    const unaffected = await independentGuard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(independentRequest)
+    });
+    await expect(unaffected.json()).resolves.toMatchObject({ status: "committed", request_id: independentRequest.request_id });
+
+    failure!.mockRestore();
+    expect(await runDurableObjectAlarm(blockedGuard)).toBe(true);
+    const recovered = await blockedGuard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(blockedRequest)
+    });
+    await expect(recovered.json()).resolves.toMatchObject({ status: "committed", request_id: blockedRequest.request_id });
+  });
+
+  it("rotates recoverable work so repeated failures cannot starve a later request", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-FAIR-0045");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const seen: string[] = [];
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockImplementation(async (...args: unknown[]) => {
+        const request = args[0] as { request_id: string };
+        seen.push(request.request_id);
+        throw new Error("temporary_provider_unavailable");
+      });
+    });
+    const requests = await Promise.all([1, 2, 3, 4, 5].map(async (number) => {
+      const content = `retry ${number}`;
+      return {
+        operation: "working.write" as const,
+        request_id: `DOCREQ-RECOVERY-FAIR-000${number}`,
+        project_id: created.project_id,
+        logical_path: `strategy/retry-${number}.md`,
+        content,
+        content_sha256: await sha256Text(content),
+        created_at: at
+      };
+    }));
+    for (const request of requests) {
+      const response = await guard.fetch("https://project-guard.internal/document", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request)
+      });
+      expect(response.status).toBe(503);
+    }
+    expect(seen).toHaveLength(5);
+
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    expect(seen.slice(5)).toEqual(requests.slice(0, 4).map((request) => request.request_id));
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    expect(seen.slice(9)).toContain(requests[4]!.request_id);
+  });
+
+  it("does not advertise malformed durable intent as automatically recoverable", async () => {
+    const created = await createProject("TXN-DOCUMENT-RECOVERY-CORRUPT-0046");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn((instance as any).managedDocumentService, "writeWorking")
+        .mockRejectedValueOnce(new Error("temporary_provider_unavailable"));
+    });
+    const content = "corrupt recovery status";
+    const request = {
+      operation: "working.write" as const,
+      request_id: "DOCREQ-RECOVERY-CORRUPT-0046",
+      project_id: created.project_id,
+      logical_path: "strategy/corrupt.md",
+      content,
+      content_sha256: await sha256Text(content),
+      created_at: at
+    };
+    const pending = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request)
+    });
+    expect(pending.status).toBe(503);
+    const runtime = createProductionPersistence(testEnv);
+    const intentPath = `${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/intent.json`;
+    const stored = JSON.parse((await runtime.objects.readText(intentPath))!);
+    stored.request_json = "{not-valid-json";
+    stored.request_sha256 = await sha256Text(stored.request_json);
+    await runtime.objects.upsertText(intentPath, JSON.stringify(stored));
+
+    const status = await guard.fetch(
+      `https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`
+    );
+    await expect(status.json()).resolves.toMatchObject({
+      status: "recovery_unavailable",
+      recovery: { durable_intent: true, recoverable: false, code: "intent_payload_invalid" }
+    });
   });
 
   it("keeps an unqualified local expected-version rule unavailable", async () => {

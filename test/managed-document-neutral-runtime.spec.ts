@@ -186,6 +186,25 @@ it("persists managed request intents and receipts through object persistence", a
   expect(await ledger.readReceipt("PRJ-0002", requestId)).toEqual(receipt);
 });
 
+it("recovers the exact persisted document request only when its immutable digest matches", async () => {
+  const { runtime } = neutralRuntime();
+  const ledger = new ManagedDocumentRequestLedger(runtime.objects);
+  const requestId = "DOCREQ-NEUTRAL-RECOVERY-0001";
+  const requestJson = JSON.stringify({
+    operation: "working.write",
+    request_id: requestId,
+    project_id: "PRJ-0002",
+    content: "# Durable recovery"
+  });
+
+  await ledger.ensureIntent("PRJ-0002", requestId, requestJson);
+
+  await expect(ledger.readRecoverableIntent("PRJ-0002", requestId)).resolves.toMatchObject({
+    request_id: requestId,
+    request_json: requestJson
+  });
+});
+
 it("constructs the legacy managed artifact writer from the neutral runtime", () => {
   const { runtime } = neutralRuntime();
   expect(new LegacyArtifactDocumentWriter(runtime)).toBeInstanceOf(LegacyArtifactDocumentWriter);

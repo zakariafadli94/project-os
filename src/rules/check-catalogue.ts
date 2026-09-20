@@ -6,9 +6,9 @@ import { verdict, type CheckStage, type RuleResult } from "./contract";
 export const normalizedMutationOperations: readonly string[] = [...operationValues,
   "package.freeze", "package.replace",
   "package.drift.observe",
-  "artifact.write", "document.publish", "document.reopen", "working.write", "working.supersede", "working.fork", "review.promote",
+  "artifact.write", "document.publish", "document.reopen", "working.write", "working.supersede", "working.fork", "review.write", "review.promote",
   "input.intake", "input.recover", "project.materialize", "project.repair", "candidate.resolve"];
-const physical = ["package.replace", "package.drift.observe", "artifact.write", "document.publish", "document.reopen", "working.write", "working.supersede", "working.fork", "review.promote", "input.intake", "input.recover", "project.materialize", "project.repair"];
+const physical = ["package.replace", "package.drift.observe", "artifact.write", "document.publish", "document.reopen", "working.write", "working.supersede", "working.fork", "review.write", "review.promote", "input.intake", "input.recover", "project.materialize", "project.repair"];
 export interface CheckDefinition {
   check_id: string; operations: readonly string[]; parameters: z.ZodType;
   required_evidence: readonly string[]; stages: readonly CheckStage[];

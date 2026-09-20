@@ -3,6 +3,7 @@ import { emptyProjectState } from "../src/domain/transitions";
 import { ruleVersionSchema } from "../src/domain/rule-governance";
 import { resolveEffectiveRules } from "../src/rules/resolution";
 import { ruleFixture, exceptionFixture, ruleAt } from "./helpers/rule-fixtures";
+import { normalizeDocumentAdmission } from "../src/admission/operation-context";
 
 async function runtime() {
   const module = await vi.importActual<Record<string, (...args: any[]) => any>>("../src/rules/evaluator").catch(() => null);
@@ -36,6 +37,16 @@ function approval(changes: Record<string, unknown> = {}) {
 async function evaluate(input: unknown) { return (await runtime()).evaluateRules(input); }
 
 describe("server-side effective rule evaluation", () => {
+  it("admits a typed managed REVIEW write through the common rule evaluator", async () => {
+    const operation = await normalizeDocumentAdmission({
+      operation: "review.write", request_id: "DOCREQ-REVIEW-7101", project_id: "PRJ-7101",
+      document_id: "DOC-ABCDEF0123456789ABCDEF01", content: "candidate",
+      content_sha256: "b".repeat(64), expected_version_id: "VERSION-7101",
+      created_at: "2026-09-12T10:00:00.000Z"
+    });
+    const input = { ...context([], []), operation: operation.operation, resources: operation.resources };
+    expect(await evaluate(input)).toMatchObject({ verdict: "allow", code: "RULES_SATISFIED" });
+  });
   it("inherits all global and project rules with exact versions", async () => {
     const input = context([rule()], [rule("RULE-LOCAL", "PRJ-7101")]);
     const resolved = await resolveEffectiveRules(input as any);

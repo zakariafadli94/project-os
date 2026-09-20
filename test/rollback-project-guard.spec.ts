@@ -5,7 +5,7 @@ import { executeWithRollback } from "../src/continuity/rollback";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import type { Transaction } from "../src/domain/transaction";
-import { machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
+import { machineCommitRecordPath, machineMaterializationHeadPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
@@ -58,18 +58,41 @@ function projectionStub(projectId: string) {
   return testEnv.MATERIALIZATION_GUARD.getByName(projectId);
 }
 
-async function materializeThroughContinuations(projectId: string): Promise<void> {
+async function materializeThroughContinuations(projectId: string, expectedRevision = 1): Promise<void> {
   const stub = projectionStub(projectId);
   await runInDurableObject(stub, (instance) => {
     (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
       [projectId]: "repair"
     });
   });
-  for (let slice = 0; slice < 64; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+  for (let slice = 0; slice < 64; slice += 1) {
+    const ran = await runDurableObjectAlarm(stub);
+    const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
+    const state = await repository.readProjectState(projectId);
+    const head = await repository.readMaterializationHead(projectId);
+    if (state && head && state.revision >= expectedRevision && head.target_revision >= expectedRevision) return;
+    if (!ran) throw new Error(`materialization_not_verified:${projectId}@${expectedRevision}`);
+  }
+  throw new Error(`materialization_not_verified:${projectId}@${expectedRevision}`);
 }
 
 describe("ProjectGuard data-preserving rollback", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("does not treat an absent alarm as proof that the projected state exists", async () => {
+    installDropboxMock();
+    await expect(materializeThroughContinuations("PRJ-2099")).rejects.toThrow("materialization_not_verified");
+  });
+
+  it("does not treat a state snapshot without its published head as complete", async () => {
+    const projectId = "PRJ-2098";
+    const mock = installDropboxMock();
+    await createProject(projectId);
+    await materializeThroughContinuations(projectId);
+    mock.files.delete(machineMaterializationHeadPath(projectId));
+    await runInDurableObject(projectionStub(projectId), async (_instance, state) => state.storage.deleteAlarm());
+    await expect(materializeThroughContinuations(projectId)).rejects.toThrow("materialization_not_verified");
+  });
 
   it("falls back before commit and applies the business effect exactly once", async () => {
     const projectId = "PRJ-2020";
@@ -97,7 +120,7 @@ describe("ProjectGuard data-preserving rollback", () => {
 
     const replay = await submit(projectId, tx);
     expect(replay).toEqual(execution.receipt);
-    await materializeThroughContinuations(projectId);
+    await materializeThroughContinuations(projectId, 2);
     const state = JSON.parse(mock.files.get(machineStatePath(projectId)) ?? "{}");
     expect(state.revision).toBe(2);
     expect(state.tasks).toHaveProperty("TASK-ROLLBACK2020");
@@ -176,8 +199,8 @@ describe("ProjectGuard data-preserving rollback", () => {
     expect(mock.files.has(machineCommitRecordPath(projectA, 3))).toBe(false);
     expect(mock.files.has(machineCommitRecordPath(projectB, 3))).toBe(false);
 
-    await materializeThroughContinuations(projectA);
-    await materializeThroughContinuations(projectB);
+    await materializeThroughContinuations(projectA, 2);
+    await materializeThroughContinuations(projectB, 2);
     const stateA = JSON.parse(mock.files.get(machineStatePath(projectA)) ?? "{}");
     const stateB = JSON.parse(mock.files.get(machineStatePath(projectB)) ?? "{}");
     expect(stateA.revision).toBe(2);

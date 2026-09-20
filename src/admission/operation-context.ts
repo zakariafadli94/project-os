@@ -42,6 +42,15 @@ export async function normalizeArtifactAdmission(request: ArtifactWriteRequest |
 
 export async function normalizeDocumentAdmission(request: ManagedDocumentRequest): Promise<NormalizedAdmissionOperation> {
   if (request.operation === "package.replace") return normalized(request.project_id, request.operation, [{ resource_id: request.candidate.package_id, resource_type: "package", zone: request.zone, version: packageResourceVersion(request.candidate) }], request);
+  if (request.operation === "document.archive") {
+    return normalized(request.project_id, request.operation, [{
+      resource_id: request.document_id,
+      resource_type: "document",
+      zone: "ARCHIVES",
+      version: request.expected_version_id,
+      expected_version: request.expected_version_id
+    }], request);
+  }
   const operation = request.operation === "publish"
     ? "document.publish"
     : request.operation === "reopen"

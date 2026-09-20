@@ -76,6 +76,8 @@ The PRJ-0003 anomaly filed in PRJ-0002 `INPUTS/PRJ-0003-20260920-GOVERNED-ARCHIV
 
 **Gate:** governed archival is possible without a bypass, and each actual relocation has a committed receipt and verified destination; unresolved business choices remain explicit.
 
+**Implementation status — 2026-09-20:** the minimal `document.archive` operation is implemented and qualified for one exact active machine-managed document in `WORKING`, `REVIEW` or `DELIVERABLES`. It derives an immutable server-owned archive destination, verifies the preserved content, clears only the matching active pointer, is idempotent for its request, and is resumed after an interruption without a second move. It deliberately does not yet archive folders, packages, binaries, references or the 17 reported PRJ-0003 candidates: their identity, eligibility and founder-approved disposition must first be inventoried and refreshed. This task is therefore not complete until those governed production relocations are separately receipted and physically verified.
+
 ## Phase 2 — Finish the open SOP programme
 
 ### Task 5: Reconcile the accepted coverage matrix with deployed code

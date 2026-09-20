@@ -806,7 +806,7 @@ export class ProjectGuard extends DurableObject<Env> {
     // interruption, without asking a chat to submit or approve it again.
     try {
       const receipt = await this.executeManagedDocument(operation, state);
-      return this.finalizeDocument(operation, receipt);
+      return await this.finalizeDocument(operation, receipt);
     } catch (error) {
       if (error instanceof ManagedDocumentConflictError) {
         return this.finalizeDocument(
@@ -867,6 +867,8 @@ export class ProjectGuard extends DurableObject<Env> {
         return this.managedDocumentService.promoteReviewCandidate(request, state);
       case "reopen":
         return this.managedDocumentService.reopenPublished(request, state);
+      case "document.archive":
+        return this.managedDocumentService.archiveActiveDocument(request, state);
       case "reference.classify":
         return this.managedDocumentService.classifyReference(request, state);
     }

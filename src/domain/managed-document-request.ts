@@ -73,6 +73,16 @@ const referenceClassifySchema = z.strictObject({
   collection_path: collectionPath
 });
 
+const documentArchiveSchema = z.strictObject({
+  operation: z.literal("document.archive"),
+  request_id: requestId,
+  project_id: projectId,
+  document_id: documentId,
+  stage: z.enum(["working", "review", "published"]),
+  expected_version_id: versionId,
+  created_at: createdAt
+});
+
 export const managedDocumentRequestSchema = z.discriminatedUnion("operation", [
   z.strictObject({ operation: z.literal("package.replace"), request_id: requestId, project_id: projectId, candidate: packageRefSchema, zone: packageZoneSchema, expected_navigation_generation: z.number().int().nonnegative().safe(), expected_project_revision: z.number().int().nonnegative().safe(), created_at: createdAt }),
   z.strictObject({ operation: z.literal("package.freeze"), request_id: requestId, project_id: projectId, document_id: documentId, expected_version_id: versionId, content_sha256: hash, expected_project_revision: z.number().int().nonnegative().safe(), created_at: createdAt }),
@@ -82,7 +92,8 @@ export const managedDocumentRequestSchema = z.discriminatedUnion("operation", [
   reviewCandidatePromotionSchema,
   publishSchema,
   reopenSchema,
-  referenceClassifySchema
+  referenceClassifySchema,
+  documentArchiveSchema
 ]);
 
 export type ManagedDocumentRequest = z.infer<typeof managedDocumentRequestSchema>;

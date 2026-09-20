@@ -60,6 +60,8 @@
 
 **Gate:** all five documents communicate their real approved status, with history preserved.
 
+**Observed 2026-09-20:** all five files were found in PRJ-0007 `DELIVERABLES/.../10-RISQUES-TESTS-ET-PORTES-DE-DECISION/`; each says `Version validée 1.0` and cites `DEC-REFM10VALID001` at revision 83. No editorial repair is indicated by these current files. This read-only finding does not substitute for verifying the publication receipts if that gate is later audited.
+
 ### Task 4a: Close the governed archive-relocation gap before promising cleanup
 
 The PRJ-0003 anomaly filed in PRJ-0002 `INPUTS/PRJ-0003-20260920-GOVERNED-ARCHIVE-RELOCATION-GAP.md` shows that existing `working.supersede` cannot move an unchanged current document to `ARCHIVES`, and no generic typed move is available for REVIEW or published DELIVERABLES. This is a reported anomaly to investigate, not permission to invent a business archival decision.

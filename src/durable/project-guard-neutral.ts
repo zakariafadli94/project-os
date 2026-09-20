@@ -16,7 +16,7 @@ import {
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
 import type { PackageRef } from "../domain/document-package";
-import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH } from "../domain/materialization";
+import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH, type CompletedMaterializationRecord } from "../domain/materialization";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
@@ -149,6 +149,31 @@ const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
  * an admitted request until its immutable Dropbox intent and receipt exist. */
 const REQUEST_RECOVERY_BATCH_SIZE = 4;
 const REQUEST_RECOVERY_RETRY_DELAY_MS = 30_000;
+const MATERIALIZATION_FINALIZATION_WORK_KEY = "materialization-finalization-work";
+const MATERIALIZATION_FINALIZATION_LINEAGE_BATCH_SIZE = 4;
+const MATERIALIZATION_FINALIZATION_CERTIFICATE_BATCH_SIZE = 4;
+
+interface MaterializationFinalizationCandidate {
+  revision: number;
+  materialization_revision: number;
+  projection_version: number;
+  result_root_hash: string;
+  completed_at: string;
+  source_event_id: string | null;
+}
+
+interface MaterializationFinalizationWork {
+  head: {
+    target_revision: number;
+    projection_version: number;
+    result_root_hash: string;
+    completed_at: string;
+  };
+  next_generation: { target_revision: number; projection_version: number } | null;
+  previous_child: { target_revision: number; projection_version: number; chain_depth: number } | null;
+  scan_complete: boolean;
+  candidates: MaterializationFinalizationCandidate[];
+}
 
 class RuleAdmissionRejection extends Error {
   constructor(readonly evaluation: EvaluationResult) {
@@ -2185,7 +2210,10 @@ export class ProjectGuard extends DurableObject<Env> {
   /** Transaction commits have no independent provider effect plan. They become
    * finalized only when the immutable commit is covered by the current,
    * completed materialization ancestry. */
-  private async finalizeMaterializedTransaction(journal: ExecutionJournal): Promise<void> {
+  private async finalizeMaterializedTransaction(
+    journal: ExecutionJournal,
+    verifiedMaterialization?: MaterializationFinalizationCandidate
+  ): Promise<void> {
     const admitted = await journal.readAdmission();
     const progress = await journal.status();
     if (
@@ -2209,31 +2237,42 @@ export class ProjectGuard extends DurableObject<Env> {
       || record.receipt.new_revision !== targetRevision
       || await sha256Canonical(record.transaction) !== admitted.admission.request_hash
     ) return;
-    const head = await this.repository.readMaterializationHead(admitted.admission.project_id);
-    if (!head || head.target_revision < targetRevision || head.projection_version !== CURRENT_PROJECTION_VERSION) return;
-    let generation = { target_revision: head.target_revision, projection_version: head.projection_version };
-    let materialization = null;
-    for (let depth = 0; depth <= MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH; depth += 1) {
+    let materialization: CompletedMaterializationRecord | null = null;
+    if (verifiedMaterialization) {
       const candidate = await this.repository.readMaterializationRecord(
         admitted.admission.project_id,
-        generation.target_revision,
-        generation.projection_version
+        verifiedMaterialization.materialization_revision,
+        verifiedMaterialization.projection_version
       );
-      if (!candidate) return;
-      if (depth === 0 && (
-        candidate.result_root_hash !== head.result_root_hash
-        || candidate.workspace_location !== head.workspace_location
-        || candidate.completed_at !== head.completed_at
-      )) return;
-      if (
-        (candidate.target_revision === targetRevision && candidate.source_event_id === record.event.event_id)
-        || candidate.coalesced_revisions.includes(targetRevision)
-      ) {
-        materialization = candidate;
-        break;
+      if (!candidate
+        || candidate.result_root_hash !== verifiedMaterialization.result_root_hash
+        || candidate.completed_at !== verifiedMaterialization.completed_at
+        || candidate.source_event_id !== verifiedMaterialization.source_event_id
+        || !coversTransactionRevision(candidate, targetRevision, record.event.event_id)) return;
+      materialization = candidate;
+    } else {
+      const head = await this.repository.readMaterializationHead(admitted.admission.project_id);
+      if (!head || head.target_revision < targetRevision || head.projection_version !== CURRENT_PROJECTION_VERSION) return;
+      let generation = { target_revision: head.target_revision, projection_version: head.projection_version };
+      for (let depth = 0; depth <= MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH; depth += 1) {
+        const candidate = await this.repository.readMaterializationRecord(
+          admitted.admission.project_id,
+          generation.target_revision,
+          generation.projection_version
+        );
+        if (!candidate) return;
+        if (depth === 0 && (
+          candidate.result_root_hash !== head.result_root_hash
+          || candidate.workspace_location !== head.workspace_location
+          || candidate.completed_at !== head.completed_at
+        )) return;
+        if (coversTransactionRevision(candidate, targetRevision, record.event.event_id)) {
+          materialization = candidate;
+          break;
+        }
+        if (!candidate.parent || candidate.parent.target_revision < targetRevision) return;
+        generation = candidate.parent;
       }
-      if (!candidate.parent || candidate.parent.target_revision < targetRevision) return;
-      generation = candidate.parent;
     }
     if (!materialization) return;
     await journal.finalizeMaterializedTransaction({
@@ -2333,58 +2372,109 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
     }
     // A current head can be a descendant of the generation that covered a
-    // committed transaction. Collect the immutable lineage before attempting
-    // any certificate, so an older coalesced revision remains eligible after
-    // later generations have become the published head.
-    const records = [record];
-    const seen = new Set([`${record.target_revision}:${record.projection_version}`]);
-    let cursor = record;
-    for (let depth = 0; cursor.parent !== null; depth += 1) {
-      if (cursor.record_kind !== "delta"
-        || depth >= MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH
-        || cursor.parent.target_revision >= cursor.target_revision) {
-        return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
+    // committed transaction. The lineage can be long in a busy project, so
+    // store a short, durable cursor instead of holding this ProjectGuard's
+    // serialized queue while reading every historical generation.
+    const expectedHead = {
+      target_revision: head.target_revision,
+      projection_version: head.projection_version,
+      result_root_hash: head.result_root_hash,
+      completed_at: head.completed_at
+    };
+    let work = await this.ctx.storage.get<MaterializationFinalizationWork>(MATERIALIZATION_FINALIZATION_WORK_KEY);
+    if (!work || !sameFinalizationHead(work.head, expectedHead)) {
+      work = {
+        head: expectedHead,
+        next_generation: { target_revision: record.target_revision, projection_version: record.projection_version },
+        previous_child: null,
+        scan_complete: false,
+        candidates: []
+      };
+    }
+
+    if (!work.scan_complete) {
+      const queued = new Set(work.candidates.map((candidate) => candidate.revision));
+      for (let count = 0; count < MATERIALIZATION_FINALIZATION_LINEAGE_BATCH_SIZE && work.next_generation; count += 1) {
+        const generation = work.next_generation;
+        const candidate = generation.target_revision === record.target_revision
+          && generation.projection_version === record.projection_version
+          ? record
+          : await this.repository.readMaterializationRecord(projectId, generation.target_revision, generation.projection_version);
+        if (!candidate) return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
+        if (work.previous_child === null) {
+          if (candidate.target_revision !== expectedHead.target_revision
+            || candidate.projection_version !== expectedHead.projection_version
+            || candidate.result_root_hash !== expectedHead.result_root_hash
+            || candidate.completed_at !== expectedHead.completed_at) {
+            return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
+          }
+        } else if (
+          work.previous_child.target_revision <= candidate.target_revision
+          || work.previous_child.projection_version !== candidate.projection_version
+          || work.previous_child.chain_depth !== candidate.chain_depth + 1
+        ) {
+          return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
+        }
+        appendFinalizationCandidate(work, candidate, candidate.target_revision, queued);
+        for (const revision of candidate.coalesced_revisions) appendFinalizationCandidate(work, candidate, revision, queued);
+        if (candidate.parent === null) {
+          if (candidate.record_kind !== "snapshot" || candidate.chain_depth !== 0) {
+            return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
+          }
+          work.next_generation = null;
+          work.scan_complete = true;
+          break;
+        }
+        if (candidate.record_kind !== "delta"
+          || candidate.parent.target_revision >= candidate.target_revision
+          || candidate.parent.projection_version !== candidate.projection_version
+          || candidate.chain_depth > MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH) {
+          return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
+        }
+        work.previous_child = {
+          target_revision: candidate.target_revision,
+          projection_version: candidate.projection_version,
+          chain_depth: candidate.chain_depth
+        };
+        work.next_generation = candidate.parent;
       }
-      const key = `${cursor.parent.target_revision}:${cursor.parent.projection_version}`;
-      if (seen.has(key)) return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
-      const parent = await this.repository.readMaterializationRecord(
-        projectId,
-        cursor.parent.target_revision,
-        cursor.parent.projection_version
-      );
-      if (!parent) return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
-      if (parent.projection_version !== cursor.projection_version
-        || cursor.chain_depth !== parent.chain_depth + 1) {
-        return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
-      }
-      seen.add(key);
-      records.push(parent);
-      cursor = parent;
     }
-    if (cursor.record_kind !== "snapshot" || cursor.chain_depth !== 0) {
-      return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
-    }
-    const coveredRevisions = new Set<number>();
-    for (const candidate of records) {
-      coveredRevisions.add(candidate.target_revision);
-      for (const revision of candidate.coalesced_revisions) coveredRevisions.add(revision);
-    }
+
     const finalizedRevisions: number[] = [];
-    for (const revision of [...coveredRevisions].sort((a, b) => a - b)) {
-      const commit = await this.repository.readCommitRecord(projectId, revision);
-      if (!commit || commit.receipt.status !== "committed" || commit.receipt.new_revision !== revision) continue;
-      const journal = new ExecutionJournal(this.persistence, projectId, "transaction", commit.transaction.transaction_id);
-      const before = await journal.status();
-      if (!before || before.terminal) continue;
-      await this.finalizeMaterializedTransaction(journal);
-      const after = await journal.status();
-      if (after?.terminal && after.status === "finalized") finalizedRevisions.push(revision);
+    if (work.scan_complete) {
+      let processed = 0;
+      while (processed < MATERIALIZATION_FINALIZATION_CERTIFICATE_BATCH_SIZE && work.candidates.length > 0) {
+        const candidate = work.candidates.shift()!;
+        const commit = await this.repository.readCommitRecord(projectId, candidate.revision);
+        if (!commit || commit.receipt.status !== "committed" || commit.receipt.new_revision !== candidate.revision) continue;
+        const journal = new ExecutionJournal(this.persistence, projectId, "transaction", commit.transaction.transaction_id);
+        const before = await journal.status();
+        if (!before || before.terminal) continue;
+        processed += 1;
+        await this.finalizeMaterializedTransaction(journal, candidate);
+        const after = await journal.status();
+        if (after?.terminal && after.status === "finalized") {
+          finalizedRevisions.push(candidate.revision);
+        } else {
+          // Missing evidence is not conformity. Keep the exact candidate for
+          // the next idempotent callback instead of skipping it.
+          work.candidates.unshift(candidate);
+          break;
+        }
+      }
+    }
+    const finalizationPending = !work.scan_complete || work.candidates.length > 0;
+    if (finalizationPending) {
+      await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
+    } else {
+      await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_WORK_KEY);
     }
     return Response.json({
       project_id: projectId,
       target_revision: head.target_revision,
-      finalized_revisions: finalizedRevisions
-    });
+      finalized_revisions: finalizedRevisions,
+      finalization_pending: finalizationPending
+    }, { status: finalizationPending ? 202 : 200 });
   }
 
   private async syncRegistryStatus(state: ProjectState): Promise<void> {
@@ -2528,6 +2618,43 @@ export class ProjectGuard extends DurableObject<Env> {
       release();
     }
   }
+}
+
+function sameFinalizationHead(
+  left: MaterializationFinalizationWork["head"],
+  right: MaterializationFinalizationWork["head"]
+): boolean {
+  return left.target_revision === right.target_revision
+    && left.projection_version === right.projection_version
+    && left.result_root_hash === right.result_root_hash
+    && left.completed_at === right.completed_at;
+}
+
+function appendFinalizationCandidate(
+  work: MaterializationFinalizationWork,
+  record: CompletedMaterializationRecord,
+  revision: number,
+  queued: Set<number>
+): void {
+  if (queued.has(revision)) return;
+  queued.add(revision);
+  work.candidates.push({
+    revision,
+    materialization_revision: record.target_revision,
+    projection_version: record.projection_version,
+    result_root_hash: record.result_root_hash,
+    completed_at: record.completed_at,
+    source_event_id: record.source_event_id
+  });
+}
+
+function coversTransactionRevision(
+  record: CompletedMaterializationRecord,
+  revision: number,
+  eventId: string
+): boolean {
+  return (record.target_revision === revision && record.source_event_id === eventId)
+    || record.coalesced_revisions.includes(revision);
 }
 
 function sameProviderObject(left: ProviderObjectMetadata, right: ProviderObjectMetadata): boolean {

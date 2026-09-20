@@ -30,6 +30,26 @@ it("preserves a wake scheduled by another request while finalization is unavaila
   expect(nextAlarm).toBe(targetWake);
 });
 
+it("rearms immediately when ProjectGuard bounds a finalization callback", async () => {
+  let nextAlarm: number | null = null;
+  const before = Date.now();
+  const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
+    projectId: "PRJ-0008", layoutMode: "legacy", env: {},
+    ctx: { storage: {
+      getAlarm: async () => nextAlarm,
+      setAlarm: async (at: number) => { nextAlarm = at; }
+    } },
+    coordinatorForSlice: () => ({ coordinator: { runNext: async () => ({ completed: true, more_work: false }) } }),
+    notifyProjectGuardOfCurrentHead: async () => false
+  }) as MaterializationGuard;
+
+  await materialization.alarm();
+
+  expect(nextAlarm).not.toBeNull();
+  expect(nextAlarm!).toBeGreaterThanOrEqual(before + 900);
+  expect(nextAlarm!).toBeLessThan(before + 5_000);
+});
+
 // Keep both production actors' outer queues and alarm scheduling real. Replace
 // only the slice/provider work so the competing requests meet deterministically.
 it.each(["repair", "legacy"])("finishes %s finalization while ProjectGuard is waiting for materialization status", async (mode) => {

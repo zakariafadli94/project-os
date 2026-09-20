@@ -542,13 +542,46 @@ describe("canonical execution boundary in ProjectGuard", () => {
       JSON.stringify(descendant)
     );
 
-    const wake = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+    // A published head can have a long, valid delta lineage. Finalization
+    // must stay bounded: the MaterializationGuard will immediately call back
+    // until the historical, coalesced work is fully certified.
+    let longParent = { target_revision: 272, projection_version: CURRENT_PROJECTION_VERSION };
+    for (const revision of [273, 274, 275, 276]) {
+      const longDescendant: CompletedMaterializationRecord = {
+        schema_version: "1.0", project_id: projectId, target_revision: revision, projection_version: CURRENT_PROJECTION_VERSION,
+        record_kind: "delta", parent: longParent, chain_depth: revision - 270, workspace_location: "active",
+        outputs: {}, removed_outputs: [], total_output_count: 0, result_root_hash: String(revision).repeat(64).slice(0, 64),
+        coalesced_revisions: [], source_event_id: `EVT-${String(revision).padStart(6, "0")}`,
+        completed_at: "2026-09-13T16:07:00.000Z"
+      };
+      await repository.writeCompletedMaterializationRecord(longDescendant);
+      longParent = { target_revision: revision, projection_version: CURRENT_PROJECTION_VERSION };
+    }
+    const longHead = await repository.readMaterializationRecord(projectId, 276, CURRENT_PROJECTION_VERSION);
+    if (!longHead) throw new Error("expected_long_materialization_head");
+    await repository.writeMaterializationHead({
+      schema_version: "1.0", project_id: projectId, target_revision: 276, projection_version: CURRENT_PROJECTION_VERSION,
+      workspace_location: "active", record_path: machineMaterializationRecordPath(projectId, 276, CURRENT_PROJECTION_VERSION),
+      result_root_hash: longHead.result_root_hash, completed_at: longHead.completed_at
+    });
+
+    const firstWake = await guard.fetch("https://project-guard.internal/finalize-materialization", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ target_revision: 272, projection_version: CURRENT_PROJECTION_VERSION })
+      body: JSON.stringify({ target_revision: 276, projection_version: CURRENT_PROJECTION_VERSION })
     });
+    expect(firstWake.status).toBe(202);
+    expect(await firstWake.json()).toMatchObject({ finalization_pending: true });
+
+    let wake = firstWake;
+    for (let attempt = 0; attempt < 8 && wake.status === 202; attempt += 1) {
+      wake = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ target_revision: 276, projection_version: CURRENT_PROJECTION_VERSION })
+      });
+    }
     expect(wake.status).toBe(200);
-    expect(await wake.json()).toMatchObject({ finalized_revisions: [270, 271, 272] });
 
     for (const requestId of [transaction270.transaction_id, transaction271.transaction_id, transaction272.transaction_id]) {
       const journal = new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "transaction", requestId);

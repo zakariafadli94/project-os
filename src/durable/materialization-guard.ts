@@ -84,8 +84,9 @@ export class MaterializationGuard extends DurableObject<Env> {
   }
 
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
-    return this.serialize(async () => {
-      try {
+    let notifying = false;
+    try {
+      const notify = await this.serialize(async () => {
         const convergenceMode = convergenceModeForProject(
           this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES,
           this.projectId
@@ -98,9 +99,8 @@ export class MaterializationGuard extends DurableObject<Env> {
           }
           const { engine, budget } = this.convergenceEngineForSlice();
           const result = await engine.runSlice(budget);
-          if (!result.more_work && result.health.converged) await this.notifyProjectGuardOfCurrentHead();
           await this.scheduleConvergenceContinuation(result.more_work, result.next_alarm_at);
-          return;
+          return !result.more_work && result.health.converged;
         }
         // A V2 project is owned exclusively by the convergence writer once it
         // is activated. Before activation, legacy queued targets must not let
@@ -111,11 +111,26 @@ export class MaterializationGuard extends DurableObject<Env> {
         // A synchronous /materialize can finish the target before this alarm
         // runs. In that case runNext reports idle, not completed, but the
         // already-published head still needs its deferred finalization.
-        if (result.completed || !result.more_work) await this.notifyProjectGuardOfCurrentHead();
         if (result.more_work) {
           await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
         }
-      } catch (error) {
+        return result.completed || !result.more_work;
+      });
+      // ProjectGuard may already be waiting for this actor's status/capacity.
+      // Never retain our queue while calling back into its serialized boundary.
+      if (notify) {
+        notifying = true;
+        await this.notifyProjectGuardOfCurrentHead();
+      }
+    } catch (error) {
+      return this.serialize(async () => {
+        // A concurrent request may have armed an earlier wake or a provider
+        // backoff while the callback was outside our queue. That durable wake
+        // will retry finalization too; do not replace it with our stale retry.
+        if (notifying && await this.ctx.storage.getAlarm() !== null) {
+          console.error("Project OS finalization retry retained existing wake", structuredMaterializationError(this.projectId, error));
+          return;
+        }
         if (error instanceof MaterializationOutputConflictError) {
           console.error(
             "Project OS materialization blocked",
@@ -133,8 +148,8 @@ export class MaterializationGuard extends DurableObject<Env> {
         }
         await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
         throw error;
-      }
-    });
+      });
+    }
   }
 
   private async handleRequestTarget(request: Request): Promise<Response> {
@@ -556,7 +571,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       createProductionPersistence(this.env, this.projectId),
       this.layoutMode
     );
-    const head = await repository.readMaterializationHead(this.projectId);
+    const head = await this.serialize(() => repository.readMaterializationHead(this.projectId));
     if (!head) return;
     const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
       "https://project-guard.internal/finalize-materialization",
@@ -570,7 +585,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       }
     );
     if (!response.ok) throw new Error(`ProjectGuard finalization notification returned ${response.status}`);
-    await this.acknowledgeVerifiedHumanHead(head.target_revision, head.projection_version);
+    await this.serialize(() => this.acknowledgeVerifiedHumanHead(head.target_revision, head.projection_version));
   }
 
   /**

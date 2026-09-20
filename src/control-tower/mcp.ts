@@ -4,17 +4,15 @@ import { z } from "zod";
 export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }) {
   const server = new McpServer({ name: "project-os-control-tower", version: "1.0.0" });
   server.registerTool("project_os_get_context", { description: "Read canonical Project OS context", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/) } }, async ({ project_id }) => {
-    const response = await env.PROJECT_GUARD.getByName(project_id).fetch("https://project-guard.internal/mutation-context");
-    if (!response.ok) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
-    const body = await response.json<{ context: unknown; canonical_state?: Record<string, unknown> }>();
-    return { content: [{ type: "text", text: JSON.stringify({ status: "ok", project_id, ...boundedContext(body) }) }] };
+    return readGuard(env.PROJECT_GUARD, project_id, "/mutation-context", (response, body) => {
+      if (!response.ok) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ status: "ok", project_id, ...boundedContext(body as { context: unknown; canonical_state?: Record<string, unknown> }) }) }] };
+    });
   });
   const requestStatus = async ({ project_id, request_id, kind }: { project_id: string; request_id: string; kind: "transaction" | "document" | "artifact" }) => {
-    const response = await env.PROJECT_GUARD.getByName(project_id).fetch(`https://project-guard.internal/request-status?request_id=${encodeURIComponent(request_id)}&kind=${kind}`);
-    const body = await response.json<Record<string, unknown>>();
-    return response.ok
-      ? { content: [{ type: "text" as const, text: JSON.stringify(body) }] }
-      : { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(body) }] };
+    return readGuard(env.PROJECT_GUARD, project_id, `/request-status?request_id=${encodeURIComponent(request_id)}&kind=${kind}`, (response, body) => ({
+      ...(!response.ok ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(body) }]
+    }));
   };
   const requestStatusSchema = { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) };
   server.registerTool("project_os_get_receipt", { description: "Read receipt and finalization status without triggering recovery", inputSchema: requestStatusSchema }, requestStatus);
@@ -23,6 +21,42 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
   server.registerTool("project_os_write_working_document", { description: "Submit one typed working document request", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request: z.any() } }, async ({ project_id, request }) => submitGuarded(env, project_id, "document", request));
   server.registerTool("project_os_submit_artifact", { description: "Submit one governed Project OS artifact manifest", inputSchema: { project_id: z.string().regex(/^PRJ-[0-9]{4}$/), request: z.any() } }, async ({ project_id, request }) => submitGuarded(env, project_id, "artifact", request));
   return server;
+}
+
+type ReadToolResult = { isError?: boolean; content: Array<{ type: "text"; text: string }> };
+
+async function readGuard(
+  namespace: DurableObjectNamespace,
+  projectId: string,
+  path: string,
+  present: (response: Response, body: unknown) => ReadToolResult
+): Promise<ReadToolResult> {
+  const correlationId = crypto.randomUUID();
+  const controller = new AbortController();
+  const started = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const diagnostic = { correlation_id: correlationId, project_id: projectId, route: path.split("?")[0], failed_boundary: "control_tower_to_project_guard" };
+  console.log("project_os_read_started", diagnostic);
+  try {
+    const result = await Promise.race([
+      (async () => {
+        const response = await namespace.getByName(projectId).fetch(`https://project-guard.internal${path}`, {
+          signal: controller.signal, headers: { "x-project-os-correlation-id": correlationId }
+        });
+        return present(response, await response.json());
+      })(),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("read_deadline_exceeded")), 10_000); })
+    ]);
+    console.log("project_os_read_finished", { ...diagnostic, elapsed_ms: Date.now() - started });
+    return result;
+  } catch (error) {
+    controller.abort();
+    const reason = error instanceof Error && error.message === "read_deadline_exceeded" ? "deadline_exceeded" : "dependency_failed";
+    console.warn("project_os_read_unavailable", { ...diagnostic, reason, elapsed_ms: Date.now() - started });
+    return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "PROJECT_OS_READ_UNAVAILABLE", ...diagnostic, reason }) }] };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }, projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>) {

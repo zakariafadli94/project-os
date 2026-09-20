@@ -114,6 +114,10 @@ export function machineProjectRoot(projectId: string): string {
   return `${MACHINE_ROOT}/projects/${assertSafeProjectId(projectId)}`;
 }
 
+export function machineTransactionRequestIntentPath(projectId: string, transactionId: string): string {
+  return `${machineProjectRoot(projectId)}/requests/transactions/${assertSafeTransactionId(transactionId)}/intent.json`;
+}
+
 export function machineStatePath(projectId: string): string {
   return `${machineProjectRoot(projectId)}/state.json`;
 }

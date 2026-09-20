@@ -59,7 +59,7 @@ describe("durable governed execution", () => {
     await expect(coordinator.resume(plan, adapter)).rejects.toThrow("execution_admission_missing");
     expect(adapter.execute).not.toHaveBeenCalled();
     await journal.commit(admission(), plan);
-    expect((await journal.status())?.status).toBe("committed");
+    expect((await journal.status())?.status).toBe("admitted");
     expect((await coordinator.resume(plan, adapter)).status).toBe("finalized");
     expect((await journal.status())?.completed_steps).toHaveLength(2);
   });
@@ -165,7 +165,7 @@ describe("durable governed execution", () => {
   it("refuses unsupported families' finalization without a postcheck adapter", async () => {
     const { journal } = setup();
     await journal.commit(admission(), null);
-    expect(await journal.status()).toMatchObject({ status: "committed", terminal: false, code: "MATERIALIZATION_PENDING" });
+    expect(await journal.status()).toMatchObject({ status: "admitted", terminal: false, code: null });
   });
 
   it("a stopped operation can resume after new verified progress, never merely because time passed", async () => {

@@ -72,7 +72,7 @@ export interface ExecutionProgress {
   admission_ref: string;
   effect_plan_hash: string;
   sequence: number;
-  status: "rejected" | "committed" | "finalizing" | "finalized" | "conflict" | "failed";
+  status: "admitted" | "rejected" | "committed" | "finalizing" | "finalized" | "conflict" | "failed";
   terminal: boolean;
   code: string | null;
   completed_steps: { step_id: string; evidence_refs: string[]; observation_hash?: string; precondition_refs?: string[] }[];

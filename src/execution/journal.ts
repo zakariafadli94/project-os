@@ -16,7 +16,7 @@ const successorSchema = z.strictObject({
 const progressSchema = z.strictObject({
   schema_version: z.literal("1.0"), project_id: nonempty, request_id: nonempty, kind: nonempty,
   request_hash: hash, admission_ref: nonempty, effect_plan_hash: hash, sequence: z.number().int().nonnegative(),
-  status: z.enum(["rejected", "committed", "finalizing", "finalized", "conflict", "failed"]), terminal: z.boolean(), code: nonempty.nullable(),
+  status: z.enum(["admitted", "rejected", "committed", "finalizing", "finalized", "conflict", "failed"]), terminal: z.boolean(), code: nonempty.nullable(),
   completed_steps: z.array(z.strictObject({ step_id: nonempty, evidence_refs: refs, observation_hash: hash.optional(), precondition_refs: refs.optional() })),
   postchecks: z.array(z.strictObject({ check_id: nonempty, verdict: z.enum(["allow", "deny", "unavailable"]), evidence_refs: z.array(nonempty) })),
   failure_streak: z.strictObject({ fingerprint: hash, progress_digest: hash, count: z.number().int().positive() }).nullable(),
@@ -69,7 +69,7 @@ export class ExecutionJournal {
     const progress: ExecutionProgress = {
       schema_version: "1.0", project_id: this.projectId, request_id: this.requestId, kind: this.kind,
       request_hash: admission.request_hash, admission_ref: path, effect_plan_hash: record.effect_plan_hash, sequence: 0,
-      status: "committed", terminal: false, code: plan ? null : "MATERIALIZATION_PENDING",
+      status: "admitted", terminal: false, code: null,
       completed_steps: [], postchecks: [], failure_streak: null, next_attempt_at: null, incident_ref: null,
       superseded_by: null, finalization_ref: null, receipt_ref: null, lease: null
     };
@@ -121,6 +121,7 @@ export class ExecutionJournal {
     if (p.terminal) return;
     p.receipt_ref = receiptRef;
     p.status = status === "committed" ? "finalizing" : status;
+    p.code = status === "committed" ? "MATERIALIZATION_PENDING" : p.code;
     p.terminal = status !== "committed";
     p.sequence++;
     await this.save(p, saved.token);

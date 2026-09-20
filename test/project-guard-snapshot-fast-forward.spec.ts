@@ -342,9 +342,12 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       path.includes(`/projects/${projectId}/`)
       || path.endsWith("/TXN-HOTPATH-0002-COMMIT.json")
     )));
+    // The additional immutable upload freezes the exact transaction for
+    // automatic recovery if the canonical commit is interrupted.
     expect(attributedProviderCalls.map(({ endpoint }) => endpoint)).toEqual([
       "POST /2/files/download",
       "POST /2/files/download",
+      "POST /2/files/upload",
       "POST /2/files/upload"
     ]);
 

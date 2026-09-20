@@ -10,7 +10,8 @@ import type { ProjectState } from "../src/domain/project-state";
 import {
   machineCommitRecordPath,
   machineMaterializationRecordPath,
-  machineStatePath
+  machineStatePath,
+  machineTransactionRequestIntentPath
 } from "../src/persistence/layout";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
@@ -88,6 +89,68 @@ function taskCompletionBaseline(projectId: string): CanonicalCommitRecord {
 }
 
 describe("canonical execution boundary in ProjectGuard", () => {
+  it("does not call an admitted transaction committed before its canonical record exists", async () => {
+    const projectId = "PRJ-8391";
+    const { guard } = await setup(projectId);
+    const transaction = {
+      schema_version: "1.0", transaction_id: "TXN-EXECUTION-8391-TASK-A", project_id: projectId,
+      base_revision: 1, operation: "task.create", created_at: "2026-09-20T08:00:00.000Z",
+      payload: { task_id: "TASK-EXECUTION8391A", title: "Admission without a commit" }
+    };
+    const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context } = await contextResponse.json<{ context: never }>();
+    let restore!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const repository = (instance as unknown as { repository: ProjectRepository }).repository;
+      const spy = vi.spyOn(repository, "writeCommitRecord").mockRejectedValueOnce(new Error("commit_write_unavailable"));
+      restore = () => spy.mockRestore();
+    });
+    await expect(guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", body: JSON.stringify(encodeAdmission(transaction, context))
+    })).rejects.toThrow("commit_write_unavailable");
+    restore();
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await status.json()).toMatchObject({ status: "admitted_uncommitted", recovery: { durable_intent: true } });
+    await runDurableObjectAlarm(guard);
+    const committed = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await committed.json()).toMatchObject({ status: "committed", receipt: { new_revision: 2 } });
+  });
+  it("labels historical admission without exact request bytes as unrecoverable", async () => {
+    const projectId = "PRJ-8392";
+    const { guard, mock } = await setup(projectId);
+    const transaction = {
+      schema_version: "1.0", transaction_id: "TXN-EXECUTION-8392-TASK-A", project_id: projectId,
+      base_revision: 1, operation: "task.create", created_at: "2026-09-20T08:00:00.000Z",
+      payload: { task_id: "TASK-EXECUTION8392A", title: "Historical admission" }
+    };
+    const { context } = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    let restore!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const repository = (instance as unknown as { repository: ProjectRepository }).repository;
+      const spy = vi.spyOn(repository, "writeCommitRecord").mockRejectedValueOnce(new Error("commit_write_unavailable"));
+      restore = () => spy.mockRestore();
+    });
+    await expect(guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", body: JSON.stringify(encodeAdmission(transaction, context))
+    })).rejects.toThrow("commit_write_unavailable");
+    restore();
+    mock.files.delete(machineTransactionRequestIntentPath(projectId, transaction.transaction_id));
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM request_recovery_payload WHERE kind = 'transaction' AND request_id = ?", transaction.transaction_id);
+      state.storage.sql.exec("DELETE FROM request_recovery WHERE kind = 'transaction' AND request_id = ?", transaction.transaction_id);
+    });
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await status.json()).toMatchObject({ status: "admitted_uncommitted", recovery: { durable_intent: false, recoverable: false, code: "recovery_unavailable" } });
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO request_recovery (kind, request_id) VALUES ('transaction', ?)", transaction.transaction_id);
+      state.storage.sql.exec(
+        "INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message) VALUES ('transaction', ?, ?, 6, 1, 'unavailable')",
+        transaction.transaction_id, "a".repeat(64)
+      );
+    });
+    const blocked = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await blocked.json()).toMatchObject({ status: "recovery_blocked", recovery: { attempts: 6 } });
+  });
   it("serves fresh canonical context while a separate serialized operation is waiting", async () => {
     const projectId = "PRJ-8310";
     const { guard } = await setup(projectId);
@@ -280,7 +343,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(JSON.parse(evidence![1]).admission).toMatchObject({ project_id: "PRJ-8291", operation: "input.recover", actor: { authority: "durable_object" }, verdict: "allow" });
     const status = await guard.fetch("https://project-guard.internal/execution-status?kind=recovery&request_id=input-recovery%401");
     expect(status.status).toBe(200);
-    expect(await status.json()).toMatchObject({ status: "committed", terminal: false, code: "MATERIALIZATION_PENDING" });
+    expect(await status.json()).toMatchObject({ status: "admitted", terminal: false, code: null });
   });
 
   it("fails closed when the canonical admission cannot commit; no discovery/effect runs", async () => {

@@ -186,6 +186,10 @@ export class ProjectGuard extends DurableObject<Env> {
   protected readonly layoutMode: LayoutMode;
   private queue: Promise<void> = Promise.resolve();
   private queueDepth = 0;
+  /** A timed-out provider read may still be in flight. Keep one owner until
+   * it settles so retries cannot turn one slow Dropbox operation into a herd. */
+  private contextReadPending: Promise<void> | null = null;
+  private contextProviderReadCount = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1385,42 +1389,94 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!projectId || projectId === AUTO_PROJECT_ID || !secret) {
       return Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
-    const includeState = new URL(request.url).searchParams.get("include_state") !== "false";
-    const progress = initialProgress(projectId, new Date().toISOString(), crypto.randomUUID());
-    let latest: ProjectState | null = null;
-    const historicalSnapshot = await this.repository.readProjectState(projectId);
-    if (historicalSnapshot) {
-      // Older projects predate the immutable commit log. Their validated
-      // machine snapshot is a read-only baseline; discovery still requires a
-      // contiguous immutable chain for every later revision.
-      progress.canonical_observed_revision = historicalSnapshot.revision;
-      progress.baseline_revision = historicalSnapshot.revision;
-      progress.baseline_kind = "pre_commit001";
-      latest = historicalSnapshot;
+    if (this.contextReadPending || this.contextProviderReadCount > 0) {
+      return Response.json({ error: "canonical_read_busy" }, { status: 503 });
     }
+    const includeState = new URL(request.url).searchParams.get("include_state") !== "false";
+    // A context must be fresh or unavailable. The snapshot is an accelerator,
+    // not an authority over newer immutable commits, so verify its bounded
+    // suffix before signing. Never authorize from a stale local cache.
+    let latest: ProjectState | null;
+    try {
+      latest = await this.readFreshCanonicalState(projectId);
+    } catch {
+      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    }
+    if (!latest) return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    this.persistState(latest);
+    const context = await issueMutationContext(latest, secret, Date.now(), this.contextActor(request));
+    return Response.json(includeState ? { context, canonical_state: latest } : { context });
+  }
+
+  private async readContextSnapshot(projectId: string): Promise<ProjectState | null> {
+    const source = this.repository.readProjectState(projectId);
+    this.contextProviderReadCount += 1;
+    void source.then(
+      () => undefined,
+      () => undefined
+    ).finally(() => { this.contextProviderReadCount -= 1; });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        source,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("canonical_snapshot_deadline")), 1_000); })
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private async readFreshCanonicalState(projectId: string): Promise<ProjectState | null> {
+    const deadline = Date.now() + 2_000;
+    const pending = this.readCanonicalState(projectId, deadline);
+    this.contextReadPending = pending.then(
+      () => undefined,
+      () => undefined
+    ).finally(() => { this.contextReadPending = null; });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("canonical_read_deadline")), 2_000); })
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private async readCanonicalState(projectId: string, deadline: number): Promise<ProjectState | null> {
+    const snapshot = await this.readContextSnapshot(projectId);
+    const progress = initialProgress(projectId, new Date().toISOString(), crypto.randomUUID());
+    let latest = snapshot;
+    if (snapshot) {
+      progress.canonical_observed_revision = snapshot.revision;
+      progress.baseline_revision = snapshot.revision;
+      progress.baseline_kind = "pre_commit001";
+    }
+
     for (let page = 0; page < 4; page += 1) {
-      const budget = {
-        deadline_ms: Number.MAX_SAFE_INTEGER,
-        calls_left: 1024,
-        now: () => Date.now(),
-        signal: new AbortController().signal,
-        beforeHttp() { this.calls_left -= 1; },
-        canStartEffect: () => true
-      };
-      const discovered = await discoverCanonical(this.repository, this.persistence, progress, budget);
+      const discovered = await discoverCanonical(
+        this.repository,
+        this.persistence,
+        progress,
+        {
+          deadline_ms: deadline,
+          calls_left: 128,
+          now: () => Date.now(),
+          signal: new AbortController().signal,
+          beforeHttp() { this.calls_left -= 1; },
+          canStartEffect() { return this.calls_left > 0 && Date.now() < deadline; }
+        }
+      );
       if (!discovered) {
-        if (!latest) return Response.json({ error: "canonical_unavailable" }, { status: 503 });
-        const context = await issueMutationContext(latest, secret, Date.now(), this.contextActor(request));
-        return Response.json(includeState ? { context, canonical_state: latest } : { context });
+        if (Date.now() >= deadline) throw new Error("canonical_history_deadline");
+        return latest;
       }
       latest = discovered.state;
       progress.canonical_observed_revision = discovered.state.revision;
-      if (discovered.complete) {
-        const context = await issueMutationContext(discovered.state, secret, Date.now(), this.contextActor(request));
-        return Response.json(includeState ? { context, canonical_state: discovered.state } : { context });
-      }
+      if (discovered.complete) return latest;
     }
-    return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    return null;
   }
 
   private contextActor(request: Request): { actor_id: string; authority: string } {

@@ -3,6 +3,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import { ConvergenceJournal } from "../src/convergence/journal";
+import { MaterializationGuard } from "../src/durable/materialization-guard";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import {
@@ -231,6 +232,20 @@ describe("MaterializationGuard isolation boundary", () => {
     });
 
     expect(await runDurableObjectAlarm(guard)).toBe(true);
+    expect(notify).toHaveBeenCalledOnce();
+  });
+
+  it("notifies ProjectGuard from an idle V2 alarm so a published head finalizes its covered receipts", async () => {
+    const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId: "PRJ-3919",
+      layoutMode: "v2",
+      env: {},
+      queue: Promise.resolve()
+    }) as MaterializationGuard;
+    const notify = vi.spyOn(materialization as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(undefined);
+
+    await materialization.alarm();
+
     expect(notify).toHaveBeenCalledOnce();
   });
 

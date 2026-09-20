@@ -177,6 +177,46 @@ describe("durable managed-document change jobs", () => {
     })]);
   });
 
+  it("terminally quarantines an external move that conflicts with immutable candidate evidence", async () => {
+    const mock = installDropboxMock();
+    const slug = "change-job-candidate-evidence-conflict";
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-CANDIDATE-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
+    const original = `${root}/DELIVERABLES/external.md`;
+    const moved = `${root}/DELIVERABLES/external-moved.md`;
+    await mock.writeExternal(original, "# externally moved");
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+
+    const move = await fetch("https://api.dropboxapi.com/2/files/move_v2", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from_path: original, to_path: moved })
+    });
+    expect(move.ok).toBe(true);
+
+    const first = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({
+      jobs_quarantined: 1,
+      jobs_pending: 0,
+      job_failures: 0
+    });
+
+    let quarantines: ManagedDocumentChangeQuarantine[] = [];
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    await runInDurableObject(guard, async (_instance, state) => {
+      quarantines = new ManagedDocumentChangeJobStore(state.storage).quarantines();
+    });
+    expect(quarantines).toEqual(expect.arrayContaining([expect.objectContaining({
+      path: moved,
+      code: "mutation_candidate_evidence_conflict",
+      attempts: 1
+    })]));
+  });
+
   it("keeps the old durable cursor when cursor-reset baseline fetch fails before atomic page registration", async () => {
     const faults: DropboxMockFault[] = [];
     const mock = installDropboxMock({ faults });

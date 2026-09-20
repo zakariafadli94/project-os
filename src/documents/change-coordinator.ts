@@ -2,6 +2,7 @@ import type { ProjectState } from "../domain/project-state";
 import type { NormalizedAdmissionOperation } from "../admission/operation-context";
 import { sha256Canonical } from "../materialization/hash";
 import { MutationGateClassifier } from "../mutation-gate/classifier";
+import { MutationCandidateEvidenceConflictError } from "../mutation-gate/repository";
 import { MutationGateService, type MutationGateMode, type MutationGateProcessSummary } from "../mutation-gate/service";
 import { workspaceProjectRoot } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
@@ -296,6 +297,22 @@ export class ManagedDocumentChangeCoordinator {
         jobs.markCompleted(job.job_id);
         summary.jobs_completed += 1;
       } catch (error) {
+        // The candidate id binds immutable Dropbox identity and revision. A
+        // different observation for that same id cannot become valid by
+        // retrying this job; preserve it as a visible quarantine instead of
+        // consuming every scheduled slice forever.
+        if (error instanceof MutationCandidateEvidenceConflictError) {
+          jobs.markQuarantined(job, "mutation_candidate_evidence_conflict");
+          summary.jobs_quarantined += 1;
+          console.error("Project OS managed document change job quarantined", {
+            project_id: state.project_id,
+            job_id: job.job_id,
+            path: job.change.path,
+            code: "mutation_candidate_evidence_conflict",
+            message: errorMessage(error)
+          });
+          continue;
+        }
         jobs.markFailed(job.job_id, errorMessage(error));
         summary.job_failures += 1;
         console.error("Project OS managed document change job failed", {

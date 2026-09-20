@@ -202,6 +202,128 @@ describe("ProjectGuard managed documents", () => {
     expect(body).not.toHaveProperty("provider");
   });
 
+  it("archives one exact active working version without a caller-selected path or later restoration", async () => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-DOCUMENT-ARCHIVE-9051");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const signing = "document-archive-governance";
+    await bootstrapRuleAdmissionGovernance(testEnv, signing, created.project_id);
+    await runInDurableObject(guard, (instance) => Object.assign((instance as unknown as { env: Env }).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: signing,
+      RULE_ADMISSION_SIGNING_KEY: signing,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    const { context } = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const content = "# Preserve this working version";
+    const writeRequest = {
+      operation: "working.write" as const,
+      request_id: "DOCREQ-ARCHIVE-WRITE-0001",
+      project_id: created.project_id,
+      logical_path: "passage/brief.md",
+      content,
+      content_sha256: await sha256Text(content),
+      created_at: at
+    };
+    const written = await (await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(writeRequest, context))
+    })).json<any>();
+    expect(written).toMatchObject({ status: "committed", stage: "working" });
+
+    const request = {
+      operation: "document.archive" as const,
+      request_id: "DOCREQ-ARCHIVE-WORK-0001",
+      project_id: created.project_id,
+      document_id: written.document_id,
+      stage: "working" as const,
+      expected_version_id: written.version_id,
+      created_at: at
+    };
+    const stale = await (await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission({
+        ...request,
+        request_id: "DOCREQ-ARCHIVE-WORK-STALE-0001",
+        expected_version_id: "VER-REQ-FFFFFFFFFFFFFFFFFFFFFFFF"
+      }, context))
+    })).json<any>();
+    expect(stale).toMatchObject({ status: "conflict", code: "STALE_DOCUMENT_VERSION" });
+    const archived = await (await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(request, context))
+    })).json<any>();
+
+    expect(archived).toMatchObject({
+      status: "committed",
+      document_id: written.document_id,
+      version_id: written.version_id,
+      archived_stage: "working",
+      archive_path: expect.stringContaining(`/ARCHIVES/MANAGED-DOCUMENTS/${written.document_id}/${written.version_id}/working/`)
+    });
+    const visiblePath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-document-9051/WORKING/passage/brief.md`;
+    expect(mock.files.has(visiblePath)).toBe(false);
+    expect(mock.files.get(archived.archive_path)).toContain(content);
+    const execution = await guard.fetch(
+      "https://project-guard.internal/execution-status?kind=document&request_id=DOCREQ-ARCHIVE-WORK-0001"
+    );
+    expect(await execution.json()).toMatchObject({ status: "finalized", terminal: true, finalization_ref: expect.any(String) });
+
+    const status = await (await guard.fetch(`https://project-guard.internal/document-status?document_id=${written.document_id}`)).json<any>();
+    expect(status.working_version_id).toBeUndefined();
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(mock.files.has(visiblePath)).toBe(false);
+
+    const replay = await (await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(request, context))
+    })).json<any>();
+    expect(replay).toEqual(archived);
+    const secondRequest = await (await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission({
+        ...request,
+        request_id: "DOCREQ-ARCHIVE-WORK-SECOND-0001"
+      }, context))
+    })).json<any>();
+    expect(secondRequest).toMatchObject({ status: "conflict", code: "DOCUMENT_STAGE_NOT_ACTIVE" });
+    expect([...mock.files.keys()].filter((path) => path.includes(`/ARCHIVES/MANAGED-DOCUMENTS/${written.document_id}/${written.version_id}/working/`))).toHaveLength(1);
+
+    const recoveryContent = "# Preserve this interrupted archive";
+    const recoveryWrite = await (await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission({
+        operation: "working.write",
+        request_id: "DOCREQ-ARCHIVE-RECOVERY-WRITE-0001",
+        project_id: created.project_id,
+        logical_path: "passage/recovery.md",
+        content: recoveryContent,
+        content_sha256: await sha256Text(recoveryContent),
+        created_at: at
+      }, context))
+    })).json<any>();
+    expect(recoveryWrite).toMatchObject({ status: "committed", stage: "working" });
+    const recoveryRequest = {
+      operation: "document.archive" as const,
+      request_id: "DOCREQ-ARCHIVE-RECOVERY-0001",
+      project_id: created.project_id,
+      document_id: recoveryWrite.document_id,
+      stage: "working" as const,
+      expected_version_id: recoveryWrite.version_id,
+      created_at: at
+    };
+    let restoreReceiptWrite!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const writeReceipt = vi.spyOn((instance as any).managedDocumentRequests, "writeReceipt")
+        .mockRejectedValueOnce(new Error("receipt_store_interrupted"));
+      restoreReceiptWrite = () => writeReceipt.mockRestore();
+    });
+    const interrupted = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(recoveryRequest, context))
+    });
+    expect(interrupted.status).toBe(503);
+    await expect(interrupted.json()).resolves.toMatchObject({ status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED" });
+    restoreReceiptWrite();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const recovered = await (await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(recoveryRequest, context))
+    })).json<any>();
+    expect(recovered).toMatchObject({ status: "committed", archived_stage: "working", version_id: recoveryWrite.version_id });
+  });
+
   it("resumes an interrupted working write from its durable intent without a client replay", async () => {
     const created = await createProject("TXN-DOCUMENT-RECOVERY-0042");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);

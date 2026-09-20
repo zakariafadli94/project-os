@@ -175,4 +175,76 @@ describe("one active working head", () => {
     expect(files.has(workspaceManagedDocumentPath("PRJ-0002", "project-os", "working", "strategy/commercial-option-b.md"))).toBe(true);
     expect((await documents.status("PRJ-0002", source.document_id))?.working_version_id).toBe(source.version_id);
   });
+
+  it("archives exact review and published heads to deterministic immutable-history paths", async () => {
+    const { runtime, files } = runtimeHarness();
+    const documents = new ManagedDocumentService(runtime);
+    const project = state();
+    const reviewContent = "# Review candidate";
+    const reviewWorking = await documents.writeWorking({
+      request_id: "DOCREQ-ARCHIVE-REVIEW-WRITE-0001",
+      project_id: project.project_id,
+      logical_path: "passage/review.md",
+      content: reviewContent,
+      content_sha256: await sha256Text(reviewContent),
+      created_at: createdAt
+    }, project);
+    const review = await documents.promoteToReview({
+      request_id: "DOCREQ-ARCHIVE-REVIEW-PROMOTE-0001",
+      project_id: project.project_id,
+      document_id: reviewWorking.document_id,
+      expected_version_id: reviewWorking.version_id,
+      created_at: createdAt
+    }, project);
+    const archivedReview = await documents.archiveActiveDocument({
+      operation: "document.archive",
+      request_id: "DOCREQ-ARCHIVE-REVIEW-0001",
+      project_id: project.project_id,
+      document_id: review.document_id,
+      stage: "review",
+      expected_version_id: review.version_id,
+      created_at: createdAt
+    }, project);
+    expect(archivedReview).toMatchObject({ status: "committed", archived_stage: "review", version_id: review.version_id });
+    expect(files.has(workspaceManagedDocumentPath(project.project_id, project.slug, "review", "passage/review.md"))).toBe(false);
+    expect(files.get(archivedReview.archive_path!)?.content).toContain(reviewContent);
+    expect((await documents.status(project.project_id, review.document_id))?.review_version_id).toBeUndefined();
+
+    const publishedContent = "# Published deliverable";
+    const publishedWorking = await documents.writeWorking({
+      request_id: "DOCREQ-ARCHIVE-PUBLISHED-WRITE-0001",
+      project_id: project.project_id,
+      logical_path: "passage/published.md",
+      content: publishedContent,
+      content_sha256: await sha256Text(publishedContent),
+      created_at: createdAt
+    }, project);
+    const publishing = await documents.promoteToReview({
+      request_id: "DOCREQ-ARCHIVE-PUBLISHED-PROMOTE-0001",
+      project_id: project.project_id,
+      document_id: publishedWorking.document_id,
+      expected_version_id: publishedWorking.version_id,
+      created_at: createdAt
+    }, project);
+    const published = await documents.publish({
+      request_id: "DOCREQ-ARCHIVE-PUBLISHED-PUBLISH-0001",
+      project_id: project.project_id,
+      document_id: publishing.document_id,
+      expected_version_id: publishing.version_id,
+      created_at: createdAt
+    }, project);
+    const archivedPublished = await documents.archiveActiveDocument({
+      operation: "document.archive",
+      request_id: "DOCREQ-ARCHIVE-PUBLISHED-0001",
+      project_id: project.project_id,
+      document_id: published.document_id,
+      stage: "published",
+      expected_version_id: published.version_id,
+      created_at: createdAt
+    }, project);
+    expect(archivedPublished).toMatchObject({ status: "committed", archived_stage: "published", version_id: published.version_id });
+    expect(files.has(workspaceManagedDocumentPath(project.project_id, project.slug, "deliverables", "passage/published.md"))).toBe(false);
+    expect(files.get(archivedPublished.archive_path!)?.content).toContain(publishedContent);
+    expect((await documents.status(project.project_id, published.document_id))?.published_version_id).toBeUndefined();
+  });
 });

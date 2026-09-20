@@ -17,7 +17,7 @@ import {
   asProjectOsPersistence,
   type PersistenceInput
 } from "../persistence/compatibility/legacy-dropbox-runtime";
-import { machineDocumentProviderPayloadPath, workspaceManagedDocumentPath } from "../persistence/layout";
+import { machineDocumentProviderPayloadPath, workspaceManagedDocumentPath, workspaceProjectRoot } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import {
@@ -87,6 +87,8 @@ export interface ManagedDocumentReceipt {
   candidate_request_id?: string;
   accepted?: true;
   published?: true;
+  archived_stage?: "working" | "review" | "published";
+  archive_path?: string;
 }
 
 export class ManagedDocumentConflictError extends Error {
@@ -657,6 +659,51 @@ export class ManagedDocumentService {
     return receiptFor(request.request_id, record);
   }
 
+  async archiveActiveDocument(
+    request: Extract<ManagedDocumentRequest, { operation: "document.archive" }>,
+    state: ProjectState
+  ): Promise<ManagedDocumentReceipt> {
+    this.assertMutableProject(request.project_id, state);
+    const head = await this.requireWorkProductHead(request.project_id, request.document_id);
+    const target = archiveTarget(request.stage);
+    const versionId = head[target.version_field];
+    const archivePath = managedArchivePath(
+      state,
+      request.document_id,
+      request.expected_version_id,
+      request.stage,
+      request.request_id,
+      head.logical_path
+    );
+    if (!versionId) {
+      const archivedVersion = await this.requireVersion(request.project_id, request.document_id, request.expected_version_id);
+      const archived = await this.runtime.objects.getMetadata(archivePath);
+      if (archived && providerContentMatches(archived, archivedVersion)) {
+        return archiveReceipt(request, archivedVersion, archivePath);
+      }
+      throw new ManagedDocumentConflictError(
+        "DOCUMENT_STAGE_NOT_ACTIVE",
+        `Document has no active ${request.stage} version to archive`,
+        request.document_id
+      );
+    }
+    this.assertExpectedVersion(request.expected_version_id, versionId, request.document_id);
+    const version = await this.requireVersion(request.project_id, request.document_id, versionId);
+    const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, target.zone, head.logical_path);
+    await this.ensureActiveVersionArchived(visiblePath, archivePath, version, head.provider?.[target.provider_field], request.document_id);
+
+    await this.ledger.writeHead({
+      ...head,
+      [target.version_field]: undefined,
+      provider: compactProviderState({
+        ...head.provider,
+        [target.provider_field]: undefined
+      }),
+      reconciliation_status: "clean"
+    });
+    return archiveReceipt(request, version, archivePath);
+  }
+
   async classifyReference(request: ManagedReferenceClassificationRequest, state: ProjectState): Promise<ManagedDocumentReceipt> {
     this.assertMutableProject(request.project_id, state);
     const collectionPath = assertReferenceCollectionPath(request.collection_path);
@@ -793,6 +840,58 @@ export class ManagedDocumentService {
     return metadata;
   }
 
+  private async ensureActiveVersionArchived(
+    visiblePath: string,
+    archivePath: string,
+    version: DocumentVersionRecord,
+    currentObservation: ManagedProviderObservation | undefined,
+    documentId: string
+  ): Promise<void> {
+    const source = await this.runtime.objects.getMetadata(visiblePath);
+    const archived = await this.runtime.objects.getMetadata(archivePath);
+    if (!source) {
+      if (!archived || !providerContentMatches(archived, version)) {
+        throw new ManagedDocumentConflictError(
+          "DOCUMENT_ARCHIVE_SOURCE_MISSING",
+          `Active document is missing without a verified archive: ${visiblePath}`,
+          documentId
+        );
+      }
+      return;
+    }
+    await this.assertProviderStillMatches(visiblePath, version, currentObservation, documentId);
+    if (archived) {
+      throw new ManagedDocumentConflictError(
+        "DOCUMENT_ARCHIVE_DESTINATION_CONFLICT",
+        `Archive destination already exists: ${archivePath}`,
+        documentId
+      );
+    }
+    await this.runtime.directoryProvisioning?.ensureDirectory(archivePath.slice(0, archivePath.lastIndexOf("/")));
+    try {
+      await this.runtime.objects.move(visiblePath, archivePath);
+    } catch (error) {
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const retriedSource = await this.runtime.objects.getMetadata(visiblePath);
+      const retriedArchive = await this.runtime.objects.getMetadata(archivePath);
+      if (retriedSource || !retriedArchive || !providerContentMatches(retriedArchive, version)) {
+        throw new ManagedDocumentConflictError(
+          "DOCUMENT_ARCHIVE_DESTINATION_CONFLICT",
+          `Unable to verify archival transition: ${archivePath}`,
+          documentId
+        );
+      }
+    }
+    const verified = await this.runtime.objects.getMetadata(archivePath);
+    if (!verified || !providerContentMatches(verified, version)) {
+      throw new ManagedDocumentConflictError(
+        "DOCUMENT_ARCHIVE_VERIFICATION_FAILED",
+        `Archived document does not match the active version: ${archivePath}`,
+        documentId
+      );
+    }
+  }
+
   private async writeTextAtStage(
     path: string,
     content: string,
@@ -878,6 +977,45 @@ function providerVersionFields(metadata: ProviderObjectMetadata, path: string): 
 
 function providerObservation(metadata: ProviderObjectMetadata, path: string): ManagedProviderObservation {
   return toManagedProviderObservation({ ...metadata, path });
+}
+
+function archiveTarget(stage: "working" | "review" | "published"): {
+  zone: "working" | "review" | "deliverables";
+  version_field: "working_version_id" | "review_version_id" | "published_version_id";
+  provider_field: "working" | "review" | "published";
+} {
+  if (stage === "working") return { zone: "working", version_field: "working_version_id", provider_field: "working" };
+  if (stage === "review") return { zone: "review", version_field: "review_version_id", provider_field: "review" };
+  return { zone: "deliverables", version_field: "published_version_id", provider_field: "published" };
+}
+
+function managedArchivePath(
+  state: ProjectState,
+  documentId: string,
+  versionId: string,
+  stage: "working" | "review" | "published",
+  requestId: string,
+  logicalPath: string
+): string {
+  return `${workspaceProjectRoot(state.project_id, state.slug)}/ARCHIVES/MANAGED-DOCUMENTS/${documentId}/${versionId}/${stage}/${requestId}/${logicalPath}`;
+}
+
+function providerContentMatches(metadata: ProviderObjectMetadata, version: DocumentVersionRecord): boolean {
+  if (!version.provider_content_hash || version.size === undefined) return false;
+  const evidence = requireDropboxV1Evidence(metadata);
+  return evidence.content_hash === version.provider_content_hash && evidence.size === version.size;
+}
+
+function archiveReceipt(
+  request: Extract<ManagedDocumentRequest, { operation: "document.archive" }>,
+  version: DocumentVersionRecord,
+  archivePath: string
+): ManagedDocumentReceipt {
+  return {
+    ...receiptFor(request.request_id, version),
+    archived_stage: request.stage,
+    archive_path: archivePath
+  };
 }
 
 function metadataFromReviewObservation(observation: {

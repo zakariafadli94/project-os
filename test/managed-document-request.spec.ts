@@ -36,6 +36,27 @@ describe("managed document API request", () => {
     })).toMatchObject({ operation: "working.write", expected_version_id });
   });
 
+  it("admits a version-bound archival request without letting the caller choose a Dropbox path", async () => {
+    const request = {
+      operation: "document.archive",
+      request_id: "DOCREQ-ARCHIVE-000001",
+      project_id,
+      document_id,
+      stage: "published",
+      expected_version_id,
+      created_at
+    } as const;
+
+    const parsed = parseManagedDocumentRequest(request);
+    expect(parsed).toEqual(request);
+    expect(await normalizeDocumentAdmission(parsed)).toMatchObject({
+      operation: "document.archive",
+      resources: [{ resource_id: document_id, resource_type: "document", zone: "ARCHIVES", version: expected_version_id }]
+    });
+    expect(() => parseManagedDocumentRequest({ ...request, archive_path: "ARCHIVES/user-chosen.md" })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, stage: "reference" })).toThrow();
+  });
+
   it.each([
     { operation: "review.promote", request_id: "DOCREQ-REVIEW-000001", project_id, document_id, expected_version_id, created_at },
     { operation: "review.write", request_id: "DOCREQ-REVIEW-000002", project_id, document_id, content: "candidate", content_sha256: "b".repeat(64), expected_version_id, created_at },

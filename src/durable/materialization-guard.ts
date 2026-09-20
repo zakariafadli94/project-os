@@ -279,19 +279,13 @@ export class MaterializationGuard extends DurableObject<Env> {
       && targetObligations.every((obligation) => obligation.state === "verified");
   }
 
-  private async hasCurrentDurableHead(record: import("../domain/commit-record").CanonicalCommitRecord): Promise<boolean> {
-    const localHead = this.ledger.status().head;
-    if (!localHead
-      || localHead.revision !== record.new_revision
-      || localHead.projection_version !== CURRENT_PROJECTION_VERSION) return false;
+  private async hasCanonicallyBoundCurrentHead(record: import("../domain/commit-record").CanonicalCommitRecord): Promise<boolean> {
     const runtime = createProductionPersistence(this.env, this.projectId);
     const repository = new ProjectRepository(runtime, this.layoutMode);
     const providerHead = await repository.readMaterializationHead(this.projectId);
     if (!providerHead
       || providerHead.target_revision !== record.new_revision
-      || providerHead.projection_version !== CURRENT_PROJECTION_VERSION
-      || providerHead.target_revision !== localHead.revision
-      || providerHead.projection_version !== localHead.projection_version) return false;
+      || providerHead.projection_version !== CURRENT_PROJECTION_VERSION) return false;
     const completed = await repository.readMaterializationRecord(
       this.projectId,
       providerHead.target_revision,
@@ -300,8 +294,21 @@ export class MaterializationGuard extends DurableObject<Env> {
     if (!completed
       || completed.result_root_hash !== providerHead.result_root_hash
       || completed.workspace_location !== providerHead.workspace_location
-      || completed.completed_at !== providerHead.completed_at
-      || completed.source_event_id !== record.event.event_id) return false;
+      || completed.completed_at !== providerHead.completed_at) return false;
+    // This helper only admits the record at the head's own revision. A
+    // coalesced revision can prove an earlier transaction, never the head
+    // commit itself; accepting it here would let a malformed record replace
+    // the canonical event binding.
+    return completed.source_event_id === record.event.event_id;
+  }
+
+  private async hasCurrentDurableHead(record: import("../domain/commit-record").CanonicalCommitRecord): Promise<boolean> {
+    const localHead = this.ledger.status().head;
+    if (!localHead
+      || localHead.revision !== record.new_revision
+      || localHead.projection_version !== CURRENT_PROJECTION_VERSION
+      || !await this.hasCanonicallyBoundCurrentHead(record)) return false;
+    const runtime = createProductionPersistence(this.env, this.projectId);
     const saved = await new ConvergenceJournal(runtime, this.projectId).load();
     return saved !== null && saved.progress.canonical_observed_revision >= record.new_revision;
   }
@@ -438,6 +445,23 @@ export class MaterializationGuard extends DurableObject<Env> {
       return Response.json(this.statusResponse(state));
     }
     await coordinator.reconcile(state.revision);
+    // In the default V2 rollout there is no active writer once a head is
+    // current, so ensureAlarmIfPending intentionally has nothing to wake.
+    // The head can nevertheless cover committed transactions that still need
+    // their idempotent ProjectGuard finalization certificate. Fleet
+    // reconciliation is the durable recovery boundary for that callback.
+    if (this.layoutMode === "v2") {
+      const head = await repository.readMaterializationHead(this.projectId);
+      const currentRecord = head
+        && head.target_revision === state.revision
+        && head.projection_version === CURRENT_PROJECTION_VERSION
+        ? await repository.readCommitRecord(this.projectId, state.revision)
+        : null;
+      if (currentRecord && await this.hasCanonicallyBoundCurrentHead(currentRecord)) {
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+        return Response.json(this.statusResponse(state));
+      }
+    }
     await this.ensureAlarmIfPending();
     return Response.json(this.statusResponse(state));
   }

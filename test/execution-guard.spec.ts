@@ -460,6 +460,64 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await status.json()).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
   });
 
+  it("does not infer historical coverage from a generation without a partial coalescence record", async () => {
+    const projectId = "PRJ-8300";
+    const { guard } = await setup(projectId);
+    const requestIds: string[] = [];
+    for (let revision = 2; revision <= 4; revision += 1) {
+      const requestId = `TXN-EXECUTION-8300-${revision}`;
+      requestIds.push(requestId);
+      const { context } = await (await guard.fetch("https://project-guard.internal/mutation-context"))
+        .json<{ context: never }>();
+      const transaction = {
+        schema_version: "1.0", transaction_id: requestId, project_id: projectId,
+        base_revision: revision - 1, operation: "research.add", created_at: "2026-09-20T18:10:00.000Z",
+        payload: { research_id: `RES-NOINFER${revision}`, title: `No inferred coverage ${revision}`, body: "Canonical evidence" }
+      };
+      const committed = await guard.fetch("https://project-guard.internal/transaction", {
+        method: "POST", body: JSON.stringify(encodeAdmission(transaction, context))
+      });
+      expect(await committed.json()).toMatchObject({ status: "committed", new_revision: revision });
+    }
+
+    const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
+    const baseline = await repository.readCommitRecord(projectId, 1);
+    const record = await repository.readCommitRecord(projectId, 4);
+    if (!baseline || !record) throw new Error("expected_uncoalesced_jump_record");
+    await repository.writeCompletedMaterializationRecord({
+      schema_version: "1.0", project_id: projectId, target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION,
+      record_kind: "snapshot", parent: null, chain_depth: 0, workspace_location: "active",
+      outputs: {}, removed_outputs: [], total_output_count: 0, result_root_hash: "e".repeat(64),
+      coalesced_revisions: [], source_event_id: baseline.event.event_id, completed_at: "2026-09-20T18:09:00.000Z"
+    });
+    const materialization: CompletedMaterializationRecord = {
+      schema_version: "1.0", project_id: projectId, target_revision: 4, projection_version: CURRENT_PROJECTION_VERSION,
+      record_kind: "delta", parent: { target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION }, chain_depth: 1,
+      workspace_location: "active", outputs: {}, removed_outputs: [], total_output_count: 0, result_root_hash: "f".repeat(64),
+      coalesced_revisions: [], source_event_id: record.event.event_id, completed_at: "2026-09-20T18:11:00.000Z"
+    };
+    await repository.writeCompletedMaterializationRecord(materialization);
+    await repository.writeMaterializationHead({
+      schema_version: "1.0", project_id: projectId, target_revision: 4, projection_version: CURRENT_PROJECTION_VERSION,
+      workspace_location: "active", record_path: machineMaterializationRecordPath(projectId, 4, CURRENT_PROJECTION_VERSION),
+      result_root_hash: materialization.result_root_hash, completed_at: materialization.completed_at
+    });
+
+    let finalization = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target_revision: 4, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    while (finalization.status === 202) {
+      finalization = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ target_revision: 4, projection_version: CURRENT_PROJECTION_VERSION })
+      });
+    }
+    expect(finalization.status).toBe(200);
+    const status = await guard.fetch(`https://project-guard.internal/execution-status?kind=transaction&request_id=${requestIds[0]}`);
+    expect(await status.json()).toMatchObject({ status: "finalizing", terminal: false, code: "MATERIALIZATION_PENDING", finalization_ref: null });
+  });
+
   it("finalizes task.complete 268 to 269 only from its committed record and current materialization proof", async () => {
     const projectId = "PRJ-8301";
     const mock = installDropboxMock();

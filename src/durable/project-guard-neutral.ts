@@ -2466,6 +2466,10 @@ export class ProjectGuard extends DurableObject<Env> {
         for (const revision of candidate.coalesced_revisions) appendFinalizationCandidate(work, candidate, revision, queued);
         if (
           candidate.parent !== null
+          // Only legacy records that retained a partial tail can prove that
+          // a historical coalescence happened. An empty list is not evidence
+          // of a jump and must remain strict.
+          && candidate.coalesced_revisions.length > 0
           && candidate.target_revision - candidate.parent.target_revision - 1 <= MATERIALIZATION_FINALIZATION_INFERRED_RANGE_MAX
         ) {
           for (let revision = candidate.parent.target_revision + 1; revision < candidate.target_revision; revision += 1) {

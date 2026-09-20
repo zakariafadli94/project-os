@@ -39,6 +39,26 @@ describe("MaterializationLedger", () => {
     });
   });
 
+  it("repairs a partial persisted coalescence list from the verified head", async () => {
+    await withLedger("PRJ-3414", (ledger) => {
+      ledger.restoreExternalBaseline(
+        { revision: 1, projection_version: 1 },
+        new Map([["global:STATE", evidence("STATE.md", "z", 1)]])
+      );
+      ledger.requestTarget({ revision: 5, projection_version: 1 });
+      // Old persisted state can contain the tail of a coalesced range while
+      // omitting its first revision. The next target must restore it.
+      (ledger as unknown as { storage: DurableObjectStorage }).storage.sql.exec(
+        "UPDATE materialization_control SET active_coalesced_json = '[3,4]' WHERE singleton = 1"
+      );
+      expect(ledger.beginNextTarget()).toEqual({
+        revision: 5,
+        projection_version: 1,
+        coalesced_revisions: [2, 3, 4]
+      });
+    });
+  });
+
   it("does not preempt an active target and selects newer work after completion", async () => {
     await withLedger("PRJ-3402", (ledger) => {
       ledger.requestTarget({ revision: 5, projection_version: 1 });

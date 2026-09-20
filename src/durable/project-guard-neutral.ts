@@ -152,9 +152,12 @@ const REQUEST_RECOVERY_RETRY_DELAY_MS = 30_000;
 const MATERIALIZATION_FINALIZATION_WORK_KEY = "materialization-finalization-work";
 const MATERIALIZATION_FINALIZATION_LINEAGE_BATCH_SIZE = 4;
 const MATERIALIZATION_FINALIZATION_CERTIFICATE_BATCH_SIZE = 4;
+const MATERIALIZATION_FINALIZATION_INFERRED_RANGE_MAX = 64;
+const MATERIALIZATION_FINALIZATION_COVERAGE_VERSION = 2;
 
 interface MaterializationFinalizationCandidate {
   revision: number;
+  coverage: "explicit" | "canonical_range";
   materialization_revision: number;
   projection_version: number;
   result_root_hash: string;
@@ -163,6 +166,7 @@ interface MaterializationFinalizationCandidate {
 }
 
 interface MaterializationFinalizationWork {
+  coverage_version: number;
   head: {
     target_revision: number;
     projection_version: number;
@@ -2248,7 +2252,7 @@ export class ProjectGuard extends DurableObject<Env> {
         || candidate.result_root_hash !== verifiedMaterialization.result_root_hash
         || candidate.completed_at !== verifiedMaterialization.completed_at
         || candidate.source_event_id !== verifiedMaterialization.source_event_id
-        || !coversTransactionRevision(candidate, targetRevision, record.event.event_id)) return;
+        || !(await this.verifiedCandidateCoversTransaction(verifiedMaterialization, candidate, targetRevision, record.event.event_id))) return;
       materialization = candidate;
     } else {
       const head = await this.repository.readMaterializationHead(admitted.admission.project_id);
@@ -2288,6 +2292,44 @@ export class ProjectGuard extends DurableObject<Env> {
       source_event_id: record.event.event_id,
       result_root_hash: materialization.result_root_hash
     });
+  }
+
+  /**
+   * Current generations record every coalesced revision explicitly. A small
+   * number of historical generations were published with a partial list even
+   * though their immutable target state already covered the missing first
+   * revision. Accept that legacy shape only after independently proving the
+   * complete canonical commit range; normal direct status reads remain strict.
+   */
+  private async verifiedCandidateCoversTransaction(
+    verified: MaterializationFinalizationCandidate,
+    materialization: CompletedMaterializationRecord,
+    targetRevision: number,
+    targetEventId: string
+  ): Promise<boolean> {
+    if (coversTransactionRevision(materialization, targetRevision, targetEventId)) return true;
+    if (
+      verified.coverage !== "canonical_range"
+      || materialization.parent === null
+      || targetRevision <= materialization.parent.target_revision
+      || targetRevision >= materialization.target_revision
+      || materialization.target_revision - materialization.parent.target_revision - 1 > MATERIALIZATION_FINALIZATION_INFERRED_RANGE_MAX
+    ) return false;
+
+    for (let revision = materialization.parent.target_revision + 1; revision <= materialization.target_revision; revision += 1) {
+      const commit = await this.repository.readCommitRecord(materialization.project_id, revision);
+      if (
+        !commit
+        || commit.previous_revision !== revision - 1
+        || commit.new_revision !== revision
+        || commit.state.revision !== revision
+        || commit.state.last_event_id !== commit.event.event_id
+        || commit.receipt.status !== "committed"
+        || commit.receipt.new_revision !== revision
+        || commit.receipt.event_id !== commit.event.event_id
+      ) return false;
+    }
+    return true;
   }
 
   private async finalizeVerifiedArtifact(journal: ExecutionJournal): Promise<void> {
@@ -2382,8 +2424,13 @@ export class ProjectGuard extends DurableObject<Env> {
       completed_at: head.completed_at
     };
     let work = await this.ctx.storage.get<MaterializationFinalizationWork>(MATERIALIZATION_FINALIZATION_WORK_KEY);
-    if (!work || !sameFinalizationHead(work.head, expectedHead)) {
+    if (
+      !work
+      || work.coverage_version !== MATERIALIZATION_FINALIZATION_COVERAGE_VERSION
+      || !sameFinalizationHead(work.head, expectedHead)
+    ) {
       work = {
+        coverage_version: MATERIALIZATION_FINALIZATION_COVERAGE_VERSION,
         head: expectedHead,
         next_generation: { target_revision: record.target_revision, projection_version: record.projection_version },
         previous_child: null,
@@ -2417,6 +2464,16 @@ export class ProjectGuard extends DurableObject<Env> {
         }
         appendFinalizationCandidate(work, candidate, candidate.target_revision, queued);
         for (const revision of candidate.coalesced_revisions) appendFinalizationCandidate(work, candidate, revision, queued);
+        if (
+          candidate.parent !== null
+          && candidate.target_revision - candidate.parent.target_revision - 1 <= MATERIALIZATION_FINALIZATION_INFERRED_RANGE_MAX
+        ) {
+          for (let revision = candidate.parent.target_revision + 1; revision < candidate.target_revision; revision += 1) {
+            if (!candidate.coalesced_revisions.includes(revision)) {
+              appendFinalizationCandidate(work, candidate, revision, queued, "canonical_range");
+            }
+          }
+        }
         if (candidate.parent === null) {
           if (candidate.record_kind !== "snapshot" || candidate.chain_depth !== 0) {
             return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
@@ -2634,12 +2691,14 @@ function appendFinalizationCandidate(
   work: MaterializationFinalizationWork,
   record: CompletedMaterializationRecord,
   revision: number,
-  queued: Set<number>
+  queued: Set<number>,
+  coverage: MaterializationFinalizationCandidate["coverage"] = "explicit"
 ): void {
   if (queued.has(revision)) return;
   queued.add(revision);
   work.candidates.push({
     revision,
+    coverage,
     materialization_revision: record.target_revision,
     projection_version: record.projection_version,
     result_root_hash: record.result_root_hash,

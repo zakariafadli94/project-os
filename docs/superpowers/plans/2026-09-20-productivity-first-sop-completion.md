@@ -40,6 +40,8 @@
 
 **Gate:** a busy project gives a timely answer or an actionable bounded error; receipt discovery never becomes an ambiguous silent wait.
 
+**Measured 2026-09-20:** production reads of PRJ-0003 and PRJ-0007 each exceeded the 10-second Control Tower deadline during document reconciliation. The ProjectGuard diagnostic wrapper serialized even read-only context calls behind that work. The targeted fix lets canonical context reads bypass that outer queue; receipt and execution reads instead return explicit `PROJECT_OS_READ_BUSY` while a serialized write is active, preventing a misleading `not_received` or 404. This improves bounded feedback but does not promise receipt availability during a long reconciliation. Verify the deployed behaviour under real load before closing this gate.
+
 ### Task 3: Remove the intermittent deployment-test false positive
 
 **Files:** `test/rollback-project-guard.spec.ts` and its test helper only, unless investigation proves a production defect.

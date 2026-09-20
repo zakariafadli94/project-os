@@ -469,6 +469,18 @@ describe("canonical execution boundary in ProjectGuard", () => {
     });
     expect(await committed271.json()).toMatchObject({ status: "committed", new_revision: 271 });
 
+    const context272Response = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context: context272 } = await context272Response.json<{ context: never }>();
+    const transaction272 = {
+      schema_version: "1.0", transaction_id: "TXN-PRJ0003-TASK-A03FOLLOWUP-CREATE-20260913T160600Z-W8K4",
+      project_id: projectId, base_revision: 271, operation: "task.create", created_at: "2026-09-13T16:06:00.000Z",
+      payload: { task_id: "TASK-A03FOLLOWUP", title: "Follow-up after coalescence" }
+    };
+    const committed272 = await guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", body: JSON.stringify(encodeAdmission(transaction272, context272))
+    });
+    expect(await committed272.json()).toMatchObject({ status: "committed", new_revision: 272 });
+
     const record271 = await repository.readCommitRecord(projectId, 271);
     if (!record271) throw new Error("expected_coalesced_successor_record");
     const successor: CompletedMaterializationRecord = {
@@ -479,21 +491,66 @@ describe("canonical execution boundary in ProjectGuard", () => {
       source_event_id: record271.event.event_id, completed_at: "2026-09-13T16:05:00.000Z"
     };
     await repository.writeCompletedMaterializationRecord(successor);
+    const record272 = await repository.readCommitRecord(projectId, 272);
+    if (!record272) throw new Error("expected_descendant_record");
+    const descendant: CompletedMaterializationRecord = {
+      schema_version: "1.0", project_id: projectId, target_revision: 272, projection_version: CURRENT_PROJECTION_VERSION,
+      record_kind: "delta", parent: { target_revision: 271, projection_version: CURRENT_PROJECTION_VERSION },
+      chain_depth: 2, workspace_location: "active", outputs: {}, removed_outputs: [], total_output_count: 0,
+      result_root_hash: "c".repeat(64), coalesced_revisions: [],
+      source_event_id: record272.event.event_id, completed_at: "2026-09-13T16:06:30.000Z"
+    };
+    await repository.writeCompletedMaterializationRecord(descendant);
     await repository.writeMaterializationHead({
-      schema_version: "1.0", project_id: projectId, target_revision: 271, projection_version: CURRENT_PROJECTION_VERSION,
-      workspace_location: "active", record_path: machineMaterializationRecordPath(projectId, 271, CURRENT_PROJECTION_VERSION),
-      result_root_hash: successor.result_root_hash, completed_at: successor.completed_at
+      schema_version: "1.0", project_id: projectId, target_revision: 272, projection_version: CURRENT_PROJECTION_VERSION,
+      workspace_location: "active", record_path: machineMaterializationRecordPath(projectId, 272, CURRENT_PROJECTION_VERSION),
+      result_root_hash: descendant.result_root_hash, completed_at: descendant.completed_at
     });
+
+    mock.files.set(
+      machineMaterializationRecordPath(projectId, 272, CURRENT_PROJECTION_VERSION),
+      JSON.stringify({ ...descendant, chain_depth: 1 })
+    );
+    const malformedWake = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target_revision: 272, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    expect(malformedWake.status).toBe(409);
+    await expect(malformedWake.json()).resolves.toEqual({ error: "materialization_chain_invalid" });
+    mock.files.set(
+      machineMaterializationRecordPath(projectId, 272, CURRENT_PROJECTION_VERSION),
+      JSON.stringify(descendant)
+    );
+    mock.files.set(
+      machineMaterializationRecordPath(projectId, 271, 4),
+      JSON.stringify({ ...successor, projection_version: 4 })
+    );
+    mock.files.set(
+      machineMaterializationRecordPath(projectId, 272, CURRENT_PROJECTION_VERSION),
+      JSON.stringify({ ...descendant, parent: { target_revision: 271, projection_version: 4 } })
+    );
+    const crossVersionWake = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target_revision: 272, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    expect(crossVersionWake.status).toBe(409);
+    await expect(crossVersionWake.json()).resolves.toEqual({ error: "materialization_chain_invalid" });
+    mock.files.set(
+      machineMaterializationRecordPath(projectId, 272, CURRENT_PROJECTION_VERSION),
+      JSON.stringify(descendant)
+    );
 
     const wake = await guard.fetch("https://project-guard.internal/finalize-materialization", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ target_revision: 271, projection_version: CURRENT_PROJECTION_VERSION })
+      body: JSON.stringify({ target_revision: 272, projection_version: CURRENT_PROJECTION_VERSION })
     });
     expect(wake.status).toBe(200);
-    expect(await wake.json()).toMatchObject({ finalized_revisions: [270, 271] });
+    expect(await wake.json()).toMatchObject({ finalized_revisions: [270, 271, 272] });
 
-    for (const requestId of [transaction270.transaction_id, transaction271.transaction_id]) {
+    for (const requestId of [transaction270.transaction_id, transaction271.transaction_id, transaction272.transaction_id]) {
       const journal = new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "transaction", requestId);
       expect(await journal.status()).toMatchObject({ status: "finalized", terminal: true, code: null });
     }

@@ -5,7 +5,7 @@ import { executeWithRollback } from "../src/continuity/rollback";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import type { Transaction } from "../src/domain/transaction";
-import { machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
+import { machineCommitRecordPath, machineMaterializationHeadPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
@@ -67,8 +67,10 @@ async function materializeThroughContinuations(projectId: string, expectedRevisi
   });
   for (let slice = 0; slice < 64; slice += 1) {
     const ran = await runDurableObjectAlarm(stub);
-    const state = await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").readProjectState(projectId);
-    if (state && state.revision >= expectedRevision) return;
+    const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
+    const state = await repository.readProjectState(projectId);
+    const head = await repository.readMaterializationHead(projectId);
+    if (state && head && state.revision >= expectedRevision && head.target_revision >= expectedRevision) return;
     if (!ran) throw new Error(`materialization_not_verified:${projectId}@${expectedRevision}`);
   }
   throw new Error(`materialization_not_verified:${projectId}@${expectedRevision}`);
@@ -80,6 +82,16 @@ describe("ProjectGuard data-preserving rollback", () => {
   it("does not treat an absent alarm as proof that the projected state exists", async () => {
     installDropboxMock();
     await expect(materializeThroughContinuations("PRJ-2099")).rejects.toThrow("materialization_not_verified");
+  });
+
+  it("does not treat a state snapshot without its published head as complete", async () => {
+    const projectId = "PRJ-2098";
+    const mock = installDropboxMock();
+    await createProject(projectId);
+    await materializeThroughContinuations(projectId);
+    mock.files.delete(machineMaterializationHeadPath(projectId));
+    await runInDurableObject(projectionStub(projectId), async (_instance, state) => state.storage.deleteAlarm());
+    await expect(materializeThroughContinuations(projectId)).rejects.toThrow("materialization_not_verified");
   });
 
   it("falls back before commit and applies the business effect exactly once", async () => {

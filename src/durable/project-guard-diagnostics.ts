@@ -21,6 +21,19 @@ export class DiagnosticProjectGuard extends SearchSyncProjectGuard {
       ? { correlation_id: correlationId, project_id: this.ctx.id.name ?? null, route: url.pathname }
       : null;
     if (trace) console.log("project_os_guard_received", trace);
+    // These routes are observational and must remain available while a
+    // provider-backed reconciliation holds the diagnostics counter. They do
+    // not reset that counter, so they can safely bypass this outer queue.
+    if (request.method === "GET" && ["/mutation-context", "/request-status", "/execution-status", "/receipt"].includes(url.pathname)) {
+      try {
+        const response = await super.fetch(request);
+        if (trace) console.log("project_os_guard_finished", { ...trace, status: response.status, elapsed_ms: Date.now() - started });
+        return response;
+      } catch (error) {
+        if (trace) console.warn("project_os_guard_failed", { ...trace, elapsed_ms: Date.now() - started });
+        throw error;
+      }
+    }
     return this.serializeDiagnostics(async () => {
       if (trace) console.log("project_os_guard_acquired", { ...trace, queue_ms: Date.now() - started });
       this.persistence.diagnostics?.beginOperation(`ProjectGuard ${request.method} ${url.pathname}`);

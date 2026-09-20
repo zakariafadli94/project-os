@@ -2332,13 +2332,50 @@ export class ProjectGuard extends DurableObject<Env> {
       || record.completed_at !== head.completed_at) {
       return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
     }
+    // A current head can be a descendant of the generation that covered a
+    // committed transaction. Collect the immutable lineage before attempting
+    // any certificate, so an older coalesced revision remains eligible after
+    // later generations have become the published head.
+    const records = [record];
+    const seen = new Set([`${record.target_revision}:${record.projection_version}`]);
+    let cursor = record;
+    for (let depth = 0; cursor.parent !== null; depth += 1) {
+      if (cursor.record_kind !== "delta"
+        || depth >= MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH
+        || cursor.parent.target_revision >= cursor.target_revision) {
+        return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
+      }
+      const key = `${cursor.parent.target_revision}:${cursor.parent.projection_version}`;
+      if (seen.has(key)) return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
+      const parent = await this.repository.readMaterializationRecord(
+        projectId,
+        cursor.parent.target_revision,
+        cursor.parent.projection_version
+      );
+      if (!parent) return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
+      if (parent.projection_version !== cursor.projection_version
+        || cursor.chain_depth !== parent.chain_depth + 1) {
+        return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
+      }
+      seen.add(key);
+      records.push(parent);
+      cursor = parent;
+    }
+    if (cursor.record_kind !== "snapshot" || cursor.chain_depth !== 0) {
+      return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
+    }
+    const coveredRevisions = new Set<number>();
+    for (const candidate of records) {
+      coveredRevisions.add(candidate.target_revision);
+      for (const revision of candidate.coalesced_revisions) coveredRevisions.add(revision);
+    }
     const finalizedRevisions: number[] = [];
-    for (const revision of [...record.coalesced_revisions, record.target_revision].sort((a, b) => a - b)) {
+    for (const revision of [...coveredRevisions].sort((a, b) => a - b)) {
       const commit = await this.repository.readCommitRecord(projectId, revision);
       if (!commit || commit.receipt.status !== "committed" || commit.receipt.new_revision !== revision) continue;
       const journal = new ExecutionJournal(this.persistence, projectId, "transaction", commit.transaction.transaction_id);
       const before = await journal.status();
-      if (!before) continue;
+      if (!before || before.terminal) continue;
       await this.finalizeMaterializedTransaction(journal);
       const after = await journal.status();
       if (after?.terminal && after.status === "finalized") finalizedRevisions.push(revision);

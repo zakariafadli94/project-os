@@ -84,6 +84,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   }
 
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
+    let notifying = false;
     try {
       const notify = await this.serialize(async () => {
         const convergenceMode = convergenceModeForProject(
@@ -117,9 +118,19 @@ export class MaterializationGuard extends DurableObject<Env> {
       });
       // ProjectGuard may already be waiting for this actor's status/capacity.
       // Never retain our queue while calling back into its serialized boundary.
-      if (notify) await this.notifyProjectGuardOfCurrentHead();
+      if (notify) {
+        notifying = true;
+        await this.notifyProjectGuardOfCurrentHead();
+      }
     } catch (error) {
       return this.serialize(async () => {
+        // A concurrent request may have armed an earlier wake or a provider
+        // backoff while the callback was outside our queue. That durable wake
+        // will retry finalization too; do not replace it with our stale retry.
+        if (notifying && await this.ctx.storage.getAlarm() !== null) {
+          console.error("Project OS finalization retry retained existing wake", structuredMaterializationError(this.projectId, error));
+          return;
+        }
         if (error instanceof MaterializationOutputConflictError) {
           console.error(
             "Project OS materialization blocked",

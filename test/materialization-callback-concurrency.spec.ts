@@ -5,6 +5,31 @@ import { SubrequestResilientProjectGuard } from "../src/durable/project-guard-su
 
 afterEach(() => vi.restoreAllMocks());
 
+it("preserves a wake scheduled by another request while finalization is unavailable", async () => {
+  const targetWake = Date.now() + 60_000;
+  let nextAlarm: number | null = null;
+  let entered!: () => void;
+  let fail!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const pending = new Promise<void>((resolve) => { fail = resolve; });
+  const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
+    projectId: "PRJ-0007", layoutMode: "legacy", env: {},
+    ctx: { storage: {
+      getAlarm: async () => nextAlarm,
+      setAlarm: async (at: number) => { nextAlarm = at; }
+    } },
+    coordinatorForSlice: () => ({ coordinator: { runNext: async () => ({ completed: true, more_work: false }) } }),
+    notifyProjectGuardOfCurrentHead: async () => { entered(); await pending; throw new Error("temporary_unavailable"); },
+    handleRequestTarget: async () => { nextAlarm = targetWake; return Response.json({ requested: true }); }
+  }) as MaterializationGuard;
+  const alarm = materialization.alarm().catch(() => {});
+  await started;
+  await materialization.fetch(new Request("https://materialization-guard.internal/request-target", { method: "POST" }));
+  fail();
+  await alarm;
+  expect(nextAlarm).toBe(targetWake);
+});
+
 // Keep both production actors' outer queues and alarm scheduling real. Replace
 // only the slice/provider work so the competing requests meet deterministically.
 it.each(["repair", "legacy"])("finishes %s finalization while ProjectGuard is waiting for materialization status", async (mode) => {

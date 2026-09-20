@@ -100,7 +100,10 @@ export class MaterializationGuard extends DurableObject<Env> {
           const { engine, budget } = this.convergenceEngineForSlice();
           const result = await engine.runSlice(budget);
           await this.scheduleConvergenceContinuation(result.more_work, result.next_alarm_at);
-          return !result.more_work && result.health.converged;
+          // A newer target may still be converging while the published head
+          // already proves earlier committed transactions.  Finalization of
+          // those covered receipts must not wait for unrelated later output.
+          return true;
         }
         // A V2 project is owned exclusively by the convergence writer once it
         // is activated. Before activation, legacy queued targets must not let

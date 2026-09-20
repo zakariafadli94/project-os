@@ -50,6 +50,27 @@ it("rearms immediately when ProjectGuard bounds a finalization callback", async 
   expect(nextAlarm!).toBeLessThan(before + 5_000);
 });
 
+it("notifies ProjectGuard of an existing head while repair convergence continues", async () => {
+  const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
+    projectId: "PRJ-0003",
+    layoutMode: "v2",
+    env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: '{"PRJ-0003":"repair"}' },
+    ctx: { storage: { setAlarm: async () => {} } },
+    resumeConvergenceFromVerifiedHead: async () => {},
+    ensureConvergenceRequestedFromLedger: async () => false,
+    convergenceEngineForSlice: () => ({
+      engine: { runSlice: async () => ({ more_work: true, health: { converged: false }, next_alarm_at: null }) },
+      budget: {}
+    }),
+    scheduleConvergenceContinuation: async () => {}
+  }) as MaterializationGuard;
+  const notify = vi.spyOn(materialization as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(true);
+
+  await materialization.alarm();
+
+  expect(notify).toHaveBeenCalledOnce();
+});
+
 // Keep both production actors' outer queues and alarm scheduling real. Replace
 // only the slice/provider work so the competing requests meet deterministically.
 it.each(["repair", "legacy"])("finishes %s finalization while ProjectGuard is waiting for materialization status", async (mode) => {

@@ -29,6 +29,7 @@ import { prepareLocalRuleActivation, type LocalRuleActivationCapability } from "
 import { createProductionRuleQualificationResolver } from "../rules/production-qualification";
 import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinator";
 import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
+import { TransactionRequestLedger } from "../transactions/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
 import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
@@ -57,7 +58,7 @@ import {
 import { freshnessRejectionMetric, workerLogConvergenceTelemetry } from "../convergence/observability";
 import { deploymentIdentity } from "../deployment/identity";
 import { evaluateRules } from "../rules/evaluator";
-import type { EvaluationResult, RuleObservation } from "../rules/contract";
+import { canonicalJson, type EvaluationResult, type RuleObservation } from "../rules/contract";
 import type { GlobalGovernanceState } from "../domain/rule-governance";
 import { ruleVersionSchema } from "../domain/rule-governance";
 import { matchesResource } from "../rules/resolution";
@@ -181,6 +182,7 @@ export class ProjectGuard extends DurableObject<Env> {
   private readonly managedDocumentService: ManagedDocumentService;
   private readonly managedDocumentChanges: ManagedDocumentChangeCoordinator;
   private readonly managedDocumentRequests: ManagedDocumentRequestLedger;
+  private readonly transactionRequests: TransactionRequestLedger;
   protected readonly layoutMode: LayoutMode;
   private queue: Promise<void> = Promise.resolve();
 
@@ -262,6 +264,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
     );
     this.managedDocumentRequests = new ManagedDocumentRequestLedger(this.persistence.objects);
+    this.transactionRequests = new TransactionRequestLedger(this.persistence.objects);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -381,6 +384,7 @@ export class ProjectGuard extends DurableObject<Env> {
       if (existing) {
         await this.verifyCommittedReplayPayload(tx, existing);
         await this.replayStatusSideEffects(tx, existing);
+        await this.clearTransactionRecovery(tx.transaction_id);
         return Response.json(existing);
       }
 
@@ -405,6 +409,7 @@ export class ProjectGuard extends DurableObject<Env> {
         if (reconciled) {
           await this.verifyCommittedReplayPayload(tx, reconciled);
           await this.replayStatusSideEffects(tx, reconciled);
+          await this.clearTransactionRecovery(tx.transaction_id);
           return Response.json(reconciled);
         }
       }
@@ -417,21 +422,34 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.verifyCommittedReplayPayload(tx, canonicalReceipt);
         this.persistReceipt(canonicalReceipt);
         await this.replayStatusSideEffects(tx, canonicalReceipt);
+        await this.clearTransactionRecovery(tx.transaction_id);
         return Response.json(canonicalReceipt);
       }
 
       const admissionState = reconciledState ?? await this.loadOrRecoverState();
       const normalized = await normalizeTransactionAdmission(tx);
       if (!admissionState && this.strictAdmissionEnabled(tx.project_id)) throw new AdmissionError("canonical_unavailable", 503);
+      let proof: AdmissionProof | null = null;
       if (admissionState && await this.ruleAdmissionRequired(admissionState, normalized)) {
         await this.verifyAdmission(mutationContext, tx, admissionState);
-        const proof = await this.admitRules(admissionState, normalized, mutationContext!.actor);
-        await this.persistAdmissionProof("transaction", tx.transaction_id, proof);
+        proof = await this.admitRules(admissionState, normalized, mutationContext!.actor);
       }
 
       // Capacity refusal is pre-admission: it must not reserve an idempotency
       // intent that can serialize or conflict with otherwise independent work.
       await this.assertCommitCapacity(tx.project_id);
+
+      // Bind exact, server-admitted bytes before the journal can describe an
+      // admission. An interrupted provider write leaves an alarm, not a
+      // receipt-shaped progress record without any replayable request.
+      await this.enqueueRequestRecovery("transaction", tx.transaction_id, canonicalJson({ request: tx, actor: proof?.actor ?? null }));
+      try {
+        await this.transactionRequests.ensureTransactionRequest(tx.project_id, tx, proof?.actor);
+      } catch (error) {
+        if (error instanceof Error && error.message === "idempotency_payload_mismatch") throw new AdmissionError(error.message, 409);
+        throw error;
+      }
+      if (proof) await this.persistAdmissionProof("transaction", tx.transaction_id, proof);
 
       // A refused strict admission must not reserve an idempotency key.  Only
       // bind this intent after the verified permit and second rules evaluation.
@@ -455,6 +473,7 @@ export class ProjectGuard extends DurableObject<Env> {
         const receipt = this.terminalReceipt(tx, result.kind, result.code, result.message, state?.revision ?? 0);
         await this.repository.writeTerminalTransaction(tx, receipt);
         this.persistReceipt(receipt);
+        await this.clearTransactionRecovery(tx.transaction_id);
         return Response.json(receipt);
       }
 
@@ -495,12 +514,16 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.syncRegistryStatus(result.state);
       }
       await this.recordTransactionExecutionReceipt(tx, receipt);
+      await this.clearTransactionRecovery(tx.transaction_id);
       return Response.json(receipt);
     }).catch((error) => this.admissionErrorResponse(error));
   }
 
   async alarm(): Promise<void> {
     await this.serialize(() => this.resumePendingRequestRecovery());
+    // Transaction replay must enter the normal serialized admission path, so
+    // it runs after the document/artifact recovery lock has been released.
+    await this.resumePendingTransactionRecovery();
   }
 
   private async handleArtifact(request: Request): Promise<Response> {
@@ -924,15 +947,18 @@ export class ProjectGuard extends DurableObject<Env> {
     if ((await journal.status())?.terminal) this.clearRequestRecovery("artifact", request.request_id);
   }
 
-  private async enqueueRequestRecovery(kind: "artifact" | "document", requestId: string, requestJson?: string): Promise<void> {
-    if (kind === "document" && requestJson) {
+  private async enqueueRequestRecovery(kind: "artifact" | "document" | "transaction", requestId: string, requestJson?: string): Promise<void> {
+    if ((kind === "document" || kind === "transaction") && requestJson) {
       const digest = await sha256Text(requestJson);
-      const canonical = this.ctx.id.name ? await this.managedDocumentRequests.readIntent(this.ctx.id.name, requestId) : null;
+      const canonical = kind === "document" && this.ctx.id.name ? await this.managedDocumentRequests.readIntent(this.ctx.id.name, requestId) : null;
       if (canonical && canonical.request_sha256 !== digest) throw new ManagedDocumentRequestIntentConflictError(requestId);
       const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
         "SELECT request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray()[0];
-      if (staged && staged.request_sha256 !== digest) throw new ManagedDocumentRequestIntentConflictError(requestId);
+      if (staged && staged.request_sha256 !== digest) {
+        if (kind === "document") throw new ManagedDocumentRequestIntentConflictError(requestId);
+        throw new AdmissionError("idempotency_payload_mismatch", 409);
+      }
       this.ctx.storage.sql.exec(
         "INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES (?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING",
         kind, requestId, requestJson, digest
@@ -949,7 +975,7 @@ export class ProjectGuard extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + 1_000);
   }
 
-  private clearRequestRecovery(kind: "artifact" | "document", requestId: string): void {
+  private clearRequestRecovery(kind: "artifact" | "document" | "transaction", requestId: string): void {
     this.ctx.storage.sql.exec(
       "DELETE FROM request_recovery WHERE kind = ? AND request_id = ?",
       kind,
@@ -959,7 +985,12 @@ export class ProjectGuard extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId);
   }
 
-  private async blockRequestRecovery(kind: "artifact" | "document", requestId: string, code: string): Promise<void> {
+  private async clearTransactionRecovery(requestId: string): Promise<void> {
+    this.clearRequestRecovery("transaction", requestId);
+    if (!this.hasPendingRequestRecovery()) await this.ctx.storage.deleteAlarm();
+  }
+
+  private async blockRequestRecovery(kind: "artifact" | "document" | "transaction", requestId: string, code: string): Promise<void> {
     this.ctx.storage.sql.exec(
       `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
        VALUES (?, ?, ?, 1, 1, ?)
@@ -1026,7 +1057,7 @@ export class ProjectGuard extends DurableObject<Env> {
       try {
         if (recovery.kind === "document") await this.resumeManagedDocument(recovery.request_id);
         else if (recovery.kind === "artifact") await this.resumeArtifactFinalization(recovery.request_id);
-        else this.clearRequestRecovery("document", recovery.request_id);
+        else if (recovery.kind !== "transaction") this.clearRequestRecovery("document", recovery.request_id);
       } catch (error) {
         const message = error instanceof Error ? `${error.name}: ${error.message}` : "unknown_recovery_failure";
         const fingerprint = await sha256Text(message);
@@ -1047,6 +1078,67 @@ export class ProjectGuard extends DurableObject<Env> {
     if (this.hasPendingRequestRecovery()) {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
     }
+  }
+
+  private async resumePendingTransactionRecovery(): Promise<void> {
+    const projectId = this.ctx.id.name;
+    if (!projectId) return;
+    const pending = this.ctx.storage.sql.exec<RecoveryRequestRow>(
+      `SELECT r.kind, r.request_id FROM request_recovery r
+       LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
+       WHERE r.kind = 'transaction' AND COALESCE(f.stopped, 0) = 0
+       ORDER BY r.request_id LIMIT ?`, REQUEST_RECOVERY_BATCH_SIZE
+    ).toArray();
+    for (const item of pending) {
+      try {
+        let tx = await this.transactionRequests.readRecoverableTransaction(projectId, item.request_id);
+        let intent = await this.transactionRequests.readIntent(projectId, item.request_id);
+        if (!intent) {
+          const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+            "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'transaction' AND request_id = ?", item.request_id
+          ).toArray()[0];
+          if (!staged || await sha256Text(staged.request_json) !== staged.request_sha256) throw new Error("transaction_staged_payload_unavailable");
+          const envelope = JSON.parse(staged.request_json) as { request?: unknown; actor?: { actor_id: string; authority: string } | null };
+          tx = parseTransaction(envelope.request);
+          if (tx.project_id !== projectId || tx.transaction_id !== item.request_id) throw new Error("transaction_staged_identity_mismatch");
+          intent = await this.transactionRequests.ensureTransactionRequest(projectId, tx, envelope.actor ?? undefined);
+        }
+        if (!tx || !intent) throw new Error("transaction_intent_unavailable");
+        const admitted = await new ExecutionJournal(this.persistence, projectId, "transaction", item.request_id).readAdmission();
+        const actor = admitted?.admission.actor ?? intent.actor;
+        const state = await this.loadOrRecoverState();
+        if (this.strictAdmissionEnabled(projectId) && !actor) throw new Error("transaction_admission_actor_unavailable");
+        const context = state && actor && this.env.MUTATION_CONTEXT_SIGNING_KEY
+          ? await issueMutationContext(state, this.env.MUTATION_CONTEXT_SIGNING_KEY, Date.now(), actor)
+          : null;
+        const response = await this.fetch(new Request("https://project-guard.internal/transaction", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ admission_version: "1.0", request: tx, mutation_context: context })
+        }));
+        if (!response.ok) throw new Error(`transaction_recovery_http_${response.status}`);
+        const receipt = await response.json<Receipt>();
+        if (receipt.status === "committed" || receipt.status === "conflict" || receipt.status === "rejected") {
+          await this.clearTransactionRecovery(item.request_id);
+        } else {
+          throw new Error("transaction_recovery_nonterminal_response");
+        }
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "transaction_recovery_unknown";
+        const fingerprint = await sha256Text(code);
+        const previous = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; fingerprint: string; count: number }>(
+          "SELECT fingerprint, count FROM request_recovery_failures WHERE kind = ? AND request_id = ?", "transaction", item.request_id
+        ).toArray()[0];
+        const count = previous?.fingerprint === fingerprint ? previous.count + 1 : 1;
+        this.ctx.storage.sql.exec(
+          `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
+           VALUES ('transaction', ?, ?, ?, ?, ?)
+           ON CONFLICT(kind, request_id) DO UPDATE SET fingerprint = excluded.fingerprint,
+             count = excluded.count, stopped = excluded.stopped, message = excluded.message`,
+          item.request_id, fingerprint, count, count >= 6 ? 1 : 0, code
+        );
+      }
+    }
+    if (this.hasPendingRequestRecovery()) await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
   }
 
   private async readPackageAdmissionProof(operation: Extract<ManagedDocumentRequest, {
@@ -1866,12 +1958,13 @@ export class ProjectGuard extends DurableObject<Env> {
     try {
       const execution = await new ExecutionJournal(this.persistence, projectId, kind, requestId).status();
       const receipt = await this.readRequestStatusReceipt(projectId, kind as "transaction" | "document" | "artifact", requestId);
-      const intent = kind === "document" ? await this.managedDocumentRequests.readIntent(projectId, requestId) : null;
+      const intent = kind === "document" ? await this.managedDocumentRequests.readIntent(projectId, requestId)
+        : kind === "transaction" ? await this.transactionRequests.readIntent(projectId, requestId) : null;
       const queued = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_id: string }>(
         "SELECT request_id FROM request_recovery WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray().length > 0;
       const wakeScheduled = queued && await this.ctx.storage.getAlarm() !== null;
-      const staged = kind === "document" ? this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+      const staged = (kind === "document" || kind === "transaction") ? this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
         "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray()[0] : undefined;
       const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; count: number; stopped: number; message: string }>(
@@ -1882,7 +1975,13 @@ export class ProjectGuard extends DurableObject<Env> {
         : null;
       let recoverableIntent = false;
       let recoveryCode: string | null = null;
-      if (intent) {
+      if (intent && kind === "transaction") {
+        try {
+          recoverableIntent = Boolean(await this.transactionRequests.readRecoverableTransaction(projectId, requestId));
+        } catch {
+          recoveryCode = "intent_payload_invalid";
+        }
+      } else if (intent) {
         try {
           const recoverable = await this.managedDocumentRequests.readRecoverableIntent(projectId, requestId);
           if (recoverable) {
@@ -1899,15 +1998,22 @@ export class ProjectGuard extends DurableObject<Env> {
       if (!recoverableIntent && staged && !recoveryCode) {
         try {
           if (await sha256Text(staged.request_json) !== staged.request_sha256) throw new Error("staged_request_hash_invalid");
-          if (intent && intent.request_sha256 !== staged.request_sha256) throw new Error("staged_request_binding_invalid");
-          const parsed = parseManagedDocumentRequest(JSON.parse(staged.request_json));
-          if (parsed.project_id !== projectId || parsed.request_id !== requestId) throw new Error("staged_request_identity_invalid");
+          if (kind === "document") {
+            if (intent && intent.request_sha256 !== staged.request_sha256) throw new Error("staged_request_binding_invalid");
+            const parsed = parseManagedDocumentRequest(JSON.parse(staged.request_json));
+            if (parsed.project_id !== projectId || parsed.request_id !== requestId) throw new Error("staged_request_identity_invalid");
+          } else {
+            const envelope = JSON.parse(staged.request_json) as { request?: unknown };
+            const parsed = parseTransaction(envelope.request);
+            if (parsed.project_id !== projectId || parsed.transaction_id !== requestId
+              || (intent && canonicalJson(parsed) !== intent.request_json)) throw new Error("staged_request_identity_invalid");
+          }
           recoverableIntent = true;
         } catch {
           recoveryCode = "staged_payload_invalid";
         }
       }
-      if (intent && staged && intent.request_sha256 !== staged.request_sha256) recoverableIntent = false;
+      if (kind === "document" && intent && staged && intent.request_sha256 !== staged.request_sha256) recoverableIntent = false;
       const status = execution?.status === "finalized"
         ? "finalized"
         : receiptStatus === "committed"
@@ -1916,6 +2022,8 @@ export class ProjectGuard extends DurableObject<Env> {
             ? receiptStatus
             : queued && failure?.stopped
               ? "recovery_blocked"
+            : execution && (execution.status === "admitted" || (execution.status === "committed" && !execution.receipt_ref))
+              ? "admitted_uncommitted"
               : wakeScheduled && recoverableIntent
                 ? "recovery_scheduled"
               : intent || staged || queued
@@ -1928,12 +2036,14 @@ export class ProjectGuard extends DurableObject<Env> {
         status,
         ...(receipt ? { receipt } : {}),
         ...(execution ? { execution } : {}),
-        ...(intent || staged || queued ? {
+        ...(intent || staged || queued || (kind === "transaction" && execution && !receipt) ? {
           recovery: {
             durable_intent: Boolean(intent),
             recoverable: recoverableIntent,
             scheduled: wakeScheduled && !failure?.stopped,
-            ...(failure?.stopped ? { code: failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit", attempts: failure.count } : recoveryCode ? { code: recoveryCode } : {})
+            ...(failure?.stopped ? { code: failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit", attempts: failure.count }
+              : recoveryCode ? { code: recoveryCode }
+              : kind === "transaction" && execution && !receipt && !recoverableIntent ? { code: "recovery_unavailable" } : {})
           }
         } : {})
       });
@@ -1954,8 +2064,14 @@ export class ProjectGuard extends DurableObject<Env> {
     requestId: string
   ): Promise<unknown | null> {
     if (kind === "transaction") {
-      const receipt = await this.repository.readReceipt(requestId);
-      return receipt?.project_id === projectId ? receipt : null;
+      const receipt = this.findReceipt(requestId) ?? await this.repository.readReceipt(requestId);
+      if (receipt) return receipt.project_id === projectId ? receipt : null;
+      const admitted = await new ExecutionJournal(this.persistence, projectId, "transaction", requestId).readAdmission();
+      if (!admitted) return null;
+      const record = await this.repository.readCommitRecord(projectId, admitted.admission.project_revision + 1);
+      return record?.transaction.transaction_id === requestId
+        && await sha256Canonical(record.transaction) === admitted.admission.request_hash
+        ? record.receipt : null;
     }
     if (kind === "document") {
       const durable = await this.managedDocumentRequests.readReceipt(projectId, requestId);

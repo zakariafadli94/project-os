@@ -105,7 +105,11 @@ export class MaterializationGuard extends DurableObject<Env> {
         // A V2 project is owned exclusively by the convergence writer once it
         // is activated. Before activation, legacy queued targets must not let
         // the old coordinator write (or perpetually re-arm itself).
-        if (this.layoutMode === "v2") return;
+        // The V2 writer is inactive outside the explicit repair rollout, but
+        // a previously published V2 head can still certify committed work.
+        // Keep the retired writer idle while always delivering that harmless,
+        // idempotent finalization callback.
+        if (this.layoutMode === "v2") return true;
         const { coordinator } = this.coordinatorForSlice();
         const result = await coordinator.runNext(alarmInfo?.retryCount ?? 0);
         // A synchronous /materialize can finish the target before this alarm

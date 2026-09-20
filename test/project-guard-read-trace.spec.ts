@@ -1,8 +1,15 @@
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
+import type { Env } from "../src/env";
 import { DiagnosticProjectGuard } from "../src/durable/project-guard-diagnostics";
 import { SearchSyncProjectGuard } from "../src/durable/project-guard-search-sync";
 import { ProjectGuard } from "../src/durable/project-guard-neutral";
 import { ExecutionJournal } from "../src/execution/journal";
+import { machineCommitRecordPath, machineStatePath } from "../src/persistence/layout";
+import { ProjectRepository } from "../src/persistence/repository";
+import { commitFixture } from "./helpers/convergence-fixture";
+import { installDropboxMock } from "./helpers/mock-dropbox";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -92,4 +99,132 @@ it("reports a bounded unknown state instead of false receipt absence during a lo
   }
   const after = await guard.fetch(new Request("https://guard.internal/request-status?kind=transaction&request_id=TXN-1"));
   await expect(after.json()).resolves.toMatchObject({ status: "committed" });
+});
+
+it("fails closed instead of issuing a stale context when the snapshot reader stalls", async () => {
+  const projectId = "PRJ-8399";
+  const mock = installDropboxMock();
+  const record = commitFixture(projectId, 1)[0]!;
+  mock.files.set(machineCommitRecordPath(projectId, 1), JSON.stringify(record));
+  mock.files.set(machineStatePath(projectId), JSON.stringify(record.state));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  let release!: () => void;
+  const stalledSnapshot = new Promise<never>((resolve) => { release = resolve as unknown as () => void; });
+  await runInDurableObject(guard, async (instance) => {
+    const subject = instance as unknown as {
+      env: Env;
+      repository: ProjectRepository;
+      loadOrRecoverState(): Promise<unknown>;
+    };
+    subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+    await subject.loadOrRecoverState();
+    vi.spyOn(subject.repository, "readProjectState").mockImplementation(() => stalledSnapshot);
+  });
+  let finished = false;
+  const response = guard.fetch("https://project-guard.internal/mutation-context")
+    .then((value) => { finished = true; return value; });
+  try {
+    await vi.waitFor(() => expect(finished).toBe(true), { timeout: 2_500 });
+    expect((await response).status).toBe(503);
+    await expect((await response).json()).resolves.toMatchObject({ error: "canonical_unavailable" });
+  } finally {
+    release();
+  }
+});
+
+it("bounds a cold context read when the canonical snapshot reader stalls", async () => {
+  const projectId = "PRJ-8400";
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  let release!: () => void;
+  const stalledSnapshot = new Promise<never>((resolve) => { release = resolve as unknown as () => void; });
+  let readSnapshot!: ReturnType<typeof vi.spyOn>;
+  await runInDurableObject(guard, (instance) => {
+    const subject = instance as unknown as { env: Env; repository: ProjectRepository };
+    subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+    readSnapshot = vi.spyOn(subject.repository, "readProjectState").mockImplementation(() => stalledSnapshot);
+  });
+  let finished = false;
+  const response = guard.fetch("https://project-guard.internal/mutation-context")
+    .then((value) => { finished = true; return value; });
+  try {
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledOnce());
+    const concurrent = await guard.fetch("https://project-guard.internal/mutation-context");
+    expect(concurrent.status).toBe(503);
+    await expect(concurrent.json()).resolves.toMatchObject({ error: "canonical_read_busy" });
+    expect(readSnapshot).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(finished).toBe(true), { timeout: 2_500 });
+    expect((await response).status).toBe(503);
+  } finally {
+    release();
+  }
+});
+
+it("fails closed when it cannot verify the current snapshot against its commit suffix", async () => {
+  const projectId = "PRJ-8401";
+  const mock = installDropboxMock();
+  const record = commitFixture(projectId, 1)[0]!;
+  mock.files.set(machineCommitRecordPath(projectId, 1), JSON.stringify(record));
+  mock.files.set(machineStatePath(projectId), JSON.stringify(record.state));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  let release!: () => void;
+  const stalledRecord = new Promise<never>((resolve) => { release = resolve as unknown as () => void; });
+  await runInDurableObject(guard, async (instance) => {
+    const subject = instance as unknown as {
+      env: Env;
+      repository: ProjectRepository;
+      loadOrRecoverState(): Promise<unknown>;
+    };
+    subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+    await subject.loadOrRecoverState();
+    vi.spyOn(subject.repository, "readCommitRecord").mockImplementation(() => stalledRecord);
+  });
+  let finished = false;
+  const response = guard.fetch("https://project-guard.internal/mutation-context")
+    .then((value) => { finished = true; return value; });
+  try {
+    await vi.waitFor(() => expect(finished).toBe(true), { timeout: 2_500 });
+    expect((await response).status).toBe(503);
+  } finally {
+    release();
+  }
+});
+
+it("reads a short contiguous commit history when no canonical snapshot exists", async () => {
+  const projectId = "PRJ-8402";
+  const mock = installDropboxMock();
+  const records = commitFixture(projectId, 3);
+  for (const record of records) mock.files.set(machineCommitRecordPath(projectId, record.new_revision), JSON.stringify(record));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (instance) => {
+    (instance as unknown as { env: Env }).env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+  });
+  const response = await guard.fetch("https://project-guard.internal/mutation-context");
+  expect(response.status).toBe(200);
+  await expect(response.json()).resolves.toMatchObject({ canonical_state: { revision: 3 } });
+});
+
+it("does not sign a partial commit suffix when the shared read deadline expires", async () => {
+  const projectId = "PRJ-8403";
+  const mock = installDropboxMock();
+  const records = commitFixture(projectId, 129);
+  mock.files.set(machineStatePath(projectId), JSON.stringify(records[0]!.state));
+  for (const record of records.slice(1)) mock.files.set(machineCommitRecordPath(projectId, record.new_revision), JSON.stringify(record));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  let now = 1_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  await runInDurableObject(guard, (instance) => {
+    const subject = instance as unknown as { env: Env; repository: ProjectRepository };
+    subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+    const original = subject.repository.readCommitRecord.bind(subject.repository);
+    let reads = 0;
+    vi.spyOn(subject.repository, "readCommitRecord").mockImplementation(async (id, revision) => {
+      const result = await original(id, revision);
+      reads += 1;
+      if (reads === 128) now += 2_000;
+      return result;
+    });
+  });
+  const response = await guard.fetch("https://project-guard.internal/mutation-context");
+  expect(response.status).toBe(503);
+  await expect(response.json()).resolves.toMatchObject({ error: "canonical_unavailable" });
 });

@@ -7,6 +7,8 @@ import type { Receipt } from "../src/domain/receipt";
 import {
   machineCommitRecordPath,
   machineMaterializationHeadPath,
+  machineMaterializationRecordPath,
+  convergenceProgressPath,
   workspaceProjectRoot
 } from "../src/persistence/layout";
 import { createProductionPersistence } from "../src/persistence/production-factory";
@@ -253,5 +255,79 @@ describe("ProjectGuard asynchronous materialization", () => {
     );
 
     expect(response.status).toBe(200);
+  });
+
+  it("rearms finalization when fleet reconciliation finds an already-current V2 head", async () => {
+    const projectId = "PRJ-3607";
+    const projectionStub = materializationStub(projectId);
+    await createSyntheticProject(projectId, "fleet-finalization", "TXN-MATERIAL-PG-3607-CREATE");
+    await materializeThroughContinuations(projectId);
+
+    await runInDurableObject(projectionStub, async (instance, state) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = undefined;
+      await state.storage.deleteAlarm();
+    });
+
+    const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
+      "https://project-guard.internal/scheduled-reconcile-materialization",
+      { method: "POST" }
+    );
+    expect(response.status).toBe(200);
+
+    await runInDurableObject(projectionStub, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("does not rearm finalization from a head whose completed record is not canonically bound", async () => {
+    const projectId = "PRJ-3608";
+    const projectionStub = materializationStub(projectId);
+    await createSyntheticProject(projectId, "fleet-divergent-head", "TXN-MATERIAL-PG-3608-CREATE");
+    await materializeThroughContinuations(projectId);
+    const recordPath = machineMaterializationRecordPath(projectId, 1, CURRENT_PROJECTION_VERSION);
+    const record = JSON.parse(dropbox.files.get(recordPath) ?? "{}");
+    dropbox.files.set(recordPath, JSON.stringify({
+      ...record,
+      source_event_id: "EVT-999999",
+      coalesced_revisions: [1]
+    }));
+
+    await runInDurableObject(projectionStub, async (instance, state) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = undefined;
+      await state.storage.deleteAlarm();
+    });
+
+    const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
+      "https://project-guard.internal/scheduled-reconcile-materialization",
+      { method: "POST" }
+    );
+    expect(response.status).toBe(200);
+
+    await runInDurableObject(projectionStub, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("rearms a canonically bound V2 head even when no convergence journal remains", async () => {
+    const projectId = "PRJ-3609";
+    const projectionStub = materializationStub(projectId);
+    await createSyntheticProject(projectId, "fleet-without-journal", "TXN-MATERIAL-PG-3609-CREATE");
+    await materializeThroughContinuations(projectId);
+    dropbox.files.delete(convergenceProgressPath(projectId));
+
+    await runInDurableObject(projectionStub, async (instance, state) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = undefined;
+      await state.storage.deleteAlarm();
+    });
+
+    const response = await testEnv.PROJECT_GUARD.getByName(projectId).fetch(
+      "https://project-guard.internal/scheduled-reconcile-materialization",
+      { method: "POST" }
+    );
+    expect(response.status).toBe(200);
+
+    await runInDurableObject(projectionStub, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
   });
 });

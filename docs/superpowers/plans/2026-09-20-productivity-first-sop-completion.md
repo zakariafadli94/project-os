@@ -60,6 +60,18 @@
 
 **Gate:** all five documents communicate their real approved status, with history preserved.
 
+### Task 4a: Close the governed archive-relocation gap before promising cleanup
+
+The PRJ-0003 anomaly filed in PRJ-0002 `INPUTS/PRJ-0003-20260920-GOVERNED-ARCHIVE-RELOCATION-GAP.md` shows that existing `working.supersede` cannot move an unchanged current document to `ARCHIVES`, and no generic typed move is available for REVIEW or published DELIVERABLES. This is a reported anomaly to investigate, not permission to invent a business archival decision.
+
+1. Inventory the exact current document identities, versions, zones and desired destinations; distinguish outdated versions from documents still approved or under review.
+2. Confirm the governing archival rule and the founder-approved disposition for any ambiguous current item. Keep those items in place until that decision exists.
+3. Add one minimal typed, authority-checked relocation operation only for demonstrated missing cases. Preserve immutable history, document identity, receipts and idempotency; forbid arbitrary path writes and cross-project moves.
+4. Prove one current WORKING, REVIEW and published item can be relocated only when eligible, with an exact receipt and physical finalization. Prove duplicate and stale-version requests do not duplicate or delete content.
+5. Reconcile the 17 PRJ-0003 candidates through separately traceable governed operations after refreshing canonical state. Never directly move Dropbox files.
+
+**Gate:** governed archival is possible without a bypass, and each actual relocation has a committed receipt and verified destination; unresolved business choices remain explicit.
+
 ## Phase 2 — Finish the open SOP programme
 
 ### Task 5: Reconcile the accepted coverage matrix with deployed code
@@ -70,7 +82,7 @@ Refresh the existing SOP matrix against production and mark each G01–G14 guara
 
 ### Task 6: Close technical enforcement gaps, smallest first
 
-Complete only matrix-backed deficiencies in the accepted SOP plan Tasks 1–6: rule lifecycle/authority, cumulative global+local evaluation, common admission on every entry including admin/inbox/fallback, exact-version approvals and exceptions, post-execution evidence/finalization, document/package/phase controls, and external Dropbox drift detection. Each gap gets one red test, minimal implementation, targeted green test and a separate reviewable commit. Do not activate an unequipped rule.
+Complete only matrix-backed deficiencies in the accepted SOP plan Tasks 1–6: rule lifecycle/authority, cumulative global+local evaluation, common admission on every entry including admin/inbox/fallback, exact-version approvals and exceptions, post-execution evidence/finalization, document/package/phase controls (including Task 4a), and external Dropbox drift detection. Each gap gets one red test, minimal implementation, targeted green test and a separate reviewable commit. Do not activate an unequipped rule.
 
 **Gate:** no declared active rule can be bypassed through a supported entry, and unsupported obligations remain visibly `accepted_unenforced`.
 

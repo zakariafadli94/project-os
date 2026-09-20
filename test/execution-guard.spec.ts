@@ -383,6 +383,83 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await status.json()).toMatchObject({ status: "finalizing", terminal: false, receipt_ref: expect.any(String) });
   });
 
+  it("certifies a committed revision covered by a verified historical projection jump", async () => {
+    const projectId = "PRJ-8299";
+    const { guard } = await setup(projectId);
+    const requestIds: string[] = [];
+    for (let revision = 2; revision <= 7; revision += 1) {
+      const requestId = `TXN-EXECUTION-8299-${revision}`;
+      requestIds.push(requestId);
+      const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context");
+      const { context } = await contextResponse.json<{ context: never }>();
+      const transaction = {
+        schema_version: "1.0", transaction_id: requestId, project_id: projectId,
+        base_revision: revision - 1, operation: "research.add", created_at: "2026-09-20T18:00:00.000Z",
+        payload: { research_id: `RES-HIST${revision}`, title: `Historical jump ${revision}`, body: "Canonical evidence" }
+      };
+      const committed = await guard.fetch("https://project-guard.internal/transaction", {
+        method: "POST", body: JSON.stringify(encodeAdmission(transaction, context))
+      });
+      expect(await committed.json()).toMatchObject({ status: "committed", new_revision: revision });
+    }
+
+    const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
+    const baseline = await repository.readCommitRecord(projectId, 1);
+    const record = await repository.readCommitRecord(projectId, 7);
+    if (!baseline || !record) throw new Error("expected_historical_jump_record");
+    await repository.writeCompletedMaterializationRecord({
+      schema_version: "1.0", project_id: projectId, target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION,
+      record_kind: "snapshot", parent: null, chain_depth: 0, workspace_location: "active",
+      outputs: {}, removed_outputs: [], total_output_count: 0, result_root_hash: "c".repeat(64),
+      coalesced_revisions: [], source_event_id: baseline.event.event_id, completed_at: "2026-09-20T17:59:00.000Z"
+    });
+    const materialization: CompletedMaterializationRecord = {
+      schema_version: "1.0", project_id: projectId, target_revision: 7, projection_version: CURRENT_PROJECTION_VERSION,
+      record_kind: "delta", parent: { target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION }, chain_depth: 1,
+      workspace_location: "active", outputs: {}, removed_outputs: [], total_output_count: 0, result_root_hash: "d".repeat(64),
+      // This is historical data from before gap coverage was recorded. The
+      // complete canonical jump still physically reflects revision 2.
+      coalesced_revisions: [3, 4, 5, 6], source_event_id: record.event.event_id,
+      completed_at: "2026-09-20T18:01:00.000Z"
+    };
+    await repository.writeCompletedMaterializationRecord(materialization);
+    await repository.writeMaterializationHead({
+      schema_version: "1.0", project_id: projectId, target_revision: 7, projection_version: CURRENT_PROJECTION_VERSION,
+      workspace_location: "active", record_path: machineMaterializationRecordPath(projectId, 7, CURRENT_PROJECTION_VERSION),
+      result_root_hash: materialization.result_root_hash, completed_at: materialization.completed_at
+    });
+    // A callback may have completed its old scan before this coverage repair
+    // is deployed. Its persisted cursor must be rebuilt, not trusted forever.
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.put("materialization-finalization-work", {
+        head: {
+          target_revision: 7,
+          projection_version: CURRENT_PROJECTION_VERSION,
+          result_root_hash: materialization.result_root_hash,
+          completed_at: materialization.completed_at
+        },
+        next_generation: null,
+        previous_child: null,
+        scan_complete: true,
+        candidates: []
+      });
+    });
+
+    let finalization = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target_revision: 7, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    while (finalization.status === 202) {
+      finalization = await guard.fetch("https://project-guard.internal/finalize-materialization", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ target_revision: 7, projection_version: CURRENT_PROJECTION_VERSION })
+      });
+    }
+    expect(finalization.status).toBe(200);
+    const status = await guard.fetch(`https://project-guard.internal/execution-status?kind=transaction&request_id=${requestIds[0]}`);
+    expect(await status.json()).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
+  });
+
   it("finalizes task.complete 268 to 269 only from its committed record and current materialization proof", async () => {
     const projectId = "PRJ-8301";
     const mock = installDropboxMock();

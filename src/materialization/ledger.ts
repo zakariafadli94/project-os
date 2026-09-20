@@ -231,12 +231,17 @@ export class MaterializationLedger {
 
     let coalesced = parseRevisionList(row.active_coalesced_json);
     if (
-      coalesced.length === 0
-      && row.head_revision !== null
+      row.head_revision !== null
       && row.head_projection_version === row.requested_projection_version
       && row.requested_revision > row.head_revision + 1
     ) {
-      coalesced = integerRange(row.head_revision + 1, row.requested_revision - 1);
+      // A persisted coalescence tail from an interrupted older writer is not
+      // sufficient evidence: every revision after the verified head must be
+      // represented before a newer target is published.
+      coalesced = uniqueSorted([
+        ...coalesced,
+        ...integerRange(row.head_revision + 1, row.requested_revision - 1)
+      ]);
     }
 
     this.storage.transactionSync(() => {

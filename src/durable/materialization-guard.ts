@@ -124,7 +124,10 @@ export class MaterializationGuard extends DurableObject<Env> {
       // Never retain our queue while calling back into its serialized boundary.
       if (notify) {
         notifying = true;
-        await this.notifyProjectGuardOfCurrentHead();
+        const finalized = await this.notifyProjectGuardOfCurrentHead();
+        if (!finalized) {
+          await this.serialize(() => this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS));
+        }
       }
     } catch (error) {
       return this.serialize(async () => {
@@ -594,13 +597,13 @@ export class MaterializationGuard extends DurableObject<Env> {
     return Response.json(response);
   }
 
-  private async notifyProjectGuardOfCurrentHead(): Promise<void> {
+  private async notifyProjectGuardOfCurrentHead(): Promise<boolean> {
     const repository = new ProjectRepository(
       createProductionPersistence(this.env, this.projectId),
       this.layoutMode
     );
     const head = await this.serialize(() => repository.readMaterializationHead(this.projectId));
-    if (!head) return;
+    if (!head) return true;
     const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
       "https://project-guard.internal/finalize-materialization",
       {
@@ -612,8 +615,10 @@ export class MaterializationGuard extends DurableObject<Env> {
         })
       }
     );
+    if (response.status === 202) return false;
     if (!response.ok) throw new Error(`ProjectGuard finalization notification returned ${response.status}`);
     await this.serialize(() => this.acknowledgeVerifiedHumanHead(head.target_revision, head.projection_version));
+    return true;
   }
 
   /**

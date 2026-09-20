@@ -227,7 +227,7 @@ describe("MaterializationGuard isolation boundary", () => {
       (instance as any).coordinatorForSlice = () => ({
         coordinator: { runNext: async () => ({ completed: false, more_work: false }) }
       });
-      notify = vi.spyOn(instance as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(undefined);
+      notify = vi.spyOn(instance as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(true);
       await state.storage.setAlarm(Date.now() + 1_000);
     });
 
@@ -242,7 +242,7 @@ describe("MaterializationGuard isolation boundary", () => {
       env: {},
       queue: Promise.resolve()
     }) as MaterializationGuard;
-    const notify = vi.spyOn(materialization as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(undefined);
+    const notify = vi.spyOn(materialization as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(true);
 
     await materialization.alarm();
 

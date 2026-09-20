@@ -64,7 +64,11 @@ async function qualifyViaCommitInventory(f: Awaited<ReturnType<typeof fixture>>)
 async function reviewInventoryFixture(filesPerProject: number, faults: DropboxMockFault[] = []) {
   const f = await fixture({ resource_scope: { resource_types: ["artifact"], zones: ["REVIEW"] }, parameters: { allowed_zones: ["REVIEW"] } }, false, faults);
   const registry = JSON.parse(f.mock.files.get(machineRegistryJsonPath())!);
-  for (const project_id of ["PRJ-0002", "PRJ-0003", "PRJ-0007"]) {
+  // Durable Object storage outlives individual fixtures in the suite. Allocate
+  // new synthetic projects so this I/O measurement cannot inherit another
+  // test's cached ProjectGuard state.
+  const syntheticProjectIds = Array.from({ length: 3 }, () => `PRJ-${String(++projectNumber).padStart(4, "0")}`);
+  for (const project_id of syntheticProjectIds) {
     registry.projects.push({ project_id, slug: "synthetic-convergence", status: "active" });
     for (const commit of commitFixture(project_id, 2)) await f.mock.writeExternal(machineCommitRecordPath(project_id, commit.new_revision), JSON.stringify(commit));
   }

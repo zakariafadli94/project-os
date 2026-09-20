@@ -65,6 +65,39 @@ async function finalizeSyntheticProjectCreate(projectId: string, receipt: Receip
 describe("ProjectGuard crash-safe canonical commits", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("advances past failed transaction recoveries to later pending requests", async () => {
+    const projectId = "PRJ-1712";
+    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      for (let index = 1; index <= 5; index += 1) {
+        state.storage.sql.exec(
+          "INSERT INTO request_recovery (kind, request_id) VALUES ('transaction', ?)",
+          `TXN-FAIRNESS-1712-${index}`
+        );
+      }
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+    let wakeDuringProviderFailure: number | null = null;
+    await runInDurableObject(stub, (instance, state) => {
+      const ledger = (instance as unknown as { transactionRequests: {
+        readRecoverableTransaction(projectId: string, requestId: string): Promise<unknown>
+      } }).transactionRequests;
+      vi.spyOn(ledger, "readRecoverableTransaction").mockImplementationOnce(async () => {
+        wakeDuringProviderFailure = await state.storage.getAlarm();
+        throw new Error("transient_provider_failure");
+      });
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(wakeDuringProviderFailure).not.toBeNull();
+    expect(await runInDurableObject(stub, async (_instance, state) => state.storage.getAlarm())).not.toBeNull();
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const attempts = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{
+      request_id: string; count: number
+    }>("SELECT request_id, count FROM request_recovery_failures WHERE kind = 'transaction' ORDER BY request_id").toArray());
+    expect(attempts).toHaveLength(5);
+    expect(attempts.at(-1)).toMatchObject({ request_id: "TXN-FAIRNESS-1712-5", count: 1 });
+  });
+
   it("resumes the exact transaction after a failed commit write without caller replay", async () => {
     const projectId = "PRJ-1703";
     const mock = installDropboxMock();

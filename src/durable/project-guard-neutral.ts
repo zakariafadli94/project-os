@@ -234,6 +234,10 @@ export class ProjectGuard extends DurableObject<Env> {
         kind TEXT NOT NULL,
         request_id TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS transaction_recovery_cursor (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        request_id TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS project_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         state_json TEXT NOT NULL
@@ -1083,12 +1087,30 @@ export class ProjectGuard extends DurableObject<Env> {
   private async resumePendingTransactionRecovery(): Promise<void> {
     const projectId = this.ctx.id.name;
     if (!projectId) return;
-    const pending = this.ctx.storage.sql.exec<RecoveryRequestRow>(
+    const cursor = this.ctx.storage.sql.exec<{ request_id: string }>(
+      "SELECT request_id FROM transaction_recovery_cursor WHERE singleton = 1"
+    ).toArray()[0]?.request_id;
+    const select = (condition: string, parameters: unknown[]) => this.ctx.storage.sql.exec<RecoveryRequestRow>(
       `SELECT r.kind, r.request_id FROM request_recovery r
        LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-       WHERE r.kind = 'transaction' AND COALESCE(f.stopped, 0) = 0
-       ORDER BY r.request_id LIMIT ?`, REQUEST_RECOVERY_BATCH_SIZE
+       WHERE r.kind = 'transaction' AND COALESCE(f.stopped, 0) = 0 ${condition}
+       ORDER BY r.request_id LIMIT ?`, ...parameters
     ).toArray();
+    const pending = cursor
+      ? select("AND r.request_id > ?", [cursor, REQUEST_RECOVERY_BATCH_SIZE])
+      : select("", [REQUEST_RECOVERY_BATCH_SIZE]);
+    if (cursor && pending.length < REQUEST_RECOVERY_BATCH_SIZE) {
+      pending.push(...select("AND r.request_id <= ?", [cursor, REQUEST_RECOVERY_BATCH_SIZE - pending.length]));
+    }
+    if (pending.length) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO transaction_recovery_cursor (singleton, request_id) VALUES (1, ?)
+         ON CONFLICT(singleton) DO UPDATE SET request_id = excluded.request_id`,
+        pending[pending.length - 1].request_id
+      );
+      // Preserve a wake-up even if an external provider call exhausts this alarm.
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+    }
     for (const item of pending) {
       try {
         let tx = await this.transactionRequests.readRecoverableTransaction(projectId, item.request_id);

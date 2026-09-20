@@ -185,6 +185,7 @@ export class ProjectGuard extends DurableObject<Env> {
   private readonly transactionRequests: TransactionRequestLedger;
   protected readonly layoutMode: LayoutMode;
   private queue: Promise<void> = Promise.resolve();
+  private queueDepth = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -288,7 +289,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "GET" && pathname === "/execution-status") {
-      return this.serialize(async () => {
+      return this.readWhenIdle(async () => {
         const projectId = this.ctx.id.name;
         const kind = url.searchParams.get("kind");
         const requestId = url.searchParams.get("request_id");
@@ -300,7 +301,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "GET" && pathname === "/request-status") {
-      return this.serialize(() => this.handleRequestStatus(url));
+      return this.readWhenIdle(() => this.handleRequestStatus(url));
     }
 
     if (request.method === "POST" && pathname === "/finalize-materialization") {
@@ -362,7 +363,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "GET" && pathname === "/receipt") {
-      return this.serialize(() => this.handleReceiptRead(new URL(request.url)));
+      return this.readWhenIdle(() => this.handleReceiptRead(new URL(request.url)));
     }
 
     if (request.method !== "POST" || pathname !== "/transaction") {
@@ -2407,7 +2408,20 @@ export class ProjectGuard extends DurableObject<Env> {
     };
   }
 
+  /** Do not turn a racing, not-yet-persisted receipt into a false 404. A
+   * pending mutation yields a prompt, explicitly unknown status instead. */
+  private readWhenIdle(operation: () => Promise<Response>): Promise<Response> {
+    if (this.queueDepth > 0) {
+      return Promise.resolve(Response.json({ status: "unavailable", code: "PROJECT_OS_READ_BUSY", retry_after_seconds: 1 }, {
+        status: 503,
+        headers: { "Retry-After": "1" }
+      }));
+    }
+    return this.serialize(operation);
+  }
+
   protected async serialize<T>(operation: () => Promise<T>): Promise<T> {
+    this.queueDepth += 1;
     const previous = this.queue;
     let release!: () => void;
     this.queue = new Promise<void>((resolve) => { release = resolve; });
@@ -2415,6 +2429,7 @@ export class ProjectGuard extends DurableObject<Env> {
     try {
       return await operation();
     } finally {
+      this.queueDepth -= 1;
       release();
     }
   }

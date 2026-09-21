@@ -7,6 +7,7 @@ import { SearchSyncProjectGuard } from "../src/durable/project-guard-search-sync
 import { ProjectGuard } from "../src/durable/project-guard-neutral";
 import { ExecutionJournal } from "../src/execution/journal";
 import { machineCommitRecordPath, machineStatePath } from "../src/persistence/layout";
+import type { ProviderRequestScope } from "../src/persistence/provider/contract";
 import { ProjectRepository } from "../src/persistence/repository";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
@@ -115,9 +116,13 @@ it("fails closed instead of issuing a stale context when the snapshot reader sta
       env: Env;
       repository: ProjectRepository;
       loadOrRecoverState(): Promise<unknown>;
+      canonicalContextReadDeadlineMs(): number;
+      canonicalContextRepository(projectId: string, scope: ProviderRequestScope): ProjectRepository;
     };
     subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
     await subject.loadOrRecoverState();
+    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(20);
+    vi.spyOn(subject, "canonicalContextRepository").mockReturnValue(subject.repository);
     vi.spyOn(subject.repository, "readProjectState").mockImplementation(() => stalledSnapshot);
   });
   let finished = false;
@@ -139,8 +144,15 @@ it("bounds a cold context read when the canonical snapshot reader stalls", async
   const stalledSnapshot = new Promise<never>((resolve) => { release = resolve as unknown as () => void; });
   let readSnapshot!: ReturnType<typeof vi.spyOn>;
   await runInDurableObject(guard, (instance) => {
-    const subject = instance as unknown as { env: Env; repository: ProjectRepository };
+    const subject = instance as unknown as {
+      env: Env;
+      repository: ProjectRepository;
+      canonicalContextReadDeadlineMs(): number;
+      canonicalContextRepository(projectId: string, scope: ProviderRequestScope): ProjectRepository;
+    };
     subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(20);
+    vi.spyOn(subject, "canonicalContextRepository").mockReturnValue(subject.repository);
     readSnapshot = vi.spyOn(subject.repository, "readProjectState").mockImplementation(() => stalledSnapshot);
   });
   let finished = false;
@@ -159,6 +171,51 @@ it("bounds a cold context read when the canonical snapshot reader stalls", async
   }
 });
 
+it("releases a timed-out canonical read so the next fresh context can proceed", async () => {
+  const projectId = "PRJ-8404";
+  const mock = installDropboxMock();
+  const record = commitFixture(projectId, 1)[0]!;
+  mock.files.set(machineCommitRecordPath(projectId, 1), JSON.stringify(record));
+  mock.files.set(machineStatePath(projectId), JSON.stringify(record.state));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  let scope: ProviderRequestScope | null = null;
+  let wasAborted = false;
+
+  await runInDurableObject(guard, async (instance) => {
+    const subject = instance as unknown as {
+      env: Env;
+      repository: ProjectRepository;
+      canonicalContextReadDeadlineMs(): number;
+      canonicalContextRepository(projectId: string, scope: ProviderRequestScope): ProjectRepository;
+    };
+    subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(20);
+    vi.spyOn(subject, "canonicalContextRepository").mockImplementation((_projectId, nextScope) => {
+      scope = nextScope;
+      scope.signal.addEventListener("abort", () => { wasAborted = true; }, { once: true });
+      return subject.repository;
+    });
+    const original = subject.repository.readProjectState.bind(subject.repository);
+    let reads = 0;
+    vi.spyOn(subject.repository, "readProjectState").mockImplementation((id) => {
+      reads += 1;
+      if (reads > 1) return original(id);
+      return new Promise((_, reject) => {
+        scope!.signal.addEventListener("abort", () => reject(scope!.signal.reason), { once: true });
+      });
+    });
+  });
+
+  const first = await guard.fetch("https://project-guard.internal/mutation-context");
+  expect(first.status).toBe(503);
+  expect(wasAborted).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const second = await guard.fetch("https://project-guard.internal/mutation-context");
+  expect(second.status).toBe(200);
+  await expect(second.json()).resolves.toMatchObject({ canonical_state: { revision: 1 } });
+});
+
 it("fails closed when it cannot verify the current snapshot against its commit suffix", async () => {
   const projectId = "PRJ-8401";
   const mock = installDropboxMock();
@@ -173,9 +230,13 @@ it("fails closed when it cannot verify the current snapshot against its commit s
       env: Env;
       repository: ProjectRepository;
       loadOrRecoverState(): Promise<unknown>;
+      canonicalContextReadDeadlineMs(): number;
+      canonicalContextRepository(projectId: string, scope: ProviderRequestScope): ProjectRepository;
     };
     subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
     await subject.loadOrRecoverState();
+    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(20);
+    vi.spyOn(subject, "canonicalContextRepository").mockReturnValue(subject.repository);
     vi.spyOn(subject.repository, "readCommitRecord").mockImplementation(() => stalledRecord);
   });
   let finished = false;
@@ -213,8 +274,15 @@ it("does not sign a partial commit suffix when the shared read deadline expires"
   let now = 1_000_000;
   vi.spyOn(Date, "now").mockImplementation(() => now);
   await runInDurableObject(guard, (instance) => {
-    const subject = instance as unknown as { env: Env; repository: ProjectRepository };
+    const subject = instance as unknown as {
+      env: Env;
+      repository: ProjectRepository;
+      canonicalContextReadDeadlineMs(): number;
+      canonicalContextRepository(projectId: string, scope: ProviderRequestScope): ProjectRepository;
+    };
     subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(2_000);
+    vi.spyOn(subject, "canonicalContextRepository").mockReturnValue(subject.repository);
     const original = subject.repository.readCommitRecord.bind(subject.repository);
     let reads = 0;
     vi.spyOn(subject.repository, "readCommitRecord").mockImplementation(async (id, revision) => {

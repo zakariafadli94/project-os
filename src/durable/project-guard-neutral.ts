@@ -215,10 +215,10 @@ export class ProjectGuard extends DurableObject<Env> {
   protected readonly layoutMode: LayoutMode;
   private queue: Promise<void> = Promise.resolve();
   private queueDepth = 0;
-  /** A timed-out provider read may still be in flight. Keep one owner until
-   * it settles so retries cannot turn one slow Dropbox operation into a herd. */
-  private contextReadPending: Promise<void> | null = null;
-  private contextProviderReadCount = 0;
+  /** One fresh canonical read is shared by concurrent callers. This prevents a
+   * second legitimate request from being rejected while the first is verifying
+   * the same Dropbox state. */
+  private contextReadPending: Promise<ProjectState | null> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1418,9 +1418,6 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!projectId || projectId === AUTO_PROJECT_ID || !secret) {
       return Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
-    if (this.contextReadPending || this.contextProviderReadCount > 0) {
-      return Response.json({ error: "canonical_read_busy" }, { status: 503 });
-    }
     const includeState = new URL(request.url).searchParams.get("include_state") !== "false";
     // A context must be fresh or unavailable. The snapshot is an accelerator,
     // not an authority over newer immutable commits, so verify its bounded
@@ -1449,24 +1446,11 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async readContextSnapshot(repository: ProjectRepository, projectId: string): Promise<ProjectState | null> {
-    const source = repository.readProjectState(projectId);
-    this.contextProviderReadCount += 1;
-    void source.then(
-      () => undefined,
-      () => undefined
-    ).finally(() => { this.contextProviderReadCount -= 1; });
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      return await Promise.race([
-        source,
-        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("canonical_snapshot_deadline")), 1_000); })
-      ]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    return repository.readProjectState(projectId);
   }
 
   private async readFreshCanonicalState(projectId: string): Promise<ProjectState | null> {
+    if (this.contextReadPending) return this.contextReadPending;
     const deadline = Date.now() + this.canonicalContextReadDeadlineMs();
     const controller = new AbortController();
     const repository = this.canonicalContextRepository(projectId, {
@@ -1475,26 +1459,31 @@ export class ProjectGuard extends DurableObject<Env> {
       now: () => Date.now(),
       beforeHttp: () => undefined
     });
-    const pending = this.readCanonicalState(repository, projectId, deadline);
-    this.contextReadPending = pending.then(
-      () => undefined,
-      () => undefined
-    ).finally(() => { this.contextReadPending = null; });
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      return await Promise.race([
-        pending,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            const error = new Error("canonical_read_deadline");
-            controller.abort(error);
-            reject(error);
-          }, this.canonicalContextReadDeadlineMs());
-        })
-      ]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    const source = this.readCanonicalState(repository, projectId, deadline);
+    const pending = new Promise<ProjectState | null>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+        const error = new Error("canonical_read_deadline");
+        controller.abort(error);
+        reject(error);
+      }, this.canonicalContextReadDeadlineMs());
+      void source.then(
+        (state) => {
+          if (timer !== undefined) clearTimeout(timer);
+          timer = undefined;
+          resolve(state);
+        },
+        (error) => {
+          if (timer !== undefined) clearTimeout(timer);
+          timer = undefined;
+          reject(error);
+        }
+      );
+    });
+    const shared = pending.finally(() => {
+      if (this.contextReadPending === shared) this.contextReadPending = null;
+    });
+    this.contextReadPending = shared;
+    return shared;
   }
 
   private async readCanonicalState(repository: ProjectRepository, projectId: string, deadline: number): Promise<ProjectState | null> {

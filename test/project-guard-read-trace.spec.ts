@@ -6,6 +6,7 @@ import { DiagnosticProjectGuard } from "../src/durable/project-guard-diagnostics
 import { SearchSyncProjectGuard } from "../src/durable/project-guard-search-sync";
 import { ProjectGuard } from "../src/durable/project-guard-neutral";
 import { ExecutionJournal } from "../src/execution/journal";
+import type { ProjectState } from "../src/domain/project-state";
 import { machineCommitRecordPath, machineStatePath } from "../src/persistence/layout";
 import type { ProviderRequestScope } from "../src/persistence/provider/contract";
 import { ProjectRepository } from "../src/persistence/repository";
@@ -137,11 +138,14 @@ it("fails closed instead of issuing a stale context when the snapshot reader sta
   }
 });
 
-it("bounds a cold context read when the canonical snapshot reader stalls", async () => {
+it("coalesces concurrent context reads instead of rejecting a fresh read already in progress", async () => {
   const projectId = "PRJ-8400";
+  const mock = installDropboxMock();
+  const record = commitFixture(projectId, 1)[0]!;
+  mock.files.set(machineCommitRecordPath(projectId, 1), JSON.stringify(record));
   const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
-  let release!: () => void;
-  const stalledSnapshot = new Promise<never>((resolve) => { release = resolve as unknown as () => void; });
+  let release!: (state: ProjectState) => void;
+  const delayedSnapshot = new Promise<ProjectState>((resolve) => { release = resolve; });
   let readSnapshot!: ReturnType<typeof vi.spyOn>;
   await runInDurableObject(guard, (instance) => {
     const subject = instance as unknown as {
@@ -151,23 +155,20 @@ it("bounds a cold context read when the canonical snapshot reader stalls", async
       canonicalContextRepository(projectId: string, scope: ProviderRequestScope): ProjectRepository;
     };
     subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
-    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(20);
+    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(100);
     vi.spyOn(subject, "canonicalContextRepository").mockReturnValue(subject.repository);
-    readSnapshot = vi.spyOn(subject.repository, "readProjectState").mockImplementation(() => stalledSnapshot);
+    readSnapshot = vi.spyOn(subject.repository, "readProjectState").mockImplementation(() => delayedSnapshot);
   });
-  let finished = false;
-  const response = guard.fetch("https://project-guard.internal/mutation-context")
-    .then((value) => { finished = true; return value; });
+  const first = guard.fetch("https://project-guard.internal/mutation-context");
   try {
     await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledOnce());
-    const concurrent = await guard.fetch("https://project-guard.internal/mutation-context");
-    expect(concurrent.status).toBe(503);
-    await expect(concurrent.json()).resolves.toMatchObject({ error: "canonical_read_busy" });
+    const second = guard.fetch("https://project-guard.internal/mutation-context");
     expect(readSnapshot).toHaveBeenCalledOnce();
-    await vi.waitFor(() => expect(finished).toBe(true), { timeout: 2_500 });
-    expect((await response).status).toBe(503);
+    release(record.state);
+    expect((await first).status).toBe(200);
+    expect((await second).status).toBe(200);
   } finally {
-    release();
+    release(record.state);
   }
 });
 

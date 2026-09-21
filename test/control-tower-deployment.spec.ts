@@ -26,6 +26,7 @@ describe("Control Tower deployment policy", () => {
     expect(combined).toContain("GITHUB_CLIENT_ID");
     expect(combined).toContain("GITHUB_CLIENT_SECRET");
     expect(combined).toContain("OAUTH_COOKIE_ENCRYPTION_KEY");
+    expect(config).toContain("GITHUB_CLIENT_ID");
   });
 
   it("qualifies only synthetic PRJ-0008 and proves OAuth denial plus authenticated tools", async () => {

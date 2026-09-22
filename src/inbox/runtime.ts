@@ -1,8 +1,9 @@
 import { isReviewCandidate } from "../domain/artifact-write";
 import type { ArtifactWriteReceipt, ArtifactWriteRequest } from "../domain/artifact-write";
+import type { Transaction } from "../domain/transaction";
 import { binaryArtifactPolicyViolation } from "../artifacts/policy";
 import type { Env } from "../env";
-import { AdmissionError, type MutationContext } from "../admission/mutation-context";
+import { AdmissionError, parseMutationContextOrNull, type MutationContext } from "../admission/mutation-context";
 import { executeTransactionWithContinuity } from "../index-neutral";
 import { parseLayoutMode, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
@@ -30,7 +31,12 @@ export async function processDurableInbox(env: Env): Promise<DurableInboxProcess
   const transactionSummary = await processTransactionInbox(
     persistence.objects,
     mode,
-    (transaction, context) => executeTransactionWithContinuity(env, transaction, undefined, context),
+    async (transaction, context) => executeTransactionWithContinuity(
+      env,
+      transaction,
+      undefined,
+      await resolveInboxTransactionContext(env, transaction, context)
+    ),
     { respectRetryBackoff: true }
   );
   const artifactSummary = await processArtifactInbox(
@@ -54,6 +60,38 @@ export async function processDurableInbox(env: Env): Promise<DurableInboxProcess
     processed: transactionSummary.processed + artifactSummary.processed + referralSummary.processed,
     failed: transactionSummary.failed + artifactSummary.failed + referralSummary.failed
   };
+}
+
+/**
+ * The official Dropbox inbox is a server-owned ingress boundary.  Old and
+ * connector-limited clients can submit a typed request there, but never hold
+ * a signing secret.  Obtain the short-lived context immediately before the
+ * normal ProjectGuard admission; direct HTTP routes remain strict.
+ */
+export async function resolveInboxTransactionContext(
+  env: Pick<Env, "PROJECT_GUARD" | "INGRESS_TOKEN">,
+  transaction: Transaction,
+  context?: MutationContext | null
+): Promise<MutationContext | null> {
+  // Project creation is authorized by RegistryGuard, which allocates the
+  // project ID.  It never has a project-local mutation context.
+  if (context || transaction.operation === "project.create") return context ?? null;
+
+  const response = await env.PROJECT_GUARD.getByName(transaction.project_id).fetch(
+    "https://project-guard.internal/mutation-context?include_state=false",
+    { headers: { authorization: `Bearer ${env.INGRESS_TOKEN}` } }
+  );
+  if (!response.ok) throw new AdmissionError("canonical_unavailable", 503);
+
+  let body: { context?: unknown };
+  try {
+    body = await response.json<{ context?: unknown }>();
+  } catch {
+    throw new AdmissionError("canonical_unavailable", 503);
+  }
+  const fresh = parseMutationContextOrNull(body.context ?? null);
+  if (!fresh) throw new AdmissionError("canonical_unavailable", 503);
+  return fresh;
 }
 
 async function routeArtifact(env: Env, artifact: ArtifactWriteRequest, context: MutationContext | null = null): Promise<ArtifactWriteReceipt> {

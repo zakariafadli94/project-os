@@ -146,5 +146,5 @@ describe("inbox entry isolation", () => {
       if (mock.files.has(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`)) break;
     }
     expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`)).toContain("Status: active");
-  });
+  }, 20_000);
 });

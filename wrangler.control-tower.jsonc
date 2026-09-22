@@ -8,6 +8,7 @@
     { "binding": "OAUTH_KV", "id": "7625d95ddb6c4e578a5bd2e9ed333f63" }
   ],
   "vars": {
+    "GITHUB_CLIENT_ID": "Ov23liAxDCx45Iwn8kde",
     "CONTROL_TOWER_PUBLIC_URL": "https://project-os-control-tower.zakaria-fadli-94.workers.dev"
   },
   "durable_objects": {

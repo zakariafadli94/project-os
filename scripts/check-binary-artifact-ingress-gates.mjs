@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 const config = await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8");
 const publicIngress = await readFile(new URL("../src/index-neutral.ts", import.meta.url), "utf8");
 const inboxIngress = await readFile(new URL("../src/inbox/runtime.ts", import.meta.url), "utf8");
+const artifactInboxIngress = inboxIngress.split("async function routeArtifact(")[1] ?? "";
 const operating = await readFile(new URL("../src/render/operating.ts", import.meta.url), "utf8");
 const deployment = await readFile(new URL("../docs/deployment.md", import.meta.url), "utf8");
 const dropboxClient = await readFile(new URL("../src/persistence/providers/dropbox/client.ts", import.meta.url), "utf8");
@@ -22,7 +23,7 @@ const requireBefore = (value, first, second, message) => {
 requireMatch(config, /"PROJECT_OS_BINARY_ARTIFACT_INGRESS_MODE"\s*:\s*"off"/, "binary artifact ingress must remain disabled by default");
 requireMatch(config, /"PROJECT_OS_BINARY_ARTIFACT_MAX_BYTES"\s*:\s*"10485760"/, "binary artifact ingress must retain the reviewed 10 MiB default limit");
 requireBefore(publicIngress, "binaryArtifactPolicyViolation(env, artifact)", "routeArtifact(env, artifact, mutationContext)", "public ingress must enforce binary policy before ProjectGuard routing");
-requireBefore(inboxIngress, "binaryArtifactPolicyViolation(env, artifact)", "env.PROJECT_GUARD.getByName", "Dropbox inbox must enforce binary policy before ProjectGuard routing");
+requireBefore(artifactInboxIngress, "binaryArtifactPolicyViolation(env, artifact)", "env.PROJECT_GUARD.getByName", "Dropbox inbox must enforce binary policy before ProjectGuard routing");
 requireMatch(operating, /OPERATING_CONTRACT_VERSION\s*=\s*3/, "operating contract version 3 must carry the persistence preflight");
 requireMatch(operating, /LOCAL_GENERATED → STAGED → SUBMITTED → COMMITTED → CANONICAL_VERIFIED → ACCEPTED/, "operating contract must expose the full artifact evidence chain");
 requireMatch(deployment, /enablement is a separate, explicitly authorized production action/i, "deployment guide must separate code delivery from binary ingress activation");

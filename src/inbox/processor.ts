@@ -174,7 +174,12 @@ export async function processTransactionInbox(
         receipt = await executeTransaction(transaction, mutationContext);
       } catch (error) {
         if (error instanceof AdmissionError) {
-          if (error.code === "convergence_capacity_exceeded") {
+          if ([
+            "convergence_capacity_exceeded",
+            "canonical_unavailable",
+            "GLOBAL_GOVERNANCE_UNAVAILABLE",
+            "RULE_ADMISSION_STALE"
+          ].includes(error.code)) {
             summary.failed += 1;
             const diagnostic = await recordTransactionFailure(objects, mode, transaction, error);
             if (diagnostic.attempt_count >= MAX_RETRYABLE_INBOX_ATTEMPTS) {

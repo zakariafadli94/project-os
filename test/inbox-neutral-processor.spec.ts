@@ -150,6 +150,41 @@ it("terminally rejects an inbox transaction whose admission context cannot be re
   expect(objects.files.has(rejected.replace(/\.json$/, ".source.json"))).toBe(true);
 });
 
+it("retries a typed inbox transaction when canonical context is temporarily unavailable", async () => {
+  const objects = new FakeObjects();
+  const transaction = tx("TXN-INBOX-NEUTRAL-CONTEXT-0001", 7, "2026-09-01T11:06:00+01:00");
+  const incoming = `/PROJECT_OS/.project-os/transactions/incoming/${transaction.transaction_id}.json`;
+  const failure = `/PROJECT_OS/.project-os/transactions/failures/${transaction.transaction_id}.json`;
+  const rejected = `/PROJECT_OS/.project-os/transactions/rejected/${transaction.transaction_id}.json`;
+  objects.files.set(incoming, JSON.stringify(transaction));
+
+  const unavailable = await processTransactionInbox(objects, "v2", async () => {
+    throw new AdmissionError("canonical_unavailable", 503);
+  });
+  expect(unavailable).toEqual({ scanned: 1, processed: 0, failed: 1 });
+  expect(objects.files.get(incoming)).toBe(JSON.stringify(transaction));
+  expect(objects.files.has(rejected)).toBe(false);
+  expect(JSON.parse(objects.files.get(failure) ?? "null")).toMatchObject({
+    status: "retryable_failure",
+    attempt_count: 1,
+    message: "canonical_unavailable"
+  });
+
+  const recovered = await processTransactionInbox(objects, "v2", async () => ({
+    schema_version: "1.0",
+    transaction_id: transaction.transaction_id,
+    status: "committed",
+    project_id: transaction.project_id,
+    previous_revision: 7,
+    new_revision: 8,
+    event_id: "EVT-000008",
+    committed_at: transaction.created_at
+  }));
+  expect(recovered).toEqual({ scanned: 1, processed: 1, failed: 0 });
+  expect(objects.files.has(incoming)).toBe(false);
+  expect(objects.files.has(failure)).toBe(false);
+});
+
 it("keeps one inbox envelope pending when convergence capacity is temporarily exhausted", async () => {
   const objects = new FakeObjects();
   const transaction = tx("TXN-INBOX-NEUTRAL-CAPACITY-0001", 7, "2026-09-01T11:06:00+01:00");

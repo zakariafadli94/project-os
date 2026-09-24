@@ -2519,12 +2519,15 @@ export class ProjectGuard extends DurableObject<Env> {
       let processed = 0;
       while (processed < MATERIALIZATION_FINALIZATION_CERTIFICATE_BATCH_SIZE && work.candidates.length > 0) {
         const candidate = work.candidates.shift()!;
+        // Every candidate consumes the bounded slice, including missing or
+        // already-terminal work. Otherwise a large historical tail can hold
+        // the serialized ProjectGuard callback indefinitely.
+        processed += 1;
         const commit = await this.repository.readCommitRecord(projectId, candidate.revision);
         if (!commit || commit.receipt.status !== "committed" || commit.receipt.new_revision !== candidate.revision) continue;
         const journal = new ExecutionJournal(this.persistence, projectId, "transaction", commit.transaction.transaction_id);
         const before = await journal.status();
         if (!before || before.terminal) continue;
-        processed += 1;
         await this.finalizeMaterializedTransaction(journal, candidate);
         const after = await journal.status();
         if (after?.terminal && after.status === "finalized") {

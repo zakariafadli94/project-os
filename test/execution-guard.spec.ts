@@ -723,4 +723,77 @@ describe("canonical execution boundary in ProjectGuard", () => {
       expect(await journal.status()).toMatchObject({ status: "finalized", terminal: true, code: null });
     }
   });
+
+  it("bounds every examined finalization candidate, including missing commits", async () => {
+    const projectId = "PRJ-8298";
+    const { guard } = await setup(projectId);
+    const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
+    const completed: CompletedMaterializationRecord = {
+      schema_version: "1.0",
+      project_id: projectId,
+      target_revision: 1,
+      projection_version: CURRENT_PROJECTION_VERSION,
+      record_kind: "snapshot",
+      parent: null,
+      chain_depth: 0,
+      workspace_location: "active",
+      outputs: {},
+      removed_outputs: [],
+      total_output_count: 0,
+      result_root_hash: "a".repeat(64),
+      coalesced_revisions: [],
+      source_event_id: "EVT-000001",
+      completed_at: "2026-09-24T08:00:00.000Z"
+    };
+    await repository.writeCompletedMaterializationRecord(completed);
+    await repository.writeMaterializationHead({
+      schema_version: "1.0",
+      project_id: projectId,
+      target_revision: completed.target_revision,
+      projection_version: completed.projection_version,
+      workspace_location: completed.workspace_location,
+      record_path: machineMaterializationRecordPath(projectId, completed.target_revision, completed.projection_version),
+      result_root_hash: completed.result_root_hash,
+      completed_at: completed.completed_at
+    });
+    const candidates = [9001, 9002, 9003, 9004, 9005].map((revision) => ({
+      revision,
+      coverage: "explicit" as const,
+      materialization_revision: completed.target_revision,
+      projection_version: completed.projection_version,
+      result_root_hash: completed.result_root_hash,
+      completed_at: completed.completed_at,
+      source_event_id: completed.source_event_id
+    }));
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.put("materialization-finalization-work", {
+        coverage_version: 2,
+        head: {
+          target_revision: completed.target_revision,
+          projection_version: completed.projection_version,
+          result_root_hash: completed.result_root_hash,
+          completed_at: completed.completed_at
+        },
+        next_generation: null,
+        previous_child: null,
+        scan_complete: true,
+        candidates
+      });
+    });
+
+    const response = await runInDurableObject(guard, (instance) =>
+      (instance as unknown as { finalizeCurrentMaterialization(request: Request): Promise<Response> })
+        .finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+        }))
+    );
+
+    expect(response.status).toBe(202);
+    await runInDurableObject(guard, async (_instance, state) => {
+      const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
+      expect(work?.candidates).toEqual([expect.objectContaining({ revision: 9005 })]);
+    });
+  });
 });

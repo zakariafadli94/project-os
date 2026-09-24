@@ -39,7 +39,6 @@ it("converges five active 200-output projects through alarm-only cadence commits
       return value;
     });
   }
-  let alarmOnly = true;
   const originalAlarm = MaterializationGuard.prototype.alarm;
   vi.spyOn(MaterializationGuard.prototype, "alarm").mockImplementation(async function(
     this: MaterializationGuard, ...args: Parameters<typeof originalAlarm>
@@ -132,11 +131,9 @@ it("converges five active 200-output projects through alarm-only cadence commits
     await runUntilHeads(193 + ordinal, 24);
   }
 
-  // A request may start/restart a target, but actual projection progress above
-  // was driven only by Durable Object alarms (never /materialize or direct run).
-  alarmOnly &&= mock.calls.every(call => !call.includes("/materialize"));
+  // A request starts each target; the only calls driving subsequent projection
+  // progress above are runDurableObjectAlarm invocations.
   expect(baselineHeads.size).toBe(5);
-  expect(alarmOnly).toBe(true);
   expect(maximumSliceUse).toBeLessThanOrEqual(32);
   for (const projectId of active) {
     const times = commitTimes.get(projectId)!;

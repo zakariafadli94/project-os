@@ -80,6 +80,7 @@ async function materializeThroughContinuations(projectId: string): Promise<void>
     vi.setSystemTime(Math.max(Date.now(), dueAt));
     await runDurableObjectAlarm(stub);
   }
+  throw new Error("materialization_continuation_did_not_quiesce");
 }
 
 async function materializeUntil(projectId: string, reached: () => boolean): Promise<void> {

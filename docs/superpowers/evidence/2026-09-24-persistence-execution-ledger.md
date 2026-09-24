@@ -8,6 +8,7 @@ Environment: existing local Work and worktree; principal orchestration and three
 - Local HEAD at approval: `59a042c`; origin/main after fetch: `fe1eb15a49ee5baac855d49f5580335ac5f07ae1`.
 - Production /health: same main SHA, version `d18858f2-380d-45e6-aa24-a8ff8681a324`.
 - Control Tower deployments/version read through Wrangler: 100% version `fac275aa-7a0c-4209-a3b5-2315d59b97fb`, tag `git-cb9352645e63fd448727bd4771d01c47642ef2da`, created 2026-09-21T16:20:30.452Z. Guard and Tower therefore have distinct deployed revisions. GitHub PR-run lookup for Guard main SHA returned no rows (not proof of failed or absent CI).
+- Read-only GitHub REST follow-up resolved baseline CI: main `fe1eb15a` has successful CI run `35771710714` and successful deployment run `35771766910`.
 - Fresh context PRJ-0003 failed at Control Tower deadline: correlation `4d6ca3b2-0ecf-49dc-9292-4cfe6926dad2`.
 - Fresh SOP request-status failed at the same boundary: correlation `7f3d57fa-f2ab-4e9c-b0ca-bc134983077a`.
 - Fresh Dropbox reads: PRJ-0003 snapshot and materialization head 354/PV5; active/requested null and no pending obligations. PRJ-0007 head and human views 112. PRJ-0002 human views 170. These observations do not establish transport readiness.
@@ -17,21 +18,27 @@ Environment: existing local Work and worktree; principal orchestration and three
 
 | Lot | Owner | State | Next action / evidence |
 |---|---|---|---|
-| E0 | Principal | implemented | Both deployed versions observed; canonical baseline and SOP certificate read; 39 baseline tests pass; CI status unavailable from the two connector lookups, not assumed green |
-| E1 | Principal | implemented | 2c81ac3 plus blocked-code refinement; pure observation contract, six tests green; owner adapters and integrated typecheck pending |
-| E2 | A | active | 36a2a5e local receipt fast path; 28 targeted tests green; canonical cache-loss path and additive observations still pending review |
-| E3 | A | active | Monotone proven context baseline; 5-second/32-call shared budget |
-| E4 | B | active | 2c7691a independently rerun: 6 context tests + typecheck pass; JSON-escaped text boundary refinement requested before review closure |
-| E5 | B | not_started | Deadline and uncertain submission recovery |
-| E6 | C | active | Qualify create/fallback recovery; canonical business digest must exclude renewable admission envelope |
-| E7 | A | not_started | Budgets/checkpoints/wakes; candidate-count fix 59a042c exists |
-| E8 | C | not_started | Executable capacity and evidence-based obsolete closure |
-| E9 | B | not_started | Four-view publication proof |
-| E10 | C | not_started | Entry/approval continuity tests |
-| E11 | Principal | not_started | Capabilities and real client contract |
-| E12 | Principal + reviewers | not_started | Integrated qualification on fixed SHA |
+| E0 | Principal | reviewed | Both deployed versions observed; canonical baseline and SOP certificate read; 39 baseline tests pass; baseline CI/deploy verified through REST |
+| E1 | Principal | reviewed | b443ba7 adds explicit verified wake evidence after B review; 7 observation tests, 17 with fallback rerun green; owner adapters being integrated |
+| E2 | A | reviewed | 726073f; canonical cache-loss path, bounded observations and strict receipt bindings reviewed by C; principal final 39 tests green after kind allowlist/artifact intent consistency fixes |
+| E3 | A | reviewed | 4dbe2db; principal 31 tests pass: monotone proof, shared 5-second/32-call budget, newer checkpoint resume, no repeated checkpoint write |
+| E4 | B | reviewed | 2c7691a + fa0a23d + 5ef0f54; principal 8 context tests/typecheck pass; escaped text and project/revision binding regressions fixed |
+| E5 | B | reviewed | 7bc0214; C reviewed MCP and operator deadline correction; principal 37 targeted tests and typecheck passed before subsequent lots |
+| E6 | C | reviewed | de02d12 + fa0a23d + b443ba7 + e1a6ce6; principal 15 tests green, canonical cache loss/allocation/lost response and key rotation retain identity |
+| E7 | A | reviewed | f0e229b + eb31bf5: provider Retry-After and Dropbox timeout recovery; durable scoped legacy range cursor; PV6 coalescence gaps blocked visibly; no-progress finalization backoff/stop6 with intent preserved. Independent C review non-blocking; principal 59 E7/workload/cadence/sequence targeted tests and typecheck passed |
+| E8 | C | reviewed | 37d1183 quarantines proven missing file targets; 534ab4e includes actual capacity and covered-obligation checks. Principal reran 127 E8/E9 tests; provider failures remain retryable, no old cursor starvation |
+| E9 | B | reviewed | 534ab4e and 564f2bc: bounded canonical reconstruction, read-only diagnostics, four-view proof and 1000 eligible-reference paged scan. Warm-head provider drift now prevents acknowledgement; principal reran 64 E9 tests; stale scan checkpoint superseded by exact externally published head without head rewrite |
+| E10 | C | reviewed | 05f059e + 7ee4a1f: fresh strict admissions/domain refusals/payload collisions on four entries, frozen approval evidence survives lost acknowledgments then finalizes; real inbox capacity refusal preserves the exact request without artificial receipt; principal tests green and fault boundaries mapped |
+| E11 | Principal | locally_reviewed | 2a72d4f; B reviewed scopes/capabilities/errors; two findings corrected with five RED cases then 64 targeted tests green; final integration depends on E10 and real surfaces on E14 |
+| E12 | Principal + reviewers | active | Cost, alarm-only three-commit, 30-project/five-active 200-output projection and typed-shape cadence fixtures green. 704e952 qualifies a one-shot PV5→PV6 full rebuild (201 outputs), not steady-state 20 changed outputs/commit; 362ef97 adds synthetic writer-only 20-change/five-per-minute stress. Final-proof starvation (4ddf253), recovery queue mixing (ddc96d2) and outdated fixtures fixed. 6bcd205 binds fallback status to exact request digest, reviewed by B. Fifth integrated run on that code tree: 257 files/1,631 tests green. Typecheck, seven static gates, search-sync-off 4/4, both dry-runs and diff check green. Report in qualification evidence; CI on PR head still required |
 | E13 | Principal | not_started | Merge/deploy only after E12 |
 | E14 | Principal + C | not_started | Real client qualification, no active-user chat mutations |
 | E15 | Principal + C | not_started | Canonical closure and SOP remainder |
 
 No global completion claim until all required gates have evidence. Unknown production observations remain unknown.
+
+E12 preparation: `8173021` rejects JSON-RPC/MCP errors carried by HTTP 200 in deployment qualification. Principal six tests and typecheck passed; C independently reviewed helper and callers. An unauthenticated public probe remains explicitly insufficient for the real-client gate.
+
+Read-only transport recheck, before current changes deploy: both the native `mcp__project_os_control_tower` handle and connected-app `mcp__codex_apps` handle returned the SOP request's committed receipt and finalized/terminal execution on 2026-09-24. This confirms that specific historical lookup at observation time, not a new client submission or stable transport guarantee. No transaction was replayed.
+
+Git coordination: an agent amended the shared HEAD while another agent had just committed. Read-only reflog/tree comparison showed no lost content: `fa0a23d` replaces `f2822c4` and includes the E4 escaped-text fix plus a small E6 observation correction. No reset/rebase was performed. Principal now exclusively stages and commits all reviewed changes; agents edit only their owned files.

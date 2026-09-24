@@ -37,6 +37,8 @@ export interface ObservationEvidence {
   absence_verified?: boolean;
   not_submitted?: boolean;
   next_attempt_at?: string | null;
+  /** The owner observed a durable wake for this pending request. */
+  wake_scheduled?: boolean;
   running?: boolean;
   blocked?: boolean;
   code?: string | null;
@@ -60,7 +62,9 @@ export function persistenceObservation(input: ObservationEvidence): PersistenceO
   else if (input.not_submitted) status = "not_submitted";
   else if (input.absence_verified) status = "not_received";
   const terminal = finalized || status === "rejected" || status === "conflict";
-  const next = terminal || input.blocked ? null : input.next_attempt_at ?? null;
+  const next = !terminal && !input.blocked && input.wake_scheduled === true
+    && typeof input.next_attempt_at === "string" && Number.isFinite(Date.parse(input.next_attempt_at))
+    ? input.next_attempt_at : null;
   const recovery: PersistenceObservation["recovery"] = {
     durable_intent: input.not_submitted && !receiptStatus ? false : input.durable_intent ?? null,
     state: terminal ? "complete" : input.blocked ? "blocked" : input.running ? "running" : next ? "scheduled" : "none",

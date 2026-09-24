@@ -151,6 +151,7 @@ function minimalFallbackStatus(exchangeId: string, projectId: string, transactio
         ? { finalization_ref: execution.finalization_ref } : {})
     } : null,
     ...(typeof recovery?.durable_intent === "boolean" ? { durable_intent: recovery.durable_intent } : {}),
+    wake_scheduled: scheduledAt !== undefined,
     ...(scheduledAt ? { next_attempt_at: scheduledAt } : {}),
     absence_verified: evidence.status === "not_received",
     blocked: evidence.status === "recovery_blocked",

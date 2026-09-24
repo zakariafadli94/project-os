@@ -68,7 +68,9 @@ it("serves a canonical context read while a document reconciliation is waiting o
 it("reports a bounded unknown state instead of false receipt absence during a long mutation", async () => {
   vi.spyOn(ExecutionJournal.prototype, "status").mockResolvedValue(null);
   const handleRequestStatus = vi.fn().mockResolvedValue(Response.json({ status: "committed" }));
-  const handleReceiptRead = vi.fn().mockResolvedValue(Response.json({ status: "committed" }));
+  const handleReceiptRead = vi.fn()
+    .mockResolvedValueOnce(Response.json({ error: "receipt_not_found" }, { status: 404 }))
+    .mockResolvedValue(Response.json({ status: "committed" }));
   const guard = Object.assign(Object.create(ProjectGuard.prototype), {
     ctx: { id: { name: "PRJ-0007" } },
     persistence: {},
@@ -94,13 +96,43 @@ it("reports a bounded unknown state instead of false receipt absence during a lo
       await expect(response.json()).resolves.toMatchObject({ code: "PROJECT_OS_READ_BUSY" });
     }
     expect(handleRequestStatus).not.toHaveBeenCalled();
-    expect(handleReceiptRead).not.toHaveBeenCalled();
+    expect(handleReceiptRead).toHaveBeenCalledOnce();
   } finally {
     release();
     await serialized;
   }
   const after = await guard.fetch(new Request("https://guard.internal/request-status?kind=transaction&request_id=TXN-1"));
   await expect(after.json()).resolves.toMatchObject({ status: "committed" });
+});
+
+it("returns a locally committed receipt before waiting on an unrelated long mutation", async () => {
+  const receipt = {
+    schema_version: "1.0",
+    transaction_id: "TXN-8405",
+    project_id: "PRJ-8405",
+    status: "committed",
+    previous_revision: 1,
+    new_revision: 2
+  };
+  const guard = Object.assign(Object.create(ProjectGuard.prototype), {
+    ctx: {
+      id: { name: "PRJ-8405" },
+      storage: {
+        sql: {
+          exec: vi.fn(() => ({ toArray: () => [{ receipt_json: JSON.stringify(receipt) }] }))
+        }
+      }
+    },
+    queue: new Promise<void>(() => {}),
+    queueDepth: 1
+  }) as ProjectGuard;
+
+  const response = await guard.fetch(new Request(
+    "https://guard.internal/receipt?kind=transaction&request_id=TXN-8405"
+  ));
+
+  expect(response.status).toBe(200);
+  await expect(response.json()).resolves.toEqual(receipt);
 });
 
 it("fails closed instead of issuing a stale context when the snapshot reader stalls", async () => {

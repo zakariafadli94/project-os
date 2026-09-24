@@ -396,7 +396,10 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "GET" && pathname === "/receipt") {
-      return this.readWhenIdle(() => this.handleReceiptRead(new URL(request.url)));
+      const url = new URL(request.url);
+      const localReceipt = await this.handleReceiptRead(url);
+      if (localReceipt.status !== 404) return localReceipt;
+      return this.readWhenIdle(() => this.handleReceiptRead(url));
     }
 
     if (request.method !== "POST" || pathname !== "/transaction") {
@@ -2066,6 +2069,10 @@ export class ProjectGuard extends DurableObject<Env> {
     const receipt = row && typeof row === "object" && "receipt_json" in row
       ? JSON.parse(row.receipt_json)
       : row;
+    if (receipt && typeof receipt === "object" && "project_id" in receipt
+      && receipt.project_id !== this.ctx.id.name) {
+      return Response.json({ error: "receipt_not_found" }, { status: 404 });
+    }
     return receipt ? Response.json(receipt) : Response.json({ error: "receipt_not_found" }, { status: 404 });
   }
 

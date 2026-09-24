@@ -3,6 +3,7 @@ import { z } from "zod";
 import { artifactWriteRequestSchema } from "../domain/artifact-write";
 import { managedDocumentRequestSchema } from "../domain/managed-document-request";
 import { AUTO_PROJECT_ID, transactionSchema } from "../domain/transaction";
+import { parseMutationContextOrNull } from "../admission/mutation-context";
 import { DETAIL_FIELDS, retrieveContextDetail, summarizeCanonicalContext } from "./context";
 
 export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }) {
@@ -40,22 +41,40 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
     });
   });
   const requestStatus = async ({ project_id, request_id, kind }: { project_id: string; request_id: string; kind: "transaction" | "document" | "artifact" }) => {
+    if (project_id === AUTO_PROJECT_ID) {
+      if (kind !== "transaction") return invalidAutoKind();
+      return readCreateStatus(env.REGISTRY_GUARD, request_id);
+    }
     return readGuard(env.PROJECT_GUARD, project_id, `/request-status?request_id=${encodeURIComponent(request_id)}&kind=${kind}`, (response, body) => ({
       ...(!response.ok ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(body) }]
     }));
   };
   const receipt = async ({ project_id, request_id, kind }: { project_id: string; request_id: string; kind: "transaction" | "document" | "artifact" }) => {
+    if (project_id === AUTO_PROJECT_ID) {
+      if (kind !== "transaction") return invalidAutoKind();
+      return readCreateStatus(env.REGISTRY_GUARD, request_id);
+    }
     return readGuard(env.PROJECT_GUARD, project_id, `/receipt?request_id=${encodeURIComponent(request_id)}&kind=${kind}`, (response, body) => ({
       ...(!response.ok ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(body) }]
     }));
   };
-  const requestStatusSchema = { project_id: projectIdSchema, request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) };
+  const requestStatusSchema = { project_id: z.union([projectIdSchema, z.literal(AUTO_PROJECT_ID)]), request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) };
   server.registerTool("project_os_get_receipt", { description: "Read a receipt without triggering recovery", inputSchema: requestStatusSchema }, receipt);
   server.registerTool("project_os_get_request_status", { description: "Read Project OS request recovery status without triggering recovery", inputSchema: requestStatusSchema }, requestStatus);
   server.registerTool("project_os_submit_transaction", { description: "Submit one strict typed Project OS transaction after the server obtains fresh admission context", inputSchema: { project_id: z.union([projectIdSchema, z.literal(AUTO_PROJECT_ID)]), request: transactionSchema } }, async ({ project_id, request }) => submitGuarded(env, project_id, "transaction", request));
   server.registerTool("project_os_write_working_document", { description: "Submit one strict governed document request after the server obtains fresh admission context", inputSchema: { project_id: projectIdSchema, request: managedDocumentRequestSchema } }, async ({ project_id, request }) => submitGuarded(env, project_id, "document", request));
   server.registerTool("project_os_submit_artifact", { description: "Submit one strict governed artifact manifest after the server obtains fresh admission context", inputSchema: { project_id: projectIdSchema, request: artifactWriteRequestSchema } }, async ({ project_id, request }) => submitGuarded(env, project_id, "artifact", request));
   return server;
+}
+
+function readCreateStatus(namespace: DurableObjectNamespace, transactionId: string): Promise<ReadToolResult> {
+  return readGuard(namespace, "global", `/create-status?transaction_id=${encodeURIComponent(transactionId)}`, (response, body) => {
+    if (!response.ok) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unknown", code: "PROJECT_OS_CREATE_STATUS_UNAVAILABLE", transaction_id: transactionId }) }] };
+    if (!body || typeof body !== "object" || Array.isArray(body) || (body as Record<string, unknown>).transaction_id !== transactionId) {
+      return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unknown", code: "PROJECT_OS_CREATE_STATUS_IDENTITY_MISMATCH", transaction_id: transactionId }) }] };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(body) }] };
+  });
 }
 
 type ReadToolResult = { isError?: boolean; content: Array<{ type: "text"; text: string }> };
@@ -95,17 +114,142 @@ async function readGuard(
 }
 
 async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }, projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>) {
+  const requestId = kind === "transaction" ? request?.transaction_id : request?.request_id;
   if (!request || typeof request !== "object" || request.project_id !== projectId) return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({ status: "rejected", code: "project_binding_mismatch" }) }] };
   const isProjectCreate = kind === "transaction" && request.operation === "project.create";
-  let mutationContext: unknown = null;
-  if (!isProjectCreate) {
-    const contextResponse = await env.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/mutation-context?include_state=false", { headers: env.CONTROL_TOWER_OPERATOR_TOKEN ? { authorization: `Bearer ${env.CONTROL_TOWER_OPERATOR_TOKEN}` } : {} });
-    if (!contextResponse.ok) return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
-    mutationContext = (await contextResponse.json<{ context?: unknown }>()).context;
+  if ((projectId === AUTO_PROJECT_ID && !isProjectCreate) || (isProjectCreate && projectId !== AUTO_PROJECT_ID)) {
+    return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({ status: "rejected", code: "invalid_project_create_binding" }) }] };
   }
-  const owner = isProjectCreate ? env.REGISTRY_GUARD.getByName("global") : env.PROJECT_GUARD.getByName(projectId);
-  const path = kind === "transaction" ? (isProjectCreate ? "/create" : "/transaction") : kind === "document" ? "/document" : "/artifact";
-  const response = await owner.fetch(`https://project-guard.internal${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ admission_version: "1.0", request, mutation_context: mutationContext }) });
-  const payload = { content: [{ type: "text" as const, text: JSON.stringify(await response.json()) }] };
-  return response.ok ? payload : { ...payload, isError: true as const };
+  const correlationId = crypto.randomUUID();
+  const controller = new AbortController();
+  const started = Date.now();
+  let boundary: "context" | "submission" = "context";
+  let postStarted = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const diagnostic = { correlation_id: correlationId, request_id: requestId, family: kind };
+  console.log("project_os_submission_started", diagnostic);
+  try {
+    const submitted = await Promise.race([
+      (async () => {
+        let mutationContext: unknown = null;
+        if (!isProjectCreate) {
+          const contextHeaders = new Headers({ "x-project-os-correlation-id": correlationId });
+          if (env.CONTROL_TOWER_OPERATOR_TOKEN) contextHeaders.set("authorization", `Bearer ${env.CONTROL_TOWER_OPERATOR_TOKEN}`);
+          const contextResponse = await env.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/mutation-context?include_state=false", {
+            headers: contextHeaders, signal: controller.signal
+          });
+          if (!contextResponse.ok) throw new SubmissionFailure("context");
+          const contextBody = await contextResponse.json<{ context?: unknown }>();
+          const context = parseMutationContextOrNull(contextBody?.context);
+          if (!context || context.project_id !== projectId) throw new SubmissionFailure("context");
+          if (controller.signal.aborted) throw new SubmissionFailure("context", true);
+          mutationContext = context;
+        }
+        const owner = isProjectCreate ? env.REGISTRY_GUARD.getByName("global") : env.PROJECT_GUARD.getByName(projectId);
+        const path = kind === "transaction" ? (isProjectCreate ? "/create" : "/transaction") : kind === "document" ? "/document" : "/artifact";
+        const headers = new Headers({ "content-type": "application/json", "x-project-os-correlation-id": correlationId });
+        const body = JSON.stringify({ admission_version: "1.0", request, mutation_context: mutationContext });
+        if (controller.signal.aborted) throw new SubmissionFailure("context", true);
+        boundary = "submission";
+        postStarted = true;
+        const serviceHost = isProjectCreate ? "registry-guard.internal" : "project-guard.internal";
+        const response = await owner.fetch(`https://${serviceHost}${path}`, {
+          method: "POST", headers, body, signal: controller.signal
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          const refusal = knownBusinessRefusal(payload, response.status, requestId, projectId);
+          if (refusal) return { response, payload: refusal, outcome: "business_refusal" as const };
+          if (response.status >= 500) throw new SubmissionFailure("submission");
+          return { response, payload: { status: "rejected", code: "PROJECT_OS_SUBMISSION_REJECTED", request_id: requestId }, outcome: "http_rejection" as const };
+        }
+        if (!validSubmissionResponse(payload, kind, requestId, projectId, isProjectCreate)) throw new SubmissionFailure("submission");
+        if (payload.status !== "committed") {
+          return { response, payload: sanitizeSubmissionReceipt(payload), outcome: "business_refusal" as const };
+        }
+        return { response, payload, outcome: "committed" as const };
+      })(),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new SubmissionFailure(boundary, true)), 10_000); })
+    ]);
+    console.log("project_os_submission_finished", { ...diagnostic, boundary: "submission", elapsed_ms: Date.now() - started, result: submitted.outcome });
+    const payload = { content: [{ type: "text" as const, text: JSON.stringify(submitted.payload) }] };
+    return submitted.outcome === "committed" ? payload : { ...payload, isError: true as const };
+  } catch (error) {
+    controller.abort();
+    const failedBoundary = error instanceof SubmissionFailure ? error.boundary : boundary;
+    const status = postStarted ? "unknown" : "not_submitted";
+    const result = { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({
+      status, code: "PROJECT_OS_SUBMISSION_UNAVAILABLE", request_id: requestId,
+      failed_boundary: failedBoundary, correlation_id: correlationId,
+      recovery: { preserve_request_id: true, check_status_before_retry: postStarted }
+    }) }] };
+    console.warn("project_os_submission_unavailable", { ...diagnostic, boundary: failedBoundary, elapsed_ms: Date.now() - started, result: status });
+    return result;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+class SubmissionFailure extends Error {
+  constructor(readonly boundary: "context" | "submission", readonly deadline = false) { super("submission_unavailable"); }
+}
+
+function invalidAutoKind() {
+  return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ status: "rejected", code: "invalid_auto_project_status_kind" }) }] };
+}
+
+function validSubmissionResponse(payload: unknown, kind: "transaction" | "document" | "artifact", requestId: unknown, projectId: string, isProjectCreate: boolean): payload is Record<string, unknown> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const result = payload as Record<string, unknown>;
+  const identityField = kind === "transaction" ? "transaction_id" : "request_id";
+  if (result[identityField] !== requestId || !["committed", "rejected", "conflict"].includes(String(result.status))) return false;
+  if (isProjectCreate) {
+    if (result.status === "committed") return typeof result.project_id === "string" && /^PRJ-[0-9]{4,}$/.test(result.project_id);
+    return result.project_id === AUTO_PROJECT_ID || typeof result.project_id === "string" && /^PRJ-[0-9]{4,}$/.test(result.project_id);
+  }
+  return result.project_id === projectId;
+}
+
+const safeAdmissionRefusals = new Set([
+  "mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale",
+  "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE",
+  "ARTIFACT_DESTINATION_FORBIDDEN", "idempotency_payload_mismatch", "convergence_capacity_exceeded"
+]);
+
+function knownBusinessRefusal(payload: unknown, httpStatus: number, requestId: unknown, projectId: string): Record<string, unknown> | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const body = payload as Record<string, unknown>;
+  const code = typeof body.error === "string" && safeAdmissionRefusals.has(body.error) ? body.error : null;
+  if (!code || ![409, 428, 503].includes(httpStatus) || (body.project_id !== undefined && body.project_id !== projectId)) return null;
+  const result: Record<string, unknown> = {
+    status: "rejected", code, request_id: requestId, failed_boundary: "submission",
+    recovery: { preserve_request_id: true, check_status_before_retry: false }
+  };
+  if (code === "convergence_capacity_exceeded") {
+    const detail = body.detail && typeof body.detail === "object" && !Array.isArray(body.detail) ? body.detail as Record<string, unknown> : {};
+    const reasons = new Set(["continuation_unavailable", "queued_outputs_exceeded", "oldest_pending_exceeded", "blocked_obligation", "repair_required"]);
+    if (typeof detail.reason === "string" && reasons.has(detail.reason)) result.reason = detail.reason;
+    for (const key of ["canonical_revision", "materialized_revision", "queued_outputs", "oldest_pending_seconds", "retry_after_seconds"] as const) {
+      const value = detail[key];
+      if (value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0)) result[key] = value;
+    }
+    const blocker = detail.blocking_obligation;
+    if (blocker && typeof blocker === "object" && !Array.isArray(blocker)) {
+      const value = blocker as Record<string, unknown>;
+      if (typeof value.layer === "string" && value.layer.length <= 80 && Number.isSafeInteger(value.target_revision)
+        && (value.code === null || typeof value.code === "string" && value.code.length <= 120)) {
+        result.blocking_obligation = { layer: value.layer, target_revision: value.target_revision, code: value.code };
+      }
+    }
+  }
+  return result;
+}
+
+function sanitizeSubmissionReceipt(payload: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const key of ["status", "code", "request_id", "transaction_id", "project_id", "relative_path", "content_sha256", "new_revision", "previous_revision", "event_id", "committed_at"] as const) {
+    const value = payload[key];
+    if (typeof value === "string" || typeof value === "number") result[key] = value;
+  }
+  return result;
 }

@@ -42,6 +42,7 @@ export function createCloudflarePorts(options) {
  */
 export async function runOperatorSubmission(input, ports) {
   validateInput(input);
+  const requestId = requestIdentity(input);
 
   const base = await ports.captureBaseDeployment();
   if (!base || !VERSION_ID.test(String(base.version_id)) || Number(base.percentage) !== 100) {
@@ -52,6 +53,11 @@ export async function runOperatorSubmission(input, ports) {
   if (typeof token !== "string" || token.length === 0) throw new Error("operator bridge token was not generated");
 
   let operatorVersionId;
+  const controller = new AbortController();
+  const correlationId = crypto.randomUUID();
+  let timer;
+  let boundary = "context";
+  let postStarted = false;
   try {
     operatorVersionId = await ports.createOperatorVersion({ token });
     if (!VERSION_ID.test(String(operatorVersionId))) throw new Error("operator bridge returned an invalid version id");
@@ -63,32 +69,47 @@ export async function runOperatorSubmission(input, ports) {
     await requireHealth(ports, undefined, base.version_id, "normal traffic left the base version");
     await requireHealth(ports, operatorVersionId, operatorVersionId, "version override did not reach the operator version");
 
-    const context = await ports.fetchContext({
-      projectId: input.project_id,
-      token,
-      operatorVersionId
-    });
-    if (!context || context.project_id !== input.project_id) throw new Error("operator bridge received invalid mutation context");
+    return await Promise.race([
+      (async () => {
+        const context = await ports.fetchContext({
+          projectId: input.project_id,
+          token,
+          operatorVersionId,
+          correlationId,
+          signal: controller.signal
+        });
+        if (controller.signal.aborted || !context || context.project_id !== input.project_id) return operatorFailure(input, requestId, "context");
 
-    const receipt = await ports.submit({
-      kind: input.kind,
-      projectId: input.project_id,
-      request: input.request,
-      context,
-      token,
-      operatorVersionId
-    });
-    if (receipt?.status !== "committed" || receipt.project_id !== input.project_id) {
-      throw new Error("operator bridge requires a matching committed receipt");
-    }
-
-    return {
-      status: receipt.status,
-      project_id: receipt.project_id,
-      request_id: receipt.request_id,
-      base_version_id: base.version_id
-    };
+        boundary = "submission";
+        postStarted = true;
+        const receipt = await ports.submit({
+          kind: input.kind,
+          projectId: input.project_id,
+          request: input.request,
+          context,
+          token,
+          operatorVersionId,
+          correlationId,
+          signal: controller.signal
+        });
+        const identityField = input.kind === "transaction" ? "transaction_id" : "request_id";
+        if (controller.signal.aborted || receipt?.status !== "committed" || receipt.project_id !== input.project_id || receipt[identityField] !== requestId) {
+          return operatorFailure(input, requestId, "submission");
+        }
+        return {
+          status: receipt.status,
+          project_id: receipt.project_id,
+          request_id: requestId,
+          base_version_id: base.version_id
+        };
+      })(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("operator_submission_deadline")), 10_000); })
+    ]);
+  } catch {
+    controller.abort();
+    return operatorFailure(input, requestId, postStarted ? "submission" : boundary);
   } finally {
+    if (timer !== undefined) clearTimeout(timer);
     if (operatorVersionId) {
       await ports.restoreBaseDeployment({ versionId: base.version_id });
       await requireHealth(ports, undefined, base.version_id, "base restoration did not restore normal traffic");
@@ -108,6 +129,32 @@ function validateInput(input) {
   if (typeof input.request !== "string" || input.request.length === 0 || Buffer.byteLength(input.request) > 256 * 1024) {
     throw new Error("operator input request must be a non-empty string at most 256 KiB");
   }
+}
+
+function requestIdentity(input) {
+  let request;
+  try {
+    request = JSON.parse(input.request);
+  } catch {
+    throw new Error("operator request must be valid JSON");
+  }
+  const identityField = input.kind === "transaction" ? "transaction_id" : "request_id";
+  const requestId = request && typeof request === "object" ? request[identityField] : null;
+  if (typeof requestId !== "string" || requestId.length === 0) throw new Error("operator request identity is required");
+  if (request.project_id !== input.project_id) throw new Error("operator request project binding mismatch");
+  return requestId;
+}
+
+function operatorFailure(input, requestId, failedBoundary) {
+  const submitted = failedBoundary === "submission";
+  return {
+    status: submitted ? "unknown" : "not_submitted",
+    code: "PROJECT_OS_SUBMISSION_UNAVAILABLE",
+    project_id: input.project_id,
+    request_id: requestId,
+    failed_boundary: failedBoundary,
+    recovery: { preserve_request_id: true, check_status_before_retry: submitted }
+  };
 }
 
 async function requireHealth(ports, overrideVersionId, expectedVersionId, message) {

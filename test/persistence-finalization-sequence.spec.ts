@@ -18,7 +18,9 @@ it("finalizes three strict commits using alarms, with the middle revision explic
   const environment = env as unknown as Env;
   const projectId = "PRJ-8460";
   const mock = installDropboxMock();
-  vi.setSystemTime(new Date("2026-09-24T12:00:00Z"));
+  // Keep scheduled timestamps beyond the host clock: otherwise Miniflare may
+  // consume a past-due alarm before runDurableObjectAlarm explicitly drives it.
+  vi.setSystemTime(new Date(Date.now() + 86_400_000));
   const initial = commitFixture(projectId, 1)[0]!;
   seedCommits(mock, [initial]);
   mock.files.set(machineStatePath(projectId), JSON.stringify(initial.state));

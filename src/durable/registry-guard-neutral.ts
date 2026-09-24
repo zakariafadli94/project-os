@@ -130,6 +130,13 @@ function minimalFallbackStatus(exchangeId: string, projectId: string, transactio
   if (execution?.request_hash !== undefined && execution.request_hash !== requestSha256) {
     return { exchange_id: exchangeId, transaction_id: transactionId, status: "unknown", code: "request_status_digest_mismatch" };
   }
+  if (typeof execution?.request_hash !== "string" && evidence.status !== "not_received") {
+    // Legacy status/intent/receipt evidence may be bound to the transaction ID
+    // without proving which payload produced it. Only a verified absence can
+    // be reported without an exact execution digest; all other evidence stays
+    // indeterminate instead of being attributed to this fallback body.
+    return { exchange_id: exchangeId, transaction_id: transactionId, status: "unknown", code: "request_status_digest_unproven" };
+  }
   const lease = execution?.lease && typeof execution.lease === "object"
     ? execution.lease as { owner?: unknown; until?: unknown }
     : null;

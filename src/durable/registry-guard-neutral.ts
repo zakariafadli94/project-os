@@ -120,16 +120,23 @@ function minimalFallbackStatus(exchangeId: string, projectId: string, transactio
     return { exchange_id: exchangeId, status: "unknown", code: "request_status_identity_mismatch" };
   }
   const execution = evidence.execution && typeof evidence.execution === "object"
-    ? evidence.execution as { status?: unknown; terminal?: unknown; finalization_ref?: unknown; next_attempt_at?: unknown; request_hash?: unknown }
+    ? evidence.execution as { status?: unknown; terminal?: unknown; finalization_ref?: unknown; request_hash?: unknown; lease?: unknown }
     : null;
   const recovery = evidence.recovery && typeof evidence.recovery === "object"
-    ? evidence.recovery as { durable_intent?: unknown; scheduled?: unknown; code?: unknown }
+    ? evidence.recovery as { durable_intent?: unknown; scheduled?: unknown; next_attempt_at?: unknown; code?: unknown }
     : null;
   const codeCandidate = typeof evidence.code === "string" ? evidence.code : recovery?.code;
   const code = typeof codeCandidate === "string" && /^[A-Za-z0-9_:-]{1,64}$/.test(codeCandidate) ? codeCandidate : null;
   if (execution?.request_hash !== undefined && execution.request_hash !== requestSha256) {
     return { exchange_id: exchangeId, transaction_id: transactionId, status: "unknown", code: "request_status_digest_mismatch" };
   }
+  const lease = execution?.lease && typeof execution.lease === "object"
+    ? execution.lease as { owner?: unknown; until?: unknown }
+    : null;
+  const leaseUntil = typeof lease?.until === "string" ? Date.parse(lease.until) : Number.NaN;
+  const validLease = typeof lease?.owner === "string" && lease.owner.length > 0 && Number.isFinite(leaseUntil) && leaseUntil > Date.now();
+  const scheduledAt = recovery?.scheduled === true && typeof recovery.next_attempt_at === "string"
+    && Number.isFinite(Date.parse(recovery.next_attempt_at)) ? recovery.next_attempt_at : undefined;
   const observation = persistenceObservation({
     project_id: projectId,
     kind: "transaction",
@@ -144,11 +151,10 @@ function minimalFallbackStatus(exchangeId: string, projectId: string, transactio
         ? { finalization_ref: execution.finalization_ref } : {})
     } : null,
     ...(typeof recovery?.durable_intent === "boolean" ? { durable_intent: recovery.durable_intent } : {}),
-    ...(recovery?.scheduled === true && typeof execution?.next_attempt_at === "string"
-      ? { next_attempt_at: execution.next_attempt_at } : {}),
+    ...(scheduledAt ? { next_attempt_at: scheduledAt } : {}),
     absence_verified: evidence.status === "not_received",
     blocked: evidence.status === "recovery_blocked",
-    running: execution?.status === "running" || execution?.status === "finalizing",
+    running: validLease,
     code
   });
   return {

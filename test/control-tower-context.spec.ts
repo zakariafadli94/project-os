@@ -143,6 +143,28 @@ describe("Control Tower canonical context", () => {
     expect(rebuilt).toEqual(actions);
   });
 
+  it("shrinks escaped-control-character chunks to keep the final detail JSON within 16 KiB", async () => {
+    const objective = "\u0001".repeat(5_000);
+    const server = contextServer({
+      project_id: "PRJ-0007", revision: 76, current_phase_id: "PHASE-CURRENT",
+      plan_phases: { "PHASE-CURRENT": { phase_id: "PHASE-CURRENT", title: "Current", objective, next_actions: [] } }, tasks: {}
+    });
+    const detail = server._registeredTools.project_os_get_context_detail!;
+    let cursor: string | undefined;
+    let rebuilt = "";
+    do {
+      const result = await detail.handler({
+        project_id: "PRJ-0007", revision: 76, entity_type: "phase", entity_id: "PHASE-CURRENT", field: "objective", cursor
+      });
+      const body = parse(result);
+      expect(new TextEncoder().encode(result.content[0]!.text).byteLength).toBeLessThanOrEqual(16 * 1024);
+      expect(body.chunk).toEqual(expect.any(String));
+      rebuilt += body.chunk;
+      cursor = body.next_cursor ?? undefined;
+    } while (cursor);
+    expect(rebuilt).toBe(objective);
+  });
+
   it("rejects forged, oversized, out-of-range, and stale cursors without mixing revisions", async () => {
     const server = contextServer({
       project_id: "PRJ-0007", revision: 76, current_phase_id: null, plan_phases: {},

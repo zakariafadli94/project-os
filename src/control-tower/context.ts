@@ -136,11 +136,17 @@ export function retrieveContextDetail(body: Body, projectId: string, input: {
   if (input.field === "next_actions" && Array.isArray(raw)) return detailActions(raw, projectId, revision, input, cursor);
   if (typeof raw !== "string") return { value: { status: "ok", revision, entity_type: input.entity_type, entity_id: input.entity_id, field: input.field, value: null, next_cursor: null } };
   if (cursor.item_offset !== 0 || cursor.text_offset > raw.length || !safeStringOffset(raw, cursor.text_offset)) return { error: cursorError() };
-  const page = utf8Prefix(raw.slice(cursor.text_offset), DETAIL_CHUNK_LIMIT);
-  const nextOffset = cursor.text_offset + page.text.length;
-  const next = nextOffset < raw.length ? encode({ ...cursor, text_offset: nextOffset }) : null;
-  return { value: boundedDetail({ status: "ok", revision, entity_type: input.entity_type, entity_id: input.entity_id,
-    field: input.field, chunk: page.text, offset: cursor.text_offset, total_chars: raw.length, total_bytes: byteLength(raw), next_cursor: next }) };
+  let chunkLimit = DETAIL_CHUNK_LIMIT;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const page = utf8Prefix(raw.slice(cursor.text_offset), chunkLimit);
+    const nextOffset = cursor.text_offset + page.text.length;
+    const next = nextOffset < raw.length ? encode({ ...cursor, text_offset: nextOffset }) : null;
+    const value = { status: "ok", revision, entity_type: input.entity_type, entity_id: input.entity_id,
+      field: input.field, chunk: page.text, offset: cursor.text_offset, total_chars: raw.length, total_bytes: byteLength(raw), next_cursor: next };
+    if (byteLength(JSON.stringify(value)) <= DETAIL_LIMIT) return { value };
+    chunkLimit = Math.floor(chunkLimit / 2);
+  }
+  return { error: { status: "unavailable", code: "CONTEXT_DETAIL_PAGE_TOO_LARGE" } };
 }
 
 function detailActions(raw: unknown[], projectId: string, revision: number, input: { entity_type: EntityType; entity_id: string; field: string }, cursor: DetailCursor) {
@@ -149,17 +155,18 @@ function detailActions(raw: unknown[], projectId: string, revision: number, inpu
   if (cursor.item_offset === actions.length) return { value: { status: "ok", revision, entity_type: input.entity_type, entity_id: input.entity_id, field: input.field, items: [], next_cursor: null } };
   const item = actions[cursor.item_offset]!;
   if (cursor.text_offset > item.length || !safeStringOffset(item, cursor.text_offset)) return { error: cursorError() };
-  const page = utf8Prefix(item.slice(cursor.text_offset), DETAIL_CHUNK_LIMIT);
-  const textOffset = cursor.text_offset + page.text.length;
-  const itemOffset = textOffset >= item.length ? cursor.item_offset + 1 : cursor.item_offset;
-  const next = itemOffset < actions.length ? encode({ ...cursor, item_offset: itemOffset, text_offset: itemOffset === cursor.item_offset ? textOffset : 0 }) : null;
-  return { value: boundedDetail({ status: "ok", revision, entity_type: input.entity_type, entity_id: input.entity_id,
-    field: input.field, items: [{ index: cursor.item_offset, chunk: page.text, offset: cursor.text_offset, total_chars: item.length }], next_cursor: next }) };
-}
-
-function boundedDetail(value: Record<string, unknown>): Record<string, unknown> {
-  if (byteLength(JSON.stringify(value)) <= DETAIL_LIMIT) return value;
-  return { status: "unavailable", code: "CONTEXT_DETAIL_PAGE_TOO_LARGE" };
+  let chunkLimit = DETAIL_CHUNK_LIMIT;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const page = utf8Prefix(item.slice(cursor.text_offset), chunkLimit);
+    const textOffset = cursor.text_offset + page.text.length;
+    const itemOffset = textOffset >= item.length ? cursor.item_offset + 1 : cursor.item_offset;
+    const next = itemOffset < actions.length ? encode({ ...cursor, item_offset: itemOffset, text_offset: itemOffset === cursor.item_offset ? textOffset : 0 }) : null;
+    const value = { status: "ok", revision, entity_type: input.entity_type, entity_id: input.entity_id,
+      field: input.field, items: [{ index: cursor.item_offset, chunk: page.text, offset: cursor.text_offset, total_chars: item.length }], next_cursor: next };
+    if (byteLength(JSON.stringify(value)) <= DETAIL_LIMIT) return { value };
+    chunkLimit = Math.floor(chunkLimit / 2);
+  }
+  return { error: { status: "unavailable", code: "CONTEXT_DETAIL_PAGE_TOO_LARGE" } };
 }
 
 function findEntity(state: Record<string, unknown>, projectId: string, type: EntityType, id: string): Record<string, unknown> | null {

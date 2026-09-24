@@ -337,10 +337,10 @@ describe("encrypted fallback ingress", () => {
       status: "finalizing",
       recovery: {
         durable_intent: true,
-        state: "running",
+        state: "none",
         next_attempt_at: null,
-        action: "resume_execution",
-        owner: "system",
+        action: "check_status",
+        owner: "client",
         requires_new_approval: false
       }
     });

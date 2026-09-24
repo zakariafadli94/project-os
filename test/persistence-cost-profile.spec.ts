@@ -13,6 +13,7 @@ afterEach(() => vi.restoreAllMocks());
 
 it("measures warm reads and snapshot costs at 50 and 1000 revisions without claiming constant snapshot bytes", async () => {
   const reports: Array<Record<string, number>> = [];
+  const submissionCallProfiles: Array<Record<string, number>> = [];
   for (const history of [50, 1_000]) {
     const projectId = history === 50 ? "PRJ-8450" : "PRJ-8451";
     const mock = installDropboxMock();
@@ -85,6 +86,13 @@ it("measures warm reads and snapshot costs at 50 and 1000 revisions without clai
       return rows;
     });
     const submissionUploads = mock.uploadCalls.slice(beforeSubmitUploads);
+    const submissionCalls = mock.providerCalls.slice(beforeSubmitCalls);
+    const profile: Record<string, number> = {};
+    for (const call of submissionCalls) {
+      const signature = `${call.endpoint} ${call.paths.join(",")}`;
+      profile[signature] = (profile[signature] ?? 0) + 1;
+    }
+    submissionCallProfiles.push(profile);
     reports.push({
       history,
       warm_provider_calls: warmCalls,
@@ -92,7 +100,7 @@ it("measures warm reads and snapshot costs at 50 and 1000 revisions without clai
       local_commit_cache_sql_rows_written: localRows,
       canonical_record_bytes: new TextEncoder().encode(JSON.stringify(record)).byteLength,
       state_bytes: new TextEncoder().encode(JSON.stringify(record.state)).byteLength,
-      strict_submission_provider_calls: mock.providerCalls.length - beforeSubmitCalls,
+      strict_submission_provider_calls: submissionCalls.length,
       strict_submission_project_sql_rows_written: submission,
       strict_submission_provider_uploads: submissionUploads.length,
       strict_submission_uploaded_path_final_bytes_estimate: submissionUploads.reduce((sum, path) => sum + new TextEncoder().encode(mock.files.get(path) ?? "").byteLength, 0)
@@ -100,7 +108,9 @@ it("measures warm reads and snapshot costs at 50 and 1000 revisions without clai
   }
   expect(reports[1]!.warm_provider_calls).toBe(reports[0]!.warm_provider_calls);
   expect(reports[1]!.local_commit_cache_sql_rows_written).toBe(reports[0]!.local_commit_cache_sql_rows_written);
-  expect(reports[1]!.strict_submission_provider_calls).toBe(reports[0]!.strict_submission_provider_calls);
+  expect(reports[1]!.strict_submission_provider_calls,
+    `Provider-call profiles by history: ${JSON.stringify(submissionCallProfiles)}`
+  ).toBe(reports[0]!.strict_submission_provider_calls);
   expect(reports[1]!.strict_submission_project_sql_rows_written).toBe(reports[0]!.strict_submission_project_sql_rows_written);
   expect(reports[1]!.state_bytes).toBeGreaterThan(reports[0]!.state_bytes!);
   console.info("persistence_cost_profile_fixture", JSON.stringify(reports));

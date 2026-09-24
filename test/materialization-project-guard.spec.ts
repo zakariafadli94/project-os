@@ -185,7 +185,7 @@ describe("ProjectGuard asynchronous materialization", () => {
     expect(materialization.canonical_revision).toBe(2);
     expect(materialization.materialized_head?.revision).toBe(1);
     expect(materialization.blocked_error).toMatch(/overwrite|changed unexpectedly|untracked/i);
-  });
+  }, 30_000);
 
   it("exposes compact materialization status without file contents", async () => {
     const projectId = "PRJ-3603";

@@ -197,13 +197,21 @@ it("does not turn an acknowledged canonical activation into unavailable by readi
 
 it("keeps four-project qualification I/O independent of the number of REVIEW files", async () => {
   const counts: number[] = [];
+  const profiles: Array<Record<string, number>> = [];
   for (const filesPerProject of [1, 40]) {
     const f = await reviewInventoryFixture(filesPerProject);
-    const start = f.mock.calls.length;
     const providerStart = f.mock.providerCalls.length;
     const metrics = await interceptProjectStateReads(f, async () => { expect(await (await f.activate()).json()).toMatchObject({ status: "committed" }); });
     const calls = f.mock.providerCalls.slice(providerStart);
-    counts.push(f.mock.calls.length - start - metrics.delegatedHttpCalls + metrics.calls);
+    const profile: Record<string, number> = {};
+    for (const call of calls) {
+      const signature = `${call.endpoint} ${call.paths.join(",")}`;
+      profile[signature] = (profile[signature] ?? 0) + 1;
+    }
+    profiles.push(profile);
+    // The generic fetch counter also includes non-provider work and unrelated
+    // alarm traffic. Measure the Dropbox calls whose scaling this test guards.
+    counts.push(calls.length);
     expect(metrics.calls).toBe(4);
     expect(metrics.maxDelegatedHttpCalls).toBeLessThanOrEqual(50);
     expect(calls.some(call => call.endpoint.endsWith("/files/get_metadata") && call.paths.some(path => path.includes("/REVIEW/")))).toBe(false);
@@ -211,7 +219,7 @@ it("keeps four-project qualification I/O independent of the number of REVIEW fil
     expect(proof.qualification.proof.audit.project_states).toHaveLength(4);
     expect(proof.qualification.proof.audit.directories.map((entry: any) => entry.path)).toEqual(expect.arrayContaining(f.roots.flatMap(root => [root, `${root}/00-CURRENT`])));
   }
-  expect(counts[1], `provider request counts for 4 vs 160 files: ${counts.join(", ")}`).toBe(counts[0]);
+  expect(counts[1], `provider request counts for 4 vs 160 files: ${counts.join(", ")}; profiles: ${JSON.stringify(profiles)}`).toBe(counts[0]);
   expect(counts[1]).toBeLessThanOrEqual(50);
 });
 

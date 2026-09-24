@@ -1128,15 +1128,18 @@ describe("canonical execution boundary in ProjectGuard", () => {
       });
     });
 
+    // Keep the wall-clock abort timer out of this fixture; advance only Date
+    // after the first candidate so runner load cannot expire the slice early.
+    vi.useFakeTimers({ toFake: ["Date"] });
     const sliceBudget = await runInDurableObject(guard, instance =>
-      vi.spyOn(instance as any, "materializationFinalizationSliceBudgetMs").mockReturnValue(5)
+      vi.spyOn(instance as any, "materializationFinalizationSliceBudgetMs").mockReturnValue(60_000)
     );
     commitReads.mockClear();
     commitReads.mockImplementation(async function (this: ProjectRepository, candidateProjectId, revision) {
       if (candidateProjectId !== projectId || revision < 9101 || revision > 9105) {
         return originalReadCommitRecord.call(this, candidateProjectId, revision);
       }
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      if (revision === 9101) vi.setSystemTime(Date.now() + 60_001);
       return null;
     });
     const deadlineResponse = await runInDurableObject(guard, (instance) =>

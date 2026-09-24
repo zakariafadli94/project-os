@@ -168,8 +168,11 @@ export class MaterializationGuard extends DurableObject<Env> {
         // A concurrent request may have armed an earlier wake or a provider
         // backoff while the callback was outside our queue. That durable wake
         // will retry finalization too; do not replace it with our stale retry.
-        if (notifying && await this.ctx.storage.getAlarm() !== null) {
-          console.error("Project OS finalization retry retained existing wake", structuredMaterializationError(this.projectId, error));
+        const existingWake = notifying ? await this.ctx.storage.getAlarm() : null;
+        const retryDelayMs = materializationRetryDelayMs(error);
+        const retryAt = Date.now() + retryDelayMs;
+        if (existingWake !== null && existingWake > Date.now() && existingWake <= retryAt) {
+          console.error("Project OS finalization retry retained earlier wake", structuredMaterializationError(this.projectId, error));
           return;
         }
         if (error instanceof MaterializationOutputConflictError) {
@@ -187,7 +190,11 @@ export class MaterializationGuard extends DurableObject<Env> {
           await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_DEFER_DELAY_MS);
           return;
         }
-        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+        await this.ctx.storage.setAlarm(retryAt);
+        // Transient provider errors already have a durable retry alarm. Letting
+        // the platform retry the failed alarm invocation can replace that
+        // provider-directed wake with its shorter automatic backoff.
+        if (error instanceof ProviderOperationError && error.retryable) return;
         throw error;
       });
     }
@@ -823,7 +830,7 @@ export class MaterializationGuard extends DurableObject<Env> {
             || /slice_budget_exhausted|fetch failed|network (?:error|failure|unavailable)|timed? out|\bECONN(?:RESET|REFUSED|TIMEDOUT)\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i.test(error.message)
           );
         if (!transient) throw error;
-        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+        await this.ctx.storage.setAlarm(Date.now() + materializationRetryDelayMs(error));
         return false;
       }
       if (saved !== null) await this.acknowledgeVerifiedHumanHead(head.target_revision, head.projection_version);
@@ -1291,4 +1298,14 @@ function isCanonicalCommitBinding(
 
 function isSliceBudgetExhaustion(error: unknown): boolean {
   return error instanceof Error && error.message.includes("slice_budget_exhausted");
+}
+
+function materializationRetryDelayMs(error: unknown): number {
+  if (error instanceof ProviderOperationError && error.retryable) {
+    const retryAfterMs = error.diagnostics?.retryAfterMs;
+    if (typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+      return Math.max(MATERIALIZATION_ALARM_DELAY_MS, Math.min(24 * 60 * 60 * 1_000, retryAfterMs));
+    }
+  }
+  return MATERIALIZATION_ALARM_DELAY_MS;
 }

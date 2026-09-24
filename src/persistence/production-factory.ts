@@ -22,7 +22,11 @@ export function createProductionPersistence(
   }, {
     ...(requestScope ? { requestScope } : {})
   });
-  const runtime = requireProjectOsPersistence(withProviderResilience(createDropboxPersistence(raw)));
+  const runtime = requireProjectOsPersistence(withProviderResilience(createDropboxPersistence(raw), {
+    ...(requestScope ? {
+      remainingBudgetMs: () => requestScope.deadlineMs - (requestScope.now?.() ?? Date.now())
+    } : {})
+  }));
   const writerStage = resolveSchemaWriterStageForProject(
     env.PROJECT_OS_SCHEMA_WRITER_STAGE,
     env.PROJECT_OS_SCHEMA_CANARY_PROJECT_ID,

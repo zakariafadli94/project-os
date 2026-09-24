@@ -4,6 +4,7 @@ export interface ProviderDiagnostics {
   requestId?: string | null;
   code?: string;
   operation?: string;
+  retryAfterMs?: number;
 }
 
 export class ProviderOperationError extends Error {

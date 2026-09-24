@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { DiagnosticProjectGuard } from "../src/durable/project-guard-diagnostics";
 import { SearchSyncProjectGuard } from "../src/durable/project-guard-search-sync";
+import { SubrequestResilientProjectGuard } from "../src/durable/project-guard-subrequest-resilient";
 import { ProjectGuard } from "../src/durable/project-guard-neutral";
 import { ExecutionJournal } from "../src/execution/journal";
 import type { ProjectState } from "../src/domain/project-state";
@@ -16,6 +17,126 @@ import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 afterEach(() => vi.restoreAllMocks());
+
+it.each(["/mutation-context", "/request-status", "/receipt", "/execution-status"])(
+  "does not queue %s behind a slow finalization in the search boundary",
+  async (path) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const fetch = vi.spyOn(SubrequestResilientProjectGuard.prototype, "fetch")
+      .mockImplementationOnce(async () => { await pending; return Response.json({ status: "done" }); })
+      .mockResolvedValueOnce(Response.json({ status: "observed" }));
+    const guard = Object.assign(Object.create(SearchSyncProjectGuard.prototype), {
+      ctx: { id: { name: "PRJ-0007" } },
+      searchQueue: Promise.resolve(),
+      searchQueueDepth: 0,
+      handleReceiptRead: vi.fn().mockResolvedValue(Response.json({ error: "receipt_not_found" }, { status: 404 })),
+      readBoundedRequestStatusReceipt: vi.fn().mockResolvedValue(null)
+    }) as SearchSyncProjectGuard;
+    const finalization = guard.fetch(new Request("https://guard.internal/finalize-materialization", { method: "POST" }));
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    let readFinished = false;
+    const readPath = path === "/mutation-context" ? path : `${path}?kind=transaction&request_id=TXN-QUEUED`;
+    const read = guard.fetch(new Request(`https://guard.internal${readPath}`))
+      .then((response) => { readFinished = true; return response; });
+    try {
+      await vi.waitFor(() => expect(readFinished).toBe(true), { timeout: 150 });
+      await expect(read).resolves.toMatchObject({ status: path === "/mutation-context" ? 200 : 503 });
+    } finally {
+      release();
+      await Promise.all([finalization, read]);
+    }
+  }
+);
+
+it("does not report false absence for a transaction waiting at the search boundary", async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const fetch = vi.spyOn(SubrequestResilientProjectGuard.prototype, "fetch")
+    .mockImplementationOnce(async () => { await pending; return Response.json({ status: "committed" }); })
+    .mockResolvedValueOnce(Response.json({ status: "not_received" }));
+  const guard = Object.assign(Object.create(SearchSyncProjectGuard.prototype), {
+    ctx: { id: { name: "PRJ-0007" } },
+    searchQueue: Promise.resolve(),
+    searchQueueDepth: 0
+  }) as SearchSyncProjectGuard;
+  const submitted = guard.fetch(new Request("https://guard.internal/transaction", { method: "POST" }));
+  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+  try {
+    const status = await guard.fetch(new Request(
+      "https://guard.internal/request-status?kind=transaction&request_id=TXN-QUEUED",
+      { headers: { "x-project-os-correlation-id": "corr-queued" } }
+    ));
+    expect(status.status).toBe(503);
+    await expect(status.json()).resolves.toMatchObject({
+      project_id: "PRJ-0007", request_id: "TXN-QUEUED", status: "unknown", code: "PROJECT_OS_READ_BUSY"
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    release();
+    await submitted;
+  }
+});
+
+it("serves an exact locally committed receipt while unrelated search work is queued", async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const fetch = vi.spyOn(SubrequestResilientProjectGuard.prototype, "fetch")
+    .mockImplementationOnce(async () => { await pending; return Response.json({ status: "done" }); });
+  const receipt = { status: "committed", project_id: "PRJ-0007", transaction_id: "TXN-KNOWN" };
+  const guard = Object.assign(Object.create(SearchSyncProjectGuard.prototype), {
+    ctx: { id: { name: "PRJ-0007" } },
+    searchQueue: Promise.resolve(),
+    searchQueueDepth: 0,
+    handleReceiptRead: vi.fn().mockResolvedValue(Response.json(receipt))
+  }) as SearchSyncProjectGuard;
+  const finalization = guard.fetch(new Request("https://guard.internal/finalize-materialization", { method: "POST" }));
+  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+  try {
+    const response = await guard.fetch(new Request(
+      "https://guard.internal/receipt?kind=transaction&request_id=TXN-KNOWN"
+    ));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(receipt);
+  } finally {
+    release();
+    await finalization;
+  }
+});
+
+it("checks a canonical receipt under outer queue pressure but preserves project binding", async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  vi.spyOn(SubrequestResilientProjectGuard.prototype, "fetch")
+    .mockImplementationOnce(async () => { await pending; return Response.json({ status: "done" }); });
+  const receipt = { status: "committed", project_id: "PRJ-0007", transaction_id: "TXN-CANONICAL" };
+  const canonical = vi.fn().mockResolvedValue(receipt);
+  const guard = Object.assign(Object.create(SearchSyncProjectGuard.prototype), {
+    ctx: { id: { name: "PRJ-0007" } },
+    searchQueue: Promise.resolve(),
+    searchQueueDepth: 0,
+    handleReceiptRead: vi.fn().mockResolvedValue(Response.json({ error: "receipt_not_found" }, { status: 404 })),
+    readBoundedRequestStatusReceipt: canonical
+  }) as SearchSyncProjectGuard;
+  const finalization = guard.fetch(new Request("https://guard.internal/finalize-materialization", { method: "POST" }));
+  try {
+    await vi.waitFor(() => expect((guard as unknown as { searchQueueDepth: number }).searchQueueDepth).toBe(1));
+    const wrongProject = await guard.fetch(new Request(
+      "https://guard.internal/receipt?kind=transaction&request_id=TXN-CANONICAL&project_id=PRJ-9999"
+    ));
+    expect(wrongProject.status).toBe(404);
+    expect(canonical).not.toHaveBeenCalled();
+    const response = await guard.fetch(new Request(
+      "https://guard.internal/receipt?kind=transaction&request_id=TXN-CANONICAL"
+    ));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(receipt);
+    expect(canonical).toHaveBeenCalledWith("PRJ-0007", "transaction", "TXN-CANONICAL");
+  } finally {
+    release();
+    await finalization;
+  }
+});
 
 it("rejects an unsupported execution kind before reading its journal while idle", async () => {
   const status = vi.spyOn(ExecutionJournal.prototype, "status").mockResolvedValue(null);

@@ -17,11 +17,11 @@ Environment: existing local Work and worktree; principal orchestration and three
 
 | Lot | Owner | State | Next action / evidence |
 |---|---|---|---|
-| E0 | Principal | active | Refresh additional canonical reads; baseline above captures current unavailable boundary |
+| E0 | Principal | implemented | Both deployed versions observed; canonical baseline and SOP certificate read; 39 baseline tests pass; CI status unavailable from the two connector lookups, not assumed green |
 | E1 | Principal | implemented | 2c81ac3 plus blocked-code refinement; pure observation contract, six tests green; owner adapters and integrated typecheck pending |
 | E2 | A | active | 36a2a5e local receipt fast path; 28 targeted tests green; canonical cache-loss path and additive observations still pending review |
 | E3 | A | active | Monotone proven context baseline; 5-second/32-call shared budget |
-| E4 | B | active | UTF-8 bounded complete detail retrieval, not irreversible truncation |
+| E4 | B | active | 2c7691a independently rerun: 6 context tests + typecheck pass; JSON-escaped text boundary refinement requested before review closure |
 | E5 | B | not_started | Deadline and uncertain submission recovery |
 | E6 | C | active | Qualify create/fallback recovery; canonical business digest must exclude renewable admission envelope |
 | E7 | A | not_started | Budgets/checkpoints/wakes; candidate-count fix 59a042c exists |

@@ -4,7 +4,8 @@ import { ConvergenceEngine } from "../src/convergence/engine";
 import { createSliceBudget } from "../src/convergence/budget";
 import { ConvergenceJournal, initialProgress } from "../src/convergence/journal";
 import { MaterializationCoordinator, type MaterializationLedgerPort } from "../src/materialization/coordinator";
-import type { FinalVerificationItem } from "../src/materialization/ledger";
+import type { FinalVerificationItem, MaterializationRepairScanCheckpoint } from "../src/materialization/ledger";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { ProjectionOutputEvidence } from "../src/domain/materialization";
 import { ProjectRepository } from "../src/persistence/repository";
 import {
@@ -29,6 +30,7 @@ class AcceptanceLedger implements MaterializationLedgerPort {
   private head: { revision: number; projection_version: number } | null = null;
   private readonly outputs = new Map<string, ProjectionOutputEvidence>();
   private pendingFinalVerification: FinalVerificationItem[] | null = null;
+  private repairScanCheckpoint: MaterializationRepairScanCheckpoint | null = null;
 
   requestTarget(target: { revision: number; projection_version: number }) {
     if (
@@ -66,6 +68,11 @@ class AcceptanceLedger implements MaterializationLedgerPort {
   baselineOutputs() { return new Map(); }
   immutableDerivativesThrough() { return null; }
   markImmutableDerivativesThrough(_revision: number) {}
+  readRepairScanCheckpoint(canonicalRevision: number) {
+    return this.repairScanCheckpoint?.canonical_revision === canonicalRevision ? this.repairScanCheckpoint : null;
+  }
+  writeRepairScanCheckpoint(checkpoint: MaterializationRepairScanCheckpoint) { this.repairScanCheckpoint = checkpoint; }
+  clearRepairScanCheckpoint() { this.repairScanCheckpoint = null; }
   failActive(_message: string) {}
   completeTarget(input: { revision: number; projection_version: number; outputs: ReadonlyMap<string, ProjectionOutputEvidence>; removed_outputs: readonly string[] }) {
     this.head = { revision: input.revision, projection_version: input.projection_version };
@@ -122,7 +129,7 @@ describe("post-commit convergence acceptance", () => {
     expect(mock.files.get(`${root}/HANDOFF.md`)).toContain("Revision: 258");
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
       target_revision: 258,
-      projection_version: 5
+      projection_version: CURRENT_PROJECTION_VERSION
     });
   });
 
@@ -171,7 +178,7 @@ describe("post-commit convergence acceptance", () => {
 
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
       target_revision: 1,
-      projection_version: 5
+      projection_version: CURRENT_PROJECTION_VERSION
     });
   });
 
@@ -246,7 +253,7 @@ describe("post-commit convergence acceptance", () => {
     expect(resumed).toEqual({ complete: true, more_work: false });
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
       target_revision: record.new_revision,
-      projection_version: 5
+      projection_version: CURRENT_PROJECTION_VERSION
     });
   });
 
@@ -308,11 +315,11 @@ describe("post-commit convergence acceptance", () => {
     const record = commitFixture("PRJ-9274", 1)[0];
     const repository = new ProjectRepository(runtime, "v2");
     const ledger = new AcceptanceLedger();
-    ledger.requestTarget({ revision: record.new_revision, projection_version: 5 });
+    ledger.requestTarget({ revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION });
     ledger.beginNextTarget();
     const reconcile = vi.spyOn(MaterializationCoordinator.prototype, "reconcile");
     const runNext = vi.spyOn(MaterializationCoordinator.prototype, "runNext").mockResolvedValue({
-      project_id: record.project_id, target_revision: record.new_revision, projection_version: 5,
+      project_id: record.project_id, target_revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION,
       completed: false, repaired_head: false, more_work: true
     });
 
@@ -387,7 +394,7 @@ describe("post-commit convergence acceptance", () => {
     await engine.runSlice(createSliceBudget(() => 0, new AbortController().signal));
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record.project_id)) ?? "{}")).toMatchObject({
       target_revision: record.new_revision,
-      projection_version: 5
+      projection_version: CURRENT_PROJECTION_VERSION
     });
   });
 
@@ -627,7 +634,7 @@ describe("post-commit convergence acceptance", () => {
     expect(mock.files.get(`${root}/HANDOFF.md`)).toContain("Revision: 258");
     expect(JSON.parse(mock.files.get(machineMaterializationHeadPath(record258.project_id)) ?? "{}")).toMatchObject({
       target_revision: 258,
-      projection_version: 5
+      projection_version: CURRENT_PROJECTION_VERSION
     });
     expect(mock.files.get(machineReceiptPath(record258.receipt.transaction_id))).toBe(originalReceipt);
     expect(completed?.progress.alerts[exhaustedIncidentId!]?.resolved_at).toBeTruthy();

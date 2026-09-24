@@ -13,6 +13,7 @@ import {
   machineReceiptPath
 } from "../src/persistence/layout";
 import { sha256Canonical } from "../src/materialization/hash";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import { buildAlertRecord } from "../src/convergence/observability";
 import { DropboxClient } from "../src/persistence/providers/dropbox/client";
 import { commitFixture } from "./helpers/convergence-fixture";
@@ -170,7 +171,7 @@ describe("convergence engine scheduling", () => {
     expect(checkpoint).toMatchObject({
       progress: {
         canonical_observed_revision: 39,
-        active: { revision: 39, projection_version: 5 },
+        active: { revision: 39, projection_version: CURRENT_PROJECTION_VERSION },
         requested: null,
         obligations: {
           [blockedId]: { state: "blocked", code: "identical_internal_failure_limit", last_attempt_number: 673 }

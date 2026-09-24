@@ -106,7 +106,7 @@ describe("Control Tower governed artifact submission", () => {
     ]);
   });
 
-  it("returns bounded operational context instead of the complete project history", async () => {
+  it("returns the current phase and paginates bounded context details with a stable cursor", async () => {
     const canonicalState = {
       project_id: "PRJ-0007",
       name: "Atlantic Machinery",
@@ -114,14 +114,14 @@ describe("Control Tower governed artifact submission", () => {
       status: "active",
       revision: 76,
       current_phase_id: "PHASE-CURRENT",
-      phases: {
-        "PHASE-CURRENT": { phase_id: "PHASE-CURRENT", title: "Current", status: "active" },
-        "PHASE-HISTORY": { phase_id: "PHASE-HISTORY", title: "History", status: "completed", payload: "x".repeat(200_000) }
+      plan_phases: {
+        "PHASE-CURRENT": { phase_id: "PHASE-CURRENT", title: "Current", status: "active", objective: "x".repeat(200_000), next_actions: [], created_at: "2026-09-01T00:00:00.000Z", updated_at: "2026-09-01T00:00:00.000Z" },
+        "PHASE-HISTORY": { phase_id: "PHASE-HISTORY", title: "History", status: "completed", objective: "y".repeat(200_000), next_actions: [], created_at: "2026-08-01T00:00:00.000Z", updated_at: "2026-08-01T00:00:00.000Z" }
       },
-      tasks: {
-        "TASK-ACTIVE": { task_id: "TASK-ACTIVE", title: "Continue", status: "in_progress" },
-        "TASK-DONE": { task_id: "TASK-DONE", title: "Old", status: "completed", payload: "x".repeat(200_000) }
-      }
+      tasks: Object.fromEntries(Array.from({ length: 55 }, (_, index) => {
+        const taskId = `TASK-${String(index + 1).padStart(3, "0")}`;
+        return [taskId, { task_id: taskId, title: `Continue ${index + 1}`, status: "in_progress" }];
+      }))
     };
     const stub = {
       fetch: async () => Response.json({
@@ -142,10 +142,26 @@ describe("Control Tower governed artifact submission", () => {
       project_id: "PRJ-0007",
       context: { project_id: "PRJ-0007", canonical_revision: 76, token: "signed" },
       project: { name: "Atlantic Machinery", revision: 76, current_phase_id: "PHASE-CURRENT" },
-      current_phase: { phase_id: "PHASE-CURRENT", status: "active" },
-      active_tasks: [{ task_id: "TASK-ACTIVE", status: "in_progress" }]
+      current_phase: { phase_id: "PHASE-CURRENT", status: "active", objective_offset: 0, objective_total_chars: 200_000, objective_truncated: true },
+      active_tasks_total: 55,
+      active_tasks_truncated: true
     });
     expect(body).not.toHaveProperty("canonical_state");
-    expect(result.content[0]!.text.length).toBeLessThan(10_000);
+    expect(body.active_tasks).toHaveLength(50);
+    expect(body.active_tasks[0]).toMatchObject({ task_id: "TASK-001", status: "in_progress" });
+    expect(body.current_phase.objective).toHaveLength(4096);
+    expect(body.next_cursor).toEqual(expect.any(String));
+    expect(result.content[0]!.text.length).toBeLessThan(20_000);
+
+    const repeated = await server._registeredTools.project_os_get_context.handler({ project_id: "PRJ-0007" });
+    expect(JSON.parse(repeated.content[0]!.text).next_cursor).toBe(body.next_cursor);
+
+    const next = await server._registeredTools.project_os_get_context.handler({ project_id: "PRJ-0007", cursor: body.next_cursor });
+    const nextBody = JSON.parse(next.content[0]!.text);
+    expect(nextBody.active_tasks).toHaveLength(5);
+    expect(nextBody.active_tasks[0].task_id).toBe("TASK-051");
+    expect(nextBody.current_phase.objective_offset).toBe(4096);
+    expect(nextBody.current_phase.objective).toBe("x".repeat(4096));
+    expect(nextBody.next_cursor).toEqual(expect.any(String));
   });
 });

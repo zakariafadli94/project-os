@@ -89,6 +89,40 @@ describe("effective Control Tower token permissions", () => {
     expect(result.content[0]!.text).not.toContain("private-provider-detail");
   });
 
+  it("preserves a known busy status and retry delay without exposing Guard details", async () => {
+    const owner = { getByName: () => ({ fetch: async () => Response.json({
+      status: "unknown", code: "PROJECT_OS_READ_BUSY", private_detail: "provider-secret"
+    }, { status: 503, headers: { "Retry-After": "1" } }) }) } as unknown as DurableObjectNamespace;
+    const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {
+      _registeredTools: Record<string, { handler(input: unknown): Promise<{ content: Array<{ text: string }> }> }>
+    };
+    const result = await server._registeredTools.project_os_get_request_status!.handler({
+      project_id: "PRJ-0003", request_id: "TXN-ORIGINAL", kind: "transaction"
+    });
+    const body = JSON.parse(result.content[0]!.text);
+    expect(body).toMatchObject({ status: "unavailable", code: "PROJECT_OS_READ_BUSY", retry_after_seconds: 1,
+      request_id: "TXN-ORIGINAL", recovery: { action: "check_status", preserve_request_id: true } });
+    expect(result.content[0]!.text).not.toContain("provider-secret");
+  });
+
+  it("distinguishes an exhausted status observation from a busy Guard", async () => {
+    const owner = { getByName: () => ({ fetch: async () => Response.json({
+      status: "unknown", code: "request_status_unavailable", private_detail: "provider-secret"
+    }, { status: 503, headers: { "Retry-After": "1" } }) }) } as unknown as DurableObjectNamespace;
+    const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {
+      _registeredTools: Record<string, { handler(input: unknown): Promise<{ content: Array<{ text: string }> }> }>
+    };
+    const result = await server._registeredTools.project_os_get_request_status!.handler({
+      project_id: "PRJ-0003", request_id: "TXN-ORIGINAL", kind: "transaction"
+    });
+    const body = JSON.parse(result.content[0]!.text);
+    expect(body).toMatchObject({ status: "unknown", code: "request_status_unavailable",
+      request_id: "TXN-ORIGINAL", recovery: { action: "check_status", preserve_request_id: true },
+      observation: { status: "unknown", terminal: false, project_id: "PRJ-0003",
+        kind: "transaction", request_id: "TXN-ORIGINAL", code: "request_status_unavailable" } });
+    expect(result.content[0]!.text).not.toContain("provider-secret");
+  });
+
   it.each(["project_os_get_context", "project_os_get_context_detail", "project_os_get_request_status", "project_os_get_receipt"])(
     "provides recovery instructions for HTTP dependency failures in %s", async (tool) => {
       const owner = { getByName: () => ({ fetch: async () => Response.json({ error: "private-provider-detail" }, { status: 503 }) }) } as unknown as DurableObjectNamespace;

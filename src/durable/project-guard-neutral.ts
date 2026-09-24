@@ -2669,7 +2669,7 @@ export class ProjectGuard extends DurableObject<Env> {
     ).toArray()[0] ?? null;
   }
 
-  private async handleReceiptRead(url: URL): Promise<Response> {
+  protected async handleReceiptRead(url: URL): Promise<Response> {
     const requestId = url.searchParams.get("request_id");
     const kind = url.searchParams.get("kind");
     if (!requestId || !["transaction", "document", "artifact"].includes(kind ?? "")) {
@@ -2699,13 +2699,13 @@ export class ProjectGuard extends DurableObject<Env> {
     return receipt ? Response.json(receipt) : Response.json({ error: "receipt_not_found" }, { status: 404 });
   }
 
-  private observationCorrelationId(request: Request, url: URL): string {
+  protected observationCorrelationId(request: Request, url: URL): string {
     const value = request.headers.get("x-project-os-correlation-id")
       ?? url.searchParams.get("correlation_id");
     return value && value.length <= 128 ? value : crypto.randomUUID();
   }
 
-  private unknownObservationResponse(
+  protected unknownObservationResponse(
     projectId: string,
     kind: string,
     requestId: string,
@@ -3045,7 +3045,7 @@ export class ProjectGuard extends DurableObject<Env> {
     return receipt;
   }
 
-  private async readBoundedRequestStatusReceipt(
+  protected async readBoundedRequestStatusReceipt(
     projectId: string,
     kind: RequestKind,
     requestId: string

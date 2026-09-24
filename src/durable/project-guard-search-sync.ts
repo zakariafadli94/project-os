@@ -7,6 +7,7 @@ import {
 } from "../search/project-sync-store";
 import { ProjectSearchSynchronizer } from "../search/project-synchronizer";
 import { searchSyncEnabled } from "../search/sync-mode";
+import type { RequestKind } from "../persistence/observation";
 import { SubrequestResilientProjectGuard } from "./project-guard-subrequest-resilient";
 
 const SEARCH_SIDE_EFFECT_PATHS = new Set([
@@ -14,6 +15,12 @@ const SEARCH_SIDE_EFFECT_PATHS = new Set([
   "/document",
   "/reconcile-documents",
   "/artifact"
+]);
+const OBSERVATION_PATHS = new Set([
+  "/mutation-context",
+  "/request-status",
+  "/execution-status",
+  "/receipt"
 ]);
 
 /**
@@ -25,6 +32,7 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
   private readonly searchSyncStore: ProjectSearchSyncStore | null;
   private readonly searchSynchronizer: ProjectSearchSynchronizer | null;
   private searchQueue: Promise<void> = Promise.resolve();
+  private searchQueueDepth = 0;
   private searchWakeInFlight: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -48,6 +56,40 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    // These reads do not mutate search state. Keep them outside the derived
+    // search queue so a long finalization cannot delay admission/status reads.
+    if (request.method === "GET" && OBSERVATION_PATHS.has(url.pathname)) {
+      // A request may still be waiting in this outer queue before the base
+      // guard knows about it. Never report false absence for such an intent.
+      if (url.pathname !== "/mutation-context" && this.searchQueueDepth > 0) {
+        const projectId = this.ctx.id.name;
+        const kind = url.searchParams.get("kind");
+        const requestId = url.searchParams.get("request_id");
+        if (projectId && url.searchParams.has("project_id") && url.searchParams.get("project_id") !== projectId
+          && ["/request-status", "/receipt"].includes(url.pathname)) {
+          return Response.json({ error: url.pathname === "/receipt" ? "receipt_not_found" : "request_identity_mismatch" }, { status: 404 });
+        }
+        if (projectId && kind && requestId && ["transaction", "document", "artifact"].includes(kind)) {
+          if (url.pathname === "/receipt") {
+            const local = await this.handleReceiptRead(url);
+            if (local.status !== 404) return local;
+            try {
+              const canonical = await this.readBoundedRequestStatusReceipt(projectId, kind as RequestKind, requestId);
+              if (canonical) return Response.json(canonical);
+            } catch {
+              // Absence is not proven while outer work is queued.
+            }
+          }
+          return this.unknownObservationResponse(projectId, kind, requestId,
+            this.observationCorrelationId(request, url), "PROJECT_OS_READ_BUSY");
+        }
+        if (projectId && kind === "recovery" && requestId && url.pathname === "/execution-status") {
+          return Response.json({ project_id: projectId, kind, request_id: requestId,
+            status: "unknown", code: "PROJECT_OS_READ_BUSY" }, { status: 503, headers: { "Retry-After": "1" } });
+        }
+      }
+      return super.fetch(request);
+    }
     if (request.method === "GET" && url.pathname === "/search-sync-status") {
       return this.serializeSearch(() => this.handleSearchSyncStatus());
     }
@@ -244,10 +286,12 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
     const previous = this.searchQueue;
     let release!: () => void;
     this.searchQueue = new Promise<void>((resolve) => { release = resolve; });
+    this.searchQueueDepth += 1;
     await previous;
     try {
       return await operation();
     } finally {
+      this.searchQueueDepth -= 1;
       release();
     }
   }

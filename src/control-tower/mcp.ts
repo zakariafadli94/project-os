@@ -9,6 +9,7 @@ import type { ControlTowerAccess } from "./auth";
 import { persistenceCapabilities } from "../persistence/capabilities";
 import type { VersionMetadataLike } from "../deployment/identity";
 import { checkCatalogue } from "../rules/check-catalogue";
+import { persistenceObservation, type RequestKind } from "../persistence/observation";
 
 export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string; CF_VERSION_METADATA?: VersionMetadataLike }, access: ControlTowerAccess = { read: false, mutate: false }) {
   const server = new McpServer({ name: "project-os-control-tower", version: "1.0.0" });
@@ -123,7 +124,30 @@ async function readGuard(
         const response = await namespace.getByName(projectId).fetch(`https://project-guard.internal${path}`, {
           signal: controller.signal, headers: { "x-project-os-correlation-id": correlationId }
         });
-        if (response.status >= 500) throw new Error("dependency_http_failed");
+        if (response.status >= 500) {
+          // Only known, non-sensitive observation verdicts may cross this boundary.
+          // Do not echo arbitrary 5xx payloads from a dependency to a client.
+          if (diagnostic.route === "/request-status" && response.status === 503) {
+            const body = await response.clone().json().catch(() => null) as { code?: unknown } | null;
+            if (body && (body.code === "PROJECT_OS_READ_BUSY" || body.code === "request_status_unavailable")) {
+              const retryAfter = Number(response.headers.get("Retry-After"));
+              const retryAfterSeconds = Number.isSafeInteger(retryAfter) && retryAfter > 0 && retryAfter <= 60
+                ? retryAfter : 1;
+              const unavailableObservation = body.code === "request_status_unavailable" && requestId
+                && ["transaction", "document", "artifact"].includes(query.get("kind") ?? "")
+                ? persistenceObservation({ project_id: projectId, kind: query.get("kind") as RequestKind,
+                    request_id: requestId, observed_at: new Date().toISOString(), correlation_id: correlationId,
+                    code: "request_status_unavailable" })
+                : null;
+              return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({
+                status: unavailableObservation ? "unknown" : "unavailable", code: body.code, ...diagnostic,
+                ...(unavailableObservation ? { observation: unavailableObservation } : {}),
+                retry_after_seconds: retryAfterSeconds, recovery
+              }) }] };
+            }
+          }
+          throw new Error("dependency_http_failed");
+        }
         const presented = present(response, await response.json());
         if (!response.ok) {
           return { ...presented, content: presented.content.map(item => ({ ...item,

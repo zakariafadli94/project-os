@@ -37,6 +37,8 @@ Environment: existing local Work and worktree; principal orchestration and three
 
 No global completion claim until all required gates have evidence. Unknown production observations remain unknown.
 
+First PR-head CI `36015661958` on `370b45f` failed in a finalization-slice test assertion: a shared mock and a denied 33rd `beforeHttp` attempt were counted as provider calls. The counter has been scoped to the runtime and permitted calls; 38 targeted tests, independent review and a sixth complete local suite (257 files/1,631 tests) pass. CI on the revised head remains mandatory. No merge or deploy occurred on the failed SHA.
+
 E12 preparation: `8173021` rejects JSON-RPC/MCP errors carried by HTTP 200 in deployment qualification. Principal six tests and typecheck passed; C independently reviewed helper and callers. An unauthenticated public probe remains explicitly insufficient for the real-client gate.
 
 Read-only transport recheck, before current changes deploy: both the native `mcp__project_os_control_tower` handle and connected-app `mcp__codex_apps` handle returned the SOP request's committed receipt and finalized/terminal execution on 2026-09-24. This confirms that specific historical lookup at observation time, not a new client submission or stable transport guarantee. No transaction was replayed.

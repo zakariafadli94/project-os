@@ -684,15 +684,14 @@ describe("canonical execution boundary in ProjectGuard", () => {
     let lastStoredRevision = 1;
     for (; slices < 4 && !verified; slices += 1) {
       let calls = 0;
-      const before = mock.providerCalls.length;
       const sliceResult = await runInDurableObject(guard, async (instance, state) => {
         const controller = new AbortController();
         const runtime = createProductionPersistence(testEnv, projectId, {
           deadlineMs: Date.now() + 15_000,
           signal: controller.signal,
           beforeHttp: () => {
+            if (calls >= 32) throw new Error("slice_budget_exhausted");
             calls += 1;
-            if (calls > 32) throw new Error("slice_budget_exhausted");
           }
         });
         const repository = new ProjectRepository(runtime, "v2");
@@ -710,7 +709,9 @@ describe("canonical execution boundary in ProjectGuard", () => {
       expect(sliceResult.nextRevision).toBeGreaterThanOrEqual(lastStoredRevision);
       if (!verified) expect(sliceResult.nextRevision).toBeGreaterThan(lastStoredRevision);
       lastStoredRevision = sliceResult.nextRevision;
-      perSliceCalls.push(mock.providerCalls.length - before);
+      // Only this repository runtime belongs to the bounded finalization
+      // slice. The shared mock may also record asynchronous guard alarms.
+      perSliceCalls.push(calls);
       expect(perSliceCalls.at(-1)).toBeLessThanOrEqual(32);
     }
     expect(verified).toBe(true);
@@ -718,13 +719,13 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(perSliceCalls.length).toBeGreaterThan(1);
 
     const nextCandidate = { ...candidate, revision: 3 };
-    const beforeReuse = mock.providerCalls.length;
+    let reuseCalls = 0;
     await runInDurableObject(guard, async (instance, state) => {
       const controller = new AbortController();
       const runtime = createProductionPersistence(testEnv, projectId, {
         deadlineMs: Date.now() + 15_000,
         signal: controller.signal,
-        beforeHttp: () => {}
+        beforeHttp: () => { reuseCalls += 1; }
       });
       const repository = new ProjectRepository(runtime, "v2");
       const durableWork = await state.storage.get<typeof work>(workKey);
@@ -734,7 +735,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
         Date.now() + 15_000, controller.signal
       )).resolves.toBe(true);
     });
-    expect(mock.providerCalls.length - beforeReuse).toBe(0);
+    expect(reuseCalls).toBe(0);
   });
 
   it("rearms an old callback against a newer canonically bound head instead of dropping its intent", async () => {

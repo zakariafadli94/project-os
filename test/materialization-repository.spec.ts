@@ -3,6 +3,7 @@ import type {
   CompletedMaterializationRecord,
   MaterializationHead
 } from "../src/domain/materialization";
+import { CURRENT_PROJECTION_VERSION, parseCompletedMaterializationRecord } from "../src/domain/materialization";
 import { DropboxConflictError, type DropboxEntry, type DropboxFileMetadata, type DropboxTransport } from "../src/dropbox/client";
 import {
   machineMaterializationHeadPath,
@@ -15,6 +16,8 @@ class FakeTransport implements DropboxTransport {
   files = new Map<string, string>();
   revisions = new Map<string, number>();
   uploads: Array<{ path: string; mode: "add" | "overwrite" }> = [];
+  pageCalls: Array<{ path: string; cursor: string | null; limit: number }> = [];
+  pages: Array<{ entries: DropboxEntry[]; cursor: string | null }> = [];
 
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
     if (mode === "add" && this.files.has(path)) throw new DropboxConflictError("already exists", "req-materialization-test");
@@ -57,6 +60,11 @@ class FakeTransport implements DropboxTransport {
         path_display: candidate,
         path_lower: candidate.toLowerCase()
       }));
+  }
+
+  async listFolderPage(path: string, cursor: string | null, limit: number) {
+    this.pageCalls.push({ path, cursor, limit });
+    return this.pages.shift() ?? { entries: [], cursor: null };
   }
 }
 
@@ -107,6 +115,46 @@ const head: MaterializationHead = {
 };
 
 describe("durable materialization evidence repository", () => {
+  it("keeps old generation records readable but requires a four-view proof for the current projection version", () => {
+    expect(() => parseCompletedMaterializationRecord({
+      ...completed,
+      projection_version: CURRENT_PROJECTION_VERSION
+    })).toThrow();
+
+    expect(parseCompletedMaterializationRecord(completed).projection_version).toBe(1);
+  });
+
+  it("rejects a four-view proof whose PROJECT and PLAN evidence is absent from the completed generation", () => {
+    const proofEntry = (relative_path: string, letter: string) => ({
+      relative_path,
+      input_hash: letter.repeat(64),
+      content_hash: letter.repeat(64),
+      source_revision: 7,
+      provider_object_id: `object:${relative_path}`,
+      provider_revision: `revision:${relative_path}`
+    });
+    expect(() => parseCompletedMaterializationRecord({
+      ...completed,
+      projection_version: CURRENT_PROJECTION_VERSION,
+      current_views_proof: {
+        target_revision: 7,
+        projection_version: CURRENT_PROJECTION_VERSION,
+        views: {
+          "global:PROJECT": proofEntry("PROJECT.md", "a"),
+          "global:PLAN": proofEntry("PLAN.md", "b"),
+          "global:STATE": {
+            ...proofEntry("STATE.md", "a"),
+            content_hash: "b".repeat(64)
+          },
+          "global:HANDOFF": {
+            ...proofEntry("HANDOFF.md", "c"),
+            content_hash: "d".repeat(64)
+          }
+        }
+      }
+    })).toThrow();
+  });
+
   it("uses deterministic immutable generation and head paths", () => {
     expect(machineMaterializationRecordPath("PRJ-3101", 7, 1))
       .toBe("/PROJECT_OS/.project-os/projects/PRJ-3101/materializations/REV-000007-PV-0001.json");
@@ -173,5 +221,26 @@ describe("durable materialization evidence repository", () => {
     const recordPath = machineMaterializationRecordPath("PRJ-3101", 7, 1);
     transport.files.set(recordPath, JSON.stringify({ ...completed, project_id: "PRJ-9999" }));
     await expect(repository.readMaterializationRecord("PRJ-3101", 7, 1)).rejects.toThrow(/binding mismatch/i);
+  });
+
+  it("lists materialization generations as bounded provider pages with an opaque continuation cursor", async () => {
+    const transport = new FakeTransport();
+    const repository = new ProjectRepository(persistenceFromDropbox(transport), "v2");
+    transport.pages.push({
+      entries: [
+        { tag: "file", name: "REV-000007-PV-0006.json" },
+        { tag: "folder", name: "REV-000008-PV-0006.json" },
+        { tag: "file", name: "README.txt" }
+      ],
+      cursor: "provider-cursor-2"
+    });
+
+    const page = await repository.listMaterializationRecordsPage("PRJ-3101", "provider-cursor-1", 50);
+
+    expect(transport.pageCalls).toEqual([{
+      path: "/PROJECT_OS/.project-os/projects/PRJ-3101/materializations",
+      cursor: "provider-cursor-1", limit: 50
+    }]);
+    expect(page).toEqual({ records: [{ target_revision: 7, projection_version: 6 }], next_cursor: "provider-cursor-2" });
   });
 });

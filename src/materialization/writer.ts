@@ -1,4 +1,4 @@
-import type { ProjectionOutputEvidence } from "../domain/materialization";
+import type { CurrentViewsProof, ProjectionOutputEvidence } from "../domain/materialization";
 import type { SliceBudget } from "../convergence/contract";
 import { observeText, type ObservedText } from "../convergence/fenced-effects";
 import {
@@ -128,10 +128,9 @@ export class WorkspaceProjectionWriter {
       }
 
       const requiredCalls = this.runtime ? (output.critical ? 7 : 4) : (output.critical ? 3 : 2);
-      // Keep room for both critical-pair reads and the head read after
-      // publication, in addition to the journal checkpoint reserve owned by
-      // the enclosing convergence slice.
-      if (!budget.canStartEffect(requiredCalls + 5)) {
+      // Final publication verification is a separate coordinator phase now;
+      // canStartEffect itself retains the durable-checkpoint reserve.
+      if (!budget.canStartEffect(requiredCalls)) {
         return { verified, nextKey: output.key };
       }
 
@@ -179,6 +178,84 @@ export class WorkspaceProjectionWriter {
     };
     await Promise.all(Array.from({ length: Math.min(this.concurrency, outputs.length) }, () => worker()));
     if (failures.length > 0) throw failures[0];
+  }
+
+  async verifyCurrentViews(
+    outputs: ReadonlyMap<string, ProjectionOutputEvidence>,
+    targetRevision: number,
+    projectionVersion: number,
+    workspaceRoot: string,
+    expected?: CurrentViewsProof
+  ): Promise<CurrentViewsProof> {
+    const root = normalizeWorkspaceRoot(workspaceRoot);
+    const required: ReadonlyArray<readonly [string, string]> = [
+      ["global:PROJECT", "PROJECT.md"],
+      ["global:PLAN", "PLAN.md"],
+      ["global:STATE", "STATE.md"],
+      ["global:HANDOFF", "HANDOFF.md"]
+    ];
+    const views: Record<string, CurrentViewsProof["views"][keyof CurrentViewsProof["views"]]> = {};
+    for (const [key, relativePath] of required) {
+      const evidence = outputs.get(key);
+      if (!evidence || evidence.relative_path !== relativePath || evidence.source_revision !== targetRevision) {
+        throw new Error(`Current-view evidence is missing or stale for ${key}`);
+      }
+      const path = joinWorkspacePath(root, relativePath);
+      let observation: ObservedText | null;
+      if (this.runtime) {
+        observation = await observeText(this.runtime, path);
+      } else {
+        const first = await this.objects.getMetadata(path);
+        const content = await this.objects.readText(path);
+        const last = await this.objects.getMetadata(path);
+        if (!first && content === null && !last) observation = null;
+        else if (
+          content === null
+          || !first?.objectId
+          || !first.revisionToken
+          || first.objectId !== last?.objectId
+          || first.revisionToken !== last?.revisionToken
+        ) throw new Error(`Current-view provider observation was unstable for ${key}`);
+        else observation = {
+          content,
+          hash: await sha256Text(content),
+          object_id: first.objectId,
+          token: first.revisionToken
+        };
+      }
+      if (!observation || observation.hash !== evidence.content_hash) {
+        throw new MaterializationOutputConflictError(
+          key,
+          path,
+          `Current-view verification failed for ${key} at ${path}`
+        );
+      }
+      if (!hasRenderedRevision(observation.content, targetRevision)) {
+        throw new MaterializationOutputConflictError(
+          key,
+          path,
+          `Current-view rendered revision is stale for ${key} at ${path}`
+        );
+      }
+      const proof = {
+        ...evidence,
+        provider_object_id: observation.object_id,
+        provider_revision: observation.token
+      };
+      if (expected && !sameCurrentViewProof(proof, expected.views[key as keyof CurrentViewsProof["views"]])) {
+        throw new MaterializationOutputConflictError(
+          key,
+          path,
+          `Current-view provider generation changed for ${key} at ${path}`
+        );
+      }
+      views[key] = proof;
+    }
+    if (expected && (
+      expected.target_revision !== targetRevision
+      || expected.projection_version !== projectionVersion
+    )) throw new Error("Current-view proof generation binding mismatch");
+    return { target_revision: targetRevision, projection_version: projectionVersion, views } as CurrentViewsProof;
   }
 
   async verifyOutputs(
@@ -517,6 +594,23 @@ function sameEvidence(evidence: ProjectionOutputEvidence, output: PlannedProject
     && evidence.input_hash === output.input_hash
     && evidence.content_hash === output.content_hash
     && evidence.source_revision === output.source_revision;
+}
+
+function sameCurrentViewProof(
+  actual: CurrentViewsProof["views"][keyof CurrentViewsProof["views"]],
+  expected: CurrentViewsProof["views"][keyof CurrentViewsProof["views"]]
+): boolean {
+  return actual.relative_path === expected.relative_path
+    && actual.input_hash === expected.input_hash
+    && actual.content_hash === expected.content_hash
+    && actual.source_revision === expected.source_revision
+    && actual.provider_object_id === expected.provider_object_id
+    && actual.provider_revision === expected.provider_revision;
+}
+
+function hasRenderedRevision(content: string, revision: number): boolean {
+  const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  return frontmatter?.[1]?.split(/\r?\n/).some((line) => line === `revision: ${revision}`) ?? false;
 }
 
 function normalizeWorkspaceRoot(value: string): string {

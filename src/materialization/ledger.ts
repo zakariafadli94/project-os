@@ -1,4 +1,4 @@
-import type { ProjectionOutputEvidence } from "../domain/materialization";
+import type { MaterializationGenerationRef, ProjectionOutputEvidence } from "../domain/materialization";
 import type { Progress } from "../convergence/contract";
 
 export interface MaterializationTargetRequest {
@@ -20,6 +20,21 @@ export type FinalVerificationItem = {
   expected: "absent";
   evidence: ProjectionOutputEvidence;
 };
+
+export interface MaterializationRepairScanCheckpoint {
+  canonical_revision: number;
+  cursor: string | null;
+  scan_complete: boolean;
+  best_candidate: MaterializationGenerationRef | null;
+  chain_state?: {
+    phase: "discover" | "apply";
+    refs: MaterializationGenerationRef[];
+    chain_depths: number[];
+    cursor_ref: MaterializationGenerationRef | null;
+    apply_index: number;
+    outputs: Record<string, ProjectionOutputEvidence>;
+  };
+}
 
 export interface MaterializationLedgerStatus {
   head: MaterializationTargetRequest | null;
@@ -43,6 +58,7 @@ interface ControlRow {
   active_immutable_revision: number | null;
   active_verification_epoch: number;
   active_final_verification_json: string;
+  repair_scan_json: string;
   active_managed_zones_ready: number;
   active_status: string | null;
   last_error: string | null;
@@ -82,6 +98,7 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
       active_immutable_revision INTEGER,
       active_verification_epoch INTEGER NOT NULL DEFAULT 0,
       active_final_verification_json TEXT NOT NULL DEFAULT '[]',
+      repair_scan_json TEXT NOT NULL DEFAULT '',
       active_managed_zones_ready INTEGER NOT NULL DEFAULT 0,
       active_status TEXT,
       last_error TEXT
@@ -133,6 +150,11 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
   }
   try {
     storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_final_verification_json TEXT NOT NULL DEFAULT '[]'");
+  } catch (error) {
+    if (!String(error).includes("duplicate column name")) throw error;
+  }
+  try {
+    storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN repair_scan_json TEXT NOT NULL DEFAULT ''");
   } catch (error) {
     if (!String(error).includes("duplicate column name")) throw error;
   }
@@ -536,6 +558,39 @@ export class MaterializationLedger {
     return { progress, token: row.provider_token };
   }
 
+  readRepairScanCheckpoint(canonicalRevision: number): MaterializationRepairScanCheckpoint | null {
+    const raw = this.control().repair_scan_json;
+    if (!raw) return null;
+    let value: unknown;
+    try { value = JSON.parse(raw); } catch { return null; }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const checkpoint = value as Record<string, unknown>;
+    if (checkpoint.canonical_revision !== canonicalRevision || !Number.isSafeInteger(canonicalRevision)
+      || typeof checkpoint.scan_complete !== "boolean"
+      || (checkpoint.cursor !== null && (typeof checkpoint.cursor !== "string" || checkpoint.cursor.length === 0))) return null;
+    const candidate = checkpoint.best_candidate;
+    if (candidate !== null && (!candidate || typeof candidate !== "object" || Array.isArray(candidate)
+      || !Number.isSafeInteger((candidate as Record<string, unknown>).target_revision)
+      || !Number.isSafeInteger((candidate as Record<string, unknown>).projection_version))) return null;
+    return checkpoint as unknown as MaterializationRepairScanCheckpoint;
+  }
+
+  writeRepairScanCheckpoint(checkpoint: MaterializationRepairScanCheckpoint): void {
+    if (!Number.isSafeInteger(checkpoint.canonical_revision) || checkpoint.canonical_revision < 0
+      || (checkpoint.cursor !== null && checkpoint.cursor.length > 16_384)
+      || (!checkpoint.scan_complete && checkpoint.cursor === null)
+      || (checkpoint.best_candidate !== null
+        && (!Number.isSafeInteger(checkpoint.best_candidate.target_revision)
+          || !Number.isSafeInteger(checkpoint.best_candidate.projection_version)))) {
+      throw new Error("Invalid materialization repair-scan checkpoint");
+    }
+    this.storage.sql.exec("UPDATE materialization_control SET repair_scan_json = ? WHERE singleton = 1", JSON.stringify(checkpoint));
+  }
+
+  clearRepairScanCheckpoint(): void {
+    this.storage.sql.exec("UPDATE materialization_control SET repair_scan_json = '' WHERE singleton = 1");
+  }
+
   restoreConvergenceCheckpoint(progress: Progress, token: string): void {
     if (!token) throw new Error("Convergence checkpoint requires a provider token");
     this.storage.sql.exec(
@@ -553,7 +608,7 @@ export class MaterializationLedger {
     return this.storage.sql.exec<ControlRow>(
       `SELECT head_revision, head_projection_version, requested_revision, requested_projection_version,
               active_revision, active_projection_version, active_coalesced_json, active_immutable_revision,
-              active_verification_epoch, active_final_verification_json, active_managed_zones_ready, active_status, last_error
+              active_verification_epoch, active_final_verification_json, repair_scan_json, active_managed_zones_ready, active_status, last_error
        FROM materialization_control WHERE singleton = 1`
     ).one();
   }

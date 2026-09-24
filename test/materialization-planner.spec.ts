@@ -147,6 +147,21 @@ function baselineFrom(plan: ProjectionPlan): ProjectionBaseline {
 }
 
 describe("projection hashing and incremental planning", () => {
+  it("binds all four canonical views to the exact target revision in both input hashes and rendered frontmatter", async () => {
+    const { record, taskId } = fixture();
+    const initial = await planProjection(record, null, 6);
+    const next = commit(record.state, "task.start", { task_id: taskId });
+    const followup = await planProjection(next, baselineFrom(initial), 6);
+
+    for (const key of ["global:PROJECT", "global:PLAN", "global:STATE", "global:HANDOFF"]) {
+      const previous = initial.changed_outputs.get(key)!;
+      const current = followup.changed_outputs.get(key)!;
+      expect(current.source_revision).toBe(next.new_revision);
+      expect(current.input_hash).not.toBe(previous.input_hash);
+      expect(current.content).toContain(`revision: ${next.new_revision}`);
+    }
+  });
+
   it("hashes canonical objects independently of object key insertion order", async () => {
     await expect(sha256Canonical({ b: 2, a: 1 })).resolves.toBe(await sha256Canonical({ a: 1, b: 2 }));
   });

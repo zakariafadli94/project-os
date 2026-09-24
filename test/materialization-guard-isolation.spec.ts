@@ -15,6 +15,7 @@ import { createProductionPersistence } from "../src/persistence/production-facto
 import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { commitFixture } from "./helpers/convergence-fixture";
+import type { SliceBudget } from "../src/convergence/contract";
 
 const testEnv = env as unknown as Env;
 const at = "2026-09-02T07:20:00+01:00";
@@ -57,6 +58,86 @@ async function createProject(projectId: string, slug: string, transactionId: str
 
 describe("MaterializationGuard isolation boundary", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("checkpoints canonical commit reconstruction and never returns a partial state as current", async () => {
+    const projectId = "PRJ-3910";
+    const commits = commitFixture(projectId, 8);
+    let reads: number[] = [];
+    const repository = {
+      readProjectState: async () => null,
+      readCommitRecord: async (_project: string, revision: number) => {
+        reads.push(revision);
+        return commits[revision - 1] ?? null;
+      }
+    };
+    let startChecks = 0;
+    const partialBudget: SliceBudget = {
+      deadline_ms: Date.now() + 25_000,
+      calls_left: 32,
+      now: () => Date.now(),
+      signal: new AbortController().signal,
+      beforeHttp: () => undefined,
+      canStartEffect: () => ++startChecks <= 2
+    };
+    const guard = materializationNamespace().getByName(projectId);
+    const partial = await runInDurableObject(guard, (instance) =>
+      (instance as unknown as { canonicalState(repo: unknown, budget: SliceBudget): Promise<unknown> })
+        .canonicalState(repository, partialBudget)
+    );
+
+    expect(partial).toMatchObject({ complete: false, state: null });
+    expect(reads).toEqual([1, 2]);
+
+    reads = [];
+    const resumed = await runInDurableObject(guard, (instance) =>
+      (instance as unknown as { canonicalState(repo: unknown): Promise<unknown> })
+        .canonicalState(repository)
+    );
+    expect(resumed).toMatchObject({ complete: true, state: { project_id: projectId, revision: 8 } });
+    expect(reads).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
+  it("keeps bounded canonical diagnostics read-only when reconstruction is incomplete", async () => {
+    const projectId = "PRJ-3911";
+    const writes: string[] = [];
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId,
+      ctx: { storage: {
+        get: async () => undefined,
+        put: async () => { writes.push("put"); },
+        delete: async () => { writes.push("delete"); },
+        setAlarm: async () => { writes.push("alarm"); }
+      } }
+    }) as MaterializationGuard;
+    const commits = commitFixture(projectId, 4);
+    let reads = 0;
+    const repository = {
+      readProjectState: async () => null,
+      readCommitRecord: async (_project: string, revision: number) => {
+        reads += 1;
+        return commits[revision - 1] ?? null;
+      }
+    };
+    let checks = 0;
+    const budget: SliceBudget = {
+      deadline_ms: Date.now() + 25_000, calls_left: 32, now: () => Date.now(),
+      signal: new AbortController().signal, beforeHttp: () => undefined,
+      canStartEffect: () => ++checks <= 2
+    };
+    const result = await (guard as unknown as {
+      canonicalState(repo: unknown, budget: SliceBudget, persist: boolean): Promise<unknown>;
+      canonicalStatePendingResponse(schedule: boolean): Promise<Response>;
+    }).canonicalState(repository, budget, false) as { complete: boolean; state: unknown };
+    const response = await (guard as unknown as {
+      canonicalStatePendingResponse(schedule: boolean): Promise<Response>;
+    }).canonicalStatePendingResponse(false);
+
+    expect(result).toEqual({ complete: false, state: null });
+    expect(reads).toBe(2);
+    expect(response.status).toBe(202);
+    expect(await response.json()).toMatchObject({ reason: "canonical_state_reconstruction_pending" });
+    expect(writes).toEqual([]);
+  });
 
   it("exposes a separate MATERIALIZATION_GUARD Durable Object binding", () => {
     expect(materializationNamespace()).toBeDefined();
@@ -240,6 +321,7 @@ describe("MaterializationGuard isolation boundary", () => {
       projectId: "PRJ-3919",
       layoutMode: "v2",
       env: {},
+      ctx: { storage: { get: async () => undefined } },
       queue: Promise.resolve()
     }) as MaterializationGuard;
     const notify = vi.spyOn(materialization as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(true);

@@ -24,12 +24,14 @@ type DetailCursor = {
 type Body = { context?: unknown; canonical_state?: Record<string, unknown> };
 
 export function summarizeCanonicalContext(body: Body, projectId: string, token?: string): { value?: Record<string, unknown>; error?: Record<string, unknown> } {
-  const state = body.canonical_state ?? {};
+  const binding = validateCanonicalBinding(body, projectId);
+  if (binding.error) return { error: binding.error };
+  const state = body.canonical_state!;
   const phases = objectValues(state.plan_phases);
   const tasks = objectValues(state.tasks)
     .filter((task) => task.status !== "completed" && task.status !== "cancelled")
     .sort((a, b) => compare(String(a.task_id ?? ""), String(b.task_id ?? "")));
-  const revision = safeRevision(state.revision) ?? contextRevision(body.context) ?? -1;
+  const revision = binding.revision!;
   const phaseId = typeof state.current_phase_id === "string" ? state.current_phase_id : null;
   const phase = phases.find((item) => item.phase_id === phaseId) ?? null;
   const cursor = token ? decode<ContextCursor>(token) : {
@@ -118,8 +120,10 @@ function buildSummary(context: unknown, projectId: string, project: Record<strin
 export function retrieveContextDetail(body: Body, projectId: string, input: {
   revision: number; entity_type: EntityType; entity_id: string; field: string; cursor?: string
 }): { value?: Record<string, unknown>; error?: Record<string, unknown> } {
-  const state = body.canonical_state ?? {};
-  const revision = safeRevision(state.revision) ?? contextRevision(body.context) ?? -1;
+  const binding = validateCanonicalBinding(body, projectId);
+  if (binding.error) return { error: binding.error };
+  const state = body.canonical_state!;
+  const revision = binding.revision!;
   if (input.revision !== revision) return { error: { status: "stale_cursor", code: "CONTEXT_CURSOR_STALE", current_revision: revision } };
   if (!(DETAIL_FIELDS[input.entity_type] as readonly string[]).includes(input.field)) return { error: { status: "invalid_field", code: "CONTEXT_DETAIL_FIELD_INVALID" } };
   const cursor = input.cursor ? decode<DetailCursor>(input.cursor) : {
@@ -212,6 +216,22 @@ function utf8Prefix(value: string, maxBytes: number): { text: string; truncated:
 function objectValues(value: unknown): Array<Record<string, unknown>> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return [];
   return Object.values(value).filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object" && !Array.isArray(entry));
+}
+
+function validateCanonicalBinding(body: Body, projectId: string): { revision?: number; error?: Record<string, unknown> } {
+  const state = body?.canonical_state;
+  const context = body?.context;
+  if (!state || typeof state !== "object" || Array.isArray(state) || !context || typeof context !== "object" || Array.isArray(context)) {
+    return { error: { status: "unavailable", code: "CONTEXT_CANONICAL_UNAVAILABLE" } };
+  }
+  if (state.project_id !== projectId || (context as Record<string, unknown>).project_id !== projectId) {
+    return { error: { status: "unavailable", code: "CONTEXT_PROJECT_BINDING_MISMATCH" } };
+  }
+  const stateRevision = safeRevision(state.revision);
+  const signedRevision = contextRevision(context);
+  if (stateRevision === null || signedRevision === null) return { error: { status: "unavailable", code: "CONTEXT_CANONICAL_UNAVAILABLE" } };
+  if (stateRevision !== signedRevision) return { error: { status: "unavailable", code: "CONTEXT_REVISION_MISMATCH" } };
+  return { revision: stateRevision };
 }
 
 function compare(a: string, b: string): number { return a < b ? -1 : a > b ? 1 : 0; }

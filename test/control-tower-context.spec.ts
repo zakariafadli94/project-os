@@ -6,10 +6,15 @@ type ToolResult = { isError?: boolean; content: Array<{ text: string }> };
 type RegisteredServer = { _registeredTools: Record<string, { handler: (input: unknown) => Promise<ToolResult> }> };
 
 function contextServer(state: Record<string, unknown>) {
-  const stub = { fetch: async () => Response.json({
-    context: { project_id: "PRJ-0007", canonical_revision: 76, token: "signed" },
+  const revision = typeof state.revision === "number" ? state.revision : 76;
+  return contextServerBody({
+    context: { project_id: "PRJ-0007", canonical_revision: revision, token: "signed" },
     canonical_state: state
-  }) };
+  });
+}
+
+function contextServerBody(payload: unknown) {
+  const stub = { fetch: async () => Response.json(payload) };
   return createControlTowerServer({
     PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
     REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
@@ -190,7 +195,7 @@ describe("Control Tower canonical context", () => {
 
   it("rejects offsets that split surrogate pairs and reports stale detail cursors as stale", async () => {
     const body = {
-      context: { canonical_revision: 76 },
+      context: { project_id: "PRJ-0007", canonical_revision: 76 },
       canonical_state: { project_id: "PRJ-0007", revision: 76, current_phase_id: "PHASE-CURRENT",
         plan_phases: { "PHASE-CURRENT": { phase_id: "PHASE-CURRENT", title: "Current", objective: "🧭x".repeat(8_000), next_actions: [] } }, tasks: {} }
     };
@@ -225,5 +230,39 @@ describe("Control Tower canonical context", () => {
     expect(absent.value).toBeNull();
     const forbidden = await detail.handler({ project_id: "PRJ-0007", revision: 76, entity_type: "project", entity_id: "PRJ-0007", field: "canonical_state" });
     expect(forbidden.isError).toBe(true);
+  });
+
+  it("fails closed when canonical state or signed context is absent or bound to another project/revision", async () => {
+    const badBodies = [
+      {
+        context: { project_id: "PRJ-0007", canonical_revision: 76, token: "signed" },
+        canonical_state: { project_id: "PRJ-0008", name: "SECRET-OTHER-PROJECT", revision: 76, tasks: {},
+          plan_phases: { "PHASE-SECRET": { phase_id: "PHASE-SECRET", objective: "SECRET-OTHER-PROJECT-OBJECTIVE" } } }
+      },
+      {
+        context: { project_id: "PRJ-0007", canonical_revision: 75, token: "signed" },
+        canonical_state: { project_id: "PRJ-0007", name: "Project", revision: 76, tasks: {}, plan_phases: {} }
+      },
+      {}
+    ];
+    for (const payload of badBodies) {
+      const result = await contextServerBody(payload)._registeredTools.project_os_get_context.handler({ project_id: "PRJ-0007" });
+      expect(result.isError).toBe(true);
+      expect(parse(result).status).toBe("unavailable");
+      expect(result.content[0]!.text).not.toContain("SECRET-OTHER-PROJECT");
+    }
+
+    const crossProjectDetail = await contextServerBody(badBodies[0])._registeredTools.project_os_get_context_detail!.handler({
+      project_id: "PRJ-0007", revision: 76, entity_type: "phase", entity_id: "PHASE-SECRET", field: "objective"
+    });
+    expect(crossProjectDetail.isError).toBe(true);
+    expect(crossProjectDetail.content[0]!.text).not.toContain("SECRET-OTHER-PROJECT");
+    for (const payload of [badBodies[1], badBodies[2]]) {
+      const detail = await contextServerBody(payload)._registeredTools.project_os_get_context_detail!.handler({
+        project_id: "PRJ-0007", revision: 76, entity_type: "phase", entity_id: "PHASE-CURRENT", field: "objective"
+      });
+      expect(detail.isError).toBe(true);
+      expect(parse(detail).status).toBe("unavailable");
+    }
   });
 });

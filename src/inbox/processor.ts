@@ -490,7 +490,7 @@ function terminalTransactionPath(
     : transactionPath(status, transactionId);
 }
 
-function transactionFailurePath(mode: LayoutMode, transactionId: string): string {
+export function transactionFailurePath(mode: LayoutMode, transactionId: string): string {
   return mode === "v2"
     ? `${PROJECT_OS_ROOT}/.project-os/transactions/failures/${transactionId}.json`
     : `${PROJECT_OS_ROOT}/TRANSACTIONS/failures/${transactionId}.json`;

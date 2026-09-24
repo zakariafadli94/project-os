@@ -87,6 +87,7 @@ it("notifies ProjectGuard of an existing head while repair convergence continues
     layoutMode: "v2",
     env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: '{"PRJ-0003":"repair"}' },
     ctx: { storage: { get: async () => undefined, setAlarm: async () => {} } },
+    ledger: { finalVerificationActive: () => false },
     resumeConvergenceFromVerifiedHead: async () => true,
     ensureConvergenceRequestedFromLedger: async () => false,
     convergenceEngineForSlice: () => ({

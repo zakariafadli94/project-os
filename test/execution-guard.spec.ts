@@ -40,6 +40,14 @@ async function setup(projectId: string) {
   return { mock, guard };
 }
 
+function failMaterializationHeadForProject(projectId: string, error: Error): void {
+  const readHead = ProjectRepository.prototype.readMaterializationHead;
+  vi.spyOn(ProjectRepository.prototype, "readMaterializationHead").mockImplementation(function (this: ProjectRepository, readProjectId) {
+    if (readProjectId === projectId) return Promise.reject(error);
+    return readHead.call(this, readProjectId);
+  });
+}
+
 function addCurrentViewsProof(record: CompletedMaterializationRecord): CompletedMaterializationRecord {
   const paths = [
     ["global:PROJECT", "PROJECT.md"],
@@ -1391,9 +1399,8 @@ describe("canonical execution boundary in ProjectGuard", () => {
     await runInDurableObject(guard, async (_instance, state) => {
       await state.storage.put("materialization-finalization-request", target);
     });
-    vi.spyOn(ProjectRepository.prototype, "readMaterializationHead").mockRejectedValueOnce(
-      new ProviderOperationError("provider_unavailable", true, { providerId: "dropbox", status: 503 })
-    );
+    failMaterializationHeadForProject(projectId,
+      new ProviderOperationError("provider_unavailable", true, { providerId: "dropbox", status: 503 }));
     const startedAt = Date.now();
 
     await expect(runInDurableObject(guard, (instance) =>
@@ -1422,11 +1429,10 @@ describe("canonical execution boundary in ProjectGuard", () => {
     await runInDurableObject(guard, async (_instance, state) => {
       await state.storage.put("materialization-finalization-request", target);
     });
-    vi.spyOn(ProjectRepository.prototype, "readMaterializationHead").mockRejectedValueOnce(
+    failMaterializationHeadForProject(projectId,
       new ProviderOperationError("provider_unavailable", true, {
         providerId: "dropbox", status: 503, retryAfterMs: 180_000
-      })
-    );
+      }));
     const startedAt = Date.now();
 
     await runInDurableObject(guard, (instance) =>
@@ -1504,7 +1510,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     await runInDurableObject(guard, async (_instance, state) => {
       await state.storage.put("materialization-finalization-request", target);
     });
-    vi.spyOn(ProjectRepository.prototype, "readMaterializationHead").mockRejectedValueOnce(new TypeError("fetch failed"));
+    failMaterializationHeadForProject(projectId, new TypeError("fetch failed"));
     const startedAt = Date.now();
 
     await runInDurableObject(guard, (instance) =>
@@ -1534,7 +1540,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
       await runInDurableObject(guard, async (_instance, state) => {
         await state.storage.put("materialization-finalization-request", target);
       });
-      vi.spyOn(ProjectRepository.prototype, "readMaterializationHead").mockRejectedValueOnce(error);
+      failMaterializationHeadForProject(projectId, error);
 
       await expect(runInDurableObject(guard, (instance) =>
         (instance as unknown as { resumePendingMaterializationFinalization(): Promise<void> })

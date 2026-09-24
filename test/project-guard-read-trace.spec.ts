@@ -153,7 +153,6 @@ it("fails closed instead of issuing a stale context when the snapshot reader sta
       canonicalContextRepository(projectId: string, scope: ProviderRequestScope): ProjectRepository;
     };
     subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
-    await subject.loadOrRecoverState();
     vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(20);
     vi.spyOn(subject, "canonicalContextRepository").mockReturnValue(subject.repository);
     vi.spyOn(subject.repository, "readProjectState").mockImplementation(() => stalledSnapshot);
@@ -297,7 +296,7 @@ it("reads a short contiguous commit history when no canonical snapshot exists", 
   await expect(response.json()).resolves.toMatchObject({ canonical_state: { revision: 3 } });
 });
 
-it("does not sign a partial commit suffix when the shared read deadline expires", async () => {
+it("does not sign a partial commit suffix after the shared provider call budget is exhausted", async () => {
   const projectId = "PRJ-8403";
   const mock = installDropboxMock();
   const records = commitFixture(projectId, 129);
@@ -327,5 +326,162 @@ it("does not sign a partial commit suffix when the shared read deadline expires"
   });
   const response = await guard.fetch("https://project-guard.internal/mutation-context");
   expect(response.status).toBe(503);
+  expect(mock.downloadCalls.filter((path) => path === machineStatePath(projectId)
+    || path.startsWith(machineCommitRecordPath(projectId, 1).replace(/1\.json$/, ""))).length).toBeLessThanOrEqual(32);
   await expect(response.json()).resolves.toMatchObject({ error: "canonical_unavailable" });
+});
+
+it("resumes bounded canonical suffix reads from a proven technical checkpoint", async () => {
+  const projectId = "PRJ-8408";
+  const records = commitFixture(projectId, 129);
+  let checkpoint: unknown;
+  let providerCalls = 0;
+  let snapshotReads = 0;
+  const localBaseline = records[0]!.state;
+  const budget = { calls: 0, maxCalls: 32 };
+  const putCheckpoint = vi.fn(async (_key: string, value: unknown) => { checkpoint = value; });
+  const repository = {
+    readProjectState: vi.fn(async () => {
+      providerCalls += 1;
+      budget.calls += 1;
+      snapshotReads += 1;
+      return records[0]!.state;
+    }),
+    readCommitRecord: vi.fn(async (_id: string, revision: number) => {
+      providerCalls += 1;
+      budget.calls += 1;
+      return records[revision - 1] ?? null;
+    })
+  } as unknown as ProjectRepository;
+  const subject = Object.assign(Object.create(ProjectGuard.prototype), {
+    layoutMode: "v2",
+    contextVerifiedState: localBaseline,
+    contextCheckpointWriteQueue: Promise.resolve(),
+    loadState: () => localBaseline,
+    ctx: { storage: {
+      get: vi.fn(async () => checkpoint),
+      put: putCheckpoint
+    } }
+  }) as unknown as {
+    readCanonicalState(repository: ProjectRepository, projectId: string, deadline: number, budget: { calls: number; maxCalls: number }): Promise<ProjectState | null>;
+  };
+
+  const reached: number[] = [];
+  let result: ProjectState | null = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    budget.calls = 0;
+    try {
+      result = await subject.readCanonicalState(repository, projectId, Date.now() + 10_000, budget);
+    } catch (error) {
+      expect(error).toMatchObject({ message: "canonical_context_budget_exhausted" });
+    }
+    expect(budget.calls).toBeLessThanOrEqual(32);
+    if (checkpoint && typeof checkpoint === "object") {
+      reached.push((checkpoint as { revision: number }).revision);
+    }
+    if (result) break;
+  }
+
+  expect(result?.revision).toBe(129);
+  expect(reached).toEqual([33, 64, 95, 126, 129]);
+  expect(snapshotReads).toBe(0);
+  expect(providerCalls).toBeLessThanOrEqual(32 * 5);
+
+  const writesAfterCompletion = putCheckpoint.mock.calls.length;
+  budget.calls = 0;
+  await expect(subject.readCanonicalState(repository, projectId, Date.now() + 10_000, budget))
+    .resolves.toMatchObject({ revision: 129 });
+  expect(putCheckpoint).toHaveBeenCalledTimes(writesAfterCompletion);
+});
+
+it("reuses a locally proven context baseline on unchanged reads without downloading state again", async () => {
+  const projectId = "PRJ-8406";
+  const mock = installDropboxMock();
+  const record = commitFixture(projectId, 1)[0]!;
+  mock.files.set(machineCommitRecordPath(projectId, 1), JSON.stringify(record));
+  mock.files.set(machineStatePath(projectId), JSON.stringify(record.state));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+
+  await runInDurableObject(guard, (instance) => {
+    (instance as unknown as { env: Env }).env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+  });
+
+  const first = await guard.fetch("https://project-guard.internal/mutation-context");
+  const second = await guard.fetch("https://project-guard.internal/mutation-context");
+
+  expect(first.status).toBe(200);
+  expect(second.status).toBe(200);
+  expect(mock.downloadCalls.filter((path) => path === machineStatePath(projectId))).toHaveLength(1);
+
+  await runInDurableObject(guard, (instance) => {
+    (instance as unknown as { contextVerifiedState: ProjectState | null }).contextVerifiedState = null;
+  });
+  const afterEviction = await guard.fetch("https://project-guard.internal/mutation-context");
+  expect(afterEviction.status).toBe(200);
+  expect(mock.downloadCalls.filter((path) => path === machineStatePath(projectId))).toHaveLength(1);
+  expect(mock.downloadCalls.filter((path) => path === machineCommitRecordPath(projectId, 1))).toHaveLength(2);
+});
+
+it("uses the exact commit record instead of signing an altered canonical snapshot", async () => {
+  const projectId = "PRJ-8408";
+  const mock = installDropboxMock();
+  const record = commitFixture(projectId, 1)[0]!;
+  mock.files.set(machineCommitRecordPath(projectId, 1), JSON.stringify(record));
+  mock.files.set(machineStatePath(projectId), JSON.stringify({ ...record.state, name: "Altered snapshot" }));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (instance) => {
+    (instance as unknown as { env: Env }).env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
+  });
+
+  const response = await guard.fetch("https://project-guard.internal/mutation-context");
+
+  expect(response.status).toBe(200);
+  await expect(response.json()).resolves.toMatchObject({ canonical_state: record.state });
+});
+
+it("does not return an older context when a newer local commit lands during suffix verification", async () => {
+  const projectId = "PRJ-8407";
+  const records = commitFixture(projectId, 2);
+  let localState = records[0]!.state;
+  let release!: () => void;
+  let markReadStarted!: () => void;
+  const pendingRead = new Promise<void>((resolve) => { release = resolve; });
+  const readStarted = new Promise<void>((resolve) => { markReadStarted = resolve; });
+  const repository = {
+    readProjectState: vi.fn().mockResolvedValue(records[0]!.state),
+    readCommitRecord: vi.fn(async (_id: string, revision: number) => {
+      if (revision === 2) {
+        markReadStarted();
+        await pendingRead;
+      }
+      return null;
+    })
+  } as unknown as ProjectRepository;
+  const subject = Object.assign(Object.create(ProjectGuard.prototype), {
+    layoutMode: "v2",
+    contextVerifiedState: records[0]!.state,
+    contextCheckpointWriteQueue: Promise.resolve(),
+    persistence: {},
+    loadState: () => localState,
+    ctx: { storage: {
+      transactionSync: (operation: () => void) => operation(),
+      sql: { exec: vi.fn() },
+      get: vi.fn().mockResolvedValue(undefined),
+      put: vi.fn().mockResolvedValue(undefined)
+    } }
+  }) as unknown as {
+    readCanonicalState(repository: ProjectRepository, projectId: string, deadline: number, budget: { calls: number; maxCalls: number }): Promise<ProjectState | null>;
+    persistCommit(state: ProjectState, receipt: (typeof records)[number]["receipt"]): void;
+  };
+
+  const read = subject.readCanonicalState(repository, projectId, Date.now() + 2_000, { calls: 0, maxCalls: 32 });
+  try {
+    await readStarted;
+    localState = records[1]!.state;
+    subject.persistCommit(records[1]!.state, records[1]!.receipt);
+    release();
+    await expect(read).resolves.toMatchObject({ revision: 2, last_event_id: records[1]!.state.last_event_id });
+  } finally {
+    release();
+  }
 });

@@ -44,8 +44,6 @@ import { AdmissionError, issueMutationContext, verifyMutationContext, type Mutat
 import { normalizeArtifactAdmission, normalizeDocumentAdmission, normalizeSystemAdmission, normalizeTransactionAdmission, type NormalizedAdmissionOperation } from "../admission/operation-context";
 import { RuleAdmissionError, verifyRuleAdmissionPermit, type RuleAdmissionInput, type RuleAdmissionPermit } from "../admission/rule-admission";
 import { decodeAdmission } from "../admission/transport";
-import { discoverCanonical } from "../convergence/discovery";
-import { initialProgress } from "../convergence/journal";
 import { sha256Canonical } from "../materialization/hash";
 import { sha256Text } from "../documents/hash";
 import {
@@ -179,6 +177,16 @@ interface MaterializationFinalizationWork {
   candidates: MaterializationFinalizationCandidate[];
 }
 
+interface ContextReadCheckpoint {
+  schema_version: "1.0";
+  project_id: string;
+  revision: number;
+  event_id: string | null;
+  state_sha256: string;
+}
+
+const CONTEXT_READ_CHECKPOINT_KEY = "project-guard-canonical-context-checkpoint-v1";
+
 class RuleAdmissionRejection extends Error {
   constructor(readonly evaluation: EvaluationResult) {
     super(evaluation.code);
@@ -219,6 +227,10 @@ export class ProjectGuard extends DurableObject<Env> {
    * second legitimate request from being rejected while the first is verifying
    * the same Dropbox state. */
   private contextReadPending: Promise<ProjectState | null> | null = null;
+  /** In-memory provenance only. It is intentionally lost on DO eviction; a
+   * later instance must prove the cached state against its exact commit again. */
+  private contextVerifiedState: ProjectState | null = null;
+  private contextCheckpointWriteQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1432,8 +1444,17 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
     if (!latest) return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    const stateBeforePersist = this.loadState();
+    if (stateBeforePersist && stateBeforePersist.revision > latest.revision) {
+      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    }
     this.persistState(latest);
+    this.contextVerifiedState = normalizeProjectState(latest);
     const context = await issueMutationContext(latest, secret, Date.now(), this.contextActor(request));
+    const stateAfterSign = this.loadState();
+    if (stateAfterSign && stateAfterSign.revision > latest.revision) {
+      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    }
     return Response.json(includeState ? { context, canonical_state: latest } : { context });
   }
 
@@ -1456,13 +1477,19 @@ export class ProjectGuard extends DurableObject<Env> {
     if (this.contextReadPending) return this.contextReadPending;
     const deadline = Date.now() + this.canonicalContextReadDeadlineMs();
     const controller = new AbortController();
+    const budget = { calls: 0, maxCalls: 32 };
     const repository = this.canonicalContextRepository(projectId, {
       deadlineMs: deadline,
       signal: controller.signal,
       now: () => Date.now(),
-      beforeHttp: () => undefined
+      beforeHttp: () => {
+        if (Date.now() >= deadline || budget.calls >= budget.maxCalls) {
+          throw new Error("canonical_context_budget_exhausted");
+        }
+        budget.calls += 1;
+      }
     });
-    const source = this.readCanonicalState(repository, projectId, deadline);
+    const source = this.readCanonicalState(repository, projectId, deadline, budget);
     const pending = new Promise<ProjectState | null>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
         const error = new Error("canonical_read_deadline");
@@ -1489,39 +1516,141 @@ export class ProjectGuard extends DurableObject<Env> {
     return shared;
   }
 
-  private async readCanonicalState(repository: ProjectRepository, projectId: string, deadline: number): Promise<ProjectState | null> {
-    const snapshot = await this.readContextSnapshot(repository, projectId);
-    const progress = initialProgress(projectId, new Date().toISOString(), crypto.randomUUID());
-    let latest = snapshot;
-    if (snapshot) {
-      progress.canonical_observed_revision = snapshot.revision;
-      progress.baseline_revision = snapshot.revision;
-      progress.baseline_kind = "pre_commit001";
+  private async readCanonicalState(
+    repository: ProjectRepository,
+    projectId: string,
+    deadline: number,
+    budget: { calls: number; maxCalls: number }
+  ): Promise<ProjectState | null> {
+    const ensureBudget = () => {
+      if (Date.now() >= deadline || budget.calls >= budget.maxCalls) {
+        throw new Error("canonical_context_budget_exhausted");
+      }
+    };
+    const readCommit = async (revision: number) => {
+      ensureBudget();
+      const record = await repository.readCommitRecord(projectId, revision);
+      if (Date.now() >= deadline) throw new Error("canonical_context_budget_exhausted");
+      return record;
+    };
+    const sameState = (left: ProjectState, right: ProjectState) => canonicalJson(left) === canonicalJson(right);
+    const checkpoint = await this.readContextCheckpoint(projectId);
+    const exactRecordState = async (state: ProjectState): Promise<ProjectState | null> => {
+      if (state.project_id !== projectId || state.revision < 1) return null;
+      const record = await readCommit(state.revision);
+      if (!record || record.project_id !== projectId || record.new_revision !== state.revision) return null;
+      return sameState(state, record.state) ? state : record.state;
+    };
+
+    let local = this.loadState();
+    let latest: ProjectState | null = null;
+    if (local && this.layoutMode === "v2" && this.contextVerifiedState
+      && this.contextVerifiedState.revision === local.revision
+      && sameState(this.contextVerifiedState, local)) {
+      latest = local;
+    } else if (local && this.layoutMode === "v2") {
+      latest = await exactRecordState(local);
     }
 
-    for (let page = 0; page < 4; page += 1) {
-      const discovered = await discoverCanonical(
-        repository,
-        this.persistence,
-        progress,
-        {
-          deadline_ms: deadline,
-          calls_left: 128,
-          now: () => Date.now(),
-          signal: new AbortController().signal,
-          beforeHttp() { this.calls_left -= 1; },
-          canStartEffect() { return this.calls_left > 0 && Date.now() < deadline; }
-        }
-      );
-      if (!discovered) {
-        if (Date.now() >= deadline) throw new Error("canonical_history_deadline");
-        return latest;
+    if (checkpoint && (!latest || checkpoint.revision > latest.revision)) {
+      const record = await readCommit(checkpoint.revision);
+      if (record && record.project_id === projectId && record.new_revision === checkpoint.revision
+        && record.event.event_id === checkpoint.event_id
+        && await sha256Canonical(record.state) === checkpoint.state_sha256
+        && Date.now() < deadline) {
+        latest = record.state;
       }
-      latest = discovered.state;
-      progress.canonical_observed_revision = discovered.state.revision;
-      if (discovered.complete) return latest;
     }
-    return null;
+
+    if (!latest) {
+      const snapshot = await this.readContextSnapshot(repository, projectId);
+      if (snapshot) latest = await exactRecordState(snapshot);
+    }
+    if (!latest && this.layoutMode === "v2") {
+      const firstRecord = await readCommit(1);
+      if (firstRecord) {
+        if (firstRecord.previous_revision !== 0) throw new Error("canonical_commit_chain_gap");
+        latest = firstRecord.state;
+      }
+    }
+    if (!latest) return null;
+    await this.persistContextCheckpoint(latest, deadline);
+
+    // Verify only the immutable suffix from the proven baseline. Provider
+    // call accounting is shared with snapshot/baseline reads for this request.
+    for (;;) {
+      ensureBudget();
+      const next = await readCommit(latest.revision + 1);
+      if (next) {
+        if (next.previous_revision !== latest.revision || next.new_revision !== latest.revision + 1) {
+          throw new Error("canonical_commit_chain_gap");
+        }
+        latest = next.state;
+        await this.persistContextCheckpoint(latest, deadline);
+        continue;
+      }
+
+      // A commit may have completed while the provider lookup was pending.
+      // Its local cache is usable only when this instance itself recorded the
+      // same verified state; otherwise prove it against the exact commit.
+      local = this.loadState();
+      if (local && local.revision > latest.revision) {
+        if (this.contextVerifiedState && this.contextVerifiedState.revision === local.revision
+          && sameState(this.contextVerifiedState, local)) {
+          latest = local;
+          await this.persistContextCheckpoint(latest, deadline);
+          continue;
+        }
+        const newer = await exactRecordState(local);
+        if (!newer) throw new Error("canonical_context_raced_unverified_state");
+        latest = newer;
+        await this.persistContextCheckpoint(latest, deadline);
+        continue;
+      }
+      return latest;
+    }
+  }
+
+  private async readContextCheckpoint(projectId: string): Promise<ContextReadCheckpoint | null> {
+    const raw = await this.ctx.storage.get<unknown>(CONTEXT_READ_CHECKPOINT_KEY);
+    if (!raw || typeof raw !== "object") return null;
+    const value = raw as Partial<ContextReadCheckpoint>;
+    if (value.schema_version !== "1.0" || value.project_id !== projectId
+      || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1
+      || !(value.event_id === null || typeof value.event_id === "string")
+      || typeof value.state_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.state_sha256)) return null;
+    return value as ContextReadCheckpoint;
+  }
+
+  /** Persist only a proven historical checkpoint, never an unverified suffix.
+   * Serializing writes and comparing revisions prevents a late lower-revision
+   * reader from replacing a newer cursor. */
+  private async persistContextCheckpoint(state: ProjectState, deadline: number): Promise<void> {
+    if (Date.now() >= deadline) throw new Error("canonical_context_budget_exhausted");
+    const stateHash = await sha256Canonical(state);
+    if (Date.now() >= deadline) throw new Error("canonical_context_budget_exhausted");
+    const candidate: ContextReadCheckpoint = {
+      schema_version: "1.0",
+      project_id: state.project_id,
+      revision: state.revision,
+      event_id: state.last_event_id,
+      state_sha256: stateHash
+    };
+    const write = this.contextCheckpointWriteQueue.then(async () => {
+      if (Date.now() >= deadline) throw new Error("canonical_context_budget_exhausted");
+      const current = this.loadState();
+      if (current && current.revision > candidate.revision) return;
+      const saved = await this.readContextCheckpoint(candidate.project_id);
+      if (Date.now() >= deadline) throw new Error("canonical_context_budget_exhausted");
+      if (saved && saved.revision > candidate.revision) return;
+      if (saved && saved.revision === candidate.revision
+        && saved.event_id === candidate.event_id && saved.state_sha256 === candidate.state_sha256) return;
+      await this.ctx.storage.put(CONTEXT_READ_CHECKPOINT_KEY, candidate);
+      if (Date.now() >= deadline) throw new Error("canonical_context_budget_exhausted");
+    });
+    this.contextCheckpointWriteQueue = write.catch(() => undefined);
+    await write;
+    if (Date.now() >= deadline) throw new Error("canonical_context_budget_exhausted");
   }
 
   private contextActor(request: Request): { actor_id: string; authority: string } {
@@ -2027,6 +2156,8 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private persistState(state: ProjectState): void {
+    const current = this.loadState();
+    if (current && current.project_id === state.project_id && current.revision > state.revision) return;
     this.ctx.storage.sql.exec(
       "INSERT INTO project_state (singleton, state_json) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json",
       JSON.stringify(state)
@@ -2656,6 +2787,7 @@ export class ProjectGuard extends DurableObject<Env> {
         JSON.stringify(receipt)
       );
     });
+    if (this.layoutMode === "v2") this.contextVerifiedState = normalizeProjectState(state);
   }
 
   private terminalReceipt(

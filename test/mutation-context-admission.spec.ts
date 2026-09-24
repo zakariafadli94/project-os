@@ -68,6 +68,7 @@ describe("canonical mutation-context admission", () => {
     const mock = installDropboxMock();
     const records = commitFixture(projectId, 267);
     mock.files.set(machineStatePath(projectId), `${JSON.stringify(records[255].state, null, 2)}\n`);
+    mock.files.set(machineCommitRecordPath(projectId, 256), `${JSON.stringify(records[255], null, 2)}\n`);
     for (const record of records.slice(256)) {
       mock.files.set(machineCommitRecordPath(projectId, record.new_revision), `${JSON.stringify(record, null, 2)}\n`);
     }

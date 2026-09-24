@@ -39,6 +39,13 @@ import {
 const LEGACY_CURSOR_KEY = "managed-document-change-cursor-v1";
 export const SCHEDULED_DOCUMENT_JOB_LIMIT = 1;
 
+class MissingChangeTargetError extends Error {
+  constructor(path: string) {
+    super(`Provider listing confirms change target is absent: ${path}`);
+    this.name = "MissingChangeTargetError";
+  }
+}
+
 export interface ManagedDocumentCursorStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put(key: string, value: unknown): Promise<void>;
@@ -313,6 +320,17 @@ export class ManagedDocumentChangeCoordinator {
           });
           continue;
         }
+        if (error instanceof MissingChangeTargetError) {
+          jobs.markQuarantined(job, "file_target_missing");
+          summary.jobs_quarantined += 1;
+          console.warn("Project OS managed document change job quarantined", {
+            project_id: state.project_id,
+            job_id: job.job_id,
+            path: job.change.path,
+            code: "file_target_missing"
+          });
+          continue;
+        }
         jobs.markFailed(job.job_id, errorMessage(error));
         summary.job_failures += 1;
         console.error("Project OS managed document change job failed", {
@@ -332,7 +350,8 @@ export class ManagedDocumentChangeCoordinator {
     if (separator <= 0) return change.kind;
     const parent = change.path.slice(0, separator);
     const entry = (await this.runtime.objects.listChildren(parent)).find((candidate) => candidate.path === change.path);
-    return entry?.kind ?? change.kind;
+    if (!entry) throw new MissingChangeTargetError(change.path);
+    return entry.kind;
   }
 
   private async processJob(

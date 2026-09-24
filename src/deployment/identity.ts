@@ -1,6 +1,4 @@
-import type { Env } from "../env";
-
-interface VersionMetadataLike {
+export interface VersionMetadataLike {
   id?: unknown;
   tag?: unknown;
   timestamp?: unknown;
@@ -12,8 +10,8 @@ export interface DeploymentIdentity {
   git_sha: string | null;
 }
 
-export function deploymentIdentity(env: Env): DeploymentIdentity {
-  const metadata = (env as Env & { CF_VERSION_METADATA?: VersionMetadataLike }).CF_VERSION_METADATA;
+export function deploymentIdentity(env: { CF_VERSION_METADATA?: VersionMetadataLike }): DeploymentIdentity {
+  const metadata = env.CF_VERSION_METADATA;
   const workerVersionId = typeof metadata?.id === "string" && metadata.id.length > 0
     ? metadata.id
     : null;

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { artifactInboxPath, inboxPath } from "../src/index";
 import type { Env } from "../src/env";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 
 const testEnv = env as unknown as Env;
 
@@ -52,7 +53,7 @@ describe("Worker routing", () => {
     } as Env, ctx);
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
-    await expect(response.json()).resolves.toEqual({
+    await expect(response.json()).resolves.toMatchObject({
       canonical_read: true,
       typed_transactions: true,
       receipt_tracking: true,
@@ -292,7 +293,7 @@ describe("Worker routing", () => {
       project_id: project.project_id,
       canonical_revision: 1,
       materialized_head: null,
-      requested: { revision: 1, projection_version: 5 },
+      requested: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION },
       diagnostic: {
         read_only: true,
         final_verification_pending_count: 0,

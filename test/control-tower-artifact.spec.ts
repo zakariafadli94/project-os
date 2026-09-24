@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createControlTowerServer } from "../src/control-tower/mcp";
+import { createControlTowerServer as createScopedControlTowerServer } from "../src/control-tower/mcp";
+const createControlTowerServer = (env: Parameters<typeof createScopedControlTowerServer>[0]) =>
+  createScopedControlTowerServer(env, { read: true, mutate: true });
 
 const artifact = {
   request_id: "ART-CONTROL-TOWER-0001",
@@ -92,7 +94,8 @@ describe("Control Tower governed artifact submission", () => {
     const requestStatus = await server._registeredTools.project_os_get_request_status.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
 
     expect(missingReceipt.isError).toBe(true);
-    expect(JSON.parse(missingReceipt.content[0]!.text)).toEqual({ error: "receipt_not_found" });
+    expect(JSON.parse(missingReceipt.content[0]!.text)).toMatchObject({ error: "receipt_not_found",
+      request_id: artifact.request_id, recovery: { action: "check_status", requires_new_approval: false } });
     expect(calls).toEqual([
       `/receipt?request_id=${artifact.request_id}&kind=artifact`,
       `/request-status?request_id=${artifact.request_id}&kind=artifact`

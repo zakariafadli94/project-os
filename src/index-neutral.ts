@@ -31,7 +31,7 @@ import { AdmissionError, type MutationContext, type MutationContextResponse } fr
 import { decodeAdmission } from "./admission/transport";
 import { renderState } from "./render/state";
 import { renderHandoff } from "./render/handoff";
-import { deploymentIdentity } from "./deployment/identity";
+import { persistenceCapabilities } from "./persistence/capabilities";
 
 export { ProjectGuard } from "./durable/project-guard";
 export { RegistryGuard } from "./durable/registry-guard";
@@ -60,14 +60,7 @@ const worker = {
     }
 
     if (request.method === "GET" && url.pathname === "/v1/capabilities") {
-      return Response.json({
-        canonical_read: true,
-        typed_transactions: true,
-        receipt_tracking: true,
-        finalization_tracking: true,
-        fallback_ingress: true,
-        deployment_sha: deploymentIdentity(env).git_sha
-      }, { headers: { "cache-control": "no-store" } });
+      return Response.json(persistenceCapabilities(env), { headers: { "cache-control": "no-store" } });
     }
 
     if ((request.method === "POST" && url.pathname === "/v1/rule-governance/transactions") ||

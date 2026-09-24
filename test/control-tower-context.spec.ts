@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createControlTowerServer } from "../src/control-tower/mcp";
+import { createControlTowerServer as createScopedControlTowerServer } from "../src/control-tower/mcp";
+const createControlTowerServer = (env: Parameters<typeof createScopedControlTowerServer>[0]) =>
+  createScopedControlTowerServer(env, { read: true, mutate: true });
 import { summarizeCanonicalContext } from "../src/control-tower/context";
 
 type ToolResult = { isError?: boolean; content: Array<{ text: string }> };

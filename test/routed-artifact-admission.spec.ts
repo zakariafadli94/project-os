@@ -8,7 +8,9 @@ import { sha256Text } from "../src/documents/hash";
 import { encodeAdmission } from "../src/admission/transport";
 import { governanceTx, ruleFixture } from "./helpers/rule-fixtures";
 import { qualificationEntries, type RuleQualificationEvidenceResolver } from "../src/rules/qualification";
-import { createControlTowerServer } from "../src/control-tower/mcp";
+import { createControlTowerServer as createScopedControlTowerServer } from "../src/control-tower/mcp";
+const createControlTowerServer = (env: Parameters<typeof createScopedControlTowerServer>[0]) =>
+  createScopedControlTowerServer(env, { read: true, mutate: true });
 const testEnv = env as unknown as Env;
 afterEach(() => vi.restoreAllMocks());
 it("applies a WORKING rule to a binary submitted through an accepted logical artifact route", async () => {

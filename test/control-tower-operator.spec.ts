@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCloudflarePorts, runOperatorSubmission } from "../scripts/control-tower-operator.mjs";
 
 const baseVersionId = "11111111-2222-4333-8444-555555555555";
@@ -10,6 +10,76 @@ const requestText = JSON.stringify({
 });
 
 describe("Control Tower single-request operator bridge", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it.each(["context", "submit"]) ("times out a hanging %s call, aborts its shared signal, and still restores", async (boundary) => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    const signals: AbortSignal[] = [];
+    let restored = false;
+    const pending = runOperatorSubmission({ kind: "document", project_id: "PRJ-0007", request: requestText }, {
+      generateToken: () => "ephemeral-test-token",
+      captureBaseDeployment: async () => ({ version_id: baseVersionId, percentage: 100 }),
+      createOperatorVersion: async () => operatorVersionId,
+      attachZeroTrafficVersion: async () => { calls.push("attach"); },
+      health: async ({ overrideVersionId }) => ({ status: "ok", worker_version_id: restored ? baseVersionId : (overrideVersionId ?? baseVersionId) }),
+      fetchContext: async ({ signal }) => {
+        calls.push("context"); signals.push(signal);
+        if (boundary === "context") return await new Promise(() => {});
+        return { project_id: "PRJ-0007", signed: "context" };
+      },
+      submit: async ({ signal }) => {
+        calls.push("submit"); signals.push(signal);
+        return await new Promise(() => {});
+      },
+      restoreBaseDeployment: async () => { calls.push("restore"); restored = true; },
+      tokenStatusOnBase: async () => 401
+    });
+    await vi.advanceTimersByTimeAsync(10_001);
+    for (let index = 0; index < 10; index += 1) await Promise.resolve();
+    const result = await Promise.race([pending, Promise.resolve(null)]);
+    expect(result).not.toBeNull();
+    expect(result).toMatchObject({
+      status: boundary === "context" ? "not_submitted" : "unknown", project_id: "PRJ-0007", request_id: "working-20260910-0001",
+      failed_boundary: boundary === "context" ? "context" : "submission",
+      recovery: { preserve_request_id: true, check_status_before_retry: boundary === "submit" }
+    });
+    expect(signals.length).toBe(boundary === "context" ? 1 : 2);
+    expect(signals.every((signal) => signal === signals[0])).toBe(true);
+    expect(signals[0]!.aborted).toBe(true);
+    expect(restored).toBe(true);
+    expect(calls).toEqual(boundary === "context" ? ["attach", "context", "restore"] : ["attach", "context", "submit", "restore"]);
+  }, 2000);
+
+  it.each(["context", "submit"]) ("returns a recoverable identity-preserving outcome after %s failure and restores the base", async (boundary) => {
+    const calls: string[] = [];
+    let restored = false;
+    const result = await runOperatorSubmission({ kind: "document", project_id: "PRJ-0007", request: requestText }, {
+      generateToken: () => "ephemeral-test-token",
+      captureBaseDeployment: async () => ({ version_id: baseVersionId, percentage: 100 }),
+      createOperatorVersion: async () => operatorVersionId,
+      attachZeroTrafficVersion: async () => { calls.push("attach"); },
+      health: async ({ overrideVersionId }) => ({ status: "ok", worker_version_id: restored ? baseVersionId : (overrideVersionId ?? baseVersionId) }),
+      fetchContext: async () => {
+        calls.push("context");
+        if (boundary === "context") throw new Error("provider secret context diagnostic");
+        return { project_id: "PRJ-0007", signed: "context" };
+      },
+      submit: async () => {
+        calls.push("submit");
+        throw new Error("provider secret submit diagnostic");
+      },
+      restoreBaseDeployment: async () => { calls.push("restore"); restored = true; },
+      tokenStatusOnBase: async () => 401
+    });
+    expect(result).toMatchObject({
+      status: boundary === "context" ? "not_submitted" : "unknown", project_id: "PRJ-0007", request_id: "working-20260910-0001",
+      failed_boundary: boundary === "context" ? "context" : "submission", recovery: { preserve_request_id: true, check_status_before_retry: boundary === "submit" }
+    });
+    expect(JSON.stringify(result)).not.toContain("provider secret");
+    expect(calls).toEqual(boundary === "context" ? ["attach", "context", "restore"] : ["attach", "context", "submit", "restore"]);
+  });
+
   it("submits through a zero-traffic version then restores the exact base deployment", async () => {
     const calls: string[] = [];
     let capturedToken = "";

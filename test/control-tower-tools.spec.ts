@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createMcpHandler } from "agents/mcp/server";
-import { createControlTowerServer } from "../src/control-tower/mcp";
+import { successfulMcpResult } from "../scripts/control-tower-qualification.mjs";
+import { createControlTowerServer as createScopedControlTowerServer } from "../src/control-tower/mcp";
+const createControlTowerServer = (env: Parameters<typeof createScopedControlTowerServer>[0]) =>
+  createScopedControlTowerServer(env, { read: true, mutate: true });
 
 describe("Control Tower typed tool contracts", () => {
   it("publishes the strict transaction contract instead of an opaque request", async () => {
@@ -35,7 +38,7 @@ describe("Control Tower typed tool contracts", () => {
       getByName: () => ({
         fetch: async (url: string) => {
           registryRequests.push(url);
-          return Response.json({ status: "committed", project_id: "PRJ-0009" });
+          return Response.json({ status: "committed", project_id: "PRJ-0009", transaction_id: "TXN-PROJECT-CREATE-0001" });
         }
       })
     } as unknown as DurableObjectNamespace;
@@ -61,6 +64,8 @@ describe("Control Tower typed tool contracts", () => {
 
     expect(response.status).toBe(200);
     expect(projectGuardLookups).toEqual([]);
-    expect(registryRequests).toEqual(["https://project-guard.internal/create"]);
+    expect(registryRequests).toEqual(["https://registry-guard.internal/create"]);
+    const result = successfulMcpResult(await response.text(), 2) as { content: Array<{ text: string }> };
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ status: "committed", transaction_id: "TXN-PROJECT-CREATE-0001" });
   });
 });

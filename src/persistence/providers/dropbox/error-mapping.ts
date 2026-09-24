@@ -53,6 +53,7 @@ function diagnostics(error: DropboxApiError, operation: DropboxOperation) {
     status: error.status,
     requestId: error.requestId,
     ...(code ? { code } : {}),
+    ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
     operation
   };
 }

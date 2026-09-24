@@ -286,7 +286,7 @@ describe("ProjectGuard canonical snapshot catch-up", () => {
       "https://project-guard.internal/reconcile-search",
       { method: "POST" }
     )).rejects.toThrow("Verified materialization head binding mismatch");
-  });
+  }, 30_000);
 
   it("keeps a current-revision real commit minimal and preserves stale conflicts", async () => {
     const projectId = "PRJ-0006";

@@ -57,7 +57,7 @@ import {
   transactionPath
 } from "./paths";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
-import { ProviderConflictError } from "./provider/errors";
+import { ProviderCapabilityError, ProviderConflictError } from "./provider/errors";
 
 export { ArtifactGovernanceConflictError } from "./artifact-routing";
 
@@ -163,6 +163,32 @@ export class ProjectRepository {
     return refs.sort((a, b) =>
       a.projection_version - b.projection_version || a.target_revision - b.target_revision
     );
+  }
+
+  async listMaterializationRecordsPage(
+    projectId: string,
+    cursor: string | null,
+    limit: number
+  ): Promise<{ records: MaterializationGenerationRef[]; next_cursor: string | null }> {
+    if (this.mode !== "v2") return { records: [], next_cursor: null };
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw new Error("Materialization record page limit must be an integer from 1 through 200");
+    }
+    if (!this.persistence.pagedListing) throw new ProviderCapabilityError("paged-listing");
+    const page = await this.persistence.pagedListing.listPage({
+      path: machineMaterializationRoot(projectId), cursor, limit
+    });
+    const records: MaterializationGenerationRef[] = [];
+    for (const entry of page.entries) {
+      if (entry.kind !== "file") continue;
+      const match = /^REV-(\d{6,})-PV-(\d{4,})\.json$/.exec(entry.name);
+      if (!match) continue;
+      const target_revision = Number.parseInt(match[1]!, 10);
+      const projection_version = Number.parseInt(match[2]!, 10);
+      if (!Number.isSafeInteger(target_revision) || !Number.isSafeInteger(projection_version) || projection_version < 1) continue;
+      records.push({ target_revision, projection_version });
+    }
+    return { records, next_cursor: page.cursor };
   }
 
   async readReceipt(transactionId: string): Promise<Receipt | null> {

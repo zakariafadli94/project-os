@@ -1,7 +1,7 @@
 import { AuthorizationError, OAuthProvider, type AuthRequest } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
 import { createControlTowerServer } from "./mcp";
-import { ALLOWED_EMAIL, authorizeGithubIdentity, grantedScopes } from "./auth";
+import { ALLOWED_EMAIL, authorizeGithubIdentity, grantedScopes, resolveTokenAccess, type ControlTowerAccess } from "./auth";
 
 type ControlTowerEnv = {
   OAUTH_KV: KVNamespace;
@@ -10,13 +10,19 @@ type ControlTowerEnv = {
   CONTROL_TOWER_PUBLIC_URL: string;
   PROJECT_GUARD: DurableObjectNamespace;
   REGISTRY_GUARD: DurableObjectNamespace;
+  CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
 };
 
-const apiHandler: Pick<Required<ExportedHandler<ControlTowerEnv>>, "fetch"> = {
-  fetch(request, env, ctx) {
-    return createMcpHandler(() => createControlTowerServer(env))(request, env, ctx);
+export const controlTowerApiHandler = {
+  async fetch(request: Request, env: ControlTowerEnv, ctx: ExecutionContext) {
+    const helpers = (env as ControlTowerEnv & { OAUTH_PROVIDER: { unwrapToken(token: string): Promise<unknown> } }).OAUTH_PROVIDER;
+    let access: ControlTowerAccess | null;
+    try { access = await resolveTokenAccess(request, helpers); }
+    catch { return Response.json({ error: "control_tower_authority_unavailable", status: "not_submitted" }, { status: 503 }); }
+    if (!access) return Response.json({ error: "insufficient_scope", required_scope: "project.read" }, { status: 403 });
+    return createMcpHandler(() => createControlTowerServer(env, access))(request, env, ctx);
   }
-};
+} satisfies Pick<Required<ExportedHandler<ControlTowerEnv>>, "fetch">;
 
 const defaultHandler: ExportedHandler<ControlTowerEnv> = {
   async fetch(request, env) {
@@ -79,7 +85,7 @@ async function finishAuthorization(request: Request, env: ControlTowerEnv): Prom
 
 const provider = new OAuthProvider<ControlTowerEnv>({
   apiRoute: "/mcp",
-  apiHandler,
+  apiHandler: controlTowerApiHandler,
   defaultHandler,
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/token",

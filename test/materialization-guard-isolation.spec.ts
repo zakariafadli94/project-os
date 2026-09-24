@@ -15,6 +15,7 @@ import { createProductionPersistence } from "../src/persistence/production-facto
 import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { commitFixture } from "./helpers/convergence-fixture";
+import type { SliceBudget } from "../src/convergence/contract";
 
 const testEnv = env as unknown as Env;
 const at = "2026-09-02T07:20:00+01:00";
@@ -57,6 +58,86 @@ async function createProject(projectId: string, slug: string, transactionId: str
 
 describe("MaterializationGuard isolation boundary", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("checkpoints canonical commit reconstruction and never returns a partial state as current", async () => {
+    const projectId = "PRJ-3910";
+    const commits = commitFixture(projectId, 8);
+    let reads: number[] = [];
+    const repository = {
+      readProjectState: async () => null,
+      readCommitRecord: async (_project: string, revision: number) => {
+        reads.push(revision);
+        return commits[revision - 1] ?? null;
+      }
+    };
+    let startChecks = 0;
+    const partialBudget: SliceBudget = {
+      deadline_ms: Date.now() + 25_000,
+      calls_left: 32,
+      now: () => Date.now(),
+      signal: new AbortController().signal,
+      beforeHttp: () => undefined,
+      canStartEffect: () => ++startChecks <= 2
+    };
+    const guard = materializationNamespace().getByName(projectId);
+    const partial = await runInDurableObject(guard, (instance) =>
+      (instance as unknown as { canonicalState(repo: unknown, budget: SliceBudget): Promise<unknown> })
+        .canonicalState(repository, partialBudget)
+    );
+
+    expect(partial).toMatchObject({ complete: false, state: null });
+    expect(reads).toEqual([1, 2]);
+
+    reads = [];
+    const resumed = await runInDurableObject(guard, (instance) =>
+      (instance as unknown as { canonicalState(repo: unknown): Promise<unknown> })
+        .canonicalState(repository)
+    );
+    expect(resumed).toMatchObject({ complete: true, state: { project_id: projectId, revision: 8 } });
+    expect(reads).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
+  it("keeps bounded canonical diagnostics read-only when reconstruction is incomplete", async () => {
+    const projectId = "PRJ-3911";
+    const writes: string[] = [];
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId,
+      ctx: { storage: {
+        get: async () => undefined,
+        put: async () => { writes.push("put"); },
+        delete: async () => { writes.push("delete"); },
+        setAlarm: async () => { writes.push("alarm"); }
+      } }
+    }) as MaterializationGuard;
+    const commits = commitFixture(projectId, 4);
+    let reads = 0;
+    const repository = {
+      readProjectState: async () => null,
+      readCommitRecord: async (_project: string, revision: number) => {
+        reads += 1;
+        return commits[revision - 1] ?? null;
+      }
+    };
+    let checks = 0;
+    const budget: SliceBudget = {
+      deadline_ms: Date.now() + 25_000, calls_left: 32, now: () => Date.now(),
+      signal: new AbortController().signal, beforeHttp: () => undefined,
+      canStartEffect: () => ++checks <= 2
+    };
+    const result = await (guard as unknown as {
+      canonicalState(repo: unknown, budget: SliceBudget, persist: boolean): Promise<unknown>;
+      canonicalStatePendingResponse(schedule: boolean): Promise<Response>;
+    }).canonicalState(repository, budget, false) as { complete: boolean; state: unknown };
+    const response = await (guard as unknown as {
+      canonicalStatePendingResponse(schedule: boolean): Promise<Response>;
+    }).canonicalStatePendingResponse(false);
+
+    expect(result).toEqual({ complete: false, state: null });
+    expect(reads).toBe(2);
+    expect(response.status).toBe(202);
+    expect(await response.json()).toMatchObject({ reason: "canonical_state_reconstruction_pending" });
+    expect(writes).toEqual([]);
+  });
 
   it("exposes a separate MATERIALIZATION_GUARD Durable Object binding", () => {
     expect(materializationNamespace()).toBeDefined();
@@ -240,6 +321,7 @@ describe("MaterializationGuard isolation boundary", () => {
       projectId: "PRJ-3919",
       layoutMode: "v2",
       env: {},
+      ctx: { storage: { get: async () => undefined } },
       queue: Promise.resolve()
     }) as MaterializationGuard;
     const notify = vi.spyOn(materialization as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(true);
@@ -351,6 +433,62 @@ describe("MaterializationGuard isolation boundary", () => {
       expect(mock.files.has(machineMaterializationHeadPath(projectId))).toBe(true);
       expect(withoutProviderHeadBody.status).toBe("current");
     }
+  });
+
+  it("does not acknowledge a warm head when a current view has drifted at the provider", async () => {
+    const mock = installDropboxMock();
+    const projectId = "PRJ-3920";
+    const slug = "repair-warm-drift";
+    await createProject(projectId, slug, "TXN-MATISO-3920-CREATE");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    await guard.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
+      if (!await runDurableObjectAlarm(guard)) break;
+    }
+
+    const journal = new ConvergenceJournal(createProductionPersistence(testEnv, projectId), projectId);
+    const saved = await journal.load();
+    expect(saved).not.toBeNull();
+    if (!saved) throw new Error("missing convergence journal");
+    const human = Object.entries(saved.progress.obligations)
+      .find(([, obligation]) => obligation.layer === "human_handoff");
+    expect(human).toBeDefined();
+    if (!human) throw new Error("missing human obligation");
+    saved.progress.obligations[human[0]] = {
+      ...human[1], state: "retry_wait", next_attempt_at: at, code: "human_internal_failure"
+    };
+    saved.progress.requested = { revision: 1, projection_version: CURRENT_PROJECTION_VERSION };
+    saved.progress.active = { revision: 1, projection_version: CURRENT_PROJECTION_VERSION };
+    saved.progress.next_alarm_at = at;
+    await journal.save(saved.progress, saved.token);
+    await mock.writeExternal(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`, "external drift after proof");
+
+    let failedClosed = false;
+    try {
+      await guard.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    } catch (error) {
+      failedClosed = error instanceof Error && /current-view verification failed/i.test(error.message);
+    }
+    expect(failedClosed).toBe(true);
+
+    const after = await journal.load();
+    expect(after?.progress.obligations[human[0]]).toMatchObject({
+      state: "retry_wait", code: "human_internal_failure", next_attempt_at: at
+    });
+    expect(after?.progress).toMatchObject({
+      requested: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION },
+      active: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION }
+    });
+    expect(mock.files.get(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe("external drift after proof");
   });
 
   it("retires a covered blocked human obligation before rearming a newer canonical target", async () => {

@@ -58,6 +58,66 @@ it("does not retry terminal provider failures", async () => {
   expect(attempts).toBe(1);
 });
 
+it("propagates Retry-After beyond the remaining slice budget without sleeping", async () => {
+  const failure = new ProviderOperationError("temporary", true, {
+    providerId: "test", status: 503, retryAfterMs: 30_000
+  });
+  let attempts = 0;
+  const runtime = runtimeWith({ readText: async () => { attempts += 1; throw failure; } });
+  const sleep = vi.fn(async () => undefined);
+  const resilient = withProviderResilience(runtime, {
+    maxAttempts: 5,
+    baseDelayMs: 250,
+    remainingBudgetMs: () => 5_000,
+    sleep,
+    random: () => 0
+  });
+
+  await expect(resilient.objects.readText("/x")).rejects.toBe(failure);
+  expect(attempts).toBe(1);
+  expect(sleep).not.toHaveBeenCalled();
+});
+
+it("honors a short Retry-After when it fits the remaining slice budget", async () => {
+  let attempts = 0;
+  const runtime = runtimeWith({
+    readText: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new ProviderOperationError("temporary", true, {
+          providerId: "test", status: 503, retryAfterMs: 100
+        });
+      }
+      return "ok";
+    }
+  });
+  const sleep = vi.fn(async () => undefined);
+  const resilient = withProviderResilience(runtime, {
+    maxAttempts: 2,
+    baseDelayMs: 10,
+    remainingBudgetMs: () => 1_000,
+    sleep,
+    random: () => 0
+  });
+
+  await expect(resilient.objects.readText("/x")).resolves.toBe("ok");
+  expect(sleep).toHaveBeenCalledExactlyOnceWith(100);
+});
+
+it("propagates a long Retry-After from an unscoped runtime instead of sleeping in the Worker", async () => {
+  const failure = new ProviderOperationError("temporary", true, {
+    providerId: "test", status: 503, retryAfterMs: 30_000
+  });
+  let attempts = 0;
+  const runtime = runtimeWith({ readText: async () => { attempts += 1; throw failure; } });
+  const sleep = vi.fn(async () => undefined);
+  const resilient = withProviderResilience(runtime, { maxAttempts: 5, sleep, random: () => 0 });
+
+  await expect(resilient.objects.readText("/x")).rejects.toBe(failure);
+  expect(attempts).toBe(1);
+  expect(sleep).not.toHaveBeenCalled();
+});
+
 it("preserves exact-content move replay cleanup", async () => {
   const files = new Map<string, string>([["/from", "same"], ["/to", "same"]]);
   const runtime = runtimeWith({

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMcpHandler } from "agents/mcp/server";
-import { createControlTowerServer } from "../src/control-tower/mcp";
+import { createControlTowerServer as createScopedControlTowerServer } from "../src/control-tower/mcp";
+const createControlTowerServer = (env: Parameters<typeof createScopedControlTowerServer>[0]) =>
+  createScopedControlTowerServer(env, { read: true, mutate: true });
 
 describe("Control Tower MCP wire transport", () => {
   afterEach(() => vi.useRealTimers());

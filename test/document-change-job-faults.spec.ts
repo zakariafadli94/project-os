@@ -177,6 +177,87 @@ describe("durable managed-document change jobs", () => {
     })]);
   });
 
+  it("quarantines a proven-absent file target once and admits a new observation after it reappears", async () => {
+    const mock = installDropboxMock();
+    const slug = "change-job-missing-metadata";
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-MISSINGMETA-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    const absentPath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}/DELIVERABLES/vanished.pdf`;
+    await runInDurableObject(guard, async (_instance, state) => {
+      initializeManagedDocumentChangeJobSchema(state.storage);
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      store.registerPage({
+        expected_cursor: store.cursor(), next_cursor: "missing-metadata-retry-cursor",
+        jobs: [{ job_id: "CHGJOB-FFFFFFFFFFFFFFFFFFFFFFFF", change: { kind: "file", name: "vanished.pdf", path: absentPath }, detection_source: "incremental", priority: 10 }]
+      });
+    });
+
+    const response = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ jobs_pending: 0, jobs_completed: 0, job_failures: 0, jobs_quarantined: 1 });
+    let quarantines: ManagedDocumentChangeQuarantine[] = [];
+    await runInDurableObject(guard, async (_instance, state) => {
+      quarantines = new ManagedDocumentChangeJobStore(state.storage).quarantines();
+    });
+    expect(quarantines).toEqual([expect.objectContaining({
+      job_id: "CHGJOB-FFFFFFFFFFFFFFFFFFFFFFFF", path: absentPath, code: "file_target_missing", attempts: 1
+    })]);
+
+    const second = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    await expect(second.json()).resolves.toMatchObject({ jobs_pending: 0, jobs_quarantined: 0, job_failures: 0 });
+    await runInDurableObject(guard, async (_instance, state) => {
+      quarantines = new ManagedDocumentChangeJobStore(state.storage).quarantines();
+    });
+    expect(quarantines[0]?.attempts).toBe(1);
+
+    await mock.writeExternal(absentPath, "%PDF target reappeared with a new provider revision");
+    const reappeared = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    await expect(reappeared.json()).resolves.toMatchObject({ jobs_registered: 1, jobs_completed: 1, jobs_pending: 0 });
+    await runInDurableObject(guard, async (_instance, state) => {
+      const jobs = state.storage.sql.exec<{ job_id: string; status: string; attempts: number }>(
+        "SELECT job_id, status, attempts FROM managed_document_change_jobs ORDER BY ordinal"
+      ).toArray();
+      expect(jobs).toHaveLength(2);
+      expect(new Set(jobs.map((job) => job.job_id)).size).toBe(2);
+      expect(jobs.map((job) => job.status)).toEqual(["completed", "completed"]);
+      quarantines = new ManagedDocumentChangeJobStore(state.storage).quarantines();
+    });
+    expect(quarantines).toHaveLength(1);
+  });
+
+  it("keeps a file-kind change retryable when the provider listing fails", async () => {
+    const faults: DropboxMockFault[] = [];
+    installDropboxMock({ faults });
+    const slug = "change-job-list-failure";
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-LISTFAIL-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    const absentPath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}/DELIVERABLES/unknown.pdf`;
+    const parent = absentPath.slice(0, absentPath.lastIndexOf("/"));
+    await runInDurableObject(guard, async (_instance, state) => {
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      store.registerPage({ expected_cursor: store.cursor(), next_cursor: "list-failure-cursor", jobs: [{
+        job_id: "CHGJOB-EEEEEEEEEEEEEEEEEEEEEEEE",
+        change: { kind: "file", name: "unknown.pdf", path: absentPath }, detection_source: "incremental", priority: 10
+      }] });
+    });
+    for (let occurrence = 1; occurrence <= 10; occurrence += 1) {
+      faults.push({ endpoint: "/2/files/list_folder", occurrence: 1, status: 503, error_summary: "temporarily_unavailable", path: parent });
+    }
+
+    const response = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ jobs_pending: 1, jobs_completed: 0, job_failures: expect.any(Number), jobs_quarantined: 0 });
+    let pending: unknown[] = [];
+    await runInDurableObject(guard, async (_instance, state) => {
+      pending = new ManagedDocumentChangeJobStore(state.storage).pending();
+    });
+    expect(pending).toEqual([expect.objectContaining({
+      job_id: "CHGJOB-EEEEEEEEEEEEEEEEEEEEEEEE", attempts: expect.any(Number), last_error: expect.stringContaining("Dropbox list_folder failed")
+    })]);
+  }, 15_000);
+
   it("terminally quarantines an external move that conflicts with immutable candidate evidence", async () => {
     const mock = installDropboxMock();
     const slug = "change-job-candidate-evidence-conflict";

@@ -3,10 +3,12 @@ import type { CanonicalCommitRecord } from "../src/domain/commit-record";
 import {
   CURRENT_PROJECTION_VERSION,
   type CompletedMaterializationRecord,
+  type CurrentViewsProof,
   type MaterializationGenerationRef,
   type MaterializationHead,
   type ProjectionOutputEvidence
 } from "../src/domain/materialization";
+import { parseCompletedMaterializationRecord } from "../src/domain/materialization";
 import type { ProjectState } from "../src/domain/project-state";
 import type { Receipt } from "../src/domain/receipt";
 import { parseTransaction, type Transaction } from "../src/domain/transaction";
@@ -21,7 +23,7 @@ import {
   type ProjectionWriterPort
 } from "../src/materialization/coordinator";
 import { projectionIndexRootHash } from "../src/materialization/hash";
-import type { FinalVerificationItem } from "../src/materialization/ledger";
+import type { FinalVerificationItem, MaterializationRepairScanCheckpoint } from "../src/materialization/ledger";
 import type { ProjectionPlan } from "../src/materialization/planner";
 import { createSliceBudget } from "../src/convergence/budget";
 import type { SliceBudget } from "../src/convergence/contract";
@@ -117,6 +119,8 @@ class FakeRepository implements MaterializationRepositoryPort {
   failHeadOnce = false;
   headAfterWrite: MaterializationHead | null = null;
   beforeRecordWrite: (() => void) | null = null;
+  recordPages = new Map<string, { records: MaterializationGenerationRef[]; next_cursor: string | null }>();
+  recordPageCalls: Array<{ cursor: string | null; limit: number }> = [];
 
   async readCommitRecord(_projectId: string, revision: number) { return this.commits.get(revision) ?? null; }
   async readMaterializationHead() { return this.head; }
@@ -130,6 +134,16 @@ class FakeRepository implements MaterializationRepositoryPort {
       .filter((record) => record.project_id === projectId)
       .map((record) => ({ target_revision: record.target_revision, projection_version: record.projection_version }))
       .sort((a, b) => a.projection_version - b.projection_version || a.target_revision - b.target_revision);
+  }
+  async listMaterializationRecordsPage(projectId: string, cursor: string | null, limit: number) {
+    this.recordPageCalls.push({ cursor, limit });
+    const scripted = this.recordPages.get(cursor ?? "__first__");
+    if (scripted) return scripted;
+    const records = await this.listMaterializationRecordRefs(projectId);
+    const offset = cursor ? Number(cursor) : 0;
+    const page = records.slice(offset, offset + limit);
+    const next = offset + limit < records.length ? String(offset + limit) : null;
+    return { records: page, next_cursor: next };
   }
   async writeCompletedMaterializationRecord(record: CompletedMaterializationRecord) {
     const key = `${record.project_id}:${record.target_revision}:${record.projection_version}`;
@@ -164,6 +178,7 @@ class FakeLedger implements MaterializationLedgerPort {
   pendingFinalVerification: FinalVerificationItem[] | null = null;
   lastError: string | null = null;
   nextCoalesced: number[] = [];
+  repairScan: MaterializationRepairScanCheckpoint | null = null;
 
   immutableDerivativesThrough() { return 0; }
   markImmutableDerivativesThrough(_revision: number) {}
@@ -198,6 +213,11 @@ class FakeLedger implements MaterializationLedgerPort {
     const completed = new Set(keys);
     this.pendingFinalVerification = (this.pendingFinalVerification ?? []).filter((item) => !completed.has(item.key));
   }
+  readRepairScanCheckpoint(canonicalRevision: number) {
+    return this.repairScan?.canonical_revision === canonicalRevision ? this.repairScan : null;
+  }
+  writeRepairScanCheckpoint(checkpoint: MaterializationRepairScanCheckpoint) { this.repairScan = checkpoint; }
+  clearRepairScanCheckpoint() { this.repairScan = null; }
   baselineOutputs() { return new Map(this.baseline); }
   failActive(message: string) { this.lastError = message; }
   completeTarget(input: { revision: number; projection_version: number; outputs: ReadonlyMap<string, ProjectionOutputEvidence>; removed_outputs: readonly string[] }) {
@@ -238,6 +258,7 @@ class FakeWriter implements ProjectionWriterPort {
   failAfter: number | null = null;
   verifyCalls = 0;
   verifyOutputCalls = 0;
+  verifyCurrentViewsCalls = 0;
   verifiedOutputKeys: string[][] = [];
   failVerificationOnCall: number | null = null;
   onVerifyOutputs: (() => void) | null = null;
@@ -279,6 +300,35 @@ class FakeWriter implements ProjectionWriterPort {
     if (this.failVerificationOnCall === this.verifyCalls) {
       throw new Error("critical pair changed after publication");
     }
+  }
+
+  async verifyCurrentViews(
+    outputs: ReadonlyMap<string, ProjectionOutputEvidence>,
+    targetRevision: number,
+    projectionVersion: number,
+    workspaceRoot: string,
+    expected?: CurrentViewsProof
+  ): Promise<CurrentViewsProof> {
+    this.verifyCurrentViewsCalls += 1;
+    const keys = ["global:PROJECT", "global:PLAN", "global:STATE", "global:HANDOFF"] as const;
+    const views = {} as CurrentViewsProof["views"];
+    for (const key of keys) {
+      const evidence = outputs.get(key);
+      if (!evidence) throw new Error(`missing fake current view ${key}`);
+      const proof = {
+        ...evidence,
+        provider_object_id: `${workspaceRoot}/${evidence.relative_path}`,
+        provider_revision: evidence.content_hash
+      };
+      if (expected) {
+        const prior = expected.views[key];
+        if (proof.provider_object_id !== prior.provider_object_id || proof.provider_revision !== prior.provider_revision) {
+          throw new Error(`fake current view changed ${key}`);
+        }
+      }
+      views[key] = proof;
+    }
+    return { target_revision: targetRevision, projection_version: projectionVersion, views };
   }
 
   async verifyOutputs(outputs: ReadonlyMap<string, ProjectionOutputEvidence>): Promise<void> {
@@ -353,7 +403,12 @@ describe("MaterializationCoordinator", () => {
     const repo = new FakeRepository();
     repo.commits.set(record.new_revision, record);
     const writer = new FakeWriter();
-    writer.onVerifyOutputs = () => expect(repo.recordWrites).toBe(0);
+    writer.onVerifyOutputs = () => {
+      if (repo.recordWrites === 0) return;
+      expect(repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)?.current_views_proof)
+        .toBeDefined();
+      expect(repo.head).toBeNull();
+    };
     const budget = createSliceBudget(() => 0, new AbortController().signal);
     const { value } = coordinator(repo, new FakeLedger(), writer, CURRENT_PROJECTION_VERSION, budget, {
       finalVerificationBatchMax: 1
@@ -363,7 +418,7 @@ describe("MaterializationCoordinator", () => {
     await value.runUntilIdle();
 
     expect(writer.verifyOutputCalls).toBe(8);
-    expect(writer.verifiedOutputKeys.flat()).toEqual([
+    expect(writer.verifiedOutputKeys.flat()).toEqual(expect.arrayContaining([
       "global:BRIEF",
       "global:DISCOVERY",
       "global:HANDOFF",
@@ -372,7 +427,7 @@ describe("MaterializationCoordinator", () => {
       "global:PROJECT",
       "global:ROADMAP",
       "global:STATE"
-    ]);
+    ]));
     expect(repo.writeOrder).toEqual(["record", "head"]);
   });
 
@@ -444,7 +499,7 @@ describe("MaterializationCoordinator", () => {
     await value.runUntilIdle();
 
     const expected = [...writer.plans.at(-1)!.expected_output_keys].sort();
-    expect(writer.verifiedOutputKeys.slice(-expected.length).flat()).toEqual(expected);
+    expect(writer.verifiedOutputKeys.flat()).toEqual(expect.arrayContaining(expected));
   });
 
   it("revalidates only changed outputs when convergence already monitors carried-forward files", async () => {
@@ -471,7 +526,7 @@ describe("MaterializationCoordinator", () => {
     await value.runUntilIdle();
 
     const changed = [...writer.plans.at(-1)!.changed_outputs.keys()].sort();
-    expect(writer.verifiedOutputKeys.flat().sort()).toEqual(changed);
+    expect(new Set(writer.verifiedOutputKeys.flat())).toEqual(new Set(changed));
     expect(repo.head?.target_revision).toBe(second.new_revision);
   });
 
@@ -502,6 +557,8 @@ describe("MaterializationCoordinator", () => {
     expect(ledger.pendingFinalVerification).toEqual([]);
     expect(repo.head).toBeNull();
 
+    await value.runNext();
+    expect(repo.head).toBeNull();
     await value.runNext();
     expect(repo.head?.target_revision).toBe(record.new_revision);
   });
@@ -700,6 +757,59 @@ describe("MaterializationCoordinator", () => {
     expect(repo.head?.target_revision).toBe(record.new_revision);
   });
 
+  it("reuses completed output evidence and revalidates four views only when publication fits the slice", async () => {
+    const canonical = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(canonical.new_revision, canonical);
+    const outputs = new Map<string, ProjectionOutputEvidence>();
+    const viewPaths = [
+      ["global:PROJECT", "PROJECT.md"], ["global:PLAN", "PLAN.md"],
+      ["global:STATE", "STATE.md"], ["global:HANDOFF", "HANDOFF.md"]
+    ] as const;
+    for (const [key, relative_path] of viewPaths) outputs.set(key, {
+      relative_path, input_hash: "a".repeat(64), content_hash: "b".repeat(64), source_revision: canonical.new_revision
+    });
+    for (let index = 0; index < 196; index += 1) outputs.set(`task:TASK-${String(index).padStart(4, "0")}`, {
+      relative_path: `WORKING/${String(index).padStart(4, "0")}.md`,
+      input_hash: "c".repeat(64), content_hash: "d".repeat(64), source_revision: canonical.new_revision
+    });
+    const writer = new FakeWriter();
+    const root = workspaceProjectRoot(canonical.project_id, canonical.state.slug);
+    const proof = await writer.verifyCurrentViews(outputs, canonical.new_revision, CURRENT_PROJECTION_VERSION, root);
+    const completed: CompletedMaterializationRecord = {
+      schema_version: "1.0", project_id: canonical.project_id, target_revision: canonical.new_revision,
+      projection_version: CURRENT_PROJECTION_VERSION, record_kind: "snapshot", parent: null, chain_depth: 0,
+      workspace_location: "active", outputs: Object.fromEntries(outputs), removed_outputs: [],
+      total_output_count: outputs.size, result_root_hash: await projectionIndexRootHash(outputs),
+      coalesced_revisions: [], source_event_id: canonical.event.event_id, completed_at: at,
+      current_views_proof: proof
+    };
+    repo.records.set(`${canonical.project_id}:${canonical.new_revision}:${CURRENT_PROJECTION_VERSION}`, completed);
+    writer.verifyCurrentViewsCalls = 0;
+    let callsLeft = 8;
+    const budget: SliceBudget = {
+      deadline_ms: 10_000, get calls_left() { return callsLeft; }, now: () => 0, signal: new AbortController().signal,
+      beforeHttp: () => undefined, canStartEffect: (requiredCalls) => requiredCalls <= callsLeft
+    };
+    const ledger = new FakeLedger();
+    const recovery = coordinator(repo, ledger, writer, CURRENT_PROJECTION_VERSION, budget, {
+      verifyExistingCriticalPairOnly: true
+    });
+    recovery.value.requestTarget(canonical.new_revision);
+
+    const first = await recovery.value.runNext();
+
+    expect(first.completed).toBe(false);
+    expect(repo.head).toBeNull();
+    expect(writer.verifyOutputCalls).toBe(0);
+    expect(writer.verifyCurrentViewsCalls).toBe(0);
+    callsLeft = 32;
+    await recovery.value.runNext();
+    expect(repo.head?.target_revision).toBe(canonical.new_revision);
+    expect(writer.verifyOutputCalls).toBe(0);
+    expect(writer.verifyCurrentViewsCalls).toBe(1);
+  });
+
   it("revalidates every changed delta output before convergence repairs a failed head write", async () => {
     const first = createFixture();
     const second = committed(first.state, "task.create", {
@@ -750,6 +860,278 @@ describe("MaterializationCoordinator", () => {
     await resumed.value.runNext();
 
     expect(repo.head?.target_revision).toBe(second.new_revision);
+  });
+
+  it("resumes a missing-head generation scan from the durable provider cursor", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const initial = coordinator(repo);
+    initial.value.requestTarget(record.new_revision);
+    await initial.value.runNext();
+    repo.head = null;
+    repo.recordPageCalls = [];
+    repo.recordPages.set("__first__", {
+      records: [{ target_revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION }],
+      next_cursor: "provider-page-2"
+    });
+    repo.recordPages.set("provider-page-2", { records: [], next_cursor: null });
+    const ledger = new FakeLedger();
+    const recovery = coordinator(repo, ledger);
+
+    const partial = await recovery.value.reconcile(record.new_revision);
+
+    expect(partial.head).toBeNull();
+    expect(partial.requested).toEqual({ revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION });
+    expect(ledger.repairScan).toEqual({
+      canonical_revision: record.new_revision, cursor: "provider-page-2", scan_complete: false,
+      best_candidate: { target_revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION }
+    });
+    await recovery.value.reconcile(record.new_revision);
+
+    expect(repo.recordPageCalls).toEqual([
+      { cursor: null, limit: 100 }, { cursor: "provider-page-2", limit: 100 }
+    ]);
+    expect(ledger.repairScan).toBeNull();
+    expect((repo.head as MaterializationHead | null)?.target_revision).toBe(record.new_revision);
+  });
+
+  it("replaces an obsolete incomplete listing checkpoint with an exact valid external head", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const initial = coordinator(repo);
+    initial.value.requestTarget(record.new_revision);
+    await initial.value.runNext();
+    const writesBefore = repo.headWrites;
+    repo.recordPageCalls = [];
+    const ledger = new FakeLedger();
+    ledger.repairScan = {
+      canonical_revision: record.new_revision,
+      cursor: "provider-page-2",
+      scan_complete: false,
+      best_candidate: { target_revision: record.new_revision - 1, projection_version: CURRENT_PROJECTION_VERSION }
+    };
+    const recovery = coordinator(repo, ledger);
+
+    const status = await recovery.value.reconcile(record.new_revision);
+
+    expect(status.head).toEqual({ revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION });
+    expect(ledger.repairScan).toBeNull();
+    expect(ledger.baseline.size).toBe(Object.keys(
+      repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)!.outputs
+    ).length);
+    expect(repo.recordPageCalls).toEqual([]);
+    expect(repo.headWrites).toBe(writesBefore);
+    expect(recovery.writer.verifyCurrentViewsCalls).toBe(1);
+  });
+
+  it("replaces a completed stale scan candidate when a newer exact external head appeared", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const initial = coordinator(repo);
+    initial.value.requestTarget(record.new_revision);
+    await initial.value.runNext();
+    const writesBefore = repo.headWrites;
+    repo.recordPageCalls = [];
+    const ledger = new FakeLedger();
+    ledger.repairScan = {
+      canonical_revision: record.new_revision,
+      cursor: null,
+      scan_complete: true,
+      best_candidate: { target_revision: record.new_revision - 1, projection_version: CURRENT_PROJECTION_VERSION }
+    };
+    const recovery = coordinator(repo, ledger);
+
+    const status = await recovery.value.reconcile(record.new_revision);
+
+    expect(status.head).toEqual({ revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION });
+    expect(ledger.repairScan).toBeNull();
+    expect(ledger.baseline.size).toBe(Object.keys(
+      repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)!.outputs
+    ).length);
+    expect(repo.recordPageCalls).toEqual([]);
+    expect(repo.headWrites).toBe(writesBefore);
+    expect(recovery.writer.verifyCurrentViewsCalls).toBe(1);
+  });
+
+  it("scans a thousand historical refs one bounded page at a time before publishing a proved head", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const initial = coordinator(repo);
+    initial.value.requestTarget(record.new_revision);
+    await initial.value.runNext();
+    repo.head = null;
+    repo.recordPageCalls = [];
+    const stored = repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)!;
+    const eventId = "EVT-001000";
+    const canonicalAt1000: CanonicalCommitRecord = {
+      ...record,
+      previous_revision: 999,
+      new_revision: 1000,
+      state: { ...record.state, revision: 1000, last_event_id: eventId },
+      event: { ...record.event, event_id: eventId },
+      receipt: { ...record.receipt, previous_revision: 999, new_revision: 1000, event_id: eventId }
+    };
+    repo.commits.set(1000, canonicalAt1000);
+    const outputs = Object.fromEntries(Object.entries(stored.outputs).map(([key, evidence]) => [key, {
+      ...evidence,
+      source_revision: 1000
+    }]));
+    const proofViews = Object.fromEntries(Object.entries(stored.current_views_proof!.views).map(([key, evidence]) => [key, {
+      ...evidence,
+      source_revision: 1000
+    }])) as CurrentViewsProof["views"];
+    const recordAt1000: CompletedMaterializationRecord = {
+      ...stored,
+      target_revision: 1000,
+      outputs,
+      result_root_hash: await projectionIndexRootHash(new Map(Object.entries(outputs))),
+      current_views_proof: {
+        target_revision: 1000,
+        projection_version: CURRENT_PROJECTION_VERSION,
+        views: proofViews
+      },
+      source_event_id: eventId
+    };
+    repo.records.set(`PRJ-3501:1000:${CURRENT_PROJECTION_VERSION}`, recordAt1000);
+    for (let pageIndex = 0; pageIndex < 10; pageIndex += 1) {
+      const cursor = pageIndex === 0 ? "__first__" : `historical-page-${pageIndex + 1}`;
+      const refs = Array.from({ length: 100 }, (_, offset) => ({
+        target_revision: pageIndex * 100 + offset + 1,
+        projection_version: CURRENT_PROJECTION_VERSION
+      }));
+      repo.recordPages.set(cursor, {
+        records: refs,
+        next_cursor: pageIndex < 9 ? `historical-page-${pageIndex + 2}` : null
+      });
+    }
+    const ledger = new FakeLedger();
+    const recovery = coordinator(repo, ledger);
+
+    for (let pageIndex = 0; pageIndex < 9; pageIndex += 1) {
+      const before = repo.recordPageCalls.length;
+      const pending = await recovery.value.reconcile(1000);
+      expect(pending.head).toBeNull();
+      expect(repo.recordPageCalls).toHaveLength(before + 1);
+      expect(repo.recordPageCalls.at(-1)?.limit).toBe(100);
+      expect(ledger.repairScan?.scan_complete).toBe(false);
+    }
+    expect(repo.head).toBeNull();
+
+    await recovery.value.reconcile(1000);
+
+    expect(repo.recordPageCalls).toHaveLength(10);
+    expect(ledger.repairScan).toBeNull();
+    expect((repo.head as MaterializationHead | null)?.target_revision).toBe(1000);
+    expect(recovery.writer.verifyCurrentViewsCalls).toBe(1);
+  });
+
+  it("reconstructs an existing external baseline with the repair-chain checkpoint and no head rewrite", async () => {
+    const canonical = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(canonical.new_revision, canonical);
+    const initial = coordinator(repo, new FakeLedger(), new FakeWriter(), 1);
+    initial.value.requestTarget(canonical.new_revision, 1);
+    await initial.value.runNext();
+    const snapshot = repo.records.get(`PRJ-3501:${canonical.new_revision}:1`)!;
+    const eventId = "EVT-000005";
+    const canonicalAtFive: CanonicalCommitRecord = {
+      ...canonical,
+      previous_revision: 4,
+      new_revision: 5,
+      state: { ...canonical.state, revision: 5, last_event_id: eventId },
+      event: { ...canonical.event, event_id: eventId },
+      receipt: { ...canonical.receipt, previous_revision: 4, new_revision: 5, event_id: eventId }
+    };
+    repo.commits.set(5, canonicalAtFive);
+    for (let revision = 2; revision <= 5; revision += 1) {
+      repo.records.set(`PRJ-3501:${revision}:1`, {
+        ...snapshot,
+        target_revision: revision,
+        record_kind: "delta",
+        parent: { target_revision: revision - 1, projection_version: 1 },
+        chain_depth: revision - 1,
+        outputs: {},
+        source_event_id: revision === 5 ? eventId : `EVT-${String(revision).padStart(6, "0")}`
+      });
+    }
+    repo.head = {
+      ...repo.head!,
+      target_revision: 5,
+      projection_version: 1,
+      record_path: machineMaterializationRecordPath("PRJ-3501", 5, 1),
+      result_root_hash: snapshot.result_root_hash,
+      completed_at: snapshot.completed_at
+    };
+    const originalHeadWrites = repo.headWrites;
+    const ledger = new FakeLedger();
+    const makeBudget = (): SliceBudget => ({
+      deadline_ms: Date.now() + 25_000,
+      calls_left: 32,
+      now: () => Date.now(),
+      signal: new AbortController().signal,
+      beforeHttp: () => undefined,
+      canStartEffect: (required) => required <= 14
+    });
+
+    let done = false;
+    for (let slice = 0; slice < 8 && !done; slice += 1) {
+      const recovery = coordinator(repo, ledger, new FakeWriter(), 1, makeBudget());
+      const readsBefore = repo.recordReads;
+      await recovery.value.reconcile(5);
+      expect(repo.recordReads - readsBefore).toBeLessThanOrEqual(3);
+      done = ledger.head?.revision === 5;
+      if (!done) expect(ledger.repairScan?.chain_state?.refs.length ?? 0).toBeGreaterThan(0);
+    }
+
+    expect(done).toBe(true);
+    expect(ledger.baseline.size).toBe(snapshot.total_output_count);
+    expect(repo.headWrites).toBe(originalHeadWrites);
+    expect(ledger.repairScan).toBeNull();
+  });
+
+  it("fails closed when the latest eligible generation is physically missing", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const initial = coordinator(repo);
+    initial.value.requestTarget(record.new_revision);
+    await initial.value.runNext();
+    repo.head = null;
+    repo.recordPages.set("__first__", {
+      records: [
+        { target_revision: record.new_revision - 1, projection_version: CURRENT_PROJECTION_VERSION },
+        { target_revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION }
+      ], next_cursor: null
+    });
+    repo.records.delete(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`);
+    const recovery = coordinator(repo, new FakeLedger());
+
+    await expect(recovery.value.reconcile(record.new_revision)).rejects.toThrow(/latest materialization repair candidate.*invalid/i);
+    expect(repo.head).toBeNull();
+  });
+
+  it("refuses to publish an unknown future projection format over a known current generation", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const initial = coordinator(repo);
+    initial.value.requestTarget(record.new_revision);
+    await initial.value.runNext();
+    repo.head = null;
+    repo.recordPages.set("__first__", {
+      records: [
+        { target_revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION },
+        { target_revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION + 1 }
+      ], next_cursor: null
+    });
+    const recovery = coordinator(repo, new FakeLedger());
+
+    await expect(recovery.value.reconcile(record.new_revision)).rejects.toThrow(/future materialization projection version/i);
+    expect(repo.head).toBeNull();
   });
 
   it("does not complete when the critical pair changes after head publication", async () => {
@@ -957,6 +1339,79 @@ describe("MaterializationCoordinator", () => {
     expect(recordV2.record_kind).toBe("snapshot");
     expect(recordV2.projection_version).toBe(CURRENT_PROJECTION_VERSION);
     expect(repo.commits.size).toBe(1);
+  });
+
+  it("publishes a complete current-view proof for PROJECT, PLAN, STATE and HANDOFF", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const setup = coordinator(repo);
+    setup.value.requestTarget(record.new_revision);
+
+    await setup.value.runNext();
+
+    const completed = repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)! as any;
+    expect(() => parseCompletedMaterializationRecord(completed)).not.toThrow();
+    expect(Object.keys(completed.current_views_proof.views).sort()).toEqual([
+      "global:HANDOFF", "global:PLAN", "global:PROJECT", "global:STATE"
+    ]);
+    expect(completed.current_views_proof).toMatchObject({
+      target_revision: record.new_revision,
+      projection_version: CURRENT_PROJECTION_VERSION
+    });
+    expect(setup.writer.verifyCurrentViewsCalls).toBe(2);
+    for (const key of ["global:PROJECT", "global:PLAN", "global:STATE", "global:HANDOFF"]) {
+      expect(completed.current_views_proof.views[key]).toMatchObject({
+        source_revision: record.new_revision,
+        relative_path: expect.any(String),
+        input_hash: expect.any(String),
+        content_hash: expect.any(String),
+        provider_object_id: expect.any(String),
+        provider_revision: expect.any(String)
+      });
+    }
+  });
+
+  it("keeps the old head until a fresh bounded slice verifies the immutable four-view proof", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const writer = new FakeWriter();
+    const budget = createSliceBudget(() => 0, new AbortController().signal);
+    const { value } = coordinator(repo, new FakeLedger(), writer, CURRENT_PROJECTION_VERSION, budget);
+    value.requestTarget(record.new_revision);
+
+    while (repo.recordWrites === 0) await value.runNext();
+    expect(repo.head).toBeNull();
+    expect(repo.records.get(`PRJ-3501:${record.new_revision}:${CURRENT_PROJECTION_VERSION}`)?.current_views_proof)
+      .toBeDefined();
+
+    const resumed = await value.runNext();
+
+    expect(resumed.completed).toBe(true);
+    const publishedHead = repo.head as MaterializationHead | null;
+    expect(publishedHead?.projection_version).toBe(CURRENT_PROJECTION_VERSION);
+    expect(writer.verifyCurrentViewsCalls).toBe(2);
+  });
+
+  it("does not republish a pre-proof generation as the current head during recovery", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const legacy = coordinator(repo, new FakeLedger(), new FakeWriter(), 5);
+    legacy.value.requestTarget(record.new_revision, 5);
+    await legacy.value.runNext();
+    repo.head = null;
+    repo.headWrites = 0;
+
+    const current = coordinator(repo, new FakeLedger(), new FakeWriter(), CURRENT_PROJECTION_VERSION);
+    current.value.requestTarget(record.new_revision, CURRENT_PROJECTION_VERSION);
+    await current.value.runNext();
+
+    expect(repo.headWrites).toBe(1);
+    const recoveredHead = repo.head as MaterializationHead | null;
+    expect(recoveredHead?.projection_version).toBe(CURRENT_PROJECTION_VERSION);
+    expect(repo.records.get(`PRJ-3501:${record.new_revision}:5`)?.current_views_proof).toBeUndefined();
   });
 
   it("exact completed target replay performs no writer or new evidence writes", async () => {

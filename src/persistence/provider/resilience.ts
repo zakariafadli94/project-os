@@ -8,7 +8,10 @@ export interface ProviderResilienceOptions {
   sleep?: (delayMs: number) => Promise<void>;
   random?: () => number;
   log?: (entry: Record<string, unknown>) => void;
+  remainingBudgetMs?: () => number;
 }
+
+const MAX_INLINE_PROVIDER_RETRY_DELAY_MS = 1_000;
 
 export function withProviderResilience(
   runtime: PersistenceRuntime,
@@ -38,7 +41,21 @@ export function withProviderResilience(
         if (!error.retryable || attempt === maxAttempts) throw error;
 
         const exponential = baseDelayMs * (2 ** (attempt - 1));
-        const retryAfterMs = exponential + Math.floor(exponential * 0.5 * random());
+        const providerRetryAfterMs = error.diagnostics?.retryAfterMs;
+        const validProviderRetryAfterMs = typeof providerRetryAfterMs === "number"
+          && Number.isFinite(providerRetryAfterMs)
+          && providerRetryAfterMs > 0
+          ? providerRetryAfterMs
+          : 0;
+        const retryAfterMs = Math.max(
+          exponential + Math.floor(exponential * 0.5 * random()),
+          validProviderRetryAfterMs
+        );
+        const remainingBudgetMs = options.remainingBudgetMs?.();
+        if (validProviderRetryAfterMs > MAX_INLINE_PROVIDER_RETRY_DELAY_MS
+          || (remainingBudgetMs !== undefined && retryAfterMs >= remainingBudgetMs)) {
+          throw error;
+        }
         log({
           operation,
           path,

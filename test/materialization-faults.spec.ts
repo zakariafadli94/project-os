@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Env } from "../src/env";
@@ -97,9 +97,12 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
   beforeEach(() => {
     mock = installDropboxMock();
   });
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
 
-  it("updates task-dependent views without uploading unrelated entities or BRIEF and logs one structured attempt", async () => {
+  it("updates task-dependent views without unrelated uploads and logs structured convergence verification", async () => {
     const projectId = "PRJ-3801";
     const slug = "projection-efficiency";
     const root = workspaceProjectRoot(projectId, slug);
@@ -155,15 +158,14 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     expect(workspaceUploads).not.toContain(`${root}/DELIVERABLES/DEL-MAT3801.md`);
 
     expect(info).toHaveBeenCalledWith(
-      "Project OS materialization attempt",
+      "Project OS convergence metric",
       expect.objectContaining({
-        project_id: projectId,
-        target_revision: 6,
-        projection_version: CURRENT_PROJECTION_VERSION,
-        source_transaction_id: startTx.transaction_id,
-        outputs_uploaded: expect.any(Number),
-        outputs_carried_forward: expect.any(Number),
-        final_state: "complete"
+        name: "obligations_verified",
+        fields: expect.objectContaining({
+          project_id: projectId,
+          target_revision: 6,
+          projection_version: CURRENT_PROJECTION_VERSION
+        })
       })
     );
 
@@ -278,7 +280,15 @@ describe("IMP-MATERIAL001 acceptance faults and efficiency", () => {
     });
     mock.uploadCalls.length = 0;
 
-    const response = await stub.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let response = await stub.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    for (let slice = 0; response.status === 202 && slice < 128; slice += 1) {
+      const dueAt = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+      if (dueAt === null) break;
+      vi.setSystemTime(Math.max(Date.now(), dueAt));
+      await runDurableObjectAlarm(stub);
+      response = await stub.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    }
     expect(response.status).toBe(200);
     const body = await response.json<{ materialized_head: { revision: number } | null; output_count: number }>();
     expect(body.materialized_head?.revision).toBe(1);

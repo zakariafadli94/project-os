@@ -63,7 +63,10 @@ async function finalizeSyntheticProjectCreate(projectId: string, receipt: Receip
 }
 
 describe("ProjectGuard crash-safe canonical commits", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
 
   it("advances past failed transaction recoveries to later pending requests", async () => {
     const projectId = "PRJ-1712";
@@ -78,19 +81,35 @@ describe("ProjectGuard crash-safe canonical commits", () => {
       await state.storage.setAlarm(Date.now() + 60_000);
     });
     let wakeDuringProviderFailure: number | null = null;
+    const attempted: string[] = [];
     await runInDurableObject(stub, (instance, state) => {
       const ledger = (instance as unknown as { transactionRequests: {
         readRecoverableTransaction(projectId: string, requestId: string): Promise<unknown>
       } }).transactionRequests;
-      vi.spyOn(ledger, "readRecoverableTransaction").mockImplementationOnce(async () => {
-        wakeDuringProviderFailure = await state.storage.getAlarm();
-        throw new Error("transient_provider_failure");
+      const original = ledger.readRecoverableTransaction.bind(ledger);
+      let first = true;
+      vi.spyOn(ledger, "readRecoverableTransaction").mockImplementation(async (project, requestId) => {
+        attempted.push(requestId);
+        if (first) {
+          first = false;
+          wakeDuringProviderFailure = await state.storage.getAlarm();
+          throw new Error("transient_provider_failure");
+        }
+        return original(project, requestId);
       });
     });
     expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(attempted).toEqual([
+      "TXN-FAIRNESS-1712-1", "TXN-FAIRNESS-1712-2", "TXN-FAIRNESS-1712-3", "TXN-FAIRNESS-1712-4"
+    ]);
     expect(wakeDuringProviderFailure).not.toBeNull();
     expect(await runInDurableObject(stub, async (_instance, state) => state.storage.getAlarm())).not.toBeNull();
     expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(attempted.slice(4)).toEqual(["TXN-FAIRNESS-1712-5"]);
+    // A forced early alarm must not retry failed work before its recorded
+    // next_attempt_at, and must not starve the healthy fifth request.
+    await runDurableObjectAlarm(stub);
+    expect(attempted).toHaveLength(5);
     const attempts = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{
       request_id: string; count: number
     }>("SELECT request_id, count FROM request_recovery_failures WHERE kind = 'transaction' ORDER BY request_id").toArray());

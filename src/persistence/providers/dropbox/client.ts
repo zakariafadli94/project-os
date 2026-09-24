@@ -60,7 +60,8 @@ export class DropboxApiError extends Error {
     message: string,
     public readonly status: number,
     public readonly requestId: string | null,
-    public readonly responseBody: string
+    public readonly responseBody: string,
+    public readonly retryAfterMs?: number
   ) {
     super(message);
     this.name = "DropboxApiError";
@@ -68,8 +69,8 @@ export class DropboxApiError extends Error {
 }
 
 export class DropboxConflictError extends DropboxApiError {
-  constructor(message: string, requestId: string | null, responseBody = "") {
-    super(message, 409, requestId, responseBody);
+  constructor(message: string, requestId: string | null, responseBody = "", retryAfterMs?: number) {
+    super(message, 409, requestId, responseBody, retryAfterMs);
     this.name = "DropboxConflictError";
   }
 }
@@ -173,7 +174,8 @@ export class DropboxClient implements DropboxTransport {
     }
 
     if (response.status === 409) {
-      throw new DropboxConflictError(`Dropbox upload conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
+      throw new DropboxConflictError(`Dropbox upload conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text,
+        parseRetryAfterMs(response.headers.get("retry-after")));
     }
     throw this.errorFromResponse(`Dropbox upload failed for ${path}`, response, text);
   }
@@ -191,7 +193,8 @@ export class DropboxClient implements DropboxTransport {
     const text = await response.text();
     if (response.ok) return parseFileMetadata(JSON.parse(text) as RawDropboxMetadata, path);
     if (response.status === 409) {
-      throw new DropboxConflictError(`Dropbox conditional upload conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
+      throw new DropboxConflictError(`Dropbox conditional upload conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text,
+        parseRetryAfterMs(response.headers.get("retry-after")));
     }
     throw this.errorFromResponse(`Dropbox conditional upload failed for ${path}`, response, text);
   }
@@ -285,7 +288,8 @@ export class DropboxClient implements DropboxTransport {
     }
 
     if (response.status === 409) {
-      throw new DropboxConflictError(`Dropbox move conflict ${from} -> ${to}`, response.headers.get("x-dropbox-request-id"), text);
+      throw new DropboxConflictError(`Dropbox move conflict ${from} -> ${to}`, response.headers.get("x-dropbox-request-id"), text,
+        parseRetryAfterMs(response.headers.get("retry-after")));
     }
     throw this.errorFromResponse(`Dropbox move failed ${from} -> ${to}`, response, text);
   }
@@ -306,7 +310,8 @@ export class DropboxClient implements DropboxTransport {
       return parseFileMetadata(parsed.metadata ?? {}, to);
     }
     if (response.status === 409) {
-      throw new DropboxConflictError(`Dropbox copy conflict ${from} -> ${to}`, response.headers.get("x-dropbox-request-id"), text);
+      throw new DropboxConflictError(`Dropbox copy conflict ${from} -> ${to}`, response.headers.get("x-dropbox-request-id"), text,
+        parseRetryAfterMs(response.headers.get("retry-after")));
     }
     throw this.errorFromResponse(`Dropbox copy failed ${from} -> ${to}`, response, text);
   }
@@ -325,7 +330,8 @@ export class DropboxClient implements DropboxTransport {
     const text = await response.text();
     if (response.status === 409 && text.includes("not_found")) return;
     if (response.status === 409) {
-      throw new DropboxConflictError(`Dropbox delete conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
+      throw new DropboxConflictError(`Dropbox delete conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text,
+        parseRetryAfterMs(response.headers.get("retry-after")));
     }
     throw this.errorFromResponse(`Dropbox delete failed for ${path}`, response, text);
   }
@@ -344,7 +350,8 @@ export class DropboxClient implements DropboxTransport {
     const text = await response.text();
     if (response.status === 409 && text.includes("not_found")) return false;
     if (response.status === 409) {
-      throw new DropboxConflictError(`Dropbox conditional delete conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text);
+      throw new DropboxConflictError(`Dropbox conditional delete conflict for ${path}`, response.headers.get("x-dropbox-request-id"), text,
+        parseRetryAfterMs(response.headers.get("retry-after")));
     }
     throw this.errorFromResponse(`Dropbox conditional delete failed for ${path}`, response, text);
   }
@@ -604,7 +611,8 @@ export class DropboxClient implements DropboxTransport {
       throw new DropboxConflictError(
         `Dropbox directory conflict for ${path}`,
         response.headers.get("x-dropbox-request-id"),
-        text
+        text,
+        parseRetryAfterMs(response.headers.get("retry-after"))
       );
     }
     throw this.errorFromResponse(`Dropbox create_folder failed for ${path}`, response, text);
@@ -668,8 +676,25 @@ export class DropboxClient implements DropboxTransport {
   }
 
   private errorFromResponse(message: string, response: Response, responseBody: string): DropboxApiError {
-    return new DropboxApiError(message, response.status, response.headers.get("x-dropbox-request-id"), responseBody);
+    return new DropboxApiError(
+      message,
+      response.status,
+      response.headers.get("x-dropbox-request-id"),
+      responseBody,
+      parseRetryAfterMs(response.headers.get("retry-after"))
+    );
   }
+}
+
+const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1_000;
+
+function parseRetryAfterMs(value: string | null): number | undefined {
+  if (!value?.trim()) return undefined;
+  const trimmed = value.trim();
+  const deltaSeconds = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+  const deltaMs = Number.isFinite(deltaSeconds) ? deltaSeconds * 1_000 : Date.parse(trimmed) - Date.now();
+  if (!Number.isFinite(deltaMs) || deltaMs <= 0) return undefined;
+  return Math.min(MAX_RETRY_AFTER_MS, Math.ceil(deltaMs));
 }
 
 function parseFileMetadata(raw: RawDropboxMetadata, fallbackPath: string): DropboxFileMetadata {

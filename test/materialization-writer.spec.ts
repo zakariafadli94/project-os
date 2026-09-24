@@ -51,7 +51,12 @@ class InstrumentedObjects implements ObjectPersistence {
 
   async getMetadata(path: string): Promise<ProviderObjectMetadata | null> {
     const content = this.files.get(path);
-    return content === undefined ? null : { path, size: new TextEncoder().encode(content).byteLength };
+    return content === undefined ? null : {
+      path,
+      size: new TextEncoder().encode(content).byteLength,
+      objectId: `object:${path}`,
+      revisionToken: await sha256Text(content)
+    };
   }
 
   async listChildren(_path: string): Promise<ProviderEntry[]> { return []; }
@@ -106,6 +111,87 @@ function plan(outputs: PlannedProjectionOutput[]): ProjectionPlan {
 }
 
 describe("WorkspaceProjectionWriter", () => {
+  it("captures all four view hashes and stable provider identities as one revision proof", async () => {
+    const objects = new InstrumentedObjects();
+    const views = [
+      ["global:PROJECT", "PROJECT.md"],
+      ["global:PLAN", "PLAN.md"],
+      ["global:STATE", "STATE.md"],
+      ["global:HANDOFF", "HANDOFF.md"]
+    ] as const;
+    const evidence = new Map<string, ProjectionOutputEvidence>();
+    for (const [key, path] of views) {
+      const content = `---\nrevision: 9\n---\n${path}`;
+      objects.files.set(`/workspace/${path}`, content);
+      evidence.set(key, {
+        relative_path: path,
+        input_hash: await sha256Text(`input:${key}`),
+        content_hash: await sha256Text(content),
+        source_revision: 9
+      });
+    }
+    const writer = new WorkspaceProjectionWriter(objects, 1);
+
+    const proof = await writer.verifyCurrentViews(evidence, 9, 6, "/workspace");
+
+    expect(Object.keys(proof.views).sort()).toEqual(views.map(([key]) => key).sort());
+    expect(proof).toMatchObject({ target_revision: 9, projection_version: 6 });
+    expect(proof.views["global:PROJECT"]).toMatchObject({
+      provider_object_id: "object:/workspace/PROJECT.md",
+      provider_revision: await sha256Text("---\nrevision: 9\n---\nPROJECT.md")
+    });
+  });
+
+  it("refuses to prove a four-view group when its rendered revision is stale", async () => {
+    const objects = new InstrumentedObjects();
+    const views = [
+      ["global:PROJECT", "PROJECT.md"],
+      ["global:PLAN", "PLAN.md"],
+      ["global:STATE", "STATE.md"],
+      ["global:HANDOFF", "HANDOFF.md"]
+    ] as const;
+    const evidence = new Map<string, ProjectionOutputEvidence>();
+    for (const [key, path] of views) {
+      const content = `---\nrevision: 8\n---\n${path}`;
+      objects.files.set(`/workspace/${path}`, content);
+      evidence.set(key, {
+        relative_path: path,
+        input_hash: await sha256Text(`input:${key}`),
+        content_hash: await sha256Text(content),
+        source_revision: 9
+      });
+    }
+    const writer = new WorkspaceProjectionWriter(objects, 1);
+
+    await expect(writer.verifyCurrentViews(evidence, 9, 6, "/workspace"))
+      .rejects.toThrow("rendered revision");
+  });
+
+  it("does not accept the current revision when it appears only in the rendered body", async () => {
+    const objects = new InstrumentedObjects();
+    const views = [
+      ["global:PROJECT", "PROJECT.md"],
+      ["global:PLAN", "PLAN.md"],
+      ["global:STATE", "STATE.md"],
+      ["global:HANDOFF", "HANDOFF.md"]
+    ] as const;
+    const evidence = new Map<string, ProjectionOutputEvidence>();
+    for (const [key, path] of views) {
+      const content = `---\nrevision: 8\n---\nHistorical content\nrevision: 9\n`;
+      objects.files.set(`/workspace/${path}`, content);
+      evidence.set(key, {
+        relative_path: path,
+        input_hash: await sha256Text(`input:${key}`),
+        content_hash: await sha256Text(content),
+        source_revision: 9
+      });
+    }
+    const writer = new WorkspaceProjectionWriter(objects, 1);
+
+    await expect(writer.verifyCurrentViews(evidence, 9, 6, "/workspace"))
+      .rejects.toThrow("rendered revision");
+  });
+
   it("uses create for a missing destination", async () => {
     const objects = new InstrumentedObjects();
     const writer = new WorkspaceProjectionWriter(objects, 1);
@@ -350,7 +436,10 @@ describe("WorkspaceProjectionWriter", () => {
     const result = await writer.materializeSlice(plan(outputs), { workspaceRoot: "/workspace" }, budget);
 
     expect(result.nextKey).not.toBeNull();
-    expect(result.verified.size).toBeLessThan(outputs.length);
+    // Each non-critical output costs two provider calls. The slice can spend
+    // 28 calls on effects while preserving the runtime's four-call checkpoint
+    // reserve, so it should not keep the obsolete five-call publication reserve.
+    expect(result.verified.size).toBe(14);
     expect(budget.calls_left).toBeGreaterThanOrEqual(4);
   });
 

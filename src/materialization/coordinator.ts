@@ -3,6 +3,7 @@ import {
   CURRENT_PROJECTION_VERSION,
   MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH,
   type CompletedMaterializationRecord,
+  type CurrentViewsProof,
   type MaterializationGenerationRef,
   type MaterializationHead,
   type ProjectionOutputEvidence
@@ -15,7 +16,7 @@ import {
   type ProjectionBaseline as PlannerBaseline,
   type ProjectionPlan
 } from "./planner";
-import type { FinalVerificationItem, MaterializationLedgerStatus, MaterializationTarget } from "./ledger";
+import type { FinalVerificationItem, MaterializationLedgerStatus, MaterializationRepairScanCheckpoint, MaterializationTarget } from "./ledger";
 import { MaterializationOutputConflictError, type ProjectionWriteOutcome } from "./writer";
 import type { SliceBudget } from "../convergence/contract";
 import type { PackageNavigation } from "../domain/document-package";
@@ -29,7 +30,10 @@ export interface MaterializationRepositoryPort {
     revision: number,
     projectionVersion: number
   ): Promise<CompletedMaterializationRecord | null>;
-  listMaterializationRecordRefs(projectId: string): Promise<MaterializationGenerationRef[]>;
+  listMaterializationRecordsPage(projectId: string, cursor: string | null, limit: number): Promise<{
+    records: MaterializationGenerationRef[];
+    next_cursor: string | null;
+  }>;
   writeCompletedMaterializationRecord(record: CompletedMaterializationRecord): Promise<void>;
   writeMaterializationHead(head: MaterializationHead): Promise<void>;
   materializeCanonicalDerivatives(
@@ -55,6 +59,9 @@ export interface MaterializationLedgerPort {
   narrowFinalVerification(items: readonly FinalVerificationItem[]): void;
   finalVerificationPending(): FinalVerificationItem[];
   completeFinalVerification(keys: readonly string[]): void;
+  readRepairScanCheckpoint?(canonicalRevision: number): MaterializationRepairScanCheckpoint | null;
+  writeRepairScanCheckpoint?(checkpoint: MaterializationRepairScanCheckpoint): void;
+  clearRepairScanCheckpoint?(): void;
   baselineOutputs(): Map<string, ProjectionOutputEvidence>;
   immutableDerivativesThrough(): number | null;
   markImmutableDerivativesThrough(revision: number): void;
@@ -88,6 +95,13 @@ export interface ProjectionWriterPort {
     onOutputOutcome?: (key: string, outcome: ProjectionWriteOutcome) => void | Promise<void>;
   }, budget: SliceBudget): Promise<{ verified: Map<string, ProjectionOutputEvidence>; nextKey: string | null }>;
   verifyCritical?(plan: ProjectionPlan, workspaceRoot: string): Promise<void>;
+  verifyCurrentViews?(
+    outputs: ReadonlyMap<string, ProjectionOutputEvidence>,
+    targetRevision: number,
+    projectionVersion: number,
+    workspaceRoot: string,
+    expected?: CurrentViewsProof
+  ): Promise<CurrentViewsProof>;
   verifyOutputs?(outputs: ReadonlyMap<string, ProjectionOutputEvidence>, workspaceRoot: string): Promise<void>;
   verifyAbsentOutputs?(outputs: ReadonlyMap<string, ProjectionOutputEvidence>, workspaceRoot: string): Promise<void>;
 }
@@ -96,6 +110,11 @@ export interface ProjectionBaseline {
   head: MaterializationHead;
   outputs: Map<string, ProjectionOutputEvidence>;
   chain_depth: number;
+}
+
+export interface RecoveredProjectionBaseline {
+  baseline: ProjectionBaseline;
+  reconstructed: boolean;
 }
 
 export interface MaterializationCoordinatorOptions {
@@ -141,6 +160,7 @@ export class MaterializationCoordinator {
   private readonly verifyExistingCriticalPairOnly: boolean;
   private readonly finalVerificationBatchMax: number | undefined;
   private readonly knownCanonicalRecord: CanonicalCommitRecord | undefined;
+  private reconstructedBaseline: ProjectionBaseline | null = null;
 
   constructor(options: MaterializationCoordinatorOptions) {
     this.projectId = options.projectId;
@@ -175,7 +195,12 @@ export class MaterializationCoordinator {
 
     let externalHead = await this.repository.readMaterializationHead(this.projectId);
     if (!externalHead) {
-      externalHead = await this.repairHeadFromCompletedRecords(canonicalRevision);
+      const repaired = await this.repairHeadFromCompletedRecords(canonicalRevision);
+      if (repaired === "pending") {
+        this.requestTarget(canonicalRevision, this.projectionVersion);
+        return this.ledger.status();
+      }
+      externalHead = repaired;
     }
 
     if (externalHead) {
@@ -183,15 +208,19 @@ export class MaterializationCoordinator {
         throw new Error(`Materialization head is ahead of canonical revision for ${this.projectId}`);
       }
       const local = this.ledger.status().head;
-      if (
+      if (externalHead.projection_version === this.projectionVersion && (
         !local
         || local.revision !== externalHead.target_revision
         || local.projection_version !== externalHead.projection_version
-      ) {
-        const baseline = await rebuildProjectionBaseline(this.repository, externalHead);
+      )) {
+        const recovered = await this.rebuildExistingHeadBaseline(canonicalRevision, externalHead);
+        if (recovered === "pending") {
+          this.requestTarget(canonicalRevision, this.projectionVersion);
+          return this.ledger.status();
+        }
         this.ledger.restoreExternalBaseline(
           { revision: externalHead.target_revision, projection_version: externalHead.projection_version },
-          baseline.outputs
+          recovered.baseline.outputs
         );
       }
     }
@@ -245,6 +274,7 @@ export class MaterializationCoordinator {
     );
     if (existingRecord) {
       const repaired = await this.finishExistingCompletedRecord(existingRecord);
+      if (repaired === null) return pendingMaterializationResult(this.projectId, target);
       return {
         project_id: this.projectId,
         target_revision: target.revision,
@@ -332,7 +362,8 @@ export class MaterializationCoordinator {
         }
       }
 
-      const baseline = await this.loadExternalBaseline(target.revision);
+    const baseline = await this.loadExternalBaseline(target.revision);
+    if (baseline === "pending") return pendingMaterializationResult(this.projectId, target);
       if (baseline) {
         const local = this.ledger.status().head;
         if (
@@ -439,6 +470,19 @@ export class MaterializationCoordinator {
       await this.writer.verifyCritical(plan, archived ? archiveRoot : activeRoot);
 
       fullOutputs ??= applyPlanToBaseline(baseline?.outputs ?? new Map(), plan, verified);
+      if (
+        target.projection_version >= CURRENT_PROJECTION_VERSION
+        && this.sliceBudget
+        && !this.sliceBudget.canStartEffect(12)
+      ) return pendingMaterializationResult(this.projectId, target);
+      const currentViewsProof = target.projection_version >= CURRENT_PROJECTION_VERSION
+        ? await this.verifyCurrentViews(
+            fullOutputs,
+            target.revision,
+            target.projection_version,
+            archived ? archiveRoot : activeRoot
+          )
+        : undefined;
       const resultRootHash = await projectionIndexRootHash(fullOutputs);
       const snapshot = baseline === null
         || baseline.head.projection_version !== target.projection_version
@@ -465,6 +509,7 @@ export class MaterializationCoordinator {
         removed_outputs: snapshot ? [] : [...plan.removed_outputs].sort(),
         total_output_count: fullOutputs.size,
         result_root_hash: resultRootHash,
+        ...(currentViewsProof ? { current_views_proof: currentViewsProof } : {}),
         coalesced_revisions: [...target.coalesced_revisions],
         source_event_id: record.event.event_id,
         completed_at: completedAt
@@ -472,6 +517,20 @@ export class MaterializationCoordinator {
 
       await this.repository.writeCompletedMaterializationRecord(completedRecord);
       const head = headFor(completedRecord);
+      if (this.sliceBudget) {
+        // Keep the prior official head until a fresh bounded slice reobserves
+        // all four provider object/revision tokens from the immutable record.
+        return pendingMaterializationResult(this.projectId, target);
+      }
+      if (currentViewsProof) {
+        await this.verifyCurrentViews(
+          fullOutputs,
+          target.revision,
+          target.projection_version,
+          archived ? archiveRoot : activeRoot,
+          currentViewsProof
+        );
+      }
       await this.repository.writeMaterializationHead(head);
       await this.writer.verifyCritical(plan, archived ? archiveRoot : activeRoot);
       const publishedHead = await this.repository.readMaterializationHead(this.projectId);
@@ -542,10 +601,15 @@ export class MaterializationCoordinator {
     return true;
   }
 
-  private async loadExternalBaseline(canonicalRevision: number): Promise<ProjectionBaseline | null> {
+  private async loadExternalBaseline(canonicalRevision: number): Promise<ProjectionBaseline | null | "pending"> {
     let head = await this.repository.readMaterializationHead(this.projectId);
-    if (!head) head = await this.repairHeadFromCompletedRecords(canonicalRevision);
+    if (!head) {
+      const repaired = await this.repairHeadFromCompletedRecords(canonicalRevision);
+      if (repaired === "pending") return "pending";
+      head = repaired;
+    }
     if (!head) return null;
+    if (head.projection_version !== this.projectionVersion) return null;
 
     const localHead = this.ledger.status().head;
     if (
@@ -570,36 +634,265 @@ export class MaterializationCoordinator {
     // bounded Worker invocation.
     if (this.verifyExistingCriticalPairOnly) return null;
 
-    return rebuildProjectionBaseline(this.repository, head);
+    const recovered = await this.rebuildExistingHeadBaseline(canonicalRevision, head);
+    return recovered === "pending" ? "pending" : recovered.baseline;
   }
 
-  private async repairHeadFromCompletedRecords(canonicalRevision: number): Promise<MaterializationHead | null> {
-    const refs = await this.repository.listMaterializationRecordRefs(this.projectId);
-    const candidates = refs
-      .filter((ref) => ref.target_revision <= canonicalRevision)
-      .sort((a, b) => b.projection_version - a.projection_version || b.target_revision - a.target_revision);
-
-    for (const ref of candidates) {
-      const record = await this.repository.readMaterializationRecord(
-        this.projectId,
-        ref.target_revision,
-        ref.projection_version
+  async rebuildExistingHeadBaseline(
+    canonicalRevision: number,
+    head: MaterializationHead
+  ): Promise<RecoveredProjectionBaseline | "pending"> {
+    const localHead = this.ledger.status().head;
+    if (localHead?.revision === head.target_revision
+      && localHead.projection_version === head.projection_version) {
+      const tip = await this.repository.readMaterializationRecord(
+        this.projectId, head.target_revision, head.projection_version
       );
-      if (!record) continue;
-      const candidateHead = headFor(record);
-      try {
-        const baseline = await rebuildProjectionBaseline(this.repository, candidateHead);
-        await this.restoreAndVerifyCompletedProjection(record, baseline);
-        await this.repository.writeMaterializationHead(candidateHead);
-        return candidateHead;
-      } catch {
-        continue;
+      const outputs = this.ledger.baselineOutputs();
+      if (tip && tip.current_views_proof && await matchesCachedBaseline(head, tip, outputs)) {
+        return { baseline: { head, outputs, chain_depth: tip.chain_depth }, reconstructed: false };
       }
     }
-    return null;
+
+    const candidate = { target_revision: head.target_revision, projection_version: head.projection_version };
+    let checkpoint = this.ledger.readRepairScanCheckpoint?.(canonicalRevision) ?? null;
+    if (checkpoint && (!checkpoint.scan_complete || !checkpoint.best_candidate
+      || checkpoint.best_candidate.target_revision !== candidate.target_revision
+      || checkpoint.best_candidate.projection_version !== candidate.projection_version)) {
+      // A provider-published head is an exact, independently verifiable
+      // frontier. Prefer reconstructing that generation to continuing an
+      // obsolete directory scan; the old cursor is only discovery progress,
+      // not business history or proof that the head is usable. This also
+      // handles a head published after a scan completed but before its
+      // candidate validation began.
+      if (head.target_revision > canonicalRevision
+        || head.projection_version !== this.projectionVersion) {
+        throw new Error(`Materialization baseline head is not canonical for ${this.projectId}`);
+      }
+      if (!this.ledger.writeRepairScanCheckpoint) {
+        throw new Error("Bounded materialization baseline requires a durable ledger checkpoint");
+      }
+      checkpoint = {
+        canonical_revision: canonicalRevision,
+        cursor: null,
+        scan_complete: true,
+        best_candidate: candidate
+      };
+      this.ledger.writeRepairScanCheckpoint(checkpoint);
+    }
+    if (!checkpoint) {
+      if (!this.ledger.writeRepairScanCheckpoint) {
+        throw new Error("Bounded materialization baseline requires a durable ledger checkpoint");
+      }
+      checkpoint = {
+        canonical_revision: canonicalRevision,
+        cursor: null,
+        scan_complete: true,
+        best_candidate: candidate
+      };
+      this.ledger.writeRepairScanCheckpoint(checkpoint);
+    }
+
+    const restored = await this.repairHeadFromCompletedRecords(canonicalRevision);
+    if (restored === "pending") return "pending";
+    if (!restored || restored.target_revision !== head.target_revision
+      || restored.projection_version !== head.projection_version
+      || restored.result_root_hash !== head.result_root_hash) {
+      throw new Error(`Materialization baseline reconstruction did not match its head for ${this.projectId}`);
+    }
+    const baseline = this.reconstructedBaseline;
+    if (!baseline || baseline.head.result_root_hash !== head.result_root_hash) {
+      throw new Error(`Materialization baseline reconstruction evidence is missing for ${this.projectId}`);
+    }
+    this.ledger.restoreExternalBaseline(
+      { revision: baseline.head.target_revision, projection_version: baseline.head.projection_version },
+      baseline.outputs
+    );
+    return { baseline, reconstructed: true };
   }
 
-  private async finishExistingCompletedRecord(record: CompletedMaterializationRecord): Promise<boolean> {
+  async verifyExistingHeadCurrentViews(
+    record: CompletedMaterializationRecord,
+    canonical: CanonicalCommitRecord,
+    outputs: ReadonlyMap<string, ProjectionOutputEvidence>
+  ): Promise<boolean> {
+    if (record.target_revision !== canonical.new_revision
+      || record.source_event_id !== canonical.event.event_id
+      || !record.current_views_proof
+      || record.projection_version !== CURRENT_PROJECTION_VERSION) {
+      throw new Error(`Materialization current-view verification binding mismatch for ${this.projectId}`);
+    }
+    if (this.sliceBudget && !this.sliceBudget.canStartEffect(12)) return false;
+    const root = record.workspace_location === "archive"
+      ? archiveProjectRoot(canonical.state.project_id, canonical.state.slug)
+      : this.workspaceRootFor(canonical.state);
+    await this.verifyCurrentViews(
+      outputs,
+      record.target_revision,
+      record.projection_version,
+      root,
+      record.current_views_proof
+    );
+    return true;
+  }
+
+  private async repairHeadFromCompletedRecords(canonicalRevision: number): Promise<MaterializationHead | null | "pending"> {
+    const saved = this.ledger.readRepairScanCheckpoint?.(canonicalRevision) ?? null;
+    let checkpoint: MaterializationRepairScanCheckpoint = saved ?? {
+      canonical_revision: canonicalRevision, cursor: null, scan_complete: false, best_candidate: null
+    };
+    if (!checkpoint.scan_complete) {
+      if (this.sliceBudget && !this.sliceBudget.canStartEffect(13)) return "pending";
+      const page = await this.repository.listMaterializationRecordsPage(this.projectId, checkpoint.cursor, 100);
+      let bestCandidate = checkpoint.best_candidate;
+      for (const ref of page.records) {
+        if (ref.target_revision > canonicalRevision || ref.projection_version < CURRENT_PROJECTION_VERSION) continue;
+        if (!bestCandidate
+          || ref.projection_version > bestCandidate.projection_version
+          || (ref.projection_version === bestCandidate.projection_version && ref.target_revision > bestCandidate.target_revision)) {
+          bestCandidate = ref;
+        }
+      }
+      if (page.next_cursor !== null && page.next_cursor === checkpoint.cursor) {
+        throw new Error("Materialization repair listing cursor did not advance");
+      }
+      checkpoint = {
+        canonical_revision: canonicalRevision,
+        cursor: page.next_cursor,
+        scan_complete: page.next_cursor === null,
+        best_candidate: bestCandidate
+      };
+      if (page.next_cursor !== null) {
+    if (!this.ledger.writeRepairScanCheckpoint) throw new Error("Paged materialization repair requires a durable ledger checkpoint");
+        this.ledger.writeRepairScanCheckpoint(checkpoint);
+        return "pending";
+      }
+      if (!this.ledger.writeRepairScanCheckpoint) throw new Error("Paged materialization repair requires a durable ledger checkpoint");
+      // Persist completion before loading/validating a candidate. If a later
+      // provider call runs out of budget, the next alarm resumes validation,
+      // not the full directory scan.
+      this.ledger.writeRepairScanCheckpoint(checkpoint);
+    }
+    const bestCandidate = checkpoint.best_candidate;
+    if (!bestCandidate) {
+      this.ledger.clearRepairScanCheckpoint?.();
+      return null;
+    }
+    if (bestCandidate.projection_version > CURRENT_PROJECTION_VERSION) {
+      throw new Error(`Future materialization projection version requires repair for ${this.projectId}`);
+    }
+
+    let chainState = checkpoint.chain_state;
+    if (!chainState) {
+      chainState = {
+        phase: "discover", refs: [], chain_depths: [], cursor_ref: bestCandidate,
+        apply_index: -1, outputs: {}
+      };
+    }
+    const persistChainCheckpoint = () => {
+      if (!this.ledger.writeRepairScanCheckpoint) {
+        throw new Error("Materialization repair-chain progress requires a durable ledger checkpoint");
+      }
+      checkpoint = { ...checkpoint, chain_state: chainState };
+      this.ledger.writeRepairScanCheckpoint(checkpoint);
+    };
+    let reads = 0;
+    const maxReads = this.sliceBudget
+      ? maximumRepairChainReads(this.sliceBudget, 12)
+      : MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH + 1;
+    if (maxReads === 0) return "pending";
+
+    while (reads < maxReads && chainState.phase === "discover" && chainState.cursor_ref) {
+      const ref = chainState.cursor_ref;
+      const record = await this.repository.readMaterializationRecord(this.projectId, ref.target_revision, ref.projection_version);
+      if (!record || record.project_id !== this.projectId || record.target_revision !== ref.target_revision
+        || record.projection_version !== ref.projection_version) {
+        throw new Error(`Latest materialization repair candidate chain is invalid for ${this.projectId}`);
+      }
+      chainState.refs.push(ref);
+      chainState.chain_depths.push(record.chain_depth);
+      reads += 1;
+      if (chainState.refs.length > MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH + 1) {
+        throw new Error(`Materialization chain exceeds reconstruction bound for ${this.projectId}`);
+      }
+      if (record.record_kind === "snapshot") {
+        if (record.chain_depth !== 0 || record.parent !== null) throw new Error(`Invalid materialization snapshot root for ${this.projectId}`);
+        chainState = { ...chainState, phase: "apply", cursor_ref: null, apply_index: chainState.refs.length - 1, outputs: {} };
+      } else {
+        if (!record.parent || record.parent.projection_version !== bestCandidate.projection_version
+          || record.parent.target_revision >= record.target_revision) {
+          throw new Error(`Invalid materialization parent chain for ${this.projectId}`);
+        }
+        chainState = { ...chainState, cursor_ref: record.parent };
+      }
+      persistChainCheckpoint();
+    }
+
+    while (reads < maxReads && chainState.phase === "apply" && chainState.apply_index >= 0) {
+      const index: number = chainState.apply_index;
+      const ref = chainState.refs[index];
+      if (!ref) throw new Error(`Incomplete materialization repair chain for ${this.projectId}`);
+      const record = await this.repository.readMaterializationRecord(this.projectId, ref.target_revision, ref.projection_version);
+      if (!record || record.project_id !== this.projectId || record.target_revision !== ref.target_revision
+        || record.projection_version !== ref.projection_version) {
+        throw new Error(`Materialization repair chain changed for ${this.projectId}`);
+      }
+      if (index === chainState.refs.length - 1) {
+        if (record.record_kind !== "snapshot" || record.parent !== null || record.chain_depth !== 0) {
+          throw new Error(`Invalid materialization snapshot root for ${this.projectId}`);
+        }
+      } else {
+        const parent = chainState.refs[index + 1]!;
+        if (record.record_kind !== "delta" || record.parent?.target_revision !== parent.target_revision
+          || record.parent.projection_version !== parent.projection_version
+          || record.chain_depth !== chainState.chain_depths[index + 1]! + 1) {
+          throw new Error(`Invalid materialization parent chain for ${this.projectId}`);
+        }
+      }
+      const outputs: Map<string, ProjectionOutputEvidence> = new Map(Object.entries(chainState.outputs));
+      for (const key of record.removed_outputs) outputs.delete(key);
+      for (const [key, evidence] of Object.entries(record.outputs)) outputs.set(key, evidence);
+      if (outputs.size !== record.total_output_count || await projectionIndexRootHash(outputs) !== record.result_root_hash) {
+        throw new Error(`Materialization result root mismatch for ${this.projectId} revision ${record.target_revision}`);
+      }
+      chainState = { ...chainState, outputs: Object.fromEntries(outputs), apply_index: index - 1 };
+      reads += 1;
+      persistChainCheckpoint();
+    }
+    if (chainState.phase !== "apply" || chainState.apply_index >= 0) return "pending";
+
+    const candidateRecord = await this.repository.readMaterializationRecord(
+      this.projectId, bestCandidate.target_revision, bestCandidate.projection_version
+    );
+    if (!candidateRecord || candidateRecord.project_id !== this.projectId
+      || (candidateRecord.projection_version >= CURRENT_PROJECTION_VERSION && !candidateRecord.current_views_proof)) {
+      throw new Error(`Latest materialization repair candidate is invalid for ${this.projectId}`);
+    }
+    const head = headFor(candidateRecord);
+    const baseline: ProjectionBaseline = {
+      head, outputs: new Map(Object.entries(chainState.outputs)), chain_depth: candidateRecord.chain_depth
+    };
+    if (this.sliceBudget && !this.sliceBudget.canStartEffect(12)) return "pending";
+    await this.restoreAndVerifyCompletedProjection(candidateRecord, baseline);
+    const currentHead = await this.repository.readMaterializationHead(this.projectId);
+    if (!currentHead || !sameHeadTarget(currentHead, head) || currentHead.result_root_hash !== head.result_root_hash) {
+      await this.repository.writeMaterializationHead(head);
+    }
+    this.reconstructedBaseline = baseline;
+    this.ledger.restoreExternalBaseline(
+      { revision: head.target_revision, projection_version: head.projection_version },
+      baseline.outputs
+    );
+    this.ledger.clearRepairScanCheckpoint?.();
+    return head;
+  }
+
+  private async finishExistingCompletedRecord(record: CompletedMaterializationRecord): Promise<boolean | null> {
+    if (
+      record.projection_version >= CURRENT_PROJECTION_VERSION
+      && this.sliceBudget
+      && !this.sliceBudget.canStartEffect(12)
+    ) return null;
     const head = headFor(record);
     if (this.verifyExistingCriticalPairOnly) {
       const local = this.ledger.status().head;
@@ -631,7 +924,12 @@ export class MaterializationCoordinator {
       if (!canonical || record.source_event_id !== canonical.event.event_id) {
         throw new Error(`Materialization source binding mismatch for ${this.projectId} revision ${record.target_revision}`);
       }
-      if (!this.writer.verifyOutputs) throw new Error("Completed materialization repair requires output verification");
+      const canReuseCompletedOutputProof = this.sliceBudget !== undefined
+        && record.projection_version >= CURRENT_PROJECTION_VERSION
+        && record.current_views_proof !== undefined;
+      if (!this.writer.verifyOutputs && !canReuseCompletedOutputProof) {
+        throw new Error("Completed materialization repair requires output verification");
+      }
       const root = record.workspace_location === "archive"
         ? archiveProjectRoot(canonical.state.project_id, canonical.state.slug)
         : this.workspaceRootFor(canonical.state);
@@ -639,8 +937,22 @@ export class MaterializationCoordinator {
         ? outputs
         : new Map(Object.entries(record.outputs));
       const publicationFence = new Map([...criticalPairEvidence(outputs), ...changed]);
-      await this.writer.verifyOutputs(publicationFence, root);
-      if (removed.size > 0) {
+      // Completed records are persisted only after the full final output pass
+      // was checkpointed. During bounded head repair, reuse that generation-
+      // bound evidence and spend the publication reserve reobserving the four
+      // mutable current views, rather than rereading a large snapshot per alarm.
+      if (!canReuseCompletedOutputProof) await this.writer.verifyOutputs!(publicationFence, root);
+      if (record.projection_version >= CURRENT_PROJECTION_VERSION) {
+        if (!record.current_views_proof) throw new Error("Completed record is missing its four-view publication proof");
+        await this.verifyCurrentViews(
+          outputs,
+          record.target_revision,
+          record.projection_version,
+          root,
+          record.current_views_proof
+        );
+      }
+      if (removed.size > 0 && !canReuseCompletedOutputProof) {
         if (!this.writer.verifyAbsentOutputs) {
           throw new Error("Completed materialization repair requires removed-output verification");
         }
@@ -685,13 +997,39 @@ export class MaterializationCoordinator {
     const root = record.workspace_location === "archive"
       ? archiveProjectRoot(canonical.state.project_id, canonical.state.slug)
       : this.workspaceRootFor(canonical.state);
-    if (!this.writer.verifyOutputs) {
+    const canReuseCompletedOutputProof = this.sliceBudget !== undefined
+      && record.projection_version >= CURRENT_PROJECTION_VERSION
+      && record.current_views_proof !== undefined;
+    if (!this.writer.verifyOutputs && !canReuseCompletedOutputProof) {
       throw new Error("Completed materialization repair requires full-output verification");
     }
     const outputs = this.verifyExistingCriticalPairOnly
       ? criticalPairEvidence(baseline.outputs)
       : baseline.outputs;
-    await this.writer.verifyOutputs(outputs, root);
+    if (!canReuseCompletedOutputProof) await this.writer.verifyOutputs!(outputs, root);
+    if (record.projection_version >= CURRENT_PROJECTION_VERSION) {
+      if (!record.current_views_proof) throw new Error("Completed record is missing its four-view publication proof");
+      await this.verifyCurrentViews(
+        baseline.outputs,
+        record.target_revision,
+        record.projection_version,
+        root,
+        record.current_views_proof
+      );
+    }
+  }
+
+  private async verifyCurrentViews(
+    outputs: ReadonlyMap<string, ProjectionOutputEvidence>,
+    targetRevision: number,
+    projectionVersion: number,
+    root: string,
+    expected?: CurrentViewsProof
+  ): Promise<CurrentViewsProof> {
+    if (!this.writer.verifyCurrentViews) {
+      throw new Error("Current projection requires stable four-view provider verification");
+    }
+    return this.writer.verifyCurrentViews(outputs, targetRevision, projectionVersion, root, expected);
   }
 
   private async archiveWorkspaceOrConflict(state: ProjectState, activeRoot: string): Promise<void> {
@@ -826,6 +1164,14 @@ export function selectFinalVerificationBatchSize(
     // updates below make variable provider cost safe: an exhausted slice
     // resumes after the last verified file instead of repeating the batch.
     if (budget.canStartEffect(size)) return size;
+  }
+  return 0;
+}
+
+function maximumRepairChainReads(budget: SliceBudget, publicationReserve: number): number {
+  const maximum = Math.min(MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH + 1, 20);
+  for (let reads = maximum; reads >= 1; reads -= 1) {
+    if (budget.canStartEffect(reads + publicationReserve)) return reads;
   }
   return 0;
 }

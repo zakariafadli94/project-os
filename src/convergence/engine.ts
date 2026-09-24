@@ -1005,7 +1005,9 @@ export class ConvergenceEngine {
         nowMs: this.input.now(),
         failureCount,
         jitter: await deterministicRetryJitter(obligationId, attemptNumber),
-        retryAfterMs: 0
+        retryAfterMs: error instanceof ProviderOperationError && error.retryable
+          ? error.diagnostics?.retryAfterMs ?? 0
+          : 0
       });
       // An internal diagnostic is fingerprinted independently of time, attempt,
       // transport request IDs and heartbeats. Verified output hashes are the

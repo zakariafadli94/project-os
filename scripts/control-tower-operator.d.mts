@@ -16,7 +16,7 @@ export type OperatorPorts = {
   createOperatorVersion(input: { token: string }): Promise<string>;
   attachZeroTrafficVersion(input: { baseVersionId: string; operatorVersionId: string }): Promise<void>;
   health(input: { overrideVersionId?: string }): Promise<{ status: string; worker_version_id: string }>;
-  fetchContext(input: { projectId: string; token: string; operatorVersionId: string }): Promise<{ project_id: string; [key: string]: unknown }>;
+  fetchContext(input: { projectId: string; token: string; operatorVersionId: string; correlationId: string; signal: AbortSignal }): Promise<{ project_id: string; [key: string]: unknown }>;
   submit(input: {
     kind: OperatorInput["kind"];
     projectId: string;
@@ -24,16 +24,21 @@ export type OperatorPorts = {
     context: { project_id: string; [key: string]: unknown };
     token: string;
     operatorVersionId: string;
+    correlationId: string;
+    signal: AbortSignal;
   }): Promise<OperatorReceipt>;
   restoreBaseDeployment(input: { versionId: string }): Promise<void>;
   tokenStatusOnBase(input: { token: string }): Promise<number>;
 };
 
 export type SanitizedOperatorResult = {
-  status: string;
+  status: "committed" | "unknown" | "not_submitted";
   project_id: string;
   request_id: string;
-  base_version_id: string;
+  base_version_id?: string;
+  code?: string;
+  failed_boundary?: "context" | "submission";
+  recovery?: { preserve_request_id: true; check_status_before_retry: boolean };
 };
 
 export function createCloudflarePorts(options: {

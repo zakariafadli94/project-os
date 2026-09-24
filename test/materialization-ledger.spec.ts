@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ProjectionOutputEvidence } from "../src/domain/materialization";
+import type { MaterializationRepairScanCheckpoint } from "../src/materialization/ledger";
 import { initialProgress } from "../src/convergence/journal";
 import {
   initializeMaterializationSchema,
@@ -131,6 +132,25 @@ describe("MaterializationLedger", () => {
 
       const restarted = new MaterializationLedger(state.storage);
       expect(restarted.immutableDerivativesThrough()).toBe(2);
+    });
+  });
+
+  it("persists the paged repair-scan cursor and best candidate across ledger instances", async () => {
+    const projectId = "PRJ-3420";
+    const stub = env.PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      initializeMaterializationSchema(state.storage);
+      const checkpoint: MaterializationRepairScanCheckpoint = {
+        canonical_revision: 12,
+        cursor: "opaque-provider-cursor-2",
+        scan_complete: false,
+        best_candidate: { target_revision: 9, projection_version: 6 }
+      };
+      new MaterializationLedger(state.storage).writeRepairScanCheckpoint(checkpoint);
+
+      const resumed = new MaterializationLedger(state.storage);
+      expect(resumed.readRepairScanCheckpoint(12)).toEqual(checkpoint);
+      expect(resumed.readRepairScanCheckpoint(13)).toBeNull();
     });
   });
 

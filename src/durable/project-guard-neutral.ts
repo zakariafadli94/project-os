@@ -46,6 +46,7 @@ import { RuleAdmissionError, verifyRuleAdmissionPermit, type RuleAdmissionInput,
 import { decodeAdmission } from "../admission/transport";
 import { sha256Canonical } from "../materialization/hash";
 import { sha256Text } from "../documents/hash";
+import { ProviderConflictError, ProviderOperationError } from "../persistence/provider/errors";
 import {
   admissionModeForProject,
   assertCapacity,
@@ -87,6 +88,24 @@ interface RecoveryRequestRow {
   [key: string]: SqlStorageValue;
   kind: string;
   request_id: string;
+  failure_message: string | null;
+}
+
+type RecoveryFailureClassification = "provider_temporary" | "provider_blocked" | "continuation" | "internal";
+
+interface RecoveryFailureDiagnostic {
+  code: string;
+  classification: RecoveryFailureClassification;
+  error_name: string;
+  progress_sha256: string;
+  external_progress_sha256?: string;
+  next_attempt_at: string | null;
+}
+
+interface RecoveryFailureResult extends RecoveryFailureDiagnostic {
+  count: number;
+  stopped: boolean;
+  delay_ms: number;
 }
 
 interface RecoveryCursorRow {
@@ -149,10 +168,34 @@ const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
 const REQUEST_RECOVERY_BATCH_SIZE = 4;
 const REQUEST_RECOVERY_RETRY_DELAY_MS = 30_000;
 const MATERIALIZATION_FINALIZATION_WORK_KEY = "materialization-finalization-work";
+const MATERIALIZATION_FINALIZATION_REQUEST_KEY = "materialization-finalization-request";
 const MATERIALIZATION_FINALIZATION_LINEAGE_BATCH_SIZE = 4;
 const MATERIALIZATION_FINALIZATION_CERTIFICATE_BATCH_SIZE = 4;
+const MATERIALIZATION_FINALIZATION_PROVIDER_CALL_BUDGET = 32;
+const MATERIALIZATION_FINALIZATION_SLICE_MS = 20_000;
+const MATERIALIZATION_FINALIZATION_CHECKPOINT_RESERVE_MS = 3_000;
 const MATERIALIZATION_FINALIZATION_INFERRED_RANGE_MAX = 64;
+const MATERIALIZATION_FINALIZATION_LEGACY_INFERENCE_MAX_PROJECTION_VERSION = 5;
 const MATERIALIZATION_FINALIZATION_COVERAGE_VERSION = 2;
+const MATERIALIZATION_FINALIZATION_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000] as const;
+const MATERIALIZATION_FINALIZATION_INTERNAL_FAILURE_LIMIT = 6;
+const RECOVERY_MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1_000;
+
+function retryAfterDelayMs(value: string | null): number | undefined {
+  if (!value?.trim()) return undefined;
+  const trimmed = value.trim();
+  const seconds = /^\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+  const delay = Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(trimmed) - Date.now();
+  return Number.isFinite(delay) && delay > 0 ? Math.min(RECOVERY_MAX_RETRY_AFTER_MS, Math.ceil(delay)) : undefined;
+}
+
+function isTransientRecoveryFailure(error: unknown): boolean {
+  return error instanceof Error && (
+    error.name === "AbortError"
+    || error.name === "TimeoutError"
+    || /dropbox_request_timeout|fetch failed|network (?:error|failure|unavailable)|timed? out|\bECONN(?:RESET|REFUSED|TIMEDOUT)\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i.test(error.message)
+  );
+}
 
 interface MaterializationFinalizationCandidate {
   revision: number;
@@ -176,6 +219,24 @@ interface MaterializationFinalizationWork {
   previous_child: { target_revision: number; projection_version: number; chain_depth: number } | null;
   scan_complete: boolean;
   candidates: MaterializationFinalizationCandidate[];
+  uncovered_ranges?: Array<{ from_revision: number; to_revision: number }>;
+  legacy_range_cursor?: LegacyRangeVerificationCursor | null;
+}
+
+interface LegacyRangeVerificationCursor {
+  materialization_revision: number;
+  projection_version: number;
+  result_root_hash: string;
+  completed_at: string;
+  source_event_id: string | null;
+  parent_revision: number;
+  next_revision: number;
+  verified: boolean;
+}
+
+interface MaterializationFinalizationRequest {
+  target_revision: number;
+  projection_version: number;
 }
 
 interface ContextReadCheckpoint {
@@ -627,7 +688,10 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    await this.serialize(() => this.resumePendingRequestRecovery());
+    await this.serialize(async () => {
+      await this.resumePendingRequestRecovery();
+      await this.resumePendingMaterializationFinalization();
+    });
     // Transaction replay must enter the normal serialized admission path, so
     // it runs after the document/artifact recovery lock has been released.
     await this.resumePendingTransactionRecovery();
@@ -1096,17 +1160,231 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async clearTransactionRecovery(requestId: string): Promise<void> {
     this.clearRequestRecovery("transaction", requestId);
-    if (!this.hasPendingRequestRecovery()) await this.ctx.storage.deleteAlarm();
+    if (!this.hasPendingRequestRecovery() && !await this.hasPendingMaterializationFinalization()) {
+      await this.ctx.storage.deleteAlarm();
+    }
+  }
+
+  private async hasPendingMaterializationFinalization(): Promise<boolean> {
+    return Boolean(
+      await this.ctx.storage.get(MATERIALIZATION_FINALIZATION_REQUEST_KEY)
+      || await this.ctx.storage.get(MATERIALIZATION_FINALIZATION_WORK_KEY)
+    );
   }
 
   private async blockRequestRecovery(kind: "artifact" | "document" | "transaction", requestId: string, code: string): Promise<void> {
+    const progressSha256 = await sha256Text(`${kind}:${requestId}:${code}`);
+    const diagnostic: RecoveryFailureDiagnostic = {
+      code,
+      classification: "provider_blocked",
+      error_name: "InvalidRecoveryEvidence",
+      progress_sha256: progressSha256,
+      next_attempt_at: null
+    };
     this.ctx.storage.sql.exec(
       `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
        VALUES (?, ?, ?, 1, 1, ?)
        ON CONFLICT(kind, request_id) DO UPDATE SET fingerprint = excluded.fingerprint,
          count = excluded.count, stopped = 1, message = excluded.message`,
-      kind, requestId, await sha256Text(code), code
+      kind, requestId, progressSha256, JSON.stringify(diagnostic)
     );
+  }
+
+  private async recoveryProgressFingerprint(kind: "artifact" | "document" | "transaction", requestId: string): Promise<string> {
+    const payload = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
+      "SELECT request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
+    ).toArray()[0]?.request_sha256 ?? null;
+    let localEvidence: unknown = null;
+    if (kind === "transaction") {
+      const row = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; status: string; receipt_json: string }>(
+        "SELECT status, receipt_json FROM transactions WHERE transaction_id = ?", requestId
+      ).toArray()[0];
+      const intent = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; payload_hash: string }>(
+        "SELECT payload_hash FROM transaction_intents WHERE transaction_id = ?", requestId
+      ).toArray()[0];
+      localEvidence = row ? { status: row.status, receipt_sha256: await sha256Text(row.receipt_json), intent_hash: intent?.payload_hash ?? null } : intent ?? null;
+    } else {
+      const table = kind === "document" ? "document_requests" : "artifact_requests";
+      const row = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; receipt_json: string }>(
+        `SELECT request_json, receipt_json FROM ${table} WHERE request_id = ?`, requestId
+      ).toArray()[0];
+      localEvidence = row ? {
+        request_sha256: await sha256Text(row.request_json),
+        receipt_sha256: await sha256Text(row.receipt_json)
+      } : null;
+    }
+    return sha256Text(JSON.stringify({ kind, request_id: requestId, payload_sha256: payload, local_evidence: localEvidence }));
+  }
+
+  /** Read execution progress only at the internal-failure stop boundary. This
+   * avoids a provider round trip for ordinary retries while ensuring durable
+   * completed steps reset the identical-no-progress streak. */
+  private async externalRecoveryProgressFingerprint(
+    kind: "artifact" | "document" | "transaction",
+    requestId: string
+  ): Promise<string> {
+    const projectId = this.ctx.id.name;
+    if (!projectId) throw new Error("project_id_unavailable");
+    const deadlineMs = Date.now() + 5_000;
+    const controller = new AbortController();
+    let calls = 0;
+    const runtime = createProductionPersistence(this.env, projectId, {
+      deadlineMs,
+      signal: controller.signal,
+      now: () => Date.now(),
+      beforeHttp: () => {
+        if (Date.now() >= deadlineMs || calls >= 8) throw new Error("recovery_progress_probe_budget_exhausted");
+        calls += 1;
+      }
+    });
+    const source = new ExecutionJournal(runtime, projectId, kind, requestId).status();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("recovery_progress_probe_deadline");
+        controller.abort(error);
+        reject(error);
+      }, Math.max(1, deadlineMs - Date.now()));
+    });
+    let progress: Awaited<ReturnType<ExecutionJournal["status"]>>;
+    try {
+      progress = await Promise.race([source, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (!progress) return sha256Text("no_execution_progress");
+    return sha256Text(JSON.stringify({
+      status: progress.status,
+      terminal: progress.terminal,
+      completed_steps: progress.completed_steps,
+      postchecks: progress.postchecks,
+      receipt_ref: progress.receipt_ref,
+      finalization_ref: progress.finalization_ref ?? null
+    }));
+  }
+
+  private async recordRecoveryFailure(
+    kind: "artifact" | "document" | "transaction" | "materialization",
+    requestId: string,
+    error: unknown,
+    progressSha256: string
+  ): Promise<RecoveryFailureResult> {
+    const message = error instanceof Error ? error.message : "";
+    const errorName = error instanceof Error ? error.name : "UnknownError";
+    const usefulContinuation = error instanceof Error
+      && /(?:^|_)slice_budget_exhausted$/i.test(message);
+    const networkTemporary = isTransientRecoveryFailure(error);
+    const providerTemporary = !usefulContinuation && ((error instanceof ProviderOperationError && error.retryable) || networkTemporary);
+    const providerBlocked = error instanceof ProviderOperationError && !error.retryable;
+    const classification: RecoveryFailureClassification = usefulContinuation
+      ? "continuation"
+      : providerTemporary
+      ? "provider_temporary"
+      : providerBlocked ? "provider_blocked" : "internal";
+    const code = error instanceof ProviderOperationError
+      ? (error.diagnostics?.code && /^[A-Za-z0-9._/-]{1,96}$/.test(error.diagnostics.code)
+        ? error.diagnostics.code
+        : error instanceof ProviderConflictError
+          ? "provider_conflict"
+          : error.diagnostics?.status
+            ? `provider_http_${error.diagnostics.status}`
+            : "provider_operation_failed")
+      : usefulContinuation ? "slice_budget_exhausted"
+        : networkTemporary ? "network_transport_unavailable"
+          : message === "materialization_evidence_no_progress" ? message : "internal_error";
+    const previous = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; fingerprint: string; count: number; message: string }>(
+      "SELECT fingerprint, count, message FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
+    ).toArray()[0];
+    const previousDiagnostic = this.parseRecoveryFailureDiagnostic(previous?.message);
+    let externalProgressSha256 = previousDiagnostic?.external_progress_sha256;
+    const errorSha256 = await sha256Text(`${errorName}:${message}`);
+    let fingerprint = await sha256Text(JSON.stringify({ classification, error_name: errorName, error_sha256: errorSha256, progress_sha256: progressSha256, external_progress_sha256: externalProgressSha256 ?? null }));
+    let count = previous?.fingerprint === fingerprint ? previous.count + 1 : 1;
+    let stopped = providerBlocked || (classification === "internal" && count >= MATERIALIZATION_FINALIZATION_INTERNAL_FAILURE_LIMIT);
+    if (classification === "internal" && kind !== "materialization"
+      && (count === 1 || count >= MATERIALIZATION_FINALIZATION_INTERNAL_FAILURE_LIMIT)) {
+      try {
+        const currentExternalProgress = await this.externalRecoveryProgressFingerprint(kind, requestId);
+        if (externalProgressSha256 === undefined || currentExternalProgress !== externalProgressSha256) {
+          externalProgressSha256 = currentExternalProgress;
+          fingerprint = await sha256Text(JSON.stringify({ classification, error_name: errorName, error_sha256: errorSha256, progress_sha256: progressSha256, external_progress_sha256: externalProgressSha256 }));
+          count = 1;
+          stopped = false;
+        }
+      } catch {
+        // A missing/slow progress probe is not evidence that it is safe to stop.
+        stopped = false;
+      }
+    }
+    const retryAfterMs = error instanceof ProviderOperationError ? error.diagnostics?.retryAfterMs ?? NaN : NaN;
+    const delayMs = usefulContinuation ? 1_000 : providerTemporary
+      ? Math.max(MATERIALIZATION_FINALIZATION_RETRY_DELAYS_MS[Math.min(count - 1, MATERIALIZATION_FINALIZATION_RETRY_DELAYS_MS.length - 1)]!,
+          Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 0)
+      : stopped ? 0 : REQUEST_RECOVERY_RETRY_DELAY_MS;
+    const diagnostic: RecoveryFailureDiagnostic = {
+      code: stopped && classification === "internal" ? "identical_internal_failure_limit" : code,
+      classification,
+      error_name: errorName,
+      progress_sha256: progressSha256,
+      ...(externalProgressSha256 ? { external_progress_sha256: externalProgressSha256 } : {}),
+      next_attempt_at: stopped ? null : new Date(Date.now() + delayMs).toISOString()
+    };
+    this.ctx.storage.sql.exec(
+      `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(kind, request_id) DO UPDATE SET fingerprint = excluded.fingerprint,
+         count = excluded.count, stopped = excluded.stopped, message = excluded.message`,
+      kind, requestId, fingerprint, count, stopped ? 1 : 0, JSON.stringify(diagnostic)
+    );
+    return { ...diagnostic, count, stopped, delay_ms: delayMs };
+  }
+
+  private requestRecoveryFailureDue(message: string | null | undefined): boolean {
+    if (!message) return true;
+    try {
+      const diagnostic = JSON.parse(message) as { next_attempt_at?: unknown };
+      const dueAt = typeof diagnostic.next_attempt_at === "string" ? Date.parse(diagnostic.next_attempt_at) : NaN;
+      return !Number.isFinite(dueAt) || dueAt <= Date.now();
+    } catch {
+      return true;
+    }
+  }
+
+  private parseRecoveryFailureDiagnostic(message: string | null | undefined): RecoveryFailureDiagnostic | null {
+    if (!message) return null;
+    try {
+      const value = JSON.parse(message) as Partial<RecoveryFailureDiagnostic>;
+      if (typeof value.code !== "string" || !/^[A-Za-z0-9._/-]{1,96}$/.test(value.code)
+        || !["provider_temporary", "provider_blocked", "continuation", "internal"].includes(value.classification ?? "")
+        || typeof value.error_name !== "string"
+        || typeof value.progress_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.progress_sha256)
+        || (value.external_progress_sha256 !== undefined && (typeof value.external_progress_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.external_progress_sha256)))
+        || (value.next_attempt_at !== null && (typeof value.next_attempt_at !== "string" || !Number.isFinite(Date.parse(value.next_attempt_at))))) return null;
+      return value as RecoveryFailureDiagnostic;
+    } catch {
+      return null;
+    }
+  }
+
+  private async scheduleNextRequestRecoveryWake(): Promise<void> {
+    if (!this.hasPendingRequestRecovery()) return;
+    const rows = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; message: string | null }>(
+      `SELECT f.message FROM request_recovery r
+       LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
+       WHERE COALESCE(f.stopped, 0) = 0`
+    ).toArray();
+    const dueTimes = rows.map(({ message }) => {
+      if (!message) return Date.now();
+      try {
+        const diagnostic = JSON.parse(message) as { next_attempt_at?: unknown };
+        const dueAt = typeof diagnostic.next_attempt_at === "string" ? Date.parse(diagnostic.next_attempt_at) : NaN;
+        return Number.isFinite(dueAt) ? dueAt : Date.now();
+      } catch {
+        return Date.now();
+      }
+    });
+    const next = Math.min(...dueTimes);
+    await this.armRequestRecoveryAlarm(Math.max(1_000, next - Date.now()));
   }
 
   private pendingRequestRecovery(): RecoveryRequestRow[] {
@@ -1144,7 +1422,12 @@ export class ProjectGuard extends DurableObject<Env> {
         last.kind, last.request_id
       );
     }
-    return rows;
+    return rows.filter((row) => {
+      const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; message: string }>(
+        "SELECT message FROM request_recovery_failures WHERE kind = ? AND request_id = ?", row.kind, row.request_id
+      ).toArray()[0];
+      return this.requestRecoveryFailureDue(failure?.message);
+    });
   }
 
   private hasPendingRequestRecovery(): boolean {
@@ -1168,24 +1451,156 @@ export class ProjectGuard extends DurableObject<Env> {
         else if (recovery.kind === "artifact") await this.resumeArtifactFinalization(recovery.request_id);
         else if (recovery.kind !== "transaction") this.clearRequestRecovery("document", recovery.request_id);
       } catch (error) {
-        const message = error instanceof Error ? `${error.name}: ${error.message}` : "unknown_recovery_failure";
-        const fingerprint = await sha256Text(message);
-        const previous = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; fingerprint: string; count: number }>(
-          "SELECT fingerprint, count FROM request_recovery_failures WHERE kind = ? AND request_id = ?",
-          recovery.kind, recovery.request_id
-        ).toArray()[0];
-        const count = previous?.fingerprint === fingerprint ? previous.count + 1 : 1;
-        this.ctx.storage.sql.exec(
-          `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(kind, request_id) DO UPDATE SET fingerprint = excluded.fingerprint,
-             count = excluded.count, stopped = excluded.stopped, message = excluded.message`,
-          recovery.kind, recovery.request_id, fingerprint, count, count >= 6 ? 1 : 0, message
+        const progress = await this.recoveryProgressFingerprint(
+          recovery.kind as "artifact" | "document", recovery.request_id
         );
+        await this.recordRecoveryFailure(recovery.kind as "artifact" | "document", recovery.request_id, error, progress);
       }
     }
-    if (this.hasPendingRequestRecovery()) {
-      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+    await this.scheduleNextRequestRecoveryWake();
+  }
+
+  private async armMaterializationFinalizationAlarm(): Promise<void> {
+    await this.armRequestRecoveryAlarm(1_000);
+  }
+
+  private materializationFinalizationFailureRequestId(target: MaterializationFinalizationRequest): string {
+    return `${target.target_revision}:${target.projection_version}`;
+  }
+
+  private async materializationFinalizationProgress(target: MaterializationFinalizationRequest): Promise<string> {
+    const work = await this.ctx.storage.get<MaterializationFinalizationWork>(MATERIALIZATION_FINALIZATION_WORK_KEY);
+    return sha256Text(JSON.stringify({
+      target,
+      work: work ? {
+        head: work.head,
+        next_generation: work.next_generation,
+        previous_child: work.previous_child,
+        scan_complete: work.scan_complete,
+        candidates: work.candidates,
+        uncovered_ranges: work.uncovered_ranges ?? null,
+        legacy_range_cursor: work.legacy_range_cursor ?? null
+      } : null
+    }));
+  }
+
+  private async recordMaterializationFinalizationFailure(
+    target: MaterializationFinalizationRequest,
+    error: unknown
+  ): Promise<void> {
+    const requestId = this.materializationFinalizationFailureRequestId(target);
+    const progress = await this.materializationFinalizationProgress(target);
+    const failure = await this.recordRecoveryFailure("materialization", requestId, error, progress);
+    if (failure.stopped) {
+      console.error("Project OS materialization finalization blocked", {
+        project_id: this.ctx.id.name,
+        target_revision: target.target_revision,
+        projection_version: target.projection_version,
+        attempts: failure.count,
+        code: failure.code,
+        progress_sha256: progress
+      });
+      if (this.hasPendingRequestRecovery()) await this.scheduleNextRequestRecoveryWake();
+      else await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    // The alarm is the existing durable wake mechanism. Its due time, together
+    // with the failure row's next_attempt_at, survives eviction and prevents
+    // unrelated earlier alarms from turning this into a one-second loop.
+    await this.armRequestRecoveryAlarm(failure.delay_ms);
+  }
+
+  private async persistMaterializationFinalizationRequest(
+    target: MaterializationFinalizationRequest,
+    armWake = true
+  ): Promise<void> {
+    const dueAt = Date.now() + 1_000;
+    const existing = await this.ctx.storage.getAlarm();
+    // Arm before publishing work: interruption between these writes leaves a
+    // harmless empty wake, never a durable continuation without a wake.
+    if (armWake && (existing == null || existing > dueAt)) await this.ctx.storage.setAlarm(dueAt);
+    await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_REQUEST_KEY, target);
+  }
+
+  private async resumePendingMaterializationFinalization(): Promise<void> {
+    const requested = await this.ctx.storage.get<MaterializationFinalizationRequest>(MATERIALIZATION_FINALIZATION_REQUEST_KEY);
+    const work = await this.ctx.storage.get<MaterializationFinalizationWork>(MATERIALIZATION_FINALIZATION_WORK_KEY);
+    const target = requested ?? (work ? {
+      target_revision: work.head.target_revision,
+      projection_version: work.head.projection_version
+    } : null);
+    if (!target) return;
+
+    const failureRequestId = this.materializationFinalizationFailureRequestId(target);
+    const priorFailure = this.ctx.storage.sql.exec<{
+      [key: string]: SqlStorageValue;
+      stopped: number;
+      message: string;
+    }>(
+      "SELECT stopped, message FROM request_recovery_failures WHERE kind = 'materialization' AND request_id = ?",
+      failureRequestId
+    ).toArray()[0];
+    if (priorFailure?.stopped) {
+      if (this.hasPendingRequestRecovery()) await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return;
+    }
+    if (priorFailure) {
+      try {
+        const diagnostic = JSON.parse(priorFailure.message) as { next_attempt_at?: unknown };
+        const nextAttemptAt = typeof diagnostic.next_attempt_at === "string" ? Date.parse(diagnostic.next_attempt_at) : NaN;
+        if (Number.isFinite(nextAttemptAt) && nextAttemptAt > Date.now()) {
+          await this.armRequestRecoveryAlarm(nextAttemptAt - Date.now());
+          return;
+        }
+      } catch {
+        // Legacy/non-JSON rows do not delay this continuation.
+      }
+    }
+
+    // Install a durable fallback before provider work. The active alarm is
+    // consumed on entry, so a process interruption must still leave a wake.
+    await this.armRequestRecoveryAlarm(this.hasPendingRequestRecovery() ? REQUEST_RECOVERY_RETRY_DELAY_MS : 5_000);
+
+    try {
+      const progressBefore = await this.materializationFinalizationProgress(target);
+      const response = await this.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(target)
+      }), false);
+      if (response.status >= 500) {
+        await this.recordMaterializationFinalizationFailure(target, new ProviderOperationError(
+          `materialization_finalization_http_${response.status}`,
+          true,
+          { providerId: "persistence", status: response.status }
+        ));
+      } else if (response.status === 409) {
+        const body = await response.clone().json<{ error?: unknown }>().catch((): { error?: unknown } => ({}));
+        const code = typeof body.error === "string" && /^[A-Za-z0-9._/-]{1,96}$/.test(body.error)
+          ? body.error
+          : "materialization_finalization_conflict";
+        await this.recordMaterializationFinalizationFailure(target, new ProviderConflictError(
+          code,
+          { providerId: "project-guard", status: response.status, code }
+        ));
+      }
+      else if (response.status === 202 && await this.hasPendingMaterializationFinalization()) {
+        const progressAfter = await this.materializationFinalizationProgress(target);
+        if (progressAfter === progressBefore) {
+          await this.recordMaterializationFinalizationFailure(target, new Error("materialization_evidence_no_progress"));
+        } else {
+          await this.armMaterializationFinalizationAlarm();
+        }
+      } else if (!await this.hasPendingMaterializationFinalization()) {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM request_recovery_failures WHERE kind = 'materialization' AND request_id = ?",
+          failureRequestId
+        );
+      }
+    } catch (error) {
+      // Preserve the accepted intent, classify the failure, and either apply
+      // provider backoff or stop a repeated internal defect with an incident.
+      await this.recordMaterializationFinalizationFailure(target, error);
     }
   }
 
@@ -1196,23 +1611,27 @@ export class ProjectGuard extends DurableObject<Env> {
       "SELECT request_id FROM transaction_recovery_cursor WHERE singleton = 1"
     ).toArray()[0]?.request_id;
     const select = (condition: string, parameters: unknown[]) => this.ctx.storage.sql.exec<RecoveryRequestRow>(
-      `SELECT r.kind, r.request_id FROM request_recovery r
+      `SELECT r.kind, r.request_id, COALESCE(f.message, '') AS failure_message FROM request_recovery r
        LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
        WHERE r.kind = 'transaction' AND COALESCE(f.stopped, 0) = 0 ${condition}
        ORDER BY r.request_id LIMIT ?`, ...parameters
     ).toArray();
-    const pending = cursor
+    const selected = cursor
       ? select("AND r.request_id > ?", [cursor, REQUEST_RECOVERY_BATCH_SIZE])
       : select("", [REQUEST_RECOVERY_BATCH_SIZE]);
-    if (cursor && pending.length < REQUEST_RECOVERY_BATCH_SIZE) {
-      pending.push(...select("AND r.request_id <= ?", [cursor, REQUEST_RECOVERY_BATCH_SIZE - pending.length]));
+    if (cursor && selected.length < REQUEST_RECOVERY_BATCH_SIZE) {
+      selected.push(...select("AND r.request_id <= ?", [cursor, REQUEST_RECOVERY_BATCH_SIZE - selected.length]));
     }
-    if (pending.length) {
+    const pending = selected.filter((item) => this.requestRecoveryFailureDue(item.failure_message));
+    const lastSelected = selected.at(-1);
+    if (lastSelected) {
       this.ctx.storage.sql.exec(
         `INSERT INTO transaction_recovery_cursor (singleton, request_id) VALUES (1, ?)
          ON CONFLICT(singleton) DO UPDATE SET request_id = excluded.request_id`,
-        pending[pending.length - 1].request_id
+        lastSelected.request_id
       );
+    }
+    if (pending.length) {
       // Preserve a wake-up even if an external provider call exhausts this alarm.
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
     }
@@ -1242,7 +1661,17 @@ export class ProjectGuard extends DurableObject<Env> {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ admission_version: "1.0", request: tx, mutation_context: context })
         }));
-        if (!response.ok) throw new Error(`transaction_recovery_http_${response.status}`);
+        if (!response.ok) {
+          const diagnostics = {
+            providerId: "project-guard",
+            status: response.status,
+            code: response.status === 409 ? "transaction_recovery_conflict" : `provider_http_${response.status}`,
+            retryAfterMs: retryAfterDelayMs(response.headers.get("retry-after"))
+          };
+          if (response.status === 409) throw new ProviderConflictError(`transaction_recovery_http_${response.status}`, diagnostics);
+          const retryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
+          throw new ProviderOperationError(`transaction_recovery_http_${response.status}`, retryable, diagnostics);
+        }
         const receipt = await response.json<Receipt>();
         if (receipt.status === "committed" || receipt.status === "conflict" || receipt.status === "rejected") {
           await this.clearTransactionRecovery(item.request_id);
@@ -1250,22 +1679,11 @@ export class ProjectGuard extends DurableObject<Env> {
           throw new Error("transaction_recovery_nonterminal_response");
         }
       } catch (error) {
-        const code = error instanceof Error ? error.message : "transaction_recovery_unknown";
-        const fingerprint = await sha256Text(code);
-        const previous = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; fingerprint: string; count: number }>(
-          "SELECT fingerprint, count FROM request_recovery_failures WHERE kind = ? AND request_id = ?", "transaction", item.request_id
-        ).toArray()[0];
-        const count = previous?.fingerprint === fingerprint ? previous.count + 1 : 1;
-        this.ctx.storage.sql.exec(
-          `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
-           VALUES ('transaction', ?, ?, ?, ?, ?)
-           ON CONFLICT(kind, request_id) DO UPDATE SET fingerprint = excluded.fingerprint,
-             count = excluded.count, stopped = excluded.stopped, message = excluded.message`,
-          item.request_id, fingerprint, count, count >= 6 ? 1 : 0, code
-        );
+        const progress = await this.recoveryProgressFingerprint("transaction", item.request_id);
+        await this.recordRecoveryFailure("transaction", item.request_id, error, progress);
       }
     }
-    if (this.hasPendingRequestRecovery()) await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+    await this.scheduleNextRequestRecoveryWake();
   }
 
   private async readPackageAdmissionProof(operation: Extract<ManagedDocumentRequest, {
@@ -1375,10 +1793,12 @@ export class ProjectGuard extends DurableObject<Env> {
     let intent;
     try {
       intent = await this.managedDocumentRequests.readRecoverableIntent(projectId, requestId);
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderOperationError || isTransientRecoveryFailure(error)) throw error;
       // Corrupt evidence is never replayed. It remains observable through the
-      // read-only status endpoint instead of creating an untrusted effect.
-      this.clearRequestRecovery("document", requestId);
+      // read-only status endpoint instead of creating an untrusted effect or
+      // being mistaken for absent work.
+      await this.blockRequestRecovery("document", requestId, "document_intent_invalid");
       return;
     }
     if (intent && staged && intent.request_sha256 !== staged.request_sha256) {
@@ -1391,12 +1811,18 @@ export class ProjectGuard extends DurableObject<Env> {
         return;
       }
       if (await sha256Text(staged.request_json) !== staged.request_sha256) {
-        this.clearRequestRecovery("document", requestId);
+        await this.blockRequestRecovery("document", requestId, "document_staged_payload_invalid");
         return;
       }
-      const parsed = parseManagedDocumentRequest(JSON.parse(staged.request_json));
+      let parsed: ManagedDocumentRequest;
+      try {
+        parsed = parseManagedDocumentRequest(JSON.parse(staged.request_json));
+      } catch {
+        await this.blockRequestRecovery("document", requestId, "document_staged_payload_invalid");
+        return;
+      }
       if (parsed.project_id !== projectId || parsed.request_id !== requestId) {
-        this.clearRequestRecovery("document", requestId);
+        await this.blockRequestRecovery("document", requestId, "document_staged_identity_invalid");
         return;
       }
       await this.managedDocumentRequests.ensureIntent(projectId, requestId, staged.request_json);
@@ -1410,11 +1836,11 @@ export class ProjectGuard extends DurableObject<Env> {
     try {
       operation = parseManagedDocumentRequest(JSON.parse(intent.request_json));
     } catch {
-      this.clearRequestRecovery("document", requestId);
+      await this.blockRequestRecovery("document", requestId, "document_intent_invalid");
       return;
     }
     if (operation.project_id !== projectId || operation.request_id !== requestId) {
-      this.clearRequestRecovery("document", requestId);
+      await this.blockRequestRecovery("document", requestId, "document_intent_identity_invalid");
       return;
     }
     if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
@@ -2299,6 +2725,71 @@ export class ProjectGuard extends DurableObject<Env> {
     }, { status: 503, headers: { "Retry-After": "1" } });
   }
 
+  private async readMaterializationFailureForExecution(
+    projectId: string,
+    kind: string,
+    receipt: unknown,
+    execution: Awaited<ReturnType<ExecutionJournal["status"]>>
+  ): Promise<{
+    target_revision: number;
+    projection_version: number;
+    blocked: boolean;
+    code: string;
+    classification: string;
+    progress_sha256: string;
+    next_attempt_at: string | null;
+    wake_scheduled: boolean;
+  } | null> {
+    if (kind !== "transaction" || execution?.terminal === true || !receipt || typeof receipt !== "object") return null;
+    const transactionReceipt = receipt as { project_id?: unknown; status?: unknown; new_revision?: unknown };
+    if (transactionReceipt.project_id !== projectId || transactionReceipt.status !== "committed"
+      || !Number.isSafeInteger(transactionReceipt.new_revision) || (transactionReceipt.new_revision as number) < 1) return null;
+    const revision = transactionReceipt.new_revision as number;
+    const request = await this.ctx.storage.get<MaterializationFinalizationRequest>(MATERIALIZATION_FINALIZATION_REQUEST_KEY);
+    const work = await this.ctx.storage.get<MaterializationFinalizationWork>(MATERIALIZATION_FINALIZATION_WORK_KEY);
+    const target = request ?? (work ? {
+      target_revision: work.head.target_revision,
+      projection_version: work.head.projection_version
+    } : null);
+    if (!target) return null;
+    const candidateMatches = work?.uncovered_ranges
+      ? work.uncovered_ranges.some((range) => revision >= range.from_revision && revision <= range.to_revision)
+      : Boolean(work?.candidates.some((candidate) => candidate.revision === revision));
+    if (work ? !candidateMatches : target.target_revision !== revision) return null;
+    const row = this.ctx.storage.sql.exec<{
+      [key: string]: SqlStorageValue;
+      count: number;
+      stopped: number;
+      message: string;
+    }>(
+      "SELECT count, stopped, message FROM request_recovery_failures WHERE kind = 'materialization' AND request_id = ?",
+      this.materializationFinalizationFailureRequestId(target)
+    ).toArray()[0];
+    if (!row) return null;
+    let diagnostic: { code?: unknown; classification?: unknown; progress_sha256?: unknown; next_attempt_at?: unknown };
+    try {
+      diagnostic = JSON.parse(row.message) as typeof diagnostic;
+    } catch {
+      return null;
+    }
+    if (typeof diagnostic.code !== "string" || typeof diagnostic.classification !== "string"
+      || typeof diagnostic.progress_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(diagnostic.progress_sha256)) return null;
+    const nextAttemptAt = typeof diagnostic.next_attempt_at === "string" && Number.isFinite(Date.parse(diagnostic.next_attempt_at))
+      ? diagnostic.next_attempt_at
+      : null;
+    const wakeScheduled = !row.stopped && nextAttemptAt !== null && await this.ctx.storage.getAlarm() !== null;
+    return {
+      target_revision: target.target_revision,
+      projection_version: target.projection_version,
+      blocked: Boolean(row.stopped),
+      code: diagnostic.code,
+      classification: diagnostic.classification,
+      progress_sha256: diagnostic.progress_sha256,
+      next_attempt_at: nextAttemptAt,
+      wake_scheduled: wakeScheduled
+    };
+  }
+
   /** A read-only recovery view. In particular, it must not certify an effect,
    * replay a write, or create a receipt merely because a chat asked about it. */
   private async handleRequestStatus(
@@ -2316,6 +2807,7 @@ export class ProjectGuard extends DurableObject<Env> {
     try {
       const execution = await new ExecutionJournal(runtime, projectId, kind, requestId).status();
       const receipt = await this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository);
+      const materializationFailure = await this.readMaterializationFailureForExecution(projectId, kind, receipt, execution);
       const intent = kind === "document" ? await new ManagedDocumentRequestLedger(runtime.objects).readIntent(projectId, requestId)
         : kind === "transaction" ? await new TransactionRequestLedger(runtime.objects).readIntent(projectId, requestId) : null;
       const artifactIntent = kind === "artifact" ? await new MutationGateRepository(runtime).readArtifactIntent(projectId, requestId) : null;
@@ -2330,6 +2822,7 @@ export class ProjectGuard extends DurableObject<Env> {
       const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; count: number; stopped: number; message: string }>(
         "SELECT count, stopped, message FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray()[0];
+      const failureDiagnostic = this.parseRecoveryFailureDiagnostic(failure?.message);
       const receiptStatus = receipt && typeof receipt === "object" && "status" in receipt && typeof receipt.status === "string"
         ? receipt.status
         : null;
@@ -2396,6 +2889,13 @@ export class ProjectGuard extends DurableObject<Env> {
       const leaseUntil = typeof lease?.until === "string" ? Date.parse(lease.until) : Number.NaN;
       const running = typeof lease?.owner === "string" && lease.owner.length > 0
         && Number.isFinite(leaseUntil) && leaseUntil > Date.now();
+      const requestFailureWakeScheduled = queued && !failure?.stopped && wakeScheduled && alarmAt !== null;
+      const observationWakeScheduled = requestFailureWakeScheduled || Boolean(materializationFailure?.wake_scheduled);
+      const observationNextAttempt = materializationFailure?.wake_scheduled
+        ? materializationFailure.next_attempt_at
+        : requestFailureWakeScheduled
+          ? failureDiagnostic?.next_attempt_at ?? new Date(alarmAt!).toISOString()
+          : null;
       const observation = persistenceObservation({
         project_id: projectId,
         kind: kind as RequestKind,
@@ -2411,11 +2911,13 @@ export class ProjectGuard extends DurableObject<Env> {
         } : null,
         durable_intent: Boolean(intent || artifactIntent || recoverableIntent || staged || execution),
         absence_verified: status === "not_received",
-        wake_scheduled: wakeScheduled && alarmAt !== null,
-        ...(wakeScheduled && alarmAt !== null ? { next_attempt_at: new Date(alarmAt).toISOString() } : {}),
+        wake_scheduled: observationWakeScheduled,
+        ...(observationWakeScheduled && observationNextAttempt ? { next_attempt_at: observationNextAttempt } : {}),
         running,
-        blocked: Boolean(queued && failure?.stopped),
-        code: recoveryCode ?? (failure?.stopped ? "identical_internal_failure_limit" : null)
+        blocked: Boolean((queued && failure?.stopped) || materializationFailure?.blocked),
+        code: recoveryCode ?? (failure?.stopped
+          ? failureDiagnostic?.code ?? (failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit")
+          : materializationFailure?.code ?? null)
       });
       return Response.json({
         project_id: projectId,
@@ -2425,12 +2927,35 @@ export class ProjectGuard extends DurableObject<Env> {
         observation,
         ...(receipt ? { receipt } : {}),
         ...(execution ? { execution } : {}),
-        ...(intent || artifactIntent || staged || queued || (kind === "transaction" && execution && !receipt) ? {
+        ...(intent || artifactIntent || staged || queued || materializationFailure || (kind === "transaction" && execution && !receipt) ? {
           recovery: {
-            durable_intent: Boolean(intent || artifactIntent),
+            durable_intent: Boolean(intent || artifactIntent || materializationFailure),
             recoverable: recoverableIntent,
-            scheduled: wakeScheduled && !failure?.stopped,
-            ...(failure?.stopped ? { code: failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit", attempts: failure.count }
+            scheduled: requestFailureWakeScheduled || Boolean(materializationFailure?.wake_scheduled),
+            ...(materializationFailure ? {
+              finalization: {
+                target_revision: materializationFailure.target_revision,
+                projection_version: materializationFailure.projection_version,
+                blocked: materializationFailure.blocked,
+                code: materializationFailure.code,
+                classification: materializationFailure.classification,
+                progress_sha256: materializationFailure.progress_sha256,
+                next_attempt_at: materializationFailure.next_attempt_at,
+                next_action: materializationFailure.blocked ? "wait_for_dependency"
+                  : materializationFailure.wake_scheduled ? "resume_execution" : "check_status"
+              }
+            } : {}),
+            ...(failure?.stopped ? {
+              code: failureDiagnostic?.code ?? (failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit"),
+              ...(failureDiagnostic ? {
+                classification: failureDiagnostic.classification,
+                progress_sha256: failureDiagnostic.progress_sha256,
+                next_attempt_at: failureDiagnostic.next_attempt_at,
+                next_action: failureDiagnostic.classification === "provider_blocked" || failureDiagnostic.code === "identical_internal_failure_limit"
+                  ? "wait_for_dependency" : "check_status"
+              } : {}),
+              attempts: failure.count
+            }
               : recoveryCode ? { code: recoveryCode }
               : kind === "transaction" && execution && !receipt && !recoverableIntent ? { code: "recovery_unavailable" } : {})
           }
@@ -2614,7 +3139,11 @@ export class ProjectGuard extends DurableObject<Env> {
    * completed materialization ancestry. */
   private async finalizeMaterializedTransaction(
     journal: ExecutionJournal,
-    verifiedMaterialization?: MaterializationFinalizationCandidate
+    verifiedMaterialization: MaterializationFinalizationCandidate,
+    repository: ProjectRepository,
+    work?: MaterializationFinalizationWork,
+    budget?: { deadlineMs: number },
+    controller?: AbortController
   ): Promise<void> {
     const admitted = await journal.readAdmission();
     const progress = await journal.status();
@@ -2630,7 +3159,7 @@ export class ProjectGuard extends DurableObject<Env> {
     const commitRef = machineCommitRecordPath(admitted.admission.project_id, targetRevision);
     const receiptRef = `${commitRef}#receipt`;
     if (progress.receipt_ref !== receiptRef) return;
-    const record = await this.repository.readCommitRecord(admitted.admission.project_id, targetRevision);
+    const record = await repository.readCommitRecord(admitted.admission.project_id, targetRevision);
     if (
       !record
       || record.transaction.transaction_id !== admitted.admission.request_id
@@ -2639,44 +3168,25 @@ export class ProjectGuard extends DurableObject<Env> {
       || record.receipt.new_revision !== targetRevision
       || await sha256Canonical(record.transaction) !== admitted.admission.request_hash
     ) return;
-    let materialization: CompletedMaterializationRecord | null = null;
-    if (verifiedMaterialization) {
-      const candidate = await this.repository.readMaterializationRecord(
-        admitted.admission.project_id,
-        verifiedMaterialization.materialization_revision,
-        verifiedMaterialization.projection_version
-      );
-      if (!candidate
-        || candidate.result_root_hash !== verifiedMaterialization.result_root_hash
-        || candidate.completed_at !== verifiedMaterialization.completed_at
-        || candidate.source_event_id !== verifiedMaterialization.source_event_id
-        || !(await this.verifiedCandidateCoversTransaction(verifiedMaterialization, candidate, targetRevision, record.event.event_id))) return;
-      materialization = candidate;
-    } else {
-      const head = await this.repository.readMaterializationHead(admitted.admission.project_id);
-      if (!head || head.target_revision < targetRevision || head.projection_version !== CURRENT_PROJECTION_VERSION) return;
-      let generation = { target_revision: head.target_revision, projection_version: head.projection_version };
-      for (let depth = 0; depth <= MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH; depth += 1) {
-        const candidate = await this.repository.readMaterializationRecord(
-          admitted.admission.project_id,
-          generation.target_revision,
-          generation.projection_version
-        );
-        if (!candidate) return;
-        if (depth === 0 && (
-          candidate.result_root_hash !== head.result_root_hash
-          || candidate.workspace_location !== head.workspace_location
-          || candidate.completed_at !== head.completed_at
-        )) return;
-        if (coversTransactionRevision(candidate, targetRevision, record.event.event_id)) {
-          materialization = candidate;
-          break;
-        }
-        if (!candidate.parent || candidate.parent.target_revision < targetRevision) return;
-        generation = candidate.parent;
-      }
-    }
-    if (!materialization) return;
+    const materialization = await repository.readMaterializationRecord(
+      admitted.admission.project_id,
+      verifiedMaterialization.materialization_revision,
+      verifiedMaterialization.projection_version
+    );
+    if (!materialization
+      || materialization.result_root_hash !== verifiedMaterialization.result_root_hash
+      || materialization.completed_at !== verifiedMaterialization.completed_at
+      || materialization.source_event_id !== verifiedMaterialization.source_event_id
+      || !(await this.verifiedCandidateCoversTransaction(
+        verifiedMaterialization,
+        materialization,
+        targetRevision,
+        record.event.event_id,
+        repository,
+        work,
+        budget?.deadlineMs,
+        controller?.signal
+      ))) return;
     await journal.finalizeMaterializedTransaction({
       canonical_commit_ref: commitRef,
       receipt_ref: receiptRef,
@@ -2703,19 +3213,64 @@ export class ProjectGuard extends DurableObject<Env> {
     verified: MaterializationFinalizationCandidate,
     materialization: CompletedMaterializationRecord,
     targetRevision: number,
-    targetEventId: string
+    targetEventId: string,
+    repository?: ProjectRepository,
+    work?: MaterializationFinalizationWork,
+    deadlineMs?: number,
+    signal?: AbortSignal
   ): Promise<boolean> {
     if (coversTransactionRevision(materialization, targetRevision, targetEventId)) return true;
     if (
       verified.coverage !== "canonical_range"
+      || materialization.projection_version > MATERIALIZATION_FINALIZATION_LEGACY_INFERENCE_MAX_PROJECTION_VERSION
       || materialization.parent === null
       || targetRevision <= materialization.parent.target_revision
       || targetRevision >= materialization.target_revision
       || materialization.target_revision - materialization.parent.target_revision - 1 > MATERIALIZATION_FINALIZATION_INFERRED_RANGE_MAX
     ) return false;
 
-    for (let revision = materialization.parent.target_revision + 1; revision <= materialization.target_revision; revision += 1) {
-      const commit = await this.repository.readCommitRecord(materialization.project_id, revision);
+    if (!repository || !work || deadlineMs === undefined || !signal) return false;
+
+    const cursorBinding = {
+      materialization_revision: materialization.target_revision,
+      projection_version: materialization.projection_version,
+      result_root_hash: materialization.result_root_hash,
+      completed_at: materialization.completed_at,
+      source_event_id: materialization.source_event_id,
+      parent_revision: materialization.parent.target_revision
+    };
+    let cursor = work.legacy_range_cursor;
+    if (!cursor || cursor.materialization_revision !== cursorBinding.materialization_revision
+      || cursor.projection_version !== cursorBinding.projection_version
+      || cursor.result_root_hash !== cursorBinding.result_root_hash
+      || cursor.completed_at !== cursorBinding.completed_at
+      || cursor.source_event_id !== cursorBinding.source_event_id
+      || cursor.parent_revision !== cursorBinding.parent_revision
+      || !Number.isSafeInteger(cursor.next_revision)
+      || cursor.next_revision < cursor.parent_revision + 1
+      || cursor.next_revision > materialization.target_revision + 1) {
+      cursor = { ...cursorBinding, next_revision: materialization.parent.target_revision + 1, verified: false };
+      work.legacy_range_cursor = cursor;
+      await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
+    }
+    if (cursor.verified) return true;
+
+    while (cursor.next_revision <= materialization.target_revision) {
+      if (Date.now() >= deadlineMs || signal.aborted) {
+        work.legacy_range_cursor = cursor;
+        await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
+        return false;
+      }
+      const revision = cursor.next_revision;
+      let commit: CanonicalCommitRecord | null;
+      try {
+        commit = await repository.readCommitRecord(materialization.project_id, revision);
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes("slice_budget_exhausted")) throw error;
+        work.legacy_range_cursor = cursor;
+        await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
+        return false;
+      }
       if (
         !commit
         || commit.previous_revision !== revision - 1
@@ -2725,9 +3280,14 @@ export class ProjectGuard extends DurableObject<Env> {
         || commit.receipt.status !== "committed"
         || commit.receipt.new_revision !== revision
         || commit.receipt.event_id !== commit.event.event_id
+        || (revision === targetRevision && commit.event.event_id !== targetEventId)
       ) return false;
+      cursor.next_revision += 1;
+      if (cursor.next_revision > materialization.target_revision) cursor.verified = true;
+      work.legacy_range_cursor = cursor;
+      await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
     }
-    return true;
+    return cursor.verified;
   }
 
   private async finalizeVerifiedArtifact(journal: ExecutionJournal): Promise<void> {
@@ -2785,7 +3345,7 @@ export class ProjectGuard extends DurableObject<Env> {
     });
   }
 
-  private async finalizeCurrentMaterialization(request: Request): Promise<Response> {
+  private async finalizeCurrentMaterialization(request: Request, armInitialWake = true): Promise<Response> {
     const body: { target_revision?: unknown; projection_version?: unknown } = await request
       .json<{ target_revision?: unknown; projection_version?: unknown }>()
       .catch(() => ({}));
@@ -2794,13 +3354,107 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     const projectId = this.ctx.id.name;
     if (!projectId) return Response.json({ error: "project_binding_required" }, { status: 400 });
-    const head = await this.repository.readMaterializationHead(projectId);
+    const target: MaterializationFinalizationRequest = {
+      target_revision: body.target_revision as number,
+      projection_version: body.projection_version as number
+    };
+    const startedAt = Date.now();
+    const deadlineMs = startedAt + this.materializationFinalizationSliceBudgetMs();
+    const controller = new AbortController();
+    const budget = { calls: 0, deadlineMs, exhausted: false };
+    const scope: ProviderRequestScope = {
+      deadlineMs,
+      signal: controller.signal,
+      now: () => Date.now(),
+      beforeHttp: () => {
+        if (Date.now() >= deadlineMs || budget.calls >= this.materializationFinalizationProviderCallBudget()) {
+          budget.exhausted = true;
+          throw new Error("materialization_finalization_slice_budget_exhausted");
+        }
+        budget.calls += 1;
+      }
+    };
+    const runtime = createProductionPersistence(this.env, projectId, scope);
+    const repository = new ProjectRepository(runtime, this.layoutMode);
+    // Persist the exact wake target before the first provider read. On an
+    // eviction between this point and the response, the alarm owns the retry.
+    await this.persistMaterializationFinalizationRequest(target, armInitialWake);
+    const abortAtDeadline = setTimeout(
+      () => controller.abort(new Error("materialization_finalization_slice_budget_exhausted")),
+      Math.max(1, deadlineMs - Date.now())
+    );
+    try {
+      return await this.finalizeCurrentMaterializationSlice(projectId, target, runtime, repository, budget, controller);
+    } catch (error) {
+      if (!budget.exhausted && Date.now() < deadlineMs && !controller.signal.aborted
+        && !(error instanceof Error && error.message === "materialization_finalization_slice_budget_exhausted")) throw error;
+      await this.armMaterializationFinalizationAlarm();
+      return Response.json({
+        project_id: projectId,
+        target_revision: target.target_revision,
+        finalization_pending: true,
+        code: "materialization_finalization_slice_budget_exhausted"
+      }, { status: 202 });
+    } finally {
+      clearTimeout(abortAtDeadline);
+    }
+  }
+
+  private materializationFinalizationSliceBudgetMs(): number {
+    return MATERIALIZATION_FINALIZATION_SLICE_MS - MATERIALIZATION_FINALIZATION_CHECKPOINT_RESERVE_MS;
+  }
+
+  private materializationFinalizationProviderCallBudget(): number {
+    return MATERIALIZATION_FINALIZATION_PROVIDER_CALL_BUDGET;
+  }
+
+  private async finalizeCurrentMaterializationSlice(
+    projectId: string,
+    target: MaterializationFinalizationRequest,
+    runtime: ProjectOsPersistenceRuntime,
+    repository: ProjectRepository,
+    budget: { calls: number; deadlineMs: number; exhausted: boolean },
+    controller: AbortController
+  ): Promise<Response> {
+    const head = await repository.readMaterializationHead(projectId);
     if (!head
-      || head.target_revision !== body.target_revision
-      || head.projection_version !== body.projection_version) {
+      || head.target_revision !== target.target_revision
+      || head.projection_version !== target.projection_version) {
+      if (head) {
+        if (head.projection_version === target.projection_version && head.target_revision > target.target_revision) {
+          const newerRecord = await repository.readMaterializationRecord(
+            projectId,
+            head.target_revision,
+            head.projection_version
+          );
+          const newerCommit = await repository.readCommitRecord(projectId, head.target_revision);
+          if (newerRecord
+            && newerCommit
+            && newerRecord.target_revision === head.target_revision
+            && newerRecord.projection_version === head.projection_version
+            && newerRecord.result_root_hash === head.result_root_hash
+            && newerRecord.workspace_location === head.workspace_location
+            && newerRecord.completed_at === head.completed_at
+            && newerRecord.source_event_id === newerCommit.event.event_id) {
+            const newerTarget = {
+              target_revision: head.target_revision,
+              projection_version: head.projection_version
+            };
+            await this.persistMaterializationFinalizationRequest(newerTarget);
+            await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_WORK_KEY);
+            await this.armMaterializationFinalizationAlarm();
+            return Response.json({
+              project_id: projectId,
+              target_revision: head.target_revision,
+              finalization_pending: true,
+              code: "materialization_head_advanced"
+            }, { status: 202 });
+          }
+        }
+      }
       return Response.json({ error: "materialization_head_mismatch" }, { status: 409 });
     }
-    const record = await this.repository.readMaterializationRecord(
+    const record = await repository.readMaterializationRecord(
       projectId,
       head.target_revision,
       head.projection_version
@@ -2809,7 +3463,8 @@ export class ProjectGuard extends DurableObject<Env> {
       || record.result_root_hash !== head.result_root_hash
       || record.workspace_location !== head.workspace_location
       || record.completed_at !== head.completed_at) {
-      return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
+      await this.armMaterializationFinalizationAlarm();
+      return Response.json({ error: "materialization_evidence_unavailable", finalization_pending: true }, { status: 202 });
     }
     // A current head can be a descendant of the generation that covered a
     // committed transaction. The lineage can be long in a busy project, so
@@ -2833,9 +3488,12 @@ export class ProjectGuard extends DurableObject<Env> {
         next_generation: { target_revision: record.target_revision, projection_version: record.projection_version },
         previous_child: null,
         scan_complete: false,
-        candidates: []
+        candidates: [],
+        legacy_range_cursor: null
       };
     }
+    // Establish a durable baseline cursor before provider work in this slice.
+    await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
 
     if (!work.scan_complete) {
       const queued = new Set(work.candidates.map((candidate) => candidate.revision));
@@ -2844,8 +3502,11 @@ export class ProjectGuard extends DurableObject<Env> {
         const candidate = generation.target_revision === record.target_revision
           && generation.projection_version === record.projection_version
           ? record
-          : await this.repository.readMaterializationRecord(projectId, generation.target_revision, generation.projection_version);
-        if (!candidate) return Response.json({ error: "materialization_evidence_unavailable" }, { status: 409 });
+          : await repository.readMaterializationRecord(projectId, generation.target_revision, generation.projection_version);
+        if (!candidate) {
+          await this.armMaterializationFinalizationAlarm();
+          return Response.json({ error: "materialization_evidence_unavailable", finalization_pending: true }, { status: 202 });
+        }
         if (work.previous_child === null) {
           if (candidate.target_revision !== expectedHead.target_revision
             || candidate.projection_version !== expectedHead.projection_version
@@ -2860,6 +3521,24 @@ export class ProjectGuard extends DurableObject<Env> {
         ) {
           return Response.json({ error: "materialization_chain_invalid" }, { status: 409 });
         }
+        if (candidate.parent !== null
+          && candidate.projection_version > MATERIALIZATION_FINALIZATION_LEGACY_INFERENCE_MAX_PROJECTION_VERSION) {
+          const expectedCoalescedCount = candidate.target_revision - candidate.parent.target_revision - 1;
+          const orderedCoalesced = [...candidate.coalesced_revisions].sort((left, right) => left - right);
+          const hasExactCoalescence = orderedCoalesced.length === expectedCoalescedCount
+            && orderedCoalesced.every((revision, index) => revision === candidate.parent!.target_revision + index + 1);
+          if (!hasExactCoalescence) {
+            appendFinalizationCandidate(work, candidate, candidate.target_revision, queued);
+            for (const revision of candidate.coalesced_revisions) appendFinalizationCandidate(work, candidate, revision, queued);
+            work.uncovered_ranges = missingCoalescedRevisionRanges(
+              candidate.parent.target_revision,
+              candidate.target_revision,
+              candidate.coalesced_revisions
+            );
+            await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
+            return Response.json({ error: "materialization_coalescence_gap" }, { status: 409 });
+          }
+        }
         appendFinalizationCandidate(work, candidate, candidate.target_revision, queued);
         for (const revision of candidate.coalesced_revisions) appendFinalizationCandidate(work, candidate, revision, queued);
         if (
@@ -2868,6 +3547,7 @@ export class ProjectGuard extends DurableObject<Env> {
           // a historical coalescence happened. An empty list is not evidence
           // of a jump and must remain strict.
           && candidate.coalesced_revisions.length > 0
+          && candidate.projection_version <= MATERIALIZATION_FINALIZATION_LEGACY_INFERENCE_MAX_PROJECTION_VERSION
           && candidate.target_revision - candidate.parent.target_revision - 1 <= MATERIALIZATION_FINALIZATION_INFERRED_RANGE_MAX
         ) {
           for (let revision = candidate.parent.target_revision + 1; revision < candidate.target_revision; revision += 1) {
@@ -2882,6 +3562,7 @@ export class ProjectGuard extends DurableObject<Env> {
           }
           work.next_generation = null;
           work.scan_complete = true;
+          await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
           break;
         }
         if (candidate.record_kind !== "delta"
@@ -2896,6 +3577,9 @@ export class ProjectGuard extends DurableObject<Env> {
           chain_depth: candidate.chain_depth
         };
         work.next_generation = candidate.parent;
+        // The verified lineage cursor is durable before any following provider
+        // read can consume the remaining slice.
+        await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
       }
     }
 
@@ -2903,24 +3587,36 @@ export class ProjectGuard extends DurableObject<Env> {
     if (work.scan_complete) {
       let processed = 0;
       while (processed < MATERIALIZATION_FINALIZATION_CERTIFICATE_BATCH_SIZE && work.candidates.length > 0) {
-        const candidate = work.candidates.shift()!;
+        if (Date.now() >= budget.deadlineMs || controller.signal.aborted) {
+          throw new Error("materialization_finalization_slice_budget_exhausted");
+        }
+        const candidate = work.candidates[0]!;
         // Every candidate consumes the bounded slice, including missing or
         // already-terminal work. Otherwise a large historical tail can hold
         // the serialized ProjectGuard callback indefinitely.
         processed += 1;
-        const commit = await this.repository.readCommitRecord(projectId, candidate.revision);
-        if (!commit || commit.receipt.status !== "committed" || commit.receipt.new_revision !== candidate.revision) continue;
-        const journal = new ExecutionJournal(this.persistence, projectId, "transaction", commit.transaction.transaction_id);
+        const commit = await repository.readCommitRecord(projectId, candidate.revision);
+        if (!commit || commit.receipt.status !== "committed" || commit.receipt.new_revision !== candidate.revision) {
+          work.candidates.shift();
+          await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
+          continue;
+        }
+        const journal = new ExecutionJournal(runtime, projectId, "transaction", commit.transaction.transaction_id);
         const before = await journal.status();
-        if (!before || before.terminal) continue;
-        await this.finalizeMaterializedTransaction(journal, candidate);
+        if (!before || before.terminal) {
+          work.candidates.shift();
+          await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
+          continue;
+        }
+        await this.finalizeMaterializedTransaction(journal, candidate, repository, work, budget, controller);
         const after = await journal.status();
         if (after?.terminal && after.status === "finalized") {
           finalizedRevisions.push(candidate.revision);
+          work.candidates.shift();
+          await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
         } else {
-          // Missing evidence is not conformity. Keep the exact candidate for
-          // the next idempotent callback instead of skipping it.
-          work.candidates.unshift(candidate);
+          // Peek until all evidence checks and the certificate write succeed.
+          // A provider failure therefore cannot lose the exact candidate.
           break;
         }
       }
@@ -2928,8 +3624,10 @@ export class ProjectGuard extends DurableObject<Env> {
     const finalizationPending = !work.scan_complete || work.candidates.length > 0;
     if (finalizationPending) {
       await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
+      await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_REQUEST_KEY, target);
     } else {
       await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_WORK_KEY);
+      await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_REQUEST_KEY);
     }
     return Response.json({
       project_id: projectId,
@@ -3111,6 +3809,36 @@ function appendFinalizationCandidate(
     completed_at: record.completed_at,
     source_event_id: record.source_event_id
   });
+}
+
+function missingCoalescedRevisionRanges(
+  parentRevision: number,
+  targetRevision: number,
+  coalescedRevisions: number[]
+): Array<{ from_revision: number; to_revision: number }> {
+  const ranges: Array<{ from_revision: number; to_revision: number }> = [];
+  const ordered = [...coalescedRevisions].sort((left, right) => left - right);
+  let nextRevision = parentRevision + 1;
+  let malformed = false;
+  for (const revision of ordered) {
+    if (!Number.isSafeInteger(revision) || revision < parentRevision + 1 || revision >= targetRevision) {
+      malformed = true;
+      continue;
+    }
+    if (revision < nextRevision) {
+      malformed = true;
+      continue;
+    }
+    if (revision > nextRevision) ranges.push({ from_revision: nextRevision, to_revision: revision - 1 });
+    nextRevision = revision + 1;
+  }
+  if (nextRevision < targetRevision) ranges.push({ from_revision: nextRevision, to_revision: targetRevision - 1 });
+  // A malformed list with no explicit hole makes the entire claimed span
+  // unverifiable; keep it visible without treating any revision as covered.
+  if (malformed && ranges.length === 0 && targetRevision > parentRevision + 1) {
+    return [{ from_revision: parentRevision + 1, to_revision: targetRevision - 1 }];
+  }
+  return ranges;
 }
 
 function coversTransactionRevision(

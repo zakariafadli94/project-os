@@ -2,11 +2,13 @@ import { afterEach, expect, it, vi } from "vitest";
 import { MaterializationGuard } from "../src/durable/materialization-guard";
 import { DiagnosticProjectGuard } from "../src/durable/project-guard-diagnostics";
 import { SubrequestResilientProjectGuard } from "../src/durable/project-guard-subrequest-resilient";
+import { ProviderOperationError } from "../src/persistence/provider/errors";
 
 afterEach(() => vi.restoreAllMocks());
 
 it("preserves a wake scheduled by another request while finalization is unavailable", async () => {
-  const targetWake = Date.now() + 60_000;
+  const before = Date.now();
+  const targetWake = before + 2_000;
   let nextAlarm: number | null = null;
   let entered!: () => void;
   let fail!: () => void;
@@ -15,6 +17,7 @@ it("preserves a wake scheduled by another request while finalization is unavaila
   const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
     projectId: "PRJ-0007", layoutMode: "legacy", env: {},
     ctx: { storage: {
+      get: async () => undefined,
       getAlarm: async () => nextAlarm,
       setAlarm: async (at: number) => { nextAlarm = at; }
     } },
@@ -27,7 +30,9 @@ it("preserves a wake scheduled by another request while finalization is unavaila
   await materialization.fetch(new Request("https://materialization-guard.internal/request-target", { method: "POST" }));
   fail();
   await alarm;
-  expect(nextAlarm).toBe(targetWake);
+  expect(nextAlarm).not.toBeNull();
+  expect(nextAlarm!).toBeGreaterThan(before);
+  expect(nextAlarm!).toBeLessThanOrEqual(targetWake);
 });
 
 it("rearms immediately when ProjectGuard bounds a finalization callback", async () => {
@@ -36,6 +41,7 @@ it("rearms immediately when ProjectGuard bounds a finalization callback", async 
   const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
     projectId: "PRJ-0008", layoutMode: "legacy", env: {},
     ctx: { storage: {
+      get: async () => undefined,
       getAlarm: async () => nextAlarm,
       setAlarm: async (at: number) => { nextAlarm = at; }
     } },
@@ -50,13 +56,38 @@ it("rearms immediately when ProjectGuard bounds a finalization callback", async 
   expect(nextAlarm!).toBeLessThan(before + 5_000);
 });
 
+it("preserves provider Retry-After values above two minutes for MaterializationGuard alarms", async () => {
+  let nextAlarm: number | null = null;
+  const before = Date.now();
+  const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
+    projectId: "PRJ-0009", layoutMode: "legacy", env: {},
+    ctx: { storage: {
+      get: async () => undefined,
+      getAlarm: async () => nextAlarm,
+      setAlarm: async (at: number) => { nextAlarm = at; }
+    } },
+    coordinatorForSlice: () => ({ coordinator: { runNext: async () => ({ completed: true, more_work: false }) } }),
+    notifyProjectGuardOfCurrentHead: async () => {
+      throw new ProviderOperationError("provider_unavailable", true, {
+        providerId: "dropbox", status: 503, retryAfterMs: 180_000
+      });
+    }
+  }) as MaterializationGuard;
+
+  await materialization.alarm();
+
+  expect(nextAlarm).not.toBeNull();
+  expect(nextAlarm!).toBeGreaterThanOrEqual(before + 180_000);
+  expect(nextAlarm!).toBeLessThanOrEqual(before + 181_000);
+});
+
 it("notifies ProjectGuard of an existing head while repair convergence continues", async () => {
   const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
     projectId: "PRJ-0003",
     layoutMode: "v2",
     env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: '{"PRJ-0003":"repair"}' },
-    ctx: { storage: { setAlarm: async () => {} } },
-    resumeConvergenceFromVerifiedHead: async () => {},
+    ctx: { storage: { get: async () => undefined, setAlarm: async () => {} } },
+    resumeConvergenceFromVerifiedHead: async () => true,
     ensureConvergenceRequestedFromLedger: async () => false,
     convergenceEngineForSlice: () => ({
       engine: { runSlice: async () => ({ more_work: true, health: { converged: false }, next_alarm_at: null }) },
@@ -85,7 +116,7 @@ it.each(["repair", "legacy"])("finishes %s finalization while ProjectGuard is wa
     projectId: "PRJ-0007",
     layoutMode: mode === "legacy" ? "legacy" : "v2",
     env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: mode === "repair" ? '{"PRJ-0007":"repair"}' : undefined },
-    ctx: { storage: { setAlarm: async () => {} } },
+    ctx: { storage: { get: async () => undefined, setAlarm: async () => {} } },
     resumeConvergenceFromVerifiedHead: async () => {},
     ensureConvergenceRequestedFromLedger: async () => false,
     convergenceEngineForSlice: () => ({ engine: { runSlice: async () => {

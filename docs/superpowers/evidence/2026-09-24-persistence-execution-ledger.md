@@ -39,6 +39,10 @@ No global completion claim until all required gates have evidence. Unknown produ
 
 First PR-head CI `36015661958` on `370b45f` failed in a finalization-slice test assertion: a shared mock and a denied 33rd `beforeHttp` attempt were counted as provider calls. The counter has been scoped to the runtime and permitted calls; 38 targeted tests, independent review and a sixth complete local suite (257 files/1,631 tests) pass. CI on the revised head remains mandatory. No merge or deploy occurred on the failed SHA.
 
+Second PR-head CI `36017834529` on `f0cb640` failed two further prototype-wide spy assertions in `execution-guard.spec.ts` while persisted cursor and stopped-failure checks passed. The fixture now binds those observations to the specific project/candidate and Durable Object instance. Targeted 38 tests pass; independent review, full suite and new CI pending. No merge or deploy occurred on this failed SHA.
+
+Follow-up fixture audit found other prototype/mock-wide counts in the same file. They now use exact candidate IDs and durable queues, or a journal counter bound to project/request. The targeted file stays 38/38 green. A third PR-head CI must qualify the final SHA; previous failed runs do not authorize production.
+
 E12 preparation: `8173021` rejects JSON-RPC/MCP errors carried by HTTP 200 in deployment qualification. Principal six tests and typecheck passed; C independently reviewed helper and callers. An unauthenticated public probe remains explicitly insufficient for the real-client gate.
 
 Read-only transport recheck, before current changes deploy: both the native `mcp__project_os_control_tower` handle and connected-app `mcp__codex_apps` handle returned the SOP request's committed receipt and finalized/terminal execution on 2026-09-24. This confirms that specific historical lookup at observation time, not a new client submission or stable transport guarantee. No transaction was replayed.

@@ -1016,7 +1016,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
 
   it("bounds every examined finalization candidate, including missing commits", async () => {
     const projectId = "PRJ-8298";
-    const { guard, mock } = await setup(projectId);
+    const { guard } = await setup(projectId);
     const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
     const completed = addCurrentViewsProof({
       schema_version: "1.0",
@@ -1070,6 +1070,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
         candidates
       });
     });
+    const originalReadCommitRecord = ProjectRepository.prototype.readCommitRecord;
     const commitReads = vi.spyOn(ProjectRepository.prototype, "readCommitRecord");
 
     const response = await runInDurableObject(guard, (instance) =>
@@ -1082,7 +1083,8 @@ describe("canonical execution boundary in ProjectGuard", () => {
     );
 
     expect(response.status).toBe(202);
-    expect(commitReads).toHaveBeenCalledTimes(4);
+    expect(commitReads).toHaveBeenCalledWith(projectId, 9001);
+    expect(commitReads).toHaveBeenCalledWith(projectId, 9004);
     await runInDurableObject(guard, async (_instance, state) => {
       const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
       expect(work?.candidates).toEqual([expect.objectContaining({ revision: 9005 })]);
@@ -1096,7 +1098,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     });
 
     expect(await runDurableObjectAlarm(guard)).toBe(true);
-    expect(commitReads).toHaveBeenCalledTimes(5);
+    expect(commitReads).toHaveBeenCalledWith(projectId, 9005);
     await runInDurableObject(guard, async (_instance, state) => {
       expect(await state.storage.get("materialization-finalization-work")).toBeUndefined();
       await state.storage.put("materialization-finalization-work", {
@@ -1118,9 +1120,14 @@ describe("canonical execution boundary in ProjectGuard", () => {
       });
     });
 
-    const sliceBudget = vi.spyOn(ProjectGuard.prototype as any, "materializationFinalizationSliceBudgetMs").mockReturnValue(5);
+    const sliceBudget = await runInDurableObject(guard, instance =>
+      vi.spyOn(instance as any, "materializationFinalizationSliceBudgetMs").mockReturnValue(5)
+    );
     commitReads.mockClear();
-    commitReads.mockImplementation(async () => {
+    commitReads.mockImplementation(async function (this: ProjectRepository, candidateProjectId, revision) {
+      if (candidateProjectId !== projectId || revision < 9101 || revision > 9105) {
+        return originalReadCommitRecord.call(this, candidateProjectId, revision);
+      }
       await new Promise((resolve) => setTimeout(resolve, 20));
       return null;
     });
@@ -1133,7 +1140,9 @@ describe("canonical execution boundary in ProjectGuard", () => {
         }))
     );
     expect(deadlineResponse.status).toBe(202);
-    expect(commitReads).toHaveBeenCalledTimes(1);
+    // The persisted cursor below proves this invocation consumed exactly one
+    // candidate. A prototype-wide spy can also see unrelated guard alarms.
+    expect(commitReads).toHaveBeenCalledWith(projectId, 9101);
     await runInDurableObject(guard, async (_instance, state) => {
       const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
       expect(work?.candidates.map(({ revision }) => revision)).toEqual([9102, 9103, 9104, 9105]);
@@ -1157,18 +1166,33 @@ describe("canonical execution boundary in ProjectGuard", () => {
 
     sliceBudget.mockRestore();
     commitReads.mockRestore();
-    vi.spyOn(ProjectGuard.prototype as any, "materializationFinalizationProviderCallBudget").mockReturnValue(2);
-    const providerCallsBefore = mock.calls.length;
-    const providerBudgetResponse = await runInDurableObject(guard, (instance) =>
-      (instance as unknown as { finalizeCurrentMaterialization(request: Request): Promise<Response> })
-        .finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+    const { providerBudgetResponse, scopedProviderCalls } = await runInDurableObject(guard, async (instance) => {
+      const object = instance as any;
+      const budgetSpy = vi.spyOn(object, "materializationFinalizationProviderCallBudget").mockReturnValue(2);
+      const originalSlice = object.finalizeCurrentMaterializationSlice.bind(object);
+      let scopedProviderCalls = -1;
+      const sliceSpy = vi.spyOn(object, "finalizeCurrentMaterializationSlice")
+        .mockImplementation(async (...args: any[]) => {
+          const budget = args[4] as { calls: number };
+          try { return await originalSlice(...args); }
+          finally { scopedProviderCalls = budget.calls; }
+        });
+      try {
+        const providerBudgetResponse = await object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-        }))
-    );
+        }));
+        return { providerBudgetResponse, scopedProviderCalls };
+      } finally {
+        sliceSpy.mockRestore();
+        budgetSpy.mockRestore();
+      }
+    });
     expect(providerBudgetResponse.status).toBe(202);
-    expect(mock.calls.length - providerCallsBefore).toBeLessThanOrEqual(2);
+    // The budget object belongs to this one finalization slice, unlike the
+    // shared Dropbox mock which also records other projects' alarm traffic.
+    expect(scopedProviderCalls).toBe(2);
     await runInDurableObject(guard, async (_instance, state) => {
       const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
       expect(work?.candidates.map(({ revision }) => revision)).toEqual([9201]);
@@ -1223,12 +1247,20 @@ describe("canonical execution boundary in ProjectGuard", () => {
       transaction: { ...fixtureCommit.transaction, transaction_id: "TXN-UNADMITTED-9304" },
       receipt: { ...fixtureCommit.receipt, transaction_id: "TXN-UNADMITTED-9304" }
     };
-    const readCommit = vi.spyOn(ProjectRepository.prototype, "readCommitRecord").mockImplementation(async (_id, revision) => {
+    const originalReadCommitRecord = ProjectRepository.prototype.readCommitRecord;
+    const readCommit = vi.spyOn(ProjectRepository.prototype, "readCommitRecord").mockImplementation(async function (this: ProjectRepository, candidateProjectId, revision) {
+      if (candidateProjectId !== projectId || revision < 9301 || revision > 9305) {
+        return originalReadCommitRecord.call(this, candidateProjectId, revision);
+      }
       if (revision === 9302) return terminalCommit;
       if (revision === 9304) return unadmittedCommit;
       return null;
     });
+    const originalStatus = ExecutionJournal.prototype.status;
     vi.spyOn(ExecutionJournal.prototype, "status").mockImplementation(async function (this: ExecutionJournal) {
+      if (this.projectId !== projectId || ![
+        terminalCommit.transaction.transaction_id, unadmittedCommit.transaction.transaction_id
+      ].includes(this.requestId)) return originalStatus.call(this);
       return this.requestId === terminalCommit.transaction.transaction_id
         ? { status: "finalized", terminal: true } as any
         : null;
@@ -1243,7 +1275,8 @@ describe("canonical execution boundary in ProjectGuard", () => {
     );
 
     expect(response.status).toBe(202);
-    expect(readCommit).toHaveBeenCalledTimes(4);
+    expect(readCommit).toHaveBeenCalledWith(projectId, 9302);
+    expect(readCommit).toHaveBeenCalledWith(projectId, 9304);
     await runInDurableObject(guard, async (_instance, state) => {
       const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
       expect(work?.candidates.map(({ revision }) => revision)).toEqual([9305]);
@@ -1428,9 +1461,12 @@ describe("canonical execution boundary in ProjectGuard", () => {
       await state.storage.put("materialization-finalization-request", target);
       await state.storage.put("materialization-finalization-work", work);
     });
-    const callback = vi.spyOn(ProjectGuard.prototype as any, "finalizeCurrentMaterialization")
-      .mockResolvedValue(Response.json({ finalization_pending: true }, { status: 202 }));
-    vi.spyOn(ProjectGuard.prototype as any, "armRequestRecoveryAlarm").mockResolvedValue(undefined);
+    const callback = await runInDurableObject(guard, instance => {
+      const isolated = vi.spyOn(instance as any, "finalizeCurrentMaterialization")
+        .mockResolvedValue(Response.json({ finalization_pending: true }, { status: 202 }));
+      vi.spyOn(instance as any, "armRequestRecoveryAlarm").mockResolvedValue(undefined);
+      return isolated;
+    });
 
     for (let attempt = 1; attempt <= 6; attempt += 1) {
       await runInDurableObject(guard, instance =>
@@ -1828,8 +1864,12 @@ describe("canonical execution boundary in ProjectGuard", () => {
     const projectId = "PRJ-8316";
     const requestId = "DOC-8316-PROGRESS";
     const { guard } = await setup(projectId);
-    const progressReads = vi.spyOn(ExecutionJournal.prototype, "status").mockImplementation(async function(this: ExecutionJournal) {
-      const completed = progressReads.mock.calls.length >= 2;
+    const originalStatus = ExecutionJournal.prototype.status;
+    let targetProgressReads = 0;
+    vi.spyOn(ExecutionJournal.prototype, "status").mockImplementation(async function(this: ExecutionJournal) {
+      if (this.projectId !== projectId || this.requestId !== requestId) return originalStatus.call(this);
+      targetProgressReads += 1;
+      const completed = targetProgressReads >= 2;
       return {
         status: "admitted", terminal: false,
         completed_steps: completed ? [{ step_id: "copy-1", evidence_refs: ["evidence:copy-1"] }] : [],
@@ -1844,7 +1884,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
       if (attempt === 6) expect(failure).toMatchObject({ count: 1, stopped: false });
       if (attempt === 11) expect(failure).toMatchObject({ count: 6, stopped: true, code: "identical_internal_failure_limit" });
     }
-    expect(progressReads).toHaveBeenCalledTimes(3);
+    expect(targetProgressReads).toBe(3);
   });
 
   it("preserves document recovery when reading its canonical intent has a retryable provider failure", async () => {

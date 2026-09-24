@@ -583,6 +583,7 @@ it("releases a timed-out canonical read so the next fresh context can proceed", 
   const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
   let scope: ProviderRequestScope | null = null;
   let wasAborted = false;
+  let deadlineMs = 20;
 
   await runInDurableObject(guard, async (instance) => {
     const subject = instance as unknown as {
@@ -592,7 +593,7 @@ it("releases a timed-out canonical read so the next fresh context can proceed", 
       canonicalContextRepository(projectId: string, scope: ProviderRequestScope): ProjectRepository;
     };
     subject.env.MUTATION_CONTEXT_SIGNING_KEY = "read-trace-context";
-    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockReturnValue(20);
+    vi.spyOn(subject, "canonicalContextReadDeadlineMs").mockImplementation(() => deadlineMs);
     vi.spyOn(subject, "canonicalContextRepository").mockImplementation((_projectId, nextScope) => {
       scope = nextScope;
       scope.signal.addEventListener("abort", () => { wasAborted = true; }, { once: true });
@@ -614,6 +615,7 @@ it("releases a timed-out canonical read so the next fresh context can proceed", 
   expect(wasAborted).toBe(true);
   await new Promise((resolve) => setTimeout(resolve, 0));
 
+  deadlineMs = 5_000;
   const second = await guard.fetch("https://project-guard.internal/mutation-context");
   expect(second.status).toBe(200);
   await expect(second.json()).resolves.toMatchObject({ canonical_state: { revision: 1 } });

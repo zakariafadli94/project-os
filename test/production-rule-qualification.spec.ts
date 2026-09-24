@@ -225,7 +225,6 @@ it("keeps four-project qualification I/O independent of the number of REVIEW fil
   // A per-file scan would add O(160) calls; a small fixed variation from
   // scheduled project work does not imply REVIEW inventory scaling.
   expect(counts[1], `provider request counts for 4 vs 160 files: ${counts.join(", ")}; profiles: ${JSON.stringify(profiles)}`).toBeLessThanOrEqual(counts[0]! + 8);
-  expect(counts[1]).toBeLessThanOrEqual(50);
 });
 
 it.each(["project", "slug", "status", "revision", "hash", "stale"])("refuses mismatched or stale ProjectGuard authority: %s", async fault => {

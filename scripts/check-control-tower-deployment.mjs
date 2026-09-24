@@ -1,3 +1,5 @@
+import { successfulMcpResult } from "./control-tower-qualification.mjs";
+
 const baseUrl = (process.env.CONTROL_TOWER_URL ?? "https://project-os-control-tower.zakaria-fadli-94.workers.dev").replace(/\/$/, "");
 const token = process.env.CONTROL_TOWER_BEARER_TOKEN;
 const requireLive = process.env.CONTROL_TOWER_REQUIRE_LIVE === "true";
@@ -7,7 +9,7 @@ function assert(condition, message) {
 }
 
 async function jsonRequest(path, init = {}) {
-  const response = await fetch(`${baseUrl}${path}`, init);
+  const response = await fetch(`${baseUrl}${path}`, { ...init, signal: AbortSignal.timeout(15_000) });
   const text = await response.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
@@ -43,7 +45,8 @@ const initialized = await jsonRequest("/mcp", {
   body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })
 });
 assert(initialized.response.ok, "authenticated MCP tools/list failed");
-assert(JSON.stringify(initialized.body).includes("project_os_get_context"), "authenticated tools/list omitted Project OS tools");
+const discovery = successfulMcpResult(initialized.body, 2);
+assert(Array.isArray(discovery.tools) && discovery.tools.some(tool => tool.name === "project_os_get_context"), "authenticated tools/list omitted Project OS tools");
 
 const context = await jsonRequest("/mcp", {
   method: "POST",
@@ -60,4 +63,11 @@ const context = await jsonRequest("/mcp", {
   })
 });
 assert(context.response.ok, "authenticated synthetic PRJ-0008 read-only context failed");
+const contextResult = successfulMcpResult(context.body, 3);
+assert(Array.isArray(contextResult.content), "authenticated context omitted tool content");
+const content = contextResult.content.find(item => item.type === "text");
+const observed = JSON.parse(content?.text ?? "null");
+assert(observed?.status === "ok" && observed.project_id === "PRJ-0008"
+  && Number.isSafeInteger(observed.revision) && observed.revision >= 0,
+"authenticated context did not prove a canonical revision for the qualification project");
 console.log("Control Tower OAuth and synthetic PRJ-0008 read-only qualification passed.");

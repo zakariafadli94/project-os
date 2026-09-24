@@ -45,7 +45,10 @@ describe("ProjectGuard managed documents", () => {
     installDropboxMock();
     await bootstrapRuleAdmissionGovernance(testEnv, governanceSigningKey);
   });
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
 
   it("freezes a referenced document and resumes governed package effects through the existing document boundary", async () => {
     installDropboxMock({ immutableRevisions: true });
@@ -484,6 +487,7 @@ describe("ProjectGuard managed documents", () => {
   });
 
   it("bounds identical recovery failures and exposes the stalled request", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const created = await createProject("TXN-DOCUMENT-RECOVERY-FAIL-0049");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     const content = "# Repeated failure";
@@ -493,7 +497,14 @@ describe("ProjectGuard managed documents", () => {
       vi.spyOn((instance as any).managedDocumentService, "writeWorking").mockRejectedValue(new Error("persistent_internal_failure"));
     });
     await guard.fetch("https://project-guard.internal/document", { method: "POST", body: JSON.stringify(request) });
-    for (let attempt = 0; attempt < 6; attempt++) expect(await runDurableObjectAlarm(guard)).toBe(true);
+    for (let attempt = 0; attempt < 6; attempt++) {
+      expect(await runDurableObjectAlarm(guard)).toBe(true);
+      const failure = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{
+        count: number; stopped: number
+      }>("SELECT count, stopped FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id).toArray()[0]);
+      expect(failure).toEqual({ count: attempt + 1, stopped: attempt === 5 ? 1 : 0 });
+      if (attempt < 5) vi.setSystemTime(Date.now() + 30_001);
+    }
     const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
     await expect(status.json()).resolves.toMatchObject({ status: "recovery_blocked", recovery: { code: "identical_internal_failure_limit" } });
     expect(await runDurableObjectAlarm(guard)).toBe(false);
@@ -613,7 +624,7 @@ describe("ProjectGuard managed documents", () => {
     });
   });
 
-  it("keeps an unqualified local expected-version rule unavailable", async () => {
+  it("does not trust an uncommitted local expected-version rule injected into the mutable snapshot", async () => {
     const mock = installDropboxMock();
     await bootstrapRuleAdmissionGovernance(testEnv, governanceSigningKey);
     const created = await createProject("TXN-DOCUMENT-PROJECT-0008");
@@ -659,8 +670,11 @@ describe("ProjectGuard managed documents", () => {
       }, context))
     });
 
-    expect(response.status).toBe(503);
-    await expect(response.json()).resolves.toMatchObject({ error: "LOCAL_RULE_QUALIFICATION_UNAVAILABLE" });
+    // The cache and state view above are not a commit record. Reading a fresh
+    // mutation context reconstructs the state from the immutable revision-1
+    // commit, so this uncommitted local rule is not authority for the write.
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ status: "committed", request_id: "DOCREQ-WORK-36080002" });
   });
 
   it("rejects a head changed during observation and re-reads independent durable head/version evidence", async () => {

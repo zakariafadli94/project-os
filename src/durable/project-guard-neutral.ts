@@ -1366,13 +1366,13 @@ export class ProjectGuard extends DurableObject<Env> {
     }
   }
 
-  private async scheduleNextRequestRecoveryWake(): Promise<void> {
-    if (!this.hasPendingRequestRecovery()) return;
+  private async scheduleNextRequestRecoveryWake(excludeTransactions = false): Promise<void> {
     const rows = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; message: string | null }>(
       `SELECT f.message FROM request_recovery r
        LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-       WHERE COALESCE(f.stopped, 0) = 0`
+       WHERE COALESCE(f.stopped, 0) = 0 ${excludeTransactions ? "AND r.kind <> 'transaction'" : ""}`
     ).toArray();
+    if (!rows.length) return;
     const dueTimes = rows.map(({ message }) => {
       if (!message) return Date.now();
       try {
@@ -1395,21 +1395,21 @@ export class ProjectGuard extends DurableObject<Env> {
       ? this.ctx.storage.sql.exec<RecoveryRequestRow>(
           `SELECT r.kind, r.request_id FROM request_recovery r
            LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-           WHERE COALESCE(f.stopped, 0) = 0 AND (r.kind > ? OR (r.kind = ? AND r.request_id > ?))
+           WHERE r.kind <> 'transaction' AND COALESCE(f.stopped, 0) = 0 AND (r.kind > ? OR (r.kind = ? AND r.request_id > ?))
            ORDER BY r.kind, r.request_id LIMIT ?`,
           cursor.kind, cursor.kind, cursor.request_id, REQUEST_RECOVERY_BATCH_SIZE
         ).toArray()
       : this.ctx.storage.sql.exec<RecoveryRequestRow>(
           `SELECT r.kind, r.request_id FROM request_recovery r
            LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-           WHERE COALESCE(f.stopped, 0) = 0 ORDER BY r.kind, r.request_id LIMIT ?`,
+           WHERE r.kind <> 'transaction' AND COALESCE(f.stopped, 0) = 0 ORDER BY r.kind, r.request_id LIMIT ?`,
           REQUEST_RECOVERY_BATCH_SIZE
         ).toArray();
     if (cursor && rows.length < REQUEST_RECOVERY_BATCH_SIZE) {
       rows.push(...this.ctx.storage.sql.exec<RecoveryRequestRow>(
         `SELECT r.kind, r.request_id FROM request_recovery r
          LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-         WHERE COALESCE(f.stopped, 0) = 0 AND (r.kind < ? OR (r.kind = ? AND r.request_id <= ?))
+         WHERE r.kind <> 'transaction' AND COALESCE(f.stopped, 0) = 0 AND (r.kind < ? OR (r.kind = ? AND r.request_id <= ?))
          ORDER BY r.kind, r.request_id LIMIT ?`,
         cursor.kind, cursor.kind, cursor.request_id, REQUEST_RECOVERY_BATCH_SIZE - rows.length
       ).toArray());
@@ -1457,7 +1457,10 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.recordRecoveryFailure(recovery.kind as "artifact" | "document", recovery.request_id, error, progress);
       }
     }
-    await this.scheduleNextRequestRecoveryWake();
+    // Transactions are processed in a separate phase later in alarm(). Do
+    // not let their unfailed rows schedule an immediate wake before that
+    // phase records its real retry deadline.
+    await this.scheduleNextRequestRecoveryWake(true);
   }
 
   private async armMaterializationFinalizationAlarm(): Promise<void> {

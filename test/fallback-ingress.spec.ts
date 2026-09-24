@@ -252,9 +252,9 @@ describe("encrypted fallback ingress", () => {
     expect(JSON.parse(raw)).toEqual({ error: "fallback_ingress_unavailable" });
   });
 
-  it("forwards the received admission envelope bytes through the ordinary transaction route", async () => {
+  it("recovers a committed fallback exchange after its POST response is lost and the key rotates", async () => {
     const projectId = "PRJ-9942";
-    seed(projectId, 1);
+    const mock = seed(projectId, 1);
     await runInDurableObject(testEnv.PROJECT_GUARD.getByName(projectId), (instance) => {
       Object.assign((instance as unknown as { env: Env }).env, {
         PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }),
@@ -317,13 +317,14 @@ describe("encrypted fallback ingress", () => {
     }), testEnv, createExecutionContext());
 
     expect(response.status).toBe(200);
-    const body = await decryptResponse(await response.text(), server, caller, transactionRequestId, "transaction");
-    expect(body).toMatchObject({
-      status: "ok",
-      operation: "transaction",
-      request_id: transactionRequestId,
-      receipt: { status: "committed", transaction_id: transaction.transaction_id, new_revision: 2 }
-    });
+    // Simulate a lost client response: leave the encrypted body unread and do not retry POST.
+    expect(response.bodyUsed).toBe(false);
+    const rotatedKeyResponse = await worker.fetch(new Request(
+      "https://example.com/v1/fallback-ingress/key"
+    ), testEnv, createExecutionContext());
+    const rotatedKey = parseFallbackPublicKeyResponse(await rotatedKeyResponse.json());
+    expect(rotatedKey.key_id).not.toBe(server.key_id);
+    expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(true);
 
     const recoveredStatus = await worker.fetch(new Request(
       `https://example.com/v1/fallback-ingress/status?exchange_id=${transactionRequestId}`,

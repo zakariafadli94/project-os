@@ -1,4 +1,6 @@
 import { deploymentIdentity } from "./deployment/identity";
+import { sha256Text } from "./documents/hash";
+import { sha256Canonical } from "./materialization/hash";
 import { AdmissionError } from "./admission/mutation-context";
 import { decodeAdmission } from "./admission/transport";
 import { parseMutationCandidateResolutionRequest } from "./domain/mutation-candidate-resolution";
@@ -72,6 +74,19 @@ const worker = {
       }
 
       if (fallbackRequest.operation === "transaction") {
+        const transaction = fallbackRequest.admission.request;
+        const tracked = await registry.fetch("https://registry-guard.internal/fallback/track", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            exchange_id: fallbackRequest.request_id,
+            project_id: transaction.project_id,
+            transaction_id: transaction.transaction_id,
+            request_sha256: await sha256Canonical(transaction),
+            authority_sha256: await sha256Text(request.headers.get("authorization") ?? "")
+          })
+        });
+        if (!tracked.ok) return fallbackIngressError(tracked.status === 409 ? 409 : 503);
         const transactionResponse = await baseWorker.fetch(new Request("https://fallback-ingress.internal/v1/transactions", {
           method: "POST",
           headers: {
@@ -135,6 +150,50 @@ const worker = {
           operation: "project_context",
           request_id: fallbackRequest.request_id,
           code: "canonical_unavailable"
+        });
+      }
+    }
+
+    const createStatusMatch = request.method === "GET"
+      ? url.pathname.match(/^\/v1\/project-creates\/([A-Za-z0-9][A-Za-z0-9@._:-]{0,511})\/request-status$/)
+      : null;
+    if (createStatusMatch) {
+      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      try {
+        const registry = env.REGISTRY_GUARD.getByName("global");
+        const response = await registry.fetch(
+          `https://registry-guard.internal/create-status?transaction_id=${encodeURIComponent(createStatusMatch[1]!)}`
+        );
+        const headers = new Headers(response.headers);
+        headers.set("cache-control", "no-store");
+        return new Response(response.body, { status: response.status, headers });
+      } catch {
+        return Response.json({ status: "unknown", code: "create_status_unavailable" }, {
+          status: 503,
+          headers: { "cache-control": "no-store" }
+        });
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/fallback-ingress/status") {
+      if (!authorizedIngress(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const exchangeId = url.searchParams.get("exchange_id");
+      if (!exchangeId || !/^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/.test(exchangeId)) {
+        return Response.json({ error: "exchange_identity_required" }, { status: 400 });
+      }
+      try {
+        const registry = env.REGISTRY_GUARD.getByName("global");
+        const response = await registry.fetch(
+          `https://registry-guard.internal/fallback/status?exchange_id=${encodeURIComponent(exchangeId)}`,
+          { headers: { "x-authority-sha256": await sha256Text(request.headers.get("authorization") ?? "") } }
+        );
+        const headers = new Headers(response.headers);
+        headers.set("cache-control", "no-store");
+        return new Response(response.body, { status: response.status, headers });
+      } catch {
+        return Response.json({ exchange_id: exchangeId, status: "unknown", code: "fallback_status_unavailable" }, {
+          status: 503,
+          headers: { "cache-control": "no-store" }
         });
       }
     }

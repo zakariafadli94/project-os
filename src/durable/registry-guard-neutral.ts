@@ -17,6 +17,7 @@ import { machineFleetCursorPath, parseLayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../persistence/provider/errors";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import { persistenceObservation } from "../persistence/observation";
 import { ProjectRepository } from "../persistence/repository";
 import { renderRegistry, type RegistryEntry } from "../render/registry";
 import {
@@ -77,9 +78,33 @@ interface FallbackKeySessionRow {
   retired_at_ms: number | null;
 }
 
+interface FallbackExchangeRow {
+  [key: string]: SqlStorageValue;
+  exchange_id: string;
+  project_id: string;
+  transaction_id: string;
+  request_sha256: string;
+  authority_sha256: string;
+  created_at_ms: number;
+}
+
 const FALLBACK_KEY_SESSION_TTL_MS = 5 * 60_000;
 const MAX_FALLBACK_KEY_SESSIONS = 32;
+const STATUS_LOOKUP_DEADLINE_MS = 2_000;
 class GovernanceNotInitializedError extends Error {}
+
+function withReadDeadline<T>(promise: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("status_lookup_timeout")), STATUS_LOOKUP_DEADLINE_MS);
+    promise.then(value => {
+      clearTimeout(timer);
+      resolve(value);
+    }, error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
 
 function governanceTokenMatches(left: string, right: string): boolean {
   const encoder = new TextEncoder();
@@ -88,6 +113,51 @@ function governanceTokenMatches(left: string, right: string): boolean {
   let difference = a.length ^ b.length;
   for (let index = 0; index < Math.max(a.length, b.length); index++) difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
   return difference === 0;
+}
+
+function minimalFallbackStatus(exchangeId: string, projectId: string, transactionId: string, requestSha256: string, evidence: Record<string, unknown>): Record<string, unknown> {
+  if (evidence.request_id !== transactionId || evidence.kind !== "transaction" || evidence.project_id !== projectId) {
+    return { exchange_id: exchangeId, status: "unknown", code: "request_status_identity_mismatch" };
+  }
+  const execution = evidence.execution && typeof evidence.execution === "object"
+    ? evidence.execution as { status?: unknown; terminal?: unknown; finalization_ref?: unknown; next_attempt_at?: unknown; request_hash?: unknown }
+    : null;
+  const recovery = evidence.recovery && typeof evidence.recovery === "object"
+    ? evidence.recovery as { durable_intent?: unknown; scheduled?: unknown; code?: unknown }
+    : null;
+  const codeCandidate = typeof evidence.code === "string" ? evidence.code : recovery?.code;
+  const code = typeof codeCandidate === "string" && /^[A-Za-z0-9_:-]{1,64}$/.test(codeCandidate) ? codeCandidate : null;
+  if (execution?.request_hash !== undefined && execution.request_hash !== requestSha256) {
+    return { exchange_id: exchangeId, transaction_id: transactionId, status: "unknown", code: "request_status_digest_mismatch" };
+  }
+  const observation = persistenceObservation({
+    project_id: projectId,
+    kind: "transaction",
+    request_id: transactionId,
+    observed_at: new Date().toISOString(),
+    correlation_id: exchangeId,
+    ...(evidence.receipt !== undefined ? { receipt: evidence.receipt } : {}),
+    execution: execution && typeof execution.status === "string" ? {
+      status: execution.status,
+      ...(typeof execution.terminal === "boolean" ? { terminal: execution.terminal } : {}),
+      ...(typeof execution.finalization_ref === "string" || execution.finalization_ref === null
+        ? { finalization_ref: execution.finalization_ref } : {})
+    } : null,
+    ...(typeof recovery?.durable_intent === "boolean" ? { durable_intent: recovery.durable_intent } : {}),
+    ...(recovery?.scheduled === true && typeof execution?.next_attempt_at === "string"
+      ? { next_attempt_at: execution.next_attempt_at } : {}),
+    absence_verified: evidence.status === "not_received",
+    blocked: evidence.status === "recovery_blocked",
+    running: execution?.status === "running" || execution?.status === "finalizing",
+    code
+  });
+  return {
+    exchange_id: exchangeId,
+    transaction_id: transactionId,
+    status: observation.status,
+    recovery: observation.recovery,
+    ...(observation.code ? { code: observation.code } : {})
+  };
 }
 
 export class RegistryGuard extends DurableObject<Env> {
@@ -129,12 +199,24 @@ export class RegistryGuard extends DurableObject<Env> {
         created_at_ms INTEGER NOT NULL,
         retired_at_ms INTEGER
       );
+      CREATE TABLE IF NOT EXISTS fallback_exchanges (
+        exchange_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        transaction_id TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        authority_sha256 TEXT NOT NULL DEFAULT '',
+        created_at_ms INTEGER NOT NULL
+      );
       INSERT OR IGNORE INTO meta (key, value) VALUES ('next_project_number', '1');
       CREATE TABLE IF NOT EXISTS governance_events (
         revision INTEGER PRIMARY KEY,
         event_json TEXT NOT NULL
       );
     `);
+    const fallbackExchangeColumns = this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(fallback_exchanges)").toArray();
+    if (!fallbackExchangeColumns.some(column => column.name === "authority_sha256")) {
+      this.ctx.storage.sql.exec("ALTER TABLE fallback_exchanges ADD COLUMN authority_sha256 TEXT NOT NULL DEFAULT ''");
+    }
     const persistence = createProductionPersistence(env);
     this.repository = new ProjectRepository(persistence, parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE));
     this.fleetPersistence = persistence;
@@ -171,6 +253,9 @@ export class RegistryGuard extends DurableObject<Env> {
         return Response.json({ schema_version: "1.0", projects: this.registryEntries() });
       });
     }
+    if (request.method === "GET" && path === "/create-status") {
+      return this.handleCreateStatus(new URL(request.url));
+    }
     if (request.method === "POST" && path === "/sync-status") {
       return this.serialize(() => this.handleStatusSync(request));
     }
@@ -188,6 +273,12 @@ export class RegistryGuard extends DurableObject<Env> {
     }
     if (request.method === "POST" && path === "/fallback/encrypt-and-rotate") {
       return this.serialize(() => this.handleFallbackEncryptAndRotate(request));
+    }
+    if (request.method === "POST" && path === "/fallback/track") {
+      return this.serialize(() => this.handleFallbackTrack(request));
+    }
+    if (request.method === "GET" && path === "/fallback/status") {
+      return this.handleFallbackStatus(request);
     }
     return Response.json({ error: "not_found" }, { status: 404 });
   }
@@ -428,6 +519,87 @@ export class RegistryGuard extends DurableObject<Env> {
     }
   }
 
+  private async handleFallbackTrack(request: Request): Promise<Response> {
+    let input: Record<string, unknown>;
+    try {
+      input = await request.json() as Record<string, unknown>;
+    } catch {
+      return fallbackError("invalid_fallback_exchange", 400);
+    }
+    const allowed = ["exchange_id", "project_id", "transaction_id", "request_sha256", "authority_sha256"];
+    if (!input || typeof input !== "object" || Array.isArray(input)
+      || Object.keys(input).sort().join(",") !== allowed.slice().sort().join(",")
+      || typeof input.exchange_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/.test(input.exchange_id)
+      || typeof input.project_id !== "string" || !/^PRJ-[0-9]{4,}$/.test(input.project_id)
+      || typeof input.transaction_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9@._:-]{0,511}$/.test(input.transaction_id)
+      || typeof input.request_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(input.request_sha256)
+      || typeof input.authority_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(input.authority_sha256)) {
+      return fallbackError("invalid_fallback_exchange", 400);
+    }
+    const values = [input.exchange_id, input.project_id, input.transaction_id, input.request_sha256, input.authority_sha256] as const;
+    const existing = this.ctx.storage.sql.exec<FallbackExchangeRow>(
+      "SELECT * FROM fallback_exchanges WHERE exchange_id = ?", input.exchange_id
+    ).toArray()[0];
+    if (existing) {
+      if (existing.project_id !== input.project_id || existing.transaction_id !== input.transaction_id
+        || existing.request_sha256 !== input.request_sha256 || existing.authority_sha256 !== input.authority_sha256) {
+        return fallbackError("fallback_exchange_conflict", 409);
+      }
+      return fallbackJson({ status: "tracked", exchange_id: existing.exchange_id });
+    }
+    const priorBusinessRequest = this.ctx.storage.sql.exec<FallbackExchangeRow>(
+      "SELECT * FROM fallback_exchanges WHERE project_id = ? AND transaction_id = ? LIMIT 1",
+      input.project_id,
+      input.transaction_id
+    ).toArray()[0];
+    if (priorBusinessRequest && (priorBusinessRequest.request_sha256 !== input.request_sha256
+      || priorBusinessRequest.authority_sha256 !== input.authority_sha256)) {
+      return fallbackError("fallback_exchange_conflict", 409);
+    }
+    this.ctx.storage.sql.exec(
+      "INSERT INTO fallback_exchanges (exchange_id, project_id, transaction_id, request_sha256, authority_sha256, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+      ...values,
+      Date.now()
+    );
+    return fallbackJson({ status: "tracked", exchange_id: input.exchange_id });
+  }
+
+  private async handleFallbackStatus(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const exchangeId = url.searchParams.get("exchange_id");
+    const authoritySha256 = request.headers.get("x-authority-sha256");
+    if (!exchangeId || !/^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/.test(exchangeId)) {
+      return Response.json({ error: "exchange_identity_required" }, { status: 400 });
+    }
+    if (!authoritySha256 || !/^[a-f0-9]{64}$/.test(authoritySha256)) {
+      return Response.json({ exchange_id: exchangeId, status: "unknown", code: "lookup_identity_unavailable" }, { status: 503 });
+    }
+    const exchange = this.ctx.storage.sql.exec<FallbackExchangeRow>(
+      "SELECT * FROM fallback_exchanges WHERE exchange_id = ?", exchangeId
+    ).toArray()[0];
+    if (!exchange) {
+      return Response.json({ exchange_id: exchangeId, status: "unknown", code: "exchange_binding_unavailable" });
+    }
+    if (exchange && !exchange.authority_sha256) {
+      return Response.json({ exchange_id: exchangeId, status: "unknown", code: "exchange_authority_unavailable" });
+    }
+    if (exchange && !governanceTokenMatches(exchange.authority_sha256, authoritySha256)) {
+      return Response.json({ error: "fallback_exchange_forbidden" }, { status: 403 });
+    }
+    const projectId = exchange.project_id;
+    const transactionId = exchange.transaction_id;
+    try {
+      const response = await withReadDeadline(this.env.PROJECT_GUARD.getByName(projectId).fetch(
+        `https://project-guard.internal/request-status?kind=transaction&request_id=${encodeURIComponent(transactionId)}`
+      ));
+      const status = await withReadDeadline(response.json<Record<string, unknown>>());
+      if (!response.ok) return Response.json({ exchange_id: exchangeId, status: "unknown", code: "request_status_unavailable" }, { status: 503 });
+      return Response.json(minimalFallbackStatus(exchangeId, projectId, transactionId, exchange.request_sha256, status));
+    } catch {
+      return Response.json({ exchange_id: exchangeId, status: "unknown", code: "request_status_unavailable" }, { status: 503 });
+    }
+  }
+
   private liveFallbackSession(keyId: string, nowMs: number): FallbackKeySessionRow | null {
     const session = this.ctx.storage.sql.exec<FallbackKeySessionRow>(
       "SELECT * FROM fallback_key_sessions WHERE key_id = ?",
@@ -496,6 +668,53 @@ export class RegistryGuard extends DurableObject<Env> {
 
     const projectId = this.allocateProjectId(tx);
     return this.finishAllocatedCreate(tx, projectId);
+  }
+
+  private async handleCreateStatus(url: URL): Promise<Response> {
+    const transactionId = url.searchParams.get("transaction_id");
+    if (!transactionId || !/^[A-Za-z0-9][A-Za-z0-9@._:-]{0,511}$/.test(transactionId)) {
+      return Response.json({ error: "transaction_identity_required" }, { status: 400 });
+    }
+    const row = this.requestRow(transactionId);
+    if (!row) {
+      try {
+        const receipt = await withReadDeadline(this.repository.readReceipt(transactionId));
+        if (receipt?.status === "committed" && receipt.transaction_id === transactionId
+          && /^PRJ-[0-9]{4,}$/.test(receipt.project_id) && Number.isSafeInteger(receipt.new_revision)) {
+          const commit = await withReadDeadline(this.repository.readCommitRecord(receipt.project_id, receipt.new_revision));
+          if (commit?.transaction.operation === "project.create"
+            && commit.transaction.transaction_id === transactionId
+            && commit.transaction.project_id === receipt.project_id
+            && commit.project_id === receipt.project_id
+            && commit.new_revision === receipt.new_revision
+            && canonicalJson(commit.receipt) === canonicalJson(receipt)) {
+            return Response.json({ transaction_id: transactionId, status: "committed", project_id: receipt.project_id, receipt });
+          }
+        }
+      } catch {
+        return Response.json({ transaction_id: transactionId, status: "unknown", code: "create_status_unavailable" }, { status: 503 });
+      }
+      return Response.json({ transaction_id: transactionId, status: "unknown", code: "canonical_evidence_not_found" });
+    }
+    let transaction: Transaction;
+    try {
+      transaction = parseTransaction(JSON.parse(row.transaction_json));
+    } catch {
+      return Response.json({ transaction_id: transactionId, status: "unknown", code: "request_record_invalid" }, { status: 503 });
+    }
+    if (transaction.operation !== "project.create" || transaction.transaction_id !== transactionId) {
+      return Response.json({ transaction_id: transactionId, status: "unknown", code: "request_record_mismatch" });
+    }
+    const receipt = row.receipt_json ? JSON.parse(row.receipt_json) as Receipt : null;
+    const status = row.status === "allocated" || row.status === "guard_committed"
+      ? "pending"
+      : receipt?.status ?? "unknown";
+    return Response.json({
+      transaction_id: transactionId,
+      status,
+      ...(row.project_id ? { project_id: row.project_id } : {}),
+      ...(receipt ? { receipt } : {})
+    });
   }
 
   private async finishAllocatedCreate(original: Extract<Transaction, { operation: "project.create" }>, projectId: string): Promise<Response> {

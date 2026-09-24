@@ -4,6 +4,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Env } from "../src/env";
 import { encodeAdmission } from "../src/admission/transport";
+import { sha256Text } from "../src/documents/hash";
 import { parseFallbackEncryptedResponseJson, parseFallbackPublicKeyResponse } from "../src/fallback/contract";
 import { MAX_FALLBACK_ENCRYPTED_REQUEST_BYTES } from "../src/fallback/contract";
 import {
@@ -323,6 +324,108 @@ describe("encrypted fallback ingress", () => {
       request_id: transactionRequestId,
       receipt: { status: "committed", transaction_id: transaction.transaction_id, new_revision: 2 }
     });
+
+    const recoveredStatus = await worker.fetch(new Request(
+      `https://example.com/v1/fallback-ingress/status?exchange_id=${transactionRequestId}`,
+      { headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` } }
+    ), testEnv, createExecutionContext());
+    expect(recoveredStatus.status).toBe(200);
+    expect(recoveredStatus.headers.get("cache-control")).toBe("no-store");
+    expect(await recoveredStatus.json()).toEqual({
+      exchange_id: transactionRequestId,
+      transaction_id: transaction.transaction_id,
+      status: "finalizing",
+      recovery: {
+        durable_intent: true,
+        state: "running",
+        next_attempt_at: null,
+        action: "resume_execution",
+        owner: "system",
+        requires_new_approval: false
+      }
+    });
+    expect(await (await worker.fetch(new Request(
+      `https://example.com/v1/fallback-ingress/status?exchange_id=${transactionRequestId}`,
+      { headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` } }
+    ), testEnv, createExecutionContext())).text()).not.toContain("receipt");
+
+    await runInDurableObject(testEnv.REGISTRY_GUARD.getByName("global"), (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM requests WHERE transaction_id = ?", transaction.transaction_id);
+    });
+    const afterLocalCacheLoss = await worker.fetch(new Request(
+      `https://example.com/v1/fallback-ingress/status?exchange_id=${transactionRequestId}`,
+      { headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` } }
+    ), testEnv, createExecutionContext());
+    expect(await afterLocalCacheLoss.json()).toMatchObject({ status: "finalizing", transaction_id: transaction.transaction_id });
+
+    const registry = testEnv.REGISTRY_GUARD.getByName("global");
+    const timedOut = await runInDurableObject(registry, async (instance) => {
+      const mutable = instance as unknown as { env: Env; fetch(request: Request): Promise<Response> };
+      const projectGuard = mutable.env.PROJECT_GUARD;
+      Object.assign(mutable.env, {
+        PROJECT_GUARD: { getByName: () => ({ fetch: () => new Promise<Response>(() => {}) }) }
+      });
+      try {
+        return await mutable.fetch(new Request(
+          `https://registry-guard.internal/fallback/status?exchange_id=${transactionRequestId}`,
+          { headers: { "x-authority-sha256": await sha256Text(`Bearer ${testEnv.INGRESS_TOKEN}`) } }
+        ));
+      } finally {
+        Object.assign(mutable.env, { PROJECT_GUARD: projectGuard });
+      }
+    });
+    expect(timedOut.status).toBe(503);
+    expect(await timedOut.json()).toMatchObject({ status: "unknown", code: "request_status_unavailable" });
+
+    const differentAuthority = `${Date.now()}.${"a".repeat(64)}`;
+    const foreignStatus = await worker.fetch(new Request(
+      `https://example.com/v1/fallback-ingress/status?exchange_id=${transactionRequestId}`,
+      { headers: { authorization: `Bearer ${differentAuthority}` } }
+    ), { ...testEnv, CONTROL_TOWER_OPERATOR_TOKEN: differentAuthority } as Env, createExecutionContext());
+    expect(foreignStatus.status).toBe(403);
+
+    const foreignReplay = await encryptedFallbackRequest("transaction", "fallback-request-20260924-foreign-owner", {
+      admission_json: admissionJson
+    });
+    const foreignReplayResponse = await worker.fetch(new Request("https://example.com/v1/fallback-ingress", {
+      method: "POST",
+      headers: { authorization: `Bearer ${differentAuthority}`, "content-type": "application/json" },
+      body: foreignReplay.body
+    }), { ...testEnv, CONTROL_TOWER_OPERATOR_TOKEN: differentAuthority } as Env, createExecutionContext());
+    expect(foreignReplayResponse.status).toBe(409);
+
+    const changedExchange = await encryptedFallbackRequest("transaction", transactionRequestId, {
+      admission_json: JSON.stringify(encodeAdmission({
+        ...transaction,
+        payload: { ...transaction.payload, title: "Changed under the same exchange ID" }
+      }, contextBody.mutation_context as Parameters<typeof encodeAdmission>[1]))
+    });
+    const collision = await worker.fetch(new Request("https://example.com/v1/fallback-ingress", {
+      method: "POST",
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
+      body: changedExchange.body
+    }), testEnv, createExecutionContext());
+    expect(collision.status).toBe(409);
+
+    const refreshedContext = await encryptedFallbackRequest("transaction", transactionRequestId, {
+      admission_json: JSON.stringify(encodeAdmission(transaction, {
+        ...(contextBody.mutation_context as NonNullable<Parameters<typeof encodeAdmission>[1]>),
+        observed_at: "2026-09-24T09:00:01.000Z",
+        expiry: "2026-09-24T09:05:01.000Z"
+      }))
+    });
+    const refreshedResponse = await worker.fetch(new Request("https://example.com/v1/fallback-ingress", {
+      method: "POST",
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
+      body: refreshedContext.body
+    }), testEnv, createExecutionContext());
+    expect(refreshedResponse.status).toBe(200);
+
+    const unknownStatus = await worker.fetch(new Request(
+      "https://example.com/v1/fallback-ingress/status?exchange_id=fallback-request-20260924-not-found",
+      { headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` } }
+    ), testEnv, createExecutionContext());
+    expect(await unknownStatus.json()).toMatchObject({ status: "unknown" });
   });
 
   it("returns the ordinary fail-closed admission result without a business mutation", async () => {
@@ -439,12 +542,17 @@ describe("encrypted fallback ingress", () => {
     expect(replay).toMatchObject({ receipt: { status: "committed", new_revision: 2 } });
     expect(replay.receipt).toEqual(committed.receipt);
 
-    const changed = await submitFallbackRequest("transaction", "fallback-request-20260909-replay-changed", {
+    const changedExchange = await encryptedFallbackRequest("transaction", "fallback-request-20260909-replay-changed", {
       admission_json: JSON.stringify(encodeAdmission({
         ...transaction,
         payload: { ...transaction.payload, title: "Changed under same transaction id" }
       }, context.mutation_context as Parameters<typeof encodeAdmission>[1]))
     });
-    expect(changed).toMatchObject({ response_status: 409, receipt: { error: "idempotency_payload_mismatch" } });
+    const changed = await worker.fetch(new Request("https://example.com/v1/fallback-ingress", {
+      method: "POST",
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" },
+      body: changedExchange.body
+    }), testEnv, createExecutionContext());
+    expect(changed.status).toBe(409);
   });
 });

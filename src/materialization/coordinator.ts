@@ -711,6 +711,31 @@ export class MaterializationCoordinator {
     return { baseline, reconstructed: true };
   }
 
+  async verifyExistingHeadCurrentViews(
+    record: CompletedMaterializationRecord,
+    canonical: CanonicalCommitRecord,
+    outputs: ReadonlyMap<string, ProjectionOutputEvidence>
+  ): Promise<boolean> {
+    if (record.target_revision !== canonical.new_revision
+      || record.source_event_id !== canonical.event.event_id
+      || !record.current_views_proof
+      || record.projection_version !== CURRENT_PROJECTION_VERSION) {
+      throw new Error(`Materialization current-view verification binding mismatch for ${this.projectId}`);
+    }
+    if (this.sliceBudget && !this.sliceBudget.canStartEffect(12)) return false;
+    const root = record.workspace_location === "archive"
+      ? archiveProjectRoot(canonical.state.project_id, canonical.state.slug)
+      : this.workspaceRootFor(canonical.state);
+    await this.verifyCurrentViews(
+      outputs,
+      record.target_revision,
+      record.projection_version,
+      root,
+      record.current_views_proof
+    );
+    return true;
+  }
+
   private async repairHeadFromCompletedRecords(canonicalRevision: number): Promise<MaterializationHead | null | "pending"> {
     const saved = this.ledger.readRepairScanCheckpoint?.(canonicalRevision) ?? null;
     let checkpoint: MaterializationRepairScanCheckpoint = saved ?? {

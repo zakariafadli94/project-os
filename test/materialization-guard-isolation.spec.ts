@@ -435,6 +435,62 @@ describe("MaterializationGuard isolation boundary", () => {
     }
   });
 
+  it("does not acknowledge a warm head when a current view has drifted at the provider", async () => {
+    const mock = installDropboxMock();
+    const projectId = "PRJ-3920";
+    const slug = "repair-warm-drift";
+    await createProject(projectId, slug, "TXN-MATISO-3920-CREATE");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
+        [projectId]: "repair"
+      });
+    });
+    await guard.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    for (let slice = 0; slice < 64; slice += 1) {
+      if (!await runDurableObjectAlarm(guard)) break;
+    }
+
+    const journal = new ConvergenceJournal(createProductionPersistence(testEnv, projectId), projectId);
+    const saved = await journal.load();
+    expect(saved).not.toBeNull();
+    if (!saved) throw new Error("missing convergence journal");
+    const human = Object.entries(saved.progress.obligations)
+      .find(([, obligation]) => obligation.layer === "human_handoff");
+    expect(human).toBeDefined();
+    if (!human) throw new Error("missing human obligation");
+    saved.progress.obligations[human[0]] = {
+      ...human[1], state: "retry_wait", next_attempt_at: at, code: "human_internal_failure"
+    };
+    saved.progress.requested = { revision: 1, projection_version: CURRENT_PROJECTION_VERSION };
+    saved.progress.active = { revision: 1, projection_version: CURRENT_PROJECTION_VERSION };
+    saved.progress.next_alarm_at = at;
+    await journal.save(saved.progress, saved.token);
+    await mock.writeExternal(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`, "external drift after proof");
+
+    let failedClosed = false;
+    try {
+      await guard.fetch("https://materialization-guard.internal/reconcile", { method: "POST" });
+    } catch (error) {
+      failedClosed = error instanceof Error && /current-view verification failed/i.test(error.message);
+    }
+    expect(failedClosed).toBe(true);
+
+    const after = await journal.load();
+    expect(after?.progress.obligations[human[0]]).toMatchObject({
+      state: "retry_wait", code: "human_internal_failure", next_attempt_at: at
+    });
+    expect(after?.progress).toMatchObject({
+      requested: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION },
+      active: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION }
+    });
+    expect(mock.files.get(`${workspaceProjectRoot(projectId, slug)}/PROJECT.md`)).toBe("external drift after proof");
+  });
+
   it("retires a covered blocked human obligation before rearming a newer canonical target", async () => {
     const mock = installDropboxMock();
     const projectId = "PRJ-3916";

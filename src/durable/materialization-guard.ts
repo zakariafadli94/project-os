@@ -20,6 +20,7 @@ import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
 import type { Env } from "../env";
 import { MaterializationCoordinator } from "../materialization/coordinator";
+import { ProviderOperationError } from "../persistence/provider/errors";
 import {
   advanceCanonicalCoverageProof,
   advanceMaterializationCoverageCursor,
@@ -456,7 +457,6 @@ export class MaterializationGuard extends DurableObject<Env> {
         ? await repository.readCommitRecord(this.projectId, canonicalState.revision)
         : null;
       if (currentRecord && await this.hasCurrentDurableHead(currentRecord)) {
-        await this.acknowledgeVerifiedHumanHead(canonicalState.revision, CURRENT_PROJECTION_VERSION);
         // This request may have come through ProjectGuard. Notify from the
         // alarm after the response, so the two Durable Objects cannot wait
         // synchronously on each other.
@@ -544,13 +544,10 @@ export class MaterializationGuard extends DurableObject<Env> {
             status: "pending"
           }, { status: 202 });
         }
-        // A fully verified immutable head supersedes older human retry markers.
-        // Close them before the strict idle check so stale journal state cannot
-        // keep an already-current project permanently pending.
+        // resumeConvergenceFromVerifiedHead has already closed covered
+        // obligations, but only after re-observing the four mutable views when
+        // this head actually needed an acknowledgement.
         const providerHeadCurrent = await this.hasCurrentDurableHead(record);
-        if (providerHeadCurrent) {
-          await this.acknowledgeVerifiedHumanHead(canonicalState.revision, CURRENT_PROJECTION_VERSION);
-        }
         if (providerHeadCurrent && await this.hasDurablyVerifiedCurrentTarget(record)) {
           await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
           return Response.json({
@@ -660,8 +657,7 @@ export class MaterializationGuard extends DurableObject<Env> {
     );
     if (response.status === 202) return false;
     if (!response.ok) throw new Error(`ProjectGuard finalization notification returned ${response.status}`);
-    await this.serialize(() => this.acknowledgeVerifiedHumanHead(head.target_revision, head.projection_version));
-    return true;
+    return this.serialize(() => this.resumeConvergenceFromVerifiedHead());
   }
 
   /**
@@ -775,7 +771,6 @@ export class MaterializationGuard extends DurableObject<Env> {
     const { coordinator, repository, budget } = this.coordinatorForSlice();
     const runtime = createProductionPersistence(this.env, this.projectId, providerRequestScopeFor(budget));
     const journal = new ConvergenceJournal(runtime, this.projectId);
-    const saved = await journal.load();
     const head = await repository.readMaterializationHead(this.projectId);
     if (head === null || head.projection_version !== CURRENT_PROJECTION_VERSION) return true;
     const tip = await repository.readMaterializationRecord(
@@ -799,7 +794,40 @@ export class MaterializationGuard extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
       return false;
     }
-    if (saved !== null) await this.acknowledgeVerifiedHumanHead(head.target_revision, head.projection_version);
+    const saved = await journal.load();
+    const covered = (target: { revision: number; projection_version: number } | null | undefined): boolean =>
+      target !== null && target !== undefined
+      && target.revision <= head.target_revision
+      && target.projection_version <= head.projection_version;
+    const acknowledgementRequired = saved === null
+      || saved.progress.canonical_observed_revision < head.target_revision
+      || covered(saved.progress.active)
+      || covered(saved.progress.requested)
+      || Object.values(saved.progress.obligations).some((obligation) =>
+        obligation.layer === "human_handoff"
+        && obligation.state !== "verified"
+        && covered(obligation.target)
+      );
+    if (acknowledgementRequired) {
+      try {
+        const viewsVerified = await coordinator.verifyExistingHeadCurrentViews(tip, canonical, baseline.baseline.outputs);
+        if (!viewsVerified) {
+          await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+          return false;
+        }
+      } catch (error) {
+        const transient = error instanceof ProviderOperationError && error.retryable
+          || error instanceof Error && (
+            error.name === "AbortError"
+            || error.name === "TimeoutError"
+            || /slice_budget_exhausted|fetch failed|network (?:error|failure|unavailable)|timed? out|\bECONN(?:RESET|REFUSED|TIMEDOUT)\b|\bEAI_AGAIN\b|\bENOTFOUND\b/i.test(error.message)
+          );
+        if (!transient) throw error;
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+        return false;
+      }
+      if (saved !== null) await this.acknowledgeVerifiedHumanHead(head.target_revision, head.projection_version);
+    }
     const refreshed = await journal.load();
     if (refreshed === null || refreshed.progress.canonical_observed_revision < head.target_revision) {
       await journal.resumeFromVerifiedMaterialization(head.target_revision);

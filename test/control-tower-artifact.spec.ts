@@ -18,12 +18,33 @@ const artifact = {
 };
 
 describe("Control Tower governed artifact submission", () => {
-  it("returns an observational artifact request status without triggering finalization", async () => {
+  it("reads the receipt endpoint without triggering request recovery", async () => {
     const calls: string[] = [];
     const stub = {
       fetch: async (input: string) => {
         const url = new URL(input);
         calls.push(`${url.pathname}${url.search}`);
+        if (url.pathname === "/receipt") return Response.json({ status: "committed", request_id: artifact.request_id });
+        return Response.json({ error: "unexpected_route" }, { status: 500 });
+      }
+    };
+    const server = createControlTowerServer({
+      PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
+      REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
+    }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ content: Array<{ text: string }> }> }> };
+
+    const result = await server._registeredTools.project_os_get_receipt.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
+    expect(calls).toEqual([`/receipt?request_id=${artifact.request_id}&kind=artifact`]);
+    expect(JSON.parse(result.content[0]!.text)).toEqual({ status: "committed", request_id: artifact.request_id });
+  });
+
+  it("keeps request status separate and preserves non-2xx receipt responses as tool errors", async () => {
+    const calls: string[] = [];
+    const stub = {
+      fetch: async (input: string) => {
+        const url = new URL(input);
+        calls.push(`${url.pathname}${url.search}`);
+        if (url.pathname === "/receipt") return Response.json({ error: "receipt_not_found" }, { status: 404 });
         if (url.pathname === "/request-status") return Response.json({
           status: "committed",
           receipt: { status: "committed", request_id: artifact.request_id },
@@ -35,11 +56,18 @@ describe("Control Tower governed artifact submission", () => {
     const server = createControlTowerServer({
       PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
       REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
-    }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ content: Array<{ text: string }> }> }> };
+    }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }> }> };
 
-    const result = await server._registeredTools.project_os_get_receipt.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
-    expect(calls).toEqual([`/request-status?request_id=${artifact.request_id}&kind=artifact`]);
-    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ status: "committed", execution: { status: "finalizing", terminal: false } });
+    const missingReceipt = await server._registeredTools.project_os_get_receipt.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
+    const requestStatus = await server._registeredTools.project_os_get_request_status.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
+
+    expect(missingReceipt.isError).toBe(true);
+    expect(JSON.parse(missingReceipt.content[0]!.text)).toEqual({ error: "receipt_not_found" });
+    expect(calls).toEqual([
+      `/receipt?request_id=${artifact.request_id}&kind=artifact`,
+      `/request-status?request_id=${artifact.request_id}&kind=artifact`
+    ]);
+    expect(JSON.parse(requestStatus.content[0]!.text)).toMatchObject({ status: "committed", execution: { status: "finalizing", terminal: false } });
   });
 
   it("sends a staged artifact with fresh signed admission to ProjectGuard", async () => {

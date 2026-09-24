@@ -18,8 +18,13 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
       ...(!response.ok ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(body) }]
     }));
   };
+  const receipt = async ({ project_id, request_id, kind }: { project_id: string; request_id: string; kind: "transaction" | "document" | "artifact" }) => {
+    return readGuard(env.PROJECT_GUARD, project_id, `/receipt?request_id=${encodeURIComponent(request_id)}&kind=${kind}`, (response, body) => ({
+      ...(!response.ok ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(body) }]
+    }));
+  };
   const requestStatusSchema = { project_id: projectIdSchema, request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) };
-  server.registerTool("project_os_get_receipt", { description: "Read receipt and finalization status without triggering recovery", inputSchema: requestStatusSchema }, requestStatus);
+  server.registerTool("project_os_get_receipt", { description: "Read a receipt without triggering recovery", inputSchema: requestStatusSchema }, receipt);
   server.registerTool("project_os_get_request_status", { description: "Read Project OS request recovery status without triggering recovery", inputSchema: requestStatusSchema }, requestStatus);
   server.registerTool("project_os_submit_transaction", { description: "Submit one strict typed Project OS transaction after the server obtains fresh admission context", inputSchema: { project_id: z.union([projectIdSchema, z.literal(AUTO_PROJECT_ID)]), request: transactionSchema } }, async ({ project_id, request }) => submitGuarded(env, project_id, "transaction", request));
   server.registerTool("project_os_write_working_document", { description: "Submit one strict governed document request after the server obtains fresh admission context", inputSchema: { project_id: projectIdSchema, request: managedDocumentRequestSchema } }, async ({ project_id, request }) => submitGuarded(env, project_id, "document", request));

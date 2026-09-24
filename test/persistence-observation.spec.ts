@@ -23,4 +23,9 @@ describe("persistence observations", () => {
     expect(await requestDigest({ a: 1, b: 2 })).toBe(await requestDigest({ b: 2, a: 1 }));
     expect(await requestDigest({ a: 2 })).not.toBe(await requestDigest({ a: 1 }));
   });
+  it("always explains a stopped recovery and never exposes a stale wake", () => {
+    expect(persistenceObservation({ ...identity, blocked: true, next_attempt_at: "2026-09-24T10:00:01Z" })).toMatchObject({
+      code: "recovery_blocked", recovery: { state: "blocked", next_attempt_at: null, action: "wait_for_dependency" }
+    });
+  });
 });

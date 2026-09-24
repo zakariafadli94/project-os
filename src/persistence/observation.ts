@@ -23,6 +23,9 @@ export interface PersistenceObservation {
   };
 }
 
+/** Each family implements this against its validated evidence sources. */
+export type ObserveRequest = (projectId: string, kind: RequestKind, requestId: string) => Promise<PersistenceObservation>;
+
 /** Evidence must have its project/request bindings checked by the family owner.
  * This pure presentation layer never performs I/O or creates authority. */
 export interface ObservationEvidence {
@@ -71,6 +74,6 @@ export function persistenceObservation(input: ObservationEvidence): PersistenceO
     project_id: input.project_id, kind: input.kind, request_id: input.request_id,
     status, observed_at: input.observed_at, receipt: input.receipt ?? null,
     receipt_status: receiptStatus, execution_status: input.execution?.status ?? null,
-    terminal, code: input.code ?? null, correlation_id: input.correlation_id, recovery
+    terminal, code: input.code ?? (recovery.state === "blocked" ? "recovery_blocked" : null), correlation_id: input.correlation_id, recovery
   };
 }

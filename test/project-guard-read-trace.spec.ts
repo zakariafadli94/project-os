@@ -7,13 +7,61 @@ import { SearchSyncProjectGuard } from "../src/durable/project-guard-search-sync
 import { ProjectGuard } from "../src/durable/project-guard-neutral";
 import { ExecutionJournal } from "../src/execution/journal";
 import type { ProjectState } from "../src/domain/project-state";
-import { machineCommitRecordPath, machineStatePath } from "../src/persistence/layout";
+import { machineArtifactReceiptPath, machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/persistence/layout";
+import { receiptPath } from "../src/persistence/paths";
 import type { ProviderRequestScope } from "../src/persistence/provider/contract";
 import { ProjectRepository } from "../src/persistence/repository";
+import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 afterEach(() => vi.restoreAllMocks());
+
+it("rejects an unsupported execution kind before reading its journal while idle", async () => {
+  const status = vi.spyOn(ExecutionJournal.prototype, "status").mockResolvedValue(null);
+  const guard = Object.assign(Object.create(ProjectGuard.prototype), {
+    ctx: { id: { name: "PRJ-8420" } },
+    persistence: {},
+    queue: Promise.resolve(),
+    queueDepth: 0
+  }) as ProjectGuard;
+
+  const response = await guard.fetch(new Request(
+    "https://guard.internal/execution-status?kind=not-real&request_id=REQ-8420"
+  ));
+
+  expect(response.status).toBe(400);
+  await expect(response.json()).resolves.toMatchObject({ error: "execution_kind_invalid" });
+  expect(status).not.toHaveBeenCalled();
+});
+
+it("reports artifact intent consistently in additive and legacy recovery views", async () => {
+  vi.spyOn(ExecutionJournal.prototype, "status").mockResolvedValue(null);
+  vi.spyOn(MutationGateRepository.prototype, "readArtifactIntent").mockResolvedValue({} as never);
+  const guard = Object.assign(Object.create(ProjectGuard.prototype), {
+    ctx: {
+      id: { name: "PRJ-8421" },
+      storage: { sql: { exec: vi.fn(() => ({ toArray: () => [] })) }, getAlarm: vi.fn().mockResolvedValue(null) }
+    },
+    readRequestStatusReceipt: vi.fn().mockResolvedValue(null)
+  }) as ProjectGuard;
+  const read = guard as unknown as {
+    handleRequestStatus(url: URL, correlationId: string, runtime: unknown, repository: unknown): Promise<Response>;
+  };
+
+  const response = await read.handleRequestStatus(
+    new URL("https://guard.internal/request-status?kind=artifact&request_id=ART-8421"),
+    "corr-8421",
+    { objects: {} },
+    {}
+  );
+
+  expect(await response.json()).toMatchObject({
+    status: "recovery_unavailable",
+    observation: { recovery: { durable_intent: true } },
+    recovery: { durable_intent: true }
+  });
+});
 
 it("traces a mutation waiting for the diagnostic queue, without leaking query values", async () => {
   const log = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -77,6 +125,7 @@ it("reports a bounded unknown state instead of false receipt absence during a lo
     queue: Promise.resolve(),
     queueDepth: 0,
     handleRequestStatus,
+    readBoundedRequestStatus: vi.fn(() => handleRequestStatus(new URL("https://guard.internal/request-status"))),
     handleReceiptRead
   }) as ProjectGuard;
   let release!: () => void;
@@ -133,6 +182,207 @@ it("returns a locally committed receipt before waiting on an unrelated long muta
 
   expect(response.status).toBe(200);
   await expect(response.json()).resolves.toEqual(receipt);
+});
+
+it("returns a canonical committed receipt on cache miss while unrelated project work is busy", async () => {
+  const projectId = "PRJ-8409";
+  const requestId = "TXN-8409-REMOTE-RECEIPT";
+  const mock = installDropboxMock();
+  const receipt = {
+    schema_version: "1.0", transaction_id: requestId, project_id: projectId, status: "committed",
+    previous_revision: 7, new_revision: 8
+  };
+  mock.files.set(machineReceiptPath(requestId), JSON.stringify(receipt));
+  mock.files.set(receiptPath(requestId), JSON.stringify(receipt));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (instance) => {
+    (instance as unknown as { queueDepth: number }).queueDepth = 1;
+  });
+
+  const response = await guard.fetch(new Request(`https://project-guard.internal/receipt?kind=transaction&request_id=${requestId}`));
+
+  expect(response.status).toBe(200);
+  await expect(response.json()).resolves.toEqual(receipt);
+  expect(mock.uploadCalls).toHaveLength(0);
+});
+
+it("returns an identity-bound unknown observation when a busy receipt lookup cannot prove absence", async () => {
+  const projectId = "PRJ-8410";
+  const requestId = "TXN-8410-UNKNOWN";
+  const mock = installDropboxMock({ faults: [{
+    endpoint: "/2/files/download", occurrence: 1,
+    status: 503, error_summary: "temporarily/unavailable"
+  }] });
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (instance) => {
+    (instance as unknown as { queueDepth: number }).queueDepth = 1;
+  });
+
+  const response = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${requestId}`, {
+    headers: { "x-project-os-correlation-id": "corr-8410" }
+  });
+  const body = await response.json<Record<string, unknown>>();
+
+  expect(response.status).toBe(503);
+  expect(body).toMatchObject({
+    project_id: projectId, kind: "transaction", request_id: requestId, status: "unknown",
+    correlation_id: "corr-8410",
+    observation: { status: "unknown", recovery: { action: "check_status" } }
+  });
+  expect(mock.uploadCalls).toHaveLength(0);
+  expect(mock.downloadCalls.length).toBeGreaterThan(0);
+});
+
+it("bounds a stalled canonical receipt read and still returns unknown, never absence", async () => {
+  const projectId = "PRJ-8413";
+  const requestId = "TXN-8413-SLOW";
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const mock = installDropboxMock({ faults: [{ endpoint: "/2/files/download", occurrence: 1, status: 503, error_summary: "slow/provider", pause: pending }] });
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (instance) => {
+    const subject = instance as unknown as { queueDepth: number; observationReadDeadlineMs(): number };
+    subject.queueDepth = 1;
+    vi.spyOn(subject, "observationReadDeadlineMs").mockReturnValue(20);
+  });
+  let finished = false;
+  const response = guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${requestId}`)
+    .then((value) => { finished = true; return value; });
+  try {
+    await vi.waitFor(() => expect(finished).toBe(true), { timeout: 2_500 });
+    expect((await response).status).toBe(503);
+    await expect((await response).json()).resolves.toMatchObject({ status: "unknown", request_id: requestId });
+    expect(mock.uploadCalls).toHaveLength(0);
+  } finally {
+    release();
+  }
+});
+
+it("adds a correlated observation without changing legacy request-status fields or writing", async () => {
+  const projectId = "PRJ-8411";
+  const requestId = "TXN-8411-ABSENT";
+  const mock = installDropboxMock();
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+
+  const response = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`, {
+    headers: { "x-project-os-correlation-id": "corr-8411" }
+  });
+  const body = await response.json<Record<string, unknown>>();
+
+  expect(response.status).toBe(200);
+  expect(body).toMatchObject({
+    project_id: projectId, kind: "transaction", request_id: requestId, status: "not_received",
+    observation: {
+      project_id: projectId, kind: "transaction", request_id: requestId,
+      status: "not_received", correlation_id: "corr-8411",
+      recovery: { action: "retry_same_request", owner: "client" }
+    }
+  });
+  expect(mock.uploadCalls).toHaveLength(0);
+});
+
+it("refuses provider receipts bound to a different project or request instead of reporting absence", async () => {
+  const projectId = "PRJ-8412";
+  const projectMismatch = "TXN-8412-WRONG-PROJECT";
+  const requestMismatch = "TXN-8412-WRONG-REQUEST";
+  const mock = installDropboxMock();
+  const otherProject = {
+    schema_version: "1.0", transaction_id: projectMismatch, project_id: "PRJ-9999", status: "committed",
+    previous_revision: 1, new_revision: 2
+  };
+  const otherRequest = {
+    schema_version: "1.0", transaction_id: "TXN-8412-DIFFERENT", project_id: projectId, status: "committed",
+    previous_revision: 1, new_revision: 2
+  };
+  for (const id of [projectMismatch, requestMismatch]) {
+    mock.files.set(machineReceiptPath(id), JSON.stringify(id === projectMismatch ? otherProject : otherRequest));
+    mock.files.set(receiptPath(id), JSON.stringify(id === projectMismatch ? otherProject : otherRequest));
+  }
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+
+  const mismatchedProject = await guard.fetch(
+    `https://project-guard.internal/receipt?kind=transaction&request_id=${projectMismatch}&project_id=PRJ-9999`
+  );
+  expect(mismatchedProject.status).toBe(404);
+  await expect(mismatchedProject.json()).resolves.toEqual({ error: "receipt_not_found" });
+  const mismatchedStatus = await guard.fetch(
+    `https://project-guard.internal/request-status?kind=transaction&request_id=${projectMismatch}&project_id=PRJ-9999`
+  );
+  expect(mismatchedStatus.status).toBe(404);
+  await expect(mismatchedStatus.json()).resolves.toEqual({ error: "request_identity_mismatch" });
+
+  for (const requestId of [projectMismatch, requestMismatch]) {
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    const body = await response.json<Record<string, unknown>>();
+    if (requestId === projectMismatch) {
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({
+        project_id: projectId, request_id: requestId, status: "not_received",
+        observation: { status: "not_received" }
+      });
+    } else {
+      expect(response.status).toBe(503);
+      expect(body).toMatchObject({
+        project_id: projectId, request_id: requestId, status: "unknown",
+        observation: { status: "unknown", code: "request_status_unavailable" }
+      });
+    }
+    expect(body).not.toHaveProperty("receipt");
+  }
+  expect(mock.uploadCalls).toHaveLength(0);
+});
+
+it("does not return local receipts missing project or request identity bindings", async () => {
+  const projectId = "PRJ-8414";
+  const requestId = "TXN-8414-MISSING-IDENTITY";
+  const receiptWithoutProject = {
+    transaction_id: requestId, status: "committed", previous_revision: 1, new_revision: 2
+  };
+  const guard = Object.assign(Object.create(ProjectGuard.prototype), {
+    ctx: {
+      id: { name: projectId },
+      storage: {
+        sql: {
+          exec: vi.fn(() => ({ toArray: () => [{ receipt_json: JSON.stringify(receiptWithoutProject) }] }))
+        }
+      }
+    },
+    queueDepth: 0
+  }) as ProjectGuard;
+
+  const response = await guard.fetch(new Request(`https://project-guard.internal/receipt?kind=transaction&request_id=${requestId}`));
+
+  expect(response.status).toBe(503);
+  await expect(response.json()).resolves.toEqual({ error: "receipt_identity_conflict" });
+});
+
+it("keeps canonical receipts with missing identity fields unknown rather than absent", async () => {
+  const projectId = "PRJ-8415";
+  const transactionId = "TXN-8415-MISSING-PROJECT";
+  const artifactId = "ART-8415-MISSING-PROJECT";
+  const mock = installDropboxMock();
+  mock.files.set(machineReceiptPath(transactionId), JSON.stringify({
+    transaction_id: transactionId, status: "committed", previous_revision: 1, new_revision: 2
+  }));
+  mock.files.set(receiptPath(transactionId), JSON.stringify({
+    transaction_id: transactionId, status: "committed", previous_revision: 1, new_revision: 2
+  }));
+  mock.files.set(machineArtifactReceiptPath(artifactId), JSON.stringify({
+    request_id: artifactId, status: "committed"
+  }));
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+
+  for (const [kind, requestId] of [["transaction", transactionId], ["artifact", artifactId]] as const) {
+    const response = await guard.fetch(
+      `https://project-guard.internal/request-status?kind=${kind}&request_id=${requestId}`
+    );
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      project_id: projectId, kind, request_id: requestId, status: "unknown",
+      observation: { status: "unknown", code: "request_status_unavailable" }
+    });
+  }
+  expect(mock.uploadCalls).toHaveLength(0);
 });
 
 it("fails closed instead of issuing a stale context when the snapshot reader stalls", async () => {

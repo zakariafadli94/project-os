@@ -109,6 +109,12 @@ describe("canonical execution boundary in ProjectGuard", () => {
       method: "POST", body: JSON.stringify(encodeAdmission(transaction, context))
     })).rejects.toThrow("commit_write_unavailable");
     restore();
+    const receiptRead = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(receiptRead.status).toBe(503);
+    await expect(receiptRead.json()).resolves.toMatchObject({
+      project_id: projectId, kind: "transaction", request_id: transaction.transaction_id, status: "unknown",
+      observation: { status: "unknown", recovery: { action: "check_status" } }
+    });
     const status = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${transaction.transaction_id}`);
     expect(await status.json()).toMatchObject({ status: "admitted_uncommitted", recovery: { durable_intent: true } });
     await runDurableObjectAlarm(guard);

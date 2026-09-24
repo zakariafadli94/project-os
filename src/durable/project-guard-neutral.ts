@@ -34,7 +34,7 @@ import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocum
 import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata, ProviderRequestScope } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
-import { MutationIntentConflictError } from "../mutation-gate/repository";
+import { MutationIntentConflictError, MutationGateRepository } from "../mutation-gate/repository";
 import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
@@ -63,6 +63,7 @@ import { matchesResource } from "../rules/resolution";
 import { ExecutionJournal } from "../execution/journal";
 import type { ExecutionAdmission, ExecutionAdapter, ExecutionPlan } from "../execution/contract";
 import { ExecutionCoordinator } from "../execution/coordinator";
+import { persistenceObservation, type RequestKind } from "../persistence/observation";
 import { authorizeRepair, normalizeRepairAdmission, parseRepairIntent, unavailableRepairEvidence, type RepairEvidenceResolver } from "../execution/repair";
 
 interface TransactionRow {
@@ -334,11 +335,22 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "GET" && pathname === "/execution-status") {
+      const projectId = this.ctx.id.name;
+      const kind = url.searchParams.get("kind");
+      const requestId = url.searchParams.get("request_id");
+      if (!projectId || !requestId || !kind) {
+        return Response.json({ error: "execution_identity_required" }, { status: 400 });
+      }
+      if (!["transaction", "document", "artifact", "recovery"].includes(kind)) {
+        return Response.json({ error: "execution_kind_invalid" }, { status: 400 });
+      }
+      if (this.queueDepth > 0) {
+        const correlationId = this.observationCorrelationId(request, url);
+        return ["transaction", "document", "artifact"].includes(kind)
+          ? this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY")
+          : Response.json({ project_id: projectId, kind, request_id: requestId, status: "unknown", code: "PROJECT_OS_READ_BUSY", correlation_id: correlationId }, { status: 503 });
+      }
       return this.readWhenIdle(async () => {
-        const projectId = this.ctx.id.name;
-        const kind = url.searchParams.get("kind");
-        const requestId = url.searchParams.get("request_id");
-        if (!projectId || !kind || !requestId) return Response.json({ error: "execution_identity_required" }, { status: 400 });
         const journal = new ExecutionJournal(this.persistence, projectId, kind, requestId);
         const status = await journal.status();
         return status ? Response.json(status) : Response.json({ error: "execution_not_found" }, { status: 404 });
@@ -346,7 +358,20 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "GET" && pathname === "/request-status") {
-      return this.readWhenIdle(() => this.handleRequestStatus(url));
+      const projectId = this.ctx.id.name;
+      const kind = url.searchParams.get("kind");
+      const requestId = url.searchParams.get("request_id");
+      if (!projectId || !kind || !requestId || !["transaction", "document", "artifact"].includes(kind)) {
+        return Response.json({ error: "request_identity_required" }, { status: 400 });
+      }
+      if (url.searchParams.has("project_id") && url.searchParams.get("project_id") !== projectId) {
+        return Response.json({ error: "request_identity_mismatch" }, { status: 404 });
+      }
+      const correlationId = this.observationCorrelationId(request, url);
+      if (this.queueDepth > 0) {
+        return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
+      }
+      return this.readWhenIdle(() => this.readBoundedRequestStatus(url, correlationId));
     }
 
     if (request.method === "POST" && pathname === "/finalize-materialization") {
@@ -409,9 +434,38 @@ export class ProjectGuard extends DurableObject<Env> {
 
     if (request.method === "GET" && pathname === "/receipt") {
       const url = new URL(request.url);
+      const projectId = this.ctx.id.name;
+      const kind = url.searchParams.get("kind");
+      const requestId = url.searchParams.get("request_id");
+      if (!projectId || !requestId || !kind || !["transaction", "document", "artifact"].includes(kind)) {
+        return this.handleReceiptRead(url);
+      }
+      const correlationId = this.observationCorrelationId(request, url);
+      if (url.searchParams.has("project_id") && url.searchParams.get("project_id") !== projectId) {
+        return Response.json({ error: "receipt_not_found" }, { status: 404 });
+      }
       const localReceipt = await this.handleReceiptRead(url);
       if (localReceipt.status !== 404) return localReceipt;
-      return this.readWhenIdle(() => this.handleReceiptRead(url));
+      if (this.queueDepth > 0) {
+        try {
+          const canonicalReceipt = await this.readBoundedRequestStatusReceipt(projectId, kind as RequestKind, requestId);
+          if (canonicalReceipt) return Response.json(canonicalReceipt);
+        } catch {
+          return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
+        }
+        return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
+      }
+      return this.readWhenIdle(async () => {
+        const recheckedLocal = await this.handleReceiptRead(url);
+        if (recheckedLocal.status !== 404) return recheckedLocal;
+        try {
+          const canonicalReceipt = await this.readBoundedRequestStatusReceipt(projectId, kind as RequestKind, requestId);
+          if (canonicalReceipt) return Response.json(canonicalReceipt);
+          return Response.json({ error: "receipt_not_found" }, { status: 404 });
+        } catch {
+          return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "canonical_receipt_unavailable");
+        }
+      });
     }
 
     if (request.method !== "POST" || pathname !== "/transaction") {
@@ -2192,6 +2246,9 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!requestId || !["transaction", "document", "artifact"].includes(kind ?? "")) {
       return Response.json({ error: "invalid_receipt_query" }, { status: 400 });
     }
+    if (url.searchParams.has("project_id") && url.searchParams.get("project_id") !== this.ctx.id.name) {
+      return Response.json({ error: "receipt_not_found" }, { status: 404 });
+    }
     const row = kind === "transaction"
       ? this.findReceipt(requestId)
       : kind === "document"
@@ -2200,16 +2257,56 @@ export class ProjectGuard extends DurableObject<Env> {
     const receipt = row && typeof row === "object" && "receipt_json" in row
       ? JSON.parse(row.receipt_json)
       : row;
-    if (receipt && typeof receipt === "object" && "project_id" in receipt
-      && receipt.project_id !== this.ctx.id.name) {
+    const identityKey = kind === "transaction" ? "transaction_id" : "request_id";
+    if (receipt && typeof receipt === "object" && (!(identityKey in receipt) || receipt[identityKey] !== requestId)) {
+      return Response.json({ error: "receipt_identity_conflict" }, { status: 503 });
+    }
+    if (receipt && typeof receipt === "object" && !("project_id" in receipt)) {
+      return Response.json({ error: "receipt_identity_conflict" }, { status: 503 });
+    }
+    if (receipt && typeof receipt === "object" && receipt.project_id !== this.ctx.id.name) {
       return Response.json({ error: "receipt_not_found" }, { status: 404 });
     }
     return receipt ? Response.json(receipt) : Response.json({ error: "receipt_not_found" }, { status: 404 });
   }
 
+  private observationCorrelationId(request: Request, url: URL): string {
+    const value = request.headers.get("x-project-os-correlation-id")
+      ?? url.searchParams.get("correlation_id");
+    return value && value.length <= 128 ? value : crypto.randomUUID();
+  }
+
+  private unknownObservationResponse(
+    projectId: string,
+    kind: string,
+    requestId: string,
+    correlationId: string,
+    code: string
+  ): Response {
+    const observedAt = new Date().toISOString();
+    const observation = persistenceObservation({
+      project_id: projectId,
+      kind: kind as RequestKind,
+      request_id: requestId,
+      observed_at: observedAt,
+      correlation_id: correlationId,
+      code
+    });
+    return Response.json({
+      project_id: projectId, kind, request_id: requestId,
+      status: "unknown", code, correlation_id: correlationId, observed_at: observedAt,
+      observation
+    }, { status: 503, headers: { "Retry-After": "1" } });
+  }
+
   /** A read-only recovery view. In particular, it must not certify an effect,
    * replay a write, or create a receipt merely because a chat asked about it. */
-  private async handleRequestStatus(url: URL): Promise<Response> {
+  private async handleRequestStatus(
+    url: URL,
+    correlationId: string,
+    runtime: ProjectOsPersistenceRuntime = this.persistence,
+    repository: ProjectRepository = this.repository
+  ): Promise<Response> {
     const projectId = this.ctx.id.name;
     const requestId = url.searchParams.get("request_id");
     const kind = url.searchParams.get("kind");
@@ -2217,14 +2314,16 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ error: "request_identity_required" }, { status: 400 });
     }
     try {
-      const execution = await new ExecutionJournal(this.persistence, projectId, kind, requestId).status();
-      const receipt = await this.readRequestStatusReceipt(projectId, kind as "transaction" | "document" | "artifact", requestId);
-      const intent = kind === "document" ? await this.managedDocumentRequests.readIntent(projectId, requestId)
-        : kind === "transaction" ? await this.transactionRequests.readIntent(projectId, requestId) : null;
+      const execution = await new ExecutionJournal(runtime, projectId, kind, requestId).status();
+      const receipt = await this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository);
+      const intent = kind === "document" ? await new ManagedDocumentRequestLedger(runtime.objects).readIntent(projectId, requestId)
+        : kind === "transaction" ? await new TransactionRequestLedger(runtime.objects).readIntent(projectId, requestId) : null;
+      const artifactIntent = kind === "artifact" ? await new MutationGateRepository(runtime).readArtifactIntent(projectId, requestId) : null;
       const queued = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_id: string }>(
         "SELECT request_id FROM request_recovery WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray().length > 0;
-      const wakeScheduled = queued && await this.ctx.storage.getAlarm() !== null;
+      const alarmAt = queued ? await this.ctx.storage.getAlarm() : null;
+      const wakeScheduled = queued && alarmAt !== null;
       const staged = (kind === "document" || kind === "transaction") ? this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
         "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray()[0] : undefined;
@@ -2287,19 +2386,48 @@ export class ProjectGuard extends DurableObject<Env> {
               ? "admitted_uncommitted"
               : wakeScheduled && recoverableIntent
                 ? "recovery_scheduled"
-              : intent || staged || queued
+              : intent || artifactIntent || staged || queued
                 ? "recovery_unavailable"
               : "not_received";
+      const observedAt = new Date().toISOString();
+      const lease = execution?.lease && typeof execution.lease === "object"
+        ? execution.lease as { owner?: unknown; until?: unknown }
+        : null;
+      const leaseUntil = typeof lease?.until === "string" ? Date.parse(lease.until) : Number.NaN;
+      const running = typeof lease?.owner === "string" && lease.owner.length > 0
+        && Number.isFinite(leaseUntil) && leaseUntil > Date.now();
+      const observation = persistenceObservation({
+        project_id: projectId,
+        kind: kind as RequestKind,
+        request_id: requestId,
+        observed_at: observedAt,
+        correlation_id: correlationId,
+        ...(receipt ? { receipt } : {}),
+        execution: execution && typeof execution.status === "string" ? {
+          status: execution.status,
+          ...(typeof execution.terminal === "boolean" ? { terminal: execution.terminal } : {}),
+          ...(typeof execution.finalization_ref === "string" || execution.finalization_ref === null
+            ? { finalization_ref: execution.finalization_ref } : {})
+        } : null,
+        durable_intent: Boolean(intent || artifactIntent || recoverableIntent || staged || execution),
+        absence_verified: status === "not_received",
+        wake_scheduled: wakeScheduled && alarmAt !== null,
+        ...(wakeScheduled && alarmAt !== null ? { next_attempt_at: new Date(alarmAt).toISOString() } : {}),
+        running,
+        blocked: Boolean(queued && failure?.stopped),
+        code: recoveryCode ?? (failure?.stopped ? "identical_internal_failure_limit" : null)
+      });
       return Response.json({
         project_id: projectId,
         kind,
         request_id: requestId,
         status,
+        observation,
         ...(receipt ? { receipt } : {}),
         ...(execution ? { execution } : {}),
-        ...(intent || staged || queued || (kind === "transaction" && execution && !receipt) ? {
+        ...(intent || artifactIntent || staged || queued || (kind === "transaction" && execution && !receipt) ? {
           recovery: {
-            durable_intent: Boolean(intent),
+            durable_intent: Boolean(intent || artifactIntent),
             recoverable: recoverableIntent,
             scheduled: wakeScheduled && !failure?.stopped,
             ...(failure?.stopped ? { code: failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit", attempts: failure.count }
@@ -2314,7 +2442,14 @@ export class ProjectGuard extends DurableObject<Env> {
         kind,
         request_id: requestId,
         status: "unknown",
-        code: "request_status_unavailable"
+        code: "request_status_unavailable",
+        correlation_id: correlationId,
+        observed_at: new Date().toISOString(),
+        observation: persistenceObservation({
+          project_id: projectId, kind: kind as RequestKind, request_id: requestId,
+          observed_at: new Date().toISOString(), correlation_id: correlationId,
+          code: "request_status_unavailable"
+        })
       }, { status: 503 });
     }
   }
@@ -2322,28 +2457,140 @@ export class ProjectGuard extends DurableObject<Env> {
   private async readRequestStatusReceipt(
     projectId: string,
     kind: "transaction" | "document" | "artifact",
-    requestId: string
+    requestId: string,
+    runtime: ProjectOsPersistenceRuntime = this.persistence,
+    repository: ProjectRepository = this.repository,
+    pendingIsUnknown = false
   ): Promise<unknown | null> {
     if (kind === "transaction") {
-      const receipt = this.findReceipt(requestId) ?? await this.repository.readReceipt(requestId);
-      if (receipt) return receipt.project_id === projectId ? receipt : null;
-      const admitted = await new ExecutionJournal(this.persistence, projectId, "transaction", requestId).readAdmission();
-      if (!admitted) return null;
-      const record = await this.repository.readCommitRecord(projectId, admitted.admission.project_revision + 1);
-      return record?.transaction.transaction_id === requestId
-        && await sha256Canonical(record.transaction) === admitted.admission.request_hash
-        ? record.receipt : null;
+      const receipt = this.findReceipt(requestId) ?? await repository.readReceipt(requestId);
+      if (receipt) {
+        if (typeof receipt.project_id !== "string") throw new Error("receipt_project_binding_missing");
+        if (receipt.project_id !== projectId) return null;
+        if (receipt.transaction_id !== requestId) throw new Error("receipt_identity_conflict");
+        return receipt;
+      }
+      const admitted = await new ExecutionJournal(runtime, projectId, "transaction", requestId).readAdmission();
+      if (!admitted) {
+        if (pendingIsUnknown && await new TransactionRequestLedger(runtime.objects).readIntent(projectId, requestId)) {
+          throw new Error("receipt_pending_durable_intent");
+        }
+        return null;
+      }
+      if (pendingIsUnknown) throw new Error("receipt_pending_execution_admission");
+      const record = await repository.readCommitRecord(projectId, admitted.admission.project_revision + 1);
+      if (!record) return null;
+      if (record.project_id !== projectId || record.transaction.transaction_id !== requestId
+        || record.receipt.project_id !== projectId || record.receipt.transaction_id !== requestId
+        || await sha256Canonical(record.transaction) !== admitted.admission.request_hash) {
+        throw new Error("receipt_commit_binding_conflict");
+      }
+      return record.receipt;
     }
     if (kind === "document") {
-      const durable = await this.managedDocumentRequests.readReceipt(projectId, requestId);
-      return durable ? JSON.parse(durable.receipt_json) : null;
+      const durable = await new ManagedDocumentRequestLedger(runtime.objects).readReceipt(projectId, requestId);
+      if (!durable) {
+        if (pendingIsUnknown && await new ManagedDocumentRequestLedger(runtime.objects).readIntent(projectId, requestId)) {
+          throw new Error("receipt_pending_durable_intent");
+        }
+        return null;
+      }
+      const receipt = JSON.parse(durable.receipt_json) as { request_id?: unknown; project_id?: unknown };
+      if (receipt.request_id !== requestId || receipt.project_id !== projectId) throw new Error("receipt_identity_conflict");
+      return receipt;
     }
-    const raw = await this.persistence.objects.readText(machineArtifactReceiptPath(requestId));
-    if (raw === null) return null;
+    const raw = await runtime.objects.readText(machineArtifactReceiptPath(requestId));
+    if (raw === null) {
+      if (pendingIsUnknown) {
+        const execution = await new ExecutionJournal(runtime, projectId, "artifact", requestId).status();
+        const artifactIntent = await new MutationGateRepository(runtime).readArtifactIntent(projectId, requestId);
+        if (execution || artifactIntent) throw new Error("receipt_pending_durable_intent");
+      }
+      return null;
+    }
     const receipt = JSON.parse(raw) as { request_id?: unknown; project_id?: unknown };
-    if (receipt.request_id !== requestId) throw new Error("artifact_receipt_identity_conflict");
+    if (typeof receipt.project_id !== "string" || typeof receipt.request_id !== "string") {
+      throw new Error("artifact_receipt_binding_missing");
+    }
     if (receipt.project_id !== projectId) return null;
+    if (receipt.request_id !== requestId) throw new Error("artifact_receipt_identity_conflict");
     return receipt;
+  }
+
+  private async readBoundedRequestStatusReceipt(
+    projectId: string,
+    kind: RequestKind,
+    requestId: string
+  ): Promise<unknown | null> {
+    const deadlineMs = Date.now() + this.observationReadDeadlineMs();
+    const controller = new AbortController();
+    let calls = 0;
+    const runtime = createProductionPersistence(this.env, projectId, {
+      deadlineMs,
+      signal: controller.signal,
+      now: () => Date.now(),
+      beforeHttp: () => {
+        if (Date.now() >= deadlineMs || calls >= 8) throw new Error("canonical_receipt_budget_exhausted");
+        calls += 1;
+      }
+    });
+    const repository = new ProjectRepository(runtime, this.layoutMode);
+    const source = this.readRequestStatusReceipt(projectId, kind, requestId, runtime, repository, true);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("canonical_receipt_deadline");
+        controller.abort(error);
+        reject(error);
+      }, Math.max(1, deadlineMs - Date.now()));
+    });
+    try {
+      return await Promise.race([source, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private async readBoundedRequestStatus(url: URL, correlationId: string): Promise<Response> {
+    const projectId = this.ctx.id.name;
+    const kind = url.searchParams.get("kind");
+    const requestId = url.searchParams.get("request_id");
+    if (!projectId || !requestId || !kind || !["transaction", "document", "artifact"].includes(kind)) {
+      return Response.json({ error: "request_identity_required" }, { status: 400 });
+    }
+    const deadlineMs = Date.now() + this.observationReadDeadlineMs();
+    const controller = new AbortController();
+    let calls = 0;
+    const runtime = createProductionPersistence(this.env, projectId, {
+      deadlineMs,
+      signal: controller.signal,
+      now: () => Date.now(),
+      beforeHttp: () => {
+        if (Date.now() >= deadlineMs || calls >= 32) throw new Error("request_status_budget_exhausted");
+        calls += 1;
+      }
+    });
+    const repository = new ProjectRepository(runtime, this.layoutMode);
+    const source = this.handleRequestStatus(url, correlationId, runtime, repository);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("request_status_deadline");
+        controller.abort(error);
+        reject(error);
+      }, Math.max(1, deadlineMs - Date.now()));
+    });
+    try {
+      return await Promise.race([source, timeout]);
+    } catch {
+      return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "request_status_unavailable");
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private observationReadDeadlineMs(): number {
+    return 5_000;
   }
 
   private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<void> {

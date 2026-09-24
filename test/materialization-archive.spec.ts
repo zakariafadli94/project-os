@@ -64,19 +64,28 @@ function projectionStub(projectId: string) {
 }
 
 async function materializeThroughContinuations(projectId: string): Promise<void> {
+  if (!vi.isFakeTimers()) vi.useFakeTimers();
   const stub = projectionStub(projectId);
   await runInDurableObject(stub, (instance) => {
     (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({
       [projectId]: "repair"
     });
   });
-  for (let slice = 0; slice < 64; slice += 1) if (!await runDurableObjectAlarm(stub)) return;
+  // Projection repair now shares bounded provider-call slices with canonical
+  // state reconstruction and four-view verification. Advance virtual time to
+  // each durable wake instead of invoking a future alarm early.
+  for (let slice = 0; slice < 128; slice += 1) {
+    const dueAt = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+    if (dueAt === null) return;
+    vi.setSystemTime(Math.max(Date.now(), dueAt));
+    await runDurableObjectAlarm(stub);
+  }
 }
 
 async function materializeUntil(projectId: string, reached: () => boolean): Promise<void> {
   const stub = projectionStub(projectId);
   let lastStatus: number | null = null;
-  for (let slice = 0; slice < 64; slice += 1) {
+  for (let slice = 0; slice < 128; slice += 1) {
     const response = await stub.fetch("https://materialization-guard.internal/materialize", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -84,6 +93,18 @@ async function materializeUntil(projectId: string, reached: () => boolean): Prom
     });
     lastStatus = response.status;
     expect([200, 202]).toContain(response.status);
+    if (reached()) return;
+    // A bounded request can enqueue durable repair rather than advancing it
+    // synchronously. Drive the owned continuation before asking again.
+    const dueAt = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+    if (dueAt !== null && vi.isFakeTimers()) vi.setSystemTime(Math.max(Date.now(), dueAt));
+    try {
+      await runDurableObjectAlarm(stub);
+    } catch (error) {
+      // The resume test deliberately injects a generation-record write fault;
+      // the alarm must persist its retry even though the provider error escapes.
+      if (!reached()) throw error;
+    }
     if (reached()) return;
   }
   const status = await stub.fetch("https://materialization-guard.internal/status");

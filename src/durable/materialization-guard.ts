@@ -124,6 +124,21 @@ export class MaterializationGuard extends DurableObject<Env> {
         );
         if (convergenceMode === "repair") {
           if (!await this.resumeConvergenceFromVerifiedHead()) return false;
+          // Once the writer has durably recorded its final output-verification
+          // cursor, resume that bounded proof directly. Re-running discovery,
+          // canonical-derivative and journal preflight work on every wake can
+          // consume the calls needed for the four-view publication proof.
+          // The coordinator retains the shared 32-call budget and fresh view
+          // identity checks; successful publication is acknowledged by the
+          // normal verified-head resume path on the next wake.
+          if (this.ledger.finalVerificationActive()) {
+            const { coordinator } = this.coordinatorForSlice(true, true);
+            const result = await coordinator.runNext(alarmInfo?.retryCount ?? 0);
+            if (result.more_work || result.completed) {
+              await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+            }
+            return result.completed || !result.more_work;
+          }
           if (await this.ensureConvergenceRequestedFromLedger()) {
             await this.scheduleConvergenceContinuation(true, new Date().toISOString());
             return;
@@ -521,6 +536,22 @@ export class MaterializationGuard extends DurableObject<Env> {
       return Response.json({ error: "invalid_materialize_target" }, { status: 400 });
     }
 
+    // The direct legacy writer is disabled outside the explicit repair
+    // rollout. Refuse it before reconstructing canonical state: the refusal
+    // depends only on this bound DO identity and rollout configuration, and
+    // must remain deterministic even for an unproven legacy snapshot.
+    const convergenceMode = convergenceModeForProject(
+      this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES,
+      this.projectId
+    );
+    if (this.layoutMode === "v2" && convergenceMode !== "repair") {
+      return Response.json({
+        error: "convergence_writer_inactive",
+        project_id: this.projectId,
+        mode: convergenceMode
+      }, { status: 409 });
+    }
+
     const { coordinator, repository, canonicalRepository, budget } = this.coordinatorForSlice();
     const state = await this.canonicalState(canonicalRepository, budget);
     if (!state.complete) return this.canonicalStatePendingResponse();
@@ -530,17 +561,6 @@ export class MaterializationGuard extends DurableObject<Env> {
     const record = canonicalState.revision > 0
       ? await repository.readCommitRecord(canonicalState.project_id, canonicalState.revision)
       : null;
-    const convergenceMode = convergenceModeForProject(
-      this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES,
-      this.projectId
-    );
-    if (this.layoutMode === "v2" && convergenceMode !== "repair") {
-      return Response.json({
-        error: "convergence_writer_inactive",
-        project_id: canonicalState.project_id,
-        mode: convergenceMode
-      }, { status: 409 });
-    }
     if (record) {
       if (convergenceMode === "repair") {
         if (!await this.resumeConvergenceFromVerifiedHead()) {

@@ -363,6 +363,8 @@ export class ManagedDocumentChangeCoordinator {
     const gate = await this.mutationGate.processChanges(state, [job.change], job.detection_source);
     accumulateGate(summary, gate);
 
+    if (await this.observeNavigationIndexDrift(state, job.change, summary, job.job_id)) return;
+
     if (await this.observePackageDrift(state, job.change, summary, job.job_id)) return;
 
     const stable = await this.stableWorkProducts.reconcile(state, job.change);
@@ -388,6 +390,7 @@ export class ManagedDocumentChangeCoordinator {
   ): Promise<ProviderChangeEntry[]> {
     const unhandled: ProviderChangeEntry[] = [];
     for (const change of changes) {
+      if (await this.observeNavigationIndexDrift(state, change, summary)) continue;
       if (await this.observePackageDrift(state, change, summary)) continue;
       const stable = await this.stableWorkProducts.reconcile(state, change);
       if (stable.handled) accumulateStable(summary, stable);
@@ -447,6 +450,34 @@ export class ManagedDocumentChangeCoordinator {
     return true;
   }
 
+  private async observeNavigationIndexDrift(
+    state: ProjectState,
+    change: ProviderChangeEntry,
+    summary: ManagedDocumentChangeSummary,
+    jobId?: string
+  ): Promise<boolean> {
+    const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
+    if (!change.path.startsWith(root)) return false;
+    const relative = change.path.slice(root.length);
+    if (!/^(WORKING|REVIEW|DELIVERABLES)\/(00-CURRENT-INDEX\.md|00-CURRENT\.md)$/.test(relative)) return false;
+    summary.drift_findings += 1;
+    summary.conflicts += 1;
+    if (this.jobs) {
+      const resolvedJobId = jobId ?? `CHGJOB-${(await sha256Text(JSON.stringify({ project_id: state.project_id, path: change.path, kind: change.kind }))).slice(0, 24).toUpperCase()}`;
+      const findingId = `DRIFT-${(await sha256Text(JSON.stringify({ project_id: state.project_id, job_id: resolvedJobId, path: change.path, code: "navigation_index_external_change" }))).slice(0, 24).toUpperCase()}`;
+      this.jobs.recordDriftFinding({
+        finding_id: findingId,
+        job_id: resolvedJobId,
+        path: change.path,
+        change_kind: change.kind,
+        status: "unexpected_conflict",
+        code: "navigation_index_external_change",
+        observed_at: new Date().toISOString()
+      });
+    }
+    return true;
+  }
+
   private async bootstrapBaseline(
     state: ProjectState,
     changes: ProviderChangeEntry[]
@@ -493,6 +524,7 @@ export class ManagedDocumentChangeCoordinator {
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!change.path.startsWith(root)) return null;
     const relative = change.path.slice(root.length);
+    if (/^(WORKING|REVIEW|DELIVERABLES)\/(00-CURRENT-INDEX\.md|00-CURRENT\.md)$/.test(relative)) return null;
     if (relative.toUpperCase().startsWith("REVIEW/CANDIDATES/")) return null;
 
     if (relative.startsWith("DELIVERABLES/") && relative.length > "DELIVERABLES/".length) {

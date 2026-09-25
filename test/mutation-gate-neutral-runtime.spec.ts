@@ -98,6 +98,20 @@ it("coordinates managed-document reconciliation through the neutral change feed"
   expect(cursors.values.get("managed-document-change-cursor-v1")).toBe("cursor-1");
 });
 
+it("reserves both navigation index names during baseline reconciliation", async () => {
+  const runtime = neutralRuntime();
+  runtime.changeFeed.listChanges = async () => ({ entries: [
+    { kind: "deleted", name: "00-CURRENT-INDEX.md", path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/WORKING/00-CURRENT-INDEX.md" },
+    { kind: "deleted", name: "00-CURRENT.md", path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/REVIEW/00-CURRENT.md" }
+  ], cursor: "navigation-baseline" });
+  const cursors = cursorStore();
+
+  const summary = await new ManagedDocumentChangeCoordinator(runtime, cursors.store, "observe").reconcile(state());
+
+  expect(summary).toMatchObject({ baseline: true, conflicts: 2, drift_findings: 2, bootstrapped: 0, restored: 0 });
+  expect(summary.changed_document_ids).toEqual([]);
+});
+
 it("resets a stale neutral change-feed cursor before rebuilding the baseline", async () => {
   const runtime = neutralRuntime();
   let calls = 0;

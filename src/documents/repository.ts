@@ -47,6 +47,7 @@ import { upcastDropboxV1Observation, type ProviderObservation } from "../schema/
 import { schemaWriterStageFor } from "../schema/runtime-policy";
 import { writesProviderV2, type SchemaWriterStage } from "../schema/writer-stage";
 import { sha256Text } from "./hash";
+import { ZoneNavigationSources } from "./zone-navigation-sources";
 import { packageIdFor, packageManifestPath, packageRefSchema, parsePackageManifest, packageNavigationPath, packageNavigationLedgerSchema, type PackageNavigation, type FrozenPackageManifest, type PackageRef } from "../domain/document-package";
 import { renderPackageIndex } from "../render/package-navigation";
 import { canonicalJson } from "../rules/contract";
@@ -310,10 +311,19 @@ export class DocumentLedgerRepository {
       }
     }
 
-    await this.runtime.objects.upsertText(
-      machineDocumentHeadPath(validated.project_id, validated.document_id),
-      pretty(serialized)
-    );
+    const path = machineDocumentHeadPath(validated.project_id, validated.document_id);
+    const previous = await this.readHead(validated.project_id, validated.document_id);
+    const affectedZones = navigationHeadZones(previous, validated);
+    const sources = new ZoneNavigationSources(this.runtime);
+    const tickets = affectedZones.length
+      ? await sources.beginHeadWrites(validated.project_id, affectedZones, `head:${validated.document_id}`)
+      : [];
+    const exactContent = pretty(serialized);
+    await this.runtime.objects.upsertText(path, exactContent);
+    if (tickets.length) {
+      if (await this.runtime.objects.readText(path) !== exactContent) throw new Error("navigation_source_head_write_unverified");
+      await sources.completeHeadWrites(tickets);
+    }
   }
 
   async readProviderFileBinding(projectId: string, providerFileId: string): Promise<ProviderFileBindingRecord | null> {
@@ -860,6 +870,27 @@ function referenceCollectionFromVersion(record: CurrentDocumentVersionRecord): s
   if (!relative.endsWith(suffix)) return relative === record.logical_path ? "UNCLASSIFIED" : undefined;
   const collection = relative.slice(0, -suffix.length);
   return collection || "UNCLASSIFIED";
+}
+
+function navigationHeadZones(
+  previous: CurrentManagedDocumentHead | null,
+  next: CurrentManagedDocumentHead
+): import("../domain/zone-navigation").NavigationZone[] {
+  if (next.kind !== "work_product" && previous?.kind !== "work_product") return [];
+  const candidates = [
+    ["WORKING", "working_version_id", "working"],
+    ["REVIEW", "review_version_id", "review"],
+    ["DELIVERABLES", "published_version_id", "published"]
+  ] as const;
+  return candidates.filter(([, pointer, stage]) => {
+    const oldPointer = previous?.[pointer];
+    const newPointer = next[pointer];
+    const oldProvider = previous?.provider?.[stage];
+    const newProvider = next.provider?.[stage];
+    return oldPointer !== newPointer
+      || previous?.logical_path !== next.logical_path
+      || canonicalJson(oldProvider ?? null) !== canonicalJson(newProvider ?? null);
+  }).map(([zone]) => zone);
 }
 
 function pretty(value: unknown): string {

@@ -1142,14 +1142,21 @@ describe("canonical execution boundary in ProjectGuard", () => {
       if (revision === 9101) vi.setSystemTime(Date.now() + 60_001);
       return null;
     });
-    const deadlineResponse = await runInDurableObject(guard, (instance) =>
-      (instance as unknown as { finalizeCurrentMaterialization(request: Request): Promise<Response> })
-        .finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-        }))
-    );
+    // The production route and alarm both use this serialized queue. This
+    // fixture calls the slice directly, so remove an earlier alarm and avoid
+    // installing a new one until the slice itself yields and rearms it.
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.deleteAlarm();
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+    const deadlineResponse = await runInDurableObject(guard, (instance) => {
+      const object = instance as any;
+      return object.serialize(() => object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+      }), false));
+    });
     expect(deadlineResponse.status).toBe(202);
     // The persisted cursor below proves this invocation consumed exactly one
     // candidate. A prototype-wide spy can also see unrelated guard alarms.

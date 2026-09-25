@@ -10,6 +10,9 @@ it("separates server support, authorization and unobservable client tools", () =
     authorized: { read: true, mutate: false }, callable_in_this_session: null,
     runtime_readiness: "not_probed"
   });
+  // The server cannot observe client tool mounting, so it must not claim
+  // a missing connector when this very tool has just been called.
+  expect(result).not.toHaveProperty("missing_client_capability");
   expect(JSON.stringify(result)).not.toContain("Bearer");
 });
 
@@ -19,5 +22,12 @@ it("discovers capabilities without loading canonical project content", async () 
     _registeredTools: Record<string, { handler(input: unknown): Promise<{ content: Array<{ text: string }> }> }>
   };
   const result = await server._registeredTools.project_os_get_capabilities!.handler({});
-  expect(JSON.parse(result.content[0]!.text)).toMatchObject({ callable_in_this_session: null, authorized: { read: true, mutate: false } });
+  const manifest = JSON.parse(result.content[0]!.text);
+  expect(manifest).toMatchObject({
+    callable_in_this_session: null,
+    runtime_readiness: "not_probed",
+    server_supported: { typed_transactions: true },
+    authorized: { read: true, mutate: false }
+  });
+  expect(manifest).not.toHaveProperty("missing_client_capability");
 });

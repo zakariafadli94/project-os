@@ -3,6 +3,7 @@ import { createExecutionContext, runDurableObjectAlarm, runInDurableObject, wait
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/env";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 const testEnv = env as unknown as Env;
@@ -141,10 +142,38 @@ describe("inbox entry isolation", () => {
         [projectId]: "repair"
       });
     });
+    const requestedResponse = await projectionStub.fetch("https://materialization-guard.internal/request-target", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, revision: 3, projection_version: CURRENT_PROJECTION_VERSION })
+    });
+    expect(requestedResponse.status).toBe(200);
+    await expect(requestedResponse.json()).resolves.toMatchObject({
+      project_id: projectId,
+      requested: { revision: 3, projection_version: CURRENT_PROJECTION_VERSION }
+    });
+
+    const taskViewPath = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`;
+    type MaterializationStatus = {
+      canonical_revision: number;
+      materialized_head: { revision: number; projection_version: number } | null;
+      requested: { revision: number; projection_version: number } | null;
+      blocked_error: unknown;
+    };
+    let terminalStatus: MaterializationStatus | undefined;
+    let materialized = false;
     for (let slice = 0; slice < 64; slice += 1) {
-      if (!await runDurableObjectAlarm(projectionStub)) break;
-      if (mock.files.has(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`)) break;
+      const ranAlarm = await runDurableObjectAlarm(projectionStub);
+      const statusResponse = await projectionStub.fetch("https://materialization-guard.internal/diagnostic-status");
+      expect(statusResponse.status, `materialization status failed after slice ${slice + 1}`).toBe(200);
+      terminalStatus = await statusResponse.json<MaterializationStatus>();
+      materialized = terminalStatus.materialized_head?.revision === 3
+        && terminalStatus.materialized_head.projection_version === CURRENT_PROJECTION_VERSION
+        && mock.files.has(taskViewPath);
+      if (materialized) break;
+      if (!ranAlarm) break;
     }
-    expect(mock.files.get(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-inbox-ordering/TASKS/${taskId}.md`)).toContain("Status: active");
+    expect(materialized, `repair target did not converge: ${JSON.stringify({ terminalStatus, taskViewPresent: mock.files.has(taskViewPath) })}`).toBe(true);
+    expect(mock.files.get(taskViewPath)).toContain("Status: active");
   }, 60_000);
 });

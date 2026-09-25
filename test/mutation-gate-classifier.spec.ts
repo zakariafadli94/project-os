@@ -257,7 +257,7 @@ describe("MutationGateClassifier", () => {
     const metadata = await transport.seed(path, content, "id:binary-final");
 
     await expect(new MutationGateClassifier(runtime).classify(current, path, metadata))
-      .resolves.toEqual({ kind: "governed_inflight", requestId });
+      .resolves.toEqual({ kind: "governed_inflight", requestId, artifact_destination_known: true });
     expect(transport.downloadPaths).not.toContain(path);
   });
 
@@ -296,7 +296,7 @@ describe("MutationGateClassifier", () => {
 
     const restored = await transport.seed(path, originalContent, "id:restored-copy");
     await expect(new MutationGateClassifier(runtime).classify(current, path, restored))
-      .resolves.toEqual({ kind: "governed_inflight", requestId });
+      .resolves.toEqual({ kind: "governed_inflight", requestId, artifact_destination_known: true });
     expect(transport.downloadPaths).not.toContain(path);
 
     await runtime.objects.createText(machineArtifactReceiptPath(requestId), '{"status":"committed"}\n');

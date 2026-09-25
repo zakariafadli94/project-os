@@ -142,7 +142,7 @@ describe("Control Tower governed artifact submission", () => {
     ]);
   });
 
-  it("bounds context fetch by the single deadline and never submits without context", async () => {
+  it("bounds context fetch by its 10-second deadline and never submits without context", async () => {
     vi.useFakeTimers();
     let receivedSignal: AbortSignal | null | undefined;
     let releaseContext!: (response: Response) => void;
@@ -171,7 +171,32 @@ describe("Control Tower governed artifact submission", () => {
     expect(calls).toEqual(["/mutation-context"]);
   }, 2000);
 
-  it("bounds response JSON parsing after the one POST and returns unknown without retry", async () => {
+  it("keeps one ordinary submission alive for 30 seconds and returns committed without aborting", async () => {
+    vi.useFakeTimers();
+    const transaction = {
+      schema_version: "1.0", transaction_id: "TXN-CONTROL-TOWER-30000", project_id: "PRJ-0007", operation: "decision.accept",
+      base_revision: 1, created_at: "2026-09-24T10:00:00.000Z", payload: {}
+    };
+    let submissionSignal: AbortSignal | null | undefined;
+    const stub = { fetch: async (input: string, init?: RequestInit) => {
+      if (new URL(input).pathname === "/mutation-context") return Response.json({ context: validMutationContext() });
+      submissionSignal = init?.signal;
+      return await new Promise<Response>((resolve) => setTimeout(() => resolve(Response.json({
+        status: "committed", transaction_id: transaction.transaction_id, project_id: transaction.project_id
+      })), 30_000));
+    } };
+    const server = createControlTowerServer({
+      PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
+      REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
+    }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }> }> };
+    const pending = server._registeredTools.project_os_submit_transaction.handler({ project_id: transaction.project_id, request: transaction });
+    await vi.advanceTimersByTimeAsync(30_000);
+    const result = await pending;
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ status: "committed", transaction_id: transaction.transaction_id });
+    expect(submissionSignal?.aborted).toBe(false);
+  }, 2000);
+
+  it("bounds response JSON parsing at 40 seconds after the one POST and returns unknown without retry", async () => {
     vi.useFakeTimers();
     const calls: Array<{ path: string; correlation: string | null; signal: AbortSignal | null }> = [];
     const blockedJson = { ok: true, json: () => new Promise<unknown>(() => {}) } as unknown as Response;
@@ -186,6 +211,12 @@ describe("Control Tower governed artifact submission", () => {
     }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }> }> };
     const pending = server._registeredTools.project_os_submit_artifact.handler({ project_id: artifact.project_id, request: artifact });
     await vi.advanceTimersByTimeAsync(10_001);
+    let settled = false;
+    void pending.finally(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(calls[1]!.signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(30_001);
     await Promise.resolve();
     const result = await pending;
     expect(calls.map((call) => call.path)).toEqual(["/mutation-context", "/artifact"]);
@@ -336,7 +367,12 @@ describe("Control Tower governed artifact submission", () => {
       REGISTRY_GUARD: { getByName: () => registry } as unknown as DurableObjectNamespace
     }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }> }> };
     const submission = server._registeredTools.project_os_submit_transaction.handler({ project_id: "PRJ-AUTO", request: transaction });
+    let settled = false;
+    void submission.finally(() => { settled = true; });
     await vi.advanceTimersByTimeAsync(10_001);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(30_001);
     const submissionResult = await submission;
     expect(JSON.parse(submissionResult.content[0]!.text)).toMatchObject({
       status: "unknown", request_id: transaction.transaction_id,

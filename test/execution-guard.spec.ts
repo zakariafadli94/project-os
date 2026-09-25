@@ -23,6 +23,7 @@ import { createProductionPersistence } from "../src/persistence/production-facto
 import { ProjectRepository } from "../src/persistence/repository";
 import { ExecutionJournal } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
+import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ProviderConflictError, ProviderOperationError } from "../src/persistence/provider/errors";
 
 const testEnv = env as unknown as Env;
@@ -1935,6 +1936,126 @@ describe("canonical execution boundary in ProjectGuard", () => {
       expect(JSON.parse(failure!.message)).toMatchObject({ classification: "provider_temporary", code: "provider_http_503" });
       expect(await state.storage.getAlarm()).not.toBeNull();
     });
+  });
+
+  it("automatically resumes an admitted navigation request by alarm without status polling", async () => {
+    const projectId = "PRJ-8320";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-WORKING-8320",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const inventoryPages: Array<{ cursor: string | null; calls_left: number }> = [];
+    const originalListPage = ZoneNavigationInventory.prototype.listPage;
+    vi.spyOn(ZoneNavigationInventory.prototype, "listPage").mockImplementation(async function (
+      this: ZoneNavigationInventory,
+      input: Parameters<ZoneNavigationInventory["listPage"]>[0]
+    ) {
+      inventoryPages.push({ cursor: input.cursor, calls_left: input.budget.calls_left });
+      return originalListPage.call(this, input);
+    });
+    const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context } = await contextResponse.json<{ context: never }>();
+    const response = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    const initial = await response.json<{ status: string; code?: string }>();
+    expect(["pending", "committed"]).toContain(initial.status);
+
+    // Do not call execution-status or request-status to wake navigation.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const headPath = [...mock.files.keys()].find((path) => path.endsWith("/navigation/WORKING/head.json"));
+      const sourcePath = [...mock.files.keys()].find((path) => path.endsWith("/navigation-sources/state.json"));
+      const adopted = sourcePath ? JSON.parse(mock.files.get(sourcePath)!).zones.WORKING.adopted : false;
+      if (headPath && JSON.parse(mock.files.get(headPath)!).generation === 1 && adopted) break;
+      await runInDurableObject(guard, (instance) => instance.alarm());
+    }
+    const headPath = [...mock.files.keys()].find((path) => path.endsWith("/navigation/WORKING/head.json"));
+    expect(headPath).toBeDefined();
+    expect(inventoryPages.some(({ cursor }) => cursor?.startsWith("packages:"))).toBe(true);
+    expect(inventoryPages.every(({ calls_left }) => calls_left > 0 && calls_left <= 32)).toBe(true);
+    expect(JSON.parse(mock.files.get(headPath!)!)).toMatchObject({ project_id: projectId, zone: "WORKING", generation: 1, source_request_id: request.request_id });
+    const executionProgressPath = [...mock.files.keys()].find((path) => path.includes("/executions/") && path.endsWith("/progress.json"));
+    expect(executionProgressPath).toBeDefined();
+    expect(JSON.parse(mock.files.get(executionProgressPath!)!)).toMatchObject({ status: "finalized", terminal: true });
+    expect([...mock.files.keys()].some((path) => path.includes("/WORKING/00-CURRENT.md"))).toBe(true);
+  });
+
+  it("recovers an interrupted dirty-to-outbox write and refreshes without status polling", async () => {
+    const projectId = "PRJ-8321";
+    const { guard, mock } = await setup(projectId);
+    const navigation = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-WORKING-8321",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const initialContext = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const initialResponse = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(navigation, initialContext.context))
+    });
+    expect([200, 503]).toContain(initialResponse.status);
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const headPath = [...mock.files.keys()].find((path) => path.endsWith("/navigation/WORKING/head.json"));
+      const sourcePath = [...mock.files.keys()].find((path) => path.endsWith("/navigation-sources/state.json"));
+      const adopted = sourcePath ? JSON.parse(mock.files.get(sourcePath)!).zones.WORKING.adopted : false;
+      if (headPath && JSON.parse(mock.files.get(headPath)!).generation === 1 && adopted) break;
+      await runInDurableObject(guard, (instance) => instance.alarm());
+    }
+    const navHeadPath = [...mock.files.keys()].find((path) => path.endsWith("/navigation/WORKING/head.json"));
+    expect(navHeadPath).toBeDefined();
+    expect(JSON.parse(mock.files.get(navHeadPath!)!).generation).toBe(1);
+
+    let interruptOutboxOnce = true;
+    const enqueueDirtyZones = (ProjectGuard.prototype as any).enqueueNavigationRefreshForDirtyZones;
+    vi.spyOn(ProjectGuard.prototype as any, "enqueueNavigationRefreshForDirtyZones").mockImplementation(async function (
+      this: ProjectGuard,
+      ...args: unknown[]
+    ) {
+      if (interruptOutboxOnce) {
+        interruptOutboxOnce = false;
+        throw new Error("injected dirty-to-outbox interruption");
+      }
+      return enqueueDirtyZones.call(this, args[0]);
+    });
+
+    const content = "# Automatically refreshed\n";
+    const workingWrite = {
+      operation: "working.write" as const,
+      request_id: "DOCREQ-NAV-AUTO-SOURCE-8321",
+      project_id: projectId,
+      logical_path: "notes/automatic.md",
+      content,
+      content_sha256: await sha256Text(content),
+      created_at: "2026-09-25T10:01:00.000Z"
+    };
+    const workingContext = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const workingResponse = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(workingWrite, workingContext.context))
+    });
+    expect(workingResponse.status).toBe(503);
+    expect(await workingResponse.json()).toMatchObject({ status: "pending", request_id: workingWrite.request_id });
+    expect([...mock.files.keys()].some((path) => path.includes("navigation-sources/WORKING/dirty/"))).toBe(true);
+    expect(await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec("SELECT * FROM navigation_refresh_outbox").toArray())).toHaveLength(0);
+
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const navHead = JSON.parse(mock.files.get(navHeadPath!)!);
+      if (navHead.generation === 2) break;
+      await runInDurableObject(guard, (instance) => instance.alarm());
+    }
+    expect(JSON.parse(mock.files.get(navHeadPath!)!)).toMatchObject({ generation: 2, zone: "WORKING" });
+    const currentIndex = [...mock.files.entries()].find(([path]) => path.endsWith("/WORKING/00-CURRENT.md"))?.[1];
+    expect(currentIndex).toContain("](./notes/automatic.md)");
   });
 
   it("keeps a corrupt canonical document intent queued as a visible blocked recovery", async () => {

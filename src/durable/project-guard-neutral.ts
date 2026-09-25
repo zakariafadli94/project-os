@@ -15,6 +15,7 @@ import {
 } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
+import { navigationReconcileSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema, type NavigationReconcileRequest, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
 import type { PackageRef } from "../domain/document-package";
 import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH, type CompletedMaterializationRecord } from "../domain/materialization";
 import type { Env } from "../env";
@@ -31,14 +32,18 @@ import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinato
 import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
 import { TransactionRequestLedger } from "../transactions/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
+import { ZoneNavigationEngine, zoneNavigationHeadPath } from "../documents/zone-navigation";
+import { ZoneNavigationInventory } from "../documents/zone-navigation-inventory";
+import { ZoneNavigationSources } from "../documents/zone-navigation-sources";
 import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata, ProviderRequestScope } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError, MutationGateRepository } from "../mutation-gate/repository";
-import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, machineMaterializationRoot, type LayoutMode } from "../persistence/layout";
+import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, machineMaterializationRoot, workspaceProjectRoot, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
+import { resolveArtifactDestination } from "../persistence/artifact-routing";
 import { parseMutationGateMode } from "../mutation-gate/service";
 import { AdmissionError, issueMutationContext, verifyMutationContext, type MutationContext } from "../admission/mutation-context";
 import { normalizeArtifactAdmission, normalizeDocumentAdmission, normalizeSystemAdmission, normalizeTransactionAdmission, type NormalizedAdmissionOperation } from "../admission/operation-context";
@@ -66,6 +71,7 @@ import type { ExecutionAdmission, ExecutionAdapter, ExecutionPlan } from "../exe
 import { ExecutionCoordinator } from "../execution/coordinator";
 import { persistenceObservation, type RequestKind } from "../persistence/observation";
 import { authorizeRepair, normalizeRepairAdmission, parseRepairIntent, unavailableRepairEvidence, type RepairEvidenceResolver } from "../execution/repair";
+import { createSliceBudget } from "../convergence/budget";
 
 interface TransactionRow {
   [key: string]: SqlStorageValue;
@@ -76,6 +82,13 @@ interface ArtifactRow {
   [key: string]: SqlStorageValue;
   request_json: string;
   receipt_json: string;
+}
+
+interface NavigationRefreshRow {
+  [key: string]: SqlStorageValue;
+  zone: string;
+  source_generation: number;
+  request_json: string | null;
 }
 
 interface DocumentRequestRow {
@@ -153,7 +166,18 @@ interface PackageDocumentReceipt {
   code?: string;
 }
 
-type ManagedDocumentOperationReceipt = ManagedDocumentReceipt | ManagedDocumentTerminalReceipt;
+interface NavigationDocumentReceipt {
+  operation: "navigation.reconcile";
+  request_id: string;
+  project_id: string;
+  status: "committed" | "conflict";
+  execution_status: "pending" | "finalized" | "conflict";
+  navigation_receipt?: ZoneNavigationReceipt;
+  code?: string;
+  finalization_ref?: string | null;
+}
+
+type ManagedDocumentOperationReceipt = ManagedDocumentReceipt | ManagedDocumentTerminalReceipt | NavigationDocumentReceipt;
 type StoredDocumentReceipt = ManagedDocumentOperationReceipt | PackageDocumentReceipt;
 
 const PROJECT_STATUS_OPERATIONS = new Set<Transaction["operation"]>([
@@ -259,6 +283,7 @@ interface AdmissionProof {
   project_id: string;
   operation: string;
   resources: NormalizedAdmissionOperation["resources"];
+  resource_effect_scopes?: ExecutionAdmission["resource_effect_scopes"];
   diagnosed_drift_refs?: string[];
   request_hash: string;
   actor: { actor_id: string; authority: string };
@@ -341,6 +366,16 @@ export class ProjectGuard extends DurableObject<Env> {
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         kind TEXT NOT NULL,
         request_id TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS navigation_refresh_outbox (
+        zone TEXT NOT NULL,
+        source_generation INTEGER NOT NULL,
+        request_json TEXT,
+        PRIMARY KEY (zone, source_generation)
+      );
+      CREATE TABLE IF NOT EXISTS navigation_refresh_scan (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        requested_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS transaction_recovery_cursor (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -463,9 +498,21 @@ export class ProjectGuard extends DurableObject<Env> {
           const proof = await this.admitRules(state, normalized);
           await this.persistAdmissionProof("document-reconcile", `document-reconcile@${state.revision}`, proof);
         }
-        return Response.json(await this.managedDocumentChanges.reconcile(state, {
+        // The coordinator may write several canonical heads before its
+        // durable cursor is advanced. Keep a wake armed across that boundary;
+        // the alarm discovers any dirty marker whose SQL outbox write was
+        // interrupted.
+        this.ctx.storage.sql.exec(
+          "INSERT INTO navigation_refresh_scan (singleton, requested_at) VALUES (1, ?) ON CONFLICT(singleton) DO NOTHING",
+          new Date().toISOString()
+        );
+        await this.armRequestRecoveryAlarm(1_000);
+        const result = await this.managedDocumentChanges.reconcile(state, {
           scheduled: url.searchParams.get("scheduled") === "1"
-        }));
+        });
+        await this.enqueueNavigationRefreshForDirtyZones(state.project_id);
+        this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_scan WHERE singleton = 1");
+        return Response.json(result);
       }).catch((error) => this.admissionErrorResponse(error));
     }
 
@@ -690,6 +737,7 @@ export class ProjectGuard extends DurableObject<Env> {
   async alarm(): Promise<void> {
     await this.serialize(async () => {
       await this.resumePendingRequestRecovery();
+      await this.resumePendingNavigationRefreshes();
       await this.resumePendingMaterializationFinalization();
     });
     // Transaction replay must enter the normal serialized admission path, so
@@ -783,6 +831,10 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     try {
+      // Staged artifacts have no document head to fence. If the canonical
+      // destination belongs to an adopted navigation zone, persist its
+      // in-flight source marker before the destination/binding can change.
+      await this.beginArtifactNavigationSource(state, artifact);
       await this.repository.writeArtifact(state, artifact, undefined, undefined, isReviewCandidate(artifact) ? () => {
         if (!strictRules && binaryArtifactPolicyViolation(this.env, artifact)) throw new ReviewCapabilityExpiredError();
       } : undefined);
@@ -844,7 +896,12 @@ export class ProjectGuard extends DurableObject<Env> {
           "The same request_id was reused with a different managed-document payload"
         ));
       }
-      return Response.json(JSON.parse(existing.receipt_json) as ManagedDocumentOperationReceipt);
+      const cached = JSON.parse(existing.receipt_json) as ManagedDocumentOperationReceipt;
+      if (operation.operation === "navigation.reconcile") {
+        await this.settleNavigationReceipt(operation, cached as NavigationDocumentReceipt);
+        return Response.json(await this.currentNavigationReceipt(operation, cached as NavigationDocumentReceipt));
+      }
+      return Response.json(cached);
     }
 
     if (this.ctx.id.name && this.ctx.id.name !== operation.project_id) {
@@ -854,6 +911,10 @@ export class ProjectGuard extends DurableObject<Env> {
         "PROJECT_BINDING_MISMATCH",
         "Durable Object binding does not match managed document project_id"
       ));
+    }
+
+    if (operation.operation === "navigation.reconcile") {
+      return this.handleNavigationReconcile(operation, mutationContext);
     }
 
     const state = await this.loadOrRecoverState();
@@ -1013,11 +1074,179 @@ export class ProjectGuard extends DurableObject<Env> {
     return Response.json(logical);
   }
 
+  private async handleNavigationReconcile(request: NavigationReconcileRequest, mutationContext: MutationContext | null): Promise<Response> {
+    if (!this.strictAdmissionEnabled(request.project_id)) {
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "rejected", code: "NAVIGATION_GOVERNANCE_REQUIRED" });
+    }
+    const requestHash = await sha256Canonical(request);
+    const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
+    let existingAdmission = await journal.readAdmission();
+    let frozenState: ProjectState;
+
+    if (existingAdmission) {
+      if (existingAdmission.admission.operation !== request.operation || existingAdmission.admission.kind !== "document"
+        || existingAdmission.admission.project_id !== request.project_id || existingAdmission.admission.request_id !== request.request_id
+        || existingAdmission.admission.request_hash !== requestHash || existingAdmission.plan !== null) {
+        return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "conflict", code: "NAVIGATION_ADMISSION_BINDING_MISMATCH" }, { status: 409 });
+      }
+      // Revalidate the immutable journal envelope and recover only a torn
+      // navigation admission/progress boundary before the engine's intent.
+      await journal.commit(existingAdmission.admission, null);
+      frozenState = await this.readFrozenNavigationState(request, requestHash);
+    } else {
+      const current = await this.loadOrRecoverState();
+      if (!current) return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "rejected", code: "PROJECT_NOT_INITIALIZED" });
+      if (request.expected_project_revision !== current.revision) {
+        return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "conflict", code: "NAVIGATION_PROJECT_REVISION_CONFLICT" }, { status: 409 });
+      }
+      if (!mutationContext) return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "rejected", code: "NAVIGATION_GOVERNANCE_REQUIRED" });
+      await this.verifyEffectAdmission(mutationContext, request.project_id, current, true);
+      const normalized = await normalizeDocumentAdmission(request);
+      const proof = await this.admitRules(current, normalized, mutationContext.actor);
+      const indexPath = `${workspaceProjectRoot(current.project_id, current.slug)}/${request.zone}/${request.expected_index?.basename ?? "00-CURRENT.md"}`;
+      const resourceId = `navigation:${request.zone}`;
+      const preservationPath = request.expected_index
+        ? `${workspaceProjectRoot(current.project_id, current.slug)}/ARCHIVES/NAVIGATION/${request.zone}/${request.expected_generation + 1}-${request.expected_index.content_sha256}.md`
+        : null;
+      proof.resource_effect_scopes = [{
+        resource_id: resourceId,
+        resource_version: String(request.expected_generation),
+        provider_id: this.persistence.providerId,
+        sources: request.expected_index ? [{ path: indexPath, logical_path: `${request.zone}/${request.expected_index.basename}` }] : [],
+        destinations: [{ path: indexPath, logical_path: `${request.zone}/${request.expected_index?.basename ?? "00-CURRENT.md"}` }],
+        preservation_copies: preservationPath ? [{ path: preservationPath, logical_path: `ARCHIVES/NAVIGATION/${request.zone}/${request.expected_generation + 1}-${request.expected_index!.content_sha256}.md` }] : []
+      }];
+      frozenState = current;
+      await this.writeFrozenNavigationState(request, requestHash, frozenState);
+      await this.persistAdmissionProof("document", request.request_id, proof);
+      existingAdmission = await journal.readAdmission();
+      if (!existingAdmission) throw new Error("execution_admission_unavailable");
+    }
+
+    await this.enqueueRequestRecovery("document", request.request_id, JSON.stringify(request));
+    try {
+      await this.managedDocumentRequests.ensureIntent(request.project_id, request.request_id, JSON.stringify(request));
+    } catch (error) {
+      if (error instanceof ManagedDocumentRequestIntentConflictError) {
+        return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "conflict", code: "IDEMPOTENCY_PAYLOAD_MISMATCH" }, { status: 409 });
+      }
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_RECOVERY_SCHEDULED" }, { status: 503 });
+    }
+    const durable = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
+    if (durable) {
+      const receipt = JSON.parse(durable.receipt_json) as NavigationDocumentReceipt;
+      await this.settleNavigationReceipt(request, receipt);
+      return Response.json(await this.currentNavigationReceipt(request, receipt));
+    }
+    return this.executeNavigationSlice(request, frozenState, existingAdmission.admission as ExecutionAdmission);
+  }
+
+  private async executeNavigationSlice(request: NavigationReconcileRequest, state: ProjectState, admission: ExecutionAdmission): Promise<Response> {
+    const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    const sources = new ZoneNavigationSources(this.persistence);
+    let adoptionStarted = false;
+    const sourceState = await sources.readState(request.project_id, request.zone, budget);
+    if (!sourceState.adopted) {
+      adoptionStarted = true;
+      if (!await sources.beginAdoption(request.project_id, request.zone, request.request_id, sourceState.generation, budget)) {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
+      }
+    }
+    const inventory = new ZoneNavigationInventory(this.persistence, sources);
+    const result = await new ZoneNavigationEngine(this.persistence, inventory).reconcile(request, state, admission, budget);
+    if (result.status === "pending") {
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_REFRESH_PENDING", cursor: result.cursor }, { status: 503 });
+    }
+    if (result.status === "conflict") {
+      const receipt: NavigationDocumentReceipt = { operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "conflict", execution_status: "conflict", code: result.code };
+      await this.managedDocumentRequests.writeReceipt(request.project_id, request.request_id, JSON.stringify(request), JSON.stringify(receipt));
+      await this.settleNavigationReceipt(request, receipt);
+      return Response.json(receipt, { status: 409 });
+    }
+    if (adoptionStarted && budget.calls_left >= 5) {
+      if (!await sources.finishAdoption(request.project_id, request.zone, request.request_id, sourceState.generation, budget)) {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
+      }
+    } else if (adoptionStarted) {
+      // Leave the alarm armed: a fresh slice can settle adoption after the
+      // engine's request-local progress short-circuits to its receipt.
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
+    }
+    const receipt: NavigationDocumentReceipt = {
+      operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+      status: "committed", execution_status: "pending", navigation_receipt: result.receipt
+    };
+    await this.managedDocumentRequests.writeReceipt(request.project_id, request.request_id, JSON.stringify(request), JSON.stringify(receipt));
+    await this.settleNavigationReceipt(request, receipt);
+    return Response.json(await this.currentNavigationReceipt(request, receipt));
+  }
+
+  private async writeFrozenNavigationState(request: NavigationReconcileRequest, requestHash: string, state: ProjectState): Promise<void> {
+    const path = `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/navigation-admitted-state.json`;
+    const record = { schema_version: "1.0", project_id: request.project_id, request_id: request.request_id, request_hash: requestHash, project_revision: state.revision, state, state_hash: await sha256Canonical(state) };
+    const content = canonicalJson(record);
+    try { await this.persistence.objects.createText(path, content); }
+    catch (error) { if (await this.persistence.objects.readText(path) !== content) throw error; }
+  }
+
+  private async readFrozenNavigationState(request: NavigationReconcileRequest, requestHash: string): Promise<ProjectState> {
+    const path = `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/navigation-admitted-state.json`;
+    const raw = await this.persistence.objects.readText(path);
+    if (raw !== null) {
+      const record = JSON.parse(raw) as Record<string, unknown>;
+      if (record.schema_version !== "1.0" || record.project_id !== request.project_id || record.request_id !== request.request_id
+        || record.request_hash !== requestHash || record.project_revision !== request.expected_project_revision
+        || !record.state || typeof record.state !== "object" || (record.state as ProjectState).revision !== request.expected_project_revision
+        || await sha256Canonical(record.state) !== record.state_hash || canonicalJson(record) !== raw) throw new Error("navigation_admitted_state_invalid");
+      return normalizeProjectState(record.state as ProjectState);
+    }
+    const commit = await this.repository.readCommitRecord(request.project_id, request.expected_project_revision);
+    if (commit?.state && commit.state.revision === request.expected_project_revision) {
+      await this.writeFrozenNavigationState(request, requestHash, commit.state);
+      return commit.state;
+    }
+    const current = await this.loadOrRecoverState();
+    if (current?.revision === request.expected_project_revision) {
+      await this.writeFrozenNavigationState(request, requestHash, current);
+      return current;
+    }
+    throw new Error("navigation_admitted_state_unavailable");
+  }
+
+  private async settleNavigationReceipt(request: NavigationReconcileRequest, receipt: NavigationDocumentReceipt): Promise<void> {
+    this.persistDocumentRequest(request, receipt);
+    const receiptPath = `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`;
+    const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
+    await journal.recordReceipt(receipt.status, receiptPath);
+    if (receipt.status === "conflict") {
+      this.clearRequestRecovery("document", request.request_id);
+      return;
+    }
+    const navigationReceipt = zoneNavigationReceiptSchema.parse(receipt.navigation_receipt);
+    await journal.finalizeVerifiedNavigation({ receipt_ref: receiptPath, receipt: navigationReceipt });
+    if ((await journal.status())?.terminal) this.clearRequestRecovery("document", request.request_id);
+  }
+
+  private async currentNavigationReceipt(request: NavigationReconcileRequest, receipt: NavigationDocumentReceipt): Promise<NavigationDocumentReceipt> {
+    if (receipt.status !== "committed") return receipt;
+    const progress = await new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id).status();
+    return progress?.terminal && progress.status === "finalized"
+      ? { ...receipt, execution_status: "finalized", finalization_ref: progress.finalization_ref }
+      : { ...receipt, execution_status: "pending" };
+  }
+
   private async executeManagedDocument(
     request: ManagedDocumentRequest,
     state: ProjectState
   ): Promise<ManagedDocumentReceipt> {
     switch (request.operation) {
+      case "navigation.reconcile":
+        throw new Error("navigation_governance_dispatch_required");
       case "package.freeze":
       case "package.replace":
         throw new Error("package_governance_dispatch_required");
@@ -1041,6 +1270,7 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
+    await this.completeArtifactNavigationSource(request);
     if (isReviewCandidate(request)) await this.repository.reviewJournal.recordTerminal(request, receipt);
     // Store the frozen family record and its wake signal *before* the
     // canonical receipt. If a provider acknowledgement is interrupted after
@@ -1065,6 +1295,64 @@ export class ProjectGuard extends DurableObject<Env> {
         code: "ARTIFACT_FINALIZATION_SCHEDULED"
       }, { status: 503 });
     }
+  }
+
+  private async artifactNavigationResource(state: ProjectState, request: ArtifactWriteRequest): Promise<{ zone: NavigationZone; resource_id: string } | null> {
+    const destination = resolveArtifactDestination(state, request.relative_path, request);
+    const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
+    if (!destination.path.startsWith(root)) return null;
+    const first = destination.path.slice(root.length).split("/")[0];
+    if (first !== "WORKING" && first !== "REVIEW" && first !== "DELIVERABLES") return null;
+    return { zone: first, resource_id: `artifact:${await sha256Text(destination.path)}` };
+  }
+
+  private async beginArtifactNavigationSource(state: ProjectState, request: ArtifactWriteRequest): Promise<void> {
+    const resource = await this.artifactNavigationResource(state, request);
+    if (!resource) return;
+    await new ZoneNavigationSources(this.persistence).beginHeadWrite(
+      request.project_id, resource.zone, resource.resource_id, undefined, null
+    );
+  }
+
+  private async completeArtifactNavigationSource(request: ArtifactWriteRequest): Promise<void> {
+    const state = await this.loadOrRecoverState();
+    if (!state || state.project_id !== request.project_id) return;
+    const resource = await this.artifactNavigationResource(state, request);
+    if (!resource) return;
+    const sources = new ZoneNavigationSources(this.persistence);
+    const sourceState = await sources.readState(request.project_id, resource.zone);
+    // beginArtifactNavigationSource is persisted before canonical provider
+    // writes. On retry, only finish that exact pending fence; creating a new
+    // ticket here would advance generation repeatedly after an interrupted
+    // receipt finalization.
+    if (!sourceState.in_flight_resource_ids.includes(resource.resource_id)) return;
+    const ticket = await sources.beginHeadWrite(request.project_id, resource.zone, resource.resource_id, undefined, null);
+    if (!ticket) return;
+    await sources.completeHeadWrites([ticket]);
+  }
+
+  private async beginPackageNavigationSource(
+    operation: Extract<ManagedDocumentRequest, { operation: "package.replace" }>
+  ): Promise<void> {
+    await new ZoneNavigationSources(this.persistence).beginHeadWrite(
+      operation.project_id,
+      operation.zone,
+      `package:${operation.candidate.package_id}`,
+      undefined,
+      null
+    );
+  }
+
+  private async completePackageNavigationSource(
+    operation: Extract<ManagedDocumentRequest, { operation: "package.replace" }>
+  ): Promise<void> {
+    const sources = new ZoneNavigationSources(this.persistence);
+    const source = await sources.readState(operation.project_id, operation.zone);
+    const resourceId = `package:${operation.candidate.package_id}`;
+    if (!source.in_flight_resource_ids.includes(resourceId)) return;
+    const ticket = await sources.beginHeadWrite(operation.project_id, operation.zone, resourceId, undefined, null);
+    if (!ticket) return;
+    await sources.completeHeadWrites([ticket]);
   }
 
   private async finalizeDocument(
@@ -1094,11 +1382,16 @@ export class ProjectGuard extends DurableObject<Env> {
     request: ManagedDocumentRequest,
     receipt: ManagedDocumentOperationReceipt
   ): Promise<void> {
+    if (request.operation === "navigation.reconcile") {
+      await this.settleNavigationReceipt(request, receipt as NavigationDocumentReceipt);
+      return;
+    }
     this.persistDocumentRequest(request, receipt);
     if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
       this.clearRequestRecovery("document", request.request_id);
       return;
     }
+    await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
     await this.enqueueRequestRecovery("document", request.request_id);
     const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
     await journal.recordReceipt(
@@ -1114,10 +1407,138 @@ export class ProjectGuard extends DurableObject<Env> {
       this.clearRequestRecovery("artifact", request.request_id);
       return;
     }
+    await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
     const journal = new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id);
     await journal.recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
     await this.finalizeVerifiedArtifact(journal);
     if ((await journal.status())?.terminal) this.clearRequestRecovery("artifact", request.request_id);
+  }
+
+  private async enqueueNavigationRefreshForDirtyZones(projectId: string): Promise<void> {
+    const sources = new ZoneNavigationSources(this.persistence);
+    for (const zone of ["WORKING", "REVIEW", "DELIVERABLES"] as const) {
+      const source = await sources.readState(projectId, zone);
+      if (!source.adopted || source.in_flight_resource_ids.length) continue;
+      const dirty = await sources.listDirtyPage(projectId, zone, null, 1);
+      if (!dirty.resource_ids.length) continue;
+      // Arm first: if the following SQLite write is interrupted, the wake is
+      // harmless; if it commits, the durable outbox cannot be stranded.
+      await this.armRequestRecoveryAlarm(1_000);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO navigation_refresh_outbox (zone, source_generation, request_json) VALUES (?, ?, NULL)
+         ON CONFLICT(zone, source_generation) DO NOTHING`,
+        zone, source.generation
+      );
+    }
+  }
+
+  private async resumePendingNavigationRefreshes(): Promise<void> {
+    const projectId = this.ctx.id.name;
+    if (!projectId) return;
+    try {
+      // External reconciliation has no per-request recovery row. Its durable
+      // scan flag is written before invoking the coordinator, so only that
+      // path needs a bounded scan to bridge a torn marker->outbox boundary.
+      const scanRequested = this.ctx.storage.sql.exec(
+        "SELECT singleton FROM navigation_refresh_scan WHERE singleton = 1"
+      ).toArray().length > 0;
+      if (scanRequested) {
+        await this.enqueueNavigationRefreshForDirtyZones(projectId);
+        this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_scan WHERE singleton = 1");
+      }
+    } catch {
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+    }
+    const rows = this.ctx.storage.sql.exec<NavigationRefreshRow>(
+      "SELECT zone, source_generation, request_json FROM navigation_refresh_outbox ORDER BY source_generation, zone LIMIT 3"
+    ).toArray();
+    for (const row of rows) {
+      if (row.zone !== "WORKING" && row.zone !== "REVIEW" && row.zone !== "DELIVERABLES") continue;
+      const zone = row.zone as NavigationZone;
+      try {
+        const sources = new ZoneNavigationSources(this.persistence);
+        const source = await sources.readState(projectId, zone);
+        if (!source.adopted) {
+          this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);
+          continue;
+        }
+        if (source.in_flight_resource_ids.length) {
+          await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+          continue;
+        }
+        const dirty = await sources.listDirtyPage(projectId, zone, null, 1);
+        if (!dirty.resource_ids.length) {
+          this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);
+          continue;
+        }
+        let request: NavigationReconcileRequest | null = row.request_json
+          ? navigationReconcileSchema.parse(JSON.parse(row.request_json))
+          : null;
+        const journal = request
+          ? new ExecutionJournal(this.persistence, projectId, "document", request.request_id)
+          : null;
+        const admitted = journal ? await journal.readAdmission() : null;
+        const current = await this.readFreshCanonicalState(projectId);
+        if (!current) throw new Error("navigation_auto_refresh_state_unavailable");
+        const headRaw = await this.persistence.objects.readText(zoneNavigationHeadPath(projectId, zone));
+        if (!headRaw) throw new Error("navigation_auto_refresh_head_unavailable");
+        const head = zoneNavigationHeadSchema.parse(JSON.parse(headRaw));
+        if (head.project_id !== projectId || head.zone !== zone) throw new Error("navigation_auto_refresh_head_binding");
+        if (source.generation > row.source_generation && !admitted) {
+          this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);
+          await this.armNavigationRefreshOutbox(zone, source.generation);
+          continue;
+        }
+        if (!request || (!admitted && (request.expected_project_revision !== current.revision || request.expected_generation !== head.generation))) {
+          request = {
+            operation: "navigation.reconcile",
+            request_id: `DOCREQ-NAV-AUTO-${zone}-${row.source_generation}`,
+            project_id: projectId,
+            zone,
+            expected_project_revision: current.revision,
+            expected_generation: head.generation,
+            expected_index: head.index,
+            created_at: new Date().toISOString()
+          };
+          const requestJson = canonicalJson(request);
+          this.ctx.storage.sql.exec(
+            "UPDATE navigation_refresh_outbox SET request_json = ? WHERE zone = ? AND source_generation = ?",
+            requestJson, zone, row.source_generation
+          );
+        }
+        if (admitted) {
+          // Re-enter the same governed ingress with the frozen request. This
+          // closes a crash after journal admission but before request recovery
+          // was enqueued; it never invokes the engine directly.
+          await this.handleNavigationReconcile(request!, null);
+        } else {
+          const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
+          if (!secret) throw new Error("navigation_auto_refresh_context_unavailable");
+          const context = await issueMutationContext(current, secret, Date.now(), {
+            actor_id: "project_guard",
+            authority: "durable_object"
+          });
+          await this.handleNavigationReconcile(request!, context);
+        }
+        const recovered = await new ExecutionJournal(this.persistence, projectId, "document", request!.request_id).readAdmission();
+        if (recovered) {
+          this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);
+        } else {
+          await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        }
+      } catch {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      }
+    }
+  }
+
+  private async armNavigationRefreshOutbox(zone: NavigationZone, generation: number): Promise<void> {
+    await this.armRequestRecoveryAlarm(1_000);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO navigation_refresh_outbox (zone, source_generation, request_json) VALUES (?, ?, NULL)
+       ON CONFLICT(zone, source_generation) DO NOTHING`,
+      zone, generation
+    );
   }
 
   private async enqueueRequestRecovery(kind: "artifact" | "document" | "transaction", requestId: string, requestJson?: string): Promise<void> {
@@ -1727,6 +2148,10 @@ export class ProjectGuard extends DurableObject<Env> {
       serialized,
       JSON.stringify(receipt)
     );
+    if (operation.operation === "package.replace") {
+      await this.completePackageNavigationSource(operation);
+      await this.enqueueNavigationRefreshForDirtyZones(operation.project_id);
+    }
     this.persistDocumentRequest(operation, receipt);
     this.clearRequestRecovery("document", operation.request_id);
     return receipt;
@@ -1738,6 +2163,10 @@ export class ProjectGuard extends DurableObject<Env> {
     const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
     if (durableReceipt) {
       const receipt = JSON.parse(durableReceipt.receipt_json) as PackageDocumentReceipt;
+      if (operation.operation === "package.replace") {
+        await this.completePackageNavigationSource(operation);
+        await this.enqueueNavigationRefreshForDirtyZones(operation.project_id);
+      }
       this.persistDocumentRequest(operation, receipt);
       this.clearRequestRecovery("document", operation.request_id);
       return receipt;
@@ -1756,6 +2185,7 @@ export class ProjectGuard extends DurableObject<Env> {
         candidate
       });
     }
+    await this.beginPackageNavigationSource(operation);
     const global = await this.readGlobalGovernance();
     if (global.revision !== proof.global_revision) throw new Error("package_ruleset_changed");
     const progress = await this.managedDocumentService.replacePackage(
@@ -1861,6 +2291,22 @@ export class ProjectGuard extends DurableObject<Env> {
         }
         throw error;
       }
+      return;
+    }
+    if (operation.operation === "navigation.reconcile") {
+      const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, requestId);
+      if (durableReceipt) {
+        await this.settleNavigationReceipt(operation, JSON.parse(durableReceipt.receipt_json) as NavigationDocumentReceipt);
+        return;
+      }
+      const journal = new ExecutionJournal(this.persistence, operation.project_id, "document", operation.request_id);
+      const admitted = await journal.readAdmission();
+      if (!admitted || admitted.admission.operation !== "navigation.reconcile" || admitted.admission.request_hash !== await sha256Canonical(operation)) {
+        await this.blockRequestRecovery("document", requestId, "navigation_admission_unavailable");
+        return;
+      }
+      const frozen = await this.readFrozenNavigationState(operation, admitted.admission.request_hash);
+      await this.executeNavigationSlice(operation, frozen, admitted.admission);
       return;
     }
     const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, requestId);
@@ -3101,6 +3547,16 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       if (kind === "document") {
         const expectedReceiptRef = `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`;
+        if (receipt.operation === "navigation.reconcile") {
+          const navigationReceipt = zoneNavigationReceiptSchema.safeParse(receipt.navigation_receipt);
+          return navigationReceipt.success && execution.receipt_ref === expectedReceiptRef
+            && navigationReceipt.data.project_id === projectId && navigationReceipt.data.request_id === requestId
+            && record.navigation_head_ref === navigationReceipt.data.head_ref
+            && record.navigation_finalization_ref === navigationReceipt.data.finalization_ref
+            && record.generation === navigationReceipt.data.generation
+            && canonicalJson(record.index) === canonicalJson(navigationReceipt.data.index)
+            && record.source_snapshot_id === navigationReceipt.data.source_snapshot_id;
+        }
         return execution.receipt_ref === expectedReceiptRef
           && record.document_id === receipt.document_id && record.version_id === receipt.version_id
           && record.stage === receipt.stage && record.logical_path === receipt.logical_path
@@ -3454,7 +3910,8 @@ export class ProjectGuard extends DurableObject<Env> {
     const row = this.findDocumentRequest(admitted.admission.request_id);
     if (!row) return;
     const request = parseManagedDocumentRequest(JSON.parse(row.request_json));
-    const receipt = JSON.parse(row.receipt_json) as ManagedDocumentOperationReceipt;
+    if (request.operation === "navigation.reconcile") return;
+    const receipt = JSON.parse(row.receipt_json) as ManagedDocumentReceipt | ManagedDocumentTerminalReceipt;
     const receiptRef = `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`;
     if (request.project_id !== admitted.admission.project_id
       || await sha256Canonical(request) !== admitted.admission.request_hash

@@ -8,12 +8,12 @@ import {
   type NavigationIndexIdentity
 } from "../src/domain/zone-navigation";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
-import { executionHash } from "../src/execution/journal";
+import { executionHash, ExecutionJournal } from "../src/execution/journal";
 import type { ExecutionAdmission } from "../src/execution/contract";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
-import { workspaceProjectRoot } from "../src/persistence/layout";
+import { machineDocumentRoot, workspaceProjectRoot } from "../src/persistence/layout";
 import { sha256Text } from "../src/documents/hash";
 import type { SliceBudget } from "../src/convergence/contract";
 
@@ -202,6 +202,39 @@ async function reconcileUntilTerminal(engine: ZoneNavigationEngine, input: Navig
 }
 
 describe("zone navigation identity and resumable reconciliation", () => {
+  it("finalizes an immutable historical receipt after a newer navigation generation replaces the head", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const firstInput = request();
+    const firstInventory = await inventoryHarness(project);
+    seedTarget(harness, firstInventory);
+    const firstAdmission = await admissionFor(firstInput);
+    const firstJournal = new ExecutionJournal(harness.runtime, project.project_id, "document", firstInput.request_id);
+    await firstJournal.commit(firstAdmission, null);
+    const firstResult = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, firstInventory.port), firstInput, project, firstAdmission);
+    expect(firstResult.status).toBe("finalized");
+    if (firstResult.status !== "finalized") throw new Error("first_navigation_not_finalized");
+
+    const secondInput = navigationReconcileSchema.parse({ ...firstInput, request_id: "DOCREQ-NAVIGATION-WORKING-0002", expected_generation: 1, expected_index: firstResult.receipt.index });
+    const secondInventory = await inventoryHarness(project);
+    seedTarget(harness, secondInventory);
+    const secondAdmission = await admissionFor(secondInput);
+    const secondJournal = new ExecutionJournal(harness.runtime, project.project_id, "document", secondInput.request_id);
+    await secondJournal.commit(secondAdmission, null);
+    const secondResult = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, secondInventory.port), secondInput, project, secondAdmission);
+    expect(secondResult.status).toBe("finalized");
+    if (secondResult.status !== "finalized") throw new Error("second_navigation_not_finalized");
+
+    const receiptRef = `${machineDocumentRoot(project.project_id)}/requests/${firstInput.request_id}/receipt.json`;
+    await firstJournal.recordReceipt("committed", receiptRef);
+    const finalized = await firstJournal.finalizeVerifiedNavigation({ receipt_ref: receiptRef, receipt: firstResult.receipt });
+    expect(finalized).toMatchObject({ status: "finalized", terminal: true });
+    const currentHead = JSON.parse(harness.files.get(`${machineDocumentRoot(project.project_id)}/navigation/WORKING/head.json`)!.content);
+    expect(currentHead).toMatchObject({ generation: 2, source_request_id: secondInput.request_id });
+    await harness.runtime.objects.delete(`${await firstJournal.root()}/progress.json`);
+    await expect(firstJournal.commit(firstAdmission, null)).rejects.toThrow("execution_progress_unavailable");
+  });
+
   it("rejects unknown public fields and non-exact index identities", () => {
     const input = { ...request(), renderer: "client-controlled" };
     expect(navigationReconcileSchema.safeParse(input).success).toBe(false);

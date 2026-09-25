@@ -2,9 +2,10 @@ import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabi
 import type { ExecutionAdmission, ExecutionPlan, ExecutionProgress, SupersedingTarget } from "./contract";
 import { canonicalJson } from "../rules/contract";
 import { sha256Text } from "../documents/hash";
-import { machineConvergenceRoot } from "../persistence/layout";
+import { machineConvergenceRoot, machineDocumentRoot } from "../persistence/layout";
 import { z } from "zod";
 import { assertEffectBindings, parseExecutionPlan } from "./effects";
+import { zoneNavigationHeadSchema, zoneNavigationReceiptSchema } from "../domain/zone-navigation";
 
 const nonempty = z.string().min(1);
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -62,18 +63,30 @@ export class ExecutionJournal {
         || existing.admission.operation !== admission.operation || canonicalJson(existing.admission.actor) !== canonicalJson(admission.actor)
         || canonicalJson(existing.admission.resources) !== canonicalJson(admission.resources)
         || canonicalJson(existing.admission.resource_effect_scopes) !== canonicalJson(admission.resource_effect_scopes)) throw new Error("execution_identity_conflict");
-      if (!(await this.load())) throw new Error("execution_progress_unavailable");
+      if (!(await this.load())) {
+        if (admission.operation !== "navigation.reconcile"
+          || await this.runtime.objects.readText(`${root}/navigation-intention.json`) !== null) {
+          throw new Error("execution_progress_unavailable");
+        }
+        // The navigation admission is persisted before the engine may create
+        // its own immutable intention or perform an effect. A missing progress
+        // record is recoverable only at this exact pre-effect boundary.
+        await this.immutable(`${root}/progress.json`, this.initialProgress(admission, path, existing.effect_plan_hash));
+      }
       return;
     }
     await this.immutable(path, record);
-    const progress: ExecutionProgress = {
+    await this.immutable(`${root}/progress.json`, this.initialProgress(admission, path, record.effect_plan_hash));
+  }
+
+  private initialProgress(admission: ExecutionAdmission, admissionRef: string, effectPlanHash: string): ExecutionProgress {
+    return {
       schema_version: "1.0", project_id: this.projectId, request_id: this.requestId, kind: this.kind,
-      request_hash: admission.request_hash, admission_ref: path, effect_plan_hash: record.effect_plan_hash, sequence: 0,
+      request_hash: admission.request_hash, admission_ref: admissionRef, effect_plan_hash: effectPlanHash, sequence: 0,
       status: "admitted", terminal: false, code: null,
       completed_steps: [], postchecks: [], failure_streak: null, next_attempt_at: null, incident_ref: null,
       superseded_by: null, finalization_ref: null, receipt_ref: null, lease: null
     };
-    await this.immutable(`${root}/progress.json`, progress);
   }
 
   async readAdmission(): Promise<{ admission: ExecutionAdmission; plan: ExecutionPlan | null; effect_plan_hash: string } | null> {
@@ -295,6 +308,81 @@ export class ExecutionJournal {
       request_id: progress.request_id,
       request_hash: progress.request_hash,
       ...input
+    };
+    const finalizationRef = `${await this.root()}/finalizations/${await executionHash(record)}.json`;
+    await this.immutable(finalizationRef, record);
+    progress.status = "finalized";
+    progress.terminal = true;
+    progress.code = null;
+    progress.finalization_ref = finalizationRef;
+    progress.next_attempt_at = null;
+    progress.lease = null;
+    progress.sequence++;
+    await this.save(progress, saved.token);
+    return progress;
+  }
+
+  /** Navigation has its own receipt and hashed publication certificate; it is
+   * not a document version and must never be finalized as one. */
+  async finalizeVerifiedNavigation(input: {
+    receipt_ref: string;
+    receipt: import("../domain/zone-navigation").ZoneNavigationReceipt;
+  }): Promise<ExecutionProgress> {
+    const admitted = await this.readAdmission();
+    const saved = await this.load();
+    if (!admitted || admitted.admission.kind !== "document" || admitted.admission.operation !== "navigation.reconcile" || !saved) throw new Error("execution_navigation_finalization_invalid");
+    const progress = saved.progress;
+    if (progress.terminal) return progress;
+    const receipt = zoneNavigationReceiptSchema.parse(input.receipt);
+    const resource = admitted.admission.resources.find((candidate) => candidate.resource_id === `navigation:${receipt.zone}`);
+    const exactHeadPath = `${machineDocumentRoot(receipt.project_id)}/navigation/${receipt.zone}/head.json`;
+    if (progress.status !== "finalizing" || progress.receipt_ref !== input.receipt_ref
+      || receipt.project_id !== this.projectId || receipt.request_id !== this.requestId
+      || receipt.head_ref !== exactHeadPath || receipt.finalization_ref.length === 0
+      || receipt.generation !== Number(resource?.version) + 1
+      || resource?.resource_type !== "navigation" || resource.zone !== receipt.zone
+      || progress.request_hash !== admitted.admission.request_hash) throw new Error("execution_navigation_finalization_invalid");
+
+    const certificateRaw = await this.runtime.objects.readText(receipt.finalization_ref);
+    if (certificateRaw === null) throw new Error("execution_navigation_certificate_unavailable");
+    const certificate = JSON.parse(certificateRaw) as Record<string, unknown>;
+    if (certificate.schema_version !== "1.0" || certificate.project_id !== this.projectId || certificate.request_id !== this.requestId
+      || certificate.request_hash !== admitted.admission.request_hash || certificate.zone !== receipt.zone
+      || certificate.generation !== receipt.generation || canonicalJson(certificate.index) !== canonicalJson(receipt.index)
+      || certificate.source_snapshot_id !== receipt.source_snapshot_id || certificate.source_count !== receipt.source_count
+      || canonicalJson(certificate.coverage_gaps) !== canonicalJson(receipt.coverage_gaps)
+      || certificate.generated_content_sha256 !== receipt.index.content_sha256 || !Array.isArray(certificate.postchecks)
+      || canonicalJson(certificate) !== certificateRaw
+      || receipt.finalization_ref !== `${await this.root()}/navigation/finalizations/${await executionHash(certificate)}.json`) {
+      throw new Error("execution_navigation_certificate_invalid");
+    }
+    // The engine durably marks this request finalized only after conditionally
+    // publishing and rereading the generation-specific zone head. That
+    // request-local evidence preserves history when a later valid generation
+    // has already replaced the mutable current head.
+    const engineProgressRaw = await this.runtime.objects.readText(`${await this.root()}/navigation-progress.json`);
+    if (engineProgressRaw === null) throw new Error("execution_navigation_engine_progress_unavailable");
+    const engineProgress = JSON.parse(engineProgressRaw) as Record<string, unknown>;
+    if (engineProgress.schema_version !== "1.0" || engineProgress.project_id !== this.projectId
+      || engineProgress.request_id !== this.requestId || engineProgress.request_hash !== admitted.admission.request_hash
+      || engineProgress.status !== "finalized" || engineProgress.target_generation !== receipt.generation
+      || canonicalJson(engineProgress.published_index) !== canonicalJson(receipt.index)
+      || canonicalJson(engineProgress.receipt) !== canonicalJson(receipt) || canonicalJson(engineProgress) !== engineProgressRaw) {
+      throw new Error("execution_navigation_engine_progress_invalid");
+    }
+    const headRaw = await this.runtime.objects.readText(exactHeadPath);
+    if (headRaw === null) throw new Error("execution_navigation_head_unavailable");
+    const head = zoneNavigationHeadSchema.parse(JSON.parse(headRaw));
+    if (head.project_id !== receipt.project_id || head.zone !== receipt.zone || head.generation < receipt.generation
+      || (head.generation === receipt.generation && (head.source_request_id !== receipt.request_id
+        || head.finalization_ref !== receipt.finalization_ref || canonicalJson(head.index) !== canonicalJson(receipt.index)))
+      || canonicalJson(head) !== headRaw) throw new Error("execution_navigation_head_invalid");
+
+    const record = {
+      schema_version: "1.0", project_id: this.projectId, kind: this.kind, request_id: this.requestId,
+      request_hash: progress.request_hash, receipt_ref: input.receipt_ref, navigation_head_ref: exactHeadPath,
+      navigation_finalization_ref: receipt.finalization_ref, generation: receipt.generation,
+      index: receipt.index, source_snapshot_id: receipt.source_snapshot_id
     };
     const finalizationRef = `${await this.root()}/finalizations/${await executionHash(record)}.json`;
     await this.immutable(finalizationRef, record);

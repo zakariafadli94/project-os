@@ -216,7 +216,13 @@ export class ZoneNavigationSources {
         tickets.push({ project_id: projectId, zone, resource_id: resourceId, generation: existing.generation, write_hash: writeHash });
         continue;
       }
-      if (!affected.has(zone)) continue;
+      // If an earlier write already opened a flight for this resource, a
+      // later head-only update must transfer the durable fence even when its
+      // own changed fields do not alter a navigation pointer. Otherwise the
+      // old writer could discard the only invalidation after observing the
+      // newer canonical head, leaving a clean snapshot over stale catalog.
+      const supersedesInFlight = current.in_flight_writes.some((write) => write.resource_id === resourceId);
+      if (!affected.has(zone) && !supersedesInFlight) continue;
       if (!current.adopted && !current.adoption_request_id) continue;
       current.generation += 1;
       current.in_flight_writes.push({ resource_id: resourceId, generation: current.generation, write_hash: writeHash });

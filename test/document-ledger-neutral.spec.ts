@@ -147,7 +147,7 @@ it("recovers an in-flight navigation source write when the head upsert succeeded
   expect(await runtime.objects.readText(machineDocumentHeadPath(projectId, documentId))).toContain(second.version_id);
 });
 
-it("does not let an older concurrent repository head completion clear or overwrite a newer head", async () => {
+it("transfers pending navigation invalidation to a later non-pointer head update", async () => {
   const { runtime, forkRuntime, pauseNextCatalogCas, files } = runtimeWithFiles();
   const olderRepository = new DocumentLedgerRepository(runtime);
   const newerRepository = new DocumentLedgerRepository(forkRuntime());
@@ -183,11 +183,13 @@ it("does not let an older concurrent repository head completion clear or overwri
   const gate = pauseNextCatalogCas();
   const olderWrite = olderRepository.writeHead({ ...head, working_version_id: older.version_id });
   await gate.entered;
-  await newerRepository.writeHead({ ...head, working_version_id: newer.version_id });
+  // Same navigation pointer as A, but a different canonical head payload.
+  // This must inherit the in-flight invalidation rather than skip the seam.
+  await newerRepository.writeHead({ ...head, working_version_id: older.version_id, reconciliation_status: "conflict" });
   gate.release();
 
   await expect(olderWrite).rejects.toThrow("conditional_write_conflict");
-  expect(await new DocumentLedgerRepository(forkRuntime()).readHead(projectId, documentId)).toMatchObject({ working_version_id: newer.version_id });
+  expect(await new DocumentLedgerRepository(forkRuntime()).readHead(projectId, documentId)).toMatchObject({ working_version_id: older.version_id, reconciliation_status: "conflict" });
   expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 3, in_flight_resource_ids: [] });
   expect(await sources.listDirtyPage(projectId, "WORKING", null, 1)).toMatchObject({ resource_ids: [`head:${documentId}`] });
   const dirtyMarker = [...files.entries()].find(([path]) => path.includes("/dirty/"));

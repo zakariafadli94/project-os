@@ -51,12 +51,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
   }
 
   async verifyEntry(entry: NavigationInventoryEntry, budget: SliceBudget): Promise<boolean> {
-    try {
-      const resolved = await this.resolveHead(entry.project_id, entry.zone, entry.resource_id, budget);
-      return resolved.entry !== null && sameEntry(resolved.entry, entry);
-    } catch {
-      return false;
-    }
+    const resolved = await this.resolveHead(entry.project_id, entry.zone, entry.resource_id, budget);
+    return resolved.entry !== null && sameEntry(resolved.entry, entry);
   }
 
   private async initialPage(
@@ -70,9 +66,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     if (!this.runtime.pagedListing) return {
       entries: [], gaps: [{ resource_id: "heads", code: "paged_listing_unavailable" }, ...unresolvedSourceFamilyGaps()], snapshot_id: snapshotId, next_cursor: null
     };
-    // Reserve the worst-case provider work before obtaining a cursor that must
-    // not be lost between slices: list, head, version, visible metadata/bytes/
-    // metadata and the catalog update.
+    // Reserve before obtaining a cursor that must not be lost between slices.
     requireBudget(budget, 9);
     charge(budget);
     const page = await this.runtime.pagedListing.listPage({
@@ -93,12 +87,12 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
         if (resolved.gap) gaps.push(resolved.gap);
         if (resolved.entry) {
-          await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget);
+          await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
           entries.push(resolved.entry);
-        } else await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget);
+        } else await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
       } catch (error) {
         if (isBudgetError(error)) throw error;
-        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget);
+        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         gaps.push({ resource_id: resourceId, code: classifyGap(error) });
       }
     }
@@ -119,7 +113,13 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     snapshotId: string,
     budget: SliceBudget
   ) {
-    requireBudget(budget, 14);
+    // One dirty record may require marker listing/read, canonical head/version,
+    // visible metadata/bytes/metadata (plus immutable payload fallback), a
+    // catalog write, dirty compare-and-clear, and one catalog-page listing/read.
+    // Worst case: dirty list/read (2), head/version (2), visible bytes and
+    // metadata with immutable fallback (4), catalog write (4), dirty compare-
+    // and-clear (7), and catalog list/read (2). Keep the checkpoint reserve too.
+    requireBudget(budget, 21);
     const dirtyPage = await this.sources.listDirtyPage(projectId, zone, cursor, 1, budget);
     const gaps: NavigationCoverageGap[] = [];
     for (const resourceId of dirtyPage.resource_ids) {
@@ -127,24 +127,24 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         // No finalized current package/artifact resolver is wired here. Remove
         // an obsolete cached entry, but retain the dirty marker so a snapshot
         // cannot certify a catalog whose canonical source was not checked.
-        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget);
+        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         gaps.push({ resource_id: resourceId, code: unsupportedSourceCode(resourceId) });
         continue;
       }
       try {
         const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
         if (resolved.gap) {
-          await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget);
+          await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
           gaps.push(resolved.gap);
           continue;
         }
-        await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget);
+        await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         if (!await this.sources.finishDirty(projectId, zone, resourceId, resolved.entry, budget)) {
           gaps.push({ resource_id: resourceId, code: "dirty_identity_changed" });
         }
       } catch (error) {
         if (isBudgetError(error)) throw error;
-        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget);
+        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         gaps.push({ resource_id: resourceId, code: classifyGap(error) });
       }
     }
@@ -174,19 +174,60 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     });
     const entries: NavigationInventoryEntry[] = [];
     const gaps: NavigationCoverageGap[] = includeFamilyGaps ? unresolvedSourceFamilyGaps() : [];
+    const catalogRoot = this.sourcesRoot(projectId, zone);
     for (const item of page.entries) {
       if (item.kind !== "file" || !item.path) continue;
+      if (item.path !== `${catalogRoot}/${item.name}`) {
+        gaps.push({ resource_id: item.name, code: "canonical_catalog_path_mismatch" });
+        continue;
+      }
       try {
         charge(budget);
         const raw = await this.runtime.objects.readText(item.path);
-        if (raw === null) continue;
-        const record = JSON.parse(raw) as { schema_version?: unknown; entry?: unknown };
-        if (record.schema_version !== "1.0" || record.entry === null || typeof record.entry !== "object" || Array.isArray(record.entry)) continue;
-        const entry = navigationInventoryEntrySchema.parse(record.entry);
-        if (entry.project_id !== projectId || entry.zone !== zone) throw new Error("navigation_catalog_binding");
+        if (raw === null) {
+          gaps.push({ resource_id: item.name, code: "canonical_catalog_entry_unavailable" });
+          continue;
+        }
+        let parsed: unknown;
+        try { parsed = JSON.parse(raw); }
+        catch {
+          gaps.push({ resource_id: item.name, code: "canonical_catalog_entry_invalid" });
+          continue;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          gaps.push({ resource_id: item.name, code: "canonical_catalog_entry_invalid" });
+          continue;
+        }
+        const record = parsed as { schema_version?: unknown; resource_id?: unknown; entry?: unknown };
+        const keys = Object.keys(record);
+        if (record.schema_version !== "1.0" || !Object.hasOwn(record, "entry")
+          || keys.some((key) => !["schema_version", "resource_id", "entry"].includes(key))
+          || (record.resource_id !== undefined && typeof record.resource_id !== "string")) {
+          gaps.push({ resource_id: item.name, code: "canonical_catalog_entry_invalid" });
+          continue;
+        }
+        if (record.entry === null) {
+          if (typeof record.resource_id !== "string" || item.name !== `${await sha256Text(record.resource_id)}.json`) {
+            gaps.push({ resource_id: item.name, code: "canonical_catalog_entry_invalid" });
+          }
+          // A correctly bound null row is the sidecar's CAS-protected deletion tombstone.
+          continue;
+        }
+        if (typeof record.entry !== "object" || Array.isArray(record.entry)) {
+          gaps.push({ resource_id: item.name, code: "canonical_catalog_entry_invalid" });
+          continue;
+        }
+        let entry: NavigationInventoryEntry;
+        try { entry = navigationInventoryEntrySchema.parse(record.entry); }
+        catch {
+          gaps.push({ resource_id: item.name, code: "canonical_catalog_entry_invalid" });
+          continue;
+        }
+        if (entry.project_id !== projectId || entry.zone !== zone || (record.resource_id !== undefined && record.resource_id !== entry.resource_id)) throw new Error("navigation_catalog_binding");
         if (item.name !== `${await sha256Text(entry.resource_id)}.json`) throw new Error("navigation_catalog_binding");
         entries.push(entry);
       } catch (error) {
+        if (isBudgetError(error)) throw error;
         gaps.push({ resource_id: item.name, code: classifyGap(error) });
       }
     }
@@ -233,7 +274,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         version: pointer.versionId,
         logical_path: version.logical_path,
         path: observation.path,
-      expected: {
+        expected: {
           object_id: observation.object_id,
           revision_token: observation.revision_token,
           content_sha256: verified.sha256,
@@ -262,6 +303,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       bytes = text === null ? null : new TextEncoder().encode(text);
     }
     if (!bytes || bytes.byteLength !== observation.size) return null;
+    charge(budget);
     const after = await this.runtime.objects.getMetadata(path);
     const actualSha = await sha256Bytes(bytes);
     if (!metadataMatches(after, observation) || !metadataMatches(before, observation)) return null;
@@ -314,6 +356,12 @@ function metadataMatches(metadata: ProviderObjectMetadata | null, identity: { ob
 
 function requireBudget(budget: SliceBudget, calls: number): void {
   if (!budget.canStartEffect(calls)) throw new Error("slice_budget_exhausted");
+}
+
+function generationFromSnapshot(snapshotId: string): number {
+  const match = /^source:(\d+)$/.exec(snapshotId);
+  if (!match) throw new Error("navigation_inventory_snapshot_invalid");
+  return Number(match[1]);
 }
 
 function charge(budget: SliceBudget): void { budget.beforeHttp(); }

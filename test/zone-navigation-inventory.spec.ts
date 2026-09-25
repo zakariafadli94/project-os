@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { SliceBudget } from "../src/convergence/contract";
 import type { NavigationInventoryEntry } from "../src/domain/zone-navigation";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
-import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
+import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "../src/documents/zone-navigation-sources";
 import { sha256Text } from "../src/documents/hash";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, workspaceProjectRoot } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
@@ -20,7 +20,7 @@ function budget(calls = 32): SliceBudget {
     now: () => 0,
     signal: new AbortController().signal,
     beforeHttp() { this.calls_left -= 1; if (this.calls_left < 0) throw new Error("slice_budget_exhausted"); },
-    canStartEffect(requiredCalls) { return this.calls_left >= requiredCalls; }
+    canStartEffect(requiredCalls) { return this.calls_left >= requiredCalls + 4; }
   };
 }
 
@@ -28,6 +28,8 @@ function harness() {
   const files = new Map<string, { content: string; object_id: string; revision_token: string }>();
   const pageLimits: number[] = [];
   const pagePaths: string[] = [];
+  const missingOnRead = new Set<string>();
+  const readErrors = new Map<string, Error>();
   let nextIdentity = 0;
   const metadata = (path: string): ProviderObjectMetadata | null => {
     const file = files.get(path);
@@ -40,7 +42,12 @@ function harness() {
   const runtime: ProjectOsPersistenceRuntime = {
     providerId: "test",
     objects: {
-      readText: async (path) => files.get(path)?.content ?? null,
+      readText: async (path) => {
+        const error = readErrors.get(path);
+        if (error) throw error;
+        if (missingOnRead.has(path)) return null;
+        return files.get(path)?.content ?? null;
+      },
       readBytes: async (path, maxBytes) => {
         const file = files.get(path);
         if (!file) return null;
@@ -52,7 +59,14 @@ function harness() {
       getMetadata: async (path) => metadata(path),
       listChildren: async () => [],
       move: async () => {},
-      delete: async (path) => { files.delete(path); }
+      delete: async (path) => { files.delete(path); },
+      deleteIfUnchanged: async (path, expected) => {
+        const current = metadata(path);
+        if (!current) return "missing";
+        if (current.objectId !== expected.objectId || current.revisionToken !== expected.revisionToken) return "changed";
+        files.delete(path);
+        return "deleted";
+      }
     },
     conditionalWrite: { writeTextConditional: async (path, content) => { put(path, content); return metadata(path)!; } },
     serverSideCopy: { copyObject: async () => ({ path: "", objectId: "", revisionToken: "", size: 0 }) },
@@ -68,7 +82,7 @@ function harness() {
     evidence: { stableObjectId: { semantics: "stable-through-move" }, revisionToken: { semantics: "opaque-object-revision" }, integrityHash: { semantics: "identified-algorithm" } }
   };
   const sources = new ZoneNavigationSources(runtime);
-  return { runtime, files, pageLimits, pagePaths, put, sources, inventory: new ZoneNavigationInventory(runtime, sources) };
+  return { runtime, files, pageLimits, pagePaths, missingOnRead, readErrors, put, sources, inventory: new ZoneNavigationInventory(runtime, sources) };
 }
 
 async function addWorkingHead(h: ReturnType<typeof harness>, content: string, revision = "rev-visible", id = documentId, version = versionId, logicalPath = "draft.md") {
@@ -101,7 +115,8 @@ describe("ZoneNavigationInventory", () => {
 
     const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
 
-    expect(h.pageLimits).toEqual([1]);
+    expect(h.pageLimits.every((limit) => limit === 1)).toBe(true);
+    expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(1);
     expect(page.snapshot_id).toBe("source:0");
     expect(page.next_cursor).toBeNull();
     expect(page.gaps).toEqual(expect.arrayContaining([
@@ -131,7 +146,8 @@ describe("ZoneNavigationInventory", () => {
     expect(first.next_cursor).not.toBeNull();
     expect(second.entries).toHaveLength(1);
     expect(second.next_cursor).toBeNull();
-    expect(h.pageLimits).toEqual([1, 1]);
+    expect(h.pageLimits.every((limit) => limit === 1)).toBe(true);
+    expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(2);
     expect(new Set([...first.entries, ...second.entries].map((entry) => entry.resource_id)).size).toBe(2);
   });
 
@@ -145,6 +161,23 @@ describe("ZoneNavigationInventory", () => {
     h.put(headPath, JSON.stringify(raw));
 
     await expect(h.inventory.verifyEntry(original, budget())).resolves.toBe(false);
+  });
+
+  it("propagates budget exhaustion during the second visible metadata check", async () => {
+    const h = harness();
+    await addWorkingHead(h, "current body");
+    const original = (await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() })).entries[0];
+
+    await expect(h.inventory.verifyEntry(original, budget(4))).rejects.toThrow("slice_budget_exhausted");
+  });
+
+  it("propagates a transient provider read error instead of treating it as a stale head", async () => {
+    const h = harness();
+    await addWorkingHead(h, "current body");
+    const original = (await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() })).entries[0];
+    h.readErrors.set(machineDocumentHeadPath(projectId, documentId), new Error("provider_temporarily_unavailable"));
+
+    await expect(h.inventory.verifyEntry(original, budget())).rejects.toThrow("provider_temporarily_unavailable");
   });
 
   it("refreshes an adopted catalog from the exact dirty head without rescanning all heads", async () => {
@@ -166,7 +199,6 @@ describe("ZoneNavigationInventory", () => {
     const pathsBeforeDelta = h.pagePaths.length;
 
     const updated = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
-
     expect(h.pagePaths.slice(pathsBeforeDelta)).not.toContain(headListingPath);
     expect(updated.entries).toHaveLength(1);
     expect(updated.entries[0].expected.content_sha256).toBe(await sha256Text("new body"));
@@ -183,5 +215,66 @@ describe("ZoneNavigationInventory", () => {
       { resource_id: "packages", code: expect.any(String) },
       { resource_id: "artifacts", code: expect.any(String) }
     ]));
+  });
+
+  it.each([
+    ["missing catalog record", null, true, "canonical_catalog_entry_unavailable"],
+    ["invalid schema version", JSON.stringify({ schema_version: "9.0", resource_id: `head:${documentId}`, entry: {} }), false, "canonical_catalog_entry_invalid"],
+    ["catalog record without entry", JSON.stringify({ schema_version: "1.0", resource_id: `head:${documentId}` }), false, "canonical_catalog_entry_invalid"],
+    ["unbound null tombstone", JSON.stringify({ schema_version: "1.0", entry: null }), false, "canonical_catalog_entry_invalid"],
+    ["null tombstone with another resource id", JSON.stringify({ schema_version: "1.0", resource_id: "head:DOC-1123456789ABCDEF01234567", entry: null }), false, "canonical_catalog_entry_invalid"],
+    ["valid null tombstone", JSON.stringify({ schema_version: "1.0", resource_id: `head:${documentId}`, entry: null }), false, null]
+  ])("handles a %s catalog record", async (_name, raw, missing, expectedCode) => {
+    const h = harness();
+    await h.sources.beginAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, budget());
+    await h.sources.finishAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, budget());
+    const resourceId = `head:${documentId}`;
+    const path = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/${await sha256Text(resourceId)}.json`;
+    h.put(path, raw ?? JSON.stringify({ schema_version: "1.0", entry: {} }));
+    if (missing) h.missingOnRead.add(path);
+
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
+
+    const catalogResource = `${await sha256Text(resourceId)}.json`;
+    if (expectedCode === null) {
+      expect(page.entries).toEqual([]);
+      expect(page.gaps).not.toContainEqual(expect.objectContaining({ resource_id: catalogResource }));
+    } else expect(page.gaps).toContainEqual({ resource_id: catalogResource, code: expectedCode });
+  });
+
+  it("rejects a catalog listing path that escapes the configured catalog root", async () => {
+    const h = harness();
+    await h.sources.beginAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, budget());
+    await h.sources.finishAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, budget());
+    const resourceId = `head:${documentId}`;
+    const name = `${await sha256Text(resourceId)}.json`;
+    h.runtime.pagedListing!.listPage = async () => ({ entries: [{ kind: "file", name, path: `/outside/${name}` }], cursor: null });
+
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
+
+    expect(page.entries).toEqual([]);
+    expect(page.gaps).toContainEqual({ resource_id: name, code: "canonical_catalog_path_mismatch" });
+  });
+
+  it("does not start a dirty refresh without reserving the page, resolution, catalog, and checkpoint calls", async () => {
+    const h = harness();
+    await addWorkingHead(h, "current body");
+    const original = (await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() })).entries[0];
+    const b = budget();
+    const requestId = "DOCREQ-NAVIGATION-WORKING-0001";
+    await h.sources.beginAdoption(projectId, "WORKING", requestId, 0, b);
+    await h.sources.finishAdoption(projectId, "WORKING", requestId, 0, b);
+    const ticket = await h.sources.beginHeadWrite(projectId, "WORKING", original.resource_id, b);
+    const path = await addWorkingHead(h, "new body", "rev-new");
+    await h.sources.completeHeadWrite(ticket, {
+      ...original,
+      expected: { ...original.expected, revision_token: "rev-new", content_sha256: await sha256Text("new body") }
+    }, b);
+    const pagesBefore = h.pagePaths.length;
+
+    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(20) })).rejects.toThrow("slice_budget_exhausted");
+
+    expect(h.pagePaths).toHaveLength(pagesBefore);
+    expect(path).toBe(original.path);
   });
 });

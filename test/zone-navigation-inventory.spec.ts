@@ -209,7 +209,7 @@ describe("ZoneNavigationInventory", () => {
     const pages = [];
     let cursor: string | null = null;
     do {
-      const page = await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor, limit: 8, budget: budget() });
+      const page = await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor, limit: 8, budget: budget(25) });
       pages.push(page);
       cursor = page.next_cursor;
     } while (cursor !== null);
@@ -218,7 +218,40 @@ describe("ZoneNavigationInventory", () => {
     expect(pages).toHaveLength(4);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ resource_id: `package:${ref.package_id}`, logical_path: `PACKAGES/${ref.package_id}/1/INDEX.md`, version: `1:${ref.manifest_sha256}` });
+    expect(await inventory.verifyEntry(entries[0], budget())).toBe(true);
     expect(pages.flatMap((page) => page.gaps)).not.toContainEqual(expect.objectContaining({ resource_id: "packages" }));
+
+    await sources.beginAdoption(state.project_id, "WORKING", "NAV-ADOPT-PACKAGE-1", 0, budget());
+    expect(await sources.finishAdoption(state.project_id, "WORKING", "NAV-ADOPT-PACKAGE-1", 0, budget())).toBe(true);
+    const resourceId = `package:${ref.package_id}`;
+    const ticket = await sources.beginHeadWrite(state.project_id, "WORKING", resourceId, budget());
+    const nextBody = "replacement package member";
+    const nextHash = await sha256Text(nextBody);
+    const nextDocumentId = `DOC-${"3".repeat(24)}`;
+    const nextVersionId = `VER-REQ-${"3".repeat(24)}`;
+    const nextPayload = await repository.storeTextPayload(state.project_id, nextHash, nextBody);
+    await repository.writeVersion({ schema_version: "1.0", project_id: state.project_id, document_id: nextDocumentId, version_id: nextVersionId, kind: "work_product", stage: "working", logical_path: "replacement.md", source: "project_os", created_at: "2026-09-13T12:00:00Z", immutable_payload_path: nextPayload, content_sha256: nextHash, size: nextBody.length });
+    const nextManifest = { schema_version: "1.0", project_id: state.project_id, creation_request_id: "DOCREQ-PACKAGE-0001", version: 2, predecessor: ref, members: [{ relative_path: "replacement.md", document_id: nextDocumentId, document_version_id: nextVersionId, immutable_payload_path: nextPayload, content_sha256: nextHash, size: nextBody.length }], links: [], source_refs: ["accepted:package"], created_by: "operator", created_at: "2026-09-13T12:00:00Z" };
+    const nextRef = await repository.freezePackage(nextManifest);
+    expect(nextRef.package_id).toBe(ref.package_id);
+    const nextRequest = { operation: "package.replace" as const, request_id: "DOCREQ-REPLACE-0002", project_id: state.project_id, candidate: nextRef, zone: "WORKING" as const, expected_navigation_generation: 1, expected_project_revision: 0, created_at: "2026-09-13T12:00:00Z" };
+    const nextAdmission = { project_id: state.project_id, operation: "package.replace", kind: "document", request_id: nextRequest.request_id, request_hash: await sha256Text(canonicalJson(nextRequest)), actor: { actor_id: "operator", authority: "ingress" }, resources: [{ resource_id: nextRef.package_id, resource_type: "package", zone: "WORKING", version: `${nextRef.version}:${nextRef.manifest_sha256}` }], global_revision: 0, project_revision: 0, ruleset: { digest: "b".repeat(64), rules: [], global_revision: 0, project_revision: 0 }, verdict: "allow", results: [], gaps: [], deferred_rules: [] };
+    expect((await new ManagedDocumentService(runtime).replacePackage(nextRequest, state, nextAdmission as never)).status).toBe("finalized");
+    await sources.completeHeadWrite(ticket, null, budget());
+
+    const refreshedPages = [];
+    let refreshedCursor: string | null = null;
+    do {
+      const page = await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor: refreshedCursor, limit: 8, budget: budget(25) });
+      refreshedPages.push(page);
+      refreshedCursor = page.next_cursor;
+    } while (refreshedCursor !== null);
+    const refreshedEntries = refreshedPages.flatMap((page) => page.entries).filter((entry) => entry.resource_id === resourceId);
+    expect(refreshedEntries).toHaveLength(1);
+    expect(refreshedEntries[0].version).toBe(`2:${nextRef.manifest_sha256}`);
+    expect(await inventory.verifyEntry(refreshedEntries[0], budget())).toBe(true);
+    expect(await inventory.verifyEntry(entries[0], budget())).toBe(false);
+    expect(await inventory.verifySnapshot({ project_id: state.project_id, zone: "WORKING", snapshot_id: refreshedPages[0].snapshot_id, budget: budget() })).toBe(true);
   });
 
   it("includes a committed artifact only from its exact current destination and receipt", async () => {
@@ -237,6 +270,7 @@ describe("ZoneNavigationInventory", () => {
     const entries = pages.flatMap((page) => page.entries);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ resource_id: `artifact:${await sha256Text(destination)}`, version: `ART-NAVIGATION-001:${await sha256Text("approved artifact")}`, logical_path: "report.md", path: destination });
+    expect(await h.inventory.verifyEntry(entries[0], budget())).toBe(true);
   });
 
   it("does not choose by timestamp when multiple committed receipts prove identical destination bytes", async () => {
@@ -257,6 +291,45 @@ describe("ZoneNavigationInventory", () => {
     expect(pages.flatMap((page) => page.gaps)).toContainEqual(expect.objectContaining({
       resource_id: `artifact:${await sha256Text(destination)}`, code: "artifact_destination_ambiguous"
     }));
+  });
+
+  it("refreshes the stable artifact catalog entry after a committed same-destination replacement", async () => {
+    const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/report.md`;
+    await seedCommittedArtifact(h, "ART-NAVIGATION-101", destination, "old committed artifact");
+    const firstPages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, budget: budget() });
+      firstPages.push(page);
+      cursor = page.next_cursor;
+    } while (cursor !== null);
+    const original = firstPages.flatMap((page) => page.entries)[0];
+    expect(original?.version).toBe(`ART-NAVIGATION-101:${await sha256Text("old committed artifact")}`);
+
+    await h.sources.beginAdoption(projectId, "DELIVERABLES", "NAV-ADOPT-ARTIFACT-1", 0, budget());
+    expect(await h.sources.finishAdoption(projectId, "DELIVERABLES", "NAV-ADOPT-ARTIFACT-1", 0, budget())).toBe(true);
+    const resourceId = `artifact:${await sha256Text(destination)}`;
+    const ticket = await h.sources.beginHeadWrite(projectId, "DELIVERABLES", resourceId, budget());
+    await seedCommittedArtifact(h, "ART-NAVIGATION-102", destination, "new committed artifact");
+    await h.sources.completeHeadWrite(ticket, null, budget());
+
+    const refreshedPages = [];
+    let refreshedCursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor: refreshedCursor, limit: 8, budget: budget(25) });
+      refreshedPages.push(page);
+      refreshedCursor = page.next_cursor;
+    } while (refreshedCursor !== null);
+    const refreshedEntries = refreshedPages.flatMap((page) => page.entries);
+    expect(refreshedEntries).toContainEqual(expect.objectContaining({
+      resource_id: resourceId,
+      version: `ART-NAVIGATION-102:${await sha256Text("new committed artifact")}`,
+      path: destination
+    }));
+    expect(await h.inventory.verifyEntry(original!, budget())).toBe(false);
+    expect(refreshedPages.flatMap((page) => page.gaps)).not.toContainEqual(expect.objectContaining({ resource_id: resourceId, code: "committed_artifact_resolver_unavailable" }));
+    expect(await h.inventory.verifySnapshot({ project_id: projectId, zone: "DELIVERABLES", snapshot_id: refreshedPages[0].snapshot_id, budget: budget() })).toBe(true);
   });
 
   it("refuses a stale entry when its active canonical pointer changes", async () => {
@@ -306,11 +379,17 @@ describe("ZoneNavigationInventory", () => {
     const headListingPath = `${machineDocumentRoot(projectId)}/heads`;
     const pathsBeforeDelta = h.pagePaths.length;
 
-    const updated = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
+    const updates = [];
+    let updateCursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: updateCursor, limit: 8, budget: budget() });
+      updates.push(page);
+      updateCursor = page.next_cursor;
+    } while (updateCursor !== null);
     expect(h.pagePaths.slice(pathsBeforeDelta)).not.toContain(headListingPath);
-    expect(updated.entries).toHaveLength(1);
-    expect(updated.entries[0].expected.content_sha256).toBe(await sha256Text("new body"));
-    expect(updated.entries[0].expected.content_sha256).not.toBe(original.expected.content_sha256);
+    expect(updates.flatMap((page) => page.entries)).toHaveLength(1);
+    expect(updates.flatMap((page) => page.entries)[0].expected.content_sha256).toBe(await sha256Text("new body"));
+    expect(updates.flatMap((page) => page.entries)[0].expected.content_sha256).not.toBe(original.expected.content_sha256);
     expect(await h.inventory.verifySnapshot({ project_id: projectId, zone: "WORKING", snapshot_id: "source:1", budget: budget() })).toBe(true);
   });
 

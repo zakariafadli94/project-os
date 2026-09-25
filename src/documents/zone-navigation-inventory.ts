@@ -19,7 +19,7 @@ import { canonicalJson } from "../rules/contract";
 import { MutationGateRepository } from "../mutation-gate/repository";
 import { MutationGateService } from "../mutation-gate/service";
 
-type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "dirty" | "catalog";
+type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "artifact-finalize" | "dirty" | "dirty-package" | "dirty-artifacts" | "dirty-finish" | "catalog";
 interface PageCursor { phase: PagePhase; cursor: string | null }
 
 const MAX_PACKAGE_LEDGER_BYTES = 128_000;
@@ -54,7 +54,11 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     if (phase === "packages") return this.packagePage(projectId, zone, providerCursor, snapshot_id, budget);
     if (phase === "artifacts") return this.artifactPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
     if (phase === "artifact-bindings") return this.artifactBindingsPage(projectId, zone, providerCursor, snapshot_id, budget);
+    if (phase === "artifact-finalize") return this.finalizeArtifactBindings(projectId, zone, providerCursor, snapshot_id, budget);
     if (phase === "dirty") return this.dirtyAndCatalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
+    if (phase === "dirty-package") return this.dirtyPackagePage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
+    if (phase === "dirty-artifacts") return this.dirtyArtifactPage(projectId, zone, providerCursor, snapshot_id, budget);
+    if (phase === "dirty-finish") return this.dirtyFinishPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
     return this.catalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget, input.cursor === null);
   }
 
@@ -63,8 +67,34 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
   }
 
   async verifyEntry(entry: NavigationInventoryEntry, budget: SliceBudget): Promise<boolean> {
-    const resolved = await this.resolveHead(entry.project_id, entry.zone, entry.resource_id, budget);
-    return resolved.entry !== null && sameEntry(resolved.entry, entry);
+    if (entry.resource_id.startsWith("head:")) {
+      const resolved = await this.resolveHead(entry.project_id, entry.zone, entry.resource_id, budget);
+      return resolved.entry !== null && sameEntry(resolved.entry, entry);
+    }
+    if (entry.resource_id.startsWith("package:")) {
+      const source = await readCurrentPackageNavigation(this.runtime, entry.project_id, entry.zone, budget);
+      const selected = source?.head?.packages.find((item) => `package:${item.ref.package_id}` === entry.resource_id);
+      if (!source || !selected) return false;
+      const resolved = await resolvePackageIndex(this.runtime, entry.project_id, entry.zone, selected, source, 0, budget, true);
+      return resolved.entry !== null && sameEntry(resolved.entry, entry);
+    }
+    if (entry.resource_id.startsWith("artifact:")) return this.verifyArtifactEntry(entry, budget);
+    return false;
+  }
+
+  private async verifyArtifactEntry(entry: NavigationInventoryEntry, budget: SliceBudget): Promise<boolean> {
+    const match = /^(ART-[A-Z0-9-]{10,}):([a-f0-9]{64})$/.exec(entry.version);
+    if (!match || `artifact:${await sha256Text(entry.path)}` !== entry.resource_id) return false;
+    const target = artifactNavigationTarget(entry.project_id, entry.path);
+    if (target.kind !== "zone" || target.zone !== entry.zone || target.logical_path !== entry.logical_path) return false;
+    const bounded = budgetedRuntime(this.runtime, budget);
+    const repository = new MutationGateRepository(bounded);
+    const intent = await repository.readArtifactIntent(entry.project_id, match[1]);
+    if (!intent || intent.destination_path !== entry.path || intent.expected_content_sha256 !== match[2]) return false;
+    const status = await new MutationGateService(bounded, "observe").artifactStatus(entry.project_id, match[1]);
+    if (status?.verification_state !== "canonical_verified" || status.receipt_status !== "committed" || status.operation === "REVIEW_CANDIDATE") return false;
+    const resolved = await resolveArtifactEntry(this.runtime, entry.project_id, entry.zone, intent, target.logical_path, budget);
+    return resolved !== null && sameEntry(resolved, entry);
   }
 
   private async initialPage(
@@ -118,7 +148,9 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
   }
 
   private async packagePage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget) {
-    requireBudget(budget, 22);
+    // Guard/engine already spend calls on admission and source-state checks;
+    // package proof is paged one member at a time and may start with 25 calls.
+    requireBudget(budget, 17);
     let packageIndex = 0;
     let memberIndex = 0;
     if (cursor !== null) {
@@ -205,7 +237,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
 
   private async scanArtifactBindings(projectId: string, zone: NavigationZone, state: ArtifactBindingCursor, snapshotId: string, budget: SliceBudget) {
     if (!this.runtime.pagedListing) return { entries: [], gaps: [{ resource_id: `artifact:${await sha256Text(state.destination_path)}`, code: "paged_listing_unavailable" }], snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
-    requireBudget(budget, 22);
+    requireBudget(budget, 15);
     const destinationHash = await sha256Text(state.destination_path);
     const root = machineMutationIntentDestinationBindingRoot(projectId, destinationHash);
     charge(budget);
@@ -243,25 +275,43 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       state.binding_cursor = page.cursor;
       return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifact-bindings", JSON.stringify(state)) };
     }
-    const resourceId = `artifact:${destinationHash}`;
+    return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifact-finalize", JSON.stringify(state)) };
+  }
+
+  private async finalizeArtifactBindings(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget) {
+    let state: ArtifactBindingCursor;
+    try {
+      state = JSON.parse(cursor ?? "") as ArtifactBindingCursor;
+      if (!state || typeof state.request_id !== "string" || typeof state.destination_path !== "string" || !Array.isArray(state.eligible_request_ids) || !Array.isArray(state.gaps)) throw new Error();
+    } catch { throw new Error("navigation_inventory_cursor_invalid"); }
+    requireBudget(budget, 16);
+    const resourceId = `artifact:${await sha256Text(state.destination_path)}`;
     const distinct = [...new Set(state.eligible_request_ids)];
     if (distinct.length > 1) {
       await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
       state.gaps.push({ resource_id: resourceId, code: "artifact_destination_ambiguous" });
-      return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
+      return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.dirty ? null : state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
     }
-    if (distinct.length === 1 && distinct[0] === state.request_id) {
-      const intent = await new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, state.request_id);
+    if (distinct.length === 1 && (state.dirty || distinct[0] === state.request_id)) {
+      const winningRequestId = distinct[0];
+      const intent = await new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, winningRequestId);
       if (!intent) throw new Error("committed_artifact_intent_unavailable");
       const target = artifactNavigationTarget(projectId, state.destination_path);
       if (target.kind !== "zone" || target.zone !== zone) throw new Error("artifact_destination_zone_mismatch");
-      const status = await new MutationGateService(budgetedRuntime(this.runtime, budget), "observe").artifactStatus(projectId, state.request_id);
+      const status = await new MutationGateService(budgetedRuntime(this.runtime, budget), "observe").artifactStatus(projectId, winningRequestId);
       const entry = status?.verification_state === "canonical_verified" && status.receipt_status === "committed" && status.operation !== "REVIEW_CANDIDATE"
         ? await resolveArtifactEntry(this.runtime, projectId, zone, intent, target.logical_path, budget) : null;
       if (entry) {
         await this.sources.writeCatalogEntry(entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        if (state.dirty) {
+          return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: resourceId, dirty_cursor: state.dirty.dirty_cursor, entry })) };
+        }
         return { entries: [entry], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
       }
+    }
+    if (state.dirty && state.gaps.length === 0) {
+      await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+      return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: resourceId, dirty_cursor: state.dirty.dirty_cursor, entry: null })) };
     }
     return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
   }
@@ -274,46 +324,112 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     snapshotId: string,
     budget: SliceBudget
   ) {
-    // One dirty record may require marker listing/read, canonical head/version,
-    // visible metadata/bytes/metadata (plus immutable payload fallback), a
-    // catalog write, dirty compare-and-clear, and one catalog-page listing/read.
-    // Worst case: dirty list/read (2), head/version (2), visible bytes and
-    // metadata with immutable fallback (4), catalog write (4), dirty compare-
-    // and-clear (7), and catalog list/read (2). Keep the checkpoint reserve too.
-    requireBudget(budget, 21);
+    requireBudget(budget, 15);
     const dirtyPage = await this.sources.listDirtyPage(projectId, zone, cursor, 1, budget);
     const gaps: NavigationCoverageGap[] = [];
-    for (const resourceId of dirtyPage.resource_ids) {
-      if (!resourceId.startsWith("head:DOC-")) {
-        // No finalized current package/artifact resolver is wired here. Remove
-        // an obsolete cached entry, but retain the dirty marker so a snapshot
-        // cannot certify a catalog whose canonical source was not checked.
-        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
-        gaps.push({ resource_id: resourceId, code: unsupportedSourceCode(resourceId) });
-        continue;
-      }
-      try {
-        const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
-        if (resolved.gap) {
-          await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
-          gaps.push(resolved.gap);
-          continue;
-        }
-        await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
-        if (!await this.sources.finishDirty(projectId, zone, resourceId, resolved.entry, budget)) {
-          gaps.push({ resource_id: resourceId, code: "dirty_identity_changed" });
-        }
-      } catch (error) {
-        if (isBudgetError(error)) throw error;
-        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
-        gaps.push({ resource_id: resourceId, code: classifyGap(error) });
-      }
+    const resourceId = dirtyPage.resource_ids[0];
+    if (!resourceId) return await this.catalogPage(projectId, zone, null, requestedLimit, snapshotId, budget, true);
+    if (resourceId.startsWith("package:")) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-package", JSON.stringify({ resource_id: resourceId, dirty_cursor: dirtyPage.next_cursor, member_index: 0 })) };
+    if (resourceId.startsWith("artifact:")) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-artifacts", JSON.stringify({ resource_id: resourceId, dirty_cursor: dirtyPage.next_cursor, intent_cursor: null, destination_path: null, binding_cursor: null, eligible_request_ids: [], gaps: [] })) };
+    if (!resourceId.startsWith("head:DOC-")) {
+      await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+      return { entries: [], gaps: [{ resource_id: resourceId, code: unsupportedSourceCode(resourceId) }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
     }
-    if (dirtyPage.next_cursor !== null) return {
-      entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", dirtyPage.next_cursor)
-    };
-    const catalog = await this.catalogPage(projectId, zone, null, requestedLimit, snapshotId, budget, true);
-    return { ...catalog, gaps: [...gaps, ...catalog.gaps] };
+    requireBudget(budget, 12);
+    try {
+      const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
+      if (resolved.gap) return { entries: [], gaps: [resolved.gap], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
+      await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+      if (!await this.sources.finishDirty(projectId, zone, resourceId, resolved.entry, budget)) return { entries: [], gaps: [{ resource_id: resourceId, code: "dirty_identity_changed" }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
+      return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: dirtyPage.next_cursor !== null ? encodeCursor("dirty", dirtyPage.next_cursor) : encodeCursor("catalog", "") };
+    } catch (error) {
+      if (isBudgetError(error)) throw error;
+      return { entries: [], gaps: [{ resource_id: resourceId, code: classifyGap(error) }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
+    }
+  }
+
+  private async dirtyPackagePage(projectId: string, zone: NavigationZone, cursor: string | null, requestedLimit: number, snapshotId: string, budget: SliceBudget) {
+    requireBudget(budget, 12);
+    let state: { resource_id: string; dirty_cursor: string | null; member_index: number };
+    try {
+      state = JSON.parse(cursor ?? "") as typeof state;
+      if (!state || !state.resource_id.startsWith("package:") || (state.dirty_cursor !== null && typeof state.dirty_cursor !== "string") || !Number.isSafeInteger(state.member_index) || state.member_index < 0) throw new Error();
+    } catch { throw new Error("navigation_inventory_cursor_invalid"); }
+    const gaps: NavigationCoverageGap[] = [];
+    try {
+      const source = await readCurrentPackageNavigation(this.runtime, projectId, zone, budget);
+      const selected = source?.head?.packages.find((item) => `package:${item.ref.package_id}` === state.resource_id);
+      if (!selected || !source) {
+        await this.sources.writeCatalogEntry(null, projectId, zone, state.resource_id, budget, generationFromSnapshot(snapshotId));
+        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: state.resource_id, dirty_cursor: state.dirty_cursor, entry: null })) };
+      }
+      const resolved = await resolvePackageIndex(this.runtime, projectId, zone, selected, source, state.member_index, budget);
+      if (resolved.gap) return { entries: [], gaps: [resolved.gap], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-package", JSON.stringify(state)) };
+      if (resolved.pending) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-package", JSON.stringify({ ...state, member_index: state.member_index + 1 })) };
+      await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, state.resource_id, budget, generationFromSnapshot(snapshotId));
+      return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: state.resource_id, dirty_cursor: state.dirty_cursor, entry: resolved.entry })) };
+    } catch (error) {
+      if (isBudgetError(error)) throw error;
+      return { entries: [], gaps: [{ resource_id: state.resource_id, code: classifyPackageGap(error) }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-package", JSON.stringify(state)) };
+    }
+  }
+
+  private async afterDirtyPage(projectId: string, zone: NavigationZone, dirtyCursor: string | null, requestedLimit: number, snapshotId: string, budget: SliceBudget, priorGaps: NavigationCoverageGap[]) {
+    if (dirtyCursor !== null) return { entries: [], gaps: priorGaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", dirtyCursor) };
+    void projectId; void zone; void requestedLimit; void budget;
+    return { entries: [], gaps: priorGaps, snapshot_id: snapshotId, next_cursor: encodeCursor("catalog", "") };
+  }
+
+  private async dirtyFinishPage(projectId: string, zone: NavigationZone, cursor: string | null, requestedLimit: number, snapshotId: string, budget: SliceBudget) {
+    requireBudget(budget, 8);
+    let state: { resource_id: string; dirty_cursor: string | null; entry: NavigationInventoryEntry | null };
+    try {
+      state = JSON.parse(cursor ?? "") as typeof state;
+      if (!state || typeof state.resource_id !== "string" || (state.dirty_cursor !== null && typeof state.dirty_cursor !== "string")) throw new Error();
+      if (state.entry !== null) state.entry = navigationInventoryEntrySchema.parse(state.entry);
+    } catch { throw new Error("navigation_inventory_cursor_invalid"); }
+    if (!await this.sources.finishDirty(projectId, zone, state.resource_id, state.entry, budget)) return { entries: [], gaps: [{ resource_id: state.resource_id, code: "dirty_identity_changed" }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify(state)) };
+    return this.afterDirtyPage(projectId, zone, state.dirty_cursor, requestedLimit, snapshotId, budget, []);
+  }
+
+  private async dirtyArtifactPage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget) {
+    if (!this.runtime.pagedListing) return { entries: [], gaps: [{ resource_id: "artifacts", code: "paged_listing_unavailable" }], snapshot_id: snapshotId, next_cursor: cursor === null ? null : encodeCursor("dirty-artifacts", cursor) };
+    requireBudget(budget, 12);
+    let state: DirtyArtifactCursor;
+    try {
+      state = JSON.parse(cursor ?? "") as DirtyArtifactCursor;
+      if (!state || !/^artifact:[a-f0-9]{64}$/.test(state.resource_id) || (state.dirty_cursor !== null && typeof state.dirty_cursor !== "string") || (state.intent_cursor !== null && typeof state.intent_cursor !== "string") || (state.destination_path !== null && typeof state.destination_path !== "string") || (state.binding_cursor !== null && typeof state.binding_cursor !== "string") || !Array.isArray(state.eligible_request_ids) || !Array.isArray(state.gaps)) throw new Error();
+    } catch { throw new Error("navigation_inventory_cursor_invalid"); }
+    if (!state.destination_path) {
+      const root = `${machineMutationGateRoot(projectId)}/intents/artifacts`;
+      charge(budget);
+      const page = await this.runtime.pagedListing.listPage({ path: root, cursor: state.intent_cursor, limit: 1 });
+      const item = page.entries[0];
+      if (item) {
+        const match = /^(ART-[A-Z0-9-]{10,})\.json$/.exec(item.name);
+        if (item.kind === "file" && item.path === `${root}/${item.name}` && match) {
+          try {
+            const intent = await new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, match[1]);
+            if (intent && `artifact:${await sha256Text(intent.destination_path)}` === state.resource_id) {
+              const target = artifactNavigationTarget(projectId, intent.destination_path);
+              if (target.kind === "zone" && target.zone === zone) {
+                const next: ArtifactBindingCursor = { next_intent_cursor: null, request_id: intent.request_id, destination_path: intent.destination_path, binding_cursor: null, eligible_request_ids: [], gaps: [], dirty: { resource_id: state.resource_id, dirty_cursor: state.dirty_cursor } };
+                return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: encodeCursor("artifact-bindings", JSON.stringify(next)) };
+              }
+            }
+          } catch (error) {
+            if (isBudgetError(error)) throw error;
+            state.gaps.push({ resource_id: state.resource_id, code: classifyArtifactGap(error) });
+          }
+        }
+      }
+      if (page.cursor !== null) return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-artifacts", JSON.stringify({ ...state, intent_cursor: page.cursor })) };
+      if (state.gaps.length) return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: null };
+      await this.sources.writeCatalogEntry(null, projectId, zone, state.resource_id, budget, generationFromSnapshot(snapshotId));
+      return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: state.resource_id, dirty_cursor: state.dirty_cursor, entry: null })) };
+    }
+    const binding: ArtifactBindingCursor = { next_intent_cursor: null, request_id: state.request_id!, destination_path: state.destination_path, binding_cursor: state.binding_cursor, eligible_request_ids: state.eligible_request_ids, gaps: state.gaps, dirty: { resource_id: state.resource_id, dirty_cursor: state.dirty_cursor } };
+    return this.scanArtifactBindings(projectId, zone, binding, snapshotId, budget);
   }
 
   private async catalogPage(
@@ -533,7 +649,7 @@ function decodeCursor(value: string): PageCursor {
   const separator = value.indexOf(":");
   if (separator < 1) throw new Error("navigation_inventory_cursor_invalid");
   const phase = value.slice(0, separator);
-  if (phase !== "initial" && phase !== "packages" && phase !== "artifacts" && phase !== "artifact-bindings" && phase !== "dirty" && phase !== "catalog") throw new Error("navigation_inventory_cursor_invalid");
+  if (phase !== "initial" && phase !== "packages" && phase !== "artifacts" && phase !== "artifact-bindings" && phase !== "artifact-finalize" && phase !== "dirty" && phase !== "dirty-package" && phase !== "dirty-artifacts" && phase !== "dirty-finish" && phase !== "catalog") throw new Error("navigation_inventory_cursor_invalid");
   const encoded = value.slice(separator + 1);
   return { phase, cursor: encoded ? decodeURIComponent(encoded) : null };
 }
@@ -579,6 +695,18 @@ interface ArtifactBindingCursor {
   binding_cursor: string | null;
   eligible_request_ids: string[];
   gaps: NavigationCoverageGap[];
+  dirty?: { resource_id: string; dirty_cursor: string | null };
+}
+
+interface DirtyArtifactCursor {
+  resource_id: string;
+  dirty_cursor: string | null;
+  intent_cursor: string | null;
+  destination_path: string | null;
+  request_id?: string;
+  binding_cursor: string | null;
+  eligible_request_ids: string[];
+  gaps: NavigationCoverageGap[];
 }
 
 async function readCurrentPackageNavigation(runtime: ProjectOsPersistenceRuntime, projectId: string, zone: NavigationZone, budget: SliceBudget): Promise<CurrentPackageNavigation | null> {
@@ -616,7 +744,8 @@ async function resolvePackageIndex(
   selected: PackageNavigationHead["packages"][number],
   source: CurrentPackageNavigation,
   memberIndex: number,
-  budget: SliceBudget
+  budget: SliceBudget,
+  verifyAllMembers = false
 ): Promise<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap; pending?: boolean }> {
   const ref = packageRefSchema.parse(selected.ref);
   if (ref.project_id !== projectId || selected.root !== `${zone}/PACKAGES/${ref.package_id}/${ref.version}`) throw new Error("package_navigation_binding");
@@ -632,14 +761,14 @@ async function resolvePackageIndex(
   const manifest = parsePackageManifest(JSON.parse(raw));
   if (manifest.project_id !== projectId || manifest.version !== ref.version || await packageIdFor(projectId, manifest.creation_request_id) !== ref.package_id || canonicalJson(manifest) !== raw) throw new Error("package_manifest_binding");
   if (!source.visible_members) throw new Error("package_visible_member_evidence_unavailable");
-  if (memberIndex >= manifest.members.length) throw new Error("package_member_cursor_invalid");
-  const member = manifest.members[memberIndex];
-  const memberPath = `${source.base_path}/${selected.root}/${member.relative_path}`;
-  const memberEvidence = source.visible_members.filter((candidate) => candidate.path === memberPath);
-  if (memberEvidence.length !== 1 || memberEvidence[0].provider_id !== runtime.providerId || memberEvidence[0].content_sha256 !== member.content_sha256) throw new Error("package_visible_member_binding");
-  const memberMetadata = await bounded.objects.getMetadata(memberPath);
-  if (!memberMetadata || memberMetadata.objectId !== memberEvidence[0].object_id || memberMetadata.revisionToken !== memberEvidence[0].revision_token || memberMetadata.size !== member.size) throw new Error("package_visible_member_changed");
-  if (memberIndex + 1 < manifest.members.length) return { entry: null, pending: true };
+  if (verifyAllMembers) {
+    if (!budget.canStartEffect(manifest.members.length + 13)) throw new Error("slice_budget_exhausted");
+    for (const member of manifest.members) await verifyPackageMember(runtime, bounded, projectId, selected.root, source, member);
+  } else {
+    if (memberIndex >= manifest.members.length) throw new Error("package_member_cursor_invalid");
+    await verifyPackageMember(runtime, bounded, projectId, selected.root, source, manifest.members[memberIndex]);
+    if (memberIndex + 1 < manifest.members.length) return { entry: null, pending: true };
+  }
   const logicalPath = `${selected.root.slice(zone.length + 1)}/INDEX.md`;
   const content = `# ${ref.package_id} v${ref.version}\n\n${manifest.members.map((member) => `- [[${selected.root}/${member.relative_path}]]`).join("\n")}\n`;
   const contentHash = await sha256Text(content);
@@ -658,6 +787,21 @@ async function resolvePackageIndex(
     path: visiblePath,
     expected: { object_id: before.objectId, revision_token: before.revisionToken, content_sha256: contentHash, size: before.size }
   }) };
+}
+
+async function verifyPackageMember(
+  runtime: ProjectOsPersistenceRuntime,
+  bounded: ProjectOsPersistenceRuntime,
+  projectId: string,
+  packageRoot: string,
+  source: CurrentPackageNavigation,
+  member: ReturnType<typeof parsePackageManifest>["members"][number]
+): Promise<void> {
+  const memberPath = `${source.base_path}/${packageRoot}/${member.relative_path}`;
+  const memberEvidence = source.visible_members!.filter((candidate) => candidate.path === memberPath);
+  if (memberEvidence.length !== 1 || memberEvidence[0].provider_id !== runtime.providerId || memberEvidence[0].content_sha256 !== member.content_sha256) throw new Error("package_visible_member_binding");
+  const memberMetadata = await bounded.objects.getMetadata(memberPath);
+  if (!memberMetadata || memberMetadata.objectId !== memberEvidence[0].object_id || memberMetadata.revisionToken !== memberEvidence[0].revision_token || memberMetadata.size !== member.size) throw new Error("package_visible_member_changed");
 }
 
 function budgetedRuntime(runtime: ProjectOsPersistenceRuntime, budget: SliceBudget): ProjectOsPersistenceRuntime {

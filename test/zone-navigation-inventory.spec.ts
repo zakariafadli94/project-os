@@ -205,6 +205,36 @@ describe("ZoneNavigationInventory", () => {
     expect(h.pageLimits.every((limit) => limit <= 8)).toBe(true);
   });
 
+  it("uses the cheap path for inactive heads so a bounded slice does not stall on them", async () => {
+    const h = harness();
+    for (let index = 0; index < 8; index++) {
+      const id = `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`;
+      h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+        schema_version: "1.0", project_id: projectId, document_id: id,
+        kind: "work_product", logical_path: `inactive-${index}.md`, reconciliation_status: "clean"
+      }));
+    }
+    const slice = budget(25);
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "REVIEW", cursor: null, limit: 8, budget: slice });
+    expect(page.entries).toEqual([]);
+    expect(page.gaps).toEqual([]);
+    expect(page.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
+    expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+  });
+
+  it("defers an active head when its proof budget is short, then resumes the exact source", async () => {
+    const h = harness();
+    await addWorkingHead(h, "active body");
+    const short = budget(15);
+    const deferred = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: short });
+    expect(deferred.entries).toEqual([]);
+    expect(deferred.next_cursor?.startsWith("initial:")).toBe(true);
+    expect(short.calls_left).toBeGreaterThanOrEqual(0);
+    const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: deferred.next_cursor, limit: 8, budget: budget(32) });
+    expect(resumed.entries.map((entry) => entry.resource_id)).toEqual([`head:${documentId}`]);
+    expect(resumed.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
+  });
+
   it("avoids a null catalog write for a clean inactive head but clears a stale catalog row", async () => {
     const h = harness();
     const visiblePath = await addWorkingHead(h, "current body");

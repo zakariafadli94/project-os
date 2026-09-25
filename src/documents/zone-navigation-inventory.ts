@@ -28,6 +28,7 @@ const MAX_PACKAGE_MANIFEST_BYTES = 256_000;
 const MAX_VISIBLE_SOURCE_BYTES = 2_000_000;
 const MAX_INITIAL_HEADS_PER_PAGE = 8;
 const MAX_INITIAL_HEAD_PROVIDER_CALLS = 10;
+const MIN_INACTIVE_HEAD_PROVIDER_CALLS = 2;
 
 interface InitialHeadPageCursor {
   kind: "zone-navigation-head-batch-v1";
@@ -160,9 +161,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         offset += 1;
         continue;
       }
-      // Budget the worst supported item cost plus the engine's checkpoint
-      // reserve. If it does not fit, leave this item in the returned cursor.
-      if (!budget.canStartEffect(MAX_INITIAL_HEAD_PROVIDER_CALLS)) {
+      // Inactive heads only need a head read and catalog check. Reserve the
+      // larger proof budget after inspecting an active pointer, so historical
+      // inactive heads do not consume a whole recovery slice apiece.
+      if (!budget.canStartEffect(MIN_INACTIVE_HEAD_PROVIDER_CALLS)) {
         if (offset === 0) throw new Error("slice_budget_exhausted");
         break;
       }
@@ -582,6 +584,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const pointer = activePointer(head, zone);
     if (!pointer.versionId && !pointer.observation) return { entry: null };
     if (!pointer.versionId || !pointer.observation) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_binding_missing" } };
+    requireBudget(budget, MAX_INITIAL_HEAD_PROVIDER_CALLS - 1);
     const observation = normalizeObservation(pointer.observation);
     charge(budget);
     const rawVersion = await this.runtime.objects.readText(machineDocumentVersionPath(projectId, documentId, pointer.versionId));

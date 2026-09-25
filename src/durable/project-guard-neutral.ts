@@ -1387,11 +1387,11 @@ export class ProjectGuard extends DurableObject<Env> {
       return;
     }
     this.persistDocumentRequest(request, receipt);
+    if (receipt.status === "committed") await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
     if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
       this.clearRequestRecovery("document", request.request_id);
       return;
     }
-    await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
     await this.enqueueRequestRecovery("document", request.request_id);
     const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
     await journal.recordReceipt(
@@ -1403,11 +1403,11 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async settleArtifactReceipt(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<void> {
+    if (receipt.status === "committed") await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
     if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
       this.clearRequestRecovery("artifact", request.request_id);
       return;
     }
-    await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
     const journal = new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id);
     await journal.recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
     await this.finalizeVerifiedArtifact(journal);

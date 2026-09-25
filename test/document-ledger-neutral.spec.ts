@@ -6,11 +6,18 @@ import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources"
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import { ProviderConflictError } from "../src/persistence/provider/errors";
 
-function runtimeWithFiles(): { runtime: ProjectOsPersistenceRuntime; files: Map<string, string>; failNextHeadReadAfterUpsert: () => void } {
+function runtimeWithFiles(): {
+  runtime: ProjectOsPersistenceRuntime;
+  files: Map<string, string>;
+  forkRuntime: () => ProjectOsPersistenceRuntime;
+  failNextHeadReadAfterUpsert: () => void;
+  pauseNextCatalogCas: () => { entered: Promise<void>; release: () => void };
+} {
   const files = new Map<string, string>();
   const revisions = new Map<string, number>();
   let failNextHeadReadAfterUpsert = false;
   let failingHeadPath: string | null = null;
+  let nextCatalogGate: { entered(): void; enteredPromise: Promise<void>; wait: Promise<void>; release(): void } | null = null;
   const store = (path: string, content: string) => {
     files.set(path, content);
     revisions.set(path, (revisions.get(path) ?? 0) + 1);
@@ -42,6 +49,12 @@ function runtimeWithFiles(): { runtime: ProjectOsPersistenceRuntime; files: Map<
     },
     conditionalWrite: {
       writeTextConditional: async (path, content, expectedRevisionToken) => {
+        if (path.includes("/dirty/") && nextCatalogGate) {
+          const gate = nextCatalogGate;
+          nextCatalogGate = null;
+          gate.entered();
+          await gate.wait;
+        }
         if (String(revisions.get(path)) !== expectedRevisionToken) throw new Error("conditional_write_conflict");
         store(path, content);
         return { path, objectId: path, revisionToken: String(revisions.get(path)), size: content.length };
@@ -67,7 +80,18 @@ function runtimeWithFiles(): { runtime: ProjectOsPersistenceRuntime; files: Map<
       integrityHash: { semantics: "identified-algorithm" }
     }
   };
-  return { runtime, files, failNextHeadReadAfterUpsert: () => { failNextHeadReadAfterUpsert = true; } };
+  return {
+    runtime, files,
+    forkRuntime: () => ({ ...runtime, objects: { ...runtime.objects }, conditionalWrite: { ...runtime.conditionalWrite } }) as ProjectOsPersistenceRuntime,
+    failNextHeadReadAfterUpsert: () => { failNextHeadReadAfterUpsert = true; },
+    pauseNextCatalogCas() {
+      let enter!: () => void, release!: () => void;
+      const enteredPromise = new Promise<void>((resolve) => { enter = resolve; });
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      nextCatalogGate = { entered: enter, enteredPromise, wait, release };
+      return { entered: enteredPromise, release };
+    }
+  };
 }
 
 it("reads and writes schema-1.0 versions through neutral persistence", async () => {
@@ -121,4 +145,51 @@ it("recovers an in-flight navigation source write when the head upsert succeeded
 
   expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, in_flight_resource_ids: [] });
   expect(await runtime.objects.readText(machineDocumentHeadPath(projectId, documentId))).toContain(second.version_id);
+});
+
+it("does not let an older concurrent repository head completion clear or overwrite a newer head", async () => {
+  const { runtime, forkRuntime, pauseNextCatalogCas, files } = runtimeWithFiles();
+  const olderRepository = new DocumentLedgerRepository(runtime);
+  const newerRepository = new DocumentLedgerRepository(forkRuntime());
+  const projectId = "PRJ-0002";
+  const documentId = "DOC-0123456789ABCDEF01234567";
+  const version = (version_id: string, created_at: string, hash: string): DocumentVersionRecord => ({
+    schema_version: "1.0", project_id: projectId, document_id: documentId, version_id,
+    kind: "work_product", stage: "working", logical_path: "strategy/a.md", source: "project_os", created_at,
+    immutable_payload_path: `/PROJECT_OS/.project-os/projects/PRJ-0002/documents/payloads/sha256/${hash.repeat(64)}`,
+    content_sha256: hash.repeat(64)
+  });
+  const first = version("VER-REQ-111111111111111111111111", "2026-08-26T12:45:00+01:00", "a");
+  const older = version("VER-REQ-222222222222222222222222", "2026-08-27T12:45:00+01:00", "b");
+  const newer = version("VER-REQ-333333333333333333333333", "2026-08-28T12:45:00+01:00", "c");
+  for (const record of [first, older, newer]) await olderRepository.writeVersion(record);
+  const head = { schema_version: "1.0" as const, project_id: projectId, document_id: documentId, kind: "work_product" as const, logical_path: first.logical_path, working_version_id: first.version_id, reconciliation_status: "clean" as const };
+  await olderRepository.writeHead(head);
+  const sources = new ZoneNavigationSources(runtime);
+  await sources.beginAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0);
+  await sources.finishAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0);
+  await sources.writeCatalogEntry({
+    project_id: projectId, zone: "WORKING", resource_id: `head:${documentId}`, version: first.version_id,
+    logical_path: first.logical_path, path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/WORKING/strategy/a.md",
+    expected: { object_id: "id:original", revision_token: "rev-original", content_sha256: first.content_sha256!, size: 1 }
+  }, projectId, "WORKING", `head:${documentId}`);
+  const seedTicket = await sources.beginHeadWrite(projectId, "WORKING", `head:${documentId}`);
+  await sources.completeHeadWrite(seedTicket, {
+    project_id: projectId, zone: "WORKING", resource_id: `head:${documentId}`, version: first.version_id,
+    logical_path: first.logical_path, path: "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/WORKING/strategy/a.md",
+    expected: { object_id: "id:original", revision_token: "rev-original", content_sha256: first.content_sha256!, size: 1 }
+  });
+
+  const gate = pauseNextCatalogCas();
+  const olderWrite = olderRepository.writeHead({ ...head, working_version_id: older.version_id });
+  await gate.entered;
+  await newerRepository.writeHead({ ...head, working_version_id: newer.version_id });
+  gate.release();
+
+  await expect(olderWrite).rejects.toThrow("conditional_write_conflict");
+  expect(await new DocumentLedgerRepository(forkRuntime()).readHead(projectId, documentId)).toMatchObject({ working_version_id: newer.version_id });
+  expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 3, in_flight_resource_ids: [] });
+  expect(await sources.listDirtyPage(projectId, "WORKING", null, 1)).toMatchObject({ resource_ids: [`head:${documentId}`] });
+  const dirtyMarker = [...files.entries()].find(([path]) => path.includes("/dirty/"));
+  expect(dirtyMarker && JSON.parse(dirtyMarker[1])).toMatchObject({ resource_id: `head:${documentId}`, generation: 3 });
 });

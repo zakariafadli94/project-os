@@ -316,10 +316,11 @@ export class DocumentLedgerRepository {
     const affectedZones = navigationHeadZones(previous, validated);
     const recoveryZones = navigationHeadZonesPresent(previous, validated);
     const sources = new ZoneNavigationSources(this.runtime);
-    const tickets = recoveryZones.length
-      ? await sources.beginHeadWrites(validated.project_id, affectedZones, `head:${validated.document_id}`, undefined, recoveryZones)
-      : [];
     const exactContent = pretty(serialized);
+    const writeHash = await sha256Text(exactContent);
+    const tickets = recoveryZones.length
+      ? await sources.beginHeadWrites(validated.project_id, affectedZones, `head:${validated.document_id}`, undefined, recoveryZones, writeHash)
+      : [];
     await this.runtime.objects.upsertText(path, exactContent);
     if (tickets.length) {
       if (await this.runtime.objects.readText(path) !== exactContent) throw new Error("navigation_source_head_write_unverified");

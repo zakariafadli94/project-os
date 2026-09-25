@@ -6,6 +6,7 @@
 - Added a final source snapshot verification immediately before navigation-head publication. A source mutation observed after the earlier pre-publication check now returns `navigation_snapshot_changed` without advancing the head.
 - Carried known artifact destination paths through mutation-gate summaries and the change coordinator. Observed artifact mutations are fenced with stable `artifact:<sha256(canonical destination path)>` resource IDs across all zone destinations, including routed paths such as `DELIVERABLES/foo.pdf`; reserved navigation index paths are excluded.
 - Persisted package drift using `package:<PKG-ID>` and artifact destination invalidation before coordinator jobs/cursors are completed. Deleted artifact paths use a bounded first-page lookup of that destination's binding root; unsupported paged listing does not claim a binding.
+- The production Durable Object job-processing path now checks deleted artifact destinations before marking each job complete; regression coverage uses the SQLite-backed change-job store rather than the legacy cursor seam.
 - Added regression coverage for stale frozen auto-refresh recovery, routed artifact invalidation, observed package invalidation, and a source mutation between the initial snapshot check and head publication.
 
 ## Verification

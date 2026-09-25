@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import type { InlineArtifactWriteRequest } from "../src/domain/artifact-write";
+import type { Env } from "../src/env";
 import { emptyProjectState } from "../src/domain/transitions";
+import { ManagedDocumentChangeCoordinator } from "../src/documents/change-coordinator";
+import { ManagedDocumentChangeJobStore } from "../src/documents/change-job-store";
 import { sha256Text } from "../src/documents/hash";
 import { DropboxConflictError, type DropboxEntry, type DropboxTransport } from "../src/dropbox/client";
 import { ProjectRepository } from "../src/dropbox/repository";
 import { ArtifactMutationIntentService } from "../src/mutation-gate/artifact-intent";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
 import { MutationGateService } from "../src/mutation-gate/service";
-import { ManagedDocumentChangeCoordinator } from "../src/documents/change-coordinator";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 
 class FakeArtifactIntentDropbox implements DropboxTransport {
@@ -174,6 +178,42 @@ describe("ArtifactMutationIntentService", () => {
 
     expect(prepared.destination.path).toContain("/DELIVERABLES/REVENUE-OS/foo.md");
     expect(summary.artifact_destination_paths).toEqual([prepared.destination.path]);
+    expect(invalidations).toEqual([[state.project_id, "DELIVERABLES", `artifact:${await sha256Text(prepared.destination.path)}`]]);
+  });
+
+  it("invalidates a deleted routed artifact before completing its durable change job", async () => {
+    const transport = new FakeArtifactIntentDropbox();
+    const runtime = persistenceFromDropbox(transport);
+    const state = stateAfterRoute();
+    const artifact = await request();
+    const repository = new MutationGateRepository(runtime);
+    const prepared = await new ArtifactMutationIntentService(repository, runtime).prepare(state, artifact);
+    await transport.upload(prepared.destination.path, artifact.content, "add");
+    transport.files.delete(prepared.destination.path);
+    runtime.pagedListing = {
+      listPage: async ({ path, limit }) => {
+        const prefix = `${path}/`;
+        const entries = [...transport.files.keys()]
+          .filter((candidate) => candidate.startsWith(prefix) && !candidate.slice(prefix.length).includes("/"))
+          .slice(0, limit)
+          .map((candidate) => ({ kind: "file" as const, name: candidate.slice(prefix.length), path: candidate }));
+        return { entries, cursor: null };
+      }
+    };
+    runtime.changeFeed = {
+      listChanges: async () => ({ entries: [{ kind: "deleted", name: "foo.md", path: prepared.destination.path }], cursor: "artifact-delete-cursor" })
+    };
+    const invalidations: unknown[] = [];
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(state.project_id);
+    const summary = await runInDurableObject(guard, async (_instance, durableState) => {
+      const jobs = new ManagedDocumentChangeJobStore(durableState.storage);
+      jobs.registerPage({ expected_cursor: null, next_cursor: "before-artifact-delete", jobs: [] });
+      return new ManagedDocumentChangeCoordinator(runtime, durableState.storage, "observe", undefined, async (...args) => {
+        invalidations.push(args);
+      }).reconcile(state);
+    });
+
+    expect(summary).toMatchObject({ jobs_completed: 1, jobs_pending: 0 });
     expect(invalidations).toEqual([[state.project_id, "DELIVERABLES", `artifact:${await sha256Text(prepared.destination.path)}`]]);
   });
 

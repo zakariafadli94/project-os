@@ -375,6 +375,7 @@ export class ManagedDocumentChangeCoordinator {
     job: ManagedDocumentChangeJob,
     summary: ManagedDocumentChangeSummary
   ): Promise<void> {
+    if (job.change.kind === "deleted") await this.recordArtifactDeletion(state, job.change.path);
     if (await this.observeNavigationIndexDrift(state, job.change, summary, job.job_id)) return;
 
     // MutationGate remains the first semantic observer for every non-navigation change.

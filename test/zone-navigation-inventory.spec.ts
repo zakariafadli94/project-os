@@ -135,13 +135,13 @@ async function addWorkingHead(h: ReturnType<typeof harness>, content: string, re
 }
 
 describe("ZoneNavigationInventory", () => {
-  it("enumerates only current canonical zone heads with a provider page size of one", async () => {
+  it("enumerates only current canonical zone heads from a bounded provider page", async () => {
     const h = harness();
     const visiblePath = await addWorkingHead(h, "current body");
 
     const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
 
-    expect(h.pageLimits.every((limit) => limit === 1)).toBe(true);
+    expect(h.pageLimits.every((limit) => limit <= 8)).toBe(true);
     expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(1);
     expect(page.snapshot_id).toBe("source:0");
     expect(page.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
@@ -154,23 +154,80 @@ describe("ZoneNavigationInventory", () => {
     expect(page.entries[0].expected.content_sha256).toBe(await sha256Text("current body"));
   });
 
-  it("persists opaque head-page cursors and never asks the provider for more than one item", async () => {
+  it("persists head-page cursors and does not skip entries after a provider batch", async () => {
     const h = harness();
     await addWorkingHead(h, "first body");
     const secondId = "DOC-1123456789ABCDEF01234567";
     const secondVersion = "VER-REQ-1123456789ABCDEF01234567";
     await addWorkingHead(h, "second body", "rev-second", secondId, secondVersion, "second.md");
+    const thirdId = "DOC-2123456789ABCDEF01234567";
+    const thirdVersion = "VER-REQ-2123456789ABCDEF01234567";
+    await addWorkingHead(h, "third body", "rev-third", thirdId, thirdVersion, "third.md");
 
     const first = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
     const second = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: first.next_cursor, limit: 8, budget: budget() });
 
-    expect(first.entries).toHaveLength(1);
+    expect(first.entries).toHaveLength(2);
     expect(first.next_cursor).not.toBeNull();
     expect(second.entries).toHaveLength(1);
     expect(second.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
-    expect(h.pageLimits.every((limit) => limit === 1)).toBe(true);
-    expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(2);
-    expect(new Set([...first.entries, ...second.entries].map((entry) => entry.resource_id)).size).toBe(2);
+    expect(h.pageLimits.every((limit) => limit <= 8)).toBe(true);
+    expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(1);
+    expect(new Set([...first.entries, ...second.entries].map((entry) => entry.resource_id)).size).toBe(3);
+  });
+
+  it("batches managed-head scanning within each 32-call slice without losing cursor entries", async () => {
+    const h = harness();
+    const expected: string[] = [];
+    for (let index = 0; index < 5; index++) {
+      const id = `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`;
+      const version = `VER-REQ-${index.toString(16).toUpperCase().padStart(24, "0")}`;
+      await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, version, `doc-${index}.md`);
+      expected.push(`head:${id}`);
+    }
+
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const slice = budget(32);
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: slice });
+      expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+      pages.push(page);
+      cursor = page.next_cursor;
+    } while (cursor !== null);
+
+    const actual = pages.flatMap((page) => page.entries.map((entry) => entry.resource_id));
+    expect(pages[0].entries.length).toBeGreaterThan(1);
+    expect(actual).toEqual(expected);
+    expect(new Set(actual).size).toBe(expected.length);
+    const headPageCount = h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`).length;
+    expect(headPageCount).toBeLessThan(expected.length);
+    expect(h.pageLimits.every((limit) => limit <= 8)).toBe(true);
+  });
+
+  it("avoids a null catalog write for a clean inactive head but clears a stale catalog row", async () => {
+    const h = harness();
+    const visiblePath = await addWorkingHead(h, "current body");
+    const headPath = machineDocumentHeadPath(projectId, documentId);
+    const head = JSON.parse(h.files.get(headPath)!.content);
+    delete head.working_version_id;
+    delete head.provider.working;
+    h.put(headPath, JSON.stringify(head), "id:head");
+    const catalogPath = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/${await sha256Text(`head:${documentId}`)}.json`;
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
+    expect(page.entries).toHaveLength(0);
+    expect(h.files.has(catalogPath)).toBe(false);
+
+    const stale = await addWorkingHead(h, "restored body", "rev-restored");
+    const active = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
+    expect(active.entries).toHaveLength(1);
+    const activeHead = JSON.parse(h.files.get(headPath)!.content);
+    delete activeHead.working_version_id;
+    delete activeHead.provider.working;
+    h.put(headPath, JSON.stringify(activeHead), "id:head");
+    await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
+    expect(JSON.parse(h.files.get(catalogPath)!.content).entry).toBeNull();
+    expect(stale).toBe(visiblePath);
   });
 
   it("includes only a finalized current package index as a bounded canonical source", async () => {

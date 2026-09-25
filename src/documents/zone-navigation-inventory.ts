@@ -9,7 +9,7 @@ import type { SliceBudget } from "../convergence/contract";
 import { readDocumentVersionRecord, readManagedDocumentHead } from "../schema/managed-document";
 import type { CurrentManagedDocumentHead, CurrentDocumentVersionRecord } from "../schema/managed-document";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
-import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import type { ProviderEntry, ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderOperationError } from "../persistence/provider/errors";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot } from "../persistence/layout";
 import { sha256Text } from "./hash";
@@ -26,6 +26,15 @@ interface PageCursor { phase: PagePhase; cursor: string | null }
 const MAX_PACKAGE_LEDGER_BYTES = 128_000;
 const MAX_PACKAGE_MANIFEST_BYTES = 256_000;
 const MAX_VISIBLE_SOURCE_BYTES = 2_000_000;
+const MAX_INITIAL_HEADS_PER_PAGE = 8;
+const MAX_INITIAL_HEAD_PROVIDER_CALLS = 10;
+
+interface InitialHeadPageCursor {
+  kind: "zone-navigation-head-batch-v1";
+  entries: ProviderEntry[];
+  provider_cursor: string | null;
+  listing_limit: number;
+}
 
 /** Canonical, bounded source adapter used by ZoneNavigationEngine. */
 export class ZoneNavigationInventory implements NavigationInventoryPort {
@@ -109,22 +118,53 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     if (!this.runtime.pagedListing) return {
       entries: [], gaps: [{ resource_id: "heads", code: "paged_listing_unavailable" }, ...unresolvedSourceFamilyGaps()], snapshot_id: snapshotId, next_cursor: null
     };
-    // Reserve before obtaining a cursor that must not be lost between slices.
-    requireBudget(budget, 9);
-    charge(budget);
-    const page = await this.runtime.pagedListing.listPage({
-      path: `${machineDocumentRoot(projectId)}/heads`, cursor, limit: 1
-    });
+    const savedPage = cursor === null ? null : parseInitialHeadPageCursor(cursor);
+    let listedEntries: ProviderEntry[];
+    let providerCursor: string | null;
+    let listingLimit: number;
+    if (savedPage) {
+      listedEntries = savedPage.entries;
+      providerCursor = savedPage.provider_cursor;
+      listingLimit = savedPage.listing_limit;
+    } else {
+      // New listings request a full engine-sized provider page. Any suffix
+      // that cannot be processed this slice is carried in the opaque engine
+      // cursor, so the provider cursor never advances past unprocessed heads.
+      // A legacy opaque cursor was created with limit=1; preserve its page
+      // size rather than changing pagination semantics mid-request.
+      listingLimit = cursor === null ? Math.max(1, Math.min(requestedLimit, MAX_INITIAL_HEADS_PER_PAGE)) : 1;
+      requireBudget(budget, 1);
+      charge(budget);
+      const page = await this.runtime.pagedListing.listPage({
+        path: `${machineDocumentRoot(projectId)}/heads`, cursor, limit: listingLimit
+      });
+      listedEntries = page.entries;
+      providerCursor = page.cursor;
+    }
     const entries: NavigationInventoryEntry[] = [];
     const gaps: NavigationCoverageGap[] = [];
-    for (const item of page.entries) {
-      if (item.kind !== "file" || !item.path) continue;
+    let offset = 0;
+    for (const item of listedEntries) {
+      if (item.kind !== "file" || !item.path) {
+        offset += 1;
+        continue;
+      }
       const match = /^(DOC-[A-F0-9]{24})\.json$/.exec(item.name);
-      if (!match) continue;
+      if (!match) {
+        offset += 1;
+        continue;
+      }
       const resourceId = `head:${match[1]}`;
       if (item.path !== machineDocumentHeadPath(projectId, match[1])) {
         gaps.push({ resource_id: resourceId, code: "head_listing_path_mismatch" });
+        offset += 1;
         continue;
+      }
+      // Budget the worst supported item cost plus the engine's checkpoint
+      // reserve. If it does not fit, leave this item in the returned cursor.
+      if (!budget.canStartEffect(MAX_INITIAL_HEAD_PROVIDER_CALLS)) {
+        if (offset === 0) throw new Error("slice_budget_exhausted");
+        break;
       }
       try {
         const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
@@ -132,19 +172,31 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         if (resolved.entry) {
           await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
           entries.push(resolved.entry);
-        } else await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        } else {
+          // Clean inactive heads need no catalog tombstone unless a prior
+          // partial adoption left an active row behind. Gaps are retained
+          // independently below, and stale rows are still cleared exactly.
+          const prior = await this.sources.readCatalogEntry(projectId, zone, resourceId, budget);
+          if (prior) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        }
       } catch (error) {
-        if (isBudgetError(error)) throw error;
+        if (isBudgetError(error)) break;
         await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         gaps.push({ resource_id: resourceId, code: classifyGap(error) });
       }
+      offset += 1;
     }
     if (cursor === null) gaps.push(...unresolvedSourceFamilyGaps());
+    const nextCursor = offset < listedEntries.length
+      ? encodeCursor("initial", JSON.stringify({ kind: "zone-navigation-head-batch-v1", entries: listedEntries.slice(offset), provider_cursor: providerCursor, listing_limit: listingLimit } satisfies InitialHeadPageCursor))
+      : providerCursor === null
+        ? encodeCursor("packages", JSON.stringify({ package_index: 0, member_index: 0 }))
+        : encodeCursor("initial", JSON.stringify({ kind: "zone-navigation-head-batch-v1", entries: [], provider_cursor: providerCursor, listing_limit: listingLimit } satisfies InitialHeadPageCursor));
     return {
       entries,
       gaps,
       snapshot_id: snapshotId,
-      next_cursor: page.cursor === null ? encodeCursor("packages", JSON.stringify({ package_index: 0, member_index: 0 })) : encodeCursor("initial", page.cursor)
+      next_cursor: nextCursor
     };
   }
 
@@ -645,6 +697,29 @@ function generationFromSnapshot(snapshotId: string): number {
 function charge(budget: SliceBudget): void { budget.beforeHttp(); }
 
 function encodeCursor(phase: PagePhase, cursor: string): string { return `${phase}:${encodeURIComponent(cursor)}`; }
+
+function parseInitialHeadPageCursor(cursor: string): InitialHeadPageCursor | null {
+  let value: unknown;
+  try { value = JSON.parse(cursor); }
+  catch { return null; }
+  if (!value || typeof value !== "object" || Array.isArray(value) || (value as Record<string, unknown>).kind !== "zone-navigation-head-batch-v1") return null;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !["kind", "entries", "provider_cursor", "listing_limit"].includes(key))
+    || !Array.isArray(record.entries)
+    || (record.provider_cursor !== null && typeof record.provider_cursor !== "string")
+    || typeof record.listing_limit !== "number" || !Number.isSafeInteger(record.listing_limit) || record.listing_limit < 1 || record.listing_limit > MAX_INITIAL_HEADS_PER_PAGE) {
+    throw new Error("navigation_inventory_cursor_invalid");
+  }
+  const entries: ProviderEntry[] = record.entries.map((item): ProviderEntry => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("navigation_inventory_cursor_invalid");
+    const entry = item as Record<string, unknown>;
+    if (Object.keys(entry).some((key) => !["kind", "name", "path"].includes(key))
+      || (entry.kind !== "file" && entry.kind !== "folder" && entry.kind !== "deleted")
+      || typeof entry.name !== "string" || (entry.path !== undefined && typeof entry.path !== "string")) throw new Error("navigation_inventory_cursor_invalid");
+    return { kind: entry.kind, name: entry.name, ...(entry.path === undefined ? {} : { path: entry.path }) } as ProviderEntry;
+  });
+  return { kind: "zone-navigation-head-batch-v1", entries, provider_cursor: record.provider_cursor as string | null, listing_limit: record.listing_limit };
+}
 
 function decodeCursor(value: string): PageCursor {
   const separator = value.indexOf(":");

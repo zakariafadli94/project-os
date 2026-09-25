@@ -1,0 +1,285 @@
+{
+  "guard_sha": "2cbd7979f4d45307fbae92f4f81a32dc42c5914c",
+  "tower_sha": "b3d77771ac7b240c5c8f1cb22f6d6d648f05c33c",
+  "tower_code_changed": false,
+  "scope": "Finished read-handler observations during 30 planned cross-surface context reads, four status probes and additional format/transport probes. Only sanitized application diagnostics; not request headers or credentials. A plugin transport error occurred before the final five Work-local reads; it is not erased by these completed-handler samples. No artificial production load.",
+  "rows": [
+    {
+      "correlation_id": "21586d61-8052-4c91-acc3-b72c1e0efd74",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 2045,
+      "timestamp": 1790331987630
+    },
+    {
+      "correlation_id": "49cae8c8-59c1-4f13-8a30-95406c1f87b9",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1897,
+      "timestamp": 1790331991450
+    },
+    {
+      "correlation_id": "aeda8306-623c-404b-96ee-cdf1455544c6",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1267,
+      "timestamp": 1790331994307
+    },
+    {
+      "correlation_id": "06c53798-2682-412b-86b5-2b2d1b6b72a8",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1053,
+      "timestamp": 1790331997134
+    },
+    {
+      "correlation_id": "8f9e961c-6185-4a67-bf07-99ce3947e803",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 923,
+      "timestamp": 1790331999680
+    },
+    {
+      "correlation_id": "249a45dc-8d87-4dbc-ba7b-7327d777c782",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 983,
+      "timestamp": 1790332002036
+    },
+    {
+      "correlation_id": "49ad76b0-ed2b-4872-bd3a-957dc2e526b1",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1203,
+      "timestamp": 1790332004816
+    },
+    {
+      "correlation_id": "d5477345-0205-4b30-87f2-97ed2e47552c",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1044,
+      "timestamp": 1790332007093
+    },
+    {
+      "correlation_id": "578f675d-3332-4dae-88d5-d06a1f221c80",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1120,
+      "timestamp": 1790332009591
+    },
+    {
+      "correlation_id": "ef6e5a09-921d-45a2-8f7a-bd517c7e2ea6",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1028,
+      "timestamp": 1790332011836
+    },
+    {
+      "correlation_id": "6af9a865-5fed-428c-99f8-83536c2697d6",
+      "project_id": "PRJ-0007",
+      "route": "/request-status",
+      "request_id": "TXN-PRJ0007-REMVARIABLEV1-20260924T192830Z-L9S4",
+      "elapsed_ms": 3602,
+      "timestamp": 1790332016573
+    },
+    {
+      "correlation_id": "f1cfee43-d4b2-43bb-bec8-8fcd009d88e3",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 2085,
+      "timestamp": 1790332035874
+    },
+    {
+      "correlation_id": "019f630f-3091-4d02-86d3-3f3ca3bc582f",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1002,
+      "timestamp": 1790332037633
+    },
+    {
+      "correlation_id": "7f4cf34c-252e-4784-ac67-c7e4c03c6f52",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 910,
+      "timestamp": 1790332038146
+    },
+    {
+      "correlation_id": "d9d75d0f-bcc9-4e96-bcf6-a9d24f4bf843",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1068,
+      "timestamp": 1790332039170
+    },
+    {
+      "correlation_id": "8d350244-2b31-4fe5-b0fd-4dc08c8fe3fa",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1175,
+      "timestamp": 1790332045661
+    },
+    {
+      "correlation_id": "9961442d-47ca-4ba0-9368-d9c7ada98da7",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1088,
+      "timestamp": 1790332048989
+    },
+    {
+      "correlation_id": "03c58912-3078-4982-b8b4-517fac34c42c",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1136,
+      "timestamp": 1790332049857
+    },
+    {
+      "correlation_id": "6f36a279-b0e3-4558-8898-180ce5227f2d",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1219,
+      "timestamp": 1790332051304
+    },
+    {
+      "correlation_id": "70d679f6-c17c-40bc-b0e6-7e652b534468",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 903,
+      "timestamp": 1790332054269
+    },
+    {
+      "correlation_id": "d340f5bf-dbdc-437f-b78a-1ab8fe30fef2",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1369,
+      "timestamp": 1790332057102
+    },
+    {
+      "correlation_id": "c838de24-3cb2-4419-af31-82b17775e9db",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1043,
+      "timestamp": 1790332061699
+    },
+    {
+      "correlation_id": "789539d4-2219-4da2-b31f-3c8d5f7db017",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 922,
+      "timestamp": 1790332061712
+    },
+    {
+      "correlation_id": "f927f702-684f-43ac-bf2f-2b3d2f6ff106",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 887,
+      "timestamp": 1790332062694
+    },
+    {
+      "correlation_id": "9d2269bf-7fdf-4fcf-bc43-32a5acd0149e",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 693,
+      "timestamp": 1790332062803
+    },
+    {
+      "correlation_id": "93a1ba47-8b5a-42f7-814c-7343ad76a23a",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 654,
+      "timestamp": 1790332063976
+    },
+    {
+      "correlation_id": "bf6dbf30-4382-471f-a5ad-be871a630b72",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1218,
+      "timestamp": 1790332064049
+    },
+    {
+      "correlation_id": "1eb38b68-af8d-428d-89e8-5b493d94a3bc",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 509,
+      "timestamp": 1790332064936
+    },
+    {
+      "correlation_id": "afe06008-c1b2-4635-9b94-049d41938e68",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 993,
+      "timestamp": 1790332065155
+    },
+    {
+      "correlation_id": "8955885f-813b-42cd-9354-db03475bf7cb",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 783,
+      "timestamp": 1790332066265
+    },
+    {
+      "correlation_id": "46118a5a-adfb-4857-b000-a641c347df9e",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1101,
+      "timestamp": 1790332066326
+    },
+    {
+      "correlation_id": "3f004627-922d-43f1-add3-c5b712fd8499",
+      "project_id": "PRJ-0007",
+      "route": "/request-status",
+      "request_id": "TXN-PRJ0007-REMVARIABLEV1-20260924T192830Z-L9S4",
+      "elapsed_ms": 2897,
+      "timestamp": 1790332069309
+    },
+    {
+      "correlation_id": "be206b9e-4320-49c1-aff4-56ecdaf0b1c8",
+      "project_id": "PRJ-0007",
+      "route": "/request-status",
+      "request_id": "TXN-PRJ0007-REMVARIABLEV1-20260924T192830Z-L9S4",
+      "elapsed_ms": 2936,
+      "timestamp": 1790332080728
+    },
+    {
+      "correlation_id": "88861aab-43bc-482d-9d9e-1682764ef9be",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1204,
+      "timestamp": 1790332081437
+    },
+    {
+      "correlation_id": "ac8a2a06-b597-48ea-9ff2-1e844a98d7a4",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 2082,
+      "timestamp": 1790332085696
+    },
+    {
+      "correlation_id": "e44192ee-7bc7-4688-96a1-81994c6ea5e5",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1127,
+      "timestamp": 1790332088297
+    },
+    {
+      "correlation_id": "937a6d0e-04de-4af0-abb5-e29a0a5bdfb5",
+      "project_id": "PRJ-0003",
+      "route": "/mutation-context",
+      "elapsed_ms": 1147,
+      "timestamp": 1790332090720
+    },
+    {
+      "correlation_id": "f5869d13-cf4f-45fc-9c20-0292204c19a6",
+      "project_id": "PRJ-0007",
+      "route": "/mutation-context",
+      "elapsed_ms": 1353,
+      "timestamp": 1790332093118
+    },
+    {
+      "correlation_id": "02632759-9857-438e-b854-105b4807cd31",
+      "project_id": "PRJ-0007",
+      "route": "/request-status",
+      "request_id": "TXN-PRJ0007-REMVARIABLEV1-20260924T192830Z-L9S4",
+      "elapsed_ms": 2842,
+      "timestamp": 1790332097203
+    }
+  ]
+}

@@ -41,6 +41,7 @@ export async function normalizeArtifactAdmission(request: ArtifactWriteRequest |
 }
 
 export async function normalizeDocumentAdmission(request: ManagedDocumentRequest): Promise<NormalizedAdmissionOperation> {
+  if (request.operation === "navigation.reconcile") return normalized(request.project_id, request.operation, [{ resource_id: `navigation:${request.zone}`, resource_type: "navigation", zone: request.zone, version: String(request.expected_generation) }], request);
   if (request.operation === "package.replace") return normalized(request.project_id, request.operation, [{ resource_id: request.candidate.package_id, resource_type: "package", zone: request.zone, version: packageResourceVersion(request.candidate) }], request);
   if (request.operation === "document.archive") {
     return normalized(request.project_id, request.operation, [{

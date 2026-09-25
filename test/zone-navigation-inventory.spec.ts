@@ -7,11 +7,13 @@ import { sha256Text } from "../src/documents/hash";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, workspaceProjectRoot } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
+import { ProviderOperationError } from "../src/persistence/provider/errors";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { ManagedDocumentService } from "../src/documents/service";
 import { emptyProjectState } from "../src/domain/transitions";
 import { canonicalJson } from "../src/rules/contract";
 import { packageRuntime } from "./helpers/package-runtime";
+import { packageNavigationPath } from "../src/domain/document-package";
 import { machineArtifactReceiptPath } from "../src/persistence/layout";
 import { mutationIntentIdFor } from "../src/domain/mutation-gate";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
@@ -252,6 +254,39 @@ describe("ZoneNavigationInventory", () => {
     expect(await inventory.verifyEntry(refreshedEntries[0], budget())).toBe(true);
     expect(await inventory.verifyEntry(entries[0], budget())).toBe(false);
     expect(await inventory.verifySnapshot({ project_id: state.project_id, zone: "WORKING", snapshot_id: refreshedPages[0].snapshot_id, budget: budget() })).toBe(true);
+
+    const transientTicket = await sources.beginHeadWrite(state.project_id, "WORKING", resourceId, budget());
+    await sources.completeHeadWrite(transientTicket, null, budget());
+    const transientStart = await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor: null, limit: 8, budget: budget(25) });
+    expect(transientStart.next_cursor).not.toBeNull();
+    const transientReadBytes = runtime.objects.readBytes;
+    let failOnce = true;
+    runtime.objects.readBytes = async (...args) => {
+      if (failOnce && args[0] === packageNavigationPath(state.project_id)) {
+        failOnce = false;
+        throw new ProviderOperationError("temporary package ledger read failure", true);
+      }
+      return transientReadBytes!(...args);
+    };
+    await expect(inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor: transientStart.next_cursor, limit: 8, budget: budget(25) }))
+      .rejects.toThrow("temporary package ledger read failure");
+    runtime.objects.readBytes = transientReadBytes;
+    let retryCursor = transientStart.next_cursor;
+    for (let attempt = 0; retryCursor !== null && attempt < 8; attempt += 1) {
+      retryCursor = (await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor: retryCursor, limit: 8, budget: budget(25) })).next_cursor;
+    }
+    expect(retryCursor).toBeNull();
+
+    const permanentTicket = await sources.beginHeadWrite(state.project_id, "WORKING", resourceId, budget());
+    await sources.completeHeadWrite(permanentTicket, null, budget());
+    const memberPath = `${workspaceProjectRoot(state.project_id, state.slug)}/WORKING/PACKAGES/${nextRef.package_id}/2/replacement.md`;
+    await runtime.objects.upsertText(memberPath, "bytes no longer match finalized package evidence");
+    const permanentStart = await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor: null, limit: 8, budget: budget(25) });
+    expect(permanentStart.next_cursor).not.toBeNull();
+    const permanentResult = await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor: permanentStart.next_cursor, limit: 8, budget: budget(25) });
+    expect(permanentResult.gaps).toContainEqual(expect.objectContaining({ resource_id: resourceId, code: "finalized_package_source_unavailable" }));
+    expect(permanentResult.next_cursor).toBeNull();
+    expect(await inventory.verifySnapshot({ project_id: state.project_id, zone: "WORKING", snapshot_id: permanentStart.snapshot_id, budget: budget() })).toBe(false);
   });
 
   it("includes a committed artifact only from its exact current destination and receipt", async () => {

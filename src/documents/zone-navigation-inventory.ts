@@ -10,6 +10,7 @@ import { readDocumentVersionRecord, readManagedDocumentHead } from "../schema/ma
 import type { CurrentManagedDocumentHead, CurrentDocumentVersionRecord } from "../schema/managed-document";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
+import { ProviderOperationError } from "../persistence/provider/errors";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot } from "../persistence/layout";
 import { sha256Text } from "./hash";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "./zone-navigation-sources";
@@ -364,13 +365,13 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: state.resource_id, dirty_cursor: state.dirty_cursor, entry: null })) };
       }
       const resolved = await resolvePackageIndex(this.runtime, projectId, zone, selected, source, state.member_index, budget);
-      if (resolved.gap) return { entries: [], gaps: [resolved.gap], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-package", JSON.stringify(state)) };
+      if (resolved.gap) return { entries: [], gaps: [resolved.gap], snapshot_id: snapshotId, next_cursor: null };
       if (resolved.pending) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-package", JSON.stringify({ ...state, member_index: state.member_index + 1 })) };
       await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, state.resource_id, budget, generationFromSnapshot(snapshotId));
       return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: state.resource_id, dirty_cursor: state.dirty_cursor, entry: resolved.entry })) };
     } catch (error) {
-      if (isBudgetError(error)) throw error;
-      return { entries: [], gaps: [{ resource_id: state.resource_id, code: classifyPackageGap(error) }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-package", JSON.stringify(state)) };
+      if (isBudgetError(error) || isRetryableProviderError(error)) throw error;
+      return { entries: [], gaps: [{ resource_id: state.resource_id, code: classifyPackageGap(error) }], snapshot_id: snapshotId, next_cursor: null };
     }
   }
 
@@ -666,6 +667,7 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 }
 
 function isBudgetError(error: unknown): boolean { return error instanceof Error && error.message.includes("slice_budget_exhausted"); }
+function isRetryableProviderError(error: unknown): boolean { return error instanceof ProviderOperationError && error.retryable; }
 
 function classifyGap(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error);

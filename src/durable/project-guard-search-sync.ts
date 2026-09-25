@@ -70,6 +70,10 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
           return Response.json({ error: url.pathname === "/receipt" ? "receipt_not_found" : "request_identity_mismatch" }, { status: 404 });
         }
         if (projectId && kind && requestId && ["transaction", "document", "artifact"].includes(kind)) {
+          if (url.pathname === "/request-status") {
+            return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId,
+              this.observationCorrelationId(request, url));
+          }
           if (url.pathname === "/receipt") {
             const local = await this.handleReceiptRead(url);
             if (local.status !== 404) return local;

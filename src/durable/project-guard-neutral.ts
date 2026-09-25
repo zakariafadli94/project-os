@@ -35,7 +35,7 @@ import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata, ProviderRequestScope } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError, MutationGateRepository } from "../mutation-gate/repository";
-import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, type LayoutMode } from "../persistence/layout";
+import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, machineMaterializationRoot, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
@@ -430,7 +430,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       const correlationId = this.observationCorrelationId(request, url);
       if (this.queueDepth > 0) {
-        return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
+        return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId);
       }
       return this.readWhenIdle(() => this.readBoundedRequestStatus(url, correlationId));
     }
@@ -2799,7 +2799,8 @@ export class ProjectGuard extends DurableObject<Env> {
     url: URL,
     correlationId: string,
     runtime: ProjectOsPersistenceRuntime = this.persistence,
-    repository: ProjectRepository = this.repository
+    repository: ProjectRepository = this.repository,
+    requireFinalizationProof = false
   ): Promise<Response> {
     const projectId = this.ctx.id.name;
     const requestId = url.searchParams.get("request_id");
@@ -2810,6 +2811,17 @@ export class ProjectGuard extends DurableObject<Env> {
     try {
       const execution = await new ExecutionJournal(runtime, projectId, kind, requestId).status();
       const receipt = await this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository);
+      if (requireFinalizationProof && execution?.status === "finalized") {
+        if (!await this.hasValidFinalizationEvidence(projectId, kind, requestId, receipt, execution, runtime)) {
+          return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "finalization_proof_unavailable");
+        }
+        const observedAt = new Date().toISOString();
+        const observation = persistenceObservation({
+          project_id: projectId, kind: kind as RequestKind, request_id: requestId, observed_at: observedAt,
+          correlation_id: correlationId, receipt, execution, durable_intent: true
+        });
+        return Response.json({ project_id: projectId, kind, request_id: requestId, status: "finalized", observation, receipt, execution });
+      }
       const materializationFailure = await this.readMaterializationFailureForExecution(projectId, kind, receipt, execution);
       const intent = kind === "document" ? await new ManagedDocumentRequestLedger(runtime.objects).readIntent(projectId, requestId)
         : kind === "transaction" ? await new TransactionRequestLedger(runtime.objects).readIntent(projectId, requestId) : null;
@@ -3045,6 +3057,72 @@ export class ProjectGuard extends DurableObject<Env> {
     return receipt;
   }
 
+  private async hasValidFinalizationEvidence(
+    projectId: string,
+    kind: string,
+    requestId: string,
+    receiptValue: unknown,
+    execution: Awaited<ReturnType<ExecutionJournal["status"]>>,
+    runtime: ProjectOsPersistenceRuntime
+  ): Promise<boolean> {
+    if (!execution || execution.status !== "finalized" || execution.terminal !== true
+      || !execution.finalization_ref || !execution.receipt_ref || !receiptValue || typeof receiptValue !== "object") return false;
+    const receipt = receiptValue as Record<string, unknown>;
+    if (receipt.project_id !== projectId || receipt.status !== "committed"
+      || (kind === "transaction" ? receipt.transaction_id !== requestId : receipt.request_id !== requestId)) return false;
+    try {
+      const journal = new ExecutionJournal(runtime, projectId, kind, requestId);
+      const root = await journal.root();
+      const prefix = `${root}/finalizations/`;
+      if (!execution.finalization_ref.startsWith(prefix)) return false;
+      const expectedHash = execution.finalization_ref.slice(prefix.length).replace(/\.json$/, "");
+      if (!/^[a-f0-9]{64}$/.test(expectedHash) || !execution.finalization_ref.endsWith(".json")) return false;
+      const raw = await runtime.objects.readText(execution.finalization_ref);
+      if (raw === null) return false;
+      const record = JSON.parse(raw) as Record<string, unknown>;
+      if (await sha256Text(canonicalJson(record)) !== expectedHash
+        || record.schema_version !== "1.0"
+        || record.project_id !== projectId || record.kind !== kind || record.request_id !== requestId
+        || record.request_hash !== execution.request_hash || record.receipt_ref !== execution.receipt_ref) return false;
+      if (kind === "transaction") {
+        const revision = receipt.new_revision;
+        return Number.isSafeInteger(revision) && typeof revision === "number" && revision > 0
+          && typeof receipt.event_id === "string" && receipt.event_id.length > 0
+          && record.target_revision === revision
+          && record.source_event_id === receipt.event_id
+          && record.canonical_commit_ref === machineCommitRecordPath(projectId, revision)
+          && execution.receipt_ref === `${machineCommitRecordPath(projectId, revision)}#receipt`
+          && record.receipt_ref === execution.receipt_ref
+          && record.materialization_head_ref === machineMaterializationHeadPath(projectId)
+          && typeof record.materialization_record_ref === "string"
+          && record.materialization_record_ref.startsWith(`${machineMaterializationRoot(projectId)}/REV-${String(revision).padStart(6, "0")}-PV-`)
+          && /^\d{4}\.json$/.test(record.materialization_record_ref.slice(`${machineMaterializationRoot(projectId)}/REV-${String(revision).padStart(6, "0")}-PV-`.length))
+          && typeof record.result_root_hash === "string" && /^[a-f0-9]{64}$/.test(record.result_root_hash);
+      }
+      if (kind === "document") {
+        const expectedReceiptRef = `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`;
+        return execution.receipt_ref === expectedReceiptRef
+          && record.document_id === receipt.document_id && record.version_id === receipt.version_id
+          && record.stage === receipt.stage && record.logical_path === receipt.logical_path
+          && record.provider_rev === receipt.provider_rev
+          && [record.document_id, record.version_id, record.stage, record.logical_path, record.provider_rev]
+            .every((value) => typeof value === "string" && value.length > 0);
+      }
+      if (kind === "artifact") {
+        return execution.receipt_ref === machineArtifactReceiptPath(requestId)
+          && record.mutation_intent_ref === machineMutationIntentPath(projectId, requestId)
+          && record.content_sha256 === receipt.content_sha256
+          && typeof record.destination_path === "string"
+          && record.destination_path.startsWith(`/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-`)
+          && record.destination_path.endsWith(`/${String(receipt.relative_path)}`)
+          && typeof record.content_sha256 === "string" && /^[a-f0-9]{64}$/.test(record.content_sha256);
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   protected async readBoundedRequestStatusReceipt(
     projectId: string,
     kind: RequestKind,
@@ -3079,7 +3157,54 @@ export class ProjectGuard extends DurableObject<Env> {
     }
   }
 
-  private async readBoundedRequestStatus(url: URL, correlationId: string): Promise<Response> {
+  protected async readFinalizedRequestStatusWhileBusy(
+    url: URL,
+    projectId: string,
+    kind: string,
+    requestId: string,
+    correlationId: string
+  ): Promise<Response> {
+    try {
+      const response = await this.readBoundedRequestStatus(url, correlationId, true);
+      if (!response.ok) throw new Error("request_status_not_verified");
+      const body = await response.clone().json() as Record<string, any>;
+      const receipt = body.receipt as Record<string, any> | undefined;
+      const execution = body.execution as Record<string, any> | undefined;
+      const observation = body.observation as Record<string, any> | undefined;
+      const receiptId = kind === "transaction" ? receipt?.transaction_id : receipt?.request_id;
+      const executionRoot = await new ExecutionJournal(this.persistence, projectId, kind, requestId).root();
+      const finalizationRef = execution?.finalization_ref;
+      const finalizationPrefix = `${executionRoot}/finalizations/`;
+      const validFinalizationRef = typeof finalizationRef === "string" && finalizationRef.startsWith(finalizationPrefix)
+        && /^[a-f0-9]{64}\.json$/.test(finalizationRef.slice(finalizationPrefix.length));
+      const receiptRevision = receipt?.new_revision;
+      const receiptRefMatches = kind === "transaction"
+        ? Number.isSafeInteger(receiptRevision) && typeof receiptRevision === "number" && receiptRevision > 0
+          && execution?.receipt_ref === `${machineCommitRecordPath(projectId, receiptRevision)}#receipt`
+        : kind === "document"
+          ? execution?.receipt_ref === `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`
+          : kind === "artifact" && execution?.receipt_ref === machineArtifactReceiptPath(requestId);
+      const finalizedAndBound = body.project_id === projectId && body.kind === kind && body.request_id === requestId
+        && body.status === "finalized"
+        && receipt?.project_id === projectId && receiptId === requestId && receipt.status === "committed"
+        && execution?.project_id === projectId && execution.kind === kind && execution.request_id === requestId
+        && execution.status === "finalized" && execution.terminal === true
+        && execution.admission_ref === `${executionRoot}/admission.json`
+        && typeof execution.request_hash === "string" && /^[a-f0-9]{64}$/.test(execution.request_hash)
+        && receiptRefMatches
+        && validFinalizationRef
+        && observation?.project_id === projectId && observation.kind === kind && observation.request_id === requestId
+        && observation.status === "finalized" && observation.receipt_status === "committed"
+        && observation.execution_status === "finalized" && observation.terminal === true;
+      if (finalizedAndBound) return response;
+    } catch {
+      // A bounded read that is absent, malformed, mismatched, or unavailable
+      // is still unknown while work is queued; it must never imply absence.
+    }
+    return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
+  }
+
+  protected async readBoundedRequestStatus(url: URL, correlationId: string, requireFinalizationProof = false): Promise<Response> {
     const projectId = this.ctx.id.name;
     const kind = url.searchParams.get("kind");
     const requestId = url.searchParams.get("request_id");
@@ -3099,7 +3224,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
     });
     const repository = new ProjectRepository(runtime, this.layoutMode);
-    const source = this.handleRequestStatus(url, correlationId, runtime, repository);
+    const source = this.handleRequestStatus(url, correlationId, runtime, repository, requireFinalizationProof);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {

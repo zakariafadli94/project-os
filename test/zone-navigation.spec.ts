@@ -293,6 +293,27 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(JSON.parse(progress!)).toMatchObject({ status: "conflict", published_index: { basename: "00-CURRENT.md" }, postchecks: [{ verdict: "deny" }] });
   });
 
+  it("does not publish the navigation head when a source changes after the first snapshot check", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    let snapshotChecks = 0;
+    const port: NavigationInventoryPort = {
+      ...inv.port,
+      verifySnapshot: async ({ budget: slice }) => {
+        slice.beforeHttp();
+        snapshotChecks += 1;
+        return snapshotChecks === 1;
+      }
+    };
+    const input = request();
+    const result = await new ZoneNavigationEngine(harness.runtime, port).reconcile(input, project, await admissionFor(input), budget(128));
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_snapshot_changed" });
+    expect(snapshotChecks).toBe(2);
+    expect(harness.files.has(`${machineDocumentRoot(project.project_id)}/navigation/WORKING/head.json`)).toBe(false);
+  });
+
   it("resumes an unavailable postcheck against the already-published index", async () => {
     const harness = runtimeHarness();
     const project = state();

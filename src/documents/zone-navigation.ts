@@ -119,7 +119,6 @@ export class ZoneNavigationEngine {
       progress.status = "publishing";
       progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
 
-      budget.beforeHttp();
       if (!await this.inventory.verifySnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id!, budget })) {
         return { status: "conflict", code: "navigation_snapshot_changed" };
       }
@@ -155,6 +154,12 @@ export class ZoneNavigationEngine {
       };
       const finalizationRef = `${root}/navigation/finalizations/${await executionHash(certificate)}.json`;
       await this.immutable(finalizationRef, certificate, budget);
+      // Source writes observed during publication may invalidate the inventory
+      // after the pre-write snapshot check. Recheck at the head boundary so a
+      // stale index can never become the zone's current navigation generation.
+      if (!await this.inventory.verifySnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id!, budget })) {
+        return { status: "conflict", code: "navigation_snapshot_changed" };
+      }
       const head = await this.publishHead(request, progress, index, finalizationRef, headPath, budget);
       if (head.status === "conflict") return head;
       const receipt = zoneNavigationReceiptSchema.parse({

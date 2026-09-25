@@ -84,6 +84,12 @@ export type ObservedPackageDriftAdmission = (
   findingId: string
 ) => Promise<void>;
 
+export type ObservedNavigationSourceMutation = (
+  projectId: string,
+  zone: "WORKING" | "REVIEW" | "DELIVERABLES",
+  resourceId: string
+) => Promise<void>;
+
 interface BootstrapCandidate {
   change: ProviderChangeEntry;
   stage: BootstrapManagedStage;
@@ -115,7 +121,8 @@ export class ManagedDocumentChangeCoordinator {
     input: PersistenceInput,
     storage: DurableObjectStorage | ManagedDocumentCursorStore,
     private readonly gateMode: MutationGateMode = "observe",
-    private readonly admitObservedPackageDrift?: ObservedPackageDriftAdmission
+    private readonly admitObservedPackageDrift?: ObservedPackageDriftAdmission,
+    private readonly recordObservedNavigationSourceMutation?: ObservedNavigationSourceMutation
   ) {
     this.runtime = asProjectOsPersistence(input);
     this.reconciler = new ManagedDocumentReconciler(this.runtime);
@@ -234,9 +241,11 @@ export class ManagedDocumentChangeCoordinator {
     const detectionSource = cursorReset ? "cursor_reset" : baseline ? "baseline" : "incremental";
     const unreserved: ProviderChangeEntry[] = [];
     for (const change of page.entries) {
+      if (change.kind === "deleted") await this.recordArtifactDeletion(state, change.path);
       if (!await this.observeNavigationIndexDrift(state, change, summary)) unreserved.push(change);
     }
     const gate = await this.mutationGate.processChanges(state, unreserved, detectionSource);
+    await this.recordArtifactDestinationMutations(state, gate.artifact_destination_paths ?? []);
     accumulateGate(summary, gate);
     const unhandled = await this.reconcileStableChanges(state, unreserved, summary);
     if (baseline) {
@@ -327,6 +336,7 @@ export class ManagedDocumentChangeCoordinator {
           continue;
         }
         if (error instanceof MissingChangeTargetError) {
+          await this.recordArtifactDeletion(state, job.change.path);
           jobs.markQuarantined(job, "file_target_missing");
           summary.jobs_quarantined += 1;
           console.warn("Project OS managed document change job quarantined", {
@@ -369,6 +379,7 @@ export class ManagedDocumentChangeCoordinator {
 
     // MutationGate remains the first semantic observer for every non-navigation change.
     const gate = await this.mutationGate.processChanges(state, [job.change], job.detection_source);
+    await this.recordArtifactDestinationMutations(state, gate.artifact_destination_paths ?? []);
     accumulateGate(summary, gate);
 
     if (await this.observePackageDrift(state, job.change, summary, job.job_id)) return;
@@ -413,6 +424,13 @@ export class ManagedDocumentChangeCoordinator {
   ): Promise<boolean> {
     const drift = await this.packageDrift.observe(state, change);
     if (!drift.handled) return false;
+    if (drift.resource) {
+      await this.recordObservedNavigationSourceMutation?.(
+        state.project_id,
+        drift.resource.zone as "WORKING" | "REVIEW" | "DELIVERABLES",
+        `package:${drift.resource.resource_id}`
+      );
+    }
     summary.drift_findings += 1;
     if (drift.status === "expected_reconciled") summary.expected_changes += 1;
     else if (drift.status === "unexpected_conflict") summary.conflicts += 1;
@@ -454,6 +472,33 @@ export class ManagedDocumentChangeCoordinator {
       }
     }
     return true;
+  }
+
+  private async recordArtifactDestinationMutations(state: ProjectState, paths: string[]): Promise<void> {
+    const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
+    for (const path of paths) {
+      if (!path.startsWith(root)) continue;
+      const relative = path.slice(root.length);
+      const match = /^(WORKING|REVIEW|DELIVERABLES)\/(.+)$/.exec(relative);
+      if (!match) continue;
+      const zone = match[1].toUpperCase() as "WORKING" | "REVIEW" | "DELIVERABLES";
+      if (/^(00-CURRENT-INDEX\.md|00-CURRENT\.md)$/i.test(match[2])) continue;
+      await this.recordObservedNavigationSourceMutation?.(
+        state.project_id,
+        zone,
+        `artifact:${await sha256Text(path)}`
+      );
+    }
+  }
+
+  private async recordArtifactDeletion(state: ProjectState, path: string): Promise<void> {
+    const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
+    if (!path.startsWith(root)) return;
+    const relative = path.slice(root.length);
+    const match = /^(WORKING|REVIEW|DELIVERABLES)\/(.+)$/.exec(relative);
+    if (!match || !await this.mutationGate.hasArtifactDestinationBinding(state.project_id, path)) return;
+    const zone = match[1].toUpperCase() as "WORKING" | "REVIEW" | "DELIVERABLES";
+    await this.recordObservedNavigationSourceMutation?.(state.project_id, zone, `artifact:${await sha256Text(path)}`);
   }
 
   private async observeNavigationIndexDrift(
@@ -594,6 +639,9 @@ export class ManagedDocumentChangeCoordinator {
 function accumulateGate(target: ManagedDocumentChangeSummary, source: MutationGateProcessSummary): void {
   target.candidates += source.candidates;
   target.policy_violations += source.policy_violations;
+  if (source.artifact_destination_paths?.length) {
+    target.artifact_destination_paths = [...new Set([...(target.artifact_destination_paths ?? []), ...source.artifact_destination_paths])];
+  }
   if (source.last_candidate_detection_source) {
     target.last_candidate_detection_source = source.last_candidate_detection_source;
   }

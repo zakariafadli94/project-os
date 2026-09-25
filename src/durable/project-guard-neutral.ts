@@ -408,7 +408,8 @@ export class ProjectGuard extends DurableObject<Env> {
       async (state, operation, findingId) => {
         if (!await this.ruleAdmissionRequired(state, operation)) return;
         await this.persistAdmissionProof("document-drift", findingId, await this.admitRules(state, operation));
-      }
+      },
+      (projectId, zone, resourceId) => this.recordObservedNavigationSourceMutation(projectId, zone, resourceId)
     );
     this.managedDocumentRequests = new ManagedDocumentRequestLedger(this.persistence.objects);
     this.transactionRequests = new TransactionRequestLedger(this.persistence.objects);
@@ -1432,6 +1433,20 @@ export class ProjectGuard extends DurableObject<Env> {
     }
   }
 
+  private async recordObservedNavigationSourceMutation(
+    projectId: string,
+    zone: NavigationZone,
+    resourceId: string
+  ): Promise<void> {
+    const sources = new ZoneNavigationSources(this.persistence);
+    const source = await sources.readState(projectId, zone);
+    if (!source.adopted && !source.adoption_request_id) return;
+    if (source.in_flight_resource_ids.includes(resourceId)) return;
+    if (await sources.hasDirtyMarker(projectId, zone, resourceId)) return;
+    const ticket = await sources.beginHeadWrite(projectId, zone, resourceId, undefined, null);
+    if (ticket) await sources.completeHeadWrites([ticket]);
+  }
+
   private async resumePendingNavigationRefreshes(): Promise<void> {
     const projectId = this.ctx.id.name;
     if (!projectId) return;
@@ -1492,7 +1507,11 @@ export class ProjectGuard extends DurableObject<Env> {
         if (!request || (!admitted && (request.expected_project_revision !== current.revision || request.expected_generation !== head.generation))) {
           request = {
             operation: "navigation.reconcile",
-            request_id: `DOCREQ-NAV-AUTO-${zone}-${row.source_generation}`,
+            // Frozen admission state is immutable even before its journal
+            // admission exists. If recovery's prior request becomes stale,
+            // bind a fresh identity to the exact revision/head snapshot
+            // instead of rewriting a payload under that frozen identity.
+            request_id: `DOCREQ-NAV-AUTO-${zone}-S${row.source_generation}-R${current.revision}-G${head.generation}`,
             project_id: projectId,
             zone,
             expected_project_revision: current.revision,

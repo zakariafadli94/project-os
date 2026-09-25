@@ -123,6 +123,16 @@ export class ZoneNavigationSources {
     return { resource_ids: resourceIds, next_cursor: page.cursor };
   }
 
+  async hasDirtyMarker(projectId: string, zone: NavigationZone, resourceId: string, budget?: SliceBudget): Promise<boolean> {
+    const path = await resourcePath(zoneNavigationDirtyRoot(projectId, zone), resourceId);
+    charge(budget);
+    const raw = await this.runtime.objects.readText(path);
+    if (raw === null) return false;
+    const marker = dirtySchema.parse(JSON.parse(raw));
+    if (marker.resource_id !== resourceId) throw new Error("navigation_dirty_binding");
+    return true;
+  }
+
   async readCatalogEntry(projectId: string, zone: NavigationZone, resourceId: string, budget?: SliceBudget): Promise<NavigationInventoryEntry | null> {
     charge(budget);
     const path = await resourcePath(zoneNavigationCatalogRoot(projectId, zone), resourceId);

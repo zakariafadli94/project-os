@@ -152,6 +152,17 @@ export class MutationGateRepository {
     return records.sort((left, right) => left.recorded_at.localeCompare(right.recorded_at) || left.request_id.localeCompare(right.request_id));
   }
 
+  async hasArtifactDestinationBinding(projectId: string, destinationPath: string): Promise<boolean> {
+    if (!this.runtime.pagedListing) return false;
+    const pathHash = await sha256Text(destinationPath);
+    const root = machineMutationIntentDestinationBindingRoot(projectId, pathHash);
+    const page = await this.runtime.pagedListing.listPage({ path: root, cursor: null, limit: 1 });
+    const entry = page.entries.find((candidate) => candidate.kind === "file" && /^(ART-[A-Z0-9-]{10,})\.json$/.test(candidate.name));
+    if (!entry) return false;
+    const requestId = entry.name.slice(0, -5);
+    return (await this.readDestinationBinding(projectId, destinationPath, requestId)) !== null;
+  }
+
   async captureCandidate(input: CaptureExternalMutationCandidateInput): Promise<CaptureExternalMutationCandidateResult> {
     const metadata = toProviderObjectMetadata(input.metadata);
     validateSourceMetadata(input.visiblePath, metadata);

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { assertManagedRelativePath, assertReferenceCollectionPath } from "./managed-document";
 import { packageRefSchema, packageZoneSchema } from "./document-package";
+import { navigationReconcileSchema } from "./zone-navigation";
 
 const requestId = z.string().regex(/^DOCREQ-[A-Z0-9-]{8,}$/);
 const projectId = z.string().regex(/^PRJ-[0-9]{4,}$/);
@@ -84,6 +85,7 @@ const documentArchiveSchema = z.strictObject({
 });
 
 export const managedDocumentRequestSchema = z.discriminatedUnion("operation", [
+  navigationReconcileSchema,
   z.strictObject({ operation: z.literal("package.replace"), request_id: requestId, project_id: projectId, candidate: packageRefSchema, zone: packageZoneSchema, expected_navigation_generation: z.number().int().nonnegative().safe(), expected_project_revision: z.number().int().nonnegative().safe(), created_at: createdAt }),
   z.strictObject({ operation: z.literal("package.freeze"), request_id: requestId, project_id: projectId, document_id: documentId, expected_version_id: versionId, content_sha256: hash, expected_project_revision: z.number().int().nonnegative().safe(), created_at: createdAt }),
   workingWriteSchema,

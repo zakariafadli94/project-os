@@ -32,9 +32,9 @@ import { MutationGateRepository } from "./repository";
 
 export type MutationGateClassification =
   | { kind: "not_final_zone" }
-  | { kind: "governed_current"; documentId?: string; requestId?: string }
-  | { kind: "governed_inflight"; requestId: string }
-  | { kind: "external_candidate" };
+  | { kind: "governed_current"; documentId?: string; requestId?: string; artifact_destination_known?: boolean }
+  | { kind: "governed_inflight"; requestId: string; artifact_destination_known?: boolean }
+  | { kind: "external_candidate"; artifact_destination_known?: boolean };
 
 type StrictZone =
   | { kind: "working" | "review" | "deliverables"; logicalPath: string }
@@ -76,7 +76,7 @@ export class MutationGateClassifier {
           const raw = await this.runtime.objects.readText(machineArtifactReceiptPath(intent.request_id));
           if (raw !== null) {
             if (reviewReceiptMatchesObservation(JSON.parse(raw), frozen, metadata, this.runtime.providerId)) {
-              return { kind: "governed_inflight", requestId: intent.request_id };
+              return { kind: "governed_inflight", requestId: intent.request_id, artifact_destination_known: true };
             }
             continue;
           }
@@ -85,7 +85,7 @@ export class MutationGateClassifier {
           && intentExplainsProviderChange(intent, metadata, this.runtime.providerId);
         const restoredPayload = await this.matchesActiveRollbackEvidence(intent, metadata);
         if (publishedPayload || restoredPayload) {
-          return { kind: "governed_inflight", requestId: intent.request_id };
+          return { kind: "governed_inflight", requestId: intent.request_id, artifact_destination_known: true };
         }
       }
 
@@ -101,7 +101,7 @@ export class MutationGateClassifier {
             intent.expected_content_sha256 === contentSha256
             && intentExplainsProviderChange(intent, metadata, this.runtime.providerId)
           );
-          if (exact) return { kind: "governed_inflight", requestId: exact.request_id };
+          if (exact) return { kind: "governed_inflight", requestId: exact.request_id, artifact_destination_known: true };
         }
       }
     }
@@ -132,10 +132,10 @@ export class MutationGateClassifier {
             // revision of the same governed object is captured by the document
             // reconciler as a new immutable version rather than treated as an
             // ungoverned competing head.
-            return { kind: "governed_current", documentId: resolution.documentId };
+            return { kind: "governed_current", documentId: resolution.documentId, ...(intents.length ? { artifact_destination_known: true } : {}) };
           }
           if (sameObservation(observation, metadata)) {
-            return { kind: "governed_current", documentId: resolution.documentId };
+            return { kind: "governed_current", documentId: resolution.documentId, ...(intents.length ? { artifact_destination_known: true } : {}) };
           }
           const version = await this.documents.readVersion(state.project_id, resolution.documentId, versionId);
           if (
@@ -146,14 +146,14 @@ export class MutationGateClassifier {
             && version.provider_content_hash === evidence.content_hash
             && version.size === evidence.size
           ) {
-            return { kind: "governed_current", documentId: resolution.documentId };
+            return { kind: "governed_current", documentId: resolution.documentId, ...(intents.length ? { artifact_destination_known: true } : {}) };
           }
         }
       }
       // Unknown files, orphaned identities and a second visible path carrying an
       // existing document_id are all deterministic external candidates. We do
       // not infer lineage from filenames such as v0.1/v0.2.
-      return { kind: "external_candidate" };
+      return { kind: "external_candidate", ...(intents.length ? { artifact_destination_known: true } : {}) };
     }
 
     return { kind: "external_candidate" };

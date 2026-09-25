@@ -104,7 +104,10 @@ export class SubrequestResilientProjectGuard extends MutationGateProjectGuard {
       if (inspected.kind === "working_head") {
         return this.serializeRecovery(async () => {
           await this.fastForwardFromVerifiedMachineSnapshot();
-          return this.handleWorkingHead(inspected.request, inspected.context);
+          // Keep the shared document-head/navigation source mutation under
+          // ProjectGuard's base queue as well as this recovery queue. Lock
+          // order is recovery -> base, matching transaction and refresh paths.
+          return this.serialize(() => this.handleWorkingHead(inspected.request, inspected.context));
         });
       }
     }

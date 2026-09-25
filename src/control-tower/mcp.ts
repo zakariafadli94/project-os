@@ -187,10 +187,14 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
   const diagnostic = { correlation_id: correlationId, request_id: requestId, family: kind };
   console.log("project_os_submission_started", diagnostic);
   try {
-    const submitted = await Promise.race([
-      (async () => {
-        let mutationContext: unknown = null;
-        if (!isProjectCreate) {
+    let mutationContext: unknown = null;
+    if (!isProjectCreate) {
+      const contextStarted = Date.now();
+      const contextDeadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new SubmissionFailure("context", true)), 10_000);
+      });
+      try {
+        const contextWork = (async () => {
           const contextHeaders = new Headers({ "x-project-os-correlation-id": correlationId });
           if (env.CONTROL_TOWER_OPERATOR_TOKEN) contextHeaders.set("authorization", `Bearer ${env.CONTROL_TOWER_OPERATOR_TOKEN}`);
           const contextResponse = await env.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/mutation-context?include_state=false", {
@@ -200,35 +204,51 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
           const contextBody = await contextResponse.json<{ context?: unknown }>();
           const context = parseMutationContextOrNull(contextBody?.context);
           if (!context || context.project_id !== projectId) throw new SubmissionFailure("context");
-          if (controller.signal.aborted) throw new SubmissionFailure("context", true);
-          mutationContext = context;
-        }
-        const owner = isProjectCreate ? env.REGISTRY_GUARD.getByName("global") : env.PROJECT_GUARD.getByName(projectId);
-        const path = kind === "transaction" ? (isProjectCreate ? "/create" : "/transaction") : kind === "document" ? "/document" : "/artifact";
-        const headers = new Headers({ "content-type": "application/json", "x-project-os-correlation-id": correlationId });
-        const body = JSON.stringify({ admission_version: "1.0", request, mutation_context: mutationContext });
-        if (controller.signal.aborted) throw new SubmissionFailure("context", true);
-        boundary = "submission";
-        postStarted = true;
-        const serviceHost = isProjectCreate ? "registry-guard.internal" : "project-guard.internal";
-        const response = await owner.fetch(`https://${serviceHost}${path}`, {
-          method: "POST", headers, body, signal: controller.signal
-        });
-        const payload = await response.json();
-        if (!response.ok) {
-          const refusal = knownBusinessRefusal(payload, response.status, requestId, projectId);
-          if (refusal) return { response, payload: refusal, outcome: "business_refusal" as const };
-          if (response.status >= 500) throw new SubmissionFailure("submission");
-          return { response, payload: { status: "rejected", code: "PROJECT_OS_SUBMISSION_REJECTED", request_id: requestId }, outcome: "http_rejection" as const };
-        }
-        if (!validSubmissionResponse(payload, kind, requestId, projectId, isProjectCreate)) throw new SubmissionFailure("submission");
-        if (payload.status !== "committed") {
-          return { response, payload: sanitizeSubmissionReceipt(payload), outcome: "business_refusal" as const };
-        }
-        return { response, payload, outcome: "committed" as const };
-      })(),
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new SubmissionFailure(boundary, true)), 10_000); })
-    ]);
+          return context;
+        })();
+        mutationContext = await Promise.race([contextWork, contextDeadline]);
+        if (Date.now() - contextStarted >= 10_000) throw new SubmissionFailure("context", true);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        timer = undefined;
+      }
+    }
+    const owner = isProjectCreate ? env.REGISTRY_GUARD.getByName("global") : env.PROJECT_GUARD.getByName(projectId);
+    const path = kind === "transaction" ? (isProjectCreate ? "/create" : "/transaction") : kind === "document" ? "/document" : "/artifact";
+    const headers = new Headers({ "content-type": "application/json", "x-project-os-correlation-id": correlationId });
+    const body = JSON.stringify({ admission_version: "1.0", request, mutation_context: mutationContext });
+    if (controller.signal.aborted) throw new SubmissionFailure("context", true);
+    boundary = "submission";
+    const submissionDeadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new SubmissionFailure("submission", true)), 40_000);
+    });
+    postStarted = true;
+    const serviceHost = isProjectCreate ? "registry-guard.internal" : "project-guard.internal";
+    const submissionWork = (async () => {
+      const response = await owner.fetch(`https://${serviceHost}${path}`, {
+        method: "POST", headers, body, signal: controller.signal
+      });
+      return { response, payload: await response.json() };
+    })();
+    let response: Response;
+    let submissionPayload: unknown;
+    try {
+      ({ response, payload: submissionPayload } = await Promise.race([submissionWork, submissionDeadline]));
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    }
+    let submitted: { response: Response; payload: unknown; outcome: "business_refusal" | "http_rejection" | "committed" };
+    if (!response.ok) {
+      const refusal = knownBusinessRefusal(submissionPayload, response.status, requestId, projectId);
+      if (refusal) submitted = { response, payload: refusal, outcome: "business_refusal" };
+      else if (response.status >= 500) throw new SubmissionFailure("submission");
+      else submitted = { response, payload: { status: "rejected", code: "PROJECT_OS_SUBMISSION_REJECTED", request_id: requestId }, outcome: "http_rejection" };
+    } else {
+      if (!validSubmissionResponse(submissionPayload, kind, requestId, projectId, isProjectCreate)) throw new SubmissionFailure("submission");
+      if (submissionPayload.status !== "committed") submitted = { response, payload: sanitizeSubmissionReceipt(submissionPayload), outcome: "business_refusal" };
+      else submitted = { response, payload: submissionPayload, outcome: "committed" };
+    }
     console.log("project_os_submission_finished", { ...diagnostic, boundary: "submission", elapsed_ms: Date.now() - started, result: submitted.outcome });
     const payload = { content: [{ type: "text" as const, text: JSON.stringify(submitted.payload) }] };
     return submitted.outcome === "committed" ? payload : { ...payload, isError: true as const };

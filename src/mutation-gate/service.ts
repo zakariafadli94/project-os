@@ -55,6 +55,7 @@ export interface MutationGateProcessSummary {
   mutation_gate_mode: MutationGateMode;
   policy_violations: number;
   last_candidate_detection_source?: MutationDetectionSource;
+  artifact_destination_paths?: string[];
 }
 
 export interface MutationCandidateStatus {
@@ -123,12 +124,14 @@ export class MutationGateService {
     detectionSource: MutationDetectionSource
   ): Promise<MutationGateProcessSummary> {
     let candidates = 0;
+    const artifactDestinationPaths = new Set<string>();
     for (const changeInput of changes) {
       const change = toProviderChangeEntry(changeInput);
       if (change.kind !== "file") continue;
       const metadata = await this.metadataFor(change);
       if (!metadata) continue;
       const classification = await this.classifier.classify(state, change.path, metadata);
+      if ("artifact_destination_known" in classification && classification.artifact_destination_known) artifactDestinationPaths.add(change.path);
       if (classification.kind !== "external_candidate") continue;
       await this.captureExternalCandidate(state, change.path, metadata, detectionSource);
       candidates += 1;
@@ -137,6 +140,7 @@ export class MutationGateService {
       candidates,
       mutation_gate_mode: this.mode,
       policy_violations: this.mode === "enforce" ? candidates : 0,
+      ...(artifactDestinationPaths.size ? { artifact_destination_paths: [...artifactDestinationPaths] } : {}),
       ...(candidates > 0 ? { last_candidate_detection_source: detectionSource } : {})
     };
   }
@@ -155,6 +159,10 @@ export class MutationGateService {
       metadata,
       detectedAt: metadata.modifiedAt ?? new Date().toISOString()
     });
+  }
+
+  async hasArtifactDestinationBinding(projectId: string, destinationPath: string): Promise<boolean> {
+    return this.repository.hasArtifactDestinationBinding(projectId, destinationPath);
   }
 
   async assertDestinationClear(

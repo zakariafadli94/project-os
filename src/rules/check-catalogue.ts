@@ -7,7 +7,7 @@ export const normalizedMutationOperations: readonly string[] = [...operationValu
   "package.freeze", "package.replace",
   "package.drift.observe",
   "artifact.write", "document.publish", "document.reopen", "document.archive", "working.write", "working.supersede", "working.fork", "review.write", "review.promote",
-  "input.intake", "input.recover", "project.materialize", "project.repair", "candidate.resolve"];
+  "input.intake", "input.recover", "project.materialize", "project.repair", "candidate.resolve", "navigation.reconcile"];
 const physical = ["package.replace", "package.drift.observe", "artifact.write", "document.publish", "document.reopen", "document.archive", "working.write", "working.supersede", "working.fork", "review.write", "review.promote", "input.intake", "input.recover", "project.materialize", "project.repair"];
 export interface CheckDefinition {
   check_id: string; operations: readonly string[]; parameters: z.ZodType;

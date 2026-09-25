@@ -196,6 +196,35 @@ describe("durable governed execution", () => {
     await expect(journal.status()).rejects.toThrow("execution_progress_unavailable");
   });
 
+  it("recovers a torn navigation admission only before its immutable intention exists", async () => {
+    const { journal, runtime } = setup();
+    const navRequestId = "DOCREQ-NAVIGATION-0001";
+    const navJournal = new ExecutionJournal(runtime, "PRJ-9258", "document", navRequestId);
+    const navAdmission: ExecutionAdmission = {
+      ...admission(), operation: "navigation.reconcile", request_id: navRequestId, kind: "document",
+      resources: [{ resource_id: "navigation:WORKING", resource_type: "navigation", zone: "WORKING", version: "0" }],
+      resource_effect_scopes: []
+    };
+    const originalCreate = runtime.objects.createText.bind(runtime.objects);
+    let failProgressCreate = true;
+    vi.spyOn(runtime.objects, "createText").mockImplementation(async (path, content) => {
+      if (failProgressCreate && path.endsWith("/progress.json")) {
+        failProgressCreate = false;
+        throw new Error("injected progress create interruption");
+      }
+      return originalCreate(path, content);
+    });
+    await expect(navJournal.commit(navAdmission, null)).rejects.toThrow("injected progress create interruption");
+    await navJournal.commit(navAdmission, null);
+    expect(await navJournal.status()).toMatchObject({ status: "admitted", sequence: 0 });
+
+    // The engine's immutable intention is written before provider effects. If
+    // progress later disappears after any navigation execution, fail closed.
+    await runtime.objects.createText(`${await navJournal.root()}/navigation-intention.json`, JSON.stringify({ schema_version: "1.0", request_id: navRequestId }));
+    await runtime.objects.delete(`${await navJournal.root()}/progress.json`);
+    await expect(navJournal.commit(navAdmission, null)).rejects.toThrow("execution_progress_unavailable");
+  });
+
   it.each([1, 2])("a lost checkpoint after step %s resumes by observation, not by repeating the effect", async (stepCount) => {
     const { journal, coordinator, adapter } = setup();
     await journal.commit(admission(), plan);

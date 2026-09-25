@@ -7,9 +7,14 @@ import { SearchSyncProjectGuard } from "../src/durable/project-guard-search-sync
 import { SubrequestResilientProjectGuard } from "../src/durable/project-guard-subrequest-resilient";
 import { ProjectGuard } from "../src/durable/project-guard-neutral";
 import { ExecutionJournal } from "../src/execution/journal";
+import type { ExecutionAdmission } from "../src/execution/contract";
 import type { ProjectState } from "../src/domain/project-state";
-import { machineArtifactReceiptPath, machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/persistence/layout";
+import { machineArtifactReceiptPath, machineCommitRecordPath, machineDocumentRoot, machineMaterializationHeadPath, machineMaterializationRecordPath, machineMutationIntentPath, machineReceiptPath, machineStatePath } from "../src/persistence/layout";
 import { receiptPath } from "../src/persistence/paths";
+import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ManagedDocumentRequestLedger } from "../src/documents/request-ledger";
+import { sha256Text } from "../src/documents/hash";
+import { canonicalJson } from "../src/rules/contract";
 import type { ProviderRequestScope } from "../src/persistence/provider/contract";
 import { ProjectRepository } from "../src/persistence/repository";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
@@ -17,6 +22,248 @@ import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 
 afterEach(() => vi.restoreAllMocks());
+
+async function seedFinalizedTransactionStatus(projectId: string, requestId: string, revision: number) {
+  const mock = installDropboxMock();
+  const hash = "a".repeat(64);
+  const admission: ExecutionAdmission = {
+    project_id: projectId, operation: "research.add", request_id: requestId, kind: "transaction",
+    request_hash: hash, actor: { actor_id: "qualification-fixture", authority: "test" },
+    global_revision: 1, project_revision: revision - 1,
+    ruleset: { digest: hash, rules: [], global_revision: 1, project_revision: revision - 1 },
+    verdict: "allow", results: [], gaps: [], deferred_rules: [],
+    resources: [{ resource_id: "research", resource_type: "research", zone: "RESEARCH", version: hash }]
+  };
+  const journal = new ExecutionJournal(createProductionPersistence(env as unknown as Env, projectId), projectId, "transaction", requestId);
+  await journal.commit(admission, null);
+  const receipt = {
+    schema_version: "1.0", transaction_id: requestId, project_id: projectId,
+    status: "committed", previous_revision: revision - 1, new_revision: revision,
+    event_id: `EVT-${String(revision).padStart(6, "0")}`, committed_at: "2026-09-25T00:00:00.000Z"
+  };
+  mock.files.set(machineReceiptPath(requestId), JSON.stringify(receipt));
+  const receiptRef = `${machineCommitRecordPath(projectId, revision)}#receipt`;
+  await journal.recordReceipt("committed", receiptRef);
+  await journal.finalizeMaterializedTransaction({
+    canonical_commit_ref: machineCommitRecordPath(projectId, revision), receipt_ref: receiptRef,
+    materialization_head_ref: machineMaterializationHeadPath(projectId),
+    materialization_record_ref: machineMaterializationRecordPath(projectId, revision, 1),
+    target_revision: revision, source_event_id: receipt.event_id, result_root_hash: "b".repeat(64)
+  });
+  return { mock, receipt, uploadCountAfterSeed: mock.uploadCalls.length };
+}
+
+async function seedFinalizedDocumentOrArtifactStatus(kind: "document" | "artifact", projectId: string, requestId: string) {
+  const mock = installDropboxMock();
+  const runtime = createProductionPersistence(env as unknown as Env, projectId);
+  const requestHash = await sha256Text("{}");
+  const contentHash = "c".repeat(64);
+  const admission: ExecutionAdmission = {
+    project_id: projectId, operation: kind === "document" ? "document.write_working" : "artifact.write",
+    request_id: requestId, kind, request_hash: requestHash,
+    actor: { actor_id: "qualification-fixture", authority: "test" },
+    global_revision: 1, project_revision: 2,
+    ruleset: { digest: "a".repeat(64), rules: [], global_revision: 1, project_revision: 2 },
+    verdict: "allow", results: [], gaps: [], deferred_rules: [],
+    resources: [{ resource_id: kind === "document" ? "DOC-8428" : requestId, resource_type: kind, zone: "WORKING", version: contentHash }]
+  };
+  const journal = new ExecutionJournal(runtime, projectId, kind, requestId);
+  await journal.commit(admission, null);
+  let receipt: Record<string, any>;
+  let receiptRef: string;
+  if (kind === "document") {
+    const documentRequest = "{}";
+    receipt = {
+      request_id: requestId, project_id: projectId, document_id: "DOC-8428", version_id: "v1",
+      stage: "working", logical_path: "WORKING/QUALIFICATION.md", status: "committed", provider_rev: "rev-doc-1"
+    };
+    const ledger = new ManagedDocumentRequestLedger(runtime.objects);
+    await ledger.ensureIntent(projectId, requestId, documentRequest);
+    await ledger.writeReceipt(projectId, requestId, documentRequest, JSON.stringify(receipt));
+    receiptRef = `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`;
+    await journal.recordReceipt("committed", receiptRef);
+    await journal.finalizeVerifiedDocument({
+      receipt_ref: receiptRef, document_id: receipt.document_id, version_id: receipt.version_id,
+      stage: receipt.stage, logical_path: receipt.logical_path, provider_rev: receipt.provider_rev
+    });
+  } else {
+    receipt = {
+      request_id: requestId, project_id: projectId, relative_path: "QUALIFICATION.md",
+      content_sha256: contentHash, status: "committed"
+    };
+    mock.files.set(machineArtifactReceiptPath(requestId), JSON.stringify(receipt));
+    receiptRef = machineArtifactReceiptPath(requestId);
+    await journal.recordReceipt("committed", receiptRef);
+    await journal.finalizeVerifiedArtifact({
+      receipt_ref: receiptRef, mutation_intent_ref: machineMutationIntentPath(projectId, requestId),
+      destination_path: `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-qualification/WORKING/QUALIFICATION.md`, content_sha256: contentHash
+    });
+  }
+  return { mock, receipt, uploadCountAfterSeed: mock.uploadCalls.length };
+}
+
+it.each(["project_queue", "search_queue"] as const)(
+  "returns an identity-bound finalized status while %s is occupied when all evidence is durable",
+  async (queue) => {
+    const projectId = queue === "project_queue" ? "PRJ-8422" : "PRJ-8423";
+    const requestId = `TXN-${projectId}-FINALIZED`;
+    const revision = 121;
+    const { mock, receipt, uploadCountAfterSeed } = await seedFinalizedTransactionStatus(projectId, requestId, revision);
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      const state = instance as unknown as { queueDepth: number; searchQueueDepth: number };
+      if (queue === "project_queue") state.queueDepth = 1;
+      else state.searchQueueDepth = 1;
+    });
+
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    const body = await response.json<Record<string, any>>();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      project_id: projectId, kind: "transaction", request_id: requestId, status: "finalized",
+      receipt: { ...receipt },
+      execution: {
+        project_id: projectId, kind: "transaction", request_id: requestId,
+        status: "finalized", terminal: true, finalization_ref: expect.stringContaining(`/executions/`)
+      },
+      observation: {
+        project_id: projectId, kind: "transaction", request_id: requestId,
+        status: "finalized", receipt_status: "committed", execution_status: "finalized", terminal: true
+      }
+    });
+    expect(mock.uploadCalls).toHaveLength(uploadCountAfterSeed);
+  }
+);
+
+it.each(["project_queue", "search_queue"] as const)(
+  "keeps an absent request unknown while %s is occupied",
+  async (queue) => {
+    const projectId = queue === "project_queue" ? "PRJ-8424" : "PRJ-8425";
+    const requestId = `TXN-${projectId}-ABSENT`;
+    const mock = installDropboxMock();
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      const state = instance as unknown as { queueDepth: number; searchQueueDepth: number };
+      if (queue === "project_queue") state.queueDepth = 1;
+      else state.searchQueueDepth = 1;
+    });
+
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    const body = await response.json<Record<string, unknown>>();
+
+    expect(response.status).toBe(503);
+    expect(body).toMatchObject({
+      project_id: projectId, kind: "transaction", request_id: requestId,
+      status: "unknown", code: "PROJECT_OS_READ_BUSY",
+      observation: { status: "unknown", code: "PROJECT_OS_READ_BUSY" }
+    });
+    expect(mock.uploadCalls).toHaveLength(0);
+  }
+);
+
+it.each(["project_binding_mismatch", "receipt_revision_mismatch", "provider_unavailable"] as const)(
+  "keeps a busy status unknown when bounded evidence has %s",
+  async (caseName) => {
+    const projectId = caseName === "project_binding_mismatch" ? "PRJ-8426"
+      : caseName === "receipt_revision_mismatch" ? "PRJ-8427" : "PRJ-8428";
+    const requestId = `TXN-${projectId}-FINALIZED`;
+    const revision = 122;
+    const { mock, uploadCountAfterSeed } = await seedFinalizedTransactionStatus(projectId, requestId, revision);
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+    const initial = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    const evidence = await initial.json<Record<string, any>>();
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { queueDepth: number }).queueDepth = 1;
+    });
+    if (caseName === "project_binding_mismatch") {
+      evidence.project_id = "PRJ-9999";
+      vi.spyOn(ProjectGuard.prototype as any, "readBoundedRequestStatus").mockResolvedValue(Response.json(evidence));
+    } else if (caseName === "receipt_revision_mismatch") {
+      evidence.receipt.new_revision++;
+      vi.spyOn(ProjectGuard.prototype as any, "readBoundedRequestStatus").mockResolvedValue(Response.json(evidence));
+    } else {
+      vi.spyOn(ProjectGuard.prototype as any, "readBoundedRequestStatus").mockResolvedValue(
+        Response.json({ status: "unknown", code: "request_status_unavailable" }, { status: 503 })
+      );
+    }
+
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    const body = await response.json<Record<string, unknown>>();
+
+    expect(response.status).toBe(503);
+    expect(body).toMatchObject({ project_id: projectId, kind: "transaction", request_id: requestId,
+      status: "unknown", code: "PROJECT_OS_READ_BUSY" });
+    expect(mock.uploadCalls).toHaveLength(uploadCountAfterSeed);
+  }
+);
+
+it.each(["certificate_missing", "certificate_hash_mismatch", "certificate_cross_binding"] as const)(
+  "does not trust a finalized status when its durable certificate is %s",
+  async (caseName) => {
+    const projectId = caseName === "certificate_missing" ? "PRJ-8429"
+      : caseName === "certificate_hash_mismatch" ? "PRJ-8430" : "PRJ-8433";
+    const requestId = `TXN-${projectId}-FINALIZED`;
+    const revision = 123;
+    const { mock } = await seedFinalizedTransactionStatus(projectId, requestId, revision);
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+    const initial = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    const initialBody = await initial.json<Record<string, any>>();
+    const finalizationRef = initialBody.execution.finalization_ref as string;
+    if (caseName === "certificate_missing") mock.files.delete(finalizationRef);
+    else if (caseName === "certificate_hash_mismatch") {
+      mock.files.set(finalizationRef, JSON.stringify({ project_id: projectId, request_id: requestId }));
+    } else {
+      const journal = new ExecutionJournal(createProductionPersistence(env as unknown as Env, projectId), projectId, "transaction", requestId);
+      const saved = await journal.load();
+      const raw = mock.files.get(finalizationRef);
+      expect(saved).not.toBeNull();
+      expect(raw).toBeDefined();
+      const certificate = JSON.parse(raw!) as Record<string, unknown>;
+      certificate.project_id = "PRJ-9999";
+      const crossBoundRef = `${await journal.root()}/finalizations/${await sha256Text(canonicalJson(certificate))}.json`;
+      mock.files.set(crossBoundRef, canonicalJson(certificate));
+      saved!.progress.finalization_ref = crossBoundRef;
+      saved!.progress.sequence++;
+      await journal.save(saved!.progress, saved!.token);
+    }
+    const uploadCountAfterTamper = mock.uploadCalls.length;
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { queueDepth: number }).queueDepth = 1;
+    });
+
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    const body = await response.json<Record<string, unknown>>();
+
+    expect(response.status).toBe(503);
+    expect(body).toMatchObject({ status: "unknown", code: "PROJECT_OS_READ_BUSY" });
+    expect(mock.uploadCalls).toHaveLength(uploadCountAfterTamper);
+  }
+);
+
+it.each([
+  ["document", "PRJ-8431", "DOCREQ-PROOF-8431"],
+  ["artifact", "PRJ-8432", "ART-PROOF-8432"]
+] as const)(
+  "verifies the family-specific receipt reference in a %s finalization certificate",
+  async (kind, projectId, requestId) => {
+    const { mock, receipt, uploadCountAfterSeed } = await seedFinalizedDocumentOrArtifactStatus(kind, projectId, requestId);
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { queueDepth: number; searchQueueDepth: number }).searchQueueDepth = 1;
+    });
+
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=${kind}&request_id=${requestId}`);
+    const body = await response.json<Record<string, any>>();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ project_id: projectId, kind, request_id: requestId, status: "finalized", receipt });
+    expect(body.execution.receipt_ref).toBe(kind === "document"
+      ? `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`
+      : machineArtifactReceiptPath(requestId));
+    expect(mock.uploadCalls).toHaveLength(uploadCountAfterSeed);
+  }
+);
 
 it.each(["/mutation-context", "/request-status", "/receipt", "/execution-status"])(
   "does not queue %s behind a slow finalization in the search boundary",
@@ -265,7 +512,7 @@ it("reports a bounded unknown state instead of false receipt absence during a lo
       expect(response.status).toBe(503);
       await expect(response.json()).resolves.toMatchObject({ code: "PROJECT_OS_READ_BUSY" });
     }
-    expect(handleRequestStatus).not.toHaveBeenCalled();
+    expect(handleRequestStatus).toHaveBeenCalledOnce();
     expect(handleReceiptRead).toHaveBeenCalledOnce();
   } finally {
     release();

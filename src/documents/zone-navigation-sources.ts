@@ -32,6 +32,7 @@ const DEFAULT_ZONE_STATE: z.infer<typeof zoneStateSchema> = {
 };
 const STATE_REVISION_TOKEN = Symbol("zone-navigation-state-revision-token");
 type StoredProjectState = z.infer<typeof stateSchema> & { [STATE_REVISION_TOKEN]?: string };
+const sourceMutationQueues = new WeakMap<object, Map<string, Promise<void>>>();
 
 export interface ZoneNavigationSourceState {
   schema_version: "1.0";
@@ -80,7 +81,10 @@ export class ZoneNavigationSources {
     const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
     if (current.adopted) return current.generation === expectedGeneration;
     if (current.generation !== expectedGeneration || current.in_flight_writes.length) return false;
-    if (current.adoption_request_id && (current.adoption_request_id !== requestId || current.adoption_generation !== expectedGeneration)) return false;
+    if (current.adoption_request_id && (current.adoption_request_id !== requestId || current.adoption_generation !== expectedGeneration)) {
+      const priorAdoptionWasInvalidated = current.adoption_generation !== null && current.generation > current.adoption_generation;
+      if (!priorAdoptionWasInvalidated) return false;
+    }
     current.adoption_request_id = requestId;
     current.adoption_generation = expectedGeneration;
     state.zones[zone] = current;
@@ -143,6 +147,10 @@ export class ZoneNavigationSources {
   }
 
   async finishDirty(projectId: string, zone: NavigationZone, resourceId: string, exactEntryOrNull: NavigationInventoryEntry | null, budget?: SliceBudget): Promise<boolean> {
+    return this.withMutationLock(projectId, resourceId, () => this.finishDirtyUnlocked(projectId, zone, resourceId, exactEntryOrNull, budget));
+  }
+
+  private async finishDirtyUnlocked(projectId: string, zone: NavigationZone, resourceId: string, exactEntryOrNull: NavigationInventoryEntry | null, budget?: SliceBudget): Promise<boolean> {
     const markerPath = await resourcePath(zoneNavigationDirtyRoot(projectId, zone), resourceId);
     charge(budget);
     const raw = await this.runtime.objects.readText(markerPath);
@@ -170,14 +178,24 @@ export class ZoneNavigationSources {
   }
 
   /** Shared state read/write for a source mutation that affects several zones. */
-  async beginHeadWrites(projectId: string, affectedZones: readonly NavigationZone[], resourceId: string, budget?: SliceBudget): Promise<ZoneNavigationHeadWriteTicket[]> {
+  async beginHeadWrites(projectId: string, affectedZones: readonly NavigationZone[], resourceId: string, budget?: SliceBudget, recoveryZones: readonly NavigationZone[] = []): Promise<ZoneNavigationHeadWriteTicket[]> {
+    return this.withMutationLock(projectId, resourceId, () => this.beginHeadWritesUnlocked(projectId, affectedZones, resourceId, budget, recoveryZones));
+  }
+
+  private async beginHeadWritesUnlocked(projectId: string, affectedZones: readonly NavigationZone[], resourceId: string, budget?: SliceBudget, recoveryZones: readonly NavigationZone[] = []): Promise<ZoneNavigationHeadWriteTicket[]> {
     const state = await this.readProjectState(projectId, budget);
     const tickets: ZoneNavigationHeadWriteTicket[] = [];
-    for (const zone of new Set(affectedZones)) {
+    const affected = new Set(affectedZones);
+    for (const zone of new Set([...affectedZones, ...recoveryZones])) {
       const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
+      const existing = current.in_flight_writes.find((write) => write.resource_id === resourceId);
+      if (existing) {
+        tickets.push({ project_id: projectId, zone, resource_id: resourceId, generation: existing.generation });
+        continue;
+      }
+      if (!affected.has(zone)) continue;
       if (!current.adopted && !current.adoption_request_id) continue;
       current.generation += 1;
-      current.in_flight_writes = current.in_flight_writes.filter((write) => write.resource_id !== resourceId);
       current.in_flight_writes.push({ resource_id: resourceId, generation: current.generation });
       state.zones[zone] = current;
       tickets.push({ project_id: projectId, zone, resource_id: resourceId, generation: current.generation });
@@ -194,6 +212,11 @@ export class ZoneNavigationSources {
 
   /** Durable dirty marker is written before clearing the in-flight fence. */
   async completeHeadWrites(tickets: readonly ZoneNavigationHeadWriteTicket[], observedEntries: ReadonlyMap<NavigationZone, NavigationInventoryEntry | null> = new Map(), budget?: SliceBudget): Promise<void> {
+    if (!tickets.length) return;
+    return this.withMutationLock(tickets[0].project_id, tickets[0].resource_id, () => this.completeHeadWritesUnlocked(tickets, observedEntries, budget));
+  }
+
+  private async completeHeadWritesUnlocked(tickets: readonly ZoneNavigationHeadWriteTicket[], observedEntries: ReadonlyMap<NavigationZone, NavigationInventoryEntry | null>, budget?: SliceBudget): Promise<void> {
     if (!tickets.length) return;
     const projectId = tickets[0].project_id, resourceId = tickets[0].resource_id;
     if (tickets.some((ticket) => ticket.project_id !== projectId || ticket.resource_id !== resourceId)) throw new Error("navigation_source_ticket_binding");
@@ -218,6 +241,22 @@ export class ZoneNavigationSources {
       state.zones[zone] = current;
     }
     await this.writeProjectState(projectId, state, budget);
+  }
+
+  private async withMutationLock<T>(projectId: string, resourceId: string, work: () => Promise<T>): Promise<T> {
+    let projectQueues = sourceMutationQueues.get(this.runtime);
+    if (!projectQueues) { projectQueues = new Map(); sourceMutationQueues.set(this.runtime, projectQueues); }
+    const key = `${projectId}\n${resourceId}`;
+    const previous = projectQueues.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const turn = new Promise<void>((resolve) => { release = resolve; });
+    projectQueues.set(key, turn);
+    await previous;
+    try { return await work(); }
+    finally {
+      release();
+      if (projectQueues.get(key) === turn) projectQueues.delete(key);
+    }
   }
 
   private async readProjectState(projectId: string, budget?: SliceBudget): Promise<StoredProjectState> {

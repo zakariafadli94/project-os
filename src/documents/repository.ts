@@ -314,9 +314,10 @@ export class DocumentLedgerRepository {
     const path = machineDocumentHeadPath(validated.project_id, validated.document_id);
     const previous = await this.readHead(validated.project_id, validated.document_id);
     const affectedZones = navigationHeadZones(previous, validated);
+    const recoveryZones = navigationHeadZonesPresent(previous, validated);
     const sources = new ZoneNavigationSources(this.runtime);
-    const tickets = affectedZones.length
-      ? await sources.beginHeadWrites(validated.project_id, affectedZones, `head:${validated.document_id}`)
+    const tickets = recoveryZones.length
+      ? await sources.beginHeadWrites(validated.project_id, affectedZones, `head:${validated.document_id}`, undefined, recoveryZones)
       : [];
     const exactContent = pretty(serialized);
     await this.runtime.objects.upsertText(path, exactContent);
@@ -891,6 +892,20 @@ function navigationHeadZones(
       || previous?.logical_path !== next.logical_path
       || canonicalJson(oldProvider ?? null) !== canonicalJson(newProvider ?? null);
   }).map(([zone]) => zone);
+}
+
+function navigationHeadZonesPresent(
+  previous: CurrentManagedDocumentHead | null,
+  next: CurrentManagedDocumentHead
+): import("../domain/zone-navigation").NavigationZone[] {
+  if (next.kind !== "work_product" && previous?.kind !== "work_product") return [];
+  const candidates = [
+    ["WORKING", "working_version_id", "working"],
+    ["REVIEW", "review_version_id", "review"],
+    ["DELIVERABLES", "published_version_id", "published"]
+  ] as const;
+  return candidates.filter(([, pointer, stage]) => Boolean(previous?.[pointer] || next[pointer] || previous?.provider?.[stage] || next.provider?.[stage]))
+    .map(([zone]) => zone);
 }
 
 function pretty(value: unknown): string {

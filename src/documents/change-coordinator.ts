@@ -35,6 +35,8 @@ import {
   StableWorkProductReconciler,
   type StableWorkProductReconcileResult
 } from "./stable-work-product-reconciler";
+import { zoneNavigationHeadPath } from "./zone-navigation";
+import { zoneNavigationHeadSchema } from "../domain/zone-navigation";
 
 const LEGACY_CURSOR_KEY = "managed-document-change-cursor-v1";
 export const SCHEDULED_DOCUMENT_JOB_LIMIT = 1;
@@ -230,9 +232,13 @@ export class ManagedDocumentChangeCoordinator {
     }
 
     const detectionSource = cursorReset ? "cursor_reset" : baseline ? "baseline" : "incremental";
-    const gate = await this.mutationGate.processChanges(state, page.entries, detectionSource);
+    const unreserved: ProviderChangeEntry[] = [];
+    for (const change of page.entries) {
+      if (!await this.observeNavigationIndexDrift(state, change, summary)) unreserved.push(change);
+    }
+    const gate = await this.mutationGate.processChanges(state, unreserved, detectionSource);
     accumulateGate(summary, gate);
-    const unhandled = await this.reconcileStableChanges(state, page.entries, summary);
+    const unhandled = await this.reconcileStableChanges(state, unreserved, summary);
     if (baseline) {
       const bootstrap = await this.bootstrapBaseline(state, unhandled);
       summary.bootstrapped += bootstrap.adopted;
@@ -359,11 +365,11 @@ export class ManagedDocumentChangeCoordinator {
     job: ManagedDocumentChangeJob,
     summary: ManagedDocumentChangeSummary
   ): Promise<void> {
-    // MutationGate remains the first semantic observer for every stored change.
+    if (await this.observeNavigationIndexDrift(state, job.change, summary, job.job_id)) return;
+
+    // MutationGate remains the first semantic observer for every non-navigation change.
     const gate = await this.mutationGate.processChanges(state, [job.change], job.detection_source);
     accumulateGate(summary, gate);
-
-    if (await this.observeNavigationIndexDrift(state, job.change, summary, job.job_id)) return;
 
     if (await this.observePackageDrift(state, job.change, summary, job.job_id)) return;
 
@@ -459,7 +465,39 @@ export class ManagedDocumentChangeCoordinator {
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!change.path.startsWith(root)) return false;
     const relative = change.path.slice(root.length);
-    if (!/^(WORKING|REVIEW|DELIVERABLES)\/(00-CURRENT-INDEX\.md|00-CURRENT\.md)$/.test(relative)) return false;
+    const reserved = /^(WORKING|REVIEW|DELIVERABLES)\/(00-CURRENT-INDEX\.md|00-CURRENT\.md)$/i.exec(relative);
+    if (!reserved) return false;
+    const zone = reserved[1].toUpperCase() as "WORKING" | "REVIEW" | "DELIVERABLES";
+    const rawHead = await this.runtime.objects.readText(zoneNavigationHeadPath(state.project_id, zone));
+    // Before adoption, legacy files are bootstrap input, not external mutations
+    // of a governed navigation generation. They remain reserved from bootstrap.
+    if (rawHead === null) return true;
+    const parsedHead = zoneNavigationHeadSchema.safeParse(JSON.parse(rawHead));
+    if (!parsedHead.success || parsedHead.data.project_id !== state.project_id || parsedHead.data.zone !== zone) {
+      await this.recordNavigationIndexDrift(state, change, summary, jobId);
+      return true;
+    }
+    const expected = parsedHead.data.index;
+    let matchesPublishedIdentity = change.kind === "file"
+      && change.metadata?.objectId === expected.object_id
+      && change.metadata?.revisionToken === expected.revision_token;
+    if (!matchesPublishedIdentity && change.kind === "file") {
+      // Change feeds may replay an older notification after our own write. Check
+      // current canonical identity before declaring drift; never infer from path.
+      const current = await this.runtime.objects.getMetadata(change.path);
+      matchesPublishedIdentity = current?.objectId === expected.object_id && current.revisionToken === expected.revision_token;
+    }
+    if (matchesPublishedIdentity) return true;
+    await this.recordNavigationIndexDrift(state, change, summary, jobId);
+    return true;
+  }
+
+  private async recordNavigationIndexDrift(
+    state: ProjectState,
+    change: ProviderChangeEntry,
+    summary: ManagedDocumentChangeSummary,
+    jobId?: string
+  ): Promise<void> {
     summary.drift_findings += 1;
     summary.conflicts += 1;
     if (this.jobs) {
@@ -475,7 +513,6 @@ export class ManagedDocumentChangeCoordinator {
         observed_at: new Date().toISOString()
       });
     }
-    return true;
   }
 
   private async bootstrapBaseline(
@@ -524,7 +561,7 @@ export class ManagedDocumentChangeCoordinator {
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!change.path.startsWith(root)) return null;
     const relative = change.path.slice(root.length);
-    if (/^(WORKING|REVIEW|DELIVERABLES)\/(00-CURRENT-INDEX\.md|00-CURRENT\.md)$/.test(relative)) return null;
+    if (/^(WORKING|REVIEW|DELIVERABLES)\/(00-CURRENT-INDEX\.md|00-CURRENT\.md)$/i.test(relative)) return null;
     if (relative.toUpperCase().startsWith("REVIEW/CANDIDATES/")) return null;
 
     if (relative.startsWith("DELIVERABLES/") && relative.length > "DELIVERABLES/".length) {

@@ -5,12 +5,18 @@ import type { NavigationInventoryEntry } from "../src/domain/zone-navigation";
 
 function harness() {
   const files = new Map<string, string>();
+  let nextCatalogGate: { entered(): void; enteredPromise: Promise<void>; wait: Promise<void>; release(): void } | null = null;
   const runtime: ProjectOsPersistenceRuntime = {
     providerId: "test",
     objects: {
       readText: async (path) => files.get(path) ?? null,
       createText: async (path, content) => { if (files.has(path)) throw new Error("exists"); files.set(path, content); },
-      upsertText: async (path, content) => { files.set(path, content); },
+      upsertText: async (path, content) => {
+        if (path.includes("/catalog/") && nextCatalogGate) {
+          const gate = nextCatalogGate; nextCatalogGate = null; gate.entered(); await gate.wait;
+        }
+        files.set(path, content);
+      },
       getMetadata: async (path) => files.has(path) ? { path, objectId: path, revisionToken: "1", size: files.get(path)!.length } : null,
       listChildren: async () => [], move: async () => {}, delete: async (path) => { files.delete(path); }
     },
@@ -25,7 +31,16 @@ function harness() {
     } },
     evidence: { stableObjectId: { semantics: "stable-through-move" }, revisionToken: { semantics: "opaque-object-revision" }, integrityHash: { semantics: "identified-algorithm" } }
   };
-  return { runtime, files, sources: new ZoneNavigationSources(runtime) };
+  return {
+    runtime, files, sources: new ZoneNavigationSources(runtime),
+    pauseNextCatalogWrite() {
+      let enter!: () => void, release!: () => void;
+      const enteredPromise = new Promise<void>((resolve) => { enter = resolve; });
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      nextCatalogGate = { entered: enter, enteredPromise, wait, release };
+      return { entered: enteredPromise, release };
+    }
+  };
 }
 
 function budget(calls = 32) {
@@ -66,17 +81,51 @@ describe("ZoneNavigationSources", () => {
     expect([...files.keys()].some((path) => path.startsWith(zoneNavigationDirtyRoot("PRJ-0002", "WORKING")))).toBe(false);
   });
 
-  it("rejects completion from a superseded in-flight writer before changing its catalog", async () => {
+  it("reuses the durable in-flight ticket when the same source write is retried", async () => {
     const { sources } = harness();
     const b = budget();
     await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
     await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
     const resourceId = entry().resource_id;
     const older = await sources.beginHeadWrite("PRJ-0002", "WORKING", resourceId, b);
-    const newer = await sources.beginHeadWrite("PRJ-0002", "WORKING", resourceId, b);
-    await expect(sources.completeHeadWrite(older, entry(), b)).rejects.toThrow("navigation_source_ticket_stale");
-    expect(await sources.readCatalogEntry("PRJ-0002", "WORKING", resourceId, b)).toBeNull();
-    await sources.completeHeadWrite(newer, entry(), b);
+    const retry = await sources.beginHeadWrite("PRJ-0002", "WORKING", resourceId, b);
+    expect(retry).toEqual(older);
+    await sources.completeHeadWrite(older, entry(), b);
     expect(await sources.readCatalogEntry("PRJ-0002", "WORKING", resourceId, b)).toEqual(entry());
+  });
+
+  it("lets a new adoption snapshot take over after a source write invalidates the old generation", async () => {
+    const { sources } = harness();
+    const b = budget();
+    await expect(sources.beginAdoption("PRJ-0002", "WORKING", "NAVADOPT-old", 0, b)).resolves.toBe(true);
+    const e = entry();
+    const ticket = await sources.beginHeadWrite("PRJ-0002", "WORKING", e.resource_id, b);
+    await sources.completeHeadWrite(ticket, e, b);
+    await expect(sources.beginAdoption("PRJ-0002", "WORKING", "NAVADOPT-new", 1, b)).resolves.toBe(true);
+    expect(await sources.finishAdoption("PRJ-0002", "WORKING", "NAVADOPT-new", 1, b)).toBe(false);
+    expect(await sources.finishDirty("PRJ-0002", "WORKING", e.resource_id, e, b)).toBe(true);
+    expect(await sources.finishAdoption("PRJ-0002", "WORKING", "NAVADOPT-new", 1, b)).toBe(true);
+  });
+
+  it("serializes interleaved completions so an older writer cannot overwrite a newer catalog", async () => {
+    const { sources, pauseNextCatalogWrite } = harness();
+    const b = budget();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "NAVADOPT", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "NAVADOPT", 0, b);
+    const oldEntry = entry();
+    const newEntry = { ...oldEntry, version: "VER-1123456789ABCDEF01234567", expected: { ...oldEntry.expected, revision_token: "rev-new", content_sha256: "b".repeat(64) } };
+    const oldTicket = await sources.beginHeadWrite("PRJ-0002", "WORKING", oldEntry.resource_id, b);
+    const gate = pauseNextCatalogWrite();
+    const oldCompletion = sources.completeHeadWrite(oldTicket, oldEntry, b);
+    await gate.entered;
+    let newBeginFinished = false;
+    const newBegin = sources.beginHeadWrite("PRJ-0002", "WORKING", oldEntry.resource_id, b).then((ticket) => { newBeginFinished = true; return ticket; });
+    await Promise.resolve();
+    expect(newBeginFinished).toBe(false);
+    gate.release();
+    await oldCompletion;
+    const newTicket = await newBegin;
+    await sources.completeHeadWrite(newTicket, newEntry, b);
+    expect(await sources.readCatalogEntry("PRJ-0002", "WORKING", oldEntry.resource_id, b)).toEqual(newEntry);
   });
 });

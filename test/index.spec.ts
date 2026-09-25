@@ -53,14 +53,19 @@ describe("Worker routing", () => {
     } as Env, ctx);
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
-    await expect(response.json()).resolves.toMatchObject({
+    const manifest = await response.json() as Record<string, unknown>;
+    expect(manifest).toMatchObject({
       canonical_read: true,
       typed_transactions: true,
       receipt_tracking: true,
       finalization_tracking: true,
       fallback_ingress: true,
-      deployment_sha: "a".repeat(40)
+      deployment_sha: "a".repeat(40),
+      callable_in_this_session: null,
+      runtime_readiness: "not_probed",
+      authorized: null
     });
+    expect(manifest).not.toHaveProperty("missing_client_capability");
   });
 
   it("returns the exact Dropbox webhook challenge", async () => {

@@ -22,11 +22,6 @@ export function persistenceCapabilities(
     authorized,
     callable_in_this_session: null,
     runtime_readiness: "not_probed",
-    fallback: { supported_families: ["transaction", "project_context"], requires_authorized_encrypted_transport: true },
-    missing_client_capability: {
-      code: "PROJECT_OS_CONNECTOR_UNAVAILABLE", status: "not_submitted",
-      action: "check_callable_tools_and_authorized_transport",
-      preserve_original_request: true, requires_new_approval: false
-    }
+    fallback: { supported_families: ["transaction", "project_context"], requires_authorized_encrypted_transport: true }
   };
 }

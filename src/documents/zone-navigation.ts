@@ -44,13 +44,15 @@ const navigationProgressSchema = z.strictObject({
   verify_page: z.number().int().nonnegative().safe(),
   verify_entry: z.number().int().nonnegative().safe(),
   source_count: z.number().int().nonnegative().safe(),
+  source_ids: z.array(z.string()).default([]),
+  published_index: navigationIndexIdentitySchema.nullable().default(null),
   coverage_gaps: z.array(z.object({ resource_id: z.string(), code: z.string() }).strict()),
   rendered_links: z.array(z.string()),
   generated_sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
   legacy_archive_ref: z.string().nullable(),
   status: z.enum(["adopting", "publishing", "finalized", "conflict"]),
   receipt: z.unknown().nullable(),
-  postchecks: z.array(z.object({ check_id: z.string(), verdict: z.literal("allow"), evidence_refs: z.array(z.string()).min(1) }).strict())
+  postchecks: z.array(z.object({ check_id: z.string(), verdict: z.enum(["allow", "deny", "unavailable"]), evidence_refs: z.array(z.string()) }).strict())
 });
 type NavigationProgress = z.infer<typeof navigationProgressSchema>;
 
@@ -131,7 +133,9 @@ export class ZoneNavigationEngine {
       const write = await this.publishIndex(sourcePath, generated, progress.expected_index, budget);
       if (write.status === "conflict") return write;
       const index = write.identity;
-      const checks = await this.runPostchecks(request, admission, progress, root, budget);
+      progress.published_index = index;
+      progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+      const checks = await this.runPostchecks(request, admission, progress, progressPath, budget);
       if (checks.status === "conflict") return checks;
 
       const certificate = {
@@ -195,7 +199,12 @@ export class ZoneNavigationEngine {
     const savedProgress = await this.readProgress(progressPath, budget);
     if (existingIntent !== null) {
       if (!isRecord(existingIntent) || existingIntent.request_hash !== requestHash || canonicalJson(existingIntent.request) !== canonicalJson(request)) return { status: "conflict", code: "navigation_request_id_conflict" };
-      if (!savedProgress) throw new NavigationConflict("navigation_progress_missing");
+      if (!savedProgress) {
+        const recovered = navigationProgressSchema.safeParse(existingIntent.initial_progress);
+        if (!recovered.success || recovered.data.request_hash !== requestHash || recovered.data.request_id !== request.request_id || recovered.data.project_id !== request.project_id) throw new NavigationConflict("navigation_progress_missing");
+        await this.immutable(progressPath, recovered.data, budget);
+        return { status: "ready", progress: recovered.data };
+      }
       if (savedProgress.status === "finalized" && savedProgress.receipt) return { status: "ready", progress: savedProgress };
       return { status: "ready", progress: savedProgress };
     }
@@ -230,6 +239,8 @@ export class ZoneNavigationEngine {
       verify_page: 0,
       verify_entry: 0,
       source_count: 0,
+      source_ids: [],
+      published_index: null,
       coverage_gaps: [],
       rendered_links: [],
       generated_sha256: null,
@@ -238,7 +249,7 @@ export class ZoneNavigationEngine {
       receipt: null,
       postchecks: []
     };
-    await this.immutable(intentPath, { schema_version: "1.0", request, request_hash: requestHash, target_generation: targetGeneration }, budget);
+    await this.immutable(intentPath, { schema_version: "1.0", request, request_hash: requestHash, target_generation: targetGeneration, initial_progress: progress }, budget);
     await this.immutable(progressPath, progress, budget);
     return { status: "ready", progress };
   }
@@ -259,7 +270,7 @@ export class ZoneNavigationEngine {
       const entries = page.entries.map((value) => navigationInventoryEntrySchema.parse(value));
       const gaps = page.gaps.map((value) => navigationCoverageGapSchema.parse(value));
       for (const entry of entries) this.assertEntry(entry, state, request.zone);
-      const seen = new Set<string>();
+      const seen = new Set(progress.source_ids);
       if (entries.some((entry) => seen.has(entry.resource_id)) || new Set(entries.map((entry) => entry.resource_id)).size !== entries.length) return { status: "conflict", code: "navigation_duplicate_source" };
       const savedPage: SnapshotPage = { schema_version: "1.0", page: progress.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, gaps };
       await this.immutable(`${pagesRoot}/${progress.page_count.toString().padStart(8, "0")}.json`, savedPage, budget);
@@ -267,6 +278,7 @@ export class ZoneNavigationEngine {
       progress.snapshot_id = page.snapshot_id;
       progress.page_count += 1;
       progress.source_count += entries.length;
+      progress.source_ids.push(...entries.map((entry) => entry.resource_id));
       progress.coverage_gaps.push(...gaps);
       progress.inventory_complete = page.next_cursor === null;
       progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
@@ -317,18 +329,19 @@ export class ZoneNavigationEngine {
     if (!progress.expected_index) return { status: "ok", ref: null };
     const expected = progress.expected_index;
     if (progress.legacy_archive_ref) {
-      const archived = await this.readText(progress.legacy_archive_ref, budget);
-      if (archived === null || await sha256Text(archived) !== expected.content_sha256) return { status: "conflict", code: "navigation_archive_unverified" };
+      const archived = await this.readExactBytes(progress.legacy_archive_ref, budget);
+      if (!archived || await sha256Bytes(archived) !== expected.content_sha256) return { status: "conflict", code: "navigation_archive_unverified" };
       return { status: "ok", ref: progress.legacy_archive_ref };
     }
     const observed = await this.observeIndex(sourcePath, budget);
-    if (!sameIndexIdentity(observed?.identity ?? null, expected) || observed?.content === null || observed?.content === undefined) return { status: "conflict", code: "navigation_index_changed" };
+    if (!sameIndexIdentity(observed?.identity ?? null, expected)) return { status: "conflict", code: "navigation_index_changed" };
+    if (!observed?.exact_bytes || !observed.bytes || observed.content === null) return { status: "conflict", code: "navigation_archive_bytes_unavailable" };
     const archiveRoot = `${workspaceProjectRoot(request.project_id, state.slug)}/ARCHIVES/NAVIGATION/${request.zone}`;
     const name = `${archiveRoot}/${progress.target_generation}-${expected.content_sha256}.md`;
-    await this.immutable(name, observed.content, budget);
+    await this.immutableExactText(name, observed.content, observed.bytes, budget);
     const archiveMeta = await this.metadata(name, budget);
-    const archived = await this.readText(name, budget);
-    if (!archiveMeta?.objectId || !archiveMeta.revisionToken || archived !== observed.content || await sha256Text(archived) !== expected.content_sha256) return { status: "conflict", code: "navigation_archive_unverified" };
+    const archived = await this.readExactBytes(name, budget);
+    if (!archiveMeta?.objectId || !archiveMeta.revisionToken || !archived || await sha256Bytes(archived) !== expected.content_sha256 || !sameBytes(archived, observed.bytes)) return { status: "conflict", code: "navigation_archive_unverified" };
     const evidence = `${archiveRoot}/${progress.target_generation}-${expected.content_sha256}.evidence.json`;
     await this.immutable(evidence, { schema_version: "1.0", project_id: request.project_id, request_id: request.request_id, zone: request.zone, source_path: sourcePath, source_identity: expected, archive_path: name, archive_identity: { object_id: archiveMeta.objectId, revision_token: archiveMeta.revisionToken, content_sha256: expected.content_sha256 } }, budget);
     return { status: "ok", ref: name };
@@ -408,14 +421,42 @@ export class ZoneNavigationEngine {
     if (bytes === null || bytes.byteLength !== entry.expected.size || !matchesEntryMetadata(after, entry) || after?.size !== entry.expected.size || before!.objectId !== after!.objectId || before!.revisionToken !== after!.revisionToken || await sha256Bytes(bytes) !== entry.expected.content_sha256) throw new NavigationConflict("navigation_target_missing_or_changed");
   }
 
-  private async observeIndex(path: string, budget: SliceBudget): Promise<{ identity: NavigationIndexIdentity; content: string } | null> {
+  private async observeIndex(path: string, budget: SliceBudget): Promise<{ identity: NavigationIndexIdentity; content: string; bytes: Uint8Array; exact_bytes: boolean } | null> {
     const before = await this.metadata(path, budget);
     if (!before) return null;
     if (!before.objectId || !before.revisionToken) throw new NavigationConflict("navigation_index_identity_unavailable");
-    const content = await this.readText(path, budget);
+    let bytes: Uint8Array | null = null;
+    let exactBytes = false;
+    if (this.runtime.objects.readBytes) {
+      budget.beforeHttp();
+      bytes = await this.runtime.objects.readBytes(path, Math.max(1, before.size));
+      exactBytes = bytes !== null;
+    }
+    if (!bytes) {
+      const text = await this.readText(path, budget);
+      bytes = text === null ? null : new TextEncoder().encode(text);
+    }
+    let content: string | null = null;
+    try {
+      content = bytes ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes) : null;
+      if (content !== null && !sameBytes(new TextEncoder().encode(content), bytes!)) content = null;
+    } catch {
+      content = null;
+    }
     const after = await this.metadata(path, budget);
-    if (content === null || after?.objectId !== before.objectId || after.revisionToken !== before.revisionToken || await sha256Text(content) !== before.integrityHash?.value && before.integrityHash?.algorithm === "sha256") throw new NavigationConflict("navigation_index_unstable");
-    return { identity: { basename: path.split("/").at(-1) as NavigationIndexIdentity["basename"], object_id: before.objectId, revision_token: before.revisionToken, content_sha256: await sha256Text(content) }, content };
+    if (content === null || !bytes || bytes.byteLength !== before.size || after?.objectId !== before.objectId || after?.revisionToken !== before.revisionToken || await sha256Bytes(bytes) !== before.integrityHash?.value && before.integrityHash?.algorithm === "sha256") throw new NavigationConflict("navigation_index_unstable");
+    return { identity: { basename: path.split("/").at(-1) as NavigationIndexIdentity["basename"], object_id: before.objectId, revision_token: before.revisionToken, content_sha256: await sha256Bytes(bytes) }, content, bytes, exact_bytes: exactBytes };
+  }
+
+  private async readExactBytes(path: string, budget: SliceBudget): Promise<Uint8Array | null> {
+    if (!this.runtime.objects.readBytes) return null;
+    const metadata = await this.metadata(path, budget);
+    if (!metadata) return null;
+    budget.beforeHttp();
+    const bytes = await this.runtime.objects.readBytes(path, Math.max(1, metadata.size));
+    const after = await this.metadata(path, budget);
+    if (!bytes || bytes.byteLength !== metadata.size || after?.objectId !== metadata.objectId || after?.revisionToken !== metadata.revisionToken) return null;
+    return bytes;
   }
 
   private async readHead(path: string, projectId: string, zone: NavigationZone, budget: SliceBudget): Promise<{ head: ZoneNavigationHead; token: string } | null> {
@@ -449,6 +490,17 @@ export class ZoneNavigationEngine {
       if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.readText(path, budget);
       if (existing !== content) throw new NavigationConflict("navigation_immutable_record_conflict");
+    }
+  }
+
+  private async immutableExactText(path: string, content: string, expectedBytes: Uint8Array, budget: SliceBudget): Promise<void> {
+    try {
+      budget.beforeHttp();
+      await this.runtime.objects.createText(path, content);
+    } catch (error) {
+      if (!(error instanceof ProviderConflictError)) throw error;
+      const existing = await this.readExactBytes(path, budget);
+      if (!existing || !sameBytes(existing, expectedBytes)) throw new NavigationConflict("navigation_immutable_record_conflict");
     }
   }
 
@@ -508,24 +560,32 @@ export class ZoneNavigationEngine {
     request: NavigationReconcileRequest,
     admission: ExecutionAdmission,
     progress: NavigationProgress,
-    root: string,
+    progressPath: string,
     budget: SliceBudget
   ): Promise<{ status: "ok"; records: unknown[] } | { status: "conflict"; code: string }> {
-    const records: unknown[] = [];
+    const records: NavigationProgress["postchecks"] = [...progress.postchecks];
     for (const checkId of requiredRulePostchecks(admission)) {
-      const path = `${root}/navigation/postchecks/${await executionHash(checkId)}.json`;
-      const saved = await this.readJson(path, budget);
-      if (saved) {
-        if (!isRecord(saved) || saved.request_id !== request.request_id || saved.request_hash !== progress.request_hash || saved.check_id !== checkId || saved.verdict !== "allow" || !Array.isArray(saved.evidence_refs) || !saved.evidence_refs.length || saved.evidence_refs.some((ref) => typeof ref !== "string" || !ref)) return { status: "conflict", code: "navigation_postcheck_conflict" };
-        records.push(saved);
-        continue;
+      const prior = records.find((record) => record.check_id === checkId);
+      if (prior?.verdict === "allow") continue;
+      if (prior?.verdict === "deny") {
+        progress.status = "conflict";
+        progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        return { status: "conflict", code: "navigation_postcheck_denied" };
       }
       if (!this.postchecks) return { status: "conflict", code: "navigation_postchecks_unavailable" };
       const result = await this.postchecks.run({ request, admission, check_id: checkId, budget });
-      if (result.verdict !== "allow" || !result.evidence_refs.length || result.evidence_refs.some((ref) => typeof ref !== "string" || !ref)) return { status: "conflict", code: "navigation_postcheck_denied" };
-      const record = { schema_version: "1.0", project_id: request.project_id, request_id: request.request_id, request_hash: progress.request_hash, check_id: checkId, verdict: "allow", evidence_refs: result.evidence_refs };
-      await this.immutable(path, record, budget);
-      records.push(record);
+      const verdict = result.verdict === "allow" && result.evidence_refs.length && result.evidence_refs.every((ref) => typeof ref === "string" && !!ref)
+        ? "allow"
+        : result.verdict === "deny" ? "deny" : "unavailable";
+      const record = { check_id: checkId, verdict, evidence_refs: result.evidence_refs.filter((ref) => typeof ref === "string" && !!ref) } as const;
+      const existingIndex = records.findIndex((candidate) => candidate.check_id === checkId);
+      if (existingIndex === -1) records.push(record);
+      else records[existingIndex] = record;
+      progress.postchecks = records;
+      if (verdict !== "allow") progress.status = "conflict";
+      progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+      if (verdict === "deny") return { status: "conflict", code: "navigation_postcheck_denied" };
+      if (verdict === "unavailable") return { status: "conflict", code: "navigation_postcheck_unavailable" };
     }
     return { status: "ok", records };
   }
@@ -553,6 +613,10 @@ function renderLink(entry: NavigationInventoryEntry): string {
 async function sha256Bytes(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index]);
 }
 
 function escapeMarkdown(value: string): string {

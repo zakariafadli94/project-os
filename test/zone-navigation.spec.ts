@@ -66,6 +66,7 @@ function runtimeHarness() {
   const files = new Map<string, { content: string; objectId: string; revisionToken: string }>();
   const binaryFiles = new Map<string, { bytes: Uint8Array; objectId: string; revisionToken: string }>();
   let sequence = 0;
+  let failCreatePathOnce: ((path: string) => boolean) | null = null;
   const metadata = (path: string): ProviderObjectMetadata | null => {
     const file = files.get(path);
     const binary = binaryFiles.get(path);
@@ -78,6 +79,7 @@ function runtimeHarness() {
   };
   const put = (path: string, content: string, objectId?: string): ProviderObjectMetadata => {
     sequence += 1;
+    binaryFiles.delete(path);
     files.set(path, { content, objectId: objectId ?? `id:${sequence}`, revisionToken: `rev-${sequence}` });
     return metadata(path)!;
   };
@@ -87,11 +89,16 @@ function runtimeHarness() {
       readText: async (path) => files.get(path)?.content ?? null,
       readBytes: async (path, maxBytes) => {
         const binary = binaryFiles.get(path);
-        if (!binary) return null;
-        if (binary.bytes.length > maxBytes) throw new Error("byte_limit");
-        return binary.bytes.slice();
+        const bytes = binary?.bytes ?? (files.has(path) ? new TextEncoder().encode(files.get(path)!.content) : null);
+        if (!bytes) return null;
+        if (bytes.length > maxBytes) throw new Error("byte_limit");
+        return bytes.slice();
       },
       createText: async (path, content) => {
+        if (failCreatePathOnce?.(path)) {
+          failCreatePathOnce = null;
+          throw new Error("injected create interruption");
+        }
         if (files.has(path)) throw new ProviderConflictError("exists");
         put(path, content);
       },
@@ -108,7 +115,7 @@ function runtimeHarness() {
     },
     conditionalWrite: {
       writeTextConditional: async (path, content, expectedRevisionToken) => {
-        const current = files.get(path);
+        const current = files.get(path) ?? binaryFiles.get(path);
         if (!current || current.revisionToken !== expectedRevisionToken) throw new ProviderPreconditionFailedError("stale");
         return put(path, content, current.objectId);
       }
@@ -126,7 +133,7 @@ function runtimeHarness() {
     binaryFiles.set(path, { bytes: bytes.slice(), objectId: objectId ?? `id:${sequence}`, revisionToken: `rev-${sequence}` });
     return metadata(path)!;
   };
-  return { runtime, files, binaryFiles, put, putBytes };
+  return { runtime, files, binaryFiles, put, putBytes, failNextCreate: (match: (path: string) => boolean) => { failCreatePathOnce = match; } };
 }
 
 async function inventoryHarness(inputState = state(), zone: "WORKING" | "REVIEW" | "DELIVERABLES" = "WORKING", options: { missing?: boolean; snapshotChanged?: boolean; pages?: NavigationInventoryEntry[][] } = {}) {
@@ -216,6 +223,115 @@ describe("zone navigation identity and resumable reconciliation", () => {
     const archived = [...harness.files.entries()].find(([path]) => path.includes("/ARCHIVES/NAVIGATION/WORKING/") && path.endsWith(".md"));
     expect(archived?.[1].content).toBe(legacy);
     expect(harness.files.get(indexPath)?.content).not.toBe(legacy);
+  });
+
+  it("recovers when intention creation succeeds but progress creation is interrupted", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const engine = new ZoneNavigationEngine(harness.runtime, inv.port);
+    harness.failNextCreate((path) => path.endsWith("/navigation-progress.json"));
+    await expect(engine.reconcile(input, project, await admissionFor(input), budget())).rejects.toThrow("injected create interruption");
+
+    const resumed = await reconcileUntilTerminal(engine, input, project, await admissionFor(input));
+    expect(resumed.status, JSON.stringify(resumed)).toBe("finalized");
+  });
+
+  it("journals a post-execution denial after index publication without finalizing the head", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const indexPath = `${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT.md`;
+    const input = request();
+    const admission = await admissionFor(input);
+    admission.deferred_rules = [{ rule_id: "RULE-NAV-001", version: 1, scope: { kind: "project", project_id: project.project_id } }];
+    const engine = new ZoneNavigationEngine(harness.runtime, inv.port, {
+      run: async ({ budget: slice }) => { slice.beforeHttp(); return { verdict: "deny", evidence_refs: [] }; }
+    });
+    const result = await reconcileUntilTerminal(engine, input, project, admission);
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_postcheck_denied" });
+    expect(harness.files.get(indexPath)?.content).toContain("# WORKING navigation");
+    expect([...harness.files.keys()].some((path) => path.endsWith("/documents/navigation/WORKING/head.json"))).toBe(false);
+    const progress = [...harness.files.entries()].find(([path]) => path.endsWith("/navigation-progress.json"))?.[1].content;
+    expect(progress).toBeDefined();
+    expect(JSON.parse(progress!)).toMatchObject({ status: "conflict", published_index: { basename: "00-CURRENT.md" }, postchecks: [{ verdict: "deny" }] });
+  });
+
+  it("resumes an unavailable postcheck against the already-published index", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const admission = await admissionFor(input);
+    admission.deferred_rules = [{ rule_id: "RULE-NAV-002", version: 1, scope: { kind: "project", project_id: project.project_id } }];
+    let attempts = 0;
+    const engine = new ZoneNavigationEngine(harness.runtime, inv.port, {
+      run: async ({ budget: slice }) => {
+        slice.beforeHttp();
+        attempts++;
+        return attempts === 1 ? { verdict: "unavailable", evidence_refs: [] } : { verdict: "allow", evidence_refs: ["server-check:evidence-1"] };
+      }
+    });
+    const first = await engine.reconcile(input, project, admission, budget(128));
+    expect(first).toMatchObject({ status: "conflict", code: "navigation_postcheck_unavailable" });
+    const indexPath = `${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT.md`;
+    const firstIndex = harness.files.get(indexPath);
+    expect(firstIndex?.content).toContain("# WORKING navigation");
+    const progress = [...harness.files.entries()].find(([path]) => path.endsWith("/navigation-progress.json"))?.[1].content;
+    expect(JSON.parse(progress!)).toMatchObject({ status: "conflict", published_index: { basename: "00-CURRENT.md" }, postchecks: [{ verdict: "unavailable" }] });
+
+    const resumed = await reconcileUntilTerminal(engine, input, project, admission);
+    expect(resumed.status).toBe("finalized");
+    expect(attempts).toBe(2);
+    expect(harness.files.get(indexPath)?.objectId).toBe(firstIndex?.objectId);
+    expect(harness.files.get(indexPath)?.revisionToken).toBe(firstIndex?.revisionToken);
+  });
+
+  it("rejects an overlapping inventory page instead of duplicating a source", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const duplicate = { ...inv.entry, version: "VER-OTHER" };
+    const port: NavigationInventoryPort = {
+      listPage: async ({ cursor, budget: slice }) => {
+        slice.beforeHttp();
+        return cursor === null
+          ? { entries: [inv.entry], gaps: [], snapshot_id: "overlap-snapshot", next_cursor: "next" }
+          : { entries: [duplicate], gaps: [], snapshot_id: "overlap-snapshot", next_cursor: null };
+      },
+      verifySnapshot: async ({ budget: slice }) => { slice.beforeHttp(); return true; },
+      verifyEntry: async (_entry, slice) => { slice.beforeHttp(); return true; }
+    };
+    const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, port), input, project, await admissionFor(input));
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_duplicate_source" });
+    expect(harness.files.has(`${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT.md`)).toBe(false);
+  });
+
+  it("archives a BOM-prefixed legacy index byte-for-byte", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const indexPath = `${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT-INDEX.md`;
+    const legacyBytes = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode("# Legacy index\r\nPreserve exact bytes.\r\n")]);
+    const metadata = harness.putBytes(indexPath, legacyBytes, "id:index");
+    const input = request("WORKING", {
+      basename: "00-CURRENT-INDEX.md",
+      object_id: metadata.objectId!,
+      revision_token: metadata.revisionToken!,
+      content_sha256: await sha256Bytes(legacyBytes)
+    });
+    const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, inv.port), input, project, await admissionFor(input));
+    expect(result.status, JSON.stringify(result)).toBe("finalized");
+    const archivedPath = [...harness.files.keys()].find((path) => path.includes("/ARCHIVES/NAVIGATION/WORKING/") && path.endsWith(".md"));
+    expect(archivedPath).toBeDefined();
+    expect(harness.files.get(archivedPath!)?.content).toBe("\uFEFF# Legacy index\r\nPreserve exact bytes.\r\n");
   });
 
   it("stores independent navigation identity and generation for each zone", async () => {

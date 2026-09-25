@@ -10,7 +10,7 @@ Implemented the Task 1 navigation request, receipt and engine in the three owned
 - `ZoneNavigationReceipt`: separate `committed` navigation evidence with zone generation, index identity, source snapshot ID, coverage gaps, mutable head ref and immutable `finalization_ref`. It is not a managed document version.
 - `ZoneNavigationEngine(runtime, inventory, postchecks?)`: `reconcile(request, state, admission, budget)` consumes the existing server-created `ExecutionAdmission`. Admission must bind the request hash, project/zone generation resource, exact zone index destination, and—when adopting an existing index—its source address and exact visible preservation-copy address.
 - `NavigationInventoryPort`: paged canonical entries include project, zone, resource/version, safe zone-relative path, provider object/revision identity, content SHA-256 and byte size. Implementations receive `SliceBudget` and must charge every provider call. `verifyEntry` rechecks an exact saved reference; `verifySnapshot` verifies its stable generation marker without restarting an unbounded scan.
-- `NavigationPostcheckPort`: optional trusted server adapter for deferred admission rules. The engine fails closed when deferred checks exist and no adapter is supplied, and journals allow evidence immutably before navigation finalization.
+- `NavigationPostcheckPort`: optional trusted server adapter for deferred admission rules. The engine fails closed when deferred checks exist and no adapter is supplied, and records each post-execution result plus the published index identity in the progress journal before head finalization.
 - `zoneNavigationHeadPath(project_id, zone)` exposes the fixed machine head path for Task2 status/recovery integration.
 
 ## RED/GREEN evidence
@@ -22,6 +22,16 @@ Implemented the Task 1 navigation request, receipt and engine in the three owned
 - Typecheck: `node_modules/.bin/tsc --noEmit` passed.
 - Hygiene: `git diff --check` passed.
 - The repository full suite was not rerun for this slice. The unchanged-code baseline had already completed separately with 257 files / 1,652 tests passing; its pre-existing form-urlencoded warnings were reported by the parent task.
+
+## Independent-review corrections (2026-09-25)
+
+- Reproduced four review findings before correction. The focused suite reported 4 failed / 12 passed: a persisted intention without progress retried as `navigation_progress_missing`; a deferred postcheck denial left a visible index with no faithful progress state; overlapping inventory pages finalized a duplicate source; and a BOM-prefixed legacy index could not be safely observed for byte-exact preservation.
+- Intention now contains the initial frozen progress envelope. If the progress create is interrupted, an identical admitted retry verifies and recreates progress instead of poisoning the request.
+- The inventory checkpoint carries previously seen resource IDs, so overlap between separately persisted pages is rejected before verification/publication and is not counted twice.
+- Legacy index observation hashes raw bytes and requires strict UTF-8 round-tripping for the Markdown archive. Visible history copies are create-only and verified byte-for-byte; a provider without byte-read support, or unsupported encoding, fails closed before index replacement.
+- Deferred checks remain post-execution checks: the rule references do not carry enough check-stage detail to reinterpret them as preconditions. The engine therefore publishes the index effect first, durably records the exact published index identity and each allow/deny/unavailable outcome in its progress CAS journal, and withholds head/finalization on deny or unavailable. Unavailable checks can be retried against the already-published index; deny remains a durable conflict.
+- Added interruption, deny, unavailable-resume, overlapping-page, and BOM-preservation regressions. Final targeted GREEN: `vitest run test/zone-navigation.spec.ts --reporter=dot` passed 17/17 tests. Final `tsc --noEmit` and `git diff --check` passed.
+- These corrections were not included in the previously reported full-suite result; the full suite was not rerun. No production writes or deployment occurred.
 
 ## Coverage
 

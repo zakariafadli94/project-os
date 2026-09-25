@@ -169,7 +169,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         break;
       }
       try {
-        const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
+        const resolved = await this.resolveHead(projectId, zone, resourceId, budget, true);
         if (resolved.gap) gaps.push(resolved.gap);
         if (resolved.entry) {
           await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
@@ -571,7 +571,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     };
   }
 
-  private async resolveHead(projectId: string, zone: NavigationZone, resourceId: string, budget: SliceBudget): Promise<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap }> {
+  private async resolveHead(projectId: string, zone: NavigationZone, resourceId: string, budget: SliceBudget, reserveActiveProof = false): Promise<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap }> {
     const match = /^head:(DOC-[A-F0-9]{24})$/.exec(resourceId);
     if (!match) return { entry: null, gap: { resource_id: resourceId, code: "invalid_head_resource_id" } };
     const documentId = match[1];
@@ -584,7 +584,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const pointer = activePointer(head, zone);
     if (!pointer.versionId && !pointer.observation) return { entry: null };
     if (!pointer.versionId || !pointer.observation) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_binding_missing" } };
-    requireBudget(budget, MAX_INITIAL_HEAD_PROVIDER_CALLS - 1);
+    if (reserveActiveProof) requireBudget(budget, MAX_INITIAL_HEAD_PROVIDER_CALLS - 1);
     const observation = normalizeObservation(pointer.observation);
     charge(budget);
     const rawVersion = await this.runtime.objects.readText(machineDocumentVersionPath(projectId, documentId, pointer.versionId));

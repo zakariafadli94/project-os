@@ -233,6 +233,7 @@ describe("ZoneNavigationInventory", () => {
     const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: deferred.next_cursor, limit: 8, budget: budget(32) });
     expect(resumed.entries.map((entry) => entry.resource_id)).toEqual([`head:${documentId}`]);
     expect(resumed.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
+    expect(await h.inventory.verifyEntry(resumed.entries[0], budget(12))).toBe(true);
   });
 
   it("avoids a null catalog write for a clean inactive head but clears a stale catalog row", async () => {

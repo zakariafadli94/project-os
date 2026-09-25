@@ -184,6 +184,7 @@ export class ZoneNavigationEngine {
       if (isBudgetExhausted(error)) {
         return { status: "pending", cursor: null };
       }
+      if (error instanceof Error && error.message === "navigation_listing_stalled") return { status: "conflict", code: "navigation_listing_stalled" };
       if (error instanceof ProviderPreconditionFailedError || error instanceof ProviderConflictError) return { status: "conflict", code: "navigation_provider_conflict" };
       if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
       throw error;

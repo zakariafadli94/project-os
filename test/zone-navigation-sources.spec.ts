@@ -74,6 +74,18 @@ function entry(): NavigationInventoryEntry {
 }
 
 describe("ZoneNavigationSources", () => {
+  it("releases only the exact failed adoption owner for a safe new request", async () => {
+    const { sources } = harness();
+    const b = budget();
+    const oldId = "DOCREQ-NAVIGATION-WORKING-OLD1";
+    const newId = "DOCREQ-NAVIGATION-WORKING-NEW1";
+    expect(await sources.beginAdoption("PRJ-0002", "WORKING", oldId, 0, b)).toBe(true);
+    expect(await sources.beginAdoption("PRJ-0002", "WORKING", newId, 0, b)).toBe(false);
+    expect(await sources.abortAdoption("PRJ-0002", "WORKING", newId, 0, b)).toBe(false);
+    expect(await sources.abortAdoption("PRJ-0002", "WORKING", oldId, 0, b)).toBe(true);
+    expect(await sources.beginAdoption("PRJ-0002", "WORKING", newId, 0, b)).toBe(true);
+  });
+
   it("keeps source generations, adoption and in-flight head writes durable across failed writers", async () => {
     const { sources } = harness();
     const b = budget();

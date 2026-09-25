@@ -141,7 +141,7 @@ describe("ZoneNavigationInventory", () => {
 
     const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
 
-    expect(h.pageLimits.every((limit) => limit <= 8)).toBe(true);
+    expect(h.pageLimits.every((limit) => limit <= 512)).toBe(true);
     expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(1);
     expect(page.snapshot_id).toBe("source:0");
     expect(page.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
@@ -171,7 +171,7 @@ describe("ZoneNavigationInventory", () => {
     expect(first.next_cursor).not.toBeNull();
     expect(second.entries).toHaveLength(1);
     expect(second.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
-    expect(h.pageLimits.every((limit) => limit <= 8)).toBe(true);
+    expect(h.pageLimits.every((limit) => limit <= 512)).toBe(true);
     expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(1);
     expect(new Set([...first.entries, ...second.entries].map((entry) => entry.resource_id)).size).toBe(3);
   });
@@ -202,7 +202,28 @@ describe("ZoneNavigationInventory", () => {
     expect(new Set(actual).size).toBe(expected.length);
     const headPageCount = h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`).length;
     expect(headPageCount).toBeLessThan(expected.length);
-    expect(h.pageLimits.every((limit) => limit <= 8)).toBe(true);
+    expect(h.pageLimits.every((limit) => limit <= 512)).toBe(true);
+  });
+
+  it("fails closed when Dropbox repeats the same listing cursor", async () => {
+    const h = harness();
+    h.runtime.pagedListing!.listPage = async ({ cursor }) => ({ entries: [], cursor });
+    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: "initial:opaque", limit: 8, budget: budget() }))
+      .rejects.toThrow("navigation_listing_stalled");
+  });
+
+  it("captures a sub-512-head initial listing without a fragile continuation cursor", async () => {
+    const h = harness();
+    for (let index = 0; index < 9; index++) {
+      const id = `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`;
+      h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+        schema_version: "1.0", project_id: projectId, document_id: id,
+        kind: "work_product", logical_path: `inactive-${index}.md`, reconciliation_status: "clean"
+      }));
+    }
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(40) });
+    expect(h.pageLimits[0]).toBe(512);
+    expect(page.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
   });
 
   it("uses the cheap path for inactive heads so a bounded slice does not stall on them", async () => {

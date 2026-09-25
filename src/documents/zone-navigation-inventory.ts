@@ -26,7 +26,10 @@ interface PageCursor { phase: PagePhase; cursor: string | null }
 const MAX_PACKAGE_LEDGER_BYTES = 128_000;
 const MAX_PACKAGE_MANIFEST_BYTES = 256_000;
 const MAX_VISIBLE_SOURCE_BYTES = 2_000_000;
-const MAX_INITIAL_HEADS_PER_PAGE = 8;
+// Initial adoption freezes one bounded provider page in the durable cursor.
+// PRJ-0003 has fewer than 512 heads, so this avoids a Dropbox continuation
+// cursor that can return the same page indefinitely without losing resumability.
+const MAX_INITIAL_HEADS_PER_PAGE = 512;
 const MAX_INITIAL_HEAD_PROVIDER_CALLS = 10;
 const MIN_INACTIVE_HEAD_PROVIDER_CALLS = 2;
 
@@ -112,7 +115,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     projectId: string,
     zone: NavigationZone,
     cursor: string | null,
-    requestedLimit: number,
+    _requestedLimit: number,
     snapshotId: string,
     budget: SliceBudget
   ) {
@@ -133,12 +136,13 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // cursor, so the provider cursor never advances past unprocessed heads.
       // A legacy opaque cursor was created with limit=1; preserve its page
       // size rather than changing pagination semantics mid-request.
-      listingLimit = cursor === null ? Math.max(1, Math.min(requestedLimit, MAX_INITIAL_HEADS_PER_PAGE)) : 1;
+      listingLimit = cursor === null ? MAX_INITIAL_HEADS_PER_PAGE : 1;
       requireBudget(budget, 1);
       charge(budget);
       const page = await this.runtime.pagedListing.listPage({
         path: `${machineDocumentRoot(projectId)}/heads`, cursor, limit: listingLimit
       });
+      if (cursor !== null && page.cursor === cursor) throw new Error("navigation_listing_stalled");
       listedEntries = page.entries;
       providerCursor = page.cursor;
     }

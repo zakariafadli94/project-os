@@ -367,6 +367,16 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(harness.files.has(`${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT.md`)).toBe(false);
   });
 
+  it("makes a stalled provider listing a terminal navigation conflict without publishing an index", async () => {
+    const h = runtimeHarness();
+    const input = request();
+    const inv = await inventoryHarness();
+    inv.port.listPage = async () => { throw new Error("navigation_listing_stalled"); };
+    const result = await new ZoneNavigationEngine(h.runtime, inv.port).reconcile(input, state(), await admissionFor(input), budget());
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_listing_stalled" });
+    expect(h.files.has(`${workspaceProjectRoot(input.project_id, "project-os")}/WORKING/00-CURRENT.md`)).toBe(false);
+  });
+
   it("archives a BOM-prefixed legacy index byte-for-byte", async () => {
     const harness = runtimeHarness();
     const project = state();

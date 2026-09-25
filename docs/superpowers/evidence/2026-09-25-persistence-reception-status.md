@@ -1,6 +1,6 @@
 # Persistence reliability V2 — reception status (2026-09-25)
 
-This is a technical evidence report, not a new business decision or a declaration that the global SOP programme is complete. Its canonical Project OS document receipt and physical readback are pending.
+This is a technical evidence report, not a new business decision or a declaration that the global SOP programme is complete. The initial publication `DOCREQ-PRJ0002-PERSISTENCE-E15-20260925T103412Z` was independently verified committed, finalized and physically identical to its submitted body (SHA-256 `b906487071131cc5c9ff7f1438d52d4a96306fb952c08912241b1bf4b7f1994f`). This wording update removes the historical pre-submission "pending" statement; the latest version's own receipt remains discoverable through its governed request history.
 
 ## Verified
 
@@ -42,5 +42,5 @@ All fourteen accepted guarantees G01–G14 are currently **partial at their full
 ## Next exact gates
 
 1. Guard/Tower exact-main publication and capability checks passed; the PRJ-0007 busy-read defect passed live status checks on four surfaces. Do not replay the transaction.
-2. Persist this report through the PRJ-0002 typed document route, then verify committed receipt, finalized status and physical body readback. This document cannot assert its own as-yet unissued receipt. Do not mark full E15 acceptance complete while the standalone-task client gate remains unproven.
+2. The report and full SOP matrix have been persisted through the PRJ-0002 typed document route and independently verified against their original committed receipt, finalization certificate and exact physical body. Preserve that history and use the document request history for any later version. Full E15 acceptance remains unsigned while the standalone-task client gate is unproven.
 3. Continue the separate accepted SOP L0–L10 programme with a fresh canonical rule/source inventory and typed repairs only where identity, eligibility and authorization are proven.

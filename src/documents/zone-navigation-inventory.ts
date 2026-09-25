@@ -10,12 +10,21 @@ import { readDocumentVersionRecord, readManagedDocumentHead } from "../schema/ma
 import type { CurrentManagedDocumentHead, CurrentDocumentVersionRecord } from "../schema/managed-document";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
-import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath } from "../persistence/layout";
+import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot } from "../persistence/layout";
 import { sha256Text } from "./hash";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "./zone-navigation-sources";
+import { packageIdFor, packageManifestPath, packageNavigationLedgerSchema, packageNavigationPath, packageRefSchema, packageResourceVersion, parsePackageManifest, type PackageNavigationHead, type PackageRef } from "../domain/document-package";
+import { DocumentLedgerRepository } from "./repository";
+import { canonicalJson } from "../rules/contract";
+import { MutationGateRepository } from "../mutation-gate/repository";
+import { MutationGateService } from "../mutation-gate/service";
 
-type PagePhase = "initial" | "dirty" | "catalog";
+type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "dirty" | "catalog";
 interface PageCursor { phase: PagePhase; cursor: string | null }
+
+const MAX_PACKAGE_LEDGER_BYTES = 128_000;
+const MAX_PACKAGE_MANIFEST_BYTES = 256_000;
+const MAX_VISIBLE_SOURCE_BYTES = 2_000_000;
 
 /** Canonical, bounded source adapter used by ZoneNavigationEngine. */
 export class ZoneNavigationInventory implements NavigationInventoryPort {
@@ -42,6 +51,9 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const phase: PagePhase = saved?.phase ?? (state.adopted ? "dirty" : "initial");
     const providerCursor = saved?.cursor ?? null;
     if (phase === "initial") return this.initialPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
+    if (phase === "packages") return this.packagePage(projectId, zone, providerCursor, snapshot_id, budget);
+    if (phase === "artifacts") return this.artifactPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
+    if (phase === "artifact-bindings") return this.artifactBindingsPage(projectId, zone, providerCursor, snapshot_id, budget);
     if (phase === "dirty") return this.dirtyAndCatalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
     return this.catalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget, input.cursor === null);
   }
@@ -101,8 +113,157 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       entries,
       gaps,
       snapshot_id: snapshotId,
-      next_cursor: page.cursor === null ? null : encodeCursor("initial", page.cursor)
+      next_cursor: page.cursor === null ? encodeCursor("packages", JSON.stringify({ package_index: 0, member_index: 0 })) : encodeCursor("initial", page.cursor)
     };
+  }
+
+  private async packagePage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget) {
+    requireBudget(budget, 22);
+    let packageIndex = 0;
+    let memberIndex = 0;
+    if (cursor !== null) {
+      try {
+        const parsed = JSON.parse(cursor) as { package_index?: unknown; member_index?: unknown };
+        if (typeof parsed.package_index !== "number" || !Number.isSafeInteger(parsed.package_index) || parsed.package_index < 0
+          || typeof parsed.member_index !== "number" || !Number.isSafeInteger(parsed.member_index) || parsed.member_index < 0) throw new Error();
+        packageIndex = parsed.package_index;
+        memberIndex = parsed.member_index;
+      } catch { throw new Error("navigation_inventory_cursor_invalid"); }
+    }
+    const gaps: NavigationCoverageGap[] = [];
+    let source: CurrentPackageNavigation | null;
+    try { source = await readCurrentPackageNavigation(this.runtime, projectId, zone, budget); }
+    catch (error) {
+      if (isBudgetError(error)) throw error;
+      gaps.push({ resource_id: "packages", code: classifyPackageGap(error) });
+      return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", "") };
+    }
+    const packages = source?.head?.packages ?? [];
+    if (packageIndex >= packages.length) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", "") };
+    const selected = packages[packageIndex];
+    try {
+      const resolved = await resolvePackageIndex(this.runtime, projectId, zone, selected, source!, memberIndex, budget);
+      if (resolved.gap) gaps.push(resolved.gap);
+      if (resolved.pending) return {
+        entries: [], gaps, snapshot_id: snapshotId,
+        next_cursor: encodeCursor("packages", JSON.stringify({ package_index: packageIndex, member_index: memberIndex + 1 }))
+      };
+      if (resolved.entry) await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resolved.entry.resource_id, budget, generationFromSnapshot(snapshotId));
+      else await this.sources.writeCatalogEntry(null, projectId, zone, `package:${selected.ref.package_id}`, budget, generationFromSnapshot(snapshotId));
+      return {
+        entries: resolved.entry ? [resolved.entry] : [], gaps, snapshot_id: snapshotId,
+        next_cursor: packageIndex + 1 < packages.length ? encodeCursor("packages", JSON.stringify({ package_index: packageIndex + 1, member_index: 0 })) : encodeCursor("artifacts", "")
+      };
+    } catch (error) {
+      if (isBudgetError(error)) throw error;
+      gaps.push({ resource_id: `package:${selected.ref.package_id}`, code: classifyPackageGap(error) });
+      return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: packageIndex + 1 < packages.length ? encodeCursor("packages", JSON.stringify({ package_index: packageIndex + 1, member_index: 0 })) : encodeCursor("artifacts", "") };
+    }
+  }
+
+  private async artifactPage(projectId: string, zone: NavigationZone, cursor: string | null, _requestedLimit: number, snapshotId: string, budget: SliceBudget) {
+    if (!this.runtime.pagedListing) return { entries: [], gaps: [{ resource_id: "artifacts", code: "paged_listing_unavailable" }], snapshot_id: snapshotId, next_cursor: null };
+    requireBudget(budget, 16);
+    const root = `${machineMutationGateRoot(projectId)}/intents/artifacts`;
+    charge(budget);
+    const page = await this.runtime.pagedListing.listPage({ path: root, cursor, limit: 1 });
+    const item = page.entries[0];
+    if (!item) return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: null };
+    const match = /^(ART-[A-Z0-9-]{10,})\.json$/.exec(item.name);
+    if (item.kind !== "file" || !item.path || item.path !== `${root}/${item.name}` || !match) {
+      return { entries: [], gaps: [{ resource_id: item.name, code: "artifact_intent_listing_invalid" }], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
+    }
+    let intent: Awaited<ReturnType<MutationGateRepository["readArtifactIntent"]>>;
+    try {
+      intent = await new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, match[1]);
+      if (!intent || intent.request_id !== match[1] || intent.project_id !== projectId) throw new Error("artifact_intent_binding");
+    } catch (error) {
+      if (isBudgetError(error)) throw error;
+      return { entries: [], gaps: [{ resource_id: `artifact:${match[1]}`, code: "committed_artifact_intent_unavailable" }], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
+    }
+    const target = artifactNavigationTarget(projectId, intent.destination_path);
+    if (target.kind === "outside") {
+      return { entries: [], gaps: [{ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_outside_navigation_zones" }], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
+    }
+    if (target.kind === "invalid") {
+      return { entries: [], gaps: [{ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_binding_invalid" }], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
+    }
+    if (target.zone !== zone) return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
+    const state: ArtifactBindingCursor = { next_intent_cursor: page.cursor, request_id: intent.request_id, destination_path: intent.destination_path, binding_cursor: null, eligible_request_ids: [], gaps: [] };
+    return this.scanArtifactBindings(projectId, zone, state, snapshotId, budget);
+  }
+
+  private async artifactBindingsPage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget) {
+    let state: ArtifactBindingCursor;
+    try {
+      state = JSON.parse(cursor ?? "") as ArtifactBindingCursor;
+      if (!state || typeof state.request_id !== "string" || typeof state.destination_path !== "string" || !Array.isArray(state.eligible_request_ids) || !Array.isArray(state.gaps)
+        || (state.next_intent_cursor !== null && typeof state.next_intent_cursor !== "string") || (state.binding_cursor !== null && typeof state.binding_cursor !== "string")) throw new Error("invalid");
+    } catch { throw new Error("navigation_inventory_cursor_invalid"); }
+    return this.scanArtifactBindings(projectId, zone, state, snapshotId, budget);
+  }
+
+  private async scanArtifactBindings(projectId: string, zone: NavigationZone, state: ArtifactBindingCursor, snapshotId: string, budget: SliceBudget) {
+    if (!this.runtime.pagedListing) return { entries: [], gaps: [{ resource_id: `artifact:${await sha256Text(state.destination_path)}`, code: "paged_listing_unavailable" }], snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
+    requireBudget(budget, 22);
+    const destinationHash = await sha256Text(state.destination_path);
+    const root = machineMutationIntentDestinationBindingRoot(projectId, destinationHash);
+    charge(budget);
+    const page = await this.runtime.pagedListing.listPage({ path: root, cursor: state.binding_cursor, limit: 1 });
+    for (const item of page.entries) {
+      const match = /^(ART-[A-Z0-9-]{10,})\.json$/.exec(item.name);
+      if (item.kind !== "file" || !item.path || item.path !== `${root}/${item.name}` || !match) {
+        state.gaps.push({ resource_id: item.name, code: "artifact_destination_binding_invalid" });
+        continue;
+      }
+      try {
+        charge(budget);
+        const rawBinding = await this.runtime.objects.readText(item.path);
+        if (rawBinding === null) throw new Error("artifact_destination_binding_unavailable");
+        const binding = JSON.parse(rawBinding) as Record<string, unknown>;
+        if (binding.schema_version !== "1.0" || binding.project_id !== projectId || binding.destination_path !== state.destination_path || binding.request_id !== match[1] || typeof binding.intent_id !== "string") throw new Error("artifact_destination_binding_invalid");
+        const repository = new MutationGateRepository(budgetedRuntime(this.runtime, budget));
+        const intent = await repository.readArtifactIntent(projectId, match[1]);
+        if (!intent || intent.destination_path !== state.destination_path || intent.intent_id !== binding.intent_id) throw new Error("artifact_destination_binding_conflict");
+        const target = artifactNavigationTarget(projectId, state.destination_path);
+        if (target.kind !== "zone" || target.zone !== zone) throw new Error("artifact_destination_zone_mismatch");
+        const metadata = await budgetedRuntime(this.runtime, budget).objects.getMetadata(state.destination_path);
+        if (!metadata || metadata.size > MAX_VISIBLE_SOURCE_BYTES) throw new Error("artifact_visible_out_of_bounds");
+        const status = await new MutationGateService(budgetedRuntime(this.runtime, budget), "observe").artifactStatus(projectId, match[1]);
+        if (status?.verification_state === "canonical_verified" && status.receipt_status === "committed" && status.operation !== "REVIEW_CANDIDATE") {
+          const resolved = await resolveArtifactEntry(this.runtime, projectId, zone, intent, target.logical_path, budget);
+          if (resolved) state.eligible_request_ids.push(match[1]);
+        }
+      } catch (error) {
+        if (isBudgetError(error)) throw error;
+        state.gaps.push({ resource_id: `artifact:${destinationHash}`, code: classifyArtifactGap(error) });
+      }
+    }
+    if (page.cursor !== null) {
+      state.binding_cursor = page.cursor;
+      return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifact-bindings", JSON.stringify(state)) };
+    }
+    const resourceId = `artifact:${destinationHash}`;
+    const distinct = [...new Set(state.eligible_request_ids)];
+    if (distinct.length > 1) {
+      await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+      state.gaps.push({ resource_id: resourceId, code: "artifact_destination_ambiguous" });
+      return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
+    }
+    if (distinct.length === 1 && distinct[0] === state.request_id) {
+      const intent = await new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, state.request_id);
+      if (!intent) throw new Error("committed_artifact_intent_unavailable");
+      const target = artifactNavigationTarget(projectId, state.destination_path);
+      if (target.kind !== "zone" || target.zone !== zone) throw new Error("artifact_destination_zone_mismatch");
+      const status = await new MutationGateService(budgetedRuntime(this.runtime, budget), "observe").artifactStatus(projectId, state.request_id);
+      const entry = status?.verification_state === "canonical_verified" && status.receipt_status === "committed" && status.operation !== "REVIEW_CANDIDATE"
+        ? await resolveArtifactEntry(this.runtime, projectId, zone, intent, target.logical_path, budget) : null;
+      if (entry) {
+        await this.sources.writeCatalogEntry(entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        return { entries: [entry], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
+      }
+    }
+    return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
   }
 
   private async dirtyAndCatalogPage(
@@ -372,7 +533,7 @@ function decodeCursor(value: string): PageCursor {
   const separator = value.indexOf(":");
   if (separator < 1) throw new Error("navigation_inventory_cursor_invalid");
   const phase = value.slice(0, separator);
-  if (phase !== "initial" && phase !== "dirty" && phase !== "catalog") throw new Error("navigation_inventory_cursor_invalid");
+  if (phase !== "initial" && phase !== "packages" && phase !== "artifacts" && phase !== "artifact-bindings" && phase !== "dirty" && phase !== "catalog") throw new Error("navigation_inventory_cursor_invalid");
   const encoded = value.slice(separator + 1);
   return { phase, cursor: encoded ? decodeURIComponent(encoded) : null };
 }
@@ -402,11 +563,173 @@ function unsupportedSourceCode(resourceId: string): string {
 }
 
 function unresolvedSourceFamilyGaps(): NavigationCoverageGap[] {
-  return [
-    { resource_id: "packages", code: "finalized_package_inventory_unavailable" },
-    { resource_id: "artifacts", code: "committed_artifact_inventory_unavailable" }
-  ];
+  return [];
 }
+
+interface CurrentPackageNavigation {
+  head: PackageNavigationHead | null;
+  base_path: string;
+  visible_members: Array<{ path: string; provider_id: string; object_id: string; revision_token: string; content_sha256: string }> | null;
+}
+
+interface ArtifactBindingCursor {
+  next_intent_cursor: string | null;
+  request_id: string;
+  destination_path: string;
+  binding_cursor: string | null;
+  eligible_request_ids: string[];
+  gaps: NavigationCoverageGap[];
+}
+
+async function readCurrentPackageNavigation(runtime: ProjectOsPersistenceRuntime, projectId: string, zone: NavigationZone, budget: SliceBudget): Promise<CurrentPackageNavigation | null> {
+  const bounded = budgetedRuntime(runtime, budget);
+  const path = packageNavigationPath(projectId);
+  const before = await bounded.objects.getMetadata(path);
+  if (!before) return null;
+  if (before.size > MAX_PACKAGE_LEDGER_BYTES || !bounded.objects.readBytes) throw new Error("package_navigation_ledger_oversize_or_unreadable");
+  const bytes = await bounded.objects.readBytes(path, MAX_PACKAGE_LEDGER_BYTES);
+  const after = await bounded.objects.getMetadata(path);
+  if (!bytes || bytes.byteLength !== before.size || after?.objectId !== before.objectId || after?.revisionToken !== before.revisionToken) throw new Error("package_navigation_ledger_unstable");
+  const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  const ledger = packageNavigationLedgerSchema.parse(JSON.parse(raw));
+  if (ledger.project_id !== projectId) throw new Error("package_navigation_binding");
+  const repository = new DocumentLedgerRepository(bounded);
+  const { admitted } = await repository.readPackageExecutionEvidence(projectId, "document", ledger.source_request_id);
+  const headHash = await sha256Text(raw);
+  if (!admitted.plan?.steps.some((step) => step.action.kind === "write_if_unchanged" && step.action.destination.path === path && step.action.desired.content_sha256 === headHash)) throw new Error("package_navigation_unproven");
+  const stateWrite = admitted.plan.steps.find((step) => step.action.kind === "write_if_unchanged" && step.action.destination.logical_path === "STATE.md");
+  if (!stateWrite || stateWrite.action.kind !== "write_if_unchanged" || !stateWrite.action.destination.path.endsWith("/STATE.md")) throw new Error("package_navigation_workspace_unavailable");
+  const basePath = stateWrite.action.destination.path.slice(0, -"/STATE.md".length);
+  const expectedRoot = new RegExp(`^/PROJECT_OS/WORKSPACE/PROJECTS/${escapeRegExp(projectId)}-[A-Za-z0-9][A-Za-z0-9_-]*$`);
+  if (!expectedRoot.test(basePath)) throw new Error("package_navigation_workspace_binding");
+  const head = ledger.heads[zone] ?? null;
+  if (head && (head.project_id !== projectId || head.zone !== zone
+    || new Set(head.packages.map((item) => item.ref.package_id)).size !== head.packages.length
+    || head.packages.some((item) => item.ref.project_id !== projectId || item.root !== `${zone}/PACKAGES/${item.ref.package_id}/${item.ref.version}`))) throw new Error("package_navigation_binding");
+  return { head, base_path: basePath, visible_members: ledger.visible_members ?? null };
+}
+
+async function resolvePackageIndex(
+  runtime: ProjectOsPersistenceRuntime,
+  projectId: string,
+  zone: NavigationZone,
+  selected: PackageNavigationHead["packages"][number],
+  source: CurrentPackageNavigation,
+  memberIndex: number,
+  budget: SliceBudget
+): Promise<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap; pending?: boolean }> {
+  const ref = packageRefSchema.parse(selected.ref);
+  if (ref.project_id !== projectId || selected.root !== `${zone}/PACKAGES/${ref.package_id}/${ref.version}`) throw new Error("package_navigation_binding");
+  const bounded = budgetedRuntime(runtime, budget);
+  const manifestPath = packageManifestPath(ref);
+  const metadata = await bounded.objects.getMetadata(manifestPath);
+  if (!metadata || metadata.size > MAX_PACKAGE_MANIFEST_BYTES || !bounded.objects.readBytes) throw new Error("package_manifest_unavailable_or_oversize");
+  const bytes = await bounded.objects.readBytes(manifestPath, MAX_PACKAGE_MANIFEST_BYTES);
+  const metadataAfter = await bounded.objects.getMetadata(manifestPath);
+  if (!bytes || bytes.byteLength !== metadata.size || metadataAfter?.objectId !== metadata.objectId || metadataAfter?.revisionToken !== metadata.revisionToken) throw new Error("package_manifest_unstable");
+  const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  if (await sha256Text(raw) !== ref.manifest_sha256) throw new Error("package_manifest_binding");
+  const manifest = parsePackageManifest(JSON.parse(raw));
+  if (manifest.project_id !== projectId || manifest.version !== ref.version || await packageIdFor(projectId, manifest.creation_request_id) !== ref.package_id || canonicalJson(manifest) !== raw) throw new Error("package_manifest_binding");
+  if (!source.visible_members) throw new Error("package_visible_member_evidence_unavailable");
+  if (memberIndex >= manifest.members.length) throw new Error("package_member_cursor_invalid");
+  const member = manifest.members[memberIndex];
+  const memberPath = `${source.base_path}/${selected.root}/${member.relative_path}`;
+  const memberEvidence = source.visible_members.filter((candidate) => candidate.path === memberPath);
+  if (memberEvidence.length !== 1 || memberEvidence[0].provider_id !== runtime.providerId || memberEvidence[0].content_sha256 !== member.content_sha256) throw new Error("package_visible_member_binding");
+  const memberMetadata = await bounded.objects.getMetadata(memberPath);
+  if (!memberMetadata || memberMetadata.objectId !== memberEvidence[0].object_id || memberMetadata.revisionToken !== memberEvidence[0].revision_token || memberMetadata.size !== member.size) throw new Error("package_visible_member_changed");
+  if (memberIndex + 1 < manifest.members.length) return { entry: null, pending: true };
+  const logicalPath = `${selected.root.slice(zone.length + 1)}/INDEX.md`;
+  const content = `# ${ref.package_id} v${ref.version}\n\n${manifest.members.map((member) => `- [[${selected.root}/${member.relative_path}]]`).join("\n")}\n`;
+  const contentHash = await sha256Text(content);
+  const visiblePath = `${source.base_path}/${selected.root}/INDEX.md`;
+  const before = await bounded.objects.getMetadata(visiblePath);
+  if (!before || before.size > MAX_VISIBLE_SOURCE_BYTES || !bounded.objects.readBytes) throw new Error("package_index_visible_unavailable");
+  const visible = await bounded.objects.readBytes(visiblePath, Math.max(1, before.size));
+  const after = await bounded.objects.getMetadata(visiblePath);
+  if (!visible || visible.byteLength !== before.size || after?.objectId !== before.objectId || after?.revisionToken !== before.revisionToken || await sha256Bytes(visible) !== contentHash) throw new Error("package_index_visible_changed");
+  return { entry: navigationInventoryEntrySchema.parse({
+    project_id: projectId,
+    zone,
+    resource_id: `package:${ref.package_id}`,
+    version: packageResourceVersion(ref),
+    logical_path: logicalPath,
+    path: visiblePath,
+    expected: { object_id: before.objectId, revision_token: before.revisionToken, content_sha256: contentHash, size: before.size }
+  }) };
+}
+
+function budgetedRuntime(runtime: ProjectOsPersistenceRuntime, budget: SliceBudget): ProjectOsPersistenceRuntime {
+  const wrap = <T extends object>(target: T): T => new Proxy(target, {
+    get(value, property, receiver) {
+      const member = Reflect.get(value, property, receiver) as unknown;
+      if (typeof member !== "function") return member;
+      return (...args: unknown[]) => { charge(budget); return member.apply(value, args); };
+    }
+  });
+  return {
+    ...runtime,
+    objects: wrap(runtime.objects),
+    ...(runtime.pagedListing ? { pagedListing: wrap(runtime.pagedListing) } : {})
+  };
+}
+
+function classifyPackageGap(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("unfinalized") || message.includes("unproven") ? "finalized_package_evidence_unavailable"
+    : message.includes("binding") ? "finalized_package_binding_invalid"
+      : message.includes("oversize") || message.includes("unreadable") ? "finalized_package_source_out_of_bounds"
+        : "finalized_package_source_unavailable";
+}
+
+function artifactNavigationTarget(projectId: string, path: string): { kind: "zone"; zone: NavigationZone; logical_path: string } | { kind: "outside" } | { kind: "invalid" } {
+  const match = /^\/PROJECT_OS\/WORKSPACE\/PROJECTS\/(PRJ-[0-9]{4,})-([A-Za-z0-9][A-Za-z0-9_-]*)\/(WORKING|REVIEW|DELIVERABLES)\/(.+)$/.exec(path);
+  if (!match) {
+    const projectPrefix = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-`;
+    return path.startsWith(projectPrefix) ? { kind: "outside" } : { kind: "invalid" };
+  }
+  if (match[1] !== projectId) return { kind: "invalid" };
+  try {
+    return { kind: "zone", zone: match[3] as NavigationZone, logical_path: match[4] };
+  } catch { return { kind: "invalid" }; }
+}
+
+async function resolveArtifactEntry(
+  runtime: ProjectOsPersistenceRuntime,
+  projectId: string,
+  zone: NavigationZone,
+  intent: NonNullable<Awaited<ReturnType<MutationGateRepository["readArtifactIntent"]>>>,
+  logicalPath: string,
+  budget: SliceBudget
+): Promise<NavigationInventoryEntry | null> {
+  const bounded = budgetedRuntime(runtime, budget);
+  const before = await bounded.objects.getMetadata(intent.destination_path);
+  if (!before || before.size > MAX_VISIBLE_SOURCE_BYTES || !bounded.objects.readBytes) return null;
+  const bytes = await bounded.objects.readBytes(intent.destination_path, Math.max(1, before.size));
+  const after = await bounded.objects.getMetadata(intent.destination_path);
+  if (!bytes || bytes.byteLength !== before.size || after?.objectId !== before.objectId || after?.revisionToken !== before.revisionToken || await sha256Bytes(bytes) !== intent.expected_content_sha256) return null;
+  return navigationInventoryEntrySchema.parse({
+    project_id: projectId,
+    zone,
+    resource_id: `artifact:${await sha256Text(intent.destination_path)}`,
+    version: `${intent.request_id}:${intent.expected_content_sha256}`,
+    logical_path: logicalPath,
+    path: intent.destination_path,
+    expected: { object_id: before.objectId, revision_token: before.revisionToken, content_sha256: intent.expected_content_sha256, size: before.size }
+  });
+}
+
+function classifyArtifactGap(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("destination_binding") || message.includes("destination_binding_") ? "artifact_destination_binding_invalid"
+    : message.includes("binding") ? "committed_artifact_binding_invalid"
+      : message.includes("receipt") || message.includes("intent") ? "committed_artifact_receipt_unavailable"
+        : message.includes("out_of_bounds") ? "committed_artifact_source_out_of_bounds"
+          : "committed_artifact_source_unavailable";
+}
+
+function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
 async function sha256Bytes(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);

@@ -7,6 +7,14 @@ import { sha256Text } from "../src/documents/hash";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, workspaceProjectRoot } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
+import { DocumentLedgerRepository } from "../src/documents/repository";
+import { ManagedDocumentService } from "../src/documents/service";
+import { emptyProjectState } from "../src/domain/transitions";
+import { canonicalJson } from "../src/rules/contract";
+import { packageRuntime } from "./helpers/package-runtime";
+import { machineArtifactReceiptPath } from "../src/persistence/layout";
+import { mutationIntentIdFor } from "../src/domain/mutation-gate";
+import { MutationGateRepository } from "../src/mutation-gate/repository";
 
 const projectId = "PRJ-0002";
 const documentId = "DOC-0123456789ABCDEF01234567";
@@ -85,6 +93,22 @@ function harness() {
   return { runtime, files, pageLimits, pagePaths, missingOnRead, readErrors, put, sources, inventory: new ZoneNavigationInventory(runtime, sources) };
 }
 
+async function seedCommittedArtifact(h: ReturnType<typeof harness>, requestId: string, destinationPath: string, content: string, recordedAt = "2026-09-25T00:00:00Z") {
+  const contentHash = await sha256Text(content);
+  const request = { request_id: requestId, project_id: projectId, relative_path: "report.md", content, content_sha256: contentHash, mode: "create" as const };
+  const requestJson = JSON.stringify(request);
+  const intent = {
+    schema_version: "1.0" as const, intent_id: await mutationIntentIdFor(projectId, requestId), project_id: projectId,
+    kind: "artifact" as const, request_id: requestId, request_sha256: await sha256Text(requestJson), request_json: requestJson,
+    base_project_revision: 0, destination_path: destinationPath, provider_precondition: { kind: "absent" as const, provider_id: "test" },
+    expected_content_sha256: contentHash, mode: "create" as const, recorded_at: recordedAt
+  };
+  await new MutationGateRepository(h.runtime, "provider_v2").ensureArtifactIntent(intent);
+  h.put(destinationPath, content, "id:artifact");
+  h.put(machineArtifactReceiptPath(requestId), JSON.stringify({ request_id: requestId, project_id: projectId, relative_path: "report.md", content_sha256: contentHash, status: "committed" }));
+  return intent;
+}
+
 async function addWorkingHead(h: ReturnType<typeof harness>, content: string, revision = "rev-visible", id = documentId, version = versionId, logicalPath = "draft.md") {
   const sha = await sha256Text(content);
   const path = `${workspaceProjectRoot(projectId, slug)}/WORKING/${logicalPath}`;
@@ -118,11 +142,7 @@ describe("ZoneNavigationInventory", () => {
     expect(h.pageLimits.every((limit) => limit === 1)).toBe(true);
     expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(1);
     expect(page.snapshot_id).toBe("source:0");
-    expect(page.next_cursor).toBeNull();
-    expect(page.gaps).toEqual(expect.arrayContaining([
-      { resource_id: "packages", code: "finalized_package_inventory_unavailable" },
-      { resource_id: "artifacts", code: "committed_artifact_inventory_unavailable" }
-    ]));
+    expect(page.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
     expect(page.entries).toHaveLength(1);
     expect(page.entries[0]).toMatchObject<Partial<NavigationInventoryEntry>>({
       project_id: projectId, zone: "WORKING", resource_id: `head:${documentId}`, version: versionId,
@@ -145,10 +165,98 @@ describe("ZoneNavigationInventory", () => {
     expect(first.entries).toHaveLength(1);
     expect(first.next_cursor).not.toBeNull();
     expect(second.entries).toHaveLength(1);
-    expect(second.next_cursor).toBeNull();
+    expect(second.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
     expect(h.pageLimits.every((limit) => limit === 1)).toBe(true);
     expect(h.pagePaths.filter((path) => path === `${machineDocumentRoot(projectId)}/heads`)).toHaveLength(2);
     expect(new Set([...first.entries, ...second.entries].map((entry) => entry.resource_id)).size).toBe(2);
+  });
+
+  it("includes only a finalized current package index as a bounded canonical source", async () => {
+    const store = packageRuntime();
+    const runtime = store.runtime;
+    const repository = new DocumentLedgerRepository(runtime);
+    const state = emptyProjectState("PRJ-9300", "Packages", "packages");
+    const body = "package member";
+    const content_sha256 = await sha256Text(body);
+    const document_id = `DOC-${"1".repeat(24)}`;
+    const document_version_id = `VER-REQ-${"1".repeat(24)}`;
+    const immutable_payload_path = await repository.storeTextPayload(state.project_id, content_sha256, body);
+    await repository.writeVersion({ schema_version: "1.0", project_id: state.project_id, document_id, version_id: document_version_id, kind: "work_product", stage: "working", logical_path: "member.md", source: "project_os", created_at: "2026-09-12T12:00:00Z", immutable_payload_path, content_sha256, size: body.length });
+    const body2 = "second package member";
+    const content_sha256_2 = await sha256Text(body2);
+    const document_id_2 = `DOC-${"2".repeat(24)}`;
+    const document_version_id_2 = `VER-REQ-${"2".repeat(24)}`;
+    const immutable_payload_path_2 = await repository.storeTextPayload(state.project_id, content_sha256_2, body2);
+    await repository.writeVersion({ schema_version: "1.0", project_id: state.project_id, document_id: document_id_2, version_id: document_version_id_2, kind: "work_product", stage: "working", logical_path: "second.md", source: "project_os", created_at: "2026-09-12T12:00:00Z", immutable_payload_path: immutable_payload_path_2, content_sha256: content_sha256_2, size: body2.length });
+    const manifest = { schema_version: "1.0", project_id: state.project_id, creation_request_id: "DOCREQ-PACKAGE-0001", version: 1, members: [
+      { relative_path: "member.md", document_id, document_version_id, immutable_payload_path, content_sha256, size: body.length },
+      { relative_path: "second.md", document_id: document_id_2, document_version_id: document_version_id_2, immutable_payload_path: immutable_payload_path_2, content_sha256: content_sha256_2, size: body2.length }
+    ], links: [], source_refs: ["accepted:package"], created_by: "operator", created_at: "2026-09-12T12:00:00Z" };
+    const ref = await repository.freezePackage(manifest);
+    const request = { operation: "package.replace" as const, request_id: "DOCREQ-REPLACE-0001", project_id: state.project_id, candidate: ref, zone: "WORKING" as const, expected_navigation_generation: 0, expected_project_revision: 0, created_at: "2026-09-12T12:00:00Z" };
+    const admission = { project_id: state.project_id, operation: "package.replace", kind: "document", request_id: request.request_id, request_hash: await sha256Text(canonicalJson(request)), actor: { actor_id: "operator", authority: "ingress" }, resources: [{ resource_id: ref.package_id, resource_type: "package", zone: "WORKING", version: `${ref.version}:${ref.manifest_sha256}` }], global_revision: 0, project_revision: 0, ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 }, verdict: "allow", results: [], gaps: [], deferred_rules: [] };
+    const result = await new ManagedDocumentService(runtime).replacePackage(request, state, admission as never);
+    expect(result.status).toBe("finalized");
+    runtime.pagedListing = { listPage: async ({ path, cursor, limit }) => {
+      const matching = [...store.files.keys()].filter((key) => key.startsWith(`${path}/`) && !key.slice(path.length + 1).includes("/" )).sort();
+      const start = cursor ? Math.max(0, matching.findIndex((key) => key > cursor)) : 0;
+      const page = matching.slice(start, start + limit);
+      return { entries: page.map((key) => ({ kind: "file" as const, name: key.slice(path.length + 1), path: key })), cursor: start + page.length < matching.length ? page.at(-1) ?? null : null };
+    } };
+    runtime.objects.listChildren = async () => { throw new Error("unbounded listChildren forbidden"); };
+    const sources = new ZoneNavigationSources(runtime);
+    const inventory = new ZoneNavigationInventory(runtime, sources);
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor, limit: 8, budget: budget() });
+      pages.push(page);
+      cursor = page.next_cursor;
+    } while (cursor !== null);
+
+    const entries = pages.flatMap((page) => page.entries);
+    expect(pages).toHaveLength(4);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ resource_id: `package:${ref.package_id}`, logical_path: `PACKAGES/${ref.package_id}/1/INDEX.md`, version: `1:${ref.manifest_sha256}` });
+    expect(pages.flatMap((page) => page.gaps)).not.toContainEqual(expect.objectContaining({ resource_id: "packages" }));
+  });
+
+  it("includes a committed artifact only from its exact current destination and receipt", async () => {
+    const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/report.md`;
+    await seedCommittedArtifact(h, "ART-NAVIGATION-001", destination, "approved artifact");
+
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, budget: budget() });
+      pages.push(page);
+      cursor = page.next_cursor;
+    } while (cursor !== null);
+
+    const entries = pages.flatMap((page) => page.entries);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ resource_id: `artifact:${await sha256Text(destination)}`, version: `ART-NAVIGATION-001:${await sha256Text("approved artifact")}`, logical_path: "report.md", path: destination });
+  });
+
+  it("does not choose by timestamp when multiple committed receipts prove identical destination bytes", async () => {
+    const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/report.md`;
+    await seedCommittedArtifact(h, "ART-NAVIGATION-001", destination, "same bytes", "2026-09-25T00:00:00Z");
+    await seedCommittedArtifact(h, "ART-NAVIGATION-002", destination, "same bytes", "2026-09-26T00:00:00Z");
+
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, budget: budget() });
+      pages.push(page);
+      cursor = page.next_cursor;
+    } while (cursor !== null);
+
+    expect(pages.flatMap((page) => page.entries)).toEqual([]);
+    expect(pages.flatMap((page) => page.gaps)).toContainEqual(expect.objectContaining({
+      resource_id: `artifact:${await sha256Text(destination)}`, code: "artifact_destination_ambiguous"
+    }));
   });
 
   it("refuses a stale entry when its active canonical pointer changes", async () => {
@@ -206,15 +314,21 @@ describe("ZoneNavigationInventory", () => {
     expect(await h.inventory.verifySnapshot({ project_id: projectId, zone: "WORKING", snapshot_id: "source:1", budget: budget() })).toBe(true);
   });
 
-  it("keeps visible gaps for canonical source families without a verifiable resolver", async () => {
+  it("keeps generic ARTIFACTS destinations outside the three navigation zones", async () => {
     const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/ARTIFACTS/report.md`;
+    await seedCommittedArtifact(h, "ART-NAVIGATION-OUTSIDE-001", destination, "out of zone artifact");
 
-    const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor: null, limit: 8, budget: budget() });
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, budget: budget() });
+      pages.push(page);
+      cursor = page.next_cursor;
+    } while (cursor !== null);
 
-    expect(page.gaps).toEqual(expect.arrayContaining([
-      { resource_id: "packages", code: expect.any(String) },
-      { resource_id: "artifacts", code: expect.any(String) }
-    ]));
+    expect(pages.flatMap((page) => page.entries)).toEqual([]);
+    expect(pages.flatMap((page) => page.gaps)).toContainEqual(expect.objectContaining({ code: "artifact_destination_outside_navigation_zones" }));
   });
 
   it.each([

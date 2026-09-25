@@ -20,7 +20,7 @@ const stateSchema = z.strictObject({
   state_revision: z.number().int().nonnegative().safe(),
   zones: z.record(z.enum(zones), zoneStateSchema)
 });
-const catalogSchema = z.strictObject({ schema_version: z.literal("1.0"), entry: z.unknown() });
+const catalogSchema = z.strictObject({ schema_version: z.literal("1.0"), resource_id: z.string().optional(), entry: z.unknown() });
 const dirtySchema = z.strictObject({
   schema_version: z.literal("1.0"),
   resource_id: z.string(),
@@ -128,22 +128,26 @@ export class ZoneNavigationSources {
     const raw = await this.runtime.objects.readText(path);
     if (raw === null) return null;
     const record = catalogSchema.parse(JSON.parse(raw));
-    if (record.entry === null) return null;
+    if (record.resource_id !== undefined && record.resource_id !== resourceId) throw new Error("navigation_catalog_binding");
+    if (record.entry === null) {
+      if (record.resource_id !== resourceId) throw new Error("navigation_catalog_binding");
+      return null;
+    }
     const entry = navigationInventoryEntrySchema.parse(record.entry);
     if (entry.project_id !== projectId || entry.zone !== zone || entry.resource_id !== resourceId) throw new Error("navigation_catalog_binding");
     return entry;
   }
 
-  async writeCatalogEntry(entry: NavigationInventoryEntry | null, projectId: string, zone: NavigationZone, resourceId: string, budget?: SliceBudget): Promise<void> {
+  async writeCatalogEntry(entry: NavigationInventoryEntry | null, projectId: string, zone: NavigationZone, resourceId: string, budget?: SliceBudget, expectedGeneration?: number): Promise<void> {
     const path = await resourcePath(zoneNavigationCatalogRoot(projectId, zone), resourceId);
     if (entry && (entry.project_id !== projectId || entry.zone !== zone || entry.resource_id !== resourceId)) throw new Error("navigation_catalog_binding");
-    if (entry === null) {
-      charge(budget);
-      await this.runtime.objects.delete(path);
-      return;
+    const content = JSON.stringify({ schema_version: "1.0", resource_id: resourceId, entry });
+    const token = await this.readWriteToken(path, budget);
+    if (expectedGeneration !== undefined) {
+      const state = await this.readState(projectId, zone, budget);
+      if (state.generation !== expectedGeneration || state.in_flight_resource_ids.includes(resourceId)) throw new Error("navigation_catalog_snapshot_stale");
     }
-    charge(budget);
-    await this.runtime.objects.upsertText(path, JSON.stringify({ schema_version: "1.0", entry }));
+    await this.writeAtToken(path, content, token, budget);
   }
 
   async finishDirty(projectId: string, zone: NavigationZone, resourceId: string, exactEntryOrNull: NavigationInventoryEntry | null, budget?: SliceBudget): Promise<boolean> {
@@ -152,6 +156,7 @@ export class ZoneNavigationSources {
 
   private async finishDirtyUnlocked(projectId: string, zone: NavigationZone, resourceId: string, exactEntryOrNull: NavigationInventoryEntry | null, budget?: SliceBudget): Promise<boolean> {
     const markerPath = await resourcePath(zoneNavigationDirtyRoot(projectId, zone), resourceId);
+    const markerToken = await this.readWriteToken(markerPath, budget);
     charge(budget);
     const raw = await this.runtime.objects.readText(markerPath);
     if (raw === null) return true;
@@ -161,9 +166,11 @@ export class ZoneNavigationSources {
     if (state.in_flight_resource_ids.includes(resourceId)) return false;
     const current = await this.readCatalogEntry(projectId, zone, resourceId, budget);
     if (canonicalJson(current) !== canonicalJson(exactEntryOrNull)) return false;
+    const metadata = await this.runtime.objects.getMetadata(markerPath);
     charge(budget);
-    await this.runtime.objects.delete(markerPath);
-    return true;
+    if (!metadata?.objectId || !metadata.revisionToken || !this.runtime.objects.deleteIfUnchanged) return false;
+    if (markerToken !== metadata.revisionToken) return false;
+    return (await this.runtime.objects.deleteIfUnchanged(markerPath, { objectId: metadata.objectId, revisionToken: metadata.revisionToken })) !== "changed";
   }
 
   async verifySnapshot(projectId: string, zone: NavigationZone, snapshotId: string, budget?: SliceBudget): Promise<boolean> {
@@ -224,13 +231,24 @@ export class ZoneNavigationSources {
     for (const { zone, generation } of tickets) {
       if (!(before.zones[zone] ?? DEFAULT_ZONE_STATE).in_flight_writes.some((write) => write.resource_id === resourceId && write.generation === generation)) throw new Error("navigation_source_ticket_stale");
     }
+    // Capture per-resource CAS tokens before the final ticket validation. If a
+    // second runtime completes a newer write after validation, its record
+    // revision makes these conditional writes fail instead of being clobbered.
+    const mutations = [] as { zone: NavigationZone; generation: number; catalogPath: string; dirtyPath: string; catalogToken: string | null; dirtyToken: string | null }[];
     for (const { zone, generation } of tickets) {
+      const catalogPath = await resourcePath(zoneNavigationCatalogRoot(projectId, zone), resourceId);
+      const dirtyPath = await resourcePath(zoneNavigationDirtyRoot(projectId, zone), resourceId);
+      mutations.push({ zone, generation, catalogPath, dirtyPath, catalogToken: await this.readWriteToken(catalogPath, budget), dirtyToken: await this.readWriteToken(dirtyPath, budget) });
+    }
+    const beforeWrites = await this.readProjectState(projectId, budget);
+    for (const { zone, generation } of tickets) {
+      if (!(beforeWrites.zones[zone] ?? DEFAULT_ZONE_STATE).in_flight_writes.some((write) => write.resource_id === resourceId && write.generation === generation)) throw new Error("navigation_source_ticket_stale");
+    }
+    for (const { zone, generation, catalogPath, dirtyPath, catalogToken, dirtyToken } of mutations) {
       const observedEntry = observedEntries.get(zone);
       if (observedEntries.has(zone) && observedEntry && (observedEntry.project_id !== projectId || observedEntry.zone !== zone || observedEntry.resource_id !== resourceId)) throw new Error("navigation_catalog_binding");
-      if (observedEntries.has(zone)) await this.writeCatalogEntry(observedEntry ?? null, projectId, zone, resourceId, budget);
-      const markerPath = await resourcePath(zoneNavigationDirtyRoot(projectId, zone), resourceId);
-      charge(budget);
-      await this.runtime.objects.upsertText(markerPath, JSON.stringify({ schema_version: "1.0", resource_id: resourceId, generation, entry_hash: observedEntry ? await entryHash(observedEntry) : null }));
+      if (observedEntries.has(zone)) await this.writeAtToken(catalogPath, JSON.stringify({ schema_version: "1.0", resource_id: resourceId, entry: observedEntry ?? null }), catalogToken, budget);
+      await this.writeAtToken(dirtyPath, JSON.stringify({ schema_version: "1.0", resource_id: resourceId, generation, entry_hash: observedEntry ? await entryHash(observedEntry) : null }), dirtyToken, budget);
     }
     const state = await this.readProjectState(projectId, budget);
     for (const { zone } of tickets) {
@@ -257,6 +275,23 @@ export class ZoneNavigationSources {
       release();
       if (projectQueues.get(key) === turn) projectQueues.delete(key);
     }
+  }
+
+  private async readWriteToken(path: string, budget?: SliceBudget): Promise<string | null> {
+    charge(budget);
+    const metadata = await this.runtime.objects.getMetadata(path);
+    if (metadata && !metadata.revisionToken) throw new Error("navigation_record_revision_missing");
+    return metadata?.revisionToken ?? null;
+  }
+
+  private async writeAtToken(path: string, content: string, token: string | null, budget?: SliceBudget): Promise<void> {
+    charge(budget);
+    if (token === null) {
+      await this.runtime.objects.createText(path, content);
+      return;
+    }
+    if (!this.runtime.conditionalWrite) throw new Error("navigation_conditional_write_unavailable");
+    await this.runtime.conditionalWrite.writeTextConditional(path, content, token);
   }
 
   private async readProjectState(projectId: string, budget?: SliceBudget): Promise<StoredProjectState> {

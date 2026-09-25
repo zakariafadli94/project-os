@@ -5,22 +5,40 @@ import type { NavigationInventoryEntry } from "../src/domain/zone-navigation";
 
 function harness() {
   const files = new Map<string, string>();
+  const revisions = new Map<string, number>();
   let nextCatalogGate: { entered(): void; enteredPromise: Promise<void>; wait: Promise<void>; release(): void } | null = null;
   const runtime: ProjectOsPersistenceRuntime = {
     providerId: "test",
     objects: {
       readText: async (path) => files.get(path) ?? null,
-      createText: async (path, content) => { if (files.has(path)) throw new Error("exists"); files.set(path, content); },
-      upsertText: async (path, content) => {
-        if (path.includes("/catalog/") && nextCatalogGate) {
-          const gate = nextCatalogGate; nextCatalogGate = null; gate.entered(); await gate.wait;
-        }
+      createText: async (path, content) => {
+        if (files.has(path)) throw new Error("exists");
         files.set(path, content);
+        revisions.set(path, (revisions.get(path) ?? 0) + 1);
       },
-      getMetadata: async (path) => files.has(path) ? { path, objectId: path, revisionToken: "1", size: files.get(path)!.length } : null,
-      listChildren: async () => [], move: async () => {}, delete: async (path) => { files.delete(path); }
+      upsertText: async (path, content) => {
+        files.set(path, content);
+        revisions.set(path, (revisions.get(path) ?? 0) + 1);
+      },
+      getMetadata: async (path) => files.has(path) ? { path, objectId: path, revisionToken: String(revisions.get(path)), size: files.get(path)!.length } : null,
+      listChildren: async () => [], move: async () => {}, delete: async (path) => { files.delete(path); },
+      deleteIfUnchanged: async (path, expected) => {
+        if (!files.has(path)) return "missing";
+        if (path !== expected.objectId || String(revisions.get(path)) !== expected.revisionToken) return "changed";
+        files.delete(path);
+        revisions.delete(path);
+        return "deleted";
+      }
     },
-    conditionalWrite: { writeTextConditional: async (path, content) => { files.set(path, content); return { path, objectId: path, revisionToken: "2", size: content.length }; } },
+    conditionalWrite: { writeTextConditional: async (path, content, token) => {
+      if (path.includes("/catalog/") && nextCatalogGate) {
+        const gate = nextCatalogGate; nextCatalogGate = null; gate.entered(); await gate.wait;
+      }
+      if (!files.has(path) || String(revisions.get(path)) !== token) throw new Error("precondition_failed");
+      files.set(path, content);
+      revisions.set(path, (revisions.get(path) ?? 0) + 1);
+      return { path, objectId: path, revisionToken: String(revisions.get(path)), size: content.length };
+    } },
     serverSideCopy: { copyObject: async () => ({ path: "", objectId: "", revisionToken: "", size: 0 }) },
     changeFeed: { listChanges: async () => ({ entries: [], cursor: "" }) },
     pagedListing: { listPage: async ({ path, cursor, limit }) => {
@@ -33,6 +51,10 @@ function harness() {
   };
   return {
     runtime, files, sources: new ZoneNavigationSources(runtime),
+    forkRuntime() {
+      const fork = { ...runtime, objects: { ...runtime.objects } };
+      return { runtime: fork as ProjectOsPersistenceRuntime, sources: new ZoneNavigationSources(fork as ProjectOsPersistenceRuntime) };
+    },
     pauseNextCatalogWrite() {
       let enter!: () => void, release!: () => void;
       const enteredPromise = new Promise<void>((resolve) => { enter = resolve; });
@@ -43,7 +65,7 @@ function harness() {
   };
 }
 
-function budget(calls = 32) {
+function budget(calls = 256) {
   return { deadline_ms: 1000, calls_left: calls, now: () => 0, signal: new AbortController().signal, beforeHttp() { this.calls_left--; if (this.calls_left < 0) throw new Error("budget"); }, canStartEffect: () => true };
 }
 
@@ -114,6 +136,7 @@ describe("ZoneNavigationSources", () => {
     await sources.finishAdoption("PRJ-0002", "WORKING", "NAVADOPT", 0, b);
     const oldEntry = entry();
     const newEntry = { ...oldEntry, version: "VER-1123456789ABCDEF01234567", expected: { ...oldEntry.expected, revision_token: "rev-new", content_sha256: "b".repeat(64) } };
+    await sources.writeCatalogEntry(oldEntry, "PRJ-0002", "WORKING", oldEntry.resource_id, b);
     const oldTicket = await sources.beginHeadWrite("PRJ-0002", "WORKING", oldEntry.resource_id, b);
     const gate = pauseNextCatalogWrite();
     const oldCompletion = sources.completeHeadWrite(oldTicket, oldEntry, b);
@@ -127,5 +150,26 @@ describe("ZoneNavigationSources", () => {
     const newTicket = await newBegin;
     await sources.completeHeadWrite(newTicket, newEntry, b);
     expect(await sources.readCatalogEntry("PRJ-0002", "WORKING", oldEntry.resource_id, b)).toEqual(newEntry);
+  });
+
+  it("uses durable record CAS across distinct runtime wrappers sharing one provider store", async () => {
+    const { sources, forkRuntime, pauseNextCatalogWrite } = harness();
+    const b = budget();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "NAVADOPT", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "NAVADOPT", 0, b);
+    const oldEntry = entry();
+    const newEntry = { ...oldEntry, version: "VER-1123456789ABCDEF01234567", expected: { ...oldEntry.expected, revision_token: "rev-new", content_sha256: "b".repeat(64) } };
+    await sources.writeCatalogEntry(oldEntry, "PRJ-0002", "WORKING", oldEntry.resource_id, b);
+    const ticket = await sources.beginHeadWrite("PRJ-0002", "WORKING", oldEntry.resource_id, b);
+    const gate = pauseNextCatalogWrite();
+    const staleRuntimeCompletion = sources.completeHeadWrite(ticket, oldEntry, b);
+    await gate.entered;
+    const newerRuntime = forkRuntime();
+    await newerRuntime.sources.completeHeadWrite(ticket, newEntry, budget());
+    gate.release();
+
+    await expect(staleRuntimeCompletion).rejects.toThrow("precondition_failed");
+    expect(await newerRuntime.sources.readCatalogEntry("PRJ-0002", "WORKING", oldEntry.resource_id, budget())).toEqual(newEntry);
+    expect(await newerRuntime.sources.readState("PRJ-0002", "WORKING", budget())).toMatchObject({ generation: 1, in_flight_resource_ids: [] });
   });
 });

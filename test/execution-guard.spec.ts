@@ -24,6 +24,7 @@ import { ProjectRepository } from "../src/persistence/repository";
 import { ExecutionJournal } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
+import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
 import { ProviderConflictError, ProviderOperationError } from "../src/persistence/provider/errors";
 
 const testEnv = env as unknown as Env;
@@ -130,6 +131,61 @@ function taskCompletionBaseline(projectId: string): CanonicalCommitRecord {
 }
 
 describe("canonical execution boundary in ProjectGuard", () => {
+  it("resumes the exact observed source ticket after interruption before completion", async () => {
+    const projectId = "PRJ-8330";
+    const { guard } = await setup(projectId);
+    const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
+    await sources.beginAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-8330", 0);
+    await sources.finishAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-8330", 0);
+    const resourceId = "package:PKG-INTERRUPTED-SOURCE-0001";
+    const complete = (ZoneNavigationSources.prototype as any).completeHeadWrites as (...args: any[]) => Promise<void>;
+    let interrupt = true;
+    vi.spyOn(ZoneNavigationSources.prototype as any, "completeHeadWrites").mockImplementation(async function (this: ZoneNavigationSources, ...args: any[]) {
+      if (interrupt) { interrupt = false; throw new Error("injected before source completion"); }
+      return complete.apply(this, args);
+    });
+    const record = () => runInDurableObject(guard, (instance) =>
+      (instance as any).recordObservedNavigationSourceMutation(projectId, "WORKING", resourceId)
+    );
+
+    await expect(record()).rejects.toThrow("injected before source completion");
+    expect((await sources.readState(projectId, "WORKING")).in_flight_resource_ids).toContain(resourceId);
+    expect(await sources.hasDirtyMarker(projectId, "WORKING", resourceId)).toBe(false);
+    await record();
+
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, in_flight_resource_ids: [] });
+    expect(await sources.hasDirtyMarker(projectId, "WORKING", resourceId)).toBe(true);
+  });
+
+  it("resumes marker-written source tickets without certifying an in-flight source", async () => {
+    const projectId = "PRJ-8331";
+    const { guard } = await setup(projectId);
+    const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
+    await sources.beginAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-8331", 0);
+    await sources.finishAdoption(projectId, "WORKING", "DOCREQ-NAVIGATION-WORKING-8331", 0);
+    const resourceId = "artifact:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const writeState = (ZoneNavigationSources.prototype as any).writeProjectState as (...args: any[]) => Promise<void>;
+    let stateWrites = 0;
+    vi.spyOn(ZoneNavigationSources.prototype as any, "writeProjectState").mockImplementation(async function (this: ZoneNavigationSources, ...args: any[]) {
+      stateWrites += 1;
+      if (stateWrites === 2) throw new Error("injected after dirty marker before fence clear");
+      return writeState.apply(this, args);
+    });
+    const record = () => runInDurableObject(guard, (instance) =>
+      (instance as any).recordObservedNavigationSourceMutation(projectId, "WORKING", resourceId)
+    );
+
+    await expect(record()).rejects.toThrow("injected after dirty marker before fence clear");
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, in_flight_resource_ids: [resourceId] });
+    expect(await sources.hasDirtyMarker(projectId, "WORKING", resourceId)).toBe(true);
+    expect(await sources.verifySnapshot(projectId, "WORKING", "source:1")).toBe(false);
+    await record();
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, in_flight_resource_ids: [] });
+
+    await record();
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, in_flight_resource_ids: [] });
+  });
+
   it("does not call an admitted transaction committed before its canonical record exists", async () => {
     const projectId = "PRJ-8391";
     const { guard } = await setup(projectId);

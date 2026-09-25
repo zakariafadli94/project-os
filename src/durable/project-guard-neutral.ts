@@ -1441,8 +1441,12 @@ export class ProjectGuard extends DurableObject<Env> {
     const sources = new ZoneNavigationSources(this.persistence);
     const source = await sources.readState(projectId, zone);
     if (!source.adopted && !source.adoption_request_id) return;
-    if (source.in_flight_resource_ids.includes(resourceId)) return;
-    if (await sources.hasDirtyMarker(projectId, zone, resourceId)) return;
+    const hasInFlightTicket = source.in_flight_resource_ids.includes(resourceId);
+    // A marker with no flight is already a durable invalidation. If the ticket
+    // remains in flight, however, its completion may have been interrupted
+    // after beginHeadWrite or after writing the marker; replay that exact
+    // ticket instead of allowing an orphaned fence to block this zone forever.
+    if (!hasInFlightTicket && await sources.hasDirtyMarker(projectId, zone, resourceId)) return;
     const ticket = await sources.beginHeadWrite(projectId, zone, resourceId, undefined, null);
     if (ticket) await sources.completeHeadWrites([ticket]);
   }

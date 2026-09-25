@@ -1154,7 +1154,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     // The persisted cursor below proves this invocation consumed exactly one
     // candidate. A prototype-wide spy can also see unrelated guard alarms.
     expect(commitReads).toHaveBeenCalledWith(projectId, 9101);
-    await runInDurableObject(guard, async (_instance, state) => {
+    const preinstalledAlarmAt = await runInDurableObject(guard, async (_instance, state) => {
       const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
       expect(work?.candidates.map(({ revision }) => revision)).toEqual([9102, 9103, 9104, 9105]);
       expect(await state.storage.getAlarm()).not.toBeNull();
@@ -1173,6 +1173,11 @@ describe("canonical execution boundary in ProjectGuard", () => {
           completed_at: completed.completed_at, source_event_id: completed.source_event_id
         }]
       });
+      // The previous phase advanced fake Date past its alarm. Keep that alarm
+      // from racing this explicitly invoked provider-budget slice.
+      const alarmAt = Date.now() + 60_000;
+      await state.storage.setAlarm(alarmAt);
+      return alarmAt;
     });
 
     sliceBudget.mockRestore();
@@ -1193,7 +1198,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-        }));
+        }), false);
         return { providerBudgetResponse, scopedProviderCalls };
       } finally {
         sliceSpy.mockRestore();
@@ -1207,7 +1212,9 @@ describe("canonical execution boundary in ProjectGuard", () => {
     await runInDurableObject(guard, async (_instance, state) => {
       const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
       expect(work?.candidates.map(({ revision }) => revision)).toEqual([9201]);
-      expect(await state.storage.getAlarm()).not.toBeNull();
+      // Budget exhaustion must re-arm a near wake, not merely leave the
+      // preinstalled distant alarm in place.
+      expect(await state.storage.getAlarm()).toBeLessThan(preinstalledAlarmAt);
       expect(state.storage.sql.exec(
         "SELECT count FROM request_recovery_failures WHERE kind = 'materialization' AND request_id = ?",
         `1:${CURRENT_PROJECTION_VERSION}`

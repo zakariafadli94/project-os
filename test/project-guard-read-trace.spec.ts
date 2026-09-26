@@ -575,8 +575,8 @@ it("returns a canonical committed receipt on cache miss while unrelated project 
 });
 
 it("returns an exactly bound terminal navigation conflict on a busy cold cache", async () => {
-  const projectId = "PRJ-8415";
-  const requestId = "DOCREQ-NAV-CONFLICT-CACHE-MISS-8411";
+  const projectId = "PRJ-8416";
+  const requestId = "DOCREQ-NAV-CONFLICT-CACHE-MISS-8416";
   const mock = installDropboxMock();
   const runtime = createProductionPersistence(env as unknown as Env, projectId);
   const request = {
@@ -607,22 +607,33 @@ it("returns an exactly bound terminal navigation conflict on a busy cold cache",
   await journal.recordReceipt("conflict", receiptPath);
 
   const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
-  await runInDurableObject(guard, (instance) => { (instance as unknown as { queueDepth: number }).queueDepth = 1; });
-  const response = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${requestId}`);
-  const body = await response.json<Record<string, any>>();
-  expect(response.status).toBe(200);
-  expect(body).toMatchObject({ status: "conflict", receipt, execution: { status: "conflict", terminal: true }, observation: { freshness: "verified" } });
-
-  const mismatched = { ...body, execution: { ...body.execution, receipt_ref: `${receiptPath}.other` } };
-  await runInDurableObject(guard, (instance) => {
-    const subject = instance as unknown as { readBoundedRequestStatus: () => Promise<Response> };
-    vi.spyOn(subject, "readBoundedRequestStatus").mockResolvedValue(Response.json(mismatched));
+  const previousQueueDepth = await runInDurableObject(guard, (instance) => {
+    const subject = instance as unknown as { queueDepth: number };
+    const previous = subject.queueDepth;
+    subject.queueDepth = 1;
+    return previous;
   });
-  const uploadsBeforeRejectedLookup = mock.uploadCalls.length;
-  const rejected = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${requestId}`);
-  expect(rejected.status).toBe(503);
-  await expect(rejected.json()).resolves.toMatchObject({ status: "unknown", code: "PROJECT_OS_READ_BUSY" });
-  expect(mock.uploadCalls).toHaveLength(uploadsBeforeRejectedLookup);
+  try {
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${requestId}`);
+    const body = await response.json<Record<string, any>>();
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ status: "conflict", receipt, execution: { status: "conflict", terminal: true }, observation: { freshness: "verified" } });
+
+    const mismatched = { ...body, execution: { ...body.execution, receipt_ref: `${receiptPath}.other` } };
+    await runInDurableObject(guard, (instance) => {
+      const subject = instance as unknown as { readBoundedRequestStatus: () => Promise<Response> };
+      vi.spyOn(subject, "readBoundedRequestStatus").mockResolvedValue(Response.json(mismatched));
+    });
+    const uploadsBeforeRejectedLookup = mock.uploadCalls.length;
+    const rejected = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${requestId}`);
+    expect(rejected.status).toBe(503);
+    await expect(rejected.json()).resolves.toMatchObject({ status: "unknown", code: "PROJECT_OS_READ_BUSY" });
+    expect(mock.uploadCalls).toHaveLength(uploadsBeforeRejectedLookup);
+  } finally {
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { queueDepth: number }).queueDepth = previousQueueDepth;
+    });
+  }
 });
 
 it("returns an identity-bound unknown observation when a busy receipt lookup cannot prove absence", async () => {

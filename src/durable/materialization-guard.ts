@@ -56,10 +56,18 @@ const MATERIALIZATION_COVERAGE_CURSOR_KEY = "materialization-coverage-cursor";
 const CANONICAL_STATE_CURSOR_KEY = "canonical-state-reconstruction-cursor";
 const NAVIGATION_WORK_PREFIX = "navigation-work:";
 const NAVIGATION_RETRY_PREFIX = "navigation-retry:";
+const NAVIGATION_WORK_CURSOR_KEY = "navigation-work-cursor";
+const NAVIGATION_WORK_SCAN_LIMIT = 16;
 
 interface NavigationWorkSlice {
   ref: NavigationWorkRef;
   publish: boolean;
+}
+
+interface NavigationWorkCandidate {
+  key: string;
+  value: string;
+  requestId: string;
 }
 
 interface CanonicalStateCursor {
@@ -89,6 +97,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   private queue: Promise<void> = Promise.resolve();
   private queueDepth = 0;
   private wakeScheduleQueue?: Promise<void>;
+  private selectedNavigationWorkRef?: NavigationWorkRef;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -136,16 +145,17 @@ export class MaterializationGuard extends DurableObject<Env> {
 
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
     let notifying = false;
+    this.selectedNavigationWorkRef = undefined;
     try {
       let navigation: NavigationWorkSlice | null = null;
       try {
         navigation = await this.serialize(() => this.runNavigationWorkSlice());
+        this.selectedNavigationWorkRef = undefined;
       } catch (error) {
         if (error instanceof ProviderOperationError || (error instanceof Error && error.message.includes("slice_budget_exhausted"))) throw error;
-        const stored = await this.serialize(() => this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: 1 }));
-        const item = stored.entries().next().value as [string, string] | undefined;
-        if (!item) throw error;
-        const ref = navigationWorkRefSchema.parse(JSON.parse(item[1]));
+        const ref = this.selectedNavigationWorkRef as NavigationWorkRef | undefined;
+        this.selectedNavigationWorkRef = undefined;
+        if (!ref) throw error;
         const report = navigationWorkFailureSchema.parse({ ...ref, failure_code: "navigation_work_internal_failure" });
         const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
           "https://project-guard.internal/navigation-publish",
@@ -160,12 +170,16 @@ export class MaterializationGuard extends DurableObject<Env> {
             await this.ctx.storage.delete(`navigation-context:${ref.request_id}`);
             await this.ctx.storage.put(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`, canonicalJson({ stopped: true, next_attempt_at: null }));
           });
+          await this.withWakeScheduleLock(async () => {
+            const wakeAt = await this.navigationWorkWakeAt(Date.now());
+            if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
+          });
         } else {
           const retryAt = typeof body.next_attempt_at === "string" ? Date.parse(body.next_attempt_at) : Date.now() + MATERIALIZATION_ALARM_DELAY_MS;
-          await this.serialize(async () => {
+          await this.withWakeScheduleLock(async () => {
             await this.ctx.storage.put(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`, canonicalJson({ stopped: false, next_attempt_at: new Date(retryAt).toISOString() }));
-            const existing = await this.ctx.storage.getAlarm();
-            if (existing === null || existing > retryAt) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, retryAt));
+            const wakeAt = await this.navigationWorkWakeAt(Date.now());
+            if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
           });
         }
       }
@@ -366,19 +380,15 @@ export class MaterializationGuard extends DurableObject<Env> {
   /** One bounded preparation slice. This runs under MG serialization, but the
    * later PG publication callback is deliberately made only after returning. */
   private async runNavigationWorkSlice(): Promise<NavigationWorkSlice | null> {
-    const stored = await this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: 1 });
-    const item = stored.entries().next().value as [string, string] | undefined;
-    if (!item) return null;
-    const requestId = item[0].slice(NAVIGATION_WORK_PREFIX.length);
-    const failureRaw = await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${requestId}`);
-    if (failureRaw !== undefined) {
-      const failure = JSON.parse(failureRaw) as { stopped?: unknown; next_attempt_at?: unknown };
-      if (failure.stopped === true) return null;
-      const retryAt = typeof failure.next_attempt_at === "string" ? Date.parse(failure.next_attempt_at) : Number.NaN;
-      if (Number.isFinite(retryAt) && retryAt > Date.now()) return null;
-      await this.ctx.storage.delete(`${NAVIGATION_RETRY_PREFIX}${requestId}`);
+    const candidate = await this.selectNavigationWorkCandidate(Date.now());
+    if (!candidate) {
+      const wakeAt = await this.navigationWorkWakeAt(Date.now());
+      if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
+      return null;
     }
-    const ref = navigationWorkRefSchema.parse(JSON.parse(item[1]));
+    const requestId = candidate.requestId;
+    const ref = navigationWorkRefSchema.parse(JSON.parse(candidate.value));
+    this.selectedNavigationWorkRef = ref;
     const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
     const runtime = createProductionPersistence(this.env, this.projectId);
     const contextKey = `navigation-context:${ref.request_id}`;
@@ -441,6 +451,65 @@ export class MaterializationGuard extends DurableObject<Env> {
     const inventory = new ZoneNavigationInventory(runtime, sources);
     const result = await new ZoneNavigationEngine(runtime, inventory).reconcile(request, state, admission, budget, { deferPublication: true });
     return { ref, publish: result.status !== "pending" };
+  }
+
+  /** Select at most one bounded page in durable round-robin order. Backoff
+   * entries are skipped, but remain in the queue and keep their exact retry. */
+  private async selectNavigationWorkCandidate(now: number): Promise<NavigationWorkCandidate | null> {
+    const cursor = await this.ctx.storage.get<string>(NAVIGATION_WORK_CURSOR_KEY);
+    const after = await this.ctx.storage.list<string>({
+      prefix: NAVIGATION_WORK_PREFIX,
+      limit: NAVIGATION_WORK_SCAN_LIMIT + 1,
+      ...(cursor ? { startAfter: cursor } : {})
+    });
+    const candidates = [...after.entries()] as [string, string][];
+    const pageHasMore = candidates.length > NAVIGATION_WORK_SCAN_LIMIT;
+    candidates.length = Math.min(candidates.length, NAVIGATION_WORK_SCAN_LIMIT);
+    if (cursor && !pageHasMore && candidates.length < NAVIGATION_WORK_SCAN_LIMIT) {
+      const before = await this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: NAVIGATION_WORK_SCAN_LIMIT + 1 });
+      for (const item of before.entries() as Iterable<[string, string]>) {
+        if (item[0] > cursor || candidates.length >= NAVIGATION_WORK_SCAN_LIMIT) continue;
+        candidates.push(item);
+      }
+    }
+    for (const [key, value] of candidates) {
+      const requestId = key.slice(NAVIGATION_WORK_PREFIX.length);
+      const failureRaw = await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${requestId}`);
+      if (failureRaw !== undefined) {
+        const failure = JSON.parse(failureRaw) as { stopped?: unknown; next_attempt_at?: unknown };
+        if (failure.stopped === true) {
+          await this.ctx.storage.delete(key);
+          await this.ctx.storage.delete(`navigation-context:${requestId}`);
+          continue;
+        }
+        const retryAt = typeof failure.next_attempt_at === "string" ? Date.parse(failure.next_attempt_at) : Number.NaN;
+        if (Number.isFinite(retryAt) && retryAt > now) continue;
+        await this.ctx.storage.delete(`${NAVIGATION_RETRY_PREFIX}${requestId}`);
+      }
+      await this.ctx.storage.put(NAVIGATION_WORK_CURSOR_KEY, key);
+      return { key, value, requestId };
+    }
+    const last = candidates[candidates.length - 1]?.[0];
+    if (last) await this.ctx.storage.put(NAVIGATION_WORK_CURSOR_KEY, last);
+    return null;
+  }
+
+  private async navigationWorkWakeAt(now: number): Promise<number> {
+    const items = await this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: NAVIGATION_WORK_SCAN_LIMIT + 1 });
+    const entries = [...items.entries()] as [string, string][];
+    if (entries.length > NAVIGATION_WORK_SCAN_LIMIT) return now + MATERIALIZATION_ALARM_DELAY_MS;
+    let earliestRetry = Number.POSITIVE_INFINITY;
+    for (const [key] of entries) {
+      const requestId = key.slice(NAVIGATION_WORK_PREFIX.length);
+      const raw = await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${requestId}`);
+      if (raw === undefined) return now + MATERIALIZATION_ALARM_DELAY_MS;
+      const failure = JSON.parse(raw) as { stopped?: unknown; next_attempt_at?: unknown };
+      if (failure.stopped === true) continue;
+      const retryAt = typeof failure.next_attempt_at === "string" ? Date.parse(failure.next_attempt_at) : Number.NaN;
+      if (!Number.isFinite(retryAt)) return now + MATERIALIZATION_ALARM_DELAY_MS;
+      earliestRetry = Math.min(earliestRetry, Math.max(now + MATERIALIZATION_ALARM_DELAY_MS, retryAt));
+    }
+    return earliestRetry;
   }
 
   private async handleStatus(): Promise<Response> {
@@ -1331,19 +1400,8 @@ export class MaterializationGuard extends DurableObject<Env> {
    */
   private async scheduleConvergenceContinuation(moreWork: boolean, nextAlarmAt: string | null): Promise<void> {
     return this.withWakeScheduleLock(async () => {
-      const navigationItems = await this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: 1 });
-      const navigationPending = navigationItems.size > 0;
-      const navigationItem = navigationItems.entries().next().value as [string, string] | undefined;
-      const navigationRetry = navigationItem
-        ? await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${navigationItem[0].slice(NAVIGATION_WORK_PREFIX.length)}`)
-        : undefined;
-      let navigationWake = navigationPending ? Date.now() + MATERIALIZATION_ALARM_DELAY_MS : Number.POSITIVE_INFINITY;
-      if (navigationRetry !== undefined) {
-        const failure = JSON.parse(navigationRetry) as { stopped?: unknown; next_attempt_at?: unknown };
-        const retryAt = typeof failure.next_attempt_at === "string" ? Date.parse(failure.next_attempt_at) : Number.NaN;
-        if (failure.stopped === true) navigationWake = Number.POSITIVE_INFINITY;
-        else if (Number.isFinite(retryAt) && retryAt > Date.now()) navigationWake = Math.max(Date.now() + 1_000, retryAt);
-      }
+      const navigationWake = await this.navigationWorkWakeAt(Date.now());
+      const navigationPending = Number.isFinite(navigationWake);
       if (!moreWork) {
         if (navigationPending && Number.isFinite(navigationWake)) await this.ctx.storage.setAlarm(navigationWake);
         else await this.ctx.storage.deleteAlarm();

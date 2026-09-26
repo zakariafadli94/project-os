@@ -1206,7 +1206,98 @@ export class ProjectGuard extends DurableObject<Env> {
       await this.settleNavigationReceipt(request, receipt);
       return Response.json(await this.currentNavigationReceipt(request, receipt));
     }
+    // This also runs on replay of an already persisted, exact admission so an
+    // interruption after admission cannot strand the governed successor.
+    await this.releaseTerminalNavigationAdoptionOwner(request);
     return this.executeNavigationSlice(request, frozenState, existingAdmission.admission as ExecutionAdmission);
+  }
+
+  /** A fresh, governed admission may clear a stale adoption owner only when
+   * the owner's exact canonical intent, receipt, and execution journal prove
+   * a terminal navigation snapshot conflict. The source CAS rechecks owner,
+   * generation, and in-flight writes before changing only the reservation. */
+  private async releaseTerminalNavigationAdoptionOwner(request: NavigationReconcileRequest): Promise<void> {
+    const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    const requestHash = await sha256Canonical(request);
+    budget.beforeHttp();
+    const currentIntent = await this.managedDocumentRequests.readRecoverableIntent(request.project_id, request.request_id);
+    if (!currentIntent || currentIntent.request_id !== request.request_id
+      || currentIntent.request_sha256 !== await sha256Text(currentIntent.request_json)) return;
+    try {
+      if (await sha256Canonical(navigationReconcileSchema.parse(JSON.parse(currentIntent.request_json))) !== requestHash) return;
+    } catch {
+      return;
+    }
+    const currentJournal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
+    budget.beforeHttp();
+    const currentAdmission = await currentJournal.readAdmission();
+    if (!currentAdmission || currentAdmission.admission.kind !== "document"
+      || currentAdmission.plan !== null
+      || currentAdmission.admission.operation !== "navigation.reconcile"
+      || currentAdmission.admission.project_id !== request.project_id
+      || currentAdmission.admission.request_id !== request.request_id
+      || currentAdmission.admission.request_hash !== requestHash
+      || currentAdmission.admission.resources.length !== 1
+      || currentAdmission.admission.resources[0]?.resource_id !== `navigation:${request.zone}`
+      || currentAdmission.admission.resources[0]?.resource_type !== "navigation"
+      || currentAdmission.admission.resources[0]?.zone !== request.zone
+      || currentAdmission.admission.resources[0]?.version !== String(request.expected_generation)) return;
+    for (let i = 0; i < 4; i++) budget.beforeHttp();
+    const currentProgress = await currentJournal.status();
+    if (!currentProgress || currentProgress.terminal || currentProgress.status === "conflict") return;
+
+    const sources = new ZoneNavigationSources(this.persistence);
+    const source = await sources.readState(request.project_id, request.zone, budget);
+    const ownerId = source.adoption_request_id;
+    if (!ownerId || ownerId === request.request_id || source.adopted || source.in_flight_resource_ids.length > 0) return;
+
+    budget.beforeHttp();
+    const intent = await this.managedDocumentRequests.readRecoverableIntent(request.project_id, ownerId);
+    if (!intent || intent.project_id !== request.project_id || intent.request_id !== ownerId) return;
+    let prior: NavigationReconcileRequest;
+    try {
+      prior = navigationReconcileSchema.parse(JSON.parse(intent.request_json));
+    } catch {
+      return;
+    }
+    const priorHash = await sha256Canonical(prior);
+    const intentHash = await sha256Text(intent.request_json);
+    if (prior.project_id !== request.project_id || prior.request_id !== ownerId || prior.zone !== request.zone
+      || intent.request_sha256 !== intentHash) return;
+
+    const journal = new ExecutionJournal(this.persistence, request.project_id, "document", ownerId);
+    budget.beforeHttp();
+    const admission = await journal.readAdmission();
+    if (!admission || admission.plan !== null || admission.admission.kind !== "document" || admission.admission.operation !== "navigation.reconcile"
+      || admission.admission.project_id !== request.project_id || admission.admission.request_id !== ownerId
+      || admission.admission.request_hash !== priorHash || admission.admission.resources.length !== 1
+      || admission.admission.resources[0]?.resource_id !== `navigation:${request.zone}`
+      || admission.admission.resources[0]?.resource_type !== "navigation"
+      || admission.admission.resources[0]?.zone !== request.zone
+      || admission.admission.resources[0]?.version !== String(prior.expected_generation)) return;
+
+    budget.beforeHttp();
+    const receiptRecord = await this.managedDocumentRequests.readReceipt(request.project_id, ownerId);
+    if (!receiptRecord || receiptRecord.request_sha256 !== intentHash) return;
+    let receipt: NavigationDocumentReceipt;
+    try {
+      receipt = JSON.parse(receiptRecord.receipt_json) as NavigationDocumentReceipt;
+    } catch {
+      return;
+    }
+    const receiptPath = `${machineDocumentRoot(request.project_id)}/requests/${ownerId}/receipt.json`;
+    if (receipt.operation !== "navigation.reconcile" || receipt.project_id !== request.project_id
+      || receipt.request_id !== ownerId || receipt.status !== "conflict"
+      || receipt.execution_status !== "conflict" || receipt.code !== "navigation_snapshot_changed") return;
+
+    // ExecutionJournal.status performs a bounded metadata/read/metadata proof
+    // plus its admission binding read; reserve those provider calls first.
+    for (let i = 0; i < 4; i++) budget.beforeHttp();
+    const progress = await journal.status();
+    if (!progress || progress.status !== "conflict" || !progress.terminal
+      || progress.request_hash !== priorHash || progress.receipt_ref !== receiptPath) return;
+
+    await sources.abortAdoption(request.project_id, request.zone, ownerId, source.generation, budget);
   }
 
   private async executeNavigationSlice(request: NavigationReconcileRequest, state: ProjectState, admission: ExecutionAdmission): Promise<Response> {

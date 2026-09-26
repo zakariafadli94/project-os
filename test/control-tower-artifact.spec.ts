@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createControlTowerServer as createScopedControlTowerServer } from "../src/control-tower/mcp";
+import { summarizeCanonicalContext } from "../src/control-tower/context";
 const createControlTowerServer = (env: Parameters<typeof createScopedControlTowerServer>[0]) =>
   createScopedControlTowerServer(env, { read: true, mutate: true });
 
@@ -403,11 +404,19 @@ describe("Control Tower governed artifact submission", () => {
         return [taskId, { task_id: taskId, title: `Continue ${index + 1}`, status: "in_progress" }];
       }))
     };
+    const paths: string[] = [];
+    const canonical = {
+      context: { project_id: "PRJ-0007", canonical_revision: 76 },
+      canonical_state: canonicalState
+    };
     const stub = {
-      fetch: async () => Response.json({
-        context: { project_id: "PRJ-0007", canonical_revision: 76, token: "signed" },
-        canonical_state: canonicalState
-      })
+      fetch: async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        paths.push(url.pathname + url.search);
+        const page = summarizeCanonicalContext(canonical, "PRJ-0007", url.searchParams.get("cursor") ?? undefined);
+        return Response.json(page.error ?? { ...page.value, freshness: "verified", observed_at: "2026-09-26T10:00:00.000Z" },
+          { status: page.error ? 400 : 200 });
+      }
     };
     const server = createControlTowerServer({
       PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
@@ -420,12 +429,14 @@ describe("Control Tower governed artifact submission", () => {
     expect(body).toMatchObject({
       status: "ok",
       project_id: "PRJ-0007",
-      context: { project_id: "PRJ-0007", canonical_revision: 76, token: "signed" },
+      context: { project_id: "PRJ-0007", canonical_revision: 76 },
       project: { name: "Atlantic Machinery", revision: 76, current_phase_id: "PHASE-CURRENT" },
       current_phase: { phase_id: "PHASE-CURRENT", status: "active", objective_offset: 0, objective_total_chars: 200_000, objective_truncated: true },
       active_tasks_total: 55,
       active_tasks_truncated: true
     });
+    expect(paths[0]).toBe("/context");
+    expect(body.context).not.toHaveProperty("token");
     expect(body).not.toHaveProperty("canonical_state");
     expect(body.active_tasks).toHaveLength(50);
     expect(body.active_tasks[0]).toMatchObject({ task_id: "TASK-001", status: "in_progress" });

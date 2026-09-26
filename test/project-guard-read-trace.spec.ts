@@ -483,7 +483,7 @@ it("serves a canonical context read while a document reconciliation is waiting o
 
 it("reports a bounded unknown state instead of false receipt absence during a long mutation", async () => {
   vi.spyOn(ExecutionJournal.prototype, "status").mockResolvedValue(null);
-  const handleRequestStatus = vi.fn().mockResolvedValue(Response.json({ status: "committed" }));
+  const handleRequestStatus = vi.fn().mockImplementation(() => Promise.resolve(Response.json({ status: "committed" })));
   const handleReceiptRead = vi.fn()
     .mockResolvedValueOnce(Response.json({ error: "receipt_not_found" }, { status: 404 }))
     .mockResolvedValue(Response.json({ status: "committed" }));
@@ -503,16 +503,16 @@ it("reports a bounded unknown state instead of false receipt absence during a lo
     return "written";
   });
   try {
-    for (const path of [
-      "/request-status?kind=transaction&request_id=TXN-1",
-      "/receipt?kind=transaction&request_id=TXN-1",
-      "/execution-status?kind=transaction&request_id=TXN-1"
-    ]) {
+    for (const [path, expectedStatusReads] of [
+      ["/request-status?kind=transaction&request_id=TXN-1", 1],
+      ["/receipt?kind=transaction&request_id=TXN-1", 1],
+      ["/execution-status?kind=transaction&request_id=TXN-1", 2]
+    ] as const) {
       const response = await guard.fetch(new Request(`https://guard.internal${path}`));
       expect(response.status).toBe(503);
       await expect(response.json()).resolves.toMatchObject({ code: "PROJECT_OS_READ_BUSY" });
+      expect(handleRequestStatus).toHaveBeenCalledTimes(expectedStatusReads);
     }
-    expect(handleRequestStatus).toHaveBeenCalledOnce();
     expect(handleReceiptRead).toHaveBeenCalledOnce();
   } finally {
     release();

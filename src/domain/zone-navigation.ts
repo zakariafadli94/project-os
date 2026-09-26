@@ -31,6 +31,21 @@ export const navigationReconcileSchema = z.strictObject({
 });
 export type NavigationReconcileRequest = z.infer<typeof navigationReconcileSchema>;
 
+export const navigationWorkRefSchema = z.strictObject({
+  project_id: projectId,
+  request_id: requestId,
+  zone: navigationZoneSchema,
+  expected_generation: z.number().int().nonnegative().safe(),
+  source_snapshot_id: z.string().regex(/^source:[0-9]+$/),
+  authority_ref: z.string().min(1).max(2048),
+  request_hash: hash
+});
+export type NavigationWorkRef = z.infer<typeof navigationWorkRefSchema>;
+
+export const navigationWorkFailureSchema = navigationWorkRefSchema.extend({
+  failure_code: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/)
+}).strict();
+
 const safeLogicalPath = z.string().min(1).transform((value, ctx) => {
   try {
     return assertManagedRelativePath(value);
@@ -127,5 +142,6 @@ export type ZoneNavigationReceipt = z.infer<typeof zoneNavigationReceiptSchema>;
 
 export type ZoneNavigationResult =
   | { status: "pending"; cursor: string | null }
+  | { status: "prepared"; source_snapshot_id: string }
   | { status: "conflict"; code: string }
   | { status: "finalized"; receipt: ZoneNavigationReceipt };

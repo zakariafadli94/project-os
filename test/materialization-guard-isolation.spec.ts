@@ -16,6 +16,8 @@ import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { commitFixture } from "./helpers/convergence-fixture";
 import type { SliceBudget } from "../src/convergence/contract";
+import { ExecutionJournal } from "../src/execution/journal";
+import { navigationWorkRefSchema } from "../src/domain/zone-navigation";
 
 const testEnv = env as unknown as Env;
 const at = "2026-09-02T07:20:00+01:00";
@@ -86,6 +88,88 @@ describe("MaterializationGuard isolation boundary", () => {
       release();
       await held;
     }
+  });
+
+  it("durably acknowledges exact navigation work while the MG serialization queue is held", async () => {
+    const projectId = "PRJ-3925";
+    const requestId = "DOCREQ-NAVIGATION-WORKING-3925001";
+    const authorityRef = `${await new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "document", requestId).root()}/admission.json`;
+    const ref = navigationWorkRefSchema.parse({
+      project_id: projectId, request_id: requestId, zone: "WORKING", expected_generation: 0,
+      source_snapshot_id: "source:0", authority_ref: authorityRef, request_hash: "a".repeat(64)
+    });
+    const stored = new Map<string, string>();
+    let alarm: number | null = null;
+    const storage = {
+      get: async <T>(key: string) => stored.get(key) as T | undefined,
+      put: async (key: string, value: string) => { stored.set(key, value); },
+      getAlarm: async () => alarm,
+      setAlarm: async (time: number) => { alarm = time; },
+      list: async ({ prefix, limit }: { prefix: string; limit?: number }) => new Map([...stored.entries()].filter(([key]) => key.startsWith(prefix)).slice(0, limit))
+    };
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId, env: testEnv, queue: Promise.resolve(), queueDepth: 0,
+      ctx: { id: { name: projectId }, storage }
+    }) as MaterializationGuard;
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredMaintenance = new Promise<void>((resolve) => { entered = resolve; });
+    const maintenance = new Promise<void>((resolve) => { release = resolve; });
+    const held = (guard as unknown as { serialize<T>(operation: () => Promise<T>): Promise<T> }).serialize(async () => {
+        entered();
+        await maintenance;
+      });
+    await enteredMaintenance;
+
+    try {
+      const first = await guard.fetch(new Request("https://materialization-guard.internal/navigation-work", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ref)
+      }));
+      expect(first.status).toBe(202);
+      expect(await first.json()).toMatchObject({ status: "scheduled", request_id: requestId });
+      const replay = await guard.fetch(new Request("https://materialization-guard.internal/navigation-work", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ref)
+      }));
+      expect(replay.status).toBe(202);
+      const changed = await guard.fetch(new Request("https://materialization-guard.internal/navigation-work", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...ref, request_hash: "b".repeat(64) })
+      }));
+      expect(changed.status).toBe(409);
+    } finally {
+      release();
+      await held;
+    }
+
+    expect(JSON.parse(stored.get(`navigation-work:${requestId}`)!)).toEqual(ref);
+    expect(alarm).not.toBeNull();
+  });
+
+  it("retains the navigation wake when convergence becomes idle", async () => {
+    const projectId = "PRJ-3926";
+    const requestId = "DOCREQ-NAVIGATION-WORKING-3926001";
+    const retryAt = Date.now() + 5_000;
+    const ref = navigationWorkRefSchema.parse({
+      project_id: projectId, request_id: requestId, zone: "WORKING", expected_generation: 0,
+      source_snapshot_id: "source:0",
+      authority_ref: `${await new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "document", requestId).root()}/admission.json`,
+      request_hash: "a".repeat(64)
+    });
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, async (instance, state) => {
+      await state.storage.put(`navigation-work:${requestId}`, JSON.stringify(ref));
+      await state.storage.put(`navigation-retry:${requestId}`, JSON.stringify({ stopped: false, next_attempt_at: new Date(retryAt).toISOString() }));
+      await state.storage.deleteAlarm();
+      await (instance as unknown as { scheduleConvergenceContinuation(moreWork: boolean, nextAlarmAt: string | null): Promise<void> })
+        .scheduleConvergenceContinuation(false, null);
+      const alarm = await state.storage.getAlarm();
+      expect(alarm).not.toBeNull();
+      expect(alarm!).toBeGreaterThanOrEqual(retryAt - 10);
+      const slice = await (instance as unknown as { serialize<T>(operation: () => Promise<T>): Promise<T> }).serialize(() =>
+        (instance as unknown as { runNavigationWorkSlice(): Promise<unknown> }).runNavigationWorkSlice()
+      );
+      expect(slice).toBeNull();
+      expect(await state.storage.getAlarm()).toBe(alarm);
+    });
   });
 
   it("checkpoints canonical commit reconstruction and never returns a partial state as current", async () => {

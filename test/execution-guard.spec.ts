@@ -10,6 +10,7 @@ import type { ProjectState } from "../src/domain/project-state";
 import { ProjectGuard } from "../src/durable/project-guard-neutral";
 import {
   machineCommitRecordPath,
+  machineDocumentRoot,
   machineMaterializationRecordPath,
   machineStatePath,
   machineTransactionRequestIntentPath
@@ -2086,6 +2087,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     });
     const initial = await response.json<{ status: string; code?: string }>();
     expect(["pending", "committed"]).toContain(initial.status);
+    expect(inventoryPages).toHaveLength(0);
 
     // Do not call execution-status or request-status to wake navigation.
     for (let attempt = 0; attempt < 16; attempt++) {
@@ -2095,6 +2097,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
       const progressPath = [...mock.files.keys()].find((path) => path.includes("/executions/") && path.endsWith("/progress.json"));
       const progress = progressPath ? JSON.parse(mock.files.get(progressPath)!) : null;
       if (headPath && JSON.parse(mock.files.get(headPath)!).generation === 1 && adopted && progress?.status === "finalized" && progress?.terminal === true) break;
+      await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (instance) => instance.alarm());
       await runInDurableObject(guard, (instance) => instance.alarm());
     }
     const headPath = [...mock.files.keys()].find((path) => path.endsWith("/navigation/WORKING/head.json"));
@@ -2106,6 +2109,97 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(executionProgressPath).toBeDefined();
     expect(JSON.parse(mock.files.get(executionProgressPath!)!)).toMatchObject({ status: "finalized", terminal: true });
     expect([...mock.files.keys()].some((path) => path.includes("/WORKING/00-CURRENT.md"))).toBe(true);
+  });
+
+  it("fences a prepared navigation after a source-generation interleave and replays duplicate workrefs safely", async () => {
+    const projectId = "PRJ-8324";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-WORKING-8324001",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const ingress = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    });
+    expect(ingress.status).toBe(202);
+
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    const runPreparationSlice = () => runInDurableObject(materialization, (instance) =>
+      (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+    );
+    let first: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      first = await runPreparationSlice();
+      if (first?.publish) break;
+    }
+    const replay = await runPreparationSlice();
+    expect(first).toMatchObject({ publish: true, ref: { request_id: request.request_id, request_hash: expect.any(String) } });
+    expect(replay).toEqual(first);
+
+    await runInDurableObject(guard, (instance) => (instance as any).serialize(() =>
+      (instance as any).recordObservedNavigationSourceMutation(projectId, "WORKING", "package:PKG-NAV-INTERLEAVE-8324")
+    ));
+    const publish = await guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(first.ref)
+    });
+    expect(publish.status).toBe(409);
+    expect(await publish.json()).toMatchObject({ status: "conflict", code: "navigation_snapshot_changed" });
+    expect([...mock.files.keys()].some((path) => path.endsWith("/navigation/WORKING/head.json"))).toBe(false);
+    expect([...mock.files.keys()].some((path) => path.endsWith("/WORKING/00-CURRENT.md"))).toBe(false);
+  });
+
+  it("stops six identical no-progress navigation failures using the durable recovery ledger", async () => {
+    const projectId = "PRJ-8344";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAV-FAILURE-STREAK-8344",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const ingress = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    });
+    expect(ingress.status).toBe(202);
+    const work = await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (_instance, state) =>
+      state.storage.list<string>({ prefix: "navigation-work" })
+    );
+    const rawRef = [...work.values()][0];
+    expect(rawRef).toBeDefined();
+    const ref = JSON.parse(rawRef!) as Record<string, unknown>;
+
+    let response: Response | undefined;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      response = await guard.fetch("https://project-guard.internal/navigation-publish", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...ref, failure_code: "navigation_work_internal_failure" })
+      });
+    }
+    expect(await response!.json()).toMatchObject({ status: "stopped", failure_code: "identical_internal_failure_limit" });
+    const failure = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{ count: number; stopped: number }>(
+      "SELECT count, stopped FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+    ).toArray()[0]);
+    expect(failure).toMatchObject({ count: 6, stopped: 1 });
+    const pending = await runInDurableObject(guard, (instance) => (instance as any).pendingRequestRecovery() as Array<{ kind: string; request_id: string }>);
+    expect(pending).not.toContainEqual({ kind: "document", request_id: request.request_id });
+    const frozenPath = `${machineDocumentRoot(projectId)}/requests/${request.request_id}/navigation-admitted-state.json`;
+    const frozen = JSON.parse(mock.files.get(frozenPath)!);
+    const admission = (await new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "document", request.request_id).readAdmission())!.admission;
+    const replay = await runInDurableObject(guard, (instance) => (instance as any).executeNavigationSlice(request, frozen.state, admission) as Promise<Response>);
+    expect(replay.status).toBe(503);
+    expect(await replay.json()).toMatchObject({ status: "pending", code: "identical_internal_failure_limit" });
   });
 
   it("releases the ProjectGuard queue between recovery jobs so an enqueued request runs before the next job", async () => {
@@ -2162,12 +2256,13 @@ describe("canonical execution boundary in ProjectGuard", () => {
     const initialResponse = await guard.fetch("https://project-guard.internal/document", {
       method: "POST", body: JSON.stringify(encodeAdmission(navigation, initialContext.context))
     });
-    expect([200, 503]).toContain(initialResponse.status);
+    expect([200, 202, 503]).toContain(initialResponse.status);
     for (let attempt = 0; attempt < 16; attempt++) {
       const headPath = [...mock.files.keys()].find((path) => path.endsWith("/navigation/WORKING/head.json"));
       const sourcePath = [...mock.files.keys()].find((path) => path.endsWith("/navigation-sources/state.json"));
       const adopted = sourcePath ? JSON.parse(mock.files.get(sourcePath)!).zones.WORKING.adopted : false;
       if (headPath && JSON.parse(mock.files.get(headPath)!).generation === 1 && adopted) break;
+      await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (instance) => instance.alarm());
       await runInDurableObject(guard, (instance) => instance.alarm());
     }
     const navHeadPath = [...mock.files.keys()].find((path) => path.endsWith("/navigation/WORKING/head.json"));
@@ -2209,6 +2304,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     for (let attempt = 0; attempt < 12; attempt++) {
       const navHead = JSON.parse(mock.files.get(navHeadPath!)!);
       if (navHead.generation === 2) break;
+      await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (instance) => instance.alarm());
       await runInDurableObject(guard, (instance) => instance.alarm());
     }
     expect(JSON.parse(mock.files.get(navHeadPath!)!)).toMatchObject({ generation: 2, zone: "WORKING" });
@@ -2234,7 +2330,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
       method: "POST", body: JSON.stringify(encodeAdmission(navigation, context.context))
     });
     let navHeadPath: string | undefined;
-    for (let attempt = 0; attempt < 16; attempt++) {
+    for (let attempt = 0; attempt < 50; attempt++) {
       navHeadPath = [...mock.files.keys()].find((path) => path.endsWith("/navigation/WORKING/head.json"));
       const sourcePath = [...mock.files.keys()].find((path) => path.endsWith("/navigation-sources/state.json"));
       const progressPath = [...mock.files.keys()].find((path) => path.includes("/executions/") && path.endsWith("/progress.json"));
@@ -2242,6 +2338,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
       if (navHeadPath && JSON.parse(mock.files.get(navHeadPath)!).generation === 1
         && sourcePath && JSON.parse(mock.files.get(sourcePath)!).zones.WORKING.adopted
         && progress?.status === "finalized" && progress?.terminal === true) break;
+      await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (instance) => instance.alarm());
       await runInDurableObject(guard, (instance) => instance.alarm());
     }
     expect(navHeadPath).toBeDefined();
@@ -2296,6 +2393,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     for (let attempt = 0; attempt < 16; attempt++) {
       const head = JSON.parse(mock.files.get(navHeadPath!)!);
       if (head.generation >= 2) break;
+      await runDurableObjectAlarm(testEnv.MATERIALIZATION_GUARD.getByName(projectId));
       await runInDurableObject(guard, (instance) => instance.alarm());
     }
     expect(JSON.parse(mock.files.get(navHeadPath!)!)).toMatchObject({ generation: 2, zone: "WORKING" });

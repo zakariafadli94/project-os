@@ -382,8 +382,10 @@ export class MaterializationGuard extends DurableObject<Env> {
   private async runNavigationWorkSlice(): Promise<NavigationWorkSlice | null> {
     const candidate = await this.selectNavigationWorkCandidate(Date.now());
     if (!candidate) {
-      const wakeAt = await this.navigationWorkWakeAt(Date.now());
-      if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
+      await this.withWakeScheduleLock(async () => {
+        const wakeAt = await this.navigationWorkWakeAt(Date.now());
+        if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
+      });
       return null;
     }
     const requestId = candidate.requestId;

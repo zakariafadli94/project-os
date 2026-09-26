@@ -296,6 +296,71 @@ describe("MaterializationGuard isolation boundary", () => {
     expect(reported).toEqual([ids[1]]);
   });
 
+  it("does not overwrite an enqueue wake with a stale backoff scan", async () => {
+    const projectId = "PRJ-3929";
+    const oldRequestId = "DOCREQ-NAVIGATION-WORKING-3929001";
+    const newRequestId = "DOCREQ-NAVIGATION-WORKING-3929002";
+    const retryAt = Date.now() + 60_000;
+    const oldRef = navigationWorkRefSchema.parse({
+      project_id: projectId, request_id: oldRequestId, zone: "WORKING", expected_generation: 0,
+      source_snapshot_id: "source:0", authority_ref: "authority:old", request_hash: "a".repeat(64)
+    });
+    const newRef = navigationWorkRefSchema.parse({
+      ...oldRef, request_id: newRequestId,
+      authority_ref: `${await new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "document", newRequestId).root()}/admission.json`,
+      request_hash: "b".repeat(64)
+    });
+    const stored = new Map<string, string>([
+      [`navigation-work:${oldRequestId}`, canonicalJson(oldRef)],
+      [`navigation-retry:${oldRequestId}`, canonicalJson({ stopped: false, next_attempt_at: new Date(retryAt).toISOString() })]
+    ]);
+    let alarm: number | null = null;
+    let listCalls = 0;
+    let reachedWakeSnapshot!: () => void;
+    let releaseWakeSnapshot!: () => void;
+    const wakeSnapshot = new Promise<void>((resolve) => { reachedWakeSnapshot = resolve; });
+    const snapshotRelease = new Promise<void>((resolve) => { releaseWakeSnapshot = resolve; });
+    const storage = {
+      get: async <T>(key: string) => stored.get(key) as T | undefined,
+      put: async (key: string, value: string) => { stored.set(key, value); },
+      delete: async (key: string) => { stored.delete(key); },
+      getAlarm: async () => alarm,
+      setAlarm: async (time: number) => { alarm = time; },
+      deleteAlarm: async () => { alarm = null; },
+      list: async ({ prefix, limit, startAfter }: { prefix: string; limit?: number; startAfter?: string }) => {
+        const all = [...stored.entries()].filter(([key]) => key.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b));
+        const after = startAfter ? all.filter(([key]) => key > startAfter) : all;
+        const snapshot = new Map(after.slice(0, limit));
+        listCalls += 1;
+        if (listCalls === 2) {
+          reachedWakeSnapshot();
+          await snapshotRelease;
+        }
+        return snapshot;
+      }
+    };
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId, env: testEnv, queue: Promise.resolve(), queueDepth: 0, wakeScheduleQueue: undefined,
+      ctx: { id: { name: projectId }, storage }
+    }) as MaterializationGuard;
+    const slice = (guard as unknown as { runNavigationWorkSlice(): Promise<unknown> }).runNavigationWorkSlice();
+    await wakeSnapshot;
+
+    let enqueueFinished = false;
+    const enqueue = guard.fetch(new Request("https://materialization-guard.internal/navigation-work", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(newRef)
+    })).then((response) => { enqueueFinished = true; return response; });
+    await vi.waitFor(() => expect(enqueueFinished).toBe(true), { timeout: 30 }).catch(() => undefined);
+    const enqueueWasBlockedByWakeLock = !enqueueFinished;
+    releaseWakeSnapshot();
+    const [response] = await Promise.all([enqueue, slice]);
+
+    expect(response.status).toBe(202);
+    expect(enqueueWasBlockedByWakeLock).toBe(true);
+    expect(alarm).not.toBeNull();
+    expect(alarm!).toBeLessThan(retryAt);
+  });
+
   it("keeps a navigation wake enqueued after the scheduler snapshot without losing convergence backoff", async () => {
     const projectId = "PRJ-3927";
     const requestId = "DOCREQ-NAVIGATION-WORKING-3927001";

@@ -736,8 +736,8 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    await this.resumePendingRequestRecovery();
     await this.serialize(async () => {
-      await this.resumePendingRequestRecovery();
       await this.resumePendingNavigationRefreshes();
       await this.resumePendingMaterializationFinalization();
     });
@@ -1893,21 +1893,23 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async resumePendingRequestRecovery(): Promise<void> {
     for (const recovery of this.pendingRequestRecovery()) {
-      try {
-        if (recovery.kind === "document") await this.resumeManagedDocument(recovery.request_id);
-        else if (recovery.kind === "artifact") await this.resumeArtifactFinalization(recovery.request_id);
-        else if (recovery.kind !== "transaction") this.clearRequestRecovery("document", recovery.request_id);
-      } catch (error) {
-        const progress = await this.recoveryProgressFingerprint(
-          recovery.kind as "artifact" | "document", recovery.request_id
-        );
-        await this.recordRecoveryFailure(recovery.kind as "artifact" | "document", recovery.request_id, error, progress);
-      }
+      await this.serialize(async () => {
+        try {
+          if (recovery.kind === "document") await this.resumeManagedDocument(recovery.request_id);
+          else if (recovery.kind === "artifact") await this.resumeArtifactFinalization(recovery.request_id);
+          else if (recovery.kind !== "transaction") this.clearRequestRecovery("document", recovery.request_id);
+        } catch (error) {
+          const progress = await this.recoveryProgressFingerprint(
+            recovery.kind as "artifact" | "document", recovery.request_id
+          );
+          await this.recordRecoveryFailure(recovery.kind as "artifact" | "document", recovery.request_id, error, progress);
+        }
+      });
     }
     // Transactions are processed in a separate phase later in alarm(). Do
     // not let their unfailed rows schedule an immediate wake before that
     // phase records its real retry deadline.
-    await this.scheduleNextRequestRecoveryWake(true);
+    await this.serialize(() => this.scheduleNextRequestRecoveryWake(true));
   }
 
   private async armMaterializationFinalizationAlarm(): Promise<void> {

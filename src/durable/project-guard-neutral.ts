@@ -450,9 +450,10 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       if (this.queueDepth > 0) {
         const correlationId = this.observationCorrelationId(request, url);
-        return ["transaction", "document", "artifact"].includes(kind)
-          ? this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY")
-          : Response.json({ project_id: projectId, kind, request_id: requestId, status: "unknown", code: "PROJECT_OS_READ_BUSY", correlation_id: correlationId }, { status: 503 });
+        if (["transaction", "document", "artifact"].includes(kind)) {
+          return this.readExecutionStatusWhileBusy(projectId, kind, requestId, correlationId);
+        }
+        return Response.json({ project_id: projectId, kind, request_id: requestId, status: "unknown", code: "PROJECT_OS_READ_BUSY", correlation_id: correlationId }, { status: 503 });
       }
       return this.readWhenIdle(async () => {
         const journal = new ExecutionJournal(this.persistence, projectId, kind, requestId);
@@ -3320,6 +3321,33 @@ export class ProjectGuard extends DurableObject<Env> {
       status: "unknown", code, correlation_id: correlationId, observed_at: observedAt,
       observation
     }, { status: 503, headers: { "Retry-After": "1" } });
+  }
+
+  /** Read only the already-addressed execution journal while another effect
+   * is serialized. A missing or unstable journal stays unknown; this never
+   * infers completion from a family receipt or local cache. */
+  protected async readExecutionStatusWhileBusy(
+    projectId: string,
+    kind: string,
+    requestId: string,
+    correlationId: string
+  ): Promise<Response> {
+    try {
+      const url = new URL("https://project-guard.internal/request-status");
+      url.searchParams.set("kind", kind);
+      url.searchParams.set("request_id", requestId);
+      const response = await this.readBoundedRequestStatus(url, correlationId);
+      if (!response.ok) throw new Error("execution_status_unavailable");
+      const body = await response.json() as Record<string, any>;
+      const status = body.execution as Record<string, unknown> | undefined;
+      if (body.project_id === projectId && body.kind === kind && body.request_id === requestId
+        && status?.project_id === projectId && status.kind === kind && status.request_id === requestId) {
+        return Response.json({ ...status, freshness: "verified", observed_at: body.observation?.observed_at });
+      }
+    } catch {
+      // Busy work must not turn an unavailable journal proof into absence.
+    }
+    return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
   }
 
   private async readMaterializationFailureForExecution(

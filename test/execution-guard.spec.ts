@@ -348,6 +348,55 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await finalized.json()).toMatchObject({ status: "finalized", terminal: true, code: null, finalization_ref: expect.any(String) });
   });
 
+  it("serves proven execution progress during a separate serialized effect", async () => {
+    const projectId = "PRJ-8318";
+    const { guard } = await setup(projectId);
+    const content = "# Busy status proof\n";
+    const request = {
+      request_id: "ART-EXECUTION-BUSY-0001", project_id: projectId,
+      relative_path: "proofs/busy.md", content, content_sha256: await sha256Text(content), mode: "create"
+    };
+    const { context } = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const completed = await guard.fetch("https://project-guard.internal/artifact", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await completed.json()).toMatchObject({ status: "committed", request_id: request.request_id });
+    const execution = await guard.fetch(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`);
+    expect(execution.status).toBe(200);
+    const executionBody = await execution.json<Record<string, unknown>>();
+    expect(executionBody).toMatchObject({ status: "finalized", terminal: true, request_id: request.request_id, project_id: projectId });
+
+    const busyRequest = { ...request, request_id: "ART-EXECUTION-BUSY-0002", relative_path: "proofs/busy-later.md" };
+    const { context: busyContext } = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const observed = await runInDurableObject(guard, async (instance) => {
+      let release!: () => void;
+      let entered!: () => void;
+      const hold = new Promise<void>((resolve) => { release = resolve; });
+      const started = new Promise<void>((resolve) => { entered = resolve; });
+      const repository = (instance as any).repository;
+      const original = repository.writeArtifact.bind(repository);
+      const spy = vi.spyOn(repository, "writeArtifact").mockImplementation(async (...args: unknown[]) => {
+        entered();
+        await hold;
+        return original(...args);
+      });
+      const submission = (instance as any).fetch(new Request("https://project-guard.internal/artifact", {
+        method: "POST", body: JSON.stringify(encodeAdmission(busyRequest, busyContext))
+      })) as Promise<Response>;
+      try {
+        await started;
+        const response = await (instance as any).fetch(new Request(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`)) as Response;
+        return { status: response.status, body: await response.json() };
+      } finally {
+        release();
+        await submission;
+        spy.mockRestore();
+      }
+    });
+    expect(observed).toMatchObject({ status: 200, body: { status: "finalized", terminal: true, request_id: request.request_id, project_id: projectId,
+      finalization_ref: executionBody.finalization_ref } });
+  });
+
   it("keeps artifact finalization recoverable when receipt persistence is interrupted", async () => {
     const projectId = "PRJ-8290";
     const { guard } = await setup(projectId);

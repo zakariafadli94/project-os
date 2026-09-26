@@ -110,7 +110,7 @@ export class ZoneNavigationSources {
   async abortAdoption(projectId: string, zone: NavigationZone, requestId: string, generation: number, budget?: SliceBudget): Promise<boolean> {
     const state = await this.readProjectState(projectId, budget);
     const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
-    if (current.adopted || current.generation !== generation) return false;
+    if (current.adopted || current.generation !== generation || current.in_flight_writes.length > 0) return false;
     if (current.adoption_request_id === null) return true;
     if (current.adoption_request_id !== requestId || current.adoption_generation !== generation) return false;
     current.adoption_request_id = null;

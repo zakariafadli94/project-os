@@ -2205,6 +2205,73 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await sources.readState(projectId, "WORKING")).toMatchObject({ adoption_request_id: successor.request_id });
   });
 
+  it("releases a historical terminal-conflict navigation owner only after a fresh authorized successor admission", async () => {
+    const projectId = "PRJ-8463";
+    const prior = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAV-CONFLICT-HISTORICAL-8463",
+      project_id: projectId, zone: "WORKING" as const, expected_project_revision: 1,
+      expected_generation: 0, expected_index: null, created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard } = await setup(projectId);
+    const abortAdoption = vi.spyOn(ZoneNavigationSources.prototype, "abortAdoption");
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(prior, context.context))
+    })).status).toBe(202);
+
+    const terminalReceipt = {
+      operation: prior.operation, request_id: prior.request_id, project_id: projectId,
+      status: "conflict" as const, execution_status: "conflict" as const, code: "navigation_snapshot_changed"
+    };
+    await runInDurableObject(guard, async (instance) => {
+      const ledger = (instance as any).managedDocumentRequests;
+      await ledger.writeReceipt(projectId, prior.request_id, JSON.stringify(prior), JSON.stringify(terminalReceipt));
+      await (instance as any).settleNavigationReceipt(prior, terminalReceipt);
+    });
+    const journal = new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "document", prior.request_id);
+    expect(await journal.status()).toMatchObject({ status: "conflict", terminal: true });
+    const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
+    expect(await sources.beginAdoption(projectId, "WORKING", prior.request_id, 0)).toBe(true);
+
+    const successor = { ...prior, request_id: "DOCREQ-NAV-CONFLICT-SUCCESSOR-8463" };
+    const successorContext = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const successorBody = JSON.stringify(encodeAdmission(successor, successorContext.context));
+    abortAdoption.mockResolvedValueOnce(false);
+    await guard.fetch("https://project-guard.internal/document", { method: "POST", body: successorBody });
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ adoption_request_id: prior.request_id });
+    expect(await runInDurableObject(guard, (instance) => (instance as any).managedDocumentRequests.readReceipt(projectId, successor.request_id))).toBeNull();
+
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: successorBody
+    })).status).toBe(202);
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({
+      generation: 0, adopted: false, adoption_request_id: null, in_flight_resource_ids: []
+    });
+    expect(abortAdoption).toHaveBeenCalledWith(projectId, "WORKING", prior.request_id, 0, expect.anything());
+
+    expect(await sources.beginAdoption(projectId, "WORKING", successor.request_id, 0)).toBe(true);
+    const activeSuccessor = { ...successor, request_id: "DOCREQ-NAV-CONFLICT-ACTIVE-8463" };
+    const activeContext = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(activeSuccessor, activeContext.context))
+    })).status).toBe(202);
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({
+      generation: 0, adopted: false, adoption_request_id: successor.request_id, in_flight_resource_ids: []
+    });
+
+    const inFlight = await sources.beginHeadWrite(projectId, "WORKING", "head:DOC-NAV-IN-FLIGHT-8463");
+    expect(inFlight).toMatchObject({ generation: 1, resource_id: "head:DOC-NAV-IN-FLIGHT-8463" });
+    const inFlightSuccessor = { ...activeSuccessor, request_id: "DOCREQ-NAV-CONFLICT-INFLIGHT-8463" };
+    const inFlightContext = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(inFlightSuccessor, inFlightContext.context))
+    })).status).toBe(202);
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({
+      generation: 1, adopted: false, adoption_request_id: successor.request_id,
+      in_flight_resource_ids: ["head:DOC-NAV-IN-FLIGHT-8463"]
+    });
+  });
+
   it("stops six identical no-progress navigation failures using the durable recovery ledger", async () => {
     const projectId = "PRJ-8344";
     const request = {

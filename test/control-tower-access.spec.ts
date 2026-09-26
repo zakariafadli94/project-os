@@ -91,6 +91,7 @@ describe("effective Control Tower token permissions", () => {
 
   it("preserves a known busy status and retry delay without exposing Guard details", async () => {
     const owner = { getByName: () => ({ fetch: async () => Response.json({
+      project_id: "PRJ-0003", kind: "transaction", request_id: "TXN-ORIGINAL",
       status: "unknown", code: "PROJECT_OS_READ_BUSY", private_detail: "provider-secret"
     }, { status: 503, headers: { "Retry-After": "1" } }) }) } as unknown as DurableObjectNamespace;
     const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {
@@ -107,6 +108,7 @@ describe("effective Control Tower token permissions", () => {
 
   it("distinguishes an exhausted status observation from a busy Guard", async () => {
     const owner = { getByName: () => ({ fetch: async () => Response.json({
+      project_id: "PRJ-0003", kind: "transaction", request_id: "TXN-ORIGINAL",
       status: "unknown", code: "request_status_unavailable", private_detail: "provider-secret"
     }, { status: 503, headers: { "Retry-After": "1" } }) }) } as unknown as DurableObjectNamespace;
     const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {

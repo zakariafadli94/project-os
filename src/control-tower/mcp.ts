@@ -154,21 +154,24 @@ async function readGuard(
         if (response.status >= 500) {
           // Only known, non-sensitive observation verdicts may cross this boundary.
           // Do not echo arbitrary 5xx payloads from a dependency to a client.
-          if (diagnostic.route === "/request-status" && response.status === 503) {
-            const body = await response.clone().json().catch(() => null) as { code?: unknown } | null;
-            if (body && (body.code === "PROJECT_OS_READ_BUSY" || body.code === "request_status_unavailable")) {
+          if (["/request-status", "/receipt"].includes(diagnostic.route) && response.status === 503) {
+            const body = await response.clone().json().catch(() => null) as { code?: unknown; project_id?: unknown; kind?: unknown; request_id?: unknown } | null;
+            const kind = query.get("kind");
+            const identityMatches = body?.project_id === projectId && body.kind === kind && body.request_id === requestId;
+            const knownObservationCode = diagnostic.route === "/request-status"
+              ? body?.code === "PROJECT_OS_READ_BUSY" || body?.code === "request_status_unavailable"
+              : body?.code === "PROJECT_OS_READ_BUSY" || body?.code === "canonical_receipt_unavailable";
+            if (identityMatches && knownObservationCode && requestId && kind && ["transaction", "document", "artifact"].includes(kind)) {
               const retryAfter = Number(response.headers.get("Retry-After"));
               const retryAfterSeconds = Number.isSafeInteger(retryAfter) && retryAfter > 0 && retryAfter <= 60
                 ? retryAfter : 1;
-              const unavailableObservation = body.code === "request_status_unavailable" && requestId
-                && ["transaction", "document", "artifact"].includes(query.get("kind") ?? "")
-                ? persistenceObservation({ project_id: projectId, kind: query.get("kind") as RequestKind,
-                    request_id: requestId, observed_at: new Date().toISOString(), correlation_id: correlationId,
-                    code: "request_status_unavailable" })
-                : null;
+              const observation = persistenceObservation({ project_id: projectId, kind: kind as RequestKind,
+                request_id: requestId, observed_at: new Date().toISOString(), correlation_id: correlationId,
+                code: body.code as string });
+              const status = diagnostic.route === "/request-status" && body.code === "PROJECT_OS_READ_BUSY"
+                ? "unavailable" : "unknown";
               return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({
-                status: unavailableObservation ? "unknown" : "unavailable", code: body.code, ...diagnostic,
-                ...(unavailableObservation ? { observation: unavailableObservation } : {}),
+                status, code: body.code, kind, ...diagnostic, observation,
                 retry_after_seconds: retryAfterSeconds, recovery
               }) }] };
             }

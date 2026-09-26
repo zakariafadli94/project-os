@@ -478,7 +478,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       const correlationId = this.observationCorrelationId(request, url);
       if (this.queueDepth > 0) {
-        const observed = await this.readStoredRequestObservation(projectId, kind as RequestKind, requestId);
+        const observed = await this.readStoredOrRefreshRequestObservation(url, projectId, kind as RequestKind, requestId, correlationId);
         if (observed) return observed;
         return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId);
       }
@@ -3816,6 +3816,36 @@ export class ProjectGuard extends DurableObject<Env> {
       // A damaged or unavailable local observation never becomes absence.
       return null;
     }
+  }
+
+  /** A cached admission is useful evidence, but it is not current recovery
+   * status. While the owner is busy, refresh that one addressed request using
+   * the existing bounded canonical reader; retain the explicitly stale value
+   * only when the bounded read cannot establish a fresh result. */
+  protected async readStoredOrRefreshRequestObservation(
+    url: URL,
+    projectId: string,
+    kind: RequestKind,
+    requestId: string,
+    correlationId: string
+  ): Promise<Response | null> {
+    const stored = await this.readStoredRequestObservation(projectId, kind, requestId);
+    if (!stored) return null;
+    try {
+      const body = await stored.clone().json() as Record<string, any>;
+      const refreshable = body.status === "admitted_uncommitted"
+        || (body.status === "committed" && body.observation?.terminal !== true);
+      if (!refreshable || body.observation?.freshness !== "stale") return stored;
+      const current = await this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId);
+      if (!current.ok) return stored;
+      const currentBody = await current.clone().json() as Record<string, any>;
+      if (currentBody.project_id === projectId && currentBody.kind === kind && currentBody.request_id === requestId
+        && currentBody.observation?.freshness === "verified") return current;
+    } catch {
+      // Keep the old observation explicitly stale when bounded revalidation
+      // is unavailable; never turn that condition into absence.
+    }
+    return stored;
   }
 
   /** A read-only recovery view. In particular, it must not certify an effect,

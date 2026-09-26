@@ -16,7 +16,7 @@ import { emptyProjectState } from "../src/domain/transitions";
 import { canonicalJson } from "../src/rules/contract";
 import { packageRuntime } from "./helpers/package-runtime";
 import { packageNavigationPath } from "../src/domain/document-package";
-import { machineArtifactReceiptPath } from "../src/persistence/layout";
+import { machineArtifactReceiptPath, machineMutationIntentPath } from "../src/persistence/layout";
 import { mutationIntentIdFor } from "../src/domain/mutation-gate";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
 
@@ -275,6 +275,42 @@ describe("ZoneNavigationInventory", () => {
     expect(h.pageLimits.every((limit) => limit <= 512)).toBe(true);
   });
 
+  it("catches up a legacy limit-one artifact cursor within one bounded inventory slice", async () => {
+    const h = harness();
+    const cursors = ["legacy-artifact-cursor-2", "legacy-artifact-cursor-3", "legacy-artifact-cursor-4", null];
+    const received: Array<{ cursor: string | null; limit: number }> = [];
+    h.runtime.pagedListing!.listPage = async ({ cursor, limit }) => {
+      received.push({ cursor, limit });
+      return { entries: [], cursor: cursors.shift() ?? null };
+    };
+
+    const slice = budget(32);
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: "artifacts:legacy-artifact-cursor-1", limit: 8, budget: slice });
+
+    expect(received.length).toBeGreaterThan(1);
+    expect(received[0]).toEqual({ cursor: "legacy-artifact-cursor-1", limit: 1 });
+    expect(received.slice(1).every((call) => call.limit === 1)).toBe(true);
+    expect(page.entries).toEqual([]);
+    expect(page.next_cursor).toBeNull();
+    expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+  });
+
+  it("stops a batched legacy cursor before a gap so an orphaned snapshot replays identically", async () => {
+    const h = harness();
+    const firstId = "ART-NAVIGATION-GAP-0001";
+    const firstPath = machineMutationIntentPath(projectId, firstId);
+    await seedCommittedArtifact(h, firstId, `${workspaceProjectRoot(projectId, slug)}/REVIEW/other-zone.md`, "other zone");
+    h.put(`${firstPath.slice(0, firstPath.lastIndexOf("/"))}/ZZZ-BROKEN.json`, "{}");
+
+    const first = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: "artifacts:", limit: 8, budget: budget() });
+    const replay = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: first.next_cursor, limit: 8, budget: budget() });
+
+    expect(first.entries).toEqual([]);
+    expect(first.gaps).toEqual([]);
+    expect(first.next_cursor).toBe(`artifacts:${encodeURIComponent(firstPath)}`);
+    expect(replay.gaps).toContainEqual({ resource_id: "ZZZ-BROKEN.json", code: "artifact_intent_listing_invalid" });
+  });
+
   it("fails closed when Dropbox repeats the same listing cursor", async () => {
     const h = harness();
     h.runtime.pagedListing!.listPage = async ({ cursor }) => ({ entries: [], cursor });
@@ -524,8 +560,10 @@ describe("ZoneNavigationInventory", () => {
     } while (cursor !== null);
 
     const entries = pages.flatMap((page) => page.entries);
+    const proofs = pages.flatMap((page) => page.verified_entries ?? []);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ resource_id: `artifact:${await sha256Text(destination)}`, version: `ART-NAVIGATION-001:${await sha256Text("approved artifact")}`, logical_path: "report.md", path: destination });
+    expect(proofs).toEqual([{ resource_id: entries[0].resource_id, entry_hash: await sha256Text(canonicalJson(entries[0])), persisted: false }]);
     expect(await h.inventory.verifyEntry(entries[0], budget())).toBe(true);
   });
 

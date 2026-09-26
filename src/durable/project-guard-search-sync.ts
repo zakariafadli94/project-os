@@ -76,7 +76,8 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
               this.observationCorrelationId(request, url));
           }
           if (url.pathname === "/request-status") {
-            const observed = await this.readStoredRequestObservation(projectId, kind as RequestKind, requestId);
+            const observed = await this.readStoredOrRefreshRequestObservation(url, projectId, kind as RequestKind, requestId,
+              this.observationCorrelationId(request, url));
             if (observed) return observed;
             return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId,
               this.observationCorrelationId(request, url));

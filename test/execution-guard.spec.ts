@@ -2045,6 +2045,43 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect([...mock.files.keys()].some((path) => path.includes("/WORKING/00-CURRENT.md"))).toBe(true);
   });
 
+  it("releases the ProjectGuard queue between recovery jobs so an enqueued request runs before the next job", async () => {
+    const { guard } = await setup("PRJ-8343");
+    await runInDurableObject(guard, async (instance) => {
+      const order: string[] = [];
+      let releaseFirst!: () => void;
+      let signalFirst!: () => void;
+      const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const firstStarted = new Promise<void>((resolve) => { signalFirst = resolve; });
+      const internal = instance as unknown as Record<string, any>;
+      vi.spyOn(internal, "pendingRequestRecovery").mockReturnValue([
+        { kind: "document", request_id: "job-1" },
+        { kind: "document", request_id: "job-2" }
+      ]);
+      vi.spyOn(internal, "resumeManagedDocument").mockImplementation(async (...args: unknown[]) => {
+        const requestId = args[0] as string;
+        order.push(`start:${requestId}`);
+        if (requestId === "job-1") {
+          signalFirst();
+          await firstBlocked;
+        }
+        order.push(`end:${requestId}`);
+      });
+      for (const method of ["scheduleNextRequestRecoveryWake", "resumePendingNavigationRefreshes", "resumePendingMaterializationFinalization", "resumePendingTransactionRecovery"]) {
+        vi.spyOn(internal, method).mockResolvedValue(undefined);
+      }
+      const alarm = instance.alarm();
+      await firstStarted;
+      const queuedRequest = internal.serialize(async () => { order.push("client-request"); });
+      order.push("client-enqueued");
+      releaseFirst();
+      await Promise.all([alarm, queuedRequest]);
+      expect(order).toEqual([
+        "start:job-1", "client-enqueued", "end:job-1", "client-request", "start:job-2", "end:job-2"
+      ]);
+    });
+  });
+
   it("recovers an interrupted dirty-to-outbox write and refreshes without status polling", async () => {
     const projectId = "PRJ-8321";
     const { guard, mock } = await setup(projectId);

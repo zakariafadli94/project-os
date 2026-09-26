@@ -408,7 +408,7 @@ describe("convergence rollout gates", () => {
     expect((await journal.load())?.progress.next_alarm_at).toBe(retryAt);
     const alarmAt = await runInDurableObject(guard, async (_instance, state) => state.storage.getAlarm());
     expect(alarmAt).not.toBeNull();
-    expect(alarmAt ?? 0).toBeGreaterThanOrEqual(Date.now() + 1_500);
+    expect(alarmAt ?? 0).toBeGreaterThanOrEqual(Date.parse(retryAt));
   });
 
   it("rearms a persisted convergence continuation when fleet reconciliation finds no legacy work", async () => {

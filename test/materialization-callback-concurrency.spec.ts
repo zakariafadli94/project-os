@@ -18,6 +18,7 @@ it("preserves a wake scheduled by another request while finalization is unavaila
     projectId: "PRJ-0007", layoutMode: "legacy", env: {},
     ctx: { storage: {
       get: async () => undefined,
+      list: async () => new Map(),
       getAlarm: async () => nextAlarm,
       setAlarm: async (at: number) => { nextAlarm = at; }
     } },
@@ -42,6 +43,7 @@ it("rearms immediately when ProjectGuard bounds a finalization callback", async 
     projectId: "PRJ-0008", layoutMode: "legacy", env: {},
     ctx: { storage: {
       get: async () => undefined,
+      list: async () => new Map(),
       getAlarm: async () => nextAlarm,
       setAlarm: async (at: number) => { nextAlarm = at; }
     } },
@@ -63,6 +65,7 @@ it("preserves provider Retry-After values above two minutes for MaterializationG
     projectId: "PRJ-0009", layoutMode: "legacy", env: {},
     ctx: { storage: {
       get: async () => undefined,
+      list: async () => new Map(),
       getAlarm: async () => nextAlarm,
       setAlarm: async (at: number) => { nextAlarm = at; }
     } },
@@ -86,7 +89,7 @@ it("notifies ProjectGuard of an existing head while repair convergence continues
     projectId: "PRJ-0003",
     layoutMode: "v2",
     env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: '{"PRJ-0003":"repair"}' },
-    ctx: { storage: { get: async () => undefined, setAlarm: async () => {} } },
+    ctx: { storage: { get: async () => undefined, list: async () => new Map(), setAlarm: async () => {} } },
     ledger: { finalVerificationActive: () => false },
     resumeConvergenceFromVerifiedHead: async () => true,
     ensureConvergenceRequestedFromLedger: async () => false,
@@ -117,7 +120,7 @@ it.each(["repair", "legacy"])("finishes %s finalization while ProjectGuard is wa
     projectId: "PRJ-0007",
     layoutMode: mode === "legacy" ? "legacy" : "v2",
     env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: mode === "repair" ? '{"PRJ-0007":"repair"}' : undefined },
-    ctx: { storage: { get: async () => undefined, setAlarm: async () => {} } },
+    ctx: { storage: { get: async () => undefined, list: async () => new Map(), setAlarm: async () => {} } },
     resumeConvergenceFromVerifiedHead: async () => {},
     ensureConvergenceRequestedFromLedger: async () => false,
     convergenceEngineForSlice: () => ({ engine: { runSlice: async () => {

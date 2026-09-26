@@ -1351,11 +1351,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       ? requested
       : now + MATERIALIZATION_ALARM_DELAY_MS;
     const existing = await this.ctx.storage.getAlarm();
-    const wakeAt = Math.min(
-      convergenceWakeAt,
-      navigationWake,
-      existing !== null && existing > now ? existing : Number.POSITIVE_INFINITY
-    );
+    const wakeAt = Math.min(convergenceWakeAt, navigationWake);
     // `nextAlarmAt` is the journal's earliest durable deadline. An older
     // generic materialization alarm must not shorten a retry/backoff window;
     // if another durable concern were earlier it would already be reflected

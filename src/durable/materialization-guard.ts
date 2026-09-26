@@ -88,6 +88,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   private readonly projectionConcurrency: number;
   private queue: Promise<void> = Promise.resolve();
   private queueDepth = 0;
+  private wakeScheduleQueue?: Promise<void>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -341,23 +342,25 @@ export class MaterializationGuard extends DurableObject<Env> {
       return Response.json({ error: "navigation_workref_invalid" }, { status: 400 });
     }
     const ref = parsed.data;
-    const failureRaw = await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`);
-    if (failureRaw !== undefined) {
-      const failure = JSON.parse(failureRaw) as { stopped?: unknown };
-      if (failure.stopped === true) return Response.json({ error: "navigation_work_stopped" }, { status: 409 });
-    }
     const authorityPath = `${await new ExecutionJournal(createProductionPersistence(this.env, this.projectId), this.projectId, "document", ref.request_id).root()}/admission.json`;
     if (ref.authority_ref !== authorityPath) return Response.json({ error: "navigation_authority_ref_invalid" }, { status: 409 });
-    const key = this.navigationWorkKey(ref.request_id);
-    const value = canonicalJson(ref);
-    const existing = await this.ctx.storage.get<string>(key);
-    if (existing !== undefined && existing !== value) return Response.json({ error: "navigation_workref_conflict" }, { status: 409 });
-    if (existing === undefined) await this.ctx.storage.put(key, value);
-    const alarm = await this.ctx.storage.getAlarm();
-    if (alarm === null || alarm > Date.now() + MATERIALIZATION_ALARM_DELAY_MS) {
-      await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
-    }
-    return Response.json({ project_id: this.projectId, request_id: ref.request_id, status: "scheduled" }, { status: 202 });
+    return this.withWakeScheduleLock(async () => {
+      const failureRaw = await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`);
+      if (failureRaw !== undefined) {
+        const failure = JSON.parse(failureRaw) as { stopped?: unknown };
+        if (failure.stopped === true) return Response.json({ error: "navigation_work_stopped" }, { status: 409 });
+      }
+      const key = this.navigationWorkKey(ref.request_id);
+      const value = canonicalJson(ref);
+      const existing = await this.ctx.storage.get<string>(key);
+      if (existing !== undefined && existing !== value) return Response.json({ error: "navigation_workref_conflict" }, { status: 409 });
+      if (existing === undefined) await this.ctx.storage.put(key, value);
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > Date.now() + MATERIALIZATION_ALARM_DELAY_MS) {
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+      }
+      return Response.json({ project_id: this.projectId, request_id: ref.request_id, status: "scheduled" }, { status: 202 });
+    });
   }
 
   /** One bounded preparation slice. This runs under MG serialization, but the
@@ -1327,37 +1330,54 @@ export class MaterializationGuard extends DurableObject<Env> {
    * alarm invocation.
    */
   private async scheduleConvergenceContinuation(moreWork: boolean, nextAlarmAt: string | null): Promise<void> {
-    const navigationItems = await this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: 1 });
-    const navigationPending = navigationItems.size > 0;
-    const navigationItem = navigationItems.entries().next().value as [string, string] | undefined;
-    const navigationRetry = navigationItem
-      ? await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${navigationItem[0].slice(NAVIGATION_WORK_PREFIX.length)}`)
-      : undefined;
-    let navigationWake = navigationPending ? Date.now() + MATERIALIZATION_ALARM_DELAY_MS : Number.POSITIVE_INFINITY;
-    if (navigationRetry !== undefined) {
-      const failure = JSON.parse(navigationRetry) as { stopped?: unknown; next_attempt_at?: unknown };
-      const retryAt = typeof failure.next_attempt_at === "string" ? Date.parse(failure.next_attempt_at) : Number.NaN;
-      if (failure.stopped === true) navigationWake = Number.POSITIVE_INFINITY;
-      else if (Number.isFinite(retryAt) && retryAt > Date.now()) navigationWake = Math.max(Date.now() + 1_000, retryAt);
-    }
-    if (!moreWork) {
-      if (navigationPending && Number.isFinite(navigationWake)) await this.ctx.storage.setAlarm(navigationWake);
-      else await this.ctx.storage.deleteAlarm();
-      return;
-    }
-    const now = Date.now();
-    const requested = nextAlarmAt === null ? Number.NaN : Date.parse(nextAlarmAt);
-    const convergenceWakeAt = Number.isFinite(requested) && requested > now
-      ? requested
-      : now + MATERIALIZATION_ALARM_DELAY_MS;
-    const existing = await this.ctx.storage.getAlarm();
-    const wakeAt = Math.min(convergenceWakeAt, navigationWake);
-    // `nextAlarmAt` is the journal's earliest durable deadline. An older
-    // generic materialization alarm must not shorten a retry/backoff window;
-    // if another durable concern were earlier it would already be reflected
-    // in that same minimum wake.
-    if (existing !== wakeAt) {
-      await this.ctx.storage.setAlarm(wakeAt);
+    return this.withWakeScheduleLock(async () => {
+      const navigationItems = await this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: 1 });
+      const navigationPending = navigationItems.size > 0;
+      const navigationItem = navigationItems.entries().next().value as [string, string] | undefined;
+      const navigationRetry = navigationItem
+        ? await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${navigationItem[0].slice(NAVIGATION_WORK_PREFIX.length)}`)
+        : undefined;
+      let navigationWake = navigationPending ? Date.now() + MATERIALIZATION_ALARM_DELAY_MS : Number.POSITIVE_INFINITY;
+      if (navigationRetry !== undefined) {
+        const failure = JSON.parse(navigationRetry) as { stopped?: unknown; next_attempt_at?: unknown };
+        const retryAt = typeof failure.next_attempt_at === "string" ? Date.parse(failure.next_attempt_at) : Number.NaN;
+        if (failure.stopped === true) navigationWake = Number.POSITIVE_INFINITY;
+        else if (Number.isFinite(retryAt) && retryAt > Date.now()) navigationWake = Math.max(Date.now() + 1_000, retryAt);
+      }
+      if (!moreWork) {
+        if (navigationPending && Number.isFinite(navigationWake)) await this.ctx.storage.setAlarm(navigationWake);
+        else await this.ctx.storage.deleteAlarm();
+        return;
+      }
+      const now = Date.now();
+      const requested = nextAlarmAt === null ? Number.NaN : Date.parse(nextAlarmAt);
+      const convergenceWakeAt = Number.isFinite(requested) && requested > now
+        ? requested
+        : now + MATERIALIZATION_ALARM_DELAY_MS;
+      const existing = await this.ctx.storage.getAlarm();
+      const wakeAt = Math.min(convergenceWakeAt, navigationWake);
+      // `nextAlarmAt` is the journal's earliest durable deadline. An older
+      // generic materialization alarm must not shorten a retry/backoff window;
+      // if another durable concern were earlier it would already be reflected
+      // in that same minimum wake.
+      if (existing !== wakeAt) {
+        await this.ctx.storage.setAlarm(wakeAt);
+      }
+    });
+  }
+
+  /** Serialize only the short navigation-work storage/alarm transaction. This
+   * is deliberately separate from the long provider/convergence FIFO. */
+  private async withWakeScheduleLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.wakeScheduleQueue ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    this.wakeScheduleQueue = previous.then(() => held);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 

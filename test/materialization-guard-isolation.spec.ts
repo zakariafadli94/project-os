@@ -172,6 +172,65 @@ describe("MaterializationGuard isolation boundary", () => {
     });
   });
 
+  it("keeps a navigation wake enqueued after the scheduler snapshot without losing convergence backoff", async () => {
+    const projectId = "PRJ-3927";
+    const requestId = "DOCREQ-NAVIGATION-WORKING-3927001";
+    const retryAt = Date.now() + 60_000;
+    const ref = navigationWorkRefSchema.parse({
+      project_id: projectId, request_id: requestId, zone: "WORKING", expected_generation: 0,
+      source_snapshot_id: "source:0",
+      authority_ref: `${await new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "document", requestId).root()}/admission.json`,
+      request_hash: "a".repeat(64)
+    });
+    const stored = new Map<string, string>();
+    let alarm: number | null = null;
+    let reachedSchedulerAlarm!: () => void;
+    let releaseSchedulerAlarm!: () => void;
+    const schedulerAlarmReached = new Promise<void>((resolve) => { reachedSchedulerAlarm = resolve; });
+    const schedulerAlarmRelease = new Promise<void>((resolve) => { releaseSchedulerAlarm = resolve; });
+    const storage = {
+      get: async <T>(key: string) => stored.get(key) as T | undefined,
+      put: async (key: string, value: string) => { stored.set(key, value); },
+      getAlarm: async () => alarm,
+      setAlarm: async (time: number) => {
+        if (time === retryAt) {
+          reachedSchedulerAlarm();
+          await schedulerAlarmRelease;
+        }
+        alarm = time;
+      },
+      deleteAlarm: async () => { alarm = null; },
+      list: async ({ prefix, limit }: { prefix: string; limit?: number }) => new Map([...stored.entries()].filter(([key]) => key.startsWith(prefix)).slice(0, limit))
+    };
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId, env: testEnv, ctx: { id: { name: projectId }, storage }
+    }) as MaterializationGuard;
+    const scheduler = (guard as unknown as { scheduleConvergenceContinuation(moreWork: boolean, nextAlarmAt: string | null): Promise<void> })
+      .scheduleConvergenceContinuation(true, new Date(retryAt).toISOString());
+    await schedulerAlarmReached;
+
+    let enqueueFinished = false;
+    const enqueue = guard.fetch(new Request("https://materialization-guard.internal/navigation-work", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ref)
+    })).then((response) => { enqueueFinished = true; return response; });
+    await vi.waitFor(() => expect(enqueueFinished).toBe(true), { timeout: 30 }).catch(() => undefined);
+    const enqueueWasBlockedByScheduler = !enqueueFinished;
+    releaseSchedulerAlarm();
+    const [response] = await Promise.all([enqueue, scheduler]);
+
+    expect(response.status).toBe(202);
+    expect(stored.get(`navigation-work:${requestId}`)).toBeDefined();
+    expect(alarm).not.toBeNull();
+    expect(alarm!).toBeLessThan(retryAt);
+    expect(enqueueWasBlockedByScheduler).toBe(true);
+
+    stored.delete(`navigation-work:${requestId}`);
+    alarm = null;
+    await (guard as unknown as { scheduleConvergenceContinuation(moreWork: boolean, nextAlarmAt: string | null): Promise<void> })
+      .scheduleConvergenceContinuation(true, new Date(retryAt).toISOString());
+    expect(alarm).toBeGreaterThanOrEqual(retryAt);
+  });
+
   it("checkpoints canonical commit reconstruction and never returns a partial state as current", async () => {
     const projectId = "PRJ-3910";
     const commits = commitFixture(projectId, 8);

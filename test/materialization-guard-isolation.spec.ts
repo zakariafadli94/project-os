@@ -434,7 +434,10 @@ describe("MaterializationGuard isolation boundary", () => {
       projectId: "PRJ-3919",
       layoutMode: "v2",
       env: {},
-      ctx: { storage: { get: async () => undefined } },
+      ctx: { storage: {
+        get: async () => undefined,
+        list: async () => new Map()
+      } },
       queue: Promise.resolve()
     }) as MaterializationGuard;
     const notify = vi.spyOn(materialization as any, "notifyProjectGuardOfCurrentHead").mockResolvedValue(true);

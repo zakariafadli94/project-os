@@ -2112,10 +2112,10 @@ describe("canonical execution boundary in ProjectGuard", () => {
   });
 
   it("fences a prepared navigation after a source-generation interleave and replays duplicate workrefs safely", async () => {
-    const projectId = "PRJ-8324";
+    const projectId = "PRJ-8400";
     const request = {
       operation: "navigation.reconcile" as const,
-      request_id: "DOCREQ-NAVIGATION-WORKING-8324001",
+      request_id: "DOCREQ-NAVIGATION-WORKING-8400001",
       project_id: projectId,
       zone: "WORKING" as const,
       expected_project_revision: 1,
@@ -2144,7 +2144,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(replay).toEqual(first);
 
     await runInDurableObject(guard, (instance) => (instance as any).serialize(() =>
-      (instance as any).recordObservedNavigationSourceMutation(projectId, "WORKING", "package:PKG-NAV-INTERLEAVE-8324")
+      (instance as any).recordObservedNavigationSourceMutation(projectId, "WORKING", "package:PKG-NAV-INTERLEAVE-8400")
     ));
     const publish = await guard.fetch("https://project-guard.internal/navigation-publish", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(first.ref)
@@ -2153,6 +2153,47 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await publish.json()).toMatchObject({ status: "conflict", code: "navigation_snapshot_changed" });
     expect([...mock.files.keys()].some((path) => path.endsWith("/navigation/WORKING/head.json"))).toBe(false);
     expect([...mock.files.keys()].some((path) => path.endsWith("/WORKING/00-CURRENT.md"))).toBe(false);
+  });
+
+  it("releases only the matching unadopted owner after terminal navigation conflict", async () => {
+    const projectId = "PRJ-8401";
+    const request = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAV-CONFLICT-8401",
+      project_id: projectId, zone: "WORKING" as const, expected_project_revision: 1,
+      expected_generation: 0, expected_index: null, created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+    const progressPath = `${prepared.ref.authority_ref.replace(/\/admission\.json$/, "")}/navigation-progress.json`;
+    mock.files.delete(progressPath);
+    const terminal = await guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.ref)
+    });
+    expect(terminal.status).toBe(409);
+    const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({
+      generation: 0, adopted: false, adoption_request_id: null
+    });
+    const successor = { ...request, request_id: "DOCREQ-NAV-CONFLICT-SUCCESSOR-8401" };
+    const successorContext = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(successor, successorContext.context))
+    })).status).toBe(202);
+    expect(await sources.beginAdoption(projectId, "WORKING", successor.request_id, 0)).toBe(true);
+    expect(await sources.abortAdoption(projectId, "WORKING", request.request_id, 0)).toBe(false);
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ adoption_request_id: successor.request_id });
   });
 
   it("stops six identical no-progress navigation failures using the durable recovery ledger", async () => {
@@ -2173,6 +2214,8 @@ describe("canonical execution boundary in ProjectGuard", () => {
       method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
     });
     expect(ingress.status).toBe(202);
+    const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
+    expect(await sources.beginAdoption(projectId, "WORKING", request.request_id, 0)).toBe(true);
     const work = await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (_instance, state) =>
       state.storage.list<string>({ prefix: "navigation-work" })
     );
@@ -2188,6 +2231,11 @@ describe("canonical execution boundary in ProjectGuard", () => {
       });
     }
     expect(await response!.json()).toMatchObject({ status: "stopped", failure_code: "identical_internal_failure_limit" });
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 0, adoption_request_id: null });
+    const successorId = "DOCREQ-NAV-FAILURE-SUCCESSOR-8344";
+    expect(await sources.beginAdoption(projectId, "WORKING", successorId, 0)).toBe(true);
+    expect(await sources.abortAdoption(projectId, "WORKING", request.request_id, 0)).toBe(false);
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ adoption_request_id: successorId });
     const failure = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{ count: number; stopped: number }>(
       "SELECT count, stopped FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
     ).toArray()[0]);

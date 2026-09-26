@@ -100,6 +100,14 @@ export class ZoneNavigationEngine {
       const intent = await this.prepare(request, state, requestHash, indexPath, headPath, intentPath, progressPath, budget);
       if (intent.status === "conflict") return intent;
       let progress = intent.progress;
+      if (progress.status === "adopting" && !progress.inventory_complete
+        && progress.source_count === 0 && progress.source_ids.length === 0
+        && progress.rendered_links.length === 0 && progress.verify_entry === 0
+        && progress.verify_page < progress.page_count) {
+        if (!budget.canStartEffect(2)) return { status: "pending", cursor: progress.cursor };
+        progress.verify_page = progress.page_count;
+        progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+      }
       const done = await this.resumeInventory(request, state, progress, progressPath, pagesRoot, budget);
       if (done.status === "pending" || done.status === "conflict") return done;
       progress = done.progress;
@@ -184,6 +192,7 @@ export class ZoneNavigationEngine {
       if (isBudgetExhausted(error)) {
         return { status: "pending", cursor: null };
       }
+      if (error instanceof Error && error.message === "navigation_listing_stalled") return { status: "conflict", code: "navigation_listing_stalled" };
       if (error instanceof ProviderPreconditionFailedError || error instanceof ProviderConflictError) return { status: "conflict", code: "navigation_provider_conflict" };
       if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
       throw error;

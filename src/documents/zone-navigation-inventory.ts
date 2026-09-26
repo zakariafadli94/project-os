@@ -26,8 +26,12 @@ interface PageCursor { phase: PagePhase; cursor: string | null }
 const MAX_PACKAGE_LEDGER_BYTES = 128_000;
 const MAX_PACKAGE_MANIFEST_BYTES = 256_000;
 const MAX_VISIBLE_SOURCE_BYTES = 2_000_000;
-const MAX_INITIAL_HEADS_PER_PAGE = 8;
+// Initial adoption freezes one bounded provider page in the durable cursor.
+// PRJ-0003 has fewer than 512 heads, so this avoids a Dropbox continuation
+// cursor that can return the same page indefinitely without losing resumability.
+const MAX_INITIAL_HEADS_PER_PAGE = 512;
 const MAX_INITIAL_HEAD_PROVIDER_CALLS = 10;
+const MIN_INACTIVE_HEAD_PROVIDER_CALLS = 2;
 
 interface InitialHeadPageCursor {
   kind: "zone-navigation-head-batch-v1";
@@ -111,7 +115,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     projectId: string,
     zone: NavigationZone,
     cursor: string | null,
-    requestedLimit: number,
+    _requestedLimit: number,
     snapshotId: string,
     budget: SliceBudget
   ) {
@@ -122,9 +126,13 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     let listedEntries: ProviderEntry[];
     let providerCursor: string | null;
     let listingLimit: number;
-    if (savedPage) {
+    if (savedPage && savedPage.entries.length > 0) {
       listedEntries = savedPage.entries;
       providerCursor = savedPage.provider_cursor;
+      listingLimit = savedPage.listing_limit;
+    } else if (savedPage?.provider_cursor === null) {
+      listedEntries = [];
+      providerCursor = null;
       listingLimit = savedPage.listing_limit;
     } else {
       // New listings request a full engine-sized provider page. Any suffix
@@ -132,12 +140,14 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // cursor, so the provider cursor never advances past unprocessed heads.
       // A legacy opaque cursor was created with limit=1; preserve its page
       // size rather than changing pagination semantics mid-request.
-      listingLimit = cursor === null ? Math.max(1, Math.min(requestedLimit, MAX_INITIAL_HEADS_PER_PAGE)) : 1;
+      const listingCursor = savedPage?.provider_cursor ?? cursor;
+      listingLimit = savedPage?.listing_limit ?? (cursor === null ? MAX_INITIAL_HEADS_PER_PAGE : 1);
       requireBudget(budget, 1);
       charge(budget);
       const page = await this.runtime.pagedListing.listPage({
-        path: `${machineDocumentRoot(projectId)}/heads`, cursor, limit: listingLimit
+        path: `${machineDocumentRoot(projectId)}/heads`, cursor: listingCursor, limit: listingLimit
       });
+      if (listingCursor !== null && page.cursor === listingCursor) throw new Error("navigation_listing_stalled");
       listedEntries = page.entries;
       providerCursor = page.cursor;
     }
@@ -160,14 +170,15 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         offset += 1;
         continue;
       }
-      // Budget the worst supported item cost plus the engine's checkpoint
-      // reserve. If it does not fit, leave this item in the returned cursor.
-      if (!budget.canStartEffect(MAX_INITIAL_HEAD_PROVIDER_CALLS)) {
+      // Inactive heads only need a head read and catalog check. Reserve the
+      // larger proof budget after inspecting an active pointer, so historical
+      // inactive heads do not consume a whole recovery slice apiece.
+      if (!budget.canStartEffect(MIN_INACTIVE_HEAD_PROVIDER_CALLS)) {
         if (offset === 0) throw new Error("slice_budget_exhausted");
         break;
       }
       try {
-        const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
+        const resolved = await this.resolveHead(projectId, zone, resourceId, budget, true);
         if (resolved.gap) gaps.push(resolved.gap);
         if (resolved.entry) {
           await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
@@ -569,7 +580,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     };
   }
 
-  private async resolveHead(projectId: string, zone: NavigationZone, resourceId: string, budget: SliceBudget): Promise<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap }> {
+  private async resolveHead(projectId: string, zone: NavigationZone, resourceId: string, budget: SliceBudget, reserveActiveProof = false): Promise<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap }> {
     const match = /^head:(DOC-[A-F0-9]{24})$/.exec(resourceId);
     if (!match) return { entry: null, gap: { resource_id: resourceId, code: "invalid_head_resource_id" } };
     const documentId = match[1];
@@ -582,6 +593,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const pointer = activePointer(head, zone);
     if (!pointer.versionId && !pointer.observation) return { entry: null };
     if (!pointer.versionId || !pointer.observation) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_binding_missing" } };
+    if (reserveActiveProof) requireBudget(budget, MAX_INITIAL_HEAD_PROVIDER_CALLS - 1);
     const observation = normalizeObservation(pointer.observation);
     charge(budget);
     const rawVersion = await this.runtime.objects.readText(machineDocumentVersionPath(projectId, documentId, pointer.versionId));

@@ -107,6 +107,19 @@ export class ZoneNavigationSources {
     return true;
   }
 
+  async abortAdoption(projectId: string, zone: NavigationZone, requestId: string, generation: number, budget?: SliceBudget): Promise<boolean> {
+    const state = await this.readProjectState(projectId, budget);
+    const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
+    if (current.adopted || current.generation !== generation) return false;
+    if (current.adoption_request_id === null) return true;
+    if (current.adoption_request_id !== requestId || current.adoption_generation !== generation) return false;
+    current.adoption_request_id = null;
+    current.adoption_generation = null;
+    state.zones[zone] = current;
+    await this.writeProjectState(projectId, state, budget);
+    return true;
+  }
+
   async listDirtyPage(projectId: string, zone: NavigationZone, cursor: string | null, limit: number, budget?: SliceBudget): Promise<{ resource_ids: string[]; next_cursor: string | null }> {
     if (!this.runtime.pagedListing) throw new Error("navigation_paged_listing_unavailable");
     charge(budget);

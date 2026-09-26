@@ -27,17 +27,33 @@ it("measures warm reads and snapshot costs at 50 and 1000 revisions without clai
     await runInDurableObject(guard, (instance) => {
       (instance as unknown as { env: Env }).env.MUTATION_CONTEXT_SIGNING_KEY = "cost-profile-fixture";
     });
-    expect((await guard.fetch("https://guard.internal/mutation-context")).status).toBe(200);
-    const beforeCalls = mock.providerCalls.length;
-    const beforeDownloads = mock.downloadCalls.length;
-    const beforeUploads = mock.uploadCalls.length;
-    expect((await guard.fetch("https://guard.internal/mutation-context")).status).toBe(200);
-    const warmCalls = mock.providerCalls.length - beforeCalls;
+    const { warmCalls, warmDownloads } = await runInDurableObject(guard, async (instance) => {
+      const contextRequest = () => new Request("https://guard.internal/mutation-context");
+      expect((await instance.fetch(contextRequest())).status).toBe(200);
+      const beforeCalls = mock.providerCalls.length;
+      const beforeDownloads = mock.downloadCalls.length;
+      const beforeUploads = mock.uploadCalls.length;
+      expect((await instance.fetch(contextRequest())).status).toBe(200);
+      const warmCalls = mock.providerCalls.length - beforeCalls;
+      const warmDownloads = mock.downloadCalls.slice(beforeDownloads);
+      expect(mock.uploadCalls.length).toBe(beforeUploads);
+
+      // Model a new DO activation: the SQLite snapshot/checkpoint persist, but
+      // the in-memory proof marker does not. Cold reads re-prove the current
+      // revision before checking its successor.
+      (instance as any).contextVerifiedState = null;
+      const beforeColdDownloads = mock.downloadCalls.length;
+      expect((await instance.fetch(contextRequest())).status).toBe(200);
+      const coldDownloads = mock.downloadCalls.slice(beforeColdDownloads);
+      expect(coldDownloads).toEqual([
+        machineCommitRecordPath(projectId, history),
+        machineCommitRecordPath(projectId, history + 1)
+      ]);
+      return { warmCalls, warmDownloads };
+    });
     expect(warmCalls).toBeLessThanOrEqual(2);
-    const warmDownloads = mock.downloadCalls.slice(beforeDownloads);
     expect(warmDownloads).not.toContain(machineStatePath(projectId));
-    expect(warmDownloads.every((path) => path === machineCommitRecordPath(projectId, history + 1))).toBe(true);
-    expect(mock.uploadCalls.length).toBe(beforeUploads);
+    expect(warmDownloads.every((path) => path === machineCommitRecordPath(projectId, history + 1)), JSON.stringify(warmDownloads)).toBe(true);
 
     // Isolated local commit-cache cost, not the total admission cost. Capture
     // SQLite's actual rowsWritten counters, including indices, for this step.

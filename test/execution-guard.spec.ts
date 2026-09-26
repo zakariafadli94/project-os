@@ -1206,42 +1206,42 @@ describe("canonical execution boundary in ProjectGuard", () => {
       await state.storage.deleteAlarm();
       expect(await state.storage.getAlarm()).toBeNull();
     });
-    const deadlineResponse = await runInDurableObject(guard, (instance) => {
+    const { deadlineResponse, preinstalledAlarmAt } = await runInDurableObject(guard, (instance, state) => {
       const object = instance as any;
-      return object.serialize(() => object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-      }), false));
-    });
-    expect(deadlineResponse.status).toBe(202);
-    // The persisted cursor below proves this invocation consumed exactly one
-    // candidate. A prototype-wide spy can also see unrelated guard alarms.
-    expect(commitReads).toHaveBeenCalledWith(projectId, 9101);
-    const preinstalledAlarmAt = await runInDurableObject(guard, async (_instance, state) => {
-      const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
-      expect(work?.candidates.map(({ revision }) => revision)).toEqual([9102, 9103, 9104, 9105]);
-      expect(await state.storage.getAlarm()).not.toBeNull();
-      await state.storage.put("materialization-finalization-work", {
-        coverage_version: 2,
-        head: {
-          target_revision: completed.target_revision,
-          projection_version: completed.projection_version,
-          result_root_hash: completed.result_root_hash,
-          completed_at: completed.completed_at
-        },
-        next_generation: null, previous_child: null, scan_complete: true,
-        candidates: [{
-          revision: 9201, coverage: "explicit", materialization_revision: completed.target_revision,
-          projection_version: completed.projection_version, result_root_hash: completed.result_root_hash,
-          completed_at: completed.completed_at, source_event_id: completed.source_event_id
-        }]
+      return object.serialize(async () => {
+        const deadlineResponse = await object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+        }), false);
+        expect(deadlineResponse.status).toBe(202);
+        // The persisted cursor below proves this invocation consumed exactly
+        // one candidate. A prototype-wide spy can also see unrelated alarms.
+        expect(commitReads).toHaveBeenCalledWith(projectId, 9101);
+        const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
+        expect(work?.candidates.map(({ revision }) => revision)).toEqual([9102, 9103, 9104, 9105]);
+        expect(await state.storage.getAlarm()).not.toBeNull();
+        await state.storage.put("materialization-finalization-work", {
+          coverage_version: 2,
+          head: {
+            target_revision: completed.target_revision,
+            projection_version: completed.projection_version,
+            result_root_hash: completed.result_root_hash,
+            completed_at: completed.completed_at
+          },
+          next_generation: null, previous_child: null, scan_complete: true,
+          candidates: [{
+            revision: 9201, coverage: "explicit", materialization_revision: completed.target_revision,
+            projection_version: completed.projection_version, result_root_hash: completed.result_root_hash,
+            completed_at: completed.completed_at, source_event_id: completed.source_event_id
+          }]
+        });
+        // The previous phase advanced fake Date past its alarm. Keep that alarm
+        // from racing this explicitly invoked provider-budget slice.
+        const alarmAt = Date.now() + 60_000;
+        await state.storage.setAlarm(alarmAt);
+        return { deadlineResponse, preinstalledAlarmAt: alarmAt };
       });
-      // The previous phase advanced fake Date past its alarm. Keep that alarm
-      // from racing this explicitly invoked provider-budget slice.
-      const alarmAt = Date.now() + 60_000;
-      await state.storage.setAlarm(alarmAt);
-      return alarmAt;
     });
 
     sliceBudget.mockRestore();

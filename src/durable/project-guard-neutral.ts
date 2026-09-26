@@ -1162,6 +1162,9 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_REFRESH_PENDING", cursor: result.cursor }, { status: 503 });
     }
     if (result.status === "conflict") {
+      if (adoptionStarted && result.code === "navigation_listing_stalled") {
+        await sources.abortAdoption(request.project_id, request.zone, request.request_id, sourceState.generation);
+      }
       const receipt: NavigationDocumentReceipt = { operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "conflict", execution_status: "conflict", code: result.code };
       await this.managedDocumentRequests.writeReceipt(request.project_id, request.request_id, JSON.stringify(request), JSON.stringify(receipt));
       await this.settleNavigationReceipt(request, receipt);

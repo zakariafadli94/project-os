@@ -163,6 +163,52 @@ async function inventoryHarness(inputState = state(), zone: "WORKING" | "REVIEW"
   return { port, entry, targetPath, targetContent };
 }
 
+async function seedAdoptingProgress(
+  harness: ReturnType<typeof runtimeHarness>,
+  input: NavigationReconcileRequest,
+  pageCount: number,
+  cursor: string,
+  sourceEntry?: NavigationInventoryEntry
+) {
+  const root = await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).root();
+  const requestHash = await executionHash(input);
+  const progress = {
+    schema_version: "1.0",
+    project_id: input.project_id,
+    request_id: input.request_id,
+    request_hash: requestHash,
+    target_generation: 1,
+    index_basename: "00-CURRENT.md" as const,
+    expected_index: null,
+    head_revision_token: null,
+    cursor,
+    page_count: pageCount,
+    inventory_complete: false,
+    snapshot_id: "snapshot-empty-prefix",
+    verify_page: 0,
+    verify_entry: 0,
+    source_count: sourceEntry ? 1 : 0,
+    source_ids: sourceEntry ? [sourceEntry.resource_id] : [],
+    published_index: null,
+    coverage_gaps: [],
+    rendered_links: [],
+    generated_sha256: null,
+    legacy_archive_ref: null,
+    status: "adopting" as const,
+    receipt: null,
+    postchecks: []
+  };
+  harness.put(`${root}/navigation-intention.json`, JSON.stringify({ schema_version: "1.0", request: input, request_hash: requestHash, target_generation: 1, initial_progress: progress }));
+  harness.put(`${root}/navigation-progress.json`, JSON.stringify(progress));
+  for (let page = 0; page < pageCount; page++) {
+    harness.put(`${root}/navigation/snapshot/${page.toString().padStart(8, "0")}.json`, JSON.stringify({
+      schema_version: "1.0", page, project_id: input.project_id, request_id: input.request_id,
+      snapshot_id: "snapshot-empty-prefix", entries: page === 0 && sourceEntry ? [sourceEntry] : [], gaps: []
+    }));
+  }
+  return { root, progress };
+}
+
 function budget(calls = 32): SliceBudget {
   return {
     deadline_ms: Number.MAX_SAFE_INTEGER,
@@ -367,6 +413,16 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(harness.files.has(`${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT.md`)).toBe(false);
   });
 
+  it("makes a stalled provider listing a terminal navigation conflict without publishing an index", async () => {
+    const h = runtimeHarness();
+    const input = request();
+    const inv = await inventoryHarness();
+    inv.port.listPage = async () => { throw new Error("navigation_listing_stalled"); };
+    const result = await new ZoneNavigationEngine(h.runtime, inv.port).reconcile(input, state(), await admissionFor(input), budget());
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_listing_stalled" });
+    expect(h.files.has(`${workspaceProjectRoot(input.project_id, "project-os")}/WORKING/00-CURRENT.md`)).toBe(false);
+  });
+
   it("archives a BOM-prefixed legacy index byte-for-byte", async () => {
     const harness = runtimeHarness();
     const project = state();
@@ -530,6 +586,66 @@ describe("zone navigation identity and resumable reconciliation", () => {
     const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, port), input, project, await admissionFor(input), 20);
     expect(result.status).toBe("finalized");
     expect(cursors).toEqual([null, "1", "2"]);
+  });
+
+  it("checkpoints a 1000-page empty adoption prefix and resumes verification at the next source", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const seeded = await seedAdoptingProgress(harness, input, 1000, "1000");
+    let listCalls = 0;
+    const verified: string[] = [];
+    inv.port.listPage = async ({ budget: slice }) => {
+      slice.beforeHttp();
+      listCalls += 1;
+      if (listCalls === 1) throw new Error("slice_budget_exhausted");
+      return { entries: [inv.entry], gaps: [], snapshot_id: "snapshot-empty-prefix", next_cursor: null };
+    };
+    inv.port.verifyEntry = async (entry, slice) => { slice.beforeHttp(); verified.push(entry.resource_id); return true; };
+    const snapshotReads: string[] = [];
+    const readText = harness.runtime.objects.readText;
+    harness.runtime.objects.readText = async (path) => {
+      if (path.includes("/navigation/snapshot/")) snapshotReads.push(path);
+      return readText(path);
+    };
+    const engine = new ZoneNavigationEngine(harness.runtime, inv.port);
+    const admission = await admissionFor(input);
+
+    const interrupted = await engine.reconcile(input, project, admission, budget());
+    expect(interrupted.status).toBe("pending");
+    const checkpoint = JSON.parse(harness.files.get(`${seeded.root}/navigation-progress.json`)!.content);
+    expect(checkpoint).toMatchObject({ verify_page: 1000, page_count: 1000, cursor: "1000", snapshot_id: "snapshot-empty-prefix" });
+
+    const resumed = await reconcileUntilTerminal(engine, input, project, admission);
+    expect(resumed.status, JSON.stringify(resumed)).toBe("finalized");
+    expect(snapshotReads).toEqual([`${seeded.root}/navigation/snapshot/00001000.json`]);
+    expect(verified).toEqual([inv.entry.resource_id]);
+  });
+
+  it("does not skip persisted pages when adoption progress already contains a source", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const seeded = await seedAdoptingProgress(harness, input, 1, "next", inv.entry);
+    inv.port.listPage = async ({ budget: slice }) => { slice.beforeHttp(); return { entries: [], gaps: [], snapshot_id: "snapshot-empty-prefix", next_cursor: null }; };
+    const verified: string[] = [];
+    inv.port.verifyEntry = async (entry, slice) => { slice.beforeHttp(); verified.push(entry.resource_id); return true; };
+    const snapshotReads: string[] = [];
+    const readText = harness.runtime.objects.readText;
+    harness.runtime.objects.readText = async (path) => {
+      if (path.includes("/navigation/snapshot/")) snapshotReads.push(path);
+      return readText(path);
+    };
+
+    const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, inv.port), input, project, await admissionFor(input));
+
+    expect(result.status).toBe("finalized");
+    expect(snapshotReads).toContain(`${seeded.root}/navigation/snapshot/00000000.json`);
+    expect(verified).toEqual([inv.entry.resource_id]);
   });
 
   it("returns an old finalized receipt without restoring its index over a newer generation", async () => {

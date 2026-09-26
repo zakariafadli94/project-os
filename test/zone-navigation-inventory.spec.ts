@@ -38,6 +38,7 @@ function harness() {
   const files = new Map<string, { content: string; object_id: string; revision_token: string }>();
   const pageLimits: number[] = [];
   const pagePaths: string[] = [];
+  let providerCalls = 0;
   const missingOnRead = new Set<string>();
   const readErrors = new Map<string, Error>();
   let nextIdentity = 0;
@@ -53,24 +54,27 @@ function harness() {
     providerId: "test",
     objects: {
       readText: async (path) => {
+        providerCalls += 1;
         const error = readErrors.get(path);
         if (error) throw error;
         if (missingOnRead.has(path)) return null;
         return files.get(path)?.content ?? null;
       },
       readBytes: async (path, maxBytes) => {
+        providerCalls += 1;
         const file = files.get(path);
         if (!file) return null;
         const bytes = new TextEncoder().encode(file.content);
         return bytes.length > maxBytes ? null : bytes;
       },
-      createText: async (path, content) => { if (files.has(path)) throw new Error("exists"); put(path, content); },
-      upsertText: async (path, content) => put(path, content),
-      getMetadata: async (path) => metadata(path),
-      listChildren: async () => [],
-      move: async () => {},
-      delete: async (path) => { files.delete(path); },
+      createText: async (path, content) => { providerCalls += 1; if (files.has(path)) throw new Error("exists"); put(path, content); },
+      upsertText: async (path, content) => { providerCalls += 1; put(path, content); },
+      getMetadata: async (path) => { providerCalls += 1; return metadata(path); },
+      listChildren: async () => { providerCalls += 1; return []; },
+      move: async () => { providerCalls += 1; },
+      delete: async (path) => { providerCalls += 1; files.delete(path); },
       deleteIfUnchanged: async (path, expected) => {
+        providerCalls += 1;
         const current = metadata(path);
         if (!current) return "missing";
         if (current.objectId !== expected.objectId || current.revisionToken !== expected.revisionToken) return "changed";
@@ -78,21 +82,23 @@ function harness() {
         return "deleted";
       }
     },
-    conditionalWrite: { writeTextConditional: async (path, content) => { put(path, content); return metadata(path)!; } },
-    serverSideCopy: { copyObject: async () => ({ path: "", objectId: "", revisionToken: "", size: 0 }) },
-    changeFeed: { listChanges: async () => ({ entries: [], cursor: "" }) },
+    conditionalWrite: { writeTextConditional: async (path, content) => { providerCalls += 1; put(path, content); return metadata(path)!; } },
+    serverSideCopy: { copyObject: async () => { providerCalls += 1; return { path: "", objectId: "", revisionToken: "", size: 0 }; } },
+    changeFeed: { listChanges: async () => { providerCalls += 1; return { entries: [], cursor: "" }; } },
     pagedListing: { listPage: async ({ path, cursor, limit }) => {
+      providerCalls += 1;
       pageLimits.push(limit);
       pagePaths.push(path);
-      const matching = [...files.keys()].filter((key) => key.startsWith(`${path}/`)).sort();
+      const matching = [...files.keys()].filter((key) => key.startsWith(`${path}/`) && !key.slice(path.length + 1).includes("/")).sort();
       const start = cursor ? Math.max(0, matching.findIndex((key) => key > cursor)) : 0;
       const page = matching.slice(start, start + limit);
       return { entries: page.map((key) => ({ kind: "file" as const, name: key.slice(path.length + 1), path: key })), cursor: start + page.length < matching.length ? page.at(-1) ?? null : null };
     } },
+    directoryProvisioning: { ensureDirectory: async () => { providerCalls += 1; } },
     evidence: { stableObjectId: { semantics: "stable-through-move" }, revisionToken: { semantics: "opaque-object-revision" }, integrityHash: { semantics: "identified-algorithm" } }
   };
   const sources = new ZoneNavigationSources(runtime);
-  return { runtime, files, pageLimits, pagePaths, missingOnRead, readErrors, put, sources, inventory: new ZoneNavigationInventory(runtime, sources) };
+  return { runtime, files, pageLimits, pagePaths, missingOnRead, readErrors, put, sources, inventory: new ZoneNavigationInventory(runtime, sources), get providerCalls() { return providerCalls; } };
 }
 
 async function seedCommittedArtifact(h: ReturnType<typeof harness>, requestId: string, destinationPath: string, content: string, recordedAt = "2026-09-25T00:00:00Z") {
@@ -313,6 +319,7 @@ describe("ZoneNavigationInventory", () => {
     expect(deferred.entries).toEqual([]);
     expect(deferred.next_cursor?.startsWith("initial:")).toBe(true);
     expect(short.calls_left).toBeGreaterThanOrEqual(0);
+    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: deferred.next_cursor, limit: 8, budget: budget(15) })).rejects.toThrow("slice_budget_exhausted");
     const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: deferred.next_cursor, limit: 8, budget: budget(32) });
     expect(resumed.entries.map((entry) => entry.resource_id)).toEqual([`head:${documentId}`]);
     expect(resumed.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
@@ -597,6 +604,63 @@ describe("ZoneNavigationInventory", () => {
     expect(updates.flatMap((page) => page.entries)[0].expected.content_sha256).toBe(await sha256Text("new body"));
     expect(updates.flatMap((page) => page.entries)[0].expected.content_sha256).not.toBe(original.expected.content_sha256);
     expect(await h.inventory.verifySnapshot({ project_id: projectId, zone: "WORKING", snapshot_id: "source:1", budget: budget() })).toBe(true);
+  });
+
+  it("keeps provider calls for one dirty source delta bounded as unchanged catalog references grow", async () => {
+    const measure = async (count: number) => {
+      const h = harness();
+      const entries: NavigationInventoryEntry[] = [];
+      for (let index = 0; index < count; index += 1) {
+        const suffix = index === 0 ? documentId.slice("DOC-".length) : index.toString(16).padStart(24, "0").toUpperCase();
+        const id = `DOC-${suffix}`;
+        const version = `VER-REQ-${suffix}`;
+        const content = index === 0 ? "before delta" : `unchanged ${index}`;
+        const visiblePath = await addWorkingHead(h, content, "rev-visible", id, version, `draft-${index}.md`);
+        const entry: NavigationInventoryEntry = {
+          project_id: projectId, zone: "WORKING", resource_id: `head:${id}`, version,
+          logical_path: `draft-${index}.md`, path: visiblePath,
+          expected: { object_id: "id:visible", revision_token: "rev-visible", content_sha256: await sha256Text(content), size: new TextEncoder().encode(content).byteLength }
+        };
+        expect(await h.inventory.verifyEntry(entry, budget())).toBe(true);
+        await h.sources.writeCatalogEntry(entry, projectId, "WORKING", entry.resource_id, budget(), 0);
+        await h.sources.recordVerifiedCatalogEntry(entry, "source:0", budget());
+        entries.push(entry);
+      }
+      const firstEntry = entries[0];
+      const firstId = firstEntry.resource_id;
+      const requestId = "DOCREQ-NAVIGATION-WORKING-0001";
+      await h.sources.beginAdoption(projectId, "WORKING", requestId, 0, budget());
+      await h.sources.finishAdoption(projectId, "WORKING", requestId, 0, budget());
+      await h.sources.markCatalogReady(projectId, "WORKING", 0, budget());
+      const ticket = await h.sources.beginHeadWrite(projectId, "WORKING", firstId, budget());
+      const changedPath = await addWorkingHead(h, "after delta", "rev-after", documentId, versionId, "draft-0.md");
+      const changedEntry: NavigationInventoryEntry = {
+        ...firstEntry, path: changedPath,
+        expected: { ...firstEntry.expected, revision_token: "rev-after", content_sha256: await sha256Text("after delta"), size: 11 }
+      };
+      await h.sources.completeHeadWrite(ticket, changedEntry, budget());
+      const before = h.providerCalls;
+      let cursor: string | null = null;
+      let steps = 0;
+      const listedEntries: NavigationInventoryEntry[] = [];
+      const proofs: { resource_id: string; entry_hash: string; persisted: boolean }[] = [];
+      do {
+        const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget() });
+        listedEntries.push(...page.entries);
+        proofs.push(...(page.verified_entries ?? []));
+        cursor = page.next_cursor;
+        steps += 1;
+        if (steps > count + 20) throw new Error("navigation_catalog_scan_unbounded");
+      } while (cursor !== null);
+      expect(listedEntries).toHaveLength(count);
+      expect(proofs).toHaveLength(count);
+      expect(proofs.every((proof) => proof.persisted)).toBe(true);
+      return h.providerCalls - before;
+    };
+
+    const calls100 = await measure(100);
+    const calls1000 = await measure(1000);
+    expect(calls1000).toBeLessThanOrEqual(calls100 + 100);
   });
 
   it("keeps generic ARTIFACTS destinations outside the three navigation zones", async () => {

@@ -91,6 +91,8 @@ export interface NavigationInventoryPort {
     budget: import("../convergence/contract").SliceBudget;
   }): Promise<{
     entries: NavigationInventoryEntry[];
+    /** Server-generated exact entries whose canonical physical bytes were verified in this source snapshot. */
+    verified_entries?: { resource_id: string; entry_hash: string; persisted: boolean }[];
     gaps: NavigationCoverageGap[];
     snapshot_id: string;
     next_cursor: string | null;
@@ -99,6 +101,12 @@ export interface NavigationInventoryPort {
   verifySnapshot(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: import("../convergence/contract").SliceBudget }): Promise<boolean>;
   /** Recheck this exact canonical resource/version; each provider request consumes budget. */
   verifyEntry(entry: NavigationInventoryEntry, budget: import("../convergence/contract").SliceBudget): Promise<boolean>;
+  /** True only when verifyEntry itself checks canonical bytes and stable provider identity. */
+  readonly verificationIncludesPhysicalIntegrity?: boolean;
+  /** Persist a verified exact source entry for bounded reuse in later reconciliations. */
+  recordVerifiedEntry?(entry: NavigationInventoryEntry, snapshot_id: string, budget: import("../convergence/contract").SliceBudget): Promise<void>;
+  /** Persist a compact catalog completion marker only after every snapshot entry was verified. */
+  completeSnapshot?(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: import("../convergence/contract").SliceBudget }): Promise<boolean>;
 }
 
 export interface NavigationPostcheckPort {

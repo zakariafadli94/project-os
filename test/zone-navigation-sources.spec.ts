@@ -97,6 +97,76 @@ describe("ZoneNavigationSources", () => {
     expect(await sources.readState("PRJ-0002", "WORKING", b)).toMatchObject({ generation: 1, adopted: true, in_flight_resource_ids: ["head:DOC-0123456789ABCDEF01234567"] });
   });
 
+  it("does not rewrite shared source state when the exact adoption owner resumes", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    const requestId = "DOCREQ-NAVIGATION-WORKING-0001";
+    await expect(sources.beginAdoption("PRJ-0002", "WORKING", requestId, 0, b)).resolves.toBe(true);
+    const statePath = [...files.keys()].find((path) => path.endsWith("/navigation-sources/state.json"))!;
+    const before = JSON.parse(files.get(statePath)!);
+    await expect(sources.beginAdoption("PRJ-0002", "WORKING", requestId, 0, b)).resolves.toBe(true);
+    const after = JSON.parse(files.get(statePath)!);
+    expect(after.state_revision).toBe(before.state_revision);
+    expect(after.zones.WORKING.adoption_request_id).toBe(requestId);
+  });
+
+  it("treats a missing compact shard listed by the ready manifest as unavailable", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    const e = entry();
+    await sources.recordVerifiedCatalogEntry(e, "source:0", b);
+    await expect(sources.markCatalogReady("PRJ-0002", "WORKING", 0, b)).resolves.toBe(true);
+    const manifestPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    const manifest = JSON.parse(files.get(manifestPath)!);
+    const shard = manifest.shards[0] as number;
+    const path = `${zoneNavigationCatalogRoot("PRJ-0002", "WORKING")}/compact/${shard.toString(16).padStart(2, "0")}.json`;
+    files.delete(path);
+
+    await expect(sources.readCompactCatalogShard("PRJ-0002", "WORKING", shard, 0, b)).rejects.toThrow("navigation_compact_catalog_missing");
+  });
+
+  it("rejects compact entries whose persisted identity hash no longer matches", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    const e = entry();
+    await sources.recordVerifiedCatalogEntry(e, "source:0", b);
+    const manifestPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    const manifest = JSON.parse(files.get(manifestPath)!);
+    const shard = manifest.shards[0] as number;
+    const path = `${zoneNavigationCatalogRoot("PRJ-0002", "WORKING")}/compact/${shard.toString(16).padStart(2, "0")}.json`;
+    const chunk = JSON.parse(files.get(path)!);
+    chunk.entries[0].entry.expected.revision_token = "tampered";
+    files.set(path, JSON.stringify(chunk));
+
+    await expect(sources.readCompactCatalogShard("PRJ-0002", "WORKING", shard, 0, b)).rejects.toThrow("navigation_compact_catalog_proof_invalid");
+  });
+
+  it("does not bless a compact catalog across a generation consumed by a legacy writer", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    const original = entry();
+    const requestId = "DOCREQ-NAVIGATION-WORKING-0001";
+    await sources.beginAdoption("PRJ-0002", "WORKING", requestId, 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", requestId, 0, b);
+    await sources.recordVerifiedCatalogEntry(original, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+
+    const oldTicket = await sources.beginHeadWrite("PRJ-0002", "WORKING", original.resource_id, b);
+    const legacyChanged = { ...original, version: "VER-2123456789ABCDEF01234567", expected: { ...original.expected, revision_token: "legacy-new", content_sha256: "b".repeat(64) } };
+    await sources.completeHeadWrite(oldTicket, legacyChanged, b);
+    const legacyDirty = [...files.keys()].find((path) => path.startsWith(`${zoneNavigationDirtyRoot("PRJ-0002", "WORKING")}/`))!;
+    files.delete(legacyDirty); // Simulate an older runtime consuming its marker without compact-catalog support.
+
+    const next = { ...original, resource_id: "head:DOC-1123456789ABCDEF01234567", version: "VER-1123456789ABCDEF01234567" };
+    const newTicket = await sources.beginHeadWrite("PRJ-0002", "WORKING", next.resource_id, b);
+    await sources.completeHeadWrite(newTicket, next, b);
+    await sources.writeCatalogEntry(next, "PRJ-0002", "WORKING", next.resource_id, b, 2);
+    expect(await sources.finishDirty("PRJ-0002", "WORKING", next.resource_id, next, b)).toBe(true);
+
+    const readyPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    expect(JSON.parse(files.get(readyPath)!).ready_generation).toBe(0);
+  });
+
   it("pages dirty records through pagedListing and clears only the exact verified identity", async () => {
     const { sources, files } = harness();
     const b = budget();

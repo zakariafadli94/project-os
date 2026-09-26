@@ -20,7 +20,7 @@ import { canonicalJson } from "../rules/contract";
 import { MutationGateRepository } from "../mutation-gate/repository";
 import { MutationGateService } from "../mutation-gate/service";
 
-type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "artifact-finalize" | "dirty" | "dirty-package" | "dirty-artifacts" | "dirty-finish" | "catalog";
+type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "artifact-finalize" | "dirty" | "dirty-package" | "dirty-artifacts" | "dirty-finish" | "catalog" | "catalog-compact";
 interface PageCursor { phase: PagePhase; cursor: string | null }
 
 const MAX_PACKAGE_LEDGER_BYTES = 128_000;
@@ -42,6 +42,8 @@ interface InitialHeadPageCursor {
 
 /** Canonical, bounded source adapter used by ZoneNavigationEngine. */
 export class ZoneNavigationInventory implements NavigationInventoryPort {
+  readonly verificationIncludesPhysicalIntegrity = true;
+
   constructor(
     private readonly runtime: ProjectOsPersistenceRuntime,
     private readonly sources: ZoneNavigationSources
@@ -53,7 +55,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     cursor: string | null;
     limit: number;
     budget: SliceBudget;
-  }): Promise<{ entries: NavigationInventoryEntry[]; gaps: NavigationCoverageGap[]; snapshot_id: string; next_cursor: string | null }> {
+  }): Promise<{ entries: NavigationInventoryEntry[]; verified_entries?: { resource_id: string; entry_hash: string; persisted: boolean }[]; gaps: NavigationCoverageGap[]; snapshot_id: string; next_cursor: string | null }> {
     const { project_id: projectId, zone, budget } = input;
     const state = await this.sources.readState(projectId, zone, budget);
     const snapshot_id = `source:${state.generation}`;
@@ -73,11 +75,20 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     if (phase === "dirty-package") return this.dirtyPackagePage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
     if (phase === "dirty-artifacts") return this.dirtyArtifactPage(projectId, zone, providerCursor, snapshot_id, budget);
     if (phase === "dirty-finish") return this.dirtyFinishPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
+    if (phase === "catalog-compact") return this.compactCatalogPage(projectId, zone, providerCursor, snapshot_id, budget, false);
     return this.catalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget, input.cursor === null);
   }
 
   async verifySnapshot(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: SliceBudget }): Promise<boolean> {
     return this.sources.verifySnapshot(input.project_id, input.zone, input.snapshot_id, input.budget);
+  }
+
+  async completeSnapshot(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: SliceBudget }): Promise<boolean> {
+    return this.sources.markCatalogReady(input.project_id, input.zone, generationFromSnapshot(input.snapshot_id), input.budget);
+  }
+
+  async recordVerifiedEntry(entry: NavigationInventoryEntry, snapshot_id: string, budget: SliceBudget): Promise<void> {
+    await this.sources.recordVerifiedCatalogEntry(entry, snapshot_id, budget);
   }
 
   async verifyEntry(entry: NavigationInventoryEntry, budget: SliceBudget): Promise<boolean> {
@@ -123,6 +134,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       entries: [], gaps: [{ resource_id: "heads", code: "paged_listing_unavailable" }, ...unresolvedSourceFamilyGaps()], snapshot_id: snapshotId, next_cursor: null
     };
     const savedPage = cursor === null ? null : parseInitialHeadPageCursor(cursor);
+    const reusingSavedListing = savedPage?.entries.length ? true : false;
     let listedEntries: ProviderEntry[];
     let providerCursor: string | null;
     let listingLimit: number;
@@ -174,7 +186,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // larger proof budget after inspecting an active pointer, so historical
       // inactive heads do not consume a whole recovery slice apiece.
       if (!budget.canStartEffect(MIN_INACTIVE_HEAD_PROVIDER_CALLS)) {
-        if (offset === 0) throw new Error("slice_budget_exhausted");
+        if (offset === 0 && reusingSavedListing) throw new Error("slice_budget_exhausted");
         break;
       }
       try {
@@ -191,7 +203,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
           if (prior) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         }
       } catch (error) {
-        if (isBudgetError(error)) break;
+        if (isBudgetError(error)) {
+          if (offset === 0 && reusingSavedListing) throw error;
+          break;
+        }
         await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         gaps.push({ resource_id: resourceId, code: classifyGap(error) });
       }
@@ -205,6 +220,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         : encodeCursor("initial", JSON.stringify({ kind: "zone-navigation-head-batch-v1", entries: [], provider_cursor: providerCursor, listing_limit: listingLimit } satisfies InitialHeadPageCursor));
     return {
       entries,
+      verified_entries: await Promise.all(entries.map(async (entry) => ({ resource_id: entry.resource_id, entry_hash: await sha256Text(canonicalJson(entry)), persisted: false }))),
       gaps,
       snapshot_id: snapshotId,
       next_cursor: nextCursor
@@ -247,7 +263,9 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       if (resolved.entry) await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resolved.entry.resource_id, budget, generationFromSnapshot(snapshotId));
       else await this.sources.writeCatalogEntry(null, projectId, zone, `package:${selected.ref.package_id}`, budget, generationFromSnapshot(snapshotId));
       return {
-        entries: resolved.entry ? [resolved.entry] : [], gaps, snapshot_id: snapshotId,
+        entries: resolved.entry ? [resolved.entry] : [],
+        ...(resolved.entry ? { verified_entries: [{ resource_id: resolved.entry.resource_id, entry_hash: await sha256Text(canonicalJson(resolved.entry)), persisted: false }] } : {}),
+        gaps, snapshot_id: snapshotId,
         next_cursor: packageIndex + 1 < packages.length ? encodeCursor("packages", JSON.stringify({ package_index: packageIndex + 1, member_index: 0 })) : encodeCursor("artifacts", "")
       };
     } catch (error) {
@@ -404,8 +422,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
       if (resolved.gap) return { entries: [], gaps: [resolved.gap], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
       await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
-      if (!await this.sources.finishDirty(projectId, zone, resourceId, resolved.entry, budget)) return { entries: [], gaps: [{ resource_id: resourceId, code: "dirty_identity_changed" }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
-      return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: dirtyPage.next_cursor !== null ? encodeCursor("dirty", dirtyPage.next_cursor) : encodeCursor("catalog", "") };
+      return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: resourceId, dirty_cursor: dirtyPage.next_cursor, entry: resolved.entry })) };
     } catch (error) {
       if (isBudgetError(error)) throw error;
       return { entries: [], gaps: [{ resource_id: resourceId, code: classifyGap(error) }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
@@ -505,6 +522,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     budget: SliceBudget,
     includeFamilyGaps: boolean
   ) {
+    const compactManifest = await this.sources.compactCatalogManifest(projectId, zone, budget);
+    if (compactManifest?.ready_generation === generationFromSnapshot(snapshotId)) {
+      return this.compactCatalogPage(projectId, zone, cursor, snapshotId, budget, includeFamilyGaps);
+    }
     if (!this.runtime.pagedListing) return {
       entries: [], gaps: [{ resource_id: "catalog", code: "paged_listing_unavailable" }, ...(includeFamilyGaps ? unresolvedSourceFamilyGaps() : [])], snapshot_id: snapshotId, next_cursor: null
     };
@@ -550,6 +571,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         if (record.entry === null) {
           if (typeof record.resource_id !== "string" || item.name !== `${await sha256Text(record.resource_id)}.json`) {
             gaps.push({ resource_id: item.name, code: "canonical_catalog_entry_invalid" });
+          } else {
+            await this.sources.recordVerifiedCatalogTombstone(projectId, zone, record.resource_id, snapshotId, budget);
           }
           // A correctly bound null row is the sidecar's CAS-protected deletion tombstone.
           continue;
@@ -577,6 +600,36 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       gaps,
       snapshot_id: snapshotId,
       next_cursor: page.cursor === null ? null : encodeCursor("catalog", page.cursor)
+    };
+  }
+
+  private async compactCatalogPage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget, includeFamilyGaps: boolean) {
+    const manifest = await this.sources.compactCatalogManifest(projectId, zone, budget);
+    if (!manifest || manifest.ready_generation !== generationFromSnapshot(snapshotId)) throw new Error("navigation_compact_catalog_generation_stale");
+    const shards = manifest.shards;
+    let offset = cursor === null ? 0 : Number(cursor);
+    if (!Number.isInteger(offset) || offset < 0 || offset > shards.length) throw new Error("navigation_inventory_cursor_invalid");
+    const entries: NavigationInventoryEntry[] = [];
+    const gaps: NavigationCoverageGap[] = includeFamilyGaps ? unresolvedSourceFamilyGaps() : [];
+    const firstOffset = offset;
+    while (offset < shards.length && offset - firstOffset < 8) {
+      if (!budget.canStartEffect(1)) {
+        if (offset === firstOffset) throw new Error("slice_budget_exhausted");
+        break;
+      }
+      try {
+        entries.push(...await this.sources.readCompactCatalogShard(projectId, zone, shards[offset], generationFromSnapshot(snapshotId), budget));
+      } catch (error) {
+        if (isBudgetError(error)) throw error;
+        gaps.push({ resource_id: `catalog-shard:${shards[offset]}`, code: classifyGap(error) });
+      }
+      offset += 1;
+    }
+    const next = offset < shards.length ? encodeCursor("catalog-compact", String(offset)) : null;
+    return {
+      entries,
+      verified_entries: await Promise.all(entries.map(async (entry) => ({ resource_id: entry.resource_id, entry_hash: await sha256Text(canonicalJson(entry)), persisted: true }))),
+      gaps, snapshot_id: snapshotId, next_cursor: next
     };
   }
 
@@ -737,7 +790,7 @@ function decodeCursor(value: string): PageCursor {
   const separator = value.indexOf(":");
   if (separator < 1) throw new Error("navigation_inventory_cursor_invalid");
   const phase = value.slice(0, separator);
-  if (phase !== "initial" && phase !== "packages" && phase !== "artifacts" && phase !== "artifact-bindings" && phase !== "artifact-finalize" && phase !== "dirty" && phase !== "dirty-package" && phase !== "dirty-artifacts" && phase !== "dirty-finish" && phase !== "catalog") throw new Error("navigation_inventory_cursor_invalid");
+  if (phase !== "initial" && phase !== "packages" && phase !== "artifacts" && phase !== "artifact-bindings" && phase !== "artifact-finalize" && phase !== "dirty" && phase !== "dirty-package" && phase !== "dirty-artifacts" && phase !== "dirty-finish" && phase !== "catalog" && phase !== "catalog-compact") throw new Error("navigation_inventory_cursor_invalid");
   const encoded = value.slice(separator + 1);
   return { phase, cursor: encoded ? decodeURIComponent(encoded) : null };
 }

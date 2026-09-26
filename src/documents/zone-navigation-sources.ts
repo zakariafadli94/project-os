@@ -7,6 +7,7 @@ import { canonicalJson } from "../rules/contract";
 import { sha256Text } from "./hash";
 
 const zones = ["WORKING", "REVIEW", "DELIVERABLES"] as const;
+export const ZONE_NAVIGATION_CATALOG_SHARDS = 64;
 const zoneStateSchema = z.strictObject({
   generation: z.number().int().nonnegative().safe(),
   adopted: z.boolean(),
@@ -21,6 +22,26 @@ const stateSchema = z.strictObject({
   zones: z.record(z.enum(zones), zoneStateSchema)
 });
 const catalogSchema = z.strictObject({ schema_version: z.literal("1.0"), resource_id: z.string().optional(), entry: z.unknown() });
+const compactEntrySchema = z.strictObject({
+  resource_id: z.string(),
+  source_generation: z.number().int().nonnegative().safe(),
+  entry_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  entry: navigationInventoryEntrySchema
+});
+const compactChunkSchema = z.strictObject({
+  schema_version: z.literal("1.0"),
+  project_id: z.string(),
+  zone: z.enum(zones),
+  shard: z.number().int().nonnegative().max(63),
+  entries: z.array(compactEntrySchema)
+});
+const compactReadySchema = z.strictObject({ schema_version: z.literal("1.0"), project_id: z.string(), zone: z.enum(zones), ready_generation: z.number().int().nonnegative().safe().nullable(), shards: z.array(z.number().int().nonnegative().max(63)).max(ZONE_NAVIGATION_CATALOG_SHARDS) }).superRefine((value, ctx) => {
+  if (new Set(value.shards).size !== value.shards.length || value.shards.some((shard, index) => index > 0 && value.shards[index - 1] >= shard)) {
+    ctx.addIssue({ code: "custom", message: "compact shards must be unique and ordered" });
+  }
+});
+const MAX_COMPACT_CHUNK_ENTRIES = 256;
+const MAX_COMPACT_CHUNK_BYTES = 128_000;
 const dirtySchema = z.strictObject({
   schema_version: z.literal("1.0"),
   resource_id: z.string(),
@@ -56,8 +77,20 @@ export function zoneNavigationCatalogRoot(projectId: string, zone: NavigationZon
   return `${machineDocumentRoot(projectId)}/navigation-sources/${zone}/catalog`;
 }
 
+export function zoneNavigationCompactCatalogRoot(projectId: string, zone: NavigationZone): string {
+  return `${zoneNavigationCatalogRoot(projectId, zone)}/compact`;
+}
+
+function compactReadyPath(projectId: string, zone: NavigationZone): string {
+  return `${zoneNavigationCompactCatalogRoot(projectId, zone)}/ready.json`;
+}
+
 export function zoneNavigationDirtyRoot(projectId: string, zone: NavigationZone): string {
   return `${machineDocumentRoot(projectId)}/navigation-sources/${zone}/dirty`;
+}
+
+function compactChunkPath(projectId: string, zone: NavigationZone, shard: number): string {
+  return `${zoneNavigationCompactCatalogRoot(projectId, zone)}/${shard.toString(16).padStart(2, "0")}.json`;
 }
 
 function statePath(projectId: string): string {
@@ -82,6 +115,7 @@ export class ZoneNavigationSources {
     const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
     if (current.adopted) return current.generation === expectedGeneration;
     if (current.generation !== expectedGeneration || current.in_flight_writes.length) return false;
+    if (current.adoption_request_id === requestId && current.adoption_generation === expectedGeneration) return true;
     if (current.adoption_request_id && (current.adoption_request_id !== requestId || current.adoption_generation !== expectedGeneration)) {
       const priorAdoptionWasInvalidated = current.adoption_generation !== null && current.generation > current.adoption_generation;
       if (!priorAdoptionWasInvalidated) return false;
@@ -167,11 +201,69 @@ export class ZoneNavigationSources {
     if (entry && (entry.project_id !== projectId || entry.zone !== zone || entry.resource_id !== resourceId)) throw new Error("navigation_catalog_binding");
     const content = JSON.stringify({ schema_version: "1.0", resource_id: resourceId, entry });
     const token = await this.readWriteToken(path, budget);
-    if (expectedGeneration !== undefined) {
-      const state = await this.readState(projectId, zone, budget);
-      if (state.generation !== expectedGeneration || state.in_flight_resource_ids.includes(resourceId)) throw new Error("navigation_catalog_snapshot_stale");
-    }
+    const state = await this.readState(projectId, zone, budget);
+    const generation = expectedGeneration ?? state.generation;
+    if (state.generation !== generation || state.in_flight_resource_ids.includes(resourceId)) throw new Error("navigation_catalog_snapshot_stale");
     await this.writeAtToken(path, content, token, budget);
+    // During first adoption the legacy sidecar remains the bounded migration
+    // source. Compact chunks are populated only by verified entries, or by
+    // dirty refreshes after a previously complete compact catalog exists.
+    if (await this.readCatalogReadyGeneration(projectId, zone, budget) !== null) await this.updateCompactCatalogEntry(entry, projectId, zone, resourceId, generation, budget);
+  }
+
+  async recordVerifiedCatalogEntry(entry: NavigationInventoryEntry, snapshotId: string, budget?: SliceBudget): Promise<void> {
+    const generation = /^source:(\d+)$/.exec(snapshotId);
+    if (!generation) throw new Error("navigation_inventory_snapshot_invalid");
+    const sourceGeneration = Number(generation[1]);
+    const state = await this.readState(entry.project_id, entry.zone, budget);
+    if (state.generation !== sourceGeneration || state.in_flight_resource_ids.includes(entry.resource_id)) throw new Error("navigation_catalog_snapshot_stale");
+    await this.updateCompactCatalogEntry(entry, entry.project_id, entry.zone, entry.resource_id, sourceGeneration, budget);
+  }
+
+  async recordVerifiedCatalogTombstone(projectId: string, zone: NavigationZone, resourceId: string, snapshotId: string, budget?: SliceBudget): Promise<void> {
+    const generation = /^source:(\d+)$/.exec(snapshotId);
+    if (!generation) throw new Error("navigation_inventory_snapshot_invalid");
+    const sourceGeneration = Number(generation[1]);
+    const manifest = await this.readCompactManifest(projectId, zone, budget);
+    if (!manifest?.shards.includes(shardFor(resourceId))) return;
+    const state = await this.readState(projectId, zone, budget);
+    if (state.generation !== sourceGeneration || state.in_flight_resource_ids.includes(resourceId)) throw new Error("navigation_catalog_snapshot_stale");
+    await this.updateCompactCatalogEntry(null, projectId, zone, resourceId, sourceGeneration, budget);
+  }
+
+  async readCompactCatalogShard(projectId: string, zone: NavigationZone, shard: number, expectedGeneration: number, budget?: SliceBudget): Promise<NavigationInventoryEntry[]> {
+    if (!Number.isInteger(shard) || shard < 0 || shard >= ZONE_NAVIGATION_CATALOG_SHARDS) throw new Error("navigation_catalog_shard_invalid");
+    const path = compactChunkPath(projectId, zone, shard);
+    charge(budget);
+    const raw = await this.runtime.objects.readText(path);
+    if (raw === null) throw new Error("navigation_compact_catalog_missing");
+    if (new TextEncoder().encode(raw).byteLength > MAX_COMPACT_CHUNK_BYTES) throw new Error("navigation_compact_catalog_chunk_oversize");
+    const chunk = compactChunkSchema.parse(JSON.parse(raw));
+    if (chunk.project_id !== projectId || chunk.zone !== zone || chunk.shard !== shard) throw new Error("navigation_compact_catalog_binding");
+    const result: NavigationInventoryEntry[] = [];
+    const resourceIds = new Set<string>();
+    for (const item of chunk.entries) {
+      if (item.resource_id !== item.entry.resource_id || item.entry.project_id !== projectId || item.entry.zone !== zone
+        || shardFor(item.resource_id) !== shard || item.source_generation > expectedGeneration
+        || item.entry_hash !== await entryHash(item.entry) || resourceIds.has(item.resource_id)) throw new Error("navigation_compact_catalog_proof_invalid");
+      resourceIds.add(item.resource_id);
+      result.push(item.entry);
+    }
+    return result;
+  }
+
+  async compactCatalogManifest(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<z.infer<typeof compactReadySchema> | null> {
+    return this.readCompactManifest(projectId, zone, budget);
+  }
+
+  async markCatalogReady(projectId: string, zone: NavigationZone, generation: number, budget?: SliceBudget): Promise<boolean> {
+    const dirty = await this.listDirtyPage(projectId, zone, null, 1, budget);
+    if (dirty.resource_ids.length || dirty.next_cursor !== null) return false;
+    const state = await this.readProjectState(projectId, budget);
+    const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
+    if (current.generation !== generation || current.in_flight_writes.length) return false;
+    if ((await this.readCompactManifest(projectId, zone, budget))?.ready_generation === generation) return true;
+    return this.writeCatalogReadyGeneration(projectId, zone, generation, budget);
   }
 
   async finishDirty(projectId: string, zone: NavigationZone, resourceId: string, exactEntryOrNull: NavigationInventoryEntry | null, budget?: SliceBudget): Promise<boolean> {
@@ -192,7 +284,9 @@ export class ZoneNavigationSources {
     const current = await this.readCatalogEntry(projectId, zone, resourceId, budget);
     if (canonicalJson(current) !== canonicalJson(exactEntryOrNull)) return false;
     if (!markerMetadata?.objectId || !markerMetadata.revisionToken || !this.runtime.objects.deleteIfUnchanged) return false;
-    return (await this.runtime.objects.deleteIfUnchanged(markerPath, { objectId: markerMetadata.objectId, revisionToken: markerMetadata.revisionToken })) !== "changed";
+    const deleted = (await this.runtime.objects.deleteIfUnchanged(markerPath, { objectId: markerMetadata.objectId, revisionToken: markerMetadata.revisionToken })) !== "changed";
+    if (deleted) await this.advanceReadyCatalogIfClean(projectId, zone, budget);
+    return deleted;
   }
 
   async verifySnapshot(projectId: string, zone: NavigationZone, snapshotId: string, budget?: SliceBudget): Promise<boolean> {
@@ -352,6 +446,99 @@ export class ZoneNavigationSources {
     }
   }
 
+  private async updateCompactCatalogEntry(entry: NavigationInventoryEntry | null, projectId: string, zone: NavigationZone, resourceId: string, generation: number, budget?: SliceBudget): Promise<void> {
+    if (entry && (entry.project_id !== projectId || entry.zone !== zone || entry.resource_id !== resourceId)) throw new Error("navigation_catalog_binding");
+    const shard = shardFor(resourceId);
+    const path = compactChunkPath(projectId, zone, shard);
+    await this.ensureCompactShard(projectId, zone, shard, budget);
+    const before = await this.readWriteToken(path, budget);
+    let entries: z.infer<typeof compactEntrySchema>[] = [];
+    if (before !== null) {
+      charge(budget);
+      const raw = await this.runtime.objects.readText(path);
+      const after = await this.readWriteToken(path, budget);
+      if (before !== after || raw === null) throw new Error("navigation_compact_catalog_changed");
+      const chunk = compactChunkSchema.parse(JSON.parse(raw));
+      if (chunk.project_id !== projectId || chunk.zone !== zone || chunk.shard !== shard) throw new Error("navigation_compact_catalog_binding");
+      entries = chunk.entries;
+    }
+    if (entry) {
+      const expectedHash = await entryHash(entry);
+      const prior = entries.find((item) => item.resource_id === resourceId);
+      if (prior && prior.source_generation === generation && prior.entry_hash === expectedHash && canonicalJson(prior.entry) === canonicalJson(entry)) return;
+    } else if (!entries.some((item) => item.resource_id === resourceId)) return;
+    entries = entries.filter((item) => item.resource_id !== resourceId);
+    if (entry) entries.push({ resource_id: resourceId, source_generation: generation, entry_hash: await entryHash(entry), entry });
+    entries.sort((left, right) => left.resource_id.localeCompare(right.resource_id));
+    if (entries.length > MAX_COMPACT_CHUNK_ENTRIES) throw new Error("navigation_compact_catalog_chunk_full");
+    const content = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone, shard, entries });
+    if (new TextEncoder().encode(content).byteLength > MAX_COMPACT_CHUNK_BYTES) throw new Error("navigation_compact_catalog_chunk_oversize");
+    await this.writeAtToken(path, content, before, budget);
+  }
+
+  private async advanceReadyCatalogIfClean(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<void> {
+    const manifest = await this.readCompactManifest(projectId, zone, budget);
+    if (!manifest) return;
+    const current = await this.readProjectState(projectId, budget);
+    const item = current.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
+    if (item.in_flight_writes.length) return;
+    const dirty = await this.listDirtyPage(projectId, zone, null, 1, budget);
+    if (dirty.resource_ids.length || dirty.next_cursor !== null) return;
+    const latest = await this.readProjectState(projectId, budget);
+    const latestItem = latest.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
+    if (latestItem.generation !== item.generation || latestItem.in_flight_writes.length) return;
+    if (manifest.ready_generation === latestItem.generation) return;
+    // A jump means some source generation was consumed without this writer's
+    // per-resource compact refresh (for example, a rollback/older runtime).
+    // Keep the old manifest stale and require a full verified migration.
+    if (manifest.ready_generation === null || latestItem.generation !== manifest.ready_generation + 1) return;
+    await this.writeCatalogReadyGeneration(projectId, zone, latestItem.generation, budget);
+  }
+
+  private async readCatalogReadyGeneration(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<number | null> {
+    const ready = await this.readCompactManifest(projectId, zone, budget);
+    return ready?.ready_generation ?? null;
+  }
+
+  private async readCompactManifest(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<z.infer<typeof compactReadySchema> | null> {
+    const path = compactReadyPath(projectId, zone);
+    charge(budget);
+    const raw = await this.runtime.objects.readText(path);
+    if (raw === null) return null;
+    const ready = compactReadySchema.parse(JSON.parse(raw));
+    if (ready.project_id !== projectId || ready.zone !== zone) throw new Error("navigation_compact_catalog_binding");
+    return ready;
+  }
+
+  private async writeCatalogReadyGeneration(projectId: string, zone: NavigationZone, generation: number, budget?: SliceBudget): Promise<boolean> {
+    const path = compactReadyPath(projectId, zone);
+    if (await this.readCompactManifest(projectId, zone, budget) === null) await this.ensureCompactDirectory(projectId, zone, budget);
+    const token = await this.readWriteToken(path, budget);
+    const current = token === null ? null : await this.readCompactManifest(projectId, zone, budget);
+    const shards = [...new Set(current?.shards ?? [])].sort((left, right) => left - right);
+    const content = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone, ready_generation: generation, shards });
+    await this.writeAtToken(path, content, token, budget);
+    return true;
+  }
+
+  private async ensureCompactShard(projectId: string, zone: NavigationZone, shard: number, budget?: SliceBudget): Promise<void> {
+    const current = await this.readCompactManifest(projectId, zone, budget);
+    if (current?.shards.includes(shard)) return;
+    if (current === null) await this.ensureCompactDirectory(projectId, zone, budget);
+    const path = compactReadyPath(projectId, zone);
+    const token = await this.readWriteToken(path, budget);
+    const latest = token === null ? null : await this.readCompactManifest(projectId, zone, budget);
+    const shards = [...new Set([...(latest?.shards ?? []), shard])].sort((left, right) => left - right);
+    const content = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone, ready_generation: latest?.ready_generation ?? null, shards });
+    await this.writeAtToken(path, content, token, budget);
+  }
+
+  private async ensureCompactDirectory(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<void> {
+    if (!this.runtime.directoryProvisioning) return;
+    charge(budget);
+    await this.runtime.directoryProvisioning.ensureDirectory(zoneNavigationCompactCatalogRoot(projectId, zone));
+  }
+
   private async readWriteToken(path: string, budget?: SliceBudget): Promise<string | null> {
     charge(budget);
     const metadata = await this.runtime.objects.getMetadata(path);
@@ -408,4 +595,9 @@ export class ZoneNavigationSources {
 }
 
 async function entryHash(entry: NavigationInventoryEntry): Promise<string> { return sha256Text(canonicalJson(entry)); }
+function shardFor(resourceId: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < resourceId.length; index += 1) hash = Math.imul(hash ^ resourceId.charCodeAt(index), 16777619);
+  return (hash >>> 0) % ZONE_NAVIGATION_CATALOG_SHARDS;
+}
 function charge(budget?: SliceBudget): void { budget?.beforeHttp(); }

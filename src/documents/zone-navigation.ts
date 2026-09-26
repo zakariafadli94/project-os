@@ -63,6 +63,7 @@ interface SnapshotPage {
   request_id: string;
   snapshot_id: string;
   entries: NavigationInventoryEntry[];
+  verified_entries?: { resource_id: string; entry_hash: string; persisted: boolean }[];
   gaps: { resource_id: string; code: string }[];
 }
 
@@ -119,6 +120,9 @@ export class ZoneNavigationEngine {
       const verified = await this.verifyEntries(request, state, progress, progressPath, pagesRoot, verifiedRoot, budget);
       if (verified.status === "pending" || verified.status === "conflict") return verified;
       progress = verified.progress;
+      if (this.inventory.completeSnapshot && !await this.inventory.completeSnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id!, budget })) {
+        return { status: "conflict", code: "navigation_snapshot_changed" };
+      }
 
       const generated = this.render(request.zone, progress.rendered_links, progress.coverage_gaps);
       const generatedHash = await sha256Text(generated);
@@ -405,7 +409,14 @@ export class ZoneNavigationEngine {
       for (const entry of entries) this.assertEntry(entry, state, request.zone);
       const seen = new Set(progress.source_ids);
       if (entries.some((entry) => seen.has(entry.resource_id)) || new Set(entries.map((entry) => entry.resource_id)).size !== entries.length) return { status: "conflict", code: "navigation_duplicate_source" };
-      const savedPage: SnapshotPage = { schema_version: "1.0", page: progress.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, gaps };
+      const verifiedEntries = page.verified_entries ?? [];
+      for (const proof of verifiedEntries) {
+        const matching = entries.find((entry) => entry.resource_id === proof.resource_id);
+        if (!matching || !/^[a-f0-9]{64}$/.test(proof.entry_hash) || typeof proof.persisted !== "boolean" || await executionHash(matching) !== proof.entry_hash) {
+          return { status: "conflict", code: "navigation_inventory_proof_invalid" };
+        }
+      }
+      const savedPage: SnapshotPage = { schema_version: "1.0", page: progress.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, ...(verifiedEntries.length ? { verified_entries: verifiedEntries } : {}), gaps };
       await this.immutable(`${pagesRoot}/${progress.page_count.toString().padStart(8, "0")}.json`, savedPage, budget);
       progress.cursor = page.next_cursor;
       progress.snapshot_id = page.snapshot_id;
@@ -437,8 +448,11 @@ export class ZoneNavigationEngine {
       while (progress.verify_entry < page.entries.length) {
         if (!budget.canStartEffect(9)) return { status: "pending", cursor: progress.cursor };
         const entry = page.entries[progress.verify_entry];
-        if (!await this.inventory.verifyEntry(entry, budget)) return { status: "conflict", code: "navigation_source_changed" };
-        await this.verifyPhysicalEntry(entry, budget);
+        const entryHash = await executionHash(entry);
+        const proof = page.verified_entries?.find((item) => item.resource_id === entry.resource_id && item.entry_hash === entryHash);
+        if (!proof && !await this.inventory.verifyEntry(entry, budget)) return { status: "conflict", code: "navigation_source_changed" };
+        if (!proof && !this.inventory.verificationIncludesPhysicalIntegrity) await this.verifyPhysicalEntry(entry, budget);
+        if ((!proof || !proof.persisted) && this.inventory.recordVerifiedEntry) await this.inventory.recordVerifiedEntry(entry, page.snapshot_id, budget);
         const evidence = { schema_version: "1.0", project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entry };
         await this.immutable(`${verifiedRoot}/${progress.source_count.toString().padStart(8, "0")}-${progress.verify_page.toString().padStart(8, "0")}-${progress.verify_entry.toString().padStart(8, "0")}.json`, evidence, budget);
         progress.rendered_links.push(renderLink(entry));

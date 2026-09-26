@@ -18,6 +18,7 @@ import {
 import { classifyCapacityWork } from "../convergence/capacity-work";
 import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
+import { navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, type NavigationReconcileRequest, type NavigationWorkRef } from "../domain/zone-navigation";
 import type { Env } from "../env";
 import { MaterializationCoordinator } from "../materialization/coordinator";
 import { ProviderOperationError } from "../persistence/provider/errors";
@@ -38,11 +39,28 @@ import { parseLayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ProjectRepository } from "../persistence/repository";
+import { ExecutionJournal, executionHash } from "../execution/journal";
+import type { ExecutionAdmission } from "../execution/contract";
+import { ManagedDocumentRequestLedger } from "../documents/request-ledger";
+import { ZoneNavigationEngine } from "../documents/zone-navigation";
+import { ZoneNavigationInventory } from "../documents/zone-navigation-inventory";
+import { ZoneNavigationSources } from "../documents/zone-navigation-sources";
+import { machineDocumentRoot } from "../persistence/layout";
+import { normalizeProjectState } from "../domain/project-state-normalizer";
+import { sha256Canonical } from "../materialization/hash";
+import { canonicalJson } from "../rules/contract";
 
 const MATERIALIZATION_ALARM_DELAY_MS = 1_000;
 const MATERIALIZATION_DEFER_DELAY_MS = 300_000;
 const MATERIALIZATION_COVERAGE_CURSOR_KEY = "materialization-coverage-cursor";
 const CANONICAL_STATE_CURSOR_KEY = "canonical-state-reconstruction-cursor";
+const NAVIGATION_WORK_PREFIX = "navigation-work:";
+const NAVIGATION_RETRY_PREFIX = "navigation-retry:";
+
+interface NavigationWorkSlice {
+  ref: NavigationWorkRef;
+  publish: boolean;
+}
 
 interface CanonicalStateCursor {
   schema_version: "1.0";
@@ -70,6 +88,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   private readonly projectionConcurrency: number;
   private queue: Promise<void> = Promise.resolve();
   private queueDepth = 0;
+  private wakeScheduleQueue?: Promise<void>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -88,6 +107,11 @@ export class MaterializationGuard extends DurableObject<Env> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/request-target") {
       return this.serialize(() => this.handleRequestTarget(request));
+    }
+    if (request.method === "POST" && url.pathname === "/navigation-work") {
+      // This acknowledgement must not queue behind the long materialization
+      // alarm: ProjectGuard may be holding its own serializer while enqueueing.
+      return this.enqueueNavigationWork(request);
     }
     if (request.method === "GET" && url.pathname === "/status") {
       if (this.queueDepth > 0) return this.busyReadResponse();
@@ -113,6 +137,66 @@ export class MaterializationGuard extends DurableObject<Env> {
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
     let notifying = false;
     try {
+      let navigation: NavigationWorkSlice | null = null;
+      try {
+        navigation = await this.serialize(() => this.runNavigationWorkSlice());
+      } catch (error) {
+        if (error instanceof ProviderOperationError || (error instanceof Error && error.message.includes("slice_budget_exhausted"))) throw error;
+        const stored = await this.serialize(() => this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: 1 }));
+        const item = stored.entries().next().value as [string, string] | undefined;
+        if (!item) throw error;
+        const ref = navigationWorkRefSchema.parse(JSON.parse(item[1]));
+        const report = navigationWorkFailureSchema.parse({ ...ref, failure_code: "navigation_work_internal_failure" });
+        const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
+          "https://project-guard.internal/navigation-publish",
+          { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(report) }
+        );
+        const body = await response.json<Record<string, unknown>>();
+        if (!response.ok || body.project_id !== ref.project_id || body.request_id !== ref.request_id
+          || (body.status !== "retry" && body.status !== "stopped")) throw error;
+        if (body.status === "stopped") {
+          await this.serialize(async () => {
+            await this.ctx.storage.delete(this.navigationWorkKey(ref.request_id));
+            await this.ctx.storage.delete(`navigation-context:${ref.request_id}`);
+            await this.ctx.storage.put(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`, canonicalJson({ stopped: true, next_attempt_at: null }));
+          });
+        } else {
+          const retryAt = typeof body.next_attempt_at === "string" ? Date.parse(body.next_attempt_at) : Date.now() + MATERIALIZATION_ALARM_DELAY_MS;
+          await this.serialize(async () => {
+            await this.ctx.storage.put(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`, canonicalJson({ stopped: false, next_attempt_at: new Date(retryAt).toISOString() }));
+            const existing = await this.ctx.storage.getAlarm();
+            if (existing === null || existing > retryAt) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, retryAt));
+          });
+        }
+      }
+      if (navigation) {
+        if (navigation.publish) {
+          const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
+            "https://project-guard.internal/navigation-publish",
+            { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(navigation.ref) }
+          );
+          const responseText = await response.text();
+          let responseBody: Record<string, unknown> | null = null;
+          try { responseBody = JSON.parse(responseText) as Record<string, unknown>; } catch { /* retry below */ }
+          const terminalAck = responseBody?.project_id === this.projectId
+            && responseBody.request_id === navigation.ref.request_id
+            && (responseBody.status === "committed" || responseBody.status === "conflict");
+          if (terminalAck && (response.ok || response.status === 409)) {
+            await this.serialize(async () => {
+              await this.ctx.storage.delete(this.navigationWorkKey(navigation.ref.request_id));
+              await this.ctx.storage.delete(`navigation-context:${navigation.ref.request_id}`);
+              const remaining = await this.ctx.storage.list({ prefix: NAVIGATION_WORK_PREFIX });
+              if (remaining.size > 0) await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+            });
+          } else {
+            await this.serialize(() => this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS));
+          }
+        } else {
+          await this.serialize(() => this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS));
+        }
+        // Continue to the existing materialization slice only after the
+        // navigation callback has released PG and this DO's own queue.
+      }
       const notify = await this.serialize(async () => {
         if (await this.ctx.storage.get<string>(CANONICAL_STATE_CURSOR_KEY)) {
           const { canonicalRepository, budget } = this.coordinatorForSlice();
@@ -244,6 +328,119 @@ export class MaterializationGuard extends DurableObject<Env> {
       project_id: this.projectId,
       requested: this.ledger.status().requested
     });
+  }
+
+  private navigationWorkKey(requestId: string): string {
+    return `${NAVIGATION_WORK_PREFIX}${requestId}`;
+  }
+
+  private async enqueueNavigationWork(request: Request): Promise<Response> {
+    let body: unknown;
+    try { body = await request.json(); } catch { return Response.json({ error: "navigation_workref_invalid" }, { status: 400 }); }
+    const parsed = navigationWorkRefSchema.safeParse(body);
+    if (!parsed.success || parsed.data.project_id !== this.projectId) {
+      return Response.json({ error: "navigation_workref_invalid" }, { status: 400 });
+    }
+    const ref = parsed.data;
+    const authorityPath = `${await new ExecutionJournal(createProductionPersistence(this.env, this.projectId), this.projectId, "document", ref.request_id).root()}/admission.json`;
+    if (ref.authority_ref !== authorityPath) return Response.json({ error: "navigation_authority_ref_invalid" }, { status: 409 });
+    return this.withWakeScheduleLock(async () => {
+      const failureRaw = await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`);
+      if (failureRaw !== undefined) {
+        const failure = JSON.parse(failureRaw) as { stopped?: unknown };
+        if (failure.stopped === true) return Response.json({ error: "navigation_work_stopped" }, { status: 409 });
+      }
+      const key = this.navigationWorkKey(ref.request_id);
+      const value = canonicalJson(ref);
+      const existing = await this.ctx.storage.get<string>(key);
+      if (existing !== undefined && existing !== value) return Response.json({ error: "navigation_workref_conflict" }, { status: 409 });
+      if (existing === undefined) await this.ctx.storage.put(key, value);
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > Date.now() + MATERIALIZATION_ALARM_DELAY_MS) {
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+      }
+      return Response.json({ project_id: this.projectId, request_id: ref.request_id, status: "scheduled" }, { status: 202 });
+    });
+  }
+
+  /** One bounded preparation slice. This runs under MG serialization, but the
+   * later PG publication callback is deliberately made only after returning. */
+  private async runNavigationWorkSlice(): Promise<NavigationWorkSlice | null> {
+    const stored = await this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: 1 });
+    const item = stored.entries().next().value as [string, string] | undefined;
+    if (!item) return null;
+    const requestId = item[0].slice(NAVIGATION_WORK_PREFIX.length);
+    const failureRaw = await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${requestId}`);
+    if (failureRaw !== undefined) {
+      const failure = JSON.parse(failureRaw) as { stopped?: unknown; next_attempt_at?: unknown };
+      if (failure.stopped === true) return null;
+      const retryAt = typeof failure.next_attempt_at === "string" ? Date.parse(failure.next_attempt_at) : Number.NaN;
+      if (Number.isFinite(retryAt) && retryAt > Date.now()) return null;
+      await this.ctx.storage.delete(`${NAVIGATION_RETRY_PREFIX}${requestId}`);
+    }
+    const ref = navigationWorkRefSchema.parse(JSON.parse(item[1]));
+    const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    const runtime = createProductionPersistence(this.env, this.projectId);
+    const contextKey = `navigation-context:${ref.request_id}`;
+    const cachedContext = await this.ctx.storage.get<string>(contextKey);
+    let request: NavigationReconcileRequest;
+    let admission: ExecutionAdmission;
+    let state: ProjectState;
+    if (cachedContext !== undefined) {
+      const saved = JSON.parse(cachedContext) as Record<string, unknown>;
+      if (saved.schema_version !== "1.0" || canonicalJson(saved.ref) !== canonicalJson(ref)
+        || typeof saved.state_hash !== "string" || await sha256Canonical(saved.state) !== saved.state_hash
+        || canonicalJson(saved) !== cachedContext) throw new Error("navigation_work_context_invalid");
+      request = navigationReconcileSchema.parse(saved.request);
+      admission = saved.admission as ExecutionAdmission;
+      state = normalizeProjectState(saved.state as ProjectState);
+    } else {
+      budget.beforeHttp();
+      const intent = await new ManagedDocumentRequestLedger(runtime.objects).readRecoverableIntent(this.projectId, ref.request_id);
+      if (!intent) throw new Error("navigation_work_intent_unavailable");
+      request = navigationReconcileSchema.parse(JSON.parse(intent.request_json));
+      const requestHash = await executionHash(request);
+      const journal = new ExecutionJournal(runtime, this.projectId, "document", ref.request_id);
+      budget.beforeHttp();
+      const admitted = await journal.readAdmission();
+      if (request.project_id !== this.projectId || request.request_id !== ref.request_id || request.zone !== ref.zone
+        || request.expected_generation !== ref.expected_generation || requestHash !== ref.request_hash
+        || !admitted || admitted.admission.project_id !== this.projectId || admitted.admission.request_id !== ref.request_id
+        || admitted.admission.operation !== "navigation.reconcile" || admitted.admission.request_hash !== ref.request_hash
+        || admitted.admission.verdict !== "allow" || admitted.admission.project_revision !== request.expected_project_revision
+        || admitted.admission.resources.length !== 1
+        || admitted.admission.resources[0]?.resource_id !== `navigation:${ref.zone}`
+        || admitted.admission.resources[0]?.resource_type !== "navigation"
+        || admitted.admission.resources[0]?.zone !== ref.zone
+        || admitted.admission.resources[0]?.version !== String(ref.expected_generation)
+        || ref.authority_ref !== `${await journal.root()}/admission.json`) {
+        throw new Error("navigation_work_binding_invalid");
+      }
+      admission = admitted.admission;
+      const frozenPath = `${machineDocumentRoot(this.projectId)}/requests/${ref.request_id}/navigation-admitted-state.json`;
+      budget.beforeHttp();
+      const frozenRaw = await runtime.objects.readText(frozenPath);
+      if (frozenRaw === null) throw new Error("navigation_work_state_unavailable");
+      const frozen = JSON.parse(frozenRaw) as Record<string, unknown>;
+      if (frozen.schema_version !== "1.0" || frozen.project_id !== this.projectId || frozen.request_id !== ref.request_id
+        || frozen.request_hash !== ref.request_hash || frozen.project_revision !== request.expected_project_revision
+        || await sha256Canonical(frozen.state) !== frozen.state_hash || canonicalJson(frozen) !== frozenRaw) {
+        throw new Error("navigation_work_state_invalid");
+      }
+      state = normalizeProjectState(frozen.state as ProjectState);
+      const workContext = { schema_version: "1.0", ref, request, admission, state, state_hash: await sha256Canonical(state) };
+      await this.ctx.storage.put(contextKey, canonicalJson(workContext));
+    }
+    const sources = new ZoneNavigationSources(runtime);
+    const sourceState = await sources.readState(this.projectId, ref.zone, budget);
+    if (`source:${sourceState.generation}` !== ref.source_snapshot_id) return { ref, publish: true };
+    if (sourceState.in_flight_resource_ids.length > 0) return { ref, publish: false };
+    if (!sourceState.adopted && !await sources.beginAdoption(this.projectId, ref.zone, ref.request_id, sourceState.generation, budget)) {
+      return { ref, publish: false };
+    }
+    const inventory = new ZoneNavigationInventory(runtime, sources);
+    const result = await new ZoneNavigationEngine(runtime, inventory).reconcile(request, state, admission, budget, { deferPublication: true });
+    return { ref, publish: result.status !== "pending" };
   }
 
   private async handleStatus(): Promise<Response> {
@@ -1133,22 +1330,54 @@ export class MaterializationGuard extends DurableObject<Env> {
    * alarm invocation.
    */
   private async scheduleConvergenceContinuation(moreWork: boolean, nextAlarmAt: string | null): Promise<void> {
-    if (!moreWork) {
-      await this.ctx.storage.deleteAlarm();
-      return;
-    }
-    const now = Date.now();
-    const requested = nextAlarmAt === null ? Number.NaN : Date.parse(nextAlarmAt);
-    const wakeAt = Number.isFinite(requested) && requested > now
-      ? requested
-      : now + MATERIALIZATION_ALARM_DELAY_MS;
-    const existing = await this.ctx.storage.getAlarm();
-    // `nextAlarmAt` is the journal's earliest durable deadline. An older
-    // generic materialization alarm must not shorten a retry/backoff window;
-    // if another durable concern were earlier it would already be reflected
-    // in that same minimum wake.
-    if (existing !== wakeAt) {
-      await this.ctx.storage.setAlarm(wakeAt);
+    return this.withWakeScheduleLock(async () => {
+      const navigationItems = await this.ctx.storage.list<string>({ prefix: NAVIGATION_WORK_PREFIX, limit: 1 });
+      const navigationPending = navigationItems.size > 0;
+      const navigationItem = navigationItems.entries().next().value as [string, string] | undefined;
+      const navigationRetry = navigationItem
+        ? await this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${navigationItem[0].slice(NAVIGATION_WORK_PREFIX.length)}`)
+        : undefined;
+      let navigationWake = navigationPending ? Date.now() + MATERIALIZATION_ALARM_DELAY_MS : Number.POSITIVE_INFINITY;
+      if (navigationRetry !== undefined) {
+        const failure = JSON.parse(navigationRetry) as { stopped?: unknown; next_attempt_at?: unknown };
+        const retryAt = typeof failure.next_attempt_at === "string" ? Date.parse(failure.next_attempt_at) : Number.NaN;
+        if (failure.stopped === true) navigationWake = Number.POSITIVE_INFINITY;
+        else if (Number.isFinite(retryAt) && retryAt > Date.now()) navigationWake = Math.max(Date.now() + 1_000, retryAt);
+      }
+      if (!moreWork) {
+        if (navigationPending && Number.isFinite(navigationWake)) await this.ctx.storage.setAlarm(navigationWake);
+        else await this.ctx.storage.deleteAlarm();
+        return;
+      }
+      const now = Date.now();
+      const requested = nextAlarmAt === null ? Number.NaN : Date.parse(nextAlarmAt);
+      const convergenceWakeAt = Number.isFinite(requested) && requested > now
+        ? requested
+        : now + MATERIALIZATION_ALARM_DELAY_MS;
+      const existing = await this.ctx.storage.getAlarm();
+      const wakeAt = Math.min(convergenceWakeAt, navigationWake);
+      // `nextAlarmAt` is the journal's earliest durable deadline. An older
+      // generic materialization alarm must not shorten a retry/backoff window;
+      // if another durable concern were earlier it would already be reflected
+      // in that same minimum wake.
+      if (existing !== wakeAt) {
+        await this.ctx.storage.setAlarm(wakeAt);
+      }
+    });
+  }
+
+  /** Serialize only the short navigation-work storage/alarm transaction. This
+   * is deliberately separate from the long provider/convergence FIFO. */
+  private async withWakeScheduleLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.wakeScheduleQueue ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    this.wakeScheduleQueue = previous.then(() => held);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 

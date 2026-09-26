@@ -248,6 +248,23 @@ async function reconcileUntilTerminal(engine: ZoneNavigationEngine, input: Navig
 }
 
 describe("zone navigation identity and resumable reconciliation", () => {
+  it("prepares a verified generation without publishing any visible index or head", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const inventory = await inventoryHarness(project);
+    seedTarget(harness, inventory);
+    const admission = await admissionFor(input);
+    await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).commit(admission, null);
+
+    const result = await new ZoneNavigationEngine(harness.runtime, inventory.port)
+      .reconcile(input, project, admission, budget(), { deferPublication: true });
+
+    expect(result).toMatchObject({ status: "prepared", source_snapshot_id: "snapshot-1" });
+    expect(harness.files.has(`${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT.md`)).toBe(false);
+    expect(harness.files.has(`${machineDocumentRoot(project.project_id)}/navigation/WORKING/head.json`)).toBe(false);
+  });
+
   it("finalizes an immutable historical receipt after a newer navigation generation replaces the head", async () => {
     const harness = runtimeHarness();
     const project = state();

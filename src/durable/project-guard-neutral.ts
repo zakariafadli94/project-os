@@ -15,7 +15,7 @@ import {
 } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
-import { navigationReconcileSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema, type NavigationReconcileRequest, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
+import { navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema, type NavigationReconcileRequest, type NavigationWorkRef, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
 import type { PackageRef } from "../domain/document-package";
 import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH, type CompletedMaterializationRecord } from "../domain/materialization";
 import type { Env } from "../env";
@@ -432,6 +432,10 @@ export class ProjectGuard extends DurableObject<Env> {
 
     if (request.method === "POST" && pathname === "/document") {
       return this.serialize(() => this.handleManagedDocument(request)).catch((error) => this.admissionErrorResponse(error));
+    }
+
+    if (request.method === "POST" && pathname === "/navigation-publish") {
+      return this.serialize(() => this.handleNavigationPublish(request)).catch((error) => this.admissionErrorResponse(error));
     }
 
     if (request.method === "GET" && pathname === "/document-status") {
@@ -1206,50 +1210,165 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async executeNavigationSlice(request: NavigationReconcileRequest, state: ProjectState, admission: ExecutionAdmission): Promise<Response> {
+    const stopped = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; stopped: number; message: string }>(
+      "SELECT stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+    ).toArray()[0];
+    if (stopped?.stopped) {
+      const diagnostic = this.parseRecoveryFailureDiagnostic(stopped.message);
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+        status: "pending", code: diagnostic?.code ?? "EXECUTION_RECOVERY_STOPPED" }, { status: 503 });
+    }
     const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
     const sources = new ZoneNavigationSources(this.persistence);
-    let adoptionStarted = false;
     const sourceState = await sources.readState(request.project_id, request.zone, budget);
-    if (!sourceState.adopted) {
-      adoptionStarted = true;
-      if (!await sources.beginAdoption(request.project_id, request.zone, request.request_id, sourceState.generation, budget)) {
-        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
-        return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
-      }
+    const ref: NavigationWorkRef = navigationWorkRefSchema.parse({
+      project_id: request.project_id,
+      request_id: request.request_id,
+      zone: request.zone,
+      expected_generation: request.expected_generation,
+      source_snapshot_id: `source:${sourceState.generation}`,
+      authority_ref: `${await new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id).root()}/admission.json`,
+      request_hash: await sha256Canonical(request)
+    });
+    let response: Response;
+    try {
+      response = await this.env.MATERIALIZATION_GUARD.getByName(request.project_id).fetch("https://materialization-guard.internal/navigation-work", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ref)
+      });
+      await response.text();
+    } catch {
+      response = new Response(null, { status: 503 });
     }
-    const inventory = new ZoneNavigationInventory(this.persistence, sources);
-    const result = await new ZoneNavigationEngine(this.persistence, inventory).reconcile(request, state, admission, budget);
-    if (result.status === "pending") {
+    if (!response.ok) {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
-      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_REFRESH_PENDING", cursor: result.cursor }, { status: 503 });
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_RECOVERY_SCHEDULED" }, { status: 503 });
     }
-    if (result.status === "conflict") {
-      if (adoptionStarted && result.code === "navigation_listing_stalled") {
-        await sources.abortAdoption(request.project_id, request.zone, request.request_id, sourceState.generation);
+    return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_PREPARATION_SCHEDULED" }, { status: 202 });
+  }
+
+  private async handleNavigationPublish(request: Request): Promise<Response> {
+    let raw: unknown;
+    try { raw = await request.json(); } catch { return Response.json({ error: "navigation_workref_invalid" }, { status: 400 }); }
+    const failure = navigationWorkFailureSchema.safeParse(raw);
+    if (failure.success) return this.handleNavigationWorkFailure(failure.data);
+    const parsed = navigationWorkRefSchema.safeParse(raw);
+    if (!parsed.success) return Response.json({ error: "navigation_workref_invalid" }, { status: 400 });
+    const ref = parsed.data;
+    if (ref.project_id !== this.ctx.id.name) return Response.json({ error: "project_binding_mismatch" }, { status: 409 });
+    const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    budget.beforeHttp();
+    const intent = await this.managedDocumentRequests.readRecoverableIntent(ref.project_id, ref.request_id);
+    if (!intent) return Response.json({ error: "navigation_intent_unavailable" }, { status: 409 });
+    const nav = navigationReconcileSchema.parse(JSON.parse(intent.request_json));
+    const requestHash = await sha256Canonical(nav);
+    const journal = new ExecutionJournal(this.persistence, ref.project_id, "document", ref.request_id);
+    budget.beforeHttp();
+    const admitted = await journal.readAdmission();
+    if (nav.project_id !== ref.project_id || nav.request_id !== ref.request_id || nav.zone !== ref.zone
+      || nav.expected_generation !== ref.expected_generation || intent.request_sha256 !== await sha256Text(intent.request_json)
+      || requestHash !== ref.request_hash || !admitted || admitted.admission.operation !== "navigation.reconcile"
+      || admitted.admission.request_hash !== ref.request_hash
+      || ref.authority_ref !== `${await journal.root()}/admission.json`
+      || admitted.admission.resources.length !== 1
+      || admitted.admission.resources[0]?.resource_id !== `navigation:${ref.zone}`
+      || admitted.admission.resources[0]?.resource_type !== "navigation"
+      || admitted.admission.resources[0]?.version !== String(ref.expected_generation)) {
+      return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", code: "navigation_workref_binding_mismatch" }, { status: 409 });
+    }
+    const frozenState = await this.readFrozenNavigationState(nav, ref.request_hash, budget, true);
+    const sources = new ZoneNavigationSources(this.persistence);
+    const sourceState = await sources.readState(nav.project_id, nav.zone, budget);
+    const sourceGeneration = Number(ref.source_snapshot_id.slice("source:".length));
+    if (`source:${sourceState.generation}` !== ref.source_snapshot_id
+      || (!sourceState.adopted && sourceState.adoption_request_id !== nav.request_id)) {
+      if (!sourceState.adopted && sourceState.generation === sourceGeneration
+        && sourceState.adoption_request_id === nav.request_id) {
+        await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceGeneration, budget);
       }
-      const receipt: NavigationDocumentReceipt = { operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "conflict", execution_status: "conflict", code: result.code };
-      await this.managedDocumentRequests.writeReceipt(request.project_id, request.request_id, JSON.stringify(request), JSON.stringify(receipt));
-      await this.settleNavigationReceipt(request, receipt);
+      const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: "navigation_snapshot_changed" };
+      await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
+      await this.settleNavigationReceipt(nav, receipt);
       return Response.json(receipt, { status: 409 });
     }
-    if (adoptionStarted && budget.calls_left >= 5) {
-      if (!await sources.finishAdoption(request.project_id, request.zone, request.request_id, sourceState.generation, budget)) {
-        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
-        return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
-      }
-    } else if (adoptionStarted) {
-      // Leave the alarm armed: a fresh slice can settle adoption after the
-      // engine's request-local progress short-circuits to its receipt.
+    const inventory = new ZoneNavigationInventory(this.persistence, sources);
+    const result = await new ZoneNavigationEngine(this.persistence, inventory).publishPrepared(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
+    if (result.status === "pending") {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
-      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
+      return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "pending", code: "NAVIGATION_PUBLICATION_PENDING", cursor: result.cursor }, { status: 503 });
+    }
+    if (result.status === "prepared") {
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "pending", code: "NAVIGATION_PUBLICATION_PENDING" }, { status: 503 });
+    }
+    if (result.status === "conflict") {
+      if (!sourceState.adopted && sourceState.generation === sourceGeneration
+        && sourceState.adoption_request_id === nav.request_id) {
+        await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceGeneration, budget);
+      }
+      const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: result.code };
+      await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
+      await this.settleNavigationReceipt(nav, receipt);
+      return Response.json(receipt, { status: 409 });
+    }
+    if (!sourceState.adopted) {
+      if (budget.calls_left < 5 || !await sources.finishAdoption(nav.project_id, nav.zone, nav.request_id, sourceState.generation, budget)) {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
+      }
     }
     const receipt: NavigationDocumentReceipt = {
-      operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+      operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id,
       status: "committed", execution_status: "pending", navigation_receipt: result.receipt
     };
-    await this.managedDocumentRequests.writeReceipt(request.project_id, request.request_id, JSON.stringify(request), JSON.stringify(receipt));
-    await this.settleNavigationReceipt(request, receipt);
-    return Response.json(await this.currentNavigationReceipt(request, receipt));
+    await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
+    await this.settleNavigationReceipt(nav, receipt);
+    return Response.json(await this.currentNavigationReceipt(nav, receipt));
+  }
+
+  private async handleNavigationWorkFailure(report: ReturnType<typeof navigationWorkFailureSchema.parse>): Promise<Response> {
+    const ref = report;
+    if (ref.project_id !== this.ctx.id.name) return Response.json({ error: "project_binding_mismatch" }, { status: 409 });
+    const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    budget.beforeHttp();
+    const intent = await this.managedDocumentRequests.readRecoverableIntent(ref.project_id, ref.request_id);
+    if (!intent) return Response.json({ error: "navigation_intent_unavailable" }, { status: 409 });
+    const nav = navigationReconcileSchema.parse(JSON.parse(intent.request_json));
+    const requestHash = await sha256Canonical(nav);
+    const journal = new ExecutionJournal(this.persistence, ref.project_id, "document", ref.request_id);
+    budget.beforeHttp();
+    const admitted = await journal.readAdmission();
+    if (nav.project_id !== ref.project_id || nav.request_id !== ref.request_id || nav.zone !== ref.zone
+      || nav.expected_generation !== ref.expected_generation || intent.request_sha256 !== await sha256Text(intent.request_json)
+      || requestHash !== ref.request_hash || !admitted || admitted.admission.operation !== "navigation.reconcile"
+      || admitted.admission.request_hash !== ref.request_hash
+      || ref.authority_ref !== `${await journal.root()}/admission.json`
+      || admitted.admission.resources.length !== 1
+      || admitted.admission.resources[0]?.resource_id !== `navigation:${ref.zone}`
+      || admitted.admission.resources[0]?.resource_type !== "navigation"
+      || admitted.admission.resources[0]?.version !== String(ref.expected_generation)) {
+      return Response.json({ error: "navigation_workref_binding_mismatch" }, { status: 409 });
+    }
+    const source = await new ZoneNavigationSources(this.persistence).readState(ref.project_id, ref.zone, budget);
+    if (`source:${source.generation}` !== ref.source_snapshot_id) {
+      return this.handleNavigationPublish(new Request("https://project-guard.internal/navigation-publish", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ref)
+      }));
+    }
+    const progress = await this.recoveryProgressFingerprint("document", ref.request_id);
+    const failure = await this.recordRecoveryFailure("document", ref.request_id, new Error(report.failure_code), progress);
+    const sourceGeneration = Number(ref.source_snapshot_id.slice("source:".length));
+    if (failure.stopped && !source.adopted && source.generation === sourceGeneration
+      && source.adoption_request_id === ref.request_id) {
+      await new ZoneNavigationSources(this.persistence).abortAdoption(ref.project_id, ref.zone, ref.request_id, sourceGeneration, budget);
+    }
+    if (!failure.stopped) await this.armRequestRecoveryAlarm(failure.delay_ms);
+    return Response.json({
+      project_id: ref.project_id,
+      request_id: ref.request_id,
+      status: failure.stopped ? "stopped" : "retry",
+      failure_code: failure.code,
+      next_attempt_at: failure.next_attempt_at
+    });
   }
 
   private async writeFrozenNavigationState(request: NavigationReconcileRequest, requestHash: string, state: ProjectState): Promise<void> {
@@ -1260,8 +1379,9 @@ export class ProjectGuard extends DurableObject<Env> {
     catch (error) { if (await this.persistence.objects.readText(path) !== content) throw error; }
   }
 
-  private async readFrozenNavigationState(request: NavigationReconcileRequest, requestHash: string): Promise<ProjectState> {
+  private async readFrozenNavigationState(request: NavigationReconcileRequest, requestHash: string, budget?: ReturnType<typeof createSliceBudget>, requireExisting = false): Promise<ProjectState> {
     const path = `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/navigation-admitted-state.json`;
+    budget?.beforeHttp();
     const raw = await this.persistence.objects.readText(path);
     if (raw !== null) {
       const record = JSON.parse(raw) as Record<string, unknown>;
@@ -1271,6 +1391,7 @@ export class ProjectGuard extends DurableObject<Env> {
         || await sha256Canonical(record.state) !== record.state_hash || canonicalJson(record) !== raw) throw new Error("navigation_admitted_state_invalid");
       return normalizeProjectState(record.state as ProjectState);
     }
+    if (requireExisting) throw new Error("navigation_admitted_state_unavailable");
     const commit = await this.repository.readCommitRecord(request.project_id, request.expected_project_revision);
     if (commit?.state && commit.state.revision === request.expected_project_revision) {
       await this.writeFrozenNavigationState(request, requestHash, commit.state);
@@ -1775,7 +1896,13 @@ export class ProjectGuard extends DurableObject<Env> {
         calls += 1;
       }
     });
-    const source = new ExecutionJournal(runtime, projectId, kind, requestId).status();
+    const journal = new ExecutionJournal(runtime, projectId, kind, requestId);
+    const source = Promise.all([
+      journal.status(),
+      kind === "document"
+        ? journal.root().then((root) => runtime.objects.readText(`${root}/navigation-progress.json`))
+        : Promise.resolve(null)
+    ]);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
@@ -1784,20 +1911,25 @@ export class ProjectGuard extends DurableObject<Env> {
         reject(error);
       }, Math.max(1, deadlineMs - Date.now()));
     });
-    let progress: Awaited<ReturnType<ExecutionJournal["status"]>>;
+    let observed: Awaited<typeof source>;
     try {
-      progress = await Promise.race([source, timeout]);
+      observed = await Promise.race([source, timeout]);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
-    if (!progress) return sha256Text("no_execution_progress");
+    const [progress, navigationRaw] = observed;
+    const navigationProgressDigest = navigationRaw === null
+      ? null
+      : await sha256Text(navigationRaw);
+    if (!progress) return sha256Text(JSON.stringify({ status: "no_execution_progress", navigation_progress: navigationProgressDigest }));
     return sha256Text(JSON.stringify({
       status: progress.status,
       terminal: progress.terminal,
       completed_steps: progress.completed_steps,
       postchecks: progress.postchecks,
       receipt_ref: progress.receipt_ref,
-      finalization_ref: progress.finalization_ref ?? null
+      finalization_ref: progress.finalization_ref ?? null,
+      navigation_progress: navigationProgressDigest
     }));
   }
 
@@ -4007,6 +4139,23 @@ export class ProjectGuard extends DurableObject<Env> {
       const execution = body.execution as Record<string, any> | undefined;
       const receiptId = kind === "transaction" ? receipt?.transaction_id : receipt?.request_id;
       const executionRoot = await new ExecutionJournal(this.persistence, projectId, kind, requestId).root();
+      const terminalReceiptRef = kind === "document"
+        ? `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`
+        : kind === "artifact" ? machineArtifactReceiptPath(requestId) : null;
+      const terminalStatus = receipt?.status;
+      const terminalReceiptAndBound = (terminalStatus === "conflict" || terminalStatus === "rejected")
+        && body.project_id === projectId && body.kind === kind && body.request_id === requestId
+        && body.status === terminalStatus && receipt?.project_id === projectId && receiptId === requestId
+        && execution?.project_id === projectId && execution.kind === kind && execution.request_id === requestId
+        && execution.status === terminalStatus && execution.terminal === true
+        && execution.admission_ref === `${executionRoot}/admission.json`
+        && typeof execution.request_hash === "string" && /^[a-f0-9]{64}$/.test(execution.request_hash)
+        && execution.receipt_ref === terminalReceiptRef
+        && observation?.project_id === projectId && observation.kind === kind && observation.request_id === requestId
+        && observation.status === terminalStatus && observation.receipt_status === terminalStatus
+        && observation.execution_status === terminalStatus && observation.terminal === true
+        && observation.freshness === "verified";
+      if (terminalReceiptAndBound) return response;
       const finalizationRef = execution?.finalization_ref;
       const finalizationPrefix = `${executionRoot}/finalizations/`;
       const validFinalizationRef = typeof finalizationRef === "string" && finalizationRef.startsWith(finalizationPrefix)

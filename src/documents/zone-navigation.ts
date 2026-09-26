@@ -81,7 +81,8 @@ export class ZoneNavigationEngine {
     rawRequest: NavigationReconcileRequest,
     state: ProjectState,
     admission: ExecutionAdmission,
-    budget: SliceBudget
+    budget: SliceBudget,
+    options: { deferPublication?: boolean } = {}
   ): Promise<ZoneNavigationResult> {
     const request = navigationReconcileSchema.parse(rawRequest);
     const requestHash = await executionHash(request);
@@ -130,6 +131,7 @@ export class ZoneNavigationEngine {
       if (!await this.inventory.verifySnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id!, budget })) {
         return { status: "conflict", code: "navigation_snapshot_changed" };
       }
+      if (options.deferPublication) return { status: "prepared", source_snapshot_id: progress.snapshot_id! };
 
       const sourcePath = this.indexPath(state, request.zone, progress.index_basename);
       const archiveRef = await this.archiveSource(request, state, progress, sourcePath, budget);
@@ -192,6 +194,123 @@ export class ZoneNavigationEngine {
       if (isBudgetExhausted(error)) {
         return { status: "pending", cursor: null };
       }
+      if (error instanceof Error && error.message === "navigation_listing_stalled") return { status: "conflict", code: "navigation_listing_stalled" };
+      if (error instanceof ProviderPreconditionFailedError || error instanceof ProviderConflictError) return { status: "conflict", code: "navigation_provider_conflict" };
+      if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
+      throw error;
+    }
+  }
+
+  /** Publish only a generation already prepared by the navigation worker. The
+   * PG boundary uses this method while serialized; a forged/early workref must
+   * never make PG perform an unbounded inventory scan. */
+  async publishPrepared(
+    rawRequest: NavigationReconcileRequest,
+    state: ProjectState,
+    admission: ExecutionAdmission,
+    budget: SliceBudget,
+    expectedSnapshotId: string
+  ): Promise<ZoneNavigationResult> {
+    const request = navigationReconcileSchema.parse(rawRequest);
+    const requestHash = await executionHash(request);
+    const root = await new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id).root();
+    const path = `${root}/navigation-progress.json`;
+    const indexPath = this.indexPath(state, request.zone, request.expected_index?.basename ?? "00-CURRENT.md");
+    const generatedPath = `${root}/navigation/generated-index.md`;
+    const headPath = zoneNavigationHeadPath(request.project_id, request.zone);
+    try {
+      this.assertAdmission(request, state, admission, requestHash, indexPath);
+      budget.beforeHttp();
+      const raw = await this.runtime.objects.readText(path);
+      if (raw === null) return { status: "conflict", code: "navigation_preparation_unavailable" };
+      let progress = navigationProgressSchema.parse(JSON.parse(raw));
+      if (progress.project_id !== request.project_id || progress.request_id !== request.request_id
+        || progress.request_hash !== requestHash || !progress.inventory_complete
+        || progress.verify_page < progress.page_count || progress.snapshot_id !== expectedSnapshotId
+        || !progress.generated_sha256 || canonicalJson(progress) !== raw) {
+        return { status: "conflict", code: "navigation_preparation_binding_mismatch" };
+      }
+      if (progress.status === "finalized" && progress.receipt) {
+        const receipt = zoneNavigationReceiptSchema.parse(progress.receipt);
+        if (receipt.project_id === request.project_id && receipt.request_id === request.request_id
+          && receipt.zone === request.zone && receipt.source_snapshot_id === expectedSnapshotId) {
+          return { status: "finalized", receipt };
+        }
+        return { status: "conflict", code: "navigation_preparation_binding_mismatch" };
+      }
+      if (progress.status !== "publishing") return { status: "conflict", code: "navigation_preparation_binding_mismatch" };
+
+      // Publication resumes from the durable, already verified cursor. Calling
+      // reconcile here would re-enter inventory and per-entry verification on
+      // every PG callback, starving the bounded head publication forever.
+      if (!await this.inventory.verifySnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: expectedSnapshotId, budget })) {
+        return { status: "conflict", code: "navigation_snapshot_changed" };
+      }
+      const generated = await this.readText(generatedPath, budget);
+      if (generated === null || await sha256Text(generated) !== progress.generated_sha256
+        || generated !== this.render(request.zone, progress.rendered_links, progress.coverage_gaps)) {
+        return { status: "conflict", code: "navigation_generated_input_changed" };
+      }
+      const sourcePath = this.indexPath(state, request.zone, progress.index_basename);
+      const archive = await this.archiveSource(request, state, progress, sourcePath, budget);
+      if (archive.status === "conflict") return archive;
+      if (progress.legacy_archive_ref !== archive.ref) {
+        progress.legacy_archive_ref = archive.ref;
+        progress = await this.saveProgress(path, progress, await this.token(path, budget), budget);
+      }
+
+      let index: NavigationIndexIdentity;
+      if (progress.published_index) {
+        const observed = await this.observeIndex(sourcePath, budget);
+        if (!observed || !sameIndexIdentity(observed.identity, progress.published_index) || observed.content !== generated) {
+          return { status: "conflict", code: "navigation_index_changed" };
+        }
+        index = observed.identity;
+      } else {
+        const write = await this.publishIndex(sourcePath, generated, progress.expected_index, budget);
+        if (write.status === "conflict") return write;
+        index = write.identity;
+        progress.published_index = index;
+        progress = await this.saveProgress(path, progress, await this.token(path, budget), budget);
+      }
+      const checks = await this.runPostchecks(request, admission, progress, path, budget);
+      if (checks.status === "conflict") return checks;
+
+      const certificate = {
+        schema_version: "1.0",
+        project_id: request.project_id,
+        request_id: request.request_id,
+        request_hash: requestHash,
+        zone: request.zone,
+        generation: progress.target_generation,
+        index,
+        legacy_archive_ref: progress.legacy_archive_ref,
+        source_snapshot_id: progress.snapshot_id,
+        source_count: progress.source_count,
+        coverage_gaps: progress.coverage_gaps,
+        postchecks: checks.records,
+        generated_content_sha256: progress.generated_sha256
+      };
+      const finalizationRef = `${root}/navigation/finalizations/${await executionHash(certificate)}.json`;
+      await this.immutable(finalizationRef, certificate, budget);
+      if (!await this.inventory.verifySnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: expectedSnapshotId, budget })) {
+        return { status: "conflict", code: "navigation_snapshot_changed" };
+      }
+      const head = await this.publishHead(request, progress, index, finalizationRef, headPath, budget);
+      if (head.status === "conflict") return head;
+      const receipt = zoneNavigationReceiptSchema.parse({
+        schema_version: "1.0", status: "committed", project_id: request.project_id,
+        request_id: request.request_id, zone: request.zone, generation: progress.target_generation,
+        head_ref: headPath, finalization_ref: finalizationRef, index,
+        source_snapshot_id: progress.snapshot_id, source_count: progress.source_count,
+        coverage_gaps: progress.coverage_gaps
+      });
+      progress.status = "finalized";
+      progress.receipt = receipt;
+      progress = await this.saveProgress(path, progress, await this.token(path, budget), budget);
+      return { status: "finalized", receipt };
+    } catch (error) {
+      if (isBudgetExhausted(error)) return { status: "pending", cursor: null };
       if (error instanceof Error && error.message === "navigation_listing_stalled") return { status: "conflict", code: "navigation_listing_stalled" };
       if (error instanceof ProviderPreconditionFailedError || error instanceof ProviderConflictError) return { status: "conflict", code: "navigation_provider_conflict" };
       if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };

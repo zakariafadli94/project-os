@@ -1318,44 +1318,44 @@ describe("canonical execution boundary in ProjectGuard", () => {
 
     sliceBudget.mockRestore();
     commitReads.mockRestore();
-    const { providerBudgetResponse, scopedProviderCalls } = await runInDurableObject(guard, async (instance) => {
+    const { providerBudgetResponse, scopedProviderCalls } = await runInDurableObject(guard, (instance, state) => {
       const object = instance as any;
-      const budgetSpy = vi.spyOn(object, "materializationFinalizationProviderCallBudget").mockReturnValue(2);
-      const originalSlice = object.finalizeCurrentMaterializationSlice.bind(object);
-      let scopedProviderCalls = -1;
-      const sliceSpy = vi.spyOn(object, "finalizeCurrentMaterializationSlice")
-        .mockImplementation(async (...args: any[]) => {
-          const budget = args[4] as { calls: number };
-          try { return await originalSlice(...args); }
-          finally { scopedProviderCalls = budget.calls; }
-        });
-      try {
-        const providerBudgetResponse = await object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-        }), false);
-        return { providerBudgetResponse, scopedProviderCalls };
-      } finally {
-        sliceSpy.mockRestore();
-        budgetSpy.mockRestore();
-      }
+      return object.serialize(async () => {
+        const budgetSpy = vi.spyOn(object, "materializationFinalizationProviderCallBudget").mockReturnValue(2);
+        const originalSlice = object.finalizeCurrentMaterializationSlice.bind(object);
+        let scopedProviderCalls = -1;
+        const sliceSpy = vi.spyOn(object, "finalizeCurrentMaterializationSlice")
+          .mockImplementation(async (...args: any[]) => {
+            const budget = args[4] as { calls: number };
+            try { return await originalSlice(...args); }
+            finally { scopedProviderCalls = budget.calls; }
+          });
+        try {
+          const providerBudgetResponse = await object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+          }), false);
+          expect(providerBudgetResponse.status).toBe(202);
+          expect(scopedProviderCalls).toBe(2);
+          const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
+          expect(work?.candidates.map(({ revision }) => revision)).toEqual([9201]);
+          expect(await state.storage.getAlarm()).toBeLessThan(preinstalledAlarmAt);
+          expect(state.storage.sql.exec(
+            "SELECT count FROM request_recovery_failures WHERE kind = 'materialization' AND request_id = ?",
+            `1:${CURRENT_PROJECTION_VERSION}`
+          ).toArray()).toEqual([]);
+          return { providerBudgetResponse, scopedProviderCalls };
+        } finally {
+          sliceSpy.mockRestore();
+          budgetSpy.mockRestore();
+        }
+      });
     });
     expect(providerBudgetResponse.status).toBe(202);
     // The budget object belongs to this one finalization slice, unlike the
     // shared Dropbox mock which also records other projects' alarm traffic.
     expect(scopedProviderCalls).toBe(2);
-    await runInDurableObject(guard, async (_instance, state) => {
-      const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
-      expect(work?.candidates.map(({ revision }) => revision)).toEqual([9201]);
-      // Budget exhaustion must re-arm a near wake, not merely leave the
-      // preinstalled distant alarm in place.
-      expect(await state.storage.getAlarm()).toBeLessThan(preinstalledAlarmAt);
-      expect(state.storage.sql.exec(
-        "SELECT count FROM request_recovery_failures WHERE kind = 'materialization' AND request_id = ?",
-        `1:${CURRENT_PROJECTION_VERSION}`
-      ).toArray()).toEqual([]);
-    });
   });
 
   it("counts terminal and unadmitted candidates in a mixed finalization batch", async () => {

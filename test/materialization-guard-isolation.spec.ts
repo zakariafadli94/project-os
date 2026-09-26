@@ -18,6 +18,10 @@ import { commitFixture } from "./helpers/convergence-fixture";
 import type { SliceBudget } from "../src/convergence/contract";
 import { ExecutionJournal } from "../src/execution/journal";
 import { navigationWorkRefSchema } from "../src/domain/zone-navigation";
+import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
+import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
+import { sha256Canonical } from "../src/materialization/hash";
+import { canonicalJson } from "../src/rules/contract";
 
 const testEnv = env as unknown as Env;
 const at = "2026-09-02T07:20:00+01:00";
@@ -170,6 +174,191 @@ describe("MaterializationGuard isolation boundary", () => {
       expect(slice).toBeNull();
       expect(await state.storage.getAlarm()).toBe(alarm);
     });
+  });
+
+  it("rotates actual navigation slices across nonterminal jobs and skips a backed-off head", async () => {
+    const projectId = "PRJ-3928";
+    const now = Date.now();
+    let alarmAt: number | null = null;
+    const stored = new Map<string, string>();
+    const state = commitFixture(projectId, 1)[0]!.state;
+    const zones = ["DELIVERABLES", "REVIEW", "WORKING"] as const;
+    const ids = ["DOCREQ-A-FIRST-3928001", "DOCREQ-B-SECOND-3928002", "DOCREQ-C-THIRD-3928003"];
+    for (const [index, zone] of zones.entries()) {
+      const requestId = ids[index]!;
+      const requestHash = String.fromCharCode(97 + index).repeat(64);
+      const ref = navigationWorkRefSchema.parse({
+        project_id: projectId, request_id: requestId, zone, expected_generation: 0,
+        source_snapshot_id: "source:0", authority_ref: `authority:${requestId}`, request_hash: requestHash
+      });
+      const request = {
+        operation: "navigation.reconcile", project_id: projectId, request_id: requestId, zone,
+        expected_project_revision: 1, expected_generation: 0, expected_index: null, created_at: "2026-09-26T00:00:00.000Z"
+      };
+      const frozenState = { ...state, project_id: projectId };
+      const context = {
+        schema_version: "1.0", ref, request, admission: {}, state: frozenState,
+        state_hash: await sha256Canonical(frozenState)
+      };
+      stored.set(`navigation-work:${requestId}`, canonicalJson(ref));
+      stored.set(`navigation-context:${requestId}`, canonicalJson(context));
+    }
+    stored.set(`navigation-retry:${ids[0]}`, JSON.stringify({ stopped: false, next_attempt_at: new Date(now + 60_000).toISOString() }));
+    const storage = {
+      get: async <T>(key: string) => stored.get(key) as T | undefined,
+      put: async (key: string, value: string) => { stored.set(key, value); },
+      delete: async (key: string) => { stored.delete(key); },
+      getAlarm: async () => alarmAt,
+      setAlarm: async (value: number) => { alarmAt = value; },
+      deleteAlarm: async () => { alarmAt = null; },
+      list: async ({ prefix, limit, startAfter }: { prefix: string; limit?: number; startAfter?: string }) => {
+        const all = [...stored.entries()].filter(([key]) => key.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b));
+        const after = startAfter ? all.filter(([key]) => key > startAfter) : all;
+        return new Map(after.slice(0, limit));
+      }
+    };
+    const makeGuard = (environment: Env = testEnv) => Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId, env: environment, queue: Promise.resolve(), queueDepth: 0, wakeScheduleQueue: undefined,
+      layoutMode: "v2", notifyProjectGuardOfCurrentHead: async () => true,
+      ctx: { id: { name: projectId }, storage }
+    }) as MaterializationGuard;
+    let guard = makeGuard();
+    const seen: string[] = [];
+    vi.spyOn(ZoneNavigationSources.prototype, "readState").mockResolvedValue({ generation: 0, adopted: true, in_flight_resource_ids: [] } as never);
+    vi.spyOn(ZoneNavigationEngine.prototype, "reconcile").mockImplementation(async (request) => {
+      seen.push(request.request_id);
+      return { status: "pending" } as never;
+    });
+    await guard.alarm();
+    await guard.alarm();
+    await guard.alarm();
+    expect(seen).toEqual([ids[1], ids[2], ids[1]]);
+    expect(stored.get(`navigation-retry:${ids[0]}`)).toBeDefined();
+
+    const retryAt = Date.parse(JSON.parse(stored.get(`navigation-retry:${ids[0]}`)!).next_attempt_at);
+    for (const requestId of ids.slice(1)) {
+      stored.delete(`navigation-work:${requestId}`);
+      stored.delete(`navigation-context:${requestId}`);
+    }
+    await (guard as unknown as { scheduleConvergenceContinuation(moreWork: boolean, nextAlarmAt: string | null): Promise<void> })
+      .scheduleConvergenceContinuation(false, null);
+    expect(alarmAt).toBeGreaterThanOrEqual(retryAt);
+
+    for (const requestId of ids.slice(1)) {
+      const i = ids.indexOf(requestId);
+      const zone = zones[i]!;
+      const requestHash = String.fromCharCode(97 + i).repeat(64);
+      const ref = navigationWorkRefSchema.parse({
+        project_id: projectId, request_id: requestId, zone, expected_generation: 0,
+        source_snapshot_id: "source:0", authority_ref: `authority:${requestId}`, request_hash: requestHash
+      });
+      const request = {
+        operation: "navigation.reconcile", project_id: projectId, request_id: requestId, zone,
+        expected_project_revision: 1, expected_generation: 0, expected_index: null, created_at: "2026-09-26T00:00:00.000Z"
+      };
+      const frozenState = { ...state, project_id: projectId };
+      stored.set(`navigation-work:${requestId}`, canonicalJson(ref));
+      stored.set(`navigation-context:${requestId}`, canonicalJson({
+        schema_version: "1.0", ref, request, admission: {}, state: frozenState,
+        state_hash: await sha256Canonical(frozenState)
+      }));
+    }
+    stored.delete(`navigation-retry:${ids[0]}`);
+    guard = makeGuard();
+    await guard.alarm();
+    guard = makeGuard(); // A new instance must resume from the durable cursor.
+    await guard.alarm();
+    await guard.alarm();
+    expect(seen.slice(3)).toEqual([ids[2], ids[0], ids[1]]);
+
+    stored.delete(`navigation-work:${ids[0]}`);
+    stored.delete(`navigation-context:${ids[0]}`);
+    stored.delete(`navigation-work:${ids[2]}`);
+    stored.delete(`navigation-context:${ids[2]}`);
+    await guard.alarm();
+    expect(seen.at(-1)).toBe(ids[1]);
+
+    const reported: string[] = [];
+    const failureEnv = {
+      PROJECT_GUARD: {
+        getByName: () => ({
+          fetch: async (_url: string, init: RequestInit) => {
+            const report = JSON.parse(String(init.body)) as { request_id: string };
+            reported.push(report.request_id);
+            return Response.json({ project_id: projectId, request_id: report.request_id, status: "retry", next_attempt_at: new Date(Date.now() + 60_000).toISOString() });
+          }
+        })
+      }
+    } as unknown as Env;
+    vi.spyOn(ZoneNavigationEngine.prototype, "reconcile").mockRejectedValue(new Error("synthetic navigation failure"));
+    guard = makeGuard(failureEnv);
+    await guard.alarm();
+    expect(reported).toEqual([ids[1]]);
+  });
+
+  it("does not overwrite an enqueue wake with a stale backoff scan", async () => {
+    const projectId = "PRJ-3929";
+    const oldRequestId = "DOCREQ-NAVIGATION-WORKING-3929001";
+    const newRequestId = "DOCREQ-NAVIGATION-WORKING-3929002";
+    const retryAt = Date.now() + 60_000;
+    const oldRef = navigationWorkRefSchema.parse({
+      project_id: projectId, request_id: oldRequestId, zone: "WORKING", expected_generation: 0,
+      source_snapshot_id: "source:0", authority_ref: "authority:old", request_hash: "a".repeat(64)
+    });
+    const newRef = navigationWorkRefSchema.parse({
+      ...oldRef, request_id: newRequestId,
+      authority_ref: `${await new ExecutionJournal(createProductionPersistence(testEnv, projectId), projectId, "document", newRequestId).root()}/admission.json`,
+      request_hash: "b".repeat(64)
+    });
+    const stored = new Map<string, string>([
+      [`navigation-work:${oldRequestId}`, canonicalJson(oldRef)],
+      [`navigation-retry:${oldRequestId}`, canonicalJson({ stopped: false, next_attempt_at: new Date(retryAt).toISOString() })]
+    ]);
+    let alarm: number | null = null;
+    let listCalls = 0;
+    let reachedWakeSnapshot!: () => void;
+    let releaseWakeSnapshot!: () => void;
+    const wakeSnapshot = new Promise<void>((resolve) => { reachedWakeSnapshot = resolve; });
+    const snapshotRelease = new Promise<void>((resolve) => { releaseWakeSnapshot = resolve; });
+    const storage = {
+      get: async <T>(key: string) => stored.get(key) as T | undefined,
+      put: async (key: string, value: string) => { stored.set(key, value); },
+      delete: async (key: string) => { stored.delete(key); },
+      getAlarm: async () => alarm,
+      setAlarm: async (time: number) => { alarm = time; },
+      deleteAlarm: async () => { alarm = null; },
+      list: async ({ prefix, limit, startAfter }: { prefix: string; limit?: number; startAfter?: string }) => {
+        const all = [...stored.entries()].filter(([key]) => key.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b));
+        const after = startAfter ? all.filter(([key]) => key > startAfter) : all;
+        const snapshot = new Map(after.slice(0, limit));
+        listCalls += 1;
+        if (listCalls === 2) {
+          reachedWakeSnapshot();
+          await snapshotRelease;
+        }
+        return snapshot;
+      }
+    };
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId, env: testEnv, queue: Promise.resolve(), queueDepth: 0, wakeScheduleQueue: undefined,
+      ctx: { id: { name: projectId }, storage }
+    }) as MaterializationGuard;
+    const slice = (guard as unknown as { runNavigationWorkSlice(): Promise<unknown> }).runNavigationWorkSlice();
+    await wakeSnapshot;
+
+    let enqueueFinished = false;
+    const enqueue = guard.fetch(new Request("https://materialization-guard.internal/navigation-work", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(newRef)
+    })).then((response) => { enqueueFinished = true; return response; });
+    await vi.waitFor(() => expect(enqueueFinished).toBe(true), { timeout: 30 }).catch(() => undefined);
+    const enqueueWasBlockedByWakeLock = !enqueueFinished;
+    releaseWakeSnapshot();
+    const [response] = await Promise.all([enqueue, slice]);
+
+    expect(response.status).toBe(202);
+    expect(enqueueWasBlockedByWakeLock).toBe(true);
+    expect(alarm).not.toBeNull();
+    expect(alarm!).toBeLessThan(retryAt);
   });
 
   it("keeps a navigation wake enqueued after the scheduler snapshot without losing convergence backoff", async () => {

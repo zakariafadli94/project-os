@@ -3365,7 +3365,7 @@ export class ProjectGuard extends DurableObject<Env> {
       const url = new URL("https://project-guard.internal/request-status");
       url.searchParams.set("kind", kind);
       url.searchParams.set("request_id", requestId);
-      const response = await this.readBoundedRequestStatus(url, correlationId);
+      const response = await this.readBoundedRequestStatus(url, correlationId, true);
       if (!response.ok) throw new Error("execution_status_unavailable");
       const body = await response.json() as Record<string, any>;
       const status = body.execution as Record<string, unknown> | undefined;

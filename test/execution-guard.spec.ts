@@ -350,7 +350,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
 
   it("serves proven execution progress during a separate serialized effect", async () => {
     const projectId = "PRJ-8318";
-    const { guard } = await setup(projectId);
+    const { guard, mock } = await setup(projectId);
     const content = "# Busy status proof\n";
     const request = {
       request_id: "ART-EXECUTION-BUSY-0001", project_id: projectId,
@@ -393,7 +393,11 @@ describe("canonical execution boundary in ProjectGuard", () => {
           observed = { status: response.status, body: await response.json() };
           durations.push(performance.now() - startedAt);
         }
-        return { ...observed!, p95_ms: durations.sort((a, b) => a - b)[Math.ceil(durations.length * 0.95) - 1]! };
+        if (typeof executionBody.finalization_ref !== "string") throw new Error("finalization_reference_missing");
+        mock.files.delete(executionBody.finalization_ref);
+        const corrupt = await (instance as any).fetch(new Request(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`)) as Response;
+        return { ...observed!, p95_ms: durations.sort((a, b) => a - b)[Math.ceil(durations.length * 0.95) - 1]!,
+          corrupt: { status: corrupt.status, body: await corrupt.json() } };
       } finally {
         release();
         await submission;
@@ -403,6 +407,8 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(observed).toMatchObject({ status: 200, body: { status: "finalized", terminal: true, request_id: request.request_id, project_id: projectId,
       finalization_ref: executionBody.finalization_ref } });
     expect(observed.p95_ms).toBeLessThanOrEqual(2_000);
+    expect(observed.corrupt).toMatchObject({ status: 503, body: { status: "unknown", code: "PROJECT_OS_READ_BUSY" } });
+    expect(observed.corrupt.body).not.toHaveProperty("finalization_ref");
   });
 
   it("keeps artifact finalization recoverable when receipt persistence is interrupted", async () => {

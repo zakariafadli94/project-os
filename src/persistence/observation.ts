@@ -124,7 +124,7 @@ export function persistenceObservation(input: ObservationEvidence): PersistenceO
   };
   return {
     project_id: input.project_id, kind: input.kind, request_id: input.request_id,
-    status, observed_at: input.observed_at, freshness: "verified", receipt: input.receipt ?? null,
+    status, observed_at: input.observed_at, freshness: status === "unknown" ? "unknown" : "verified", receipt: input.receipt ?? null,
     receipt_status: receiptStatus, execution_status: input.execution?.status ?? null,
     terminal, code: input.code ?? (recovery.state === "blocked" ? "recovery_blocked" : null), correlation_id: input.correlation_id, recovery
   };

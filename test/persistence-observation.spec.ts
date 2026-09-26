@@ -8,7 +8,7 @@ describe("persistence observations", () => {
     expect(result).toMatchObject({ status: "finalizing", receipt_status: "committed", terminal: false, recovery: { owner: "system", state: "scheduled", requires_new_approval: false } });
   });
   it("does not infer absence from missing local evidence", () => {
-    expect(persistenceObservation(identity)).toMatchObject({ status: "unknown", terminal: false });
+    expect(persistenceObservation(identity)).toMatchObject({ status: "unknown", freshness: "unknown", terminal: false });
     expect(persistenceObservation({ ...identity, absence_verified: true })).toMatchObject({ status: "not_received", recovery: { action: "retry_same_request" } });
   });
   it("requires receipt and certificate evidence before finality", () => {

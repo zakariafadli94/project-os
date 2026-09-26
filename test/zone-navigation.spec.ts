@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
 import {
   navigationReconcileSchema,
@@ -8,14 +8,18 @@ import {
   type NavigationIndexIdentity
 } from "../src/domain/zone-navigation";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
+import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
+import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
 import { executionHash, ExecutionJournal } from "../src/execution/journal";
 import type { ExecutionAdmission } from "../src/execution/contract";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
-import { machineDocumentRoot, workspaceProjectRoot } from "../src/persistence/layout";
+import { machineArtifactReceiptPath, machineDocumentRoot, machineMutationIntentPath, workspaceProjectRoot } from "../src/persistence/layout";
 import { sha256Text } from "../src/documents/hash";
 import type { SliceBudget } from "../src/convergence/contract";
+import { mutationIntentIdFor } from "../src/domain/mutation-gate";
+import { MutationGateRepository } from "../src/mutation-gate/repository";
 
 const state = () => emptyProjectState("PRJ-0002", "Project OS", "project-os", "Managed docs");
 const at = "2026-09-25T09:00:00.000Z";
@@ -66,6 +70,7 @@ function runtimeHarness() {
   const files = new Map<string, { content: string; objectId: string; revisionToken: string }>();
   const binaryFiles = new Map<string, { bytes: Uint8Array; objectId: string; revisionToken: string }>();
   let sequence = 0;
+  const listingCalls: Array<{ path: string; cursor: string | null; limit: number }> = [];
   let failCreatePathOnce: ((path: string) => boolean) | null = null;
   const metadata = (path: string): ProviderObjectMetadata | null => {
     const file = files.get(path);
@@ -122,6 +127,13 @@ function runtimeHarness() {
     },
     serverSideCopy: { copyObject: async () => { throw new Error("unused"); } },
     changeFeed: { listChanges: async () => ({ entries: [], cursor: "test" }) },
+    pagedListing: { listPage: async ({ path, cursor, limit }) => {
+      listingCalls.push({ path, cursor, limit });
+      const matching = [...files.keys()].filter((key) => key.startsWith(`${path}/`) && !key.slice(path.length + 1).includes("/")).sort();
+      const start = cursor ? Math.max(0, matching.findIndex((key) => key > cursor)) : 0;
+      const page = matching.slice(start, start + limit);
+      return { entries: page.map((key) => ({ kind: "file" as const, name: key.slice(path.length + 1), path: key })), cursor: start + page.length < matching.length ? page.at(-1) ?? null : null };
+    } },
     evidence: {
       stableObjectId: { semantics: "stable-through-move" },
       revisionToken: { semantics: "opaque-object-revision" },
@@ -133,7 +145,7 @@ function runtimeHarness() {
     binaryFiles.set(path, { bytes: bytes.slice(), objectId: objectId ?? `id:${sequence}`, revisionToken: `rev-${sequence}` });
     return metadata(path)!;
   };
-  return { runtime, files, binaryFiles, put, putBytes, failNextCreate: (match: (path: string) => boolean) => { failCreatePathOnce = match; } };
+  return { runtime, files, binaryFiles, listingCalls, put, putBytes, failNextCreate: (match: (path: string) => boolean) => { failCreatePathOnce = match; } };
 }
 
 async function inventoryHarness(inputState = state(), zone: "WORKING" | "REVIEW" | "DELIVERABLES" = "WORKING", options: { missing?: boolean; snapshotChanged?: boolean; pages?: NavigationInventoryEntry[][] } = {}) {
@@ -248,6 +260,138 @@ async function reconcileUntilTerminal(engine: ZoneNavigationEngine, input: Navig
 }
 
 describe("zone navigation identity and resumable reconciliation", () => {
+  it("advances a persisted legacy artifact cursor across several provider entries in one engine slice", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const admission = await admissionFor(input);
+    const journal = new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id);
+    await journal.commit(admission, null);
+
+    const artifactsRoot = machineMutationIntentPath(input.project_id, "ART-NAV-LEGACY-0000").replace(/\/[^/]+$/, "");
+    const artifactIds = Array.from({ length: 20 }, (_, index) => `ART-NAV-LEGACY-${String(index).padStart(4, "0")}`);
+    for (const requestId of artifactIds) {
+      const content = `artifact ${requestId}`;
+      const contentHash = await sha256Text(content);
+      const requestBody = { request_id: requestId, project_id: input.project_id, relative_path: "report.md", content,
+        content_sha256: contentHash, mode: "create" as const };
+      const requestJson = JSON.stringify(requestBody);
+      await new MutationGateRepository(harness.runtime).ensureArtifactIntent({
+        schema_version: "1.0", intent_id: await mutationIntentIdFor(input.project_id, requestId), project_id: input.project_id,
+        kind: "artifact", request_id: requestId, request_sha256: await sha256Text(requestJson), request_json: requestJson,
+        base_project_revision: 0, destination_path: `${workspaceProjectRoot(input.project_id, project.slug)}/REVIEW/${requestId}.md`,
+        provider_precondition: { kind: "absent", provider_id: "dropbox" }, expected_content_sha256: contentHash,
+        mode: "create", recorded_at: at
+      });
+    }
+    const firstProviderEntry = `${artifactsRoot}/${artifactIds[0]}.json`;
+    const { root, progress } = await seedAdoptingProgress(harness, input, 0, `artifacts:${encodeURIComponent(firstProviderEntry)}`);
+    progress.snapshot_id = "source:0";
+    harness.put(`${root}/navigation-progress.json`, JSON.stringify(progress));
+    const initialArtifactPageCount = harness.listingCalls.filter((call) => call.path === artifactsRoot).length;
+
+    const result = await new ZoneNavigationEngine(harness.runtime,
+      new ZoneNavigationInventory(harness.runtime, new ZoneNavigationSources(harness.runtime)))
+      .reconcile(input, project, admission, budget(32));
+    const saved = JSON.parse(harness.files.get(`${root}/navigation-progress.json`)!.content) as { cursor: string | null; page_count: number };
+    const artifactPageCalls = harness.listingCalls.filter((call) => call.path === artifactsRoot).length - initialArtifactPageCount;
+    expect(result.status).toBe("pending");
+    expect(artifactPageCalls, JSON.stringify({ result, saved, listing: harness.listingCalls })).toBe(7);
+    expect(saved.cursor).not.toBe(`artifacts:${encodeURIComponent(firstProviderEntry)}`);
+    expect(saved.page_count).toBe(1);
+    expect(saved.page_count).toBeLessThan(artifactPageCalls);
+  });
+
+  it("uses final artifact byte-integrity proof instead of a third physical reread", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const admission = await admissionFor(input);
+    const journal = new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id);
+    await journal.commit(admission, null);
+    const requestId = "ART-NAV-ENGINE-IN-ZONE-0001";
+    const content = "approved current artifact";
+    const contentHash = await sha256Text(content);
+    const artifactRequest = { request_id: requestId, project_id: input.project_id, relative_path: "current.md", content,
+      content_sha256: contentHash, mode: "create" as const };
+    const requestJson = JSON.stringify(artifactRequest);
+    const destination = `${workspaceProjectRoot(input.project_id, project.slug)}/WORKING/current.md`;
+    await new MutationGateRepository(harness.runtime).ensureArtifactIntent({
+      schema_version: "1.0", intent_id: await mutationIntentIdFor(input.project_id, requestId), project_id: input.project_id,
+      kind: "artifact", request_id: requestId, request_sha256: await sha256Text(requestJson), request_json: requestJson,
+      base_project_revision: 0, destination_path: destination, provider_precondition: { kind: "absent", provider_id: "dropbox" },
+      expected_content_sha256: contentHash, mode: "create", recorded_at: at
+    });
+    harness.put(destination, content);
+    harness.put(machineArtifactReceiptPath(requestId), JSON.stringify({ request_id: requestId, project_id: input.project_id,
+      relative_path: "current.md", content_sha256: contentHash, status: "committed" }));
+    const artifactByteReads = vi.spyOn(harness.runtime.objects, "readBytes");
+    const { root, progress } = await seedAdoptingProgress(harness, input, 0, "artifacts:");
+    progress.snapshot_id = "source:0";
+    harness.put(`${root}/navigation-progress.json`, JSON.stringify(progress));
+    const inventory = new ZoneNavigationInventory(harness.runtime, new ZoneNavigationSources(harness.runtime));
+    const verifyEntry = vi.spyOn(inventory, "verifyEntry");
+
+    const result = await new ZoneNavigationEngine(harness.runtime, inventory)
+      .reconcile(input, project, admission, budget(256), { deferPublication: true });
+
+    expect(result.status).toBe("prepared");
+    expect(verifyEntry).not.toHaveBeenCalled();
+    expect(artifactByteReads.mock.calls.filter(([path]) => path === destination)).toHaveLength(1);
+    const artifactPage = [...harness.files.entries()]
+      .filter(([path]) => path.startsWith(`${root}/navigation/snapshot/`))
+      .map(([, file]) => JSON.parse(file.content) as { entries?: NavigationInventoryEntry[]; verified_entries?: unknown[] })
+      .find((page) => page.entries?.some((entry) => entry.resource_id.startsWith("artifact:")));
+    expect(artifactPage?.verified_entries).toHaveLength(1);
+  });
+
+  it("replays an exact orphan snapshot without retroactively adding its new integrity proof", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const admission = await admissionFor(input);
+    await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).commit(admission, null);
+    const requestId = "ART-NAV-ENGINE-ORPHAN-0001";
+    const content = "approved current artifact";
+    const contentHash = await sha256Text(content);
+    const artifactRequest = { request_id: requestId, project_id: input.project_id, relative_path: "orphan.md", content,
+      content_sha256: contentHash, mode: "create" as const };
+    const requestJson = JSON.stringify(artifactRequest);
+    const destination = `${workspaceProjectRoot(input.project_id, project.slug)}/WORKING/orphan.md`;
+    await new MutationGateRepository(harness.runtime).ensureArtifactIntent({
+      schema_version: "1.0", intent_id: await mutationIntentIdFor(input.project_id, requestId), project_id: input.project_id,
+      kind: "artifact", request_id: requestId, request_sha256: await sha256Text(requestJson), request_json: requestJson,
+      base_project_revision: 0, destination_path: destination, provider_precondition: { kind: "absent", provider_id: "dropbox" },
+      expected_content_sha256: contentHash, mode: "create", recorded_at: at
+    });
+    harness.put(destination, content);
+    harness.put(machineArtifactReceiptPath(requestId), JSON.stringify({ request_id: requestId, project_id: input.project_id,
+      relative_path: "orphan.md", content_sha256: contentHash, status: "committed" }));
+    const inventory = new ZoneNavigationInventory(harness.runtime, new ZoneNavigationSources(harness.runtime));
+    let orphanCursor = "artifacts:";
+    let orphan = await inventory.listPage({ project_id: input.project_id, zone: "WORKING", cursor: orphanCursor, limit: 24, budget: budget(256) });
+    for (let page = 0; orphan.entries.length === 0 && orphan.next_cursor !== null && page < 8; page++) {
+      orphanCursor = orphan.next_cursor;
+      orphan = await inventory.listPage({ project_id: input.project_id, zone: "WORKING", cursor: orphanCursor, limit: 24, budget: budget(256) });
+    }
+    expect(orphan.verified_entries, JSON.stringify(orphan)).toHaveLength(1);
+    const { root, progress } = await seedAdoptingProgress(harness, input, 0, orphanCursor);
+    progress.snapshot_id = "source:0";
+    harness.put(`${root}/navigation-progress.json`, JSON.stringify(progress));
+    harness.put(`${root}/navigation/snapshot/00000000.json`, JSON.stringify({ schema_version: "1.0", page: 0,
+      project_id: input.project_id, request_id: input.request_id, snapshot_id: orphan.snapshot_id,
+      entries: orphan.entries, gaps: orphan.gaps }));
+    const verifyEntryPage = vi.spyOn(inventory, "verifyEntryPage");
+
+    const result = await new ZoneNavigationEngine(harness.runtime, inventory)
+      .reconcile(input, project, admission, budget(256), { deferPublication: true });
+
+    expect(result.status, JSON.stringify(result)).toBe("prepared");
+    expect(verifyEntryPage).toHaveBeenCalledTimes(1);
+    const replayed = JSON.parse(harness.files.get(`${root}/navigation/snapshot/00000000.json`)!.content) as { verified_entries?: unknown[] };
+    expect(replayed.verified_entries).toBeUndefined();
+  });
+
   it("prepares a verified generation without publishing any visible index or head", async () => {
     const harness = runtimeHarness();
     const project = state();

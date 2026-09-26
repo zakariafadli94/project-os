@@ -294,34 +294,67 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
 
   private async artifactPage(projectId: string, zone: NavigationZone, cursor: string | null, _requestedLimit: number, snapshotId: string, budget: SliceBudget) {
     if (!this.runtime.pagedListing) return { entries: [], gaps: [{ resource_id: "artifacts", code: "paged_listing_unavailable" }], snapshot_id: snapshotId, next_cursor: null };
-    requireBudget(budget, 16);
     const root = `${machineMutationGateRoot(projectId)}/intents/artifacts`;
-    charge(budget);
-    const page = await this.runtime.pagedListing.listPage({ path: root, cursor, limit: 1 });
-    const item = page.entries[0];
-    if (!item) return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: null };
-    const match = /^(ART-[A-Z0-9-]{10,})\.json$/.exec(item.name);
-    if (item.kind !== "file" || !item.path || item.path !== `${root}/${item.name}` || !match) {
-      return { entries: [], gaps: [{ resource_id: item.name, code: "artifact_intent_listing_invalid" }], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
+    let providerCursor = cursor;
+    const gaps: NavigationCoverageGap[] = [];
+    let fetched = false;
+    let lastSkippedCursor: string | null = null;
+    while (true) {
+      // Keep the old page size for saved Dropbox cursors. Drain unrelated
+      // intents within this slice, but leave enough budget for resolving one
+      // in-zone intent and its binding proof.
+      if (!budget.canStartEffect(16)) {
+        if (!fetched) throw new Error("slice_budget_exhausted");
+        return { entries: [], gaps, snapshot_id: snapshotId,
+          next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+      }
+      requireBudget(budget, 16);
+      charge(budget);
+      const page = await this.runtime.pagedListing.listPage({ path: root, cursor: providerCursor, limit: 1 });
+      if (providerCursor !== null && page.cursor === providerCursor) throw new Error("navigation_listing_stalled");
+      fetched = true;
+      const item = page.entries[0];
+      providerCursor = page.cursor;
+      if (!item) {
+        if (providerCursor === null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: null };
+        continue;
+      }
+      const match = /^(ART-[A-Z0-9-]{10,})\.json$/.exec(item.name);
+      if (item.kind !== "file" || !item.path || item.path !== `${root}/${item.name}` || !match) {
+        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        gaps.push({ resource_id: item.name, code: "artifact_intent_listing_invalid" });
+        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+      }
+      let intent: Awaited<ReturnType<MutationGateRepository["readArtifactIntent"]>>;
+      try {
+        intent = await new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, match[1]);
+        if (!intent || intent.request_id !== match[1] || intent.project_id !== projectId) throw new Error("artifact_intent_binding");
+      } catch (error) {
+        if (isBudgetError(error)) throw error;
+        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        gaps.push({ resource_id: `artifact:${match[1]}`, code: "committed_artifact_intent_unavailable" });
+        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+      }
+      const target = artifactNavigationTarget(projectId, intent.destination_path);
+      if (target.kind === "outside") {
+        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        gaps.push({ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_outside_navigation_zones" });
+        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+      }
+      if (target.kind === "invalid") {
+        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        gaps.push({ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_binding_invalid" });
+        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+      }
+      if (target.zone === zone) {
+        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        const state: ArtifactBindingCursor = { next_intent_cursor: providerCursor, request_id: intent.request_id, destination_path: intent.destination_path, binding_cursor: null, eligible_request_ids: [], gaps: [] };
+        const result = await this.scanArtifactBindings(projectId, zone, state, snapshotId, budget);
+        return { ...result, gaps: [...gaps, ...result.gaps] };
+      }
+      lastSkippedCursor = providerCursor;
+      if (providerCursor === null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: null };
     }
-    let intent: Awaited<ReturnType<MutationGateRepository["readArtifactIntent"]>>;
-    try {
-      intent = await new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, match[1]);
-      if (!intent || intent.request_id !== match[1] || intent.project_id !== projectId) throw new Error("artifact_intent_binding");
-    } catch (error) {
-      if (isBudgetError(error)) throw error;
-      return { entries: [], gaps: [{ resource_id: `artifact:${match[1]}`, code: "committed_artifact_intent_unavailable" }], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
-    }
-    const target = artifactNavigationTarget(projectId, intent.destination_path);
-    if (target.kind === "outside") {
-      return { entries: [], gaps: [{ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_outside_navigation_zones" }], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
-    }
-    if (target.kind === "invalid") {
-      return { entries: [], gaps: [{ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_binding_invalid" }], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
-    }
-    if (target.zone !== zone) return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: page.cursor === null ? null : encodeCursor("artifacts", page.cursor) };
-    const state: ArtifactBindingCursor = { next_intent_cursor: page.cursor, request_id: intent.request_id, destination_path: intent.destination_path, binding_cursor: null, eligible_request_ids: [], gaps: [] };
-    return this.scanArtifactBindings(projectId, zone, state, snapshotId, budget);
   }
 
   private async artifactBindingsPage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget) {
@@ -362,8 +395,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         if (!metadata || metadata.size > MAX_VISIBLE_SOURCE_BYTES) throw new Error("artifact_visible_out_of_bounds");
         const status = await new MutationGateService(budgetedRuntime(this.runtime, budget), "observe").artifactStatus(projectId, match[1]);
         if (status?.verification_state === "canonical_verified" && status.receipt_status === "committed" && status.operation !== "REVIEW_CANDIDATE") {
-          const resolved = await resolveArtifactEntry(this.runtime, projectId, zone, intent, target.logical_path, budget);
-          if (resolved) state.eligible_request_ids.push(match[1]);
+          // Finalization below rechecks this status and resolves the visible
+          // bytes once. Avoid doing the same physical source verification here
+          // and then again in the engine after the final entry is returned.
+          state.eligible_request_ids.push(match[1]);
         }
       } catch (error) {
         if (isBudgetError(error)) throw error;
@@ -405,7 +440,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         if (state.dirty) {
           return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: resourceId, dirty_cursor: state.dirty.dirty_cursor, entry })) };
         }
-        return { entries: [entry], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
+        return { entries: [entry], verified_entries: [{ resource_id: entry.resource_id, entry_hash: await sha256Text(canonicalJson(entry)), persisted: false }],
+          gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
       }
     }
     if (state.dirty && state.gaps.length === 0) {

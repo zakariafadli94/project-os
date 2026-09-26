@@ -136,6 +136,51 @@ it.each(["project_queue", "search_queue"] as const)(
   }
 );
 
+it.each(["project_queue", "search_queue"] as const)("refreshes a stale admitted observation with bounded canonical status while %s is busy", async (queue) => {
+  const projectId = queue === "project_queue" ? "PRJ-8440" : "PRJ-8442";
+  const requestId = `DOCREQ-STALE-STATUS-${projectId}`;
+  const stale = { project_id: projectId, kind: "document", request_id: requestId, status: "admitted_uncommitted",
+    receipt: null, observation: { project_id: projectId, kind: "document", request_id: requestId,
+      status: "admitted_uncommitted", freshness: "stale" } };
+  const current = { project_id: projectId, kind: "document", request_id: requestId, status: "conflict",
+    receipt: { project_id: projectId, request_id: requestId, status: "conflict" },
+    observation: { project_id: projectId, kind: "document", request_id: requestId,
+      status: "conflict", freshness: "verified" } };
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (instance) => {
+    const subject = instance as unknown as { queueDepth: number; searchQueueDepth: number; readStoredRequestObservation: () => Promise<Response>; readBoundedRequestStatus: () => Promise<Response> };
+    if (queue === "project_queue") subject.queueDepth = 1;
+    else subject.searchQueueDepth = 1;
+    vi.spyOn(subject, "readStoredRequestObservation").mockResolvedValue(Response.json(stale));
+    vi.spyOn(subject, "readBoundedRequestStatus").mockResolvedValue(Response.json(current));
+  });
+
+  const response = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${requestId}`);
+
+  expect(response.status).toBe(200);
+  await expect(response.json()).resolves.toMatchObject(current);
+});
+
+it("keeps stale admitted status explicitly stale when bounded refresh is unavailable", async () => {
+  const projectId = "PRJ-8441";
+  const requestId = "DOCREQ-STALE-STATUS-8441";
+  const stale = { project_id: projectId, kind: "document", request_id: requestId, status: "admitted_uncommitted",
+    receipt: null, observation: { project_id: projectId, kind: "document", request_id: requestId,
+      status: "admitted_uncommitted", freshness: "stale" } };
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (instance) => {
+    const subject = instance as unknown as { queueDepth: number; readStoredRequestObservation: () => Promise<Response>; readBoundedRequestStatus: () => Promise<Response> };
+    subject.queueDepth = 1;
+    vi.spyOn(subject, "readStoredRequestObservation").mockResolvedValue(Response.json(stale));
+    vi.spyOn(subject, "readBoundedRequestStatus").mockResolvedValue(Response.json({ status: "unknown", code: "request_status_unavailable" }, { status: 503 }));
+  });
+
+  const response = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${requestId}`);
+
+  expect(response.status).toBe(200);
+  await expect(response.json()).resolves.toMatchObject({ status: "admitted_uncommitted", observation: { freshness: "stale" } });
+});
+
 it.each(["project_queue", "search_queue"] as const)(
   "keeps an absent request unknown while %s is occupied",
   async (queue) => {

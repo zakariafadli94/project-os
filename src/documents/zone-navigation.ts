@@ -419,7 +419,7 @@ export class ZoneNavigationEngine {
         }
       }
       const savedPage: SnapshotPage = { schema_version: "1.0", page: progress.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, ...(verifiedEntries.length ? { verified_entries: verifiedEntries } : {}), gaps };
-      await this.immutable(`${pagesRoot}/${progress.page_count.toString().padStart(8, "0")}.json`, savedPage, budget);
+      await this.immutableSnapshotPage(`${pagesRoot}/${progress.page_count.toString().padStart(8, "0")}.json`, savedPage, budget);
       progress.cursor = page.next_cursor;
       progress.snapshot_id = page.snapshot_id;
       progress.page_count += 1;
@@ -431,6 +431,24 @@ export class ZoneNavigationEngine {
     }
     if (!progress.snapshot_id) return { status: "conflict", code: "navigation_snapshot_changed" };
     return { status: "done", progress };
+  }
+
+  private async immutableSnapshotPage(path: string, page: SnapshotPage, budget: SliceBudget): Promise<void> {
+    try {
+      await this.immutable(path, page, budget);
+    } catch (error) {
+      if (!(error instanceof NavigationConflict) || error.code !== "navigation_immutable_record_conflict") throw error;
+      const raw = await this.readJson(path, budget);
+      if (!raw || typeof raw !== "object") throw error;
+      const existing = raw as Partial<SnapshotPage>;
+      // An older process may have created this exact page before saving progress.
+      // Preserve that immutable payload (including proof absence); verification below
+      // will then use the conservative physical-check path for legacy pages.
+      if (existing.schema_version !== page.schema_version || existing.page !== page.page ||
+          existing.project_id !== page.project_id || existing.request_id !== page.request_id ||
+          existing.snapshot_id !== page.snapshot_id || canonicalJson(existing.entries) !== canonicalJson(page.entries) ||
+          canonicalJson(existing.gaps) !== canonicalJson(page.gaps)) throw error;
+    }
   }
 
   private async verifyEntries(

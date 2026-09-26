@@ -104,6 +104,39 @@ describe("Control Tower governed artifact submission", () => {
     expect(JSON.parse(requestStatus.content[0]!.text)).toMatchObject({ status: "committed", execution: { status: "finalizing", terminal: false } });
   });
 
+  it("preserves a known busy receipt observation as unknown instead of dependency failure", async () => {
+    const stub = { fetch: async () => Response.json({
+      project_id: "PRJ-0007", kind: "artifact", request_id: artifact.request_id,
+      status: "unknown", code: "PROJECT_OS_READ_BUSY"
+    }, { status: 503, headers: { "Retry-After": "1" } }) };
+    const server = createControlTowerServer({
+      PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
+      REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
+    }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }> }> };
+
+    const result = await server._registeredTools.project_os_get_receipt.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
+    const body = JSON.parse(result.content[0]!.text);
+    expect(result.isError).toBe(true);
+    expect(body).toMatchObject({ status: "unknown", code: "PROJECT_OS_READ_BUSY", project_id: "PRJ-0007", kind: "artifact", request_id: artifact.request_id,
+      recovery: { action: "check_status", preserve_request_id: true } });
+    expect(body).not.toHaveProperty("error", "receipt_not_found");
+  });
+
+  it("does not forward a 503 receipt observation bound to another request", async () => {
+    const stub = { fetch: async () => Response.json({
+      project_id: "PRJ-0007", kind: "artifact", request_id: "ART-OTHER-0001",
+      status: "unknown", code: "PROJECT_OS_READ_BUSY"
+    }, { status: 503 }) };
+    const server = createControlTowerServer({
+      PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
+      REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
+    }) as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }> }> };
+
+    const result = await server._registeredTools.project_os_get_receipt.handler({ project_id: "PRJ-0007", request_id: artifact.request_id, kind: "artifact" });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ status: "unavailable", code: "PROJECT_OS_READ_UNAVAILABLE", reason: "dependency_failed" });
+  });
+
   it("sends a staged artifact with fresh signed admission to ProjectGuard", async () => {
     const calls: Array<{ path: string; body?: unknown; correlation?: string | null; signal?: AbortSignal | null }> = [];
     const stub = {

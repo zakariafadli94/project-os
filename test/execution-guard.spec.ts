@@ -385,8 +385,15 @@ describe("canonical execution boundary in ProjectGuard", () => {
       })) as Promise<Response>;
       try {
         await started;
-        const response = await (instance as any).fetch(new Request(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`)) as Response;
-        return { status: response.status, body: await response.json() };
+        const durations: number[] = [];
+        let observed: { status: number; body: unknown } | null = null;
+        for (let index = 0; index < 5; index += 1) {
+          const startedAt = performance.now();
+          const response = await (instance as any).fetch(new Request(`https://project-guard.internal/execution-status?kind=artifact&request_id=${request.request_id}`)) as Response;
+          observed = { status: response.status, body: await response.json() };
+          durations.push(performance.now() - startedAt);
+        }
+        return { ...observed!, p95_ms: durations.sort((a, b) => a - b)[Math.ceil(durations.length * 0.95) - 1]! };
       } finally {
         release();
         await submission;
@@ -395,6 +402,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
     });
     expect(observed).toMatchObject({ status: 200, body: { status: "finalized", terminal: true, request_id: request.request_id, project_id: projectId,
       finalization_ref: executionBody.finalization_ref } });
+    expect(observed.p95_ms).toBeLessThanOrEqual(2_000);
   });
 
   it("keeps artifact finalization recoverable when receipt persistence is interrupted", async () => {

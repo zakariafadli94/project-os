@@ -5,7 +5,7 @@ export async function requestMaterializationTargetSafely(
   projectId: string,
   revision: number,
   projectionVersion: number
-): Promise<void> {
+): Promise<boolean> {
   try {
     const response = await env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
       "https://materialization-guard.internal/request-target",
@@ -26,6 +26,7 @@ export async function requestMaterializationTargetSafely(
     if (!response.ok) {
       throw new Error(`MaterializationGuard returned ${response.status}`);
     }
+    return true;
   } catch (error) {
     console.error("Project OS materialization scheduling failed after canonical commit", {
       project_id: projectId,
@@ -33,5 +34,6 @@ export async function requestMaterializationTargetSafely(
       projection_version: projectionVersion,
       message: error instanceof Error ? error.message : String(error)
     });
+    return false;
   }
 }

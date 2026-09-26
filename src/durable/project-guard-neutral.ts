@@ -616,13 +616,12 @@ export class ProjectGuard extends DurableObject<Env> {
           message: error instanceof Error ? error.message : "Invalid transaction"
         }, { status: 400 });
       }
+      const prefersAsync = request.headers.get("prefer")?.split(",").some((value) => value.trim().toLowerCase() === "respond-async") === true;
 
       const existing = this.findReceipt(tx.transaction_id);
       if (existing) {
         await this.verifyCommittedReplayPayload(tx, existing);
-        await this.replayStatusSideEffects(tx, existing);
-        await this.clearTransactionRecovery(tx.transaction_id);
-        return Response.json(existing);
+        return this.replayCommittedTransactionResponse(tx, existing, prefersAsync);
       }
 
       if (tx.project_id === AUTO_PROJECT_ID) {
@@ -645,9 +644,7 @@ export class ProjectGuard extends DurableObject<Env> {
         const reconciled = this.findReceipt(tx.transaction_id);
         if (reconciled) {
           await this.verifyCommittedReplayPayload(tx, reconciled);
-          await this.replayStatusSideEffects(tx, reconciled);
-          await this.clearTransactionRecovery(tx.transaction_id);
-          return Response.json(reconciled);
+          return this.replayCommittedTransactionResponse(tx, reconciled, prefersAsync);
         }
       }
 
@@ -658,9 +655,7 @@ export class ProjectGuard extends DurableObject<Env> {
         }
         await this.verifyCommittedReplayPayload(tx, canonicalReceipt);
         this.persistReceipt(canonicalReceipt);
-        await this.replayStatusSideEffects(tx, canonicalReceipt);
-        await this.clearTransactionRecovery(tx.transaction_id);
-        return Response.json(canonicalReceipt);
+        return this.replayCommittedTransactionResponse(tx, canonicalReceipt, prefersAsync);
       }
 
       const admissionState = reconciledState ?? await this.loadOrRecoverState();
@@ -725,7 +720,6 @@ export class ProjectGuard extends DurableObject<Env> {
         event_id: result.event.event_id,
         committed_at: tx.created_at
       };
-
       if (this.layoutMode === "v2") {
         const record: CanonicalCommitRecord = {
           schema_version: "1.0",
@@ -739,8 +733,32 @@ export class ProjectGuard extends DurableObject<Env> {
         };
         await this.repository.writeCommitRecord(record);
         this.persistCommit(result.state, receipt);
-        await this.storeCommittedRequestObservation(tx, receipt, machineCommitRecordPath(tx.project_id, result.state.revision), record);
-        await this.requestMaterializationSafely(result.state.revision);
+        try {
+          await this.storeCommittedRequestObservation(tx, receipt, machineCommitRecordPath(tx.project_id, result.state.revision), record);
+        } catch (error) {
+          console.warn("Project OS commit observation cache write failed after canonical commit", {
+            project_id: tx.project_id, transaction_id: tx.transaction_id,
+            message: error instanceof Error ? error.message : String(error)
+          });
+        }
+        // Opt-in short commit is terminal, not a 202: the exact immutable
+        // receipt already exists. The durable request row/alarm reconstructs
+        // projection handoff after response loss or process eviction.
+        if (prefersAsync && !PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
+          try { await this.recordTransactionExecutionReceipt(tx, receipt); }
+          catch (error) {
+            console.warn("Project OS execution receipt will be reconstructed from canonical commit", {
+              project_id: tx.project_id, transaction_id: tx.transaction_id,
+              message: error instanceof Error ? error.message : String(error)
+            });
+          }
+          return Response.json(receipt);
+        }
+        if (!await this.requestMaterializationSafely(result.state.revision)) {
+          await this.ensureTransactionRecovery(tx);
+          await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+          return Response.json(receipt, { headers: { "x-project-os-recovery-pending": "true" } });
+        }
       } else {
         await this.repository.writeCommit(result.state, result.event, receipt, {
           publishReceipt: tx.operation !== "project.create"
@@ -2175,6 +2193,14 @@ export class ProjectGuard extends DurableObject<Env> {
           intent = await this.transactionRequests.ensureTransactionRequest(projectId, tx, envelope.actor ?? undefined);
         }
         if (!tx || !intent) throw new Error("transaction_intent_unavailable");
+        const committed = this.findReceipt(item.request_id) ?? await this.repository.readReceipt(item.request_id);
+        if (committed?.status === "committed" && committed.project_id === projectId) {
+          const replay = await this.replayCommittedTransactionResponse(tx, committed, false);
+          if (replay.headers.get("x-project-os-recovery-pending") === "true") {
+            throw new Error("transaction_post_commit_handoff_pending");
+          }
+          continue;
+        }
         const admitted = await new ExecutionJournal(this.persistence, projectId, "transaction", item.request_id).readAdmission();
         const actor = admitted?.admission.actor ?? intent.actor;
         const state = await this.loadOrRecoverState();
@@ -2186,6 +2212,9 @@ export class ProjectGuard extends DurableObject<Env> {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ admission_version: "1.0", request: tx, mutation_context: context })
         }));
+        if (response.headers.get("x-project-os-recovery-pending") === "true") {
+          throw new Error("transaction_post_commit_handoff_pending");
+        }
         if (!response.ok) {
           const diagnostics = {
             providerId: "project-guard",
@@ -3161,10 +3190,10 @@ export class ProjectGuard extends DurableObject<Env> {
     this.persistCommit(record.state, record.receipt);
   }
 
-  private async requestMaterializationSafely(revision: number): Promise<void> {
+  private async requestMaterializationSafely(revision: number): Promise<boolean> {
     const projectId = this.ctx.id.name;
-    if (!projectId || projectId === AUTO_PROJECT_ID || this.layoutMode !== "v2") return;
-    await requestMaterializationTargetSafely(
+    if (!projectId || projectId === AUTO_PROJECT_ID || this.layoutMode !== "v2") return true;
+    return requestMaterializationTargetSafely(
       this.env,
       projectId,
       revision,
@@ -4051,12 +4080,64 @@ export class ProjectGuard extends DurableObject<Env> {
     return 5_000;
   }
 
-  private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<void> {
+  private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<boolean> {
     await this.recordTransactionExecutionReceipt(tx, receipt);
-    if (receipt.status !== "committed" || !PROJECT_STATUS_OPERATIONS.has(tx.operation)) return;
+    if (receipt.status !== "committed") return true;
+    if (this.layoutMode === "v2" && !await this.requestMaterializationSafely(receipt.new_revision)) return false;
+    if (!PROJECT_STATUS_OPERATIONS.has(tx.operation)) return true;
     const currentState = await this.loadOrRecoverState();
-    if (!currentState) return;
+    if (!currentState) return false;
     await this.syncRegistryStatus(currentState);
+    return true;
+  }
+
+  private async replayCommittedTransactionResponse(
+    tx: Transaction,
+    receipt: Receipt,
+    prefersAsync: boolean
+  ): Promise<Response> {
+    // A committed exact replay is already terminal business evidence. An
+    // opted-in caller receives that same receipt without waiting for views;
+    // any still-durable request row remains responsible for maintenance.
+    if (receipt.status === "committed" && prefersAsync && !PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
+      return Response.json(receipt);
+    }
+    if (receipt.status === "committed" && this.layoutMode === "v2") await this.ensureTransactionRecovery(tx);
+    if (await this.replayStatusSideEffects(tx, receipt)) {
+      await this.clearTransactionRecovery(tx.transaction_id);
+      return Response.json(receipt);
+    }
+    await this.ensureTransactionRecovery(tx);
+    await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+    return Response.json(receipt, { headers: { "x-project-os-recovery-pending": "true" } });
+  }
+
+  private async ensureTransactionRecovery(tx: Transaction): Promise<void> {
+    const projectId = tx.project_id;
+    const queued = this.ctx.storage.sql.exec<{ request_id: string }>(
+      "SELECT request_id FROM request_recovery WHERE kind = 'transaction' AND request_id = ?", tx.transaction_id
+    ).toArray()[0];
+    if (queued) {
+      if (await this.ctx.storage.getAlarm() === null) await this.armRequestRecoveryAlarm(1_000);
+      return;
+    }
+    const staged = this.ctx.storage.sql.exec<{ request_json: string; request_sha256: string }>(
+      "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'transaction' AND request_id = ?", tx.transaction_id
+    ).toArray()[0];
+    if (staged) {
+      if (await sha256Text(staged.request_json) !== staged.request_sha256) throw new Error("transaction_staged_payload_unavailable");
+      const envelope = JSON.parse(staged.request_json) as { request?: unknown };
+      if (canonicalJson(parseTransaction(envelope.request)) !== canonicalJson(tx)) throw new Error("transaction_staged_identity_mismatch");
+      await this.enqueueRequestRecovery("transaction", tx.transaction_id, staged.request_json);
+      return;
+    }
+    const intent = await this.transactionRequests.readIntent(projectId, tx.transaction_id);
+    if (intent && canonicalJson(parseTransaction(JSON.parse(intent.request_json))) !== canonicalJson(tx)) {
+      throw new Error("transaction_intent_identity_mismatch");
+    }
+    const admission = await new ExecutionJournal(this.persistence, projectId, "transaction", tx.transaction_id).readAdmission();
+    const actor = admission?.admission.actor ?? intent?.actor ?? null;
+    await this.enqueueRequestRecovery("transaction", tx.transaction_id, canonicalJson({ request: tx, actor }));
   }
 
   private async recordTransactionExecutionReceipt(tx: Transaction, receipt: Receipt): Promise<void> {

@@ -11,6 +11,24 @@ import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-gover
 
 afterEach(() => vi.restoreAllMocks());
 
+function partitionProviderCallsByProject<T extends { endpoint: string; paths: string[] }>(calls: T[], projectId: string): [T[], T[]] {
+  const scoped: T[] = [];
+  const foreign: T[] = [];
+  for (const call of calls) {
+    const projectIds = [...new Set(call.paths.flatMap((path) => path.match(/PRJ-[0-9]{4}/g) ?? []))];
+    if (projectIds.length > 0 && projectIds.every((id) => id !== projectId)) foreign.push(call);
+    else scoped.push(call);
+  }
+  return [scoped, foreign];
+}
+
+it("keeps same-project and unscoped calls while reporting other-project provider calls separately", () => {
+  const same = { endpoint: "POST /2/files/download", paths: ["/PROJECT_OS/.project-os/projects/PRJ-8451/materialization-head.json"] };
+  const foreign = { endpoint: "POST /2/files/download", paths: ["/PROJECT_OS/.project-os/projects/PRJ-8450/materialization-head.json"] };
+  const unscoped = { endpoint: "POST /2/files/list_folder", paths: [] };
+  expect(partitionProviderCallsByProject([same, foreign, unscoped], "PRJ-8451")).toEqual([[same, unscoped], [foreign]]);
+});
+
 it("measures warm reads and snapshot costs at 50 and 1000 revisions without claiming constant snapshot bytes", async () => {
   const reports: Array<Record<string, number>> = [];
   const submissionCallProfiles: Array<Record<string, number>> = [];
@@ -102,12 +120,23 @@ it("measures warm reads and snapshot costs at 50 and 1000 revisions without clai
       return rows;
     });
     const submissionUploads = mock.uploadCalls.slice(beforeSubmitUploads);
-    const submissionCalls = mock.providerCalls.slice(beforeSubmitCalls);
+    const [submissionCalls, foreignProjectCalls] = partitionProviderCallsByProject(
+      mock.providerCalls.slice(beforeSubmitCalls), projectId
+    );
+    const [projectUploads, foreignProjectUploads] = partitionProviderCallsByProject(
+      submissionUploads.map((path) => ({ endpoint: "upload", paths: [path], path })), projectId
+    );
     const profile: Record<string, number> = {};
     for (const call of submissionCalls) {
       const signature = `${call.endpoint} ${call.paths.join(",")}`;
       profile[signature] = (profile[signature] ?? 0) + 1;
     }
+    for (const call of foreignProjectCalls) {
+      const signature = `foreign project ${call.endpoint} ${call.paths.join(",")}`;
+      profile[signature] = (profile[signature] ?? 0) + 1;
+    }
+    profile.foreign_project_calls = foreignProjectCalls.length;
+    profile.foreign_project_uploads = foreignProjectUploads.length;
     submissionCallProfiles.push(profile);
     reports.push({
       history,
@@ -117,9 +146,11 @@ it("measures warm reads and snapshot costs at 50 and 1000 revisions without clai
       canonical_record_bytes: new TextEncoder().encode(JSON.stringify(record)).byteLength,
       state_bytes: new TextEncoder().encode(JSON.stringify(record.state)).byteLength,
       strict_submission_provider_calls: submissionCalls.length,
+      foreign_project_provider_calls_during_submission: foreignProjectCalls.length,
       strict_submission_project_sql_rows_written: submission,
-      strict_submission_provider_uploads: submissionUploads.length,
-      strict_submission_uploaded_path_final_bytes_estimate: submissionUploads.reduce((sum, path) => sum + new TextEncoder().encode(mock.files.get(path) ?? "").byteLength, 0)
+      strict_submission_provider_uploads: projectUploads.length,
+      foreign_project_uploads_during_submission: foreignProjectUploads.length,
+      strict_submission_uploaded_path_final_bytes_estimate: projectUploads.reduce((sum, call) => sum + new TextEncoder().encode(mock.files.get(call.path) ?? "").byteLength, 0)
     });
   }
   expect(reports[1]!.warm_provider_calls).toBe(reports[0]!.warm_provider_calls);

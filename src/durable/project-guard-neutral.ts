@@ -1,6 +1,6 @@
 import { ReviewCapabilityExpiredError } from "../artifacts/review-policy";
 import { binaryArtifactPolicyViolation } from "../artifacts/policy";
-import { ReviewCandidateRevisionError } from "../mutation-gate/artifact-intent";
+import { ArtifactMutationIntentService, ReviewCandidateRevisionError } from "../mutation-gate/artifact-intent";
 import { DurableObject } from "cloudflare:workers";
 import {
   StagedArtifactConflictError,
@@ -69,7 +69,14 @@ import { matchesResource } from "../rules/resolution";
 import { ExecutionJournal } from "../execution/journal";
 import type { ExecutionAdmission, ExecutionAdapter, ExecutionPlan } from "../execution/contract";
 import { ExecutionCoordinator } from "../execution/coordinator";
-import { persistenceObservation, type RequestKind } from "../persistence/observation";
+import {
+  isStoredPersistenceObservation,
+  persistenceObservation,
+  persistenceObservationStorageKey,
+  type RequestKind,
+  type StoredPersistenceObservation
+} from "../persistence/observation";
+import { retrieveContextDetail, summarizeCanonicalContext } from "../control-tower/context";
 import { authorizeRepair, normalizeRepairAdmission, parseRepairIntent, unavailableRepairEvidence, type RepairEvidenceResolver } from "../execution/repair";
 import { createSliceBudget } from "../convergence/budget";
 
@@ -466,6 +473,8 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       const correlationId = this.observationCorrelationId(request, url);
       if (this.queueDepth > 0) {
+        const observed = await this.readStoredRequestObservation(projectId, kind as RequestKind, requestId);
+        if (observed) return observed;
         return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId);
       }
       return this.readWhenIdle(() => this.readBoundedRequestStatus(url, correlationId));
@@ -541,6 +550,10 @@ export class ProjectGuard extends DurableObject<Env> {
       return this.handleMutationContextRead(request);
     }
 
+    if (request.method === "GET" && pathname === "/context") {
+      return this.handleContextRead(request);
+    }
+
     if (request.method === "GET" && pathname === "/receipt") {
       const url = new URL(request.url);
       const projectId = this.ctx.id.name;
@@ -555,6 +568,13 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       const localReceipt = await this.handleReceiptRead(url);
       if (localReceipt.status !== 404) return localReceipt;
+      const observed = await this.readStoredRequestObservation(projectId, kind as RequestKind, requestId);
+      if (observed) {
+        const body = await observed.clone().json() as Record<string, unknown>;
+        if (body.receipt && ["committed", "rejected", "conflict"].includes(String((body.receipt as Record<string, unknown>).status))) {
+          return Response.json(body.receipt);
+        }
+      }
       if (this.queueDepth > 0) {
         try {
           const canonicalReceipt = await this.readBoundedRequestStatusReceipt(projectId, kind as RequestKind, requestId);
@@ -718,12 +738,14 @@ export class ProjectGuard extends DurableObject<Env> {
         };
         await this.repository.writeCommitRecord(record);
         this.persistCommit(result.state, receipt);
+        await this.storeCommittedRequestObservation(tx, receipt, machineCommitRecordPath(tx.project_id, result.state.revision), record);
         await this.requestMaterializationSafely(result.state.revision);
       } else {
         await this.repository.writeCommit(result.state, result.event, receipt, {
           publishReceipt: tx.operation !== "project.create"
         });
         this.persistCommit(result.state, receipt);
+        await this.storeCommittedRequestObservation(tx, receipt, machineReceiptPath(tx.transaction_id), receipt);
       }
 
       if (PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
@@ -832,6 +854,23 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     try {
+      // In V2 the mutation-gate intent is the canonical artifact admission
+      // record. Establish it before the destination effect, so a status read
+      // during a long provider call can report a verified, resumable request.
+      if (this.layoutMode === "v2") {
+        await this.enqueueRequestRecovery("artifact", artifact.request_id);
+        await new ArtifactMutationIntentService(new MutationGateRepository(this.persistence), this.persistence).prepare(state, artifact);
+        const intent = await new MutationGateRepository(this.persistence).readArtifactIntent(artifact.project_id, artifact.request_id);
+        if (intent?.request_json === serialized
+          && intent.request_sha256 === await sha256Text(serialized)
+          && await this.ctx.storage.getAlarm() !== null) {
+          await this.storeAdmittedRequestObservation({
+            project_id: artifact.project_id, kind: "artifact", request_id: artifact.request_id,
+            request_hash: intent.request_sha256, evidence_ref: machineMutationIntentPath(artifact.project_id, artifact.request_id),
+            evidence: intent
+          });
+        }
+      }
       // Staged artifacts have no document head to fence. If the canonical
       // destination belongs to an adopted navigation zone, persist its
       // in-flight source marker before the destination/binding can change.
@@ -967,6 +1006,7 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
         return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED" }, { status: 503 });
       }
+      await this.storeAdmittedDocumentObservation(operation, serialized);
       const durable = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
       if (durable) {
         this.clearRequestRecovery("document", operation.request_id);
@@ -1021,6 +1061,8 @@ export class ProjectGuard extends DurableObject<Env> {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
       return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED" }, { status: 503 });
     }
+
+    await this.storeAdmittedDocumentObservation(operation, serialized);
 
     const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
     if (durableReceipt) {
@@ -1134,6 +1176,7 @@ export class ProjectGuard extends DurableObject<Env> {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
       return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_RECOVERY_SCHEDULED" }, { status: 503 });
     }
+    await this.storeAdmittedDocumentObservation(request, JSON.stringify(request));
     const durable = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
     if (durable) {
       const receipt = JSON.parse(durable.receipt_json) as NavigationDocumentReceipt;
@@ -1225,6 +1268,14 @@ export class ProjectGuard extends DurableObject<Env> {
   private async settleNavigationReceipt(request: NavigationReconcileRequest, receipt: NavigationDocumentReceipt): Promise<void> {
     this.persistDocumentRequest(request, receipt);
     const receiptPath = `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`;
+    const intent = await this.managedDocumentRequests.readRecoverableIntent(request.project_id, request.request_id);
+    const durableReceipt = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
+    if (intent && durableReceipt && durableReceipt.request_sha256 === intent.request_sha256
+      && canonicalJson(JSON.parse(durableReceipt.receipt_json)) === canonicalJson(receipt)) {
+      await this.storeCanonicalTerminalObservation(
+        request.project_id, "document", request.request_id, receipt, receiptPath, durableReceipt, intent.request_sha256
+      );
+    }
     const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
     await journal.recordReceipt(receipt.status, receiptPath);
     if (receipt.status === "conflict") {
@@ -1286,6 +1337,17 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     try {
       await this.repository.writeArtifactReceipt(receipt);
+      const canonicalReceipt = await this.persistence.objects.readText(machineArtifactReceiptPath(request.request_id));
+      if (canonicalReceipt !== null) {
+        const verified = JSON.parse(canonicalReceipt) as ArtifactWriteReceipt;
+        if (canonicalJson(verified) === canonicalJson(receipt)) {
+          const intent = await new MutationGateRepository(this.persistence).readArtifactIntent(request.project_id, request.request_id);
+          if (intent) await this.storeCanonicalTerminalObservation(
+            request.project_id, "artifact", request.request_id, verified, machineArtifactReceiptPath(request.request_id),
+            canonicalReceipt, intent.request_sha256
+          );
+        }
+      }
       await this.settleArtifactReceipt(request, receipt);
       if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
       return Response.json(receipt);
@@ -1371,6 +1433,16 @@ export class ProjectGuard extends DurableObject<Env> {
       requestJson,
       receiptJson
     );
+    const durableIntent = await this.managedDocumentRequests.readRecoverableIntent(request.project_id, request.request_id);
+    const durableReceipt = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
+    if (durableIntent && durableReceipt && durableIntent.request_sha256 === durableReceipt.request_sha256
+      && durableReceipt.receipt_json === receiptJson) {
+      await this.storeCanonicalTerminalObservation(
+        request.project_id, "document", request.request_id, receipt,
+        `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`,
+        durableReceipt, durableIntent.request_sha256
+      );
+    }
     // The family cache must be available before certification. Certification
     // is deliberately a separate retryable step and can now be resumed by the
     // alarm if the initial invocation ends between receipt and certificate.
@@ -2384,6 +2456,54 @@ export class ProjectGuard extends DurableObject<Env> {
     return row ? normalizeProjectState(JSON.parse(row.state_json)) : null;
   }
 
+  private async handleContextRead(request: Request): Promise<Response> {
+    const projectId = this.ctx.id.name;
+    if (!projectId || projectId === AUTO_PROJECT_ID) {
+      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    }
+    const url = new URL(request.url);
+    let state: ProjectState | null;
+    try {
+      state = await this.readFreshCanonicalState(projectId);
+    } catch {
+      return Response.json({ status: "unknown", freshness: "unknown", error: "canonical_unavailable" }, { status: 503 });
+    }
+    if (!state) return Response.json({ status: "unknown", freshness: "unknown", error: "canonical_unavailable" }, { status: 503 });
+
+    const observedAt = new Date().toISOString();
+    const canonical = {
+      context: { project_id: projectId, canonical_revision: state.revision },
+      canonical_state: state as unknown as Record<string, unknown>
+    };
+    const entityType = url.searchParams.get("entity_type");
+    const entityId = url.searchParams.get("entity_id");
+    const field = url.searchParams.get("field");
+    let page: Record<string, unknown>;
+    if (entityType !== null || entityId !== null || field !== null || url.searchParams.has("revision")) {
+      const revision = Number(url.searchParams.get("revision"));
+      if (!Number.isSafeInteger(revision) || !entityType || !entityId || !field
+        || !["project", "phase", "task"].includes(entityType)) {
+        return Response.json({ status: "invalid_request", code: "CONTEXT_DETAIL_REQUEST_INVALID" }, { status: 400 });
+      }
+      const detail = retrieveContextDetail(canonical, projectId, {
+        revision,
+        entity_type: entityType as "project" | "phase" | "task",
+        entity_id: entityId,
+        field,
+        cursor: url.searchParams.get("cursor") ?? undefined
+      });
+      if (detail.error) return Response.json(detail.error, { status: 400 });
+      page = { ...detail.value!, project_id: projectId, context: canonical.context };
+    } else {
+      const summary = summarizeCanonicalContext(canonical, projectId, url.searchParams.get("cursor") ?? undefined);
+      if (summary.error) return Response.json(summary.error, { status: 400 });
+      page = summary.value!;
+    }
+    // Context pages are bounded and read-only. They intentionally contain no
+    // mutation token; only /mutation-context issues admission authority.
+    return Response.json({ ...page, observed_at: observedAt, freshness: "verified" });
+  }
+
   private async handleMutationContextRead(request: Request): Promise<Response> {
     const projectId = this.ctx.id.name;
     const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
@@ -3267,6 +3387,157 @@ export class ProjectGuard extends DurableObject<Env> {
     };
   }
 
+  /** Persist only statuses reached after canonical evidence was verified. This
+   * local record is an observation, not authorization and not proof that
+   * mutable materialized output remains current. */
+  private async storeCommittedRequestObservation(
+    tx: Transaction,
+    receipt: Receipt,
+    evidenceRef: string,
+    evidence: unknown
+  ): Promise<void> {
+    const kind: RequestKind = "transaction";
+    const requestId = tx.transaction_id;
+    const key = persistenceObservationStorageKey(kind, requestId);
+    const previous = await this.ctx.storage.get<StoredPersistenceObservation>(key);
+    const identity = { project_id: tx.project_id, kind, request_id: requestId };
+    const sequence = isStoredPersistenceObservation(previous, identity) ? previous.observation_sequence + 1 : 1;
+    const observedAt = new Date().toISOString();
+    const requestHash = await sha256Text(canonicalJson(tx));
+    const observation = persistenceObservation({
+      ...identity,
+      observed_at: observedAt,
+      correlation_id: "",
+      receipt,
+      durable_intent: true
+    });
+    observation.observation_sequence = sequence;
+    observation.freshness = "verified";
+    const response = { ...identity, status: "committed", receipt, observation };
+    await this.ctx.storage.put(key, {
+      schema_version: "1.0",
+      ...identity,
+      observed_at: observedAt,
+      observation_sequence: sequence,
+      request_hash: requestHash,
+      evidence_ref: evidenceRef,
+      evidence_sha256: await sha256Text(canonicalJson(evidence)),
+      response
+    } satisfies StoredPersistenceObservation);
+  }
+
+  private async storeAdmittedDocumentObservation(request: ManagedDocumentRequest, requestJson: string): Promise<void> {
+    const ledger = this.managedDocumentRequests;
+    const intent = await ledger.readRecoverableIntent(request.project_id, request.request_id);
+    const expectedHash = await sha256Text(requestJson);
+    if (!intent || intent.request_json !== requestJson || intent.request_sha256 !== expectedHash) return;
+    if (await ledger.readReceipt(request.project_id, request.request_id)) return;
+    const alarmAt = await this.ctx.storage.getAlarm();
+    if (alarmAt === null) return;
+    await this.storeRequestObservation({
+      project_id: request.project_id, kind: "document", request_id: request.request_id,
+      request_hash: intent.request_sha256,
+      evidence_ref: `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/intent.json`,
+      evidence: intent, status: "admitted_uncommitted", receipt: null, alarm_at: alarmAt
+    });
+  }
+
+  private async storeAdmittedRequestObservation(input: {
+    project_id: string; kind: "artifact"; request_id: string; request_hash: string; evidence_ref: string; evidence: unknown;
+  }): Promise<void> {
+    const alarmAt = await this.ctx.storage.getAlarm();
+    if (alarmAt === null) return;
+    await this.storeRequestObservation({ ...input, status: "admitted_uncommitted", receipt: null, alarm_at: alarmAt });
+  }
+
+  private async storeCanonicalTerminalObservation(
+    projectId: string,
+    kind: "document" | "artifact",
+    requestId: string,
+    receipt: ManagedDocumentOperationReceipt | ArtifactWriteReceipt,
+    evidenceRef: string,
+    evidence: unknown,
+    requestHash: string
+  ): Promise<void> {
+    if (receipt.project_id !== projectId || receipt.request_id !== requestId
+      || !["committed", "rejected", "conflict"].includes(receipt.status)) return;
+    await this.storeRequestObservation({
+      project_id: projectId, kind, request_id: requestId, request_hash: requestHash,
+      evidence_ref: evidenceRef, evidence, status: receipt.status, receipt, alarm_at: null
+    });
+  }
+
+  private async storeRequestObservation(input: {
+    project_id: string; kind: RequestKind; request_id: string; request_hash: string | null;
+    evidence_ref: string; evidence: unknown; status: string; receipt: unknown | null; alarm_at: number | null;
+  }): Promise<void> {
+    const identity = { project_id: input.project_id, kind: input.kind, request_id: input.request_id };
+    const key = persistenceObservationStorageKey(input.kind, input.request_id);
+    const previous = await this.ctx.storage.get<StoredPersistenceObservation>(key);
+    const sequence = isStoredPersistenceObservation(previous, identity) ? previous.observation_sequence + 1 : 1;
+    const observedAt = new Date().toISOString();
+    const observation = persistenceObservation({
+      ...identity, observed_at: observedAt, correlation_id: "", receipt: input.receipt,
+      durable_intent: true,
+      wake_scheduled: input.alarm_at !== null,
+      ...(input.alarm_at !== null ? { next_attempt_at: new Date(input.alarm_at).toISOString() } : {})
+    });
+    observation.observation_sequence = sequence;
+    observation.freshness = "verified";
+    const response = { ...identity, status: input.status, receipt: input.receipt, observation };
+    await this.ctx.storage.put(key, {
+      schema_version: "1.0", ...identity, observed_at: observedAt, observation_sequence: sequence,
+      request_hash: input.request_hash, evidence_ref: input.evidence_ref,
+      evidence_sha256: await sha256Text(canonicalJson(input.evidence)), response
+    } satisfies StoredPersistenceObservation);
+  }
+
+  protected async readStoredRequestObservation(
+    projectId: string,
+    kind: RequestKind,
+    requestId: string
+  ): Promise<Response | null> {
+    try {
+      const identity = { project_id: projectId, kind, request_id: requestId };
+      const stored = await this.ctx.storage.get<StoredPersistenceObservation>(
+        persistenceObservationStorageKey(kind, requestId)
+      );
+      if (!isStoredPersistenceObservation(stored, identity)) return null;
+      const storedResponse = stored.response as Record<string, any>;
+      const receipt = stored.response.receipt as Record<string, unknown> | undefined;
+      const receiptId = kind === "transaction" ? receipt?.transaction_id : receipt?.request_id;
+      const committedReceiptMatches = receipt?.project_id === projectId && receiptId === requestId
+        && receipt.status === "committed";
+      const terminalReceiptMatches = receipt?.project_id === projectId && receiptId === requestId
+        && receipt.status === storedResponse.status && ["rejected", "conflict"].includes(String(receipt.status));
+      const canonicalRefMatches = storedResponse.status === "admitted_uncommitted"
+        ? receipt === null && stored.request_hash !== null && stored.evidence_ref === (kind === "document"
+          ? `${machineDocumentRoot(projectId)}/requests/${requestId}/intent.json`
+          : kind === "artifact" ? machineMutationIntentPath(projectId, requestId) : "")
+          && storedResponse.observation?.status === "admitted_uncommitted"
+          && storedResponse.observation?.recovery?.durable_intent === true
+          && storedResponse.observation?.recovery?.state === "scheduled"
+        : storedResponse.status === "committed"
+          ? (kind === "document" ? stored.evidence_ref === `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`
+            : kind === "artifact" ? stored.evidence_ref === machineArtifactReceiptPath(requestId)
+              : stored.evidence_ref === machineReceiptPath(requestId)
+                || (Number.isSafeInteger(receipt?.new_revision)
+                  && stored.evidence_ref === machineCommitRecordPath(projectId, receipt?.new_revision as number)))
+          : terminalReceiptMatches && (kind === "document"
+            ? stored.evidence_ref === `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`
+            : kind === "artifact" && stored.evidence_ref === machineArtifactReceiptPath(requestId));
+      if (!canonicalRefMatches || (storedResponse.status === "committed" && !committedReceiptMatches)) return null;
+
+      const response = structuredClone(storedResponse);
+      const observation = response.observation as Record<string, unknown>;
+      observation.freshness = "stale";
+      return Response.json(response);
+    } catch {
+      // A damaged or unavailable local observation never becomes absence.
+      return null;
+    }
+  }
+
   /** A read-only recovery view. In particular, it must not certify an effect,
    * replay a write, or create a receipt merely because a chat asked about it. */
   private async handleRequestStatus(
@@ -3333,6 +3604,15 @@ export class ProjectGuard extends DurableObject<Env> {
             parseManagedDocumentRequest(JSON.parse(recoverable.request_json));
             recoverableIntent = true;
           }
+        } catch {
+          recoveryCode = "intent_payload_invalid";
+        }
+      } else if (artifactIntent) {
+        try {
+          if (await sha256Text(artifactIntent.request_json) !== artifactIntent.request_sha256) throw new Error("artifact_intent_payload_invalid");
+          const parsed = parseArtifactWriteRequest(JSON.parse(artifactIntent.request_json));
+          if (parsed.project_id !== projectId || parsed.request_id !== requestId) throw new Error("artifact_intent_identity_invalid");
+          recoverableIntent = true;
         } catch {
           recoveryCode = "intent_payload_invalid";
         }
@@ -3652,9 +3932,22 @@ export class ProjectGuard extends DurableObject<Env> {
       const response = await this.readBoundedRequestStatus(url, correlationId, true);
       if (!response.ok) throw new Error("request_status_not_verified");
       const body = await response.clone().json() as Record<string, any>;
+      const observation = body.observation as Record<string, any> | undefined;
+      const recovery = body.recovery as Record<string, any> | undefined;
+      const admittedAndBound = body.project_id === projectId && body.kind === kind && body.request_id === requestId
+        && body.receipt == null
+        && ["admitted_uncommitted", "recovery_scheduled"].includes(String(body.status))
+        && observation?.project_id === projectId && observation.kind === kind && observation.request_id === requestId
+        && observation.status === "admitted_uncommitted" && observation.freshness === "verified"
+        && observation.recovery?.durable_intent === true && observation.recovery?.state === "scheduled"
+        && recovery?.durable_intent === true && recovery.recoverable === true && recovery.scheduled === true;
+      if (admittedAndBound) {
+        body.status = "admitted_uncommitted";
+        body.receipt = null;
+        return Response.json(body);
+      }
       const receipt = body.receipt as Record<string, any> | undefined;
       const execution = body.execution as Record<string, any> | undefined;
-      const observation = body.observation as Record<string, any> | undefined;
       const receiptId = kind === "transaction" ? receipt?.transaction_id : receipt?.request_id;
       const executionRoot = await new ExecutionJournal(this.persistence, projectId, kind, requestId).root();
       const finalizationRef = execution?.finalization_ref;

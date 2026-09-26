@@ -4,7 +4,7 @@ import { artifactWriteRequestSchema } from "../domain/artifact-write";
 import { managedDocumentRequestSchema } from "../domain/managed-document-request";
 import { AUTO_PROJECT_ID, transactionSchema } from "../domain/transaction";
 import { parseMutationContextOrNull } from "../admission/mutation-context";
-import { DETAIL_FIELDS, retrieveContextDetail, summarizeCanonicalContext } from "./context";
+import { DETAIL_FIELDS } from "./context";
 import type { ControlTowerAccess } from "./auth";
 import { persistenceCapabilities } from "../persistence/capabilities";
 import type { VersionMetadataLike } from "../deployment/identity";
@@ -20,11 +20,12 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
   }, async () => ({ content: [{ type: "text" as const, text: JSON.stringify(persistenceCapabilities(env, access)) }] }));
   server.registerTool("project_os_get_context", { description: "Read canonical Project OS context", inputSchema: { project_id: projectIdSchema, cursor: z.string().max(1_024).optional() } }, async ({ project_id, cursor }) => {
     if (!access.read) return scopeDenied("project.read");
-    return readGuard(env.PROJECT_GUARD, project_id, "/mutation-context", (response, body) => {
-      if (!response.ok) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
-      const bounded = summarizeCanonicalContext(body as { context: unknown; canonical_state?: Record<string, unknown> }, project_id, cursor);
-      if (bounded.error) return { isError: true, content: [{ type: "text", text: JSON.stringify(bounded.error) }] };
-      return { content: [{ type: "text", text: JSON.stringify(bounded.value) }] };
+    const query = new URLSearchParams();
+    if (cursor) query.set("cursor", cursor);
+    return readGuard(env.PROJECT_GUARD, project_id, `/context${query.size ? `?${query}` : ""}`, (response, body) => {
+      if (!response.ok) return contextReadError(response, body);
+      if (!isContextReadPage(body, project_id)) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "CONTEXT_RESPONSE_INVALID" }) }] };
+      return { content: [{ type: "text", text: JSON.stringify(body) }] };
     });
   });
   const detailFieldSchema = z.enum([...DETAIL_FIELDS.project, ...DETAIL_FIELDS.phase, ...DETAIL_FIELDS.task]);
@@ -40,12 +41,15 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
     }
   }, async ({ project_id, revision, entity_type, entity_id, field, cursor }) => {
     if (!access.read) return scopeDenied("project.read");
-    return readGuard(env.PROJECT_GUARD, project_id, "/mutation-context", (response, body) => {
-      if (!response.ok) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
-      const detail = retrieveContextDetail(body as { context: unknown; canonical_state?: Record<string, unknown> }, project_id,
-        { revision, entity_type, entity_id, field, cursor });
-      if (detail.error) return { isError: true, content: [{ type: "text", text: JSON.stringify(detail.error) }] };
-      const text = JSON.stringify(detail.value);
+    const query = new URLSearchParams({ revision: String(revision), entity_type, entity_id, field });
+    if (cursor) query.set("cursor", cursor);
+    return readGuard(env.PROJECT_GUARD, project_id, `/context?${query}`, (response, body) => {
+      if (!response.ok) return contextReadError(response, body);
+      if (!isContextReadPage(body, project_id) || body.revision !== revision || body.entity_type !== entity_type
+        || body.entity_id !== entity_id || body.field !== field) {
+        return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "CONTEXT_RESPONSE_INVALID" }) }] };
+      }
+      const text = JSON.stringify(body);
       return new TextEncoder().encode(text).byteLength <= 16 * 1024
         ? { content: [{ type: "text", text }] }
         : { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "CONTEXT_DETAIL_PAGE_TOO_LARGE" }) }] };
@@ -100,6 +104,29 @@ function readCreateStatus(namespace: DurableObjectNamespace, transactionId: stri
 }
 
 type ReadToolResult = { isError?: boolean; content: Array<{ type: "text"; text: string }> };
+
+function isContextReadPage(value: unknown, projectId: string): value is Record<string, any> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, any>;
+  const context = body.context;
+  return body.status === "ok" && body.project_id === projectId
+    && typeof body.revision === "number" && Number.isSafeInteger(body.revision)
+    && context && typeof context === "object" && context.project_id === projectId
+    && context.canonical_revision === body.revision && !("token" in context)
+    && ["verified", "stale", "unknown"].includes(body.freshness)
+    && typeof body.observed_at === "string" && Number.isFinite(Date.parse(body.observed_at))
+    && !(body.context && typeof body.context === "object" && "token" in body.context);
+}
+
+function contextReadError(response: Response, value: unknown): ReadToolResult {
+  if (response.status < 500 && value && typeof value === "object" && !Array.isArray(value)) {
+    const body = value as Record<string, unknown>;
+    if (typeof body.status === "string" && typeof body.code === "string") {
+      return { isError: true, content: [{ type: "text", text: JSON.stringify(body) }] };
+    }
+  }
+  return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
+}
 
 async function readGuard(
   namespace: DurableObjectNamespace,

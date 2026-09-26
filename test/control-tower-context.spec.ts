@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createControlTowerServer as createScopedControlTowerServer } from "../src/control-tower/mcp";
 const createControlTowerServer = (env: Parameters<typeof createScopedControlTowerServer>[0]) =>
   createScopedControlTowerServer(env, { read: true, mutate: true });
-import { summarizeCanonicalContext } from "../src/control-tower/context";
+import { retrieveContextDetail, summarizeCanonicalContext } from "../src/control-tower/context";
 
 type ToolResult = { isError?: boolean; content: Array<{ text: string }> };
 type RegisteredServer = { _registeredTools: Record<string, { handler: (input: unknown) => Promise<ToolResult> }> };
@@ -10,13 +10,32 @@ type RegisteredServer = { _registeredTools: Record<string, { handler: (input: un
 function contextServer(state: Record<string, unknown>) {
   const revision = typeof state.revision === "number" ? state.revision : 76;
   return contextServerBody({
-    context: { project_id: "PRJ-0007", canonical_revision: revision, token: "signed" },
+    context: { project_id: "PRJ-0007", canonical_revision: revision },
     canonical_state: state
   });
 }
 
 function contextServerBody(payload: unknown) {
-  const stub = { fetch: async () => Response.json(payload) };
+  const stub = { fetch: async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    const body = payload as { context?: Record<string, unknown>; canonical_state?: Record<string, unknown> };
+    const state = body.canonical_state ?? {};
+    const projectId = String(body.context?.project_id ?? "PRJ-0007");
+    const canonical = { context: body.context, canonical_state: state };
+    const entityType = url.searchParams.get("entity_type");
+    if (entityType) {
+      const detail = retrieveContextDetail(canonical, projectId, {
+        revision: Number(url.searchParams.get("revision")), entity_type: entityType as "project" | "phase" | "task",
+        entity_id: url.searchParams.get("entity_id") ?? "", field: url.searchParams.get("field") ?? "",
+        cursor: url.searchParams.get("cursor") ?? undefined
+      });
+      return Response.json(detail.error ?? { ...detail.value, project_id: projectId, context: canonical.context, freshness: "verified", observed_at: "2026-09-26T10:00:00.000Z" },
+        { status: detail.error ? 400 : 200 });
+    }
+    const summary = summarizeCanonicalContext(canonical, projectId, url.searchParams.get("cursor") ?? undefined);
+    return Response.json(summary.error ?? { ...summary.value, freshness: "verified", observed_at: "2026-09-26T10:00:00.000Z" },
+      { status: summary.error ? 400 : 200 });
+  } };
   return createControlTowerServer({
     PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
     REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
@@ -42,6 +61,43 @@ describe("Control Tower canonical context", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
   });
   afterAll(() => vi.restoreAllMocks());
+
+  it("uses the bounded read-only context endpoint for summary pages and detail chunks", async () => {
+    const paths: string[] = [];
+    const summary = {
+      status: "ok", project_id: "PRJ-0007", revision: 76,
+      freshness: "verified", observed_at: "2026-09-26T10:00:00.000Z",
+      context: { project_id: "PRJ-0007", canonical_revision: 76 },
+      project: { project_id: "PRJ-0007" }, current_phase: null, active_tasks: [], next_cursor: null
+    };
+    const stub = { fetch: async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      paths.push(url.pathname + url.search);
+      return Response.json(url.searchParams.has("entity_type") ? {
+        status: "ok", project_id: "PRJ-0007", revision: 76, entity_type: "project", entity_id: "PRJ-0007", field: "objective",
+        context: { project_id: "PRJ-0007", canonical_revision: 76 },
+        freshness: "verified", observed_at: "2026-09-26T10:00:00.000Z"
+      } : summary);
+    } };
+    const server = createControlTowerServer({
+      PROJECT_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace,
+      REGISTRY_GUARD: { getByName: () => stub } as unknown as DurableObjectNamespace
+    }) as unknown as RegisteredServer;
+
+    const context = server._registeredTools.project_os_get_context!;
+    const page = parse(await context.handler({ project_id: "PRJ-0007", cursor: "cursor-2" }));
+    expect(paths[0]).toBe("/context?cursor=cursor-2");
+    expect(page).toMatchObject({ status: "ok", project_id: "PRJ-0007", freshness: "verified" });
+
+    const detail = server._registeredTools.project_os_get_context_detail!;
+    const chunk = parse(await detail.handler({ project_id: "PRJ-0007", revision: 76, entity_type: "project",
+      entity_id: "PRJ-0007", field: "objective", cursor: "detail-cursor" }));
+    expect(paths[1]).toContain("/context?");
+    expect(paths[1]).toContain("entity_type=project");
+    expect(paths[1]).toContain("field=objective");
+    expect(paths[1]).toContain("cursor=detail-cursor");
+    expect(chunk).toMatchObject({ status: "ok", project_id: "PRJ-0007", freshness: "verified" });
+  });
 
   it("keeps the UTF-8 summary bounded and exposes reversible detail references", async () => {
     const state = {

@@ -59,6 +59,35 @@ async function createProject(projectId: string, slug: string, transactionId: str
 describe("MaterializationGuard isolation boundary", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("does not queue capacity or diagnostics reads behind maintenance I/O", async () => {
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId: "PRJ-3913", queue: Promise.resolve(), queueDepth: 0,
+      ctx: { id: { name: "PRJ-3913" }, storage: {} }
+    }) as MaterializationGuard;
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredMaintenance = new Promise<void>((resolve) => { entered = resolve; });
+    const maintenance = new Promise<void>((resolve) => { release = resolve; });
+    const held = (guard as unknown as { serialize<T>(operation: () => Promise<T>): Promise<T> })
+      .serialize(async () => { entered(); await maintenance; });
+    await enteredMaintenance;
+
+    try {
+      for (const path of ["/capacity", "/diagnostic-status"]) {
+        let finished = false;
+        const read = guard.fetch(new Request(`https://materialization-guard.internal${path}`))
+          .then((response) => { finished = true; return response; });
+        await vi.waitFor(() => expect(finished).toBe(true), { timeout: 150 });
+        const response = await read;
+        expect(response.status).toBe(503);
+        await expect(response.json()).resolves.toMatchObject({ status: "unavailable", freshness: "unknown" });
+      }
+    } finally {
+      release();
+      await held;
+    }
+  });
+
   it("checkpoints canonical commit reconstruction and never returns a partial state as current", async () => {
     const projectId = "PRJ-3910";
     const commits = commitFixture(projectId, 8);

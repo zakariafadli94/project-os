@@ -225,6 +225,35 @@ const worker = {
       });
     }
 
+    const readContextMatch = url.pathname.match(/^\/v1\/projects\/(PRJ-[0-9]{4,})\/context$/);
+    if (request.method === "GET" && readContextMatch) {
+      if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      const allowed = new Set(["cursor", "revision", "entity_type", "entity_id", "field"]);
+      const params = new URLSearchParams();
+      for (const key of new Set(url.searchParams.keys())) {
+        const values = url.searchParams.getAll(key);
+        if (!allowed.has(key) || values.length !== 1) return Response.json({ error: "invalid_context_query" }, { status: 400 });
+        const value = values[0]!;
+        const maxLength = key === "cursor" ? 1_024 : key === "entity_id" ? 512 : 128;
+        if (value.length > maxLength) return Response.json({ error: "invalid_context_query" }, { status: 400 });
+        params.set(key, value);
+      }
+      const hasDetail = ["revision", "entity_type", "entity_id", "field"].some((key) => params.has(key));
+      if (hasDetail && !["revision", "entity_type", "entity_id", "field"].every((key) => params.has(key))) {
+        return Response.json({ error: "invalid_context_query" }, { status: 400 });
+      }
+      if (params.has("revision") && !/^\d+$/.test(params.get("revision")!)) {
+        return Response.json({ error: "invalid_context_query" }, { status: 400 });
+      }
+      const suffix = params.size ? `?${params}` : "";
+      const response = await env.PROJECT_GUARD.getByName(readContextMatch[1]!).fetch(
+        `https://project-guard.internal/context${suffix}`,
+        { headers: { authorization: request.headers.get("authorization") ?? "" } }
+      );
+      const body = await response.json<unknown>().catch(() => ({ status: "unknown", freshness: "unknown", error: "canonical_unavailable" }));
+      return Response.json(body, { status: response.status, headers: response.headers });
+    }
+
     const executionStatusMatch = url.pathname.match(/^\/v1\/projects\/([^/]+)\/execution-status$/);
     if (request.method === "GET" && executionStatusMatch) {
       if (!authorized(request, env)) return Response.json({ error: "unauthorized" }, { status: 401 });

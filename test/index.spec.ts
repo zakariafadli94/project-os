@@ -5,6 +5,8 @@ import worker, { artifactInboxPath, inboxPath } from "../src/index";
 import type { Env } from "../src/env";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
+import { machineCommitRecordPath, machineStatePath } from "../src/persistence/layout";
+import { commitFixture, seedCommits } from "./helpers/convergence-fixture";
 
 const testEnv = env as unknown as Env;
 
@@ -353,6 +355,34 @@ describe("Worker routing", () => {
       request_id: "DOCREQ-REQUEST-STATUS-0001",
       status: "not_received"
     });
+  });
+
+  it("serves an authenticated read-only context page without returning a mutation token", async () => {
+    const projectId = "PRJ-8397";
+    const mock = installDropboxMock();
+    const record = commitFixture(projectId, 1)[0]!;
+    seedCommits(mock, [record]);
+    mock.files.set(machineStatePath(projectId), JSON.stringify(record.state));
+
+    const path = `/v1/projects/${projectId}/context`;
+    const unauthorized = await worker.fetch(new Request(`https://example.com${path}`), testEnv, createExecutionContext());
+    expect(unauthorized.status).toBe(401);
+
+    const duplicateCursor = await worker.fetch(new Request(`https://example.com${path}?cursor=a&cursor=b`, {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    }), testEnv, createExecutionContext());
+    expect(duplicateCursor.status).toBe(400);
+    await expect(duplicateCursor.json()).resolves.toEqual({ error: "invalid_context_query" });
+
+    const response = await worker.fetch(new Request(`https://example.com${path}`, {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    }), testEnv, createExecutionContext());
+    expect(response.status).toBe(200);
+    const page = await response.json<Record<string, any>>();
+    expect(page).toMatchObject({ status: "ok", project_id: projectId, revision: 1, freshness: "verified" });
+    expect(page.context).toMatchObject({ project_id: projectId, canonical_revision: 1 });
+    expect(page.context).not.toHaveProperty("token");
+    expect(page).not.toHaveProperty("canonical_state");
   });
 
   it("rejects staged artifacts before Durable Object routing while binary ingress is disabled", async () => {

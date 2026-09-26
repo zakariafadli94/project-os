@@ -18,6 +18,7 @@ const SEARCH_SIDE_EFFECT_PATHS = new Set([
 ]);
 const OBSERVATION_PATHS = new Set([
   "/mutation-context",
+  "/context",
   "/request-status",
   "/execution-status",
   "/receipt"
@@ -70,11 +71,24 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
           return Response.json({ error: url.pathname === "/receipt" ? "receipt_not_found" : "request_identity_mismatch" }, { status: 404 });
         }
         if (projectId && kind && requestId && ["transaction", "document", "artifact"].includes(kind)) {
+          if (url.pathname === "/execution-status") {
+            return this.readExecutionStatusWhileBusy(projectId, kind, requestId,
+              this.observationCorrelationId(request, url));
+          }
           if (url.pathname === "/request-status") {
+            const observed = await this.readStoredRequestObservation(projectId, kind as RequestKind, requestId);
+            if (observed) return observed;
             return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId,
               this.observationCorrelationId(request, url));
           }
           if (url.pathname === "/receipt") {
+            const observed = await this.readStoredRequestObservation(projectId, kind as RequestKind, requestId);
+            if (observed) {
+              const body = await observed.clone().json() as Record<string, unknown>;
+              if (body.receipt && ["committed", "rejected", "conflict"].includes(String((body.receipt as Record<string, unknown>).status))) {
+                return Response.json(body.receipt);
+              }
+            }
             const local = await this.handleReceiptRead(url);
             if (local.status !== 404) return local;
             try {
@@ -87,9 +101,10 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
           return this.unknownObservationResponse(projectId, kind, requestId,
             this.observationCorrelationId(request, url), "PROJECT_OS_READ_BUSY");
         }
-        if (projectId && kind === "recovery" && requestId && url.pathname === "/execution-status") {
+        if (projectId && requestId && url.pathname === "/execution-status") {
+          const correlationId = this.observationCorrelationId(request, url);
           return Response.json({ project_id: projectId, kind, request_id: requestId,
-            status: "unknown", code: "PROJECT_OS_READ_BUSY" }, { status: 503, headers: { "Retry-After": "1" } });
+            status: "unknown", code: "PROJECT_OS_READ_BUSY", correlation_id: correlationId }, { status: 503, headers: { "Retry-After": "1" } });
         }
       }
       return super.fetch(request);

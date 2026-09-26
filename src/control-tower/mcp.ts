@@ -4,7 +4,7 @@ import { artifactWriteRequestSchema } from "../domain/artifact-write";
 import { managedDocumentRequestSchema } from "../domain/managed-document-request";
 import { AUTO_PROJECT_ID, transactionSchema } from "../domain/transaction";
 import { parseMutationContextOrNull } from "../admission/mutation-context";
-import { DETAIL_FIELDS, retrieveContextDetail, summarizeCanonicalContext } from "./context";
+import { DETAIL_FIELDS } from "./context";
 import type { ControlTowerAccess } from "./auth";
 import { persistenceCapabilities } from "../persistence/capabilities";
 import type { VersionMetadataLike } from "../deployment/identity";
@@ -20,11 +20,12 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
   }, async () => ({ content: [{ type: "text" as const, text: JSON.stringify(persistenceCapabilities(env, access)) }] }));
   server.registerTool("project_os_get_context", { description: "Read canonical Project OS context", inputSchema: { project_id: projectIdSchema, cursor: z.string().max(1_024).optional() } }, async ({ project_id, cursor }) => {
     if (!access.read) return scopeDenied("project.read");
-    return readGuard(env.PROJECT_GUARD, project_id, "/mutation-context", (response, body) => {
-      if (!response.ok) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
-      const bounded = summarizeCanonicalContext(body as { context: unknown; canonical_state?: Record<string, unknown> }, project_id, cursor);
-      if (bounded.error) return { isError: true, content: [{ type: "text", text: JSON.stringify(bounded.error) }] };
-      return { content: [{ type: "text", text: JSON.stringify(bounded.value) }] };
+    const query = new URLSearchParams();
+    if (cursor) query.set("cursor", cursor);
+    return readGuard(env.PROJECT_GUARD, project_id, `/context${query.size ? `?${query}` : ""}`, (response, body) => {
+      if (!response.ok) return contextReadError(response, body);
+      if (!isContextReadPage(body, project_id)) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "CONTEXT_RESPONSE_INVALID" }) }] };
+      return { content: [{ type: "text", text: JSON.stringify(body) }] };
     });
   });
   const detailFieldSchema = z.enum([...DETAIL_FIELDS.project, ...DETAIL_FIELDS.phase, ...DETAIL_FIELDS.task]);
@@ -40,12 +41,15 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
     }
   }, async ({ project_id, revision, entity_type, entity_id, field, cursor }) => {
     if (!access.read) return scopeDenied("project.read");
-    return readGuard(env.PROJECT_GUARD, project_id, "/mutation-context", (response, body) => {
-      if (!response.ok) return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
-      const detail = retrieveContextDetail(body as { context: unknown; canonical_state?: Record<string, unknown> }, project_id,
-        { revision, entity_type, entity_id, field, cursor });
-      if (detail.error) return { isError: true, content: [{ type: "text", text: JSON.stringify(detail.error) }] };
-      const text = JSON.stringify(detail.value);
+    const query = new URLSearchParams({ revision: String(revision), entity_type, entity_id, field });
+    if (cursor) query.set("cursor", cursor);
+    return readGuard(env.PROJECT_GUARD, project_id, `/context?${query}`, (response, body) => {
+      if (!response.ok) return contextReadError(response, body);
+      if (!isContextReadPage(body, project_id) || body.revision !== revision || body.entity_type !== entity_type
+        || body.entity_id !== entity_id || body.field !== field) {
+        return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "CONTEXT_RESPONSE_INVALID" }) }] };
+      }
+      const text = JSON.stringify(body);
       return new TextEncoder().encode(text).byteLength <= 16 * 1024
         ? { content: [{ type: "text", text }] }
         : { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "CONTEXT_DETAIL_PAGE_TOO_LARGE" }) }] };
@@ -72,11 +76,11 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
     }));
   };
   const requestStatusSchema = { project_id: z.union([projectIdSchema, z.literal(AUTO_PROJECT_ID)]), request_id: z.string().min(1), kind: z.enum(["transaction", "document", "artifact"]) };
-  const submit = (projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>) =>
-    access.read && access.mutate ? submitGuarded(env, projectId, kind, request) : Promise.resolve(scopeDenied("project.mutate"));
+  const submit = (projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>, responseMode: "wait" | "respond_async" = "wait") =>
+    access.read && access.mutate ? submitGuarded(env, projectId, kind, request, responseMode) : Promise.resolve(scopeDenied("project.mutate"));
   server.registerTool("project_os_get_receipt", { description: "Read a receipt without triggering recovery", inputSchema: requestStatusSchema }, receipt);
   server.registerTool("project_os_get_request_status", { description: "Read Project OS request recovery status without triggering recovery", inputSchema: requestStatusSchema }, requestStatus);
-  server.registerTool("project_os_submit_transaction", { description: "Submit one strict typed Project OS transaction after the server obtains fresh admission context", inputSchema: { project_id: z.union([projectIdSchema, z.literal(AUTO_PROJECT_ID)]), request: transactionSchema } }, async ({ project_id, request }) => submit(project_id, "transaction", request));
+  server.registerTool("project_os_submit_transaction", { description: "Submit one strict typed Project OS transaction after the server obtains fresh admission context; response_mode is transport-only and defaults to wait", inputSchema: { project_id: z.union([projectIdSchema, z.literal(AUTO_PROJECT_ID)]), request: transactionSchema, response_mode: z.enum(["wait", "respond_async"]).optional() } }, async ({ project_id, request, response_mode }) => submit(project_id, "transaction", request, project_id === AUTO_PROJECT_ID ? "wait" : response_mode ?? "wait"));
   server.registerTool("project_os_write_working_document", { description: "Submit one strict governed document request after the server obtains fresh admission context", inputSchema: { project_id: projectIdSchema, request: managedDocumentRequestSchema } }, async ({ project_id, request }) => submit(project_id, "document", request));
   server.registerTool("project_os_submit_artifact", { description: "Submit one strict governed artifact manifest after the server obtains fresh admission context", inputSchema: { project_id: projectIdSchema, request: artifactWriteRequestSchema } }, async ({ project_id, request }) => submit(project_id, "artifact", request));
   return server;
@@ -100,6 +104,29 @@ function readCreateStatus(namespace: DurableObjectNamespace, transactionId: stri
 }
 
 type ReadToolResult = { isError?: boolean; content: Array<{ type: "text"; text: string }> };
+
+function isContextReadPage(value: unknown, projectId: string): value is Record<string, any> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, any>;
+  const context = body.context;
+  return body.status === "ok" && body.project_id === projectId
+    && typeof body.revision === "number" && Number.isSafeInteger(body.revision)
+    && context && typeof context === "object" && context.project_id === projectId
+    && context.canonical_revision === body.revision && !("token" in context)
+    && ["verified", "stale", "unknown"].includes(body.freshness)
+    && typeof body.observed_at === "string" && Number.isFinite(Date.parse(body.observed_at))
+    && !(body.context && typeof body.context === "object" && "token" in body.context);
+}
+
+function contextReadError(response: Response, value: unknown): ReadToolResult {
+  if (response.status < 500 && value && typeof value === "object" && !Array.isArray(value)) {
+    const body = value as Record<string, unknown>;
+    if (typeof body.status === "string" && typeof body.code === "string") {
+      return { isError: true, content: [{ type: "text", text: JSON.stringify(body) }] };
+    }
+  }
+  return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
+}
 
 async function readGuard(
   namespace: DurableObjectNamespace,
@@ -171,7 +198,7 @@ async function readGuard(
   }
 }
 
-async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }, projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>) {
+async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string }, projectId: string, kind: "transaction" | "document" | "artifact", request: Record<string, unknown>, responseMode: "wait" | "respond_async" = "wait") {
   const requestId = kind === "transaction" ? request?.transaction_id : request?.request_id;
   if (!request || typeof request !== "object" || request.project_id !== projectId) return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({ status: "rejected", code: "project_binding_mismatch" }) }] };
   const isProjectCreate = kind === "transaction" && request.operation === "project.create";
@@ -216,6 +243,7 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
     const owner = isProjectCreate ? env.REGISTRY_GUARD.getByName("global") : env.PROJECT_GUARD.getByName(projectId);
     const path = kind === "transaction" ? (isProjectCreate ? "/create" : "/transaction") : kind === "document" ? "/document" : "/artifact";
     const headers = new Headers({ "content-type": "application/json", "x-project-os-correlation-id": correlationId });
+    if (kind === "transaction" && !isProjectCreate && responseMode === "respond_async") headers.set("prefer", "respond-async");
     const body = JSON.stringify({ admission_version: "1.0", request, mutation_context: mutationContext });
     if (controller.signal.aborted) throw new SubmissionFailure("context", true);
     boundary = "submission";

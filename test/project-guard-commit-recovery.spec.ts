@@ -180,6 +180,76 @@ describe("ProjectGuard crash-safe canonical commits", () => {
     expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
   });
 
+  it("returns the exact committed receipt before an opted-in projection wait", async () => {
+    const projectId = "PRJ-1717";
+    const mock = installDropboxMock();
+    const stub = testEnv.PROJECT_GUARD.getByName(projectId);
+    const created = await submit(projectId, createTransaction(projectId));
+    await finalizeSyntheticProjectCreate(projectId, created);
+    await materializeThroughContinuations(projectId);
+    const transaction = {
+      schema_version: "1.0", transaction_id: "TXN-COMMIT-1717-TASK-A", project_id: projectId,
+      base_revision: 1, operation: "task.create", created_at: at,
+      payload: { task_id: "TASK-COMMIT1717A", title: "Return receipt without waiting for projection" }
+    };
+    let release!: () => void;
+    const projection = new Promise<void>((resolve) => { release = resolve; });
+    let responseSettled = false;
+    let completedResponse!: Response;
+    let restore!: () => void;
+    await runInDurableObject(stub, (instance) => {
+      const spy = vi.spyOn(instance as any, "requestMaterializationSafely").mockImplementationOnce(async () => projection);
+      restore = () => spy.mockRestore();
+    });
+    const submission = stub.fetch("https://project-guard.internal/transaction", {
+      method: "POST", headers: { "content-type": "application/json", prefer: "respond-async" },
+      body: JSON.stringify(transaction)
+    }).then((received) => { responseSettled = true; return received; });
+    try {
+      await vi.waitFor(() => expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(true));
+      await vi.waitFor(() => expect(responseSettled).toBe(true), { timeout: 250 });
+    } finally {
+      release();
+      completedResponse = await submission;
+      restore();
+    }
+    expect(completedResponse.status).toBe(200);
+    expect(await completedResponse.json()).toMatchObject({ transaction_id: transaction.transaction_id, project_id: projectId, status: "committed", new_revision: 2 });
+    expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(true);
+    expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
+    const replay = await stub.fetch("https://project-guard.internal/transaction", {
+      method: "POST", headers: { "content-type": "application/json", prefer: "respond-async" },
+      body: JSON.stringify(transaction)
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ transaction_id: transaction.transaction_id, project_id: projectId, status: "committed", new_revision: 2 });
+    expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
+    let restoreFailedHandoff!: () => void;
+    await runInDurableObject(stub, (instance) => {
+      const spy = vi.spyOn(instance as any, "requestMaterializationSafely").mockResolvedValueOnce(false);
+      restoreFailedHandoff = () => spy.mockRestore();
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    restoreFailedHandoff();
+    const retained = await runInDurableObject(stub, async (_instance, state) => ({
+      rows: state.storage.sql.exec<{ request_id: string }>(
+        "SELECT request_id FROM request_recovery WHERE kind = 'transaction' AND request_id = ?", transaction.transaction_id
+      ).toArray(), alarm: await state.storage.getAlarm()
+    }));
+    expect(retained.rows).toEqual([{ request_id: transaction.transaction_id }]);
+    expect(retained.alarm).not.toBeNull();
+    const retryAt = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(retryAt + 60_000);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    vi.useRealTimers();
+    const recoveryRows = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<{ request_id: string }>(
+      "SELECT request_id FROM request_recovery WHERE kind = 'transaction' AND request_id = ?", transaction.transaction_id
+    ).toArray());
+    expect(recoveryRows).toEqual([]);
+    expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(false);
+  });
+
   it("rejects different bytes under a staged transaction identifier", async () => {
     const projectId = "PRJ-1704";
     const mock = installDropboxMock();

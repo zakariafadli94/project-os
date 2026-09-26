@@ -24,7 +24,7 @@ export class DiagnosticProjectGuard extends SearchSyncProjectGuard {
     // These routes are observational and must remain available while a
     // provider-backed reconciliation holds the diagnostics counter. They do
     // not reset that counter, so they can safely bypass this outer queue.
-    if (request.method === "GET" && ["/mutation-context", "/request-status", "/execution-status", "/receipt"].includes(url.pathname)) {
+    if (request.method === "GET" && ["/mutation-context", "/context", "/request-status", "/execution-status", "/receipt"].includes(url.pathname)) {
       try {
         const response = await super.fetch(request);
         if (trace) console.log("project_os_guard_finished", { ...trace, status: response.status, elapsed_ms: Date.now() - started });

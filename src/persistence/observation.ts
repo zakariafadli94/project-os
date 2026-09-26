@@ -7,6 +7,10 @@ export interface PersistenceObservation {
   request_id: string;
   status: "not_submitted" | "unknown" | "not_received" | "admitted_uncommitted" | "committed" | "finalizing" | "finalized" | "rejected" | "conflict" | "failed";
   observed_at: string;
+  /** Monotonic within one DO-local request observation record. */
+  observation_sequence?: number;
+  /** Freshness of the exact evidence observation, not business acceptance. */
+  freshness?: "verified" | "stale" | "unknown";
   receipt: unknown | null;
   receipt_status: "committed" | "rejected" | "conflict" | null;
   execution_status: string | null;
@@ -21,6 +25,50 @@ export interface PersistenceObservation {
     owner: "client" | "system" | "operator" | "founder" | "none";
     requires_new_approval: boolean;
   };
+}
+
+export interface StoredPersistenceObservation {
+  schema_version: "1.0";
+  project_id: string;
+  kind: RequestKind;
+  request_id: string;
+  observed_at: string;
+  observation_sequence: number;
+  request_hash: string | null;
+  evidence_ref: string;
+  evidence_sha256: string;
+  response: Record<string, unknown>;
+}
+
+export function persistenceObservationStorageKey(kind: RequestKind, requestId: string): string {
+  if (!requestId || requestId.length > 512) throw new Error("observation_identity_invalid");
+  return `project-os:observation:${kind}:${encodeURIComponent(requestId)}`;
+}
+
+export function isStoredPersistenceObservation(
+  value: unknown,
+  identity: { project_id: string; kind: RequestKind; request_id: string }
+): value is StoredPersistenceObservation {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<StoredPersistenceObservation>;
+  const response = record.response;
+  const observation = response && typeof response === "object"
+    ? (response as { observation?: unknown }).observation : undefined;
+  return record.schema_version === "1.0"
+    && record.project_id === identity.project_id && record.kind === identity.kind && record.request_id === identity.request_id
+    && typeof record.observed_at === "string" && Number.isFinite(Date.parse(record.observed_at))
+    && Number.isSafeInteger(record.observation_sequence) && (record.observation_sequence ?? 0) > 0
+    && (record.request_hash === null || (typeof record.request_hash === "string" && /^[a-f0-9]{64}$/.test(record.request_hash)))
+    && typeof record.evidence_ref === "string" && record.evidence_ref.length > 0
+    && typeof record.evidence_sha256 === "string" && /^[a-f0-9]{64}$/.test(record.evidence_sha256)
+    && Boolean(response) && typeof response === "object"
+    && (response as Record<string, unknown>).project_id === identity.project_id
+    && (response as Record<string, unknown>).kind === identity.kind
+    && (response as Record<string, unknown>).request_id === identity.request_id
+    && Boolean(observation) && typeof observation === "object"
+    && (observation as Record<string, unknown>).project_id === identity.project_id
+    && (observation as Record<string, unknown>).kind === identity.kind
+    && (observation as Record<string, unknown>).request_id === identity.request_id;
 }
 
 /** Each family implements this against its validated evidence sources. */
@@ -76,7 +124,7 @@ export function persistenceObservation(input: ObservationEvidence): PersistenceO
   };
   return {
     project_id: input.project_id, kind: input.kind, request_id: input.request_id,
-    status, observed_at: input.observed_at, receipt: input.receipt ?? null,
+    status, observed_at: input.observed_at, freshness: status === "unknown" ? "unknown" : "verified", receipt: input.receipt ?? null,
     receipt_status: receiptStatus, execution_status: input.execution?.status ?? null,
     terminal, code: input.code ?? (recovery.state === "blocked" ? "recovery_blocked" : null), correlation_id: input.correlation_id, recovery
   };

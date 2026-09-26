@@ -69,6 +69,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   private readonly layoutMode: ReturnType<typeof parseLayoutMode>;
   private readonly projectionConcurrency: number;
   private queue: Promise<void> = Promise.resolve();
+  private queueDepth = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -89,12 +90,15 @@ export class MaterializationGuard extends DurableObject<Env> {
       return this.serialize(() => this.handleRequestTarget(request));
     }
     if (request.method === "GET" && url.pathname === "/status") {
+      if (this.queueDepth > 0) return this.busyReadResponse();
       return this.serialize(() => this.handleStatus());
     }
     if (request.method === "GET" && url.pathname === "/diagnostic-status") {
+      if (this.queueDepth > 0) return this.busyReadResponse();
       return this.serialize(() => this.handleDiagnosticStatus());
     }
     if (request.method === "GET" && url.pathname === "/capacity") {
+      if (this.queueDepth > 0) return this.busyReadResponse();
       return this.serialize(() => this.handleCapacity());
     }
     if (request.method === "POST" && url.pathname === "/reconcile") {
@@ -1149,6 +1153,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   }
 
   private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+    this.queueDepth += 1;
     const previous = this.queue;
     let release!: () => void;
     this.queue = new Promise<void>((resolve) => { release = resolve; });
@@ -1156,8 +1161,18 @@ export class MaterializationGuard extends DurableObject<Env> {
     try {
       return await operation();
     } finally {
+      this.queueDepth -= 1;
       release();
     }
+  }
+
+  private busyReadResponse(): Response {
+    return Response.json({
+      status: "unavailable",
+      freshness: "unknown",
+      code: "MATERIALIZATION_BUSY",
+      retry_after_seconds: 1
+    }, { status: 503, headers: { "Retry-After": "1" } });
   }
 
   private coordinatorForSlice(

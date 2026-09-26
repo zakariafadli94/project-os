@@ -168,8 +168,10 @@ async function readGuard(
               const observation = persistenceObservation({ project_id: projectId, kind: kind as RequestKind,
                 request_id: requestId, observed_at: new Date().toISOString(), correlation_id: correlationId,
                 code: body.code as string });
+              const status = diagnostic.route === "/request-status" && body.code === "PROJECT_OS_READ_BUSY"
+                ? "unavailable" : "unknown";
               return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({
-                status: "unknown", code: body.code, kind, ...diagnostic, observation,
+                status, code: body.code, kind, ...diagnostic, observation,
                 retry_after_seconds: retryAfterSeconds, recovery
               }) }] };
             }

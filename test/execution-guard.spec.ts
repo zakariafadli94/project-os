@@ -1120,41 +1120,41 @@ describe("canonical execution boundary in ProjectGuard", () => {
       completed_at: completed.completed_at,
       source_event_id: completed.source_event_id
     }));
-    await runInDurableObject(guard, async (_instance, state) => {
-      await state.storage.put("materialization-finalization-work", {
-        coverage_version: 2,
-        head: {
-          target_revision: completed.target_revision,
-          projection_version: completed.projection_version,
-          result_root_hash: completed.result_root_hash,
-          completed_at: completed.completed_at
-        },
-        next_generation: null,
-        previous_child: null,
-        scan_complete: true,
-        candidates
-      });
-    });
     const originalReadCommitRecord = ProjectRepository.prototype.readCommitRecord;
     const commitReads = vi.spyOn(ProjectRepository.prototype, "readCommitRecord");
 
-    const response = await runInDurableObject(guard, (instance) =>
-      (instance as unknown as { finalizeCurrentMaterialization(request: Request): Promise<Response> })
-        .finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+    const response = await runInDurableObject(guard, (instance, state) => {
+      const object = instance as any;
+      return object.serialize(async () => {
+        await state.storage.put("materialization-finalization-work", {
+          coverage_version: 2,
+          head: {
+            target_revision: completed.target_revision,
+            projection_version: completed.projection_version,
+            result_root_hash: completed.result_root_hash,
+            completed_at: completed.completed_at
+          },
+          next_generation: null,
+          previous_child: null,
+          scan_complete: true,
+          candidates
+        });
+        const response = await object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-        }))
-    );
-
-    expect(response.status).toBe(202);
-    expect(commitReads).toHaveBeenCalledWith(projectId, 9001);
-    expect(commitReads).toHaveBeenCalledWith(projectId, 9004);
-    await runInDurableObject(guard, async (_instance, state) => {
-      const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
-      expect(work?.candidates).toEqual([expect.objectContaining({ revision: 9005 })]);
-      expect(await state.storage.getAlarm()).not.toBeNull();
+        }));
+        expect(response.status).toBe(202);
+        expect(commitReads).toHaveBeenCalledWith(projectId, 9001);
+        expect(commitReads).toHaveBeenCalledWith(projectId, 9004);
+        const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
+        expect(work?.candidates).toEqual([expect.objectContaining({ revision: 9005 })]);
+        expect(await state.storage.getAlarm()).not.toBeNull();
+        await state.storage.setAlarm(Date.now() + 60_000);
+        return response;
+      });
     });
+    expect(response.status).toBe(202);
     await runInDurableObject(guard, async (instance, state) => {
       await (instance as unknown as { clearTransactionRecovery(requestId: string): Promise<void> })
         .clearTransactionRecovery("TXN-UNRELATED-CLEAR");

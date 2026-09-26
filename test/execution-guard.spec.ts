@@ -43,6 +43,14 @@ async function setup(projectId: string) {
   return { mock, guard };
 }
 
+function seedUnadoptedNavigationGeneration(mock: ReturnType<typeof installDropboxMock>, projectId: string, generation: number): void {
+  const zone = { generation, adopted: false, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] };
+  mock.files.set(`${machineDocumentRoot(projectId)}/navigation-sources/state.json`, JSON.stringify({
+    schema_version: "1.0", project_id: projectId, state_revision: 1,
+    zones: { WORKING: zone, REVIEW: zone, DELIVERABLES: zone }
+  }));
+}
+
 function failMaterializationHeadForProject(projectId: string, error: Error): void {
   const readHead = ProjectRepository.prototype.readMaterializationHead;
   vi.spyOn(ProjectRepository.prototype, "readMaterializationHead").mockImplementation(function (this: ProjectRepository, readProjectId) {
@@ -2163,6 +2171,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
       expected_generation: 0, expected_index: null, created_at: "2026-09-25T10:00:00.000Z"
     };
     const { guard, mock } = await setup(projectId);
+    seedUnadoptedNavigationGeneration(mock, projectId, 1);
     const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
     expect((await guard.fetch("https://project-guard.internal/document", {
       method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
@@ -2184,15 +2193,15 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(terminal.status).toBe(409);
     const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
     expect(await sources.readState(projectId, "WORKING")).toMatchObject({
-      generation: 0, adopted: false, adoption_request_id: null
+      generation: 1, adopted: false, adoption_request_id: null
     });
     const successor = { ...request, request_id: "DOCREQ-NAV-CONFLICT-SUCCESSOR-8401" };
     const successorContext = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
     expect((await guard.fetch("https://project-guard.internal/document", {
       method: "POST", body: JSON.stringify(encodeAdmission(successor, successorContext.context))
     })).status).toBe(202);
-    expect(await sources.beginAdoption(projectId, "WORKING", successor.request_id, 0)).toBe(true);
-    expect(await sources.abortAdoption(projectId, "WORKING", request.request_id, 0)).toBe(false);
+    expect(await sources.beginAdoption(projectId, "WORKING", successor.request_id, 1)).toBe(true);
+    expect(await sources.abortAdoption(projectId, "WORKING", request.request_id, 1)).toBe(false);
     expect(await sources.readState(projectId, "WORKING")).toMatchObject({ adoption_request_id: successor.request_id });
   });
 
@@ -2209,13 +2218,14 @@ describe("canonical execution boundary in ProjectGuard", () => {
       created_at: "2026-09-25T10:00:00.000Z"
     };
     const { guard, mock } = await setup(projectId);
+    seedUnadoptedNavigationGeneration(mock, projectId, 1);
     const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
     const ingress = await guard.fetch("https://project-guard.internal/document", {
       method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
     });
     expect(ingress.status).toBe(202);
     const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
-    expect(await sources.beginAdoption(projectId, "WORKING", request.request_id, 0)).toBe(true);
+    expect(await sources.beginAdoption(projectId, "WORKING", request.request_id, 1)).toBe(true);
     const work = await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (_instance, state) =>
       state.storage.list<string>({ prefix: "navigation-work" })
     );
@@ -2231,10 +2241,10 @@ describe("canonical execution boundary in ProjectGuard", () => {
       });
     }
     expect(await response!.json()).toMatchObject({ status: "stopped", failure_code: "identical_internal_failure_limit" });
-    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 0, adoption_request_id: null });
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, adoption_request_id: null });
     const successorId = "DOCREQ-NAV-FAILURE-SUCCESSOR-8344";
-    expect(await sources.beginAdoption(projectId, "WORKING", successorId, 0)).toBe(true);
-    expect(await sources.abortAdoption(projectId, "WORKING", request.request_id, 0)).toBe(false);
+    expect(await sources.beginAdoption(projectId, "WORKING", successorId, 1)).toBe(true);
+    expect(await sources.abortAdoption(projectId, "WORKING", request.request_id, 1)).toBe(false);
     expect(await sources.readState(projectId, "WORKING")).toMatchObject({ adoption_request_id: successorId });
     const failure = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{ count: number; stopped: number }>(
       "SELECT count, stopped FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id

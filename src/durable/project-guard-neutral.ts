@@ -1278,11 +1278,12 @@ export class ProjectGuard extends DurableObject<Env> {
     const frozenState = await this.readFrozenNavigationState(nav, ref.request_hash, budget, true);
     const sources = new ZoneNavigationSources(this.persistence);
     const sourceState = await sources.readState(nav.project_id, nav.zone, budget);
+    const sourceGeneration = Number(ref.source_snapshot_id.slice("source:".length));
     if (`source:${sourceState.generation}` !== ref.source_snapshot_id
       || (!sourceState.adopted && sourceState.adoption_request_id !== nav.request_id)) {
-      if (!sourceState.adopted && sourceState.generation === nav.expected_generation
+      if (!sourceState.adopted && sourceState.generation === sourceGeneration
         && sourceState.adoption_request_id === nav.request_id) {
-        await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceState.generation, budget);
+        await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceGeneration, budget);
       }
       const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: "navigation_snapshot_changed" };
       await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
@@ -1300,9 +1301,9 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "pending", code: "NAVIGATION_PUBLICATION_PENDING" }, { status: 503 });
     }
     if (result.status === "conflict") {
-      if (!sourceState.adopted && sourceState.generation === nav.expected_generation
+      if (!sourceState.adopted && sourceState.generation === sourceGeneration
         && sourceState.adoption_request_id === nav.request_id) {
-        await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceState.generation, budget);
+        await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceGeneration, budget);
       }
       const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: result.code };
       await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
@@ -1355,9 +1356,10 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     const progress = await this.recoveryProgressFingerprint("document", ref.request_id);
     const failure = await this.recordRecoveryFailure("document", ref.request_id, new Error(report.failure_code), progress);
-    if (failure.stopped && !source.adopted && source.generation === ref.expected_generation
+    const sourceGeneration = Number(ref.source_snapshot_id.slice("source:".length));
+    if (failure.stopped && !source.adopted && source.generation === sourceGeneration
       && source.adoption_request_id === ref.request_id) {
-      await new ZoneNavigationSources(this.persistence).abortAdoption(ref.project_id, ref.zone, ref.request_id, source.generation, budget);
+      await new ZoneNavigationSources(this.persistence).abortAdoption(ref.project_id, ref.zone, ref.request_id, sourceGeneration, budget);
     }
     if (!failure.stopped) await this.armRequestRecoveryAlarm(failure.delay_ms);
     return Response.json({

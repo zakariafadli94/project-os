@@ -3833,8 +3833,10 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!stored) return null;
     try {
       const body = await stored.clone().json() as Record<string, any>;
-      if (body.status !== "admitted_uncommitted" || body.observation?.freshness !== "stale") return stored;
-      const current = await this.readBoundedRequestStatus(url, correlationId);
+      const refreshable = body.status === "admitted_uncommitted"
+        || (body.status === "committed" && body.observation?.terminal !== true);
+      if (!refreshable || body.observation?.freshness !== "stale") return stored;
+      const current = await this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId);
       if (!current.ok) return stored;
       const currentBody = await current.clone().json() as Record<string, any>;
       if (currentBody.project_id === projectId && currentBody.kind === kind && currentBody.request_id === requestId

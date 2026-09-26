@@ -43,6 +43,7 @@ const navigationProgressSchema = z.strictObject({
   snapshot_id: z.string().nullable(),
   verify_page: z.number().int().nonnegative().safe(),
   verify_entry: z.number().int().nonnegative().safe(),
+  verify_cursor: z.strictObject({ resource_id: z.string(), entry_hash: z.string().regex(/^[a-f0-9]{64}$/), cursor: z.string() }).nullable().optional(),
   source_count: z.number().int().nonnegative().safe(),
   source_ids: z.array(z.string()).default([]),
   published_index: navigationIndexIdentitySchema.nullable().default(null),
@@ -375,6 +376,7 @@ export class ZoneNavigationEngine {
       snapshot_id: null,
       verify_page: 0,
       verify_entry: 0,
+      verify_cursor: null,
       source_count: 0,
       source_ids: [],
       published_index: null,
@@ -449,14 +451,26 @@ export class ZoneNavigationEngine {
         if (!budget.canStartEffect(9)) return { status: "pending", cursor: progress.cursor };
         const entry = page.entries[progress.verify_entry];
         const entryHash = await executionHash(entry);
-        const proof = page.verified_entries?.find((item) => item.resource_id === entry.resource_id && item.entry_hash === entryHash);
-        if (!proof && !await this.inventory.verifyEntry(entry, budget)) return { status: "conflict", code: "navigation_source_changed" };
+        const recordedProof = page.verified_entries?.find((item) => item.resource_id === entry.resource_id && item.entry_hash === entryHash);
+        const proof = this.inventory.verificationIncludesPhysicalIntegrity ? recordedProof : undefined;
+        if (!proof && this.inventory.verifyEntryPage) {
+          const savedCursor = progress.verify_cursor?.resource_id === entry.resource_id && progress.verify_cursor.entry_hash === entryHash ? progress.verify_cursor.cursor : null;
+          const verification = await this.inventory.verifyEntryPage(entry, savedCursor, budget);
+          if (verification.status === "conflict") return { status: "conflict", code: "navigation_source_changed" };
+          if (verification.status === "pending") {
+            progress.verify_cursor = { resource_id: entry.resource_id, entry_hash: entryHash, cursor: verification.cursor };
+            progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+            return { status: "pending", cursor: progress.cursor };
+          }
+          progress.verify_cursor = null;
+        } else if (!proof && !await this.inventory.verifyEntry(entry, budget)) return { status: "conflict", code: "navigation_source_changed" };
         if (!proof && !this.inventory.verificationIncludesPhysicalIntegrity) await this.verifyPhysicalEntry(entry, budget);
         if ((!proof || !proof.persisted) && this.inventory.recordVerifiedEntry) await this.inventory.recordVerifiedEntry(entry, page.snapshot_id, budget);
         const evidence = { schema_version: "1.0", project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entry };
         await this.immutable(`${verifiedRoot}/${progress.source_count.toString().padStart(8, "0")}-${progress.verify_page.toString().padStart(8, "0")}-${progress.verify_entry.toString().padStart(8, "0")}.json`, evidence, budget);
         progress.rendered_links.push(renderLink(entry));
         progress.verify_entry += 1;
+        progress.verify_cursor = null;
         progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
       }
       progress.verify_page += 1;

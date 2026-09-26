@@ -97,14 +97,31 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       return resolved.entry !== null && sameEntry(resolved.entry, entry);
     }
     if (entry.resource_id.startsWith("package:")) {
-      const source = await readCurrentPackageNavigation(this.runtime, entry.project_id, entry.zone, budget);
-      const selected = source?.head?.packages.find((item) => `package:${item.ref.package_id}` === entry.resource_id);
-      if (!source || !selected) return false;
-      const resolved = await resolvePackageIndex(this.runtime, entry.project_id, entry.zone, selected, source, 0, budget, true);
-      return resolved.entry !== null && sameEntry(resolved.entry, entry);
+      try {
+        const source = await readCurrentPackageNavigation(this.runtime, entry.project_id, entry.zone, budget);
+        const selected = source?.head?.packages.find((item) => `package:${item.ref.package_id}` === entry.resource_id);
+        if (!source || !selected) return false;
+        const resolved = await resolvePackageIndex(this.runtime, entry.project_id, entry.zone, selected, source, 0, budget, true);
+        return resolved.entry !== null && sameEntry(resolved.entry, entry);
+      } catch (error) {
+        if (isBudgetError(error) || isRetryableProviderError(error)) throw error;
+        return false;
+      }
     }
     if (entry.resource_id.startsWith("artifact:")) return this.verifyArtifactEntry(entry, budget);
     return false;
+  }
+
+  async verifyEntryPage(entry: NavigationInventoryEntry, cursor: string | null, budget: SliceBudget): Promise<{ status: "pending"; cursor: string } | { status: "verified" } | { status: "conflict" }> {
+    if (!entry.resource_id.startsWith("package:")) return await this.verifyEntry(entry, budget) ? { status: "verified" } : { status: "conflict" };
+    const source = await readCurrentPackageNavigation(this.runtime, entry.project_id, entry.zone, budget);
+    const selected = source?.head?.packages.find((item) => `package:${item.ref.package_id}` === entry.resource_id);
+    if (!source || !selected || packageResourceVersion(selected.ref) !== entry.version) return { status: "conflict" };
+    const memberIndex = cursor === null ? 0 : Number(cursor);
+    if (!Number.isSafeInteger(memberIndex) || memberIndex < 0) throw new Error("navigation_inventory_cursor_invalid");
+    const resolved = await resolvePackageIndex(this.runtime, entry.project_id, entry.zone, selected, source, memberIndex, budget);
+    if (resolved.pending) return { status: "pending", cursor: String(memberIndex + 1) };
+    return resolved.entry && sameEntry(resolved.entry, entry) ? { status: "verified" } : { status: "conflict" };
   }
 
   private async verifyArtifactEntry(entry: NavigationInventoryEntry, budget: SliceBudget): Promise<boolean> {
@@ -246,7 +263,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     let source: CurrentPackageNavigation | null;
     try { source = await readCurrentPackageNavigation(this.runtime, projectId, zone, budget); }
     catch (error) {
-      if (isBudgetError(error)) throw error;
+      if (isBudgetError(error) || isRetryableProviderError(error)) throw error;
       gaps.push({ resource_id: "packages", code: classifyPackageGap(error) });
       return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", "") };
     }
@@ -269,7 +286,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         next_cursor: packageIndex + 1 < packages.length ? encodeCursor("packages", JSON.stringify({ package_index: packageIndex + 1, member_index: 0 })) : encodeCursor("artifacts", "")
       };
     } catch (error) {
-      if (isBudgetError(error)) throw error;
+      if (isBudgetError(error) || isRetryableProviderError(error)) throw error;
       gaps.push({ resource_id: `package:${selected.ref.package_id}`, code: classifyPackageGap(error) });
       return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: packageIndex + 1 < packages.length ? encodeCursor("packages", JSON.stringify({ package_index: packageIndex + 1, member_index: 0 })) : encodeCursor("artifacts", "") };
     }
@@ -807,7 +824,10 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 }
 
 function isBudgetError(error: unknown): boolean { return error instanceof Error && error.message.includes("slice_budget_exhausted"); }
-function isRetryableProviderError(error: unknown): boolean { return error instanceof ProviderOperationError && error.retryable; }
+function isRetryableProviderError(error: unknown): boolean {
+  return error instanceof ProviderOperationError ? error.retryable
+    : Boolean(error && typeof error === "object" && "retryable" in error && (error as { retryable?: unknown }).retryable === true);
+}
 
 function classifyGap(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error);
@@ -904,7 +924,11 @@ async function resolvePackageIndex(
   if (manifest.project_id !== projectId || manifest.version !== ref.version || await packageIdFor(projectId, manifest.creation_request_id) !== ref.package_id || canonicalJson(manifest) !== raw) throw new Error("package_manifest_binding");
   if (!source.visible_members) throw new Error("package_visible_member_evidence_unavailable");
   if (verifyAllMembers) {
-    if (!budget.canStartEffect(manifest.members.length + 13)) throw new Error("slice_budget_exhausted");
+    // Member metadata is one provider call each; validating the visible INDEX
+    // needs before/read/after (three more). Manifest stability was already
+    // checked above, so reserving its calls again starves bounded verify_entry
+    // slices for larger legacy package pages.
+    if (!budget.canStartEffect(manifest.members.length + 3)) throw new Error("slice_budget_exhausted");
     for (const member of manifest.members) await verifyPackageMember(runtime, bounded, projectId, selected.root, source, member);
   } else {
     if (memberIndex >= manifest.members.length) throw new Error("package_member_cursor_invalid");

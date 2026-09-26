@@ -35,7 +35,11 @@ const compactChunkSchema = z.strictObject({
   shard: z.number().int().nonnegative().max(63),
   entries: z.array(compactEntrySchema)
 });
-const compactReadySchema = z.strictObject({ schema_version: z.literal("1.0"), project_id: z.string(), zone: z.enum(zones), ready_generation: z.number().int().nonnegative().safe().nullable(), shards: z.array(z.number().int().nonnegative().max(63)).max(ZONE_NAVIGATION_CATALOG_SHARDS) }).superRefine((value, ctx) => {
+const generationRangeSchema = z.strictObject({ start: z.number().int().positive().safe(), end: z.number().int().positive().safe() }).superRefine((value, ctx) => {
+  if (value.start > value.end) ctx.addIssue({ code: "custom", message: "generation range start must not exceed end" });
+});
+const coalescedDirtySchema = z.strictObject({ resource_id: z.string(), latest_generation: z.number().int().positive().safe(), covered_generations: z.array(generationRangeSchema).max(64) });
+const compactReadySchema = z.strictObject({ schema_version: z.literal("1.0"), project_id: z.string(), zone: z.enum(zones), ready_generation: z.number().int().nonnegative().safe().nullable(), shards: z.array(z.number().int().nonnegative().max(63)).max(ZONE_NAVIGATION_CATALOG_SHARDS), completed_generations: z.array(generationRangeSchema).max(64).default([]), coalesced_dirty: z.array(coalescedDirtySchema).max(512).default([]) }).superRefine((value, ctx) => {
   if (new Set(value.shards).size !== value.shards.length || value.shards.some((shard, index) => index > 0 && value.shards[index - 1] >= shard)) {
     ctx.addIssue({ code: "custom", message: "compact shards must be unique and ordered" });
   }
@@ -262,8 +266,9 @@ export class ZoneNavigationSources {
     const state = await this.readProjectState(projectId, budget);
     const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
     if (current.generation !== generation || current.in_flight_writes.length) return false;
-    if ((await this.readCompactManifest(projectId, zone, budget))?.ready_generation === generation) return true;
-    return this.writeCatalogReadyGeneration(projectId, zone, generation, budget);
+    const manifest = await this.readCompactManifest(projectId, zone, budget);
+    if (manifest?.ready_generation === generation && manifest.completed_generations.length === 0 && manifest.coalesced_dirty.length === 0) return true;
+    return this.writeCatalogReadyGeneration(projectId, zone, generation, budget, [], []);
   }
 
   async finishDirty(projectId: string, zone: NavigationZone, resourceId: string, exactEntryOrNull: NavigationInventoryEntry | null, budget?: SliceBudget): Promise<boolean> {
@@ -284,6 +289,8 @@ export class ZoneNavigationSources {
     const current = await this.readCatalogEntry(projectId, zone, resourceId, budget);
     if (canonicalJson(current) !== canonicalJson(exactEntryOrNull)) return false;
     if (!markerMetadata?.objectId || !markerMetadata.revisionToken || !this.runtime.objects.deleteIfUnchanged) return false;
+    const coalesced = await this.readCoalescedDirty(projectId, zone, resourceId, marker.generation, budget);
+    await this.recordCompletedGenerations(projectId, zone, [...coalesced, { start: marker.generation, end: marker.generation }], resourceId, marker.generation, budget);
     const deleted = (await this.runtime.objects.deleteIfUnchanged(markerPath, { objectId: markerMetadata.objectId, revisionToken: markerMetadata.revisionToken })) !== "changed";
     if (deleted) await this.advanceReadyCatalogIfClean(projectId, zone, budget);
     return deleted;
@@ -377,21 +384,44 @@ export class ZoneNavigationSources {
     // Capture per-resource CAS tokens before the final ticket validation. If a
     // second runtime completes a newer write after validation, its record
     // revision makes these conditional writes fail instead of being clobbered.
-    const mutations = [] as { zone: NavigationZone; generation: number; catalogPath: string; dirtyPath: string; catalogToken: string | null; dirtyToken: string | null }[];
+    const mutations = [] as { zone: NavigationZone; generation: number; catalogPath: string; dirtyPath: string; catalogToken: string | null; dirtyToken: string | null; previousGeneration: number | null; coveredGenerations: z.infer<typeof generationRangeSchema>[] }[];
     for (const { zone, generation } of tickets) {
       const catalogPath = await resourcePath(zoneNavigationCatalogRoot(projectId, zone), resourceId);
       const dirtyPath = await resourcePath(zoneNavigationDirtyRoot(projectId, zone), resourceId);
-      mutations.push({ zone, generation, catalogPath, dirtyPath, catalogToken: await this.readWriteToken(catalogPath, budget), dirtyToken: await this.readWriteToken(dirtyPath, budget) });
+      const catalogToken = await this.readWriteToken(catalogPath, budget);
+      const dirtyToken = await this.readWriteToken(dirtyPath, budget);
+      let previousGeneration: number | null = null;
+      let coveredGenerations: z.infer<typeof generationRangeSchema>[] = [];
+      if (dirtyToken !== null) {
+        charge(budget);
+        const priorRaw = await this.runtime.objects.readText(dirtyPath);
+        if (priorRaw === null) throw new Error("navigation_dirty_record_changed");
+        const prior = dirtySchema.parse(JSON.parse(priorRaw));
+        if (prior.resource_id !== resourceId || prior.generation > generation) throw new Error("navigation_dirty_generation_stale");
+        if (prior.generation < generation) {
+          previousGeneration = prior.generation;
+          const manifest = await this.readCompactManifest(projectId, zone, budget);
+          const existing = manifest?.coalesced_dirty.find((item) => item.resource_id === resourceId && item.latest_generation === prior.generation);
+          // Defer range compaction to recordCoalescedDirty so overflow can
+          // invalidate the optimization without blocking the source write.
+          coveredGenerations = [...(existing?.covered_generations ?? []), { start: prior.generation, end: prior.generation }];
+        } else {
+          const manifest = await this.readCompactManifest(projectId, zone, budget);
+          coveredGenerations = manifest?.coalesced_dirty.find((item) => item.resource_id === resourceId && item.latest_generation === generation)?.covered_generations ?? [];
+        }
+      }
+      mutations.push({ zone, generation, catalogPath, dirtyPath, catalogToken, dirtyToken, previousGeneration, coveredGenerations });
     }
     const beforeWrites = await this.readProjectState(projectId, budget);
     for (const { zone, generation } of tickets) {
       if (!(beforeWrites.zones[zone] ?? DEFAULT_ZONE_STATE).in_flight_writes.some((write) => write.resource_id === resourceId && write.generation === generation && (write.write_hash ?? null) === tickets.find((ticket) => ticket.zone === zone)!.write_hash)) throw new Error("navigation_source_ticket_stale");
     }
-    for (const { zone, generation, catalogPath, dirtyPath, catalogToken, dirtyToken } of mutations) {
+    for (const { zone, generation, catalogPath, dirtyPath, catalogToken, dirtyToken, previousGeneration, coveredGenerations } of mutations) {
       const observedEntry = observedEntries.get(zone);
       if (observedEntries.has(zone) && observedEntry && (observedEntry.project_id !== projectId || observedEntry.zone !== zone || observedEntry.resource_id !== resourceId)) throw new Error("navigation_catalog_binding");
       try {
         if (observedEntries.has(zone)) await this.writeAtToken(catalogPath, JSON.stringify({ schema_version: "1.0", resource_id: resourceId, entry: observedEntry ?? null }), catalogToken, budget);
+        if (previousGeneration !== null) await this.recordCoalescedDirty(projectId, zone, resourceId, previousGeneration, generation, coveredGenerations, budget);
         await this.writeAtToken(dirtyPath, JSON.stringify({ schema_version: "1.0", resource_id: resourceId, generation, entry_hash: observedEntry ? await entryHash(observedEntry) : null }), dirtyToken, budget);
       } catch (error) {
         for (const ticket of tickets) if (!await this.headWriteIsCurrent(ticket, budget)) await this.discardHeadWrite(ticket, budget);
@@ -488,11 +518,59 @@ export class ZoneNavigationSources {
     const latestItem = latest.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
     if (latestItem.generation !== item.generation || latestItem.in_flight_writes.length) return;
     if (manifest.ready_generation === latestItem.generation) return;
-    // A jump means some source generation was consumed without this writer's
-    // per-resource compact refresh (for example, a rollback/older runtime).
-    // Keep the old manifest stale and require a full verified migration.
-    if (manifest.ready_generation === null || latestItem.generation !== manifest.ready_generation + 1) return;
-    await this.writeCatalogReadyGeneration(projectId, zone, latestItem.generation, budget);
+    // Advance only when durable per-dirty acknowledgements prove every
+    // generation since ready was verified. Legacy writers which consumed a
+    // dirty marker leave a gap and therefore force a full verified migration.
+    if (manifest.ready_generation === null || !coversGenerationRange(manifest.completed_generations, manifest.ready_generation + 1, latestItem.generation)) return;
+    await this.writeCatalogReadyGeneration(projectId, zone, latestItem.generation, budget, [], []);
+  }
+
+  private async recordCompletedGenerations(projectId: string, zone: NavigationZone, generations: z.infer<typeof generationRangeSchema>[], resourceId: string, generation: number, budget?: SliceBudget): Promise<void> {
+    const manifest = await this.readCompactManifest(projectId, zone, budget);
+    if (!manifest || manifest.ready_generation === null) return;
+    let completed: z.infer<typeof generationRangeSchema>[];
+    try {
+      completed = mergeGenerationRanges([...manifest.completed_generations, ...generations]);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "navigation_completed_generation_ranges_full") throw error;
+      // Bounded acknowledgement overflow is a cache invalidation, not a
+      // reason to strand a dirty marker. A later full verified scan can adopt
+      // the current generation safely.
+      await this.invalidateCompactReadiness(projectId, zone, budget);
+      return;
+    }
+    const coalesced = manifest.coalesced_dirty.filter((item) => item.resource_id !== resourceId || item.latest_generation !== generation);
+    if (canonicalJson(completed) === canonicalJson(manifest.completed_generations) && canonicalJson(coalesced) === canonicalJson(manifest.coalesced_dirty)) return;
+    await this.writeCatalogReadyGeneration(projectId, zone, manifest.ready_generation, budget, completed, coalesced);
+  }
+
+  private async recordCoalescedDirty(projectId: string, zone: NavigationZone, resourceId: string, priorGeneration: number, latestGeneration: number, coveredGenerations: z.infer<typeof generationRangeSchema>[], budget?: SliceBudget): Promise<void> {
+    const manifest = await this.readCompactManifest(projectId, zone, budget);
+    if (!manifest || manifest.ready_generation === null) return;
+    const coalesced = manifest.coalesced_dirty.filter((item) => item.resource_id !== resourceId);
+    let ranges: z.infer<typeof generationRangeSchema>[];
+    try {
+      ranges = mergeGenerationRanges([...coveredGenerations, { start: priorGeneration, end: priorGeneration }]);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "navigation_completed_generation_ranges_full") throw error;
+      await this.invalidateCompactReadiness(projectId, zone, budget);
+      return;
+    }
+    coalesced.push({ resource_id: resourceId, latest_generation: latestGeneration, covered_generations: ranges });
+    if (coalesced.length > 512) {
+      await this.invalidateCompactReadiness(projectId, zone, budget);
+      return; // Fall back to a full verified migration; never block clearing the dirty marker.
+    }
+    await this.writeCatalogReadyGeneration(projectId, zone, manifest.ready_generation, budget, manifest.completed_generations, coalesced);
+  }
+
+  private async invalidateCompactReadiness(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<void> {
+    await this.writeCatalogReadyGeneration(projectId, zone, null, budget, [], []);
+  }
+
+  private async readCoalescedDirty(projectId: string, zone: NavigationZone, resourceId: string, generation: number, budget?: SliceBudget): Promise<z.infer<typeof generationRangeSchema>[]> {
+    const manifest = await this.readCompactManifest(projectId, zone, budget);
+    return manifest?.coalesced_dirty.find((item) => item.resource_id === resourceId && item.latest_generation === generation)?.covered_generations ?? [];
   }
 
   private async readCatalogReadyGeneration(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<number | null> {
@@ -510,13 +588,13 @@ export class ZoneNavigationSources {
     return ready;
   }
 
-  private async writeCatalogReadyGeneration(projectId: string, zone: NavigationZone, generation: number, budget?: SliceBudget): Promise<boolean> {
+  private async writeCatalogReadyGeneration(projectId: string, zone: NavigationZone, generation: number | null, budget?: SliceBudget, completedGenerations?: z.infer<typeof generationRangeSchema>[], coalescedDirty?: z.infer<typeof coalescedDirtySchema>[]): Promise<boolean> {
     const path = compactReadyPath(projectId, zone);
     if (await this.readCompactManifest(projectId, zone, budget) === null) await this.ensureCompactDirectory(projectId, zone, budget);
     const token = await this.readWriteToken(path, budget);
     const current = token === null ? null : await this.readCompactManifest(projectId, zone, budget);
     const shards = [...new Set(current?.shards ?? [])].sort((left, right) => left - right);
-    const content = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone, ready_generation: generation, shards });
+    const content = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone, ready_generation: generation, shards, completed_generations: completedGenerations ?? current?.completed_generations ?? [], coalesced_dirty: coalescedDirty ?? current?.coalesced_dirty ?? [] });
     await this.writeAtToken(path, content, token, budget);
     return true;
   }
@@ -529,7 +607,7 @@ export class ZoneNavigationSources {
     const token = await this.readWriteToken(path, budget);
     const latest = token === null ? null : await this.readCompactManifest(projectId, zone, budget);
     const shards = [...new Set([...(latest?.shards ?? []), shard])].sort((left, right) => left - right);
-    const content = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone, ready_generation: latest?.ready_generation ?? null, shards });
+    const content = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone, ready_generation: latest?.ready_generation ?? null, shards, completed_generations: latest?.completed_generations ?? [], coalesced_dirty: latest?.coalesced_dirty ?? [] });
     await this.writeAtToken(path, content, token, budget);
   }
 
@@ -595,6 +673,28 @@ export class ZoneNavigationSources {
 }
 
 async function entryHash(entry: NavigationInventoryEntry): Promise<string> { return sha256Text(canonicalJson(entry)); }
+function mergeGenerationRanges(ranges: z.infer<typeof generationRangeSchema>[]): z.infer<typeof generationRangeSchema>[] {
+  const sorted = ranges.map((range) => generationRangeSchema.parse(range)).sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged: z.infer<typeof generationRangeSchema>[] = [];
+  for (const range of sorted) {
+    const previous = merged.at(-1);
+    if (previous && range.start <= previous.end + 1) previous.end = Math.max(previous.end, range.end);
+    else merged.push({ ...range });
+  }
+  if (merged.length > 64) throw new Error("navigation_completed_generation_ranges_full");
+  return merged;
+}
+function coversGenerationRange(ranges: z.infer<typeof generationRangeSchema>[], start: number, end: number): boolean {
+  if (start > end) return true;
+  let next = start;
+  for (const range of ranges) {
+    if (range.end < next) continue;
+    if (range.start > next) return false;
+    next = range.end + 1;
+    if (next > end) return true;
+  }
+  return false;
+}
 function shardFor(resourceId: string): number {
   let hash = 2166136261;
   for (let index = 0; index < resourceId.length; index += 1) hash = Math.imul(hash ^ resourceId.charCodeAt(index), 16777619);

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { SliceBudget } from "../src/convergence/contract";
-import type { NavigationInventoryEntry } from "../src/domain/zone-navigation";
+import { navigationReconcileSchema, type NavigationInventoryEntry, type NavigationInventoryPort } from "../src/domain/zone-navigation";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "../src/documents/zone-navigation-sources";
+import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
+import { executionHash } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, workspaceProjectRoot } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
@@ -356,22 +358,20 @@ describe("ZoneNavigationInventory", () => {
     const runtime = store.runtime;
     const repository = new DocumentLedgerRepository(runtime);
     const state = emptyProjectState("PRJ-9300", "Packages", "packages");
-    const body = "package member";
-    const content_sha256 = await sha256Text(body);
-    const document_id = `DOC-${"1".repeat(24)}`;
-    const document_version_id = `VER-REQ-${"1".repeat(24)}`;
-    const immutable_payload_path = await repository.storeTextPayload(state.project_id, content_sha256, body);
-    await repository.writeVersion({ schema_version: "1.0", project_id: state.project_id, document_id, version_id: document_version_id, kind: "work_product", stage: "working", logical_path: "member.md", source: "project_os", created_at: "2026-09-12T12:00:00Z", immutable_payload_path, content_sha256, size: body.length });
-    const body2 = "second package member";
-    const content_sha256_2 = await sha256Text(body2);
-    const document_id_2 = `DOC-${"2".repeat(24)}`;
-    const document_version_id_2 = `VER-REQ-${"2".repeat(24)}`;
-    const immutable_payload_path_2 = await repository.storeTextPayload(state.project_id, content_sha256_2, body2);
-    await repository.writeVersion({ schema_version: "1.0", project_id: state.project_id, document_id: document_id_2, version_id: document_version_id_2, kind: "work_product", stage: "working", logical_path: "second.md", source: "project_os", created_at: "2026-09-12T12:00:00Z", immutable_payload_path: immutable_payload_path_2, content_sha256: content_sha256_2, size: body2.length });
-    const manifest = { schema_version: "1.0", project_id: state.project_id, creation_request_id: "DOCREQ-PACKAGE-0001", version: 1, members: [
-      { relative_path: "member.md", document_id, document_version_id, immutable_payload_path, content_sha256, size: body.length },
-      { relative_path: "second.md", document_id: document_id_2, document_version_id: document_version_id_2, immutable_payload_path: immutable_payload_path_2, content_sha256: content_sha256_2, size: body2.length }
-    ], links: [], source_refs: ["accepted:package"], created_by: "operator", created_at: "2026-09-12T12:00:00Z" };
+    const members = [] as { relative_path: string; document_id: string; document_version_id: string; immutable_payload_path: string; content_sha256: string; size: number }[];
+    for (let index = 1; index <= 4; index += 1) {
+      const suffix = index.toString(16).padStart(24, "0").toUpperCase();
+      const body = `package member ${index}`;
+      const content_sha256 = await sha256Text(body);
+      const document_id = `DOC-${suffix}`;
+      const document_version_id = `VER-REQ-${suffix}`;
+      const immutable_payload_path = await repository.storeTextPayload(state.project_id, content_sha256, body);
+      const relative_path = `member-${index}.md`;
+      await repository.writeVersion({ schema_version: "1.0", project_id: state.project_id, document_id, version_id: document_version_id, kind: "work_product", stage: "working", logical_path: relative_path, source: "project_os", created_at: "2026-09-12T12:00:00Z", immutable_payload_path, content_sha256, size: body.length });
+      members.push({ relative_path, document_id, document_version_id, immutable_payload_path, content_sha256, size: body.length });
+    }
+    const manifest = { schema_version: "1.0", project_id: state.project_id, creation_request_id: "DOCREQ-PACKAGE-0001", version: 1, members,
+      links: [], source_refs: ["accepted:package"], created_by: "operator", created_at: "2026-09-12T12:00:00Z" };
     const ref = await repository.freezePackage(manifest);
     const request = { operation: "package.replace" as const, request_id: "DOCREQ-REPLACE-0001", project_id: state.project_id, candidate: ref, zone: "WORKING" as const, expected_navigation_generation: 0, expected_project_revision: 0, created_at: "2026-09-12T12:00:00Z" };
     const admission = { project_id: state.project_id, operation: "package.replace", kind: "document", request_id: request.request_id, request_hash: await sha256Text(canonicalJson(request)), actor: { actor_id: "operator", authority: "ingress" }, resources: [{ resource_id: ref.package_id, resource_type: "package", zone: "WORKING", version: `${ref.version}:${ref.manifest_sha256}` }], global_revision: 0, project_revision: 0, ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 }, verdict: "allow", results: [], gaps: [], deferred_rules: [] };
@@ -395,14 +395,12 @@ describe("ZoneNavigationInventory", () => {
     } while (cursor !== null);
 
     const entries = pages.flatMap((page) => page.entries);
-    expect(pages).toHaveLength(4);
+    expect(pages).toHaveLength(6);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ resource_id: `package:${ref.package_id}`, logical_path: `PACKAGES/${ref.package_id}/1/INDEX.md`, version: `1:${ref.manifest_sha256}` });
     expect(await inventory.verifyEntry(entries[0], budget())).toBe(true);
     expect(pages.flatMap((page) => page.gaps)).not.toContainEqual(expect.objectContaining({ resource_id: "packages" }));
 
-    await sources.beginAdoption(state.project_id, "WORKING", "NAV-ADOPT-PACKAGE-1", 0, budget());
-    expect(await sources.finishAdoption(state.project_id, "WORKING", "NAV-ADOPT-PACKAGE-1", 0, budget())).toBe(true);
     const resourceId = `package:${ref.package_id}`;
     const ticket = await sources.beginHeadWrite(state.project_id, "WORKING", resourceId, budget());
     const nextBody = "replacement package member";
@@ -463,8 +461,53 @@ describe("ZoneNavigationInventory", () => {
     expect(permanentStart.next_cursor).not.toBeNull();
     const permanentResult = await inventory.listPage({ project_id: state.project_id, zone: "WORKING", cursor: permanentStart.next_cursor, limit: 8, budget: budget(25) });
     expect(permanentResult.gaps).toContainEqual(expect.objectContaining({ resource_id: resourceId, code: "finalized_package_source_unavailable" }));
-    expect(permanentResult.next_cursor).toBeNull();
-    expect(await inventory.verifySnapshot({ project_id: state.project_id, zone: "WORKING", snapshot_id: permanentStart.snapshot_id, budget: budget() })).toBe(false);
+    expect(permanentResult.next_cursor).toBe("artifacts:");
+    expect(await inventory.verifyEntry(refreshedEntries[0], budget())).toBe(false);
+  });
+
+  it("finishes legacy-page package verification for 40 members in resumable 32-call slices", async () => {
+    const store = packageRuntime();
+    const runtime = store.runtime;
+    const repository = new DocumentLedgerRepository(runtime);
+    const state = emptyProjectState("PRJ-9300", "Packages", "packages");
+    const members = [] as { relative_path: string; document_id: string; document_version_id: string; immutable_payload_path: string; content_sha256: string; size: number }[];
+    for (let index = 1; index <= 40; index += 1) {
+      const suffix = index.toString(16).padStart(24, "0").toUpperCase();
+      const body = `package member ${index}`;
+      const content_sha256 = await sha256Text(body);
+      const document_id = `DOC-${suffix}`;
+      const document_version_id = `VER-REQ-${suffix}`;
+      const immutable_payload_path = await repository.storeTextPayload(state.project_id, content_sha256, body);
+      const relative_path = `member-${index}.md`;
+      await repository.writeVersion({ schema_version: "1.0", project_id: state.project_id, document_id, version_id: document_version_id, kind: "work_product", stage: "working", logical_path: relative_path, source: "project_os", created_at: "2026-09-12T12:00:00Z", immutable_payload_path, content_sha256, size: body.length });
+      members.push({ relative_path, document_id, document_version_id, immutable_payload_path, content_sha256, size: body.length });
+    }
+    const ref = await repository.freezePackage({ schema_version: "1.0", project_id: state.project_id, creation_request_id: "DOCREQ-PACKAGE-0001", version: 1, members, links: [], source_refs: ["accepted:package"], created_by: "operator", created_at: "2026-09-12T12:00:00Z" });
+    const packageRequest = { operation: "package.replace" as const, request_id: "DOCREQ-REPLACE-0001", project_id: state.project_id, candidate: ref, zone: "WORKING" as const, expected_navigation_generation: 0, expected_project_revision: 0, created_at: "2026-09-12T12:00:00Z" };
+    const packageAdmission = { project_id: state.project_id, operation: "package.replace", kind: "document", request_id: packageRequest.request_id, request_hash: await sha256Text(canonicalJson(packageRequest)), actor: { actor_id: "operator", authority: "ingress" }, resources: [{ resource_id: ref.package_id, resource_type: "package", zone: "WORKING", version: `${ref.version}:${ref.manifest_sha256}` }], global_revision: 0, project_revision: 0, ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 }, verdict: "allow", results: [], gaps: [], deferred_rules: [] };
+    expect((await new ManagedDocumentService(runtime).replacePackage(packageRequest, state, packageAdmission as never)).status).toBe("finalized");
+    runtime.pagedListing = { listPage: async ({ path, cursor, limit }) => {
+      const matching = [...store.files.keys()].filter((key) => key.startsWith(`${path}/`) && !key.slice(path.length + 1).includes("/" )).sort();
+      const start = cursor ? Math.max(0, matching.findIndex((key) => key > cursor)) : 0;
+      const page = matching.slice(start, start + limit);
+      return { entries: page.map((key) => ({ kind: "file" as const, name: key.slice(path.length + 1), path: key })), cursor: start + page.length < matching.length ? page.at(-1) ?? null : null };
+    } };
+    runtime.objects.listChildren = async () => { throw new Error("unbounded listChildren forbidden"); };
+    const sources = new ZoneNavigationSources(runtime);
+    const inventory = new ZoneNavigationInventory(runtime, sources);
+    const request = navigationReconcileSchema.parse({ operation: "navigation.reconcile", request_id: "DOCREQ-NAVIGATION-PACKAGE-0001", project_id: state.project_id, zone: "WORKING", expected_project_revision: 0, expected_generation: 0, expected_index: null, created_at: "2026-09-26T18:00:00.000Z" });
+    const requestHash = await executionHash(request);
+    const indexPath = `${workspaceProjectRoot(state.project_id, state.slug)}/WORKING/00-CURRENT.md`;
+    const resourceId = "navigation:WORKING";
+    const admission = { project_id: state.project_id, request_id: request.request_id, kind: "document", operation: "navigation.reconcile", request_hash: requestHash, actor: { actor_id: "operator:test", authority: "project_guard" }, resources: [{ resource_id: resourceId, resource_type: "navigation", zone: "WORKING", version: "0" }], resource_effect_scopes: [{ resource_id: resourceId, resource_version: "0", provider_id: runtime.providerId, sources: [], destinations: [{ path: indexPath, logical_path: "WORKING/00-CURRENT.md" }], preservation_copies: [] }], global_revision: 0, project_revision: 0, ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 }, verdict: "allow", results: [], gaps: [], deferred_rules: [] };
+    const legacyPort: NavigationInventoryPort = {
+      listPage: async (input) => { const page = await inventory.listPage(input); const { verified_entries: _proof, ...withoutProof } = page; return withoutProof; },
+      verifySnapshot: inventory.verifySnapshot.bind(inventory), verifyEntry: inventory.verifyEntry.bind(inventory), verifyEntryPage: inventory.verifyEntryPage.bind(inventory),
+      verificationIncludesPhysicalIntegrity: true, recordVerifiedEntry: inventory.recordVerifiedEntry.bind(inventory), completeSnapshot: inventory.completeSnapshot.bind(inventory)
+    };
+    let result = await new ZoneNavigationEngine(runtime, legacyPort).reconcile(request, state, admission as never, budget(32));
+    for (let attempt = 0; result.status === "pending" && attempt < 160; attempt += 1) result = await new ZoneNavigationEngine(runtime, legacyPort).reconcile(request, state, admission as never, budget(32));
+    expect(result.status).toBe("finalized");
   });
 
   it("includes a committed artifact only from its exact current destination and receipt", async () => {

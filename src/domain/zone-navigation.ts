@@ -101,6 +101,8 @@ export interface NavigationInventoryPort {
   verifySnapshot(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: import("../convergence/contract").SliceBudget }): Promise<boolean>;
   /** Recheck this exact canonical resource/version; each provider request consumes budget. */
   verifyEntry(entry: NavigationInventoryEntry, budget: import("../convergence/contract").SliceBudget): Promise<boolean>;
+  /** Optional bounded proof continuation for legacy entries requiring multi-page validation. */
+  verifyEntryPage?(entry: NavigationInventoryEntry, cursor: string | null, budget: import("../convergence/contract").SliceBudget): Promise<{ status: "pending"; cursor: string } | { status: "verified" } | { status: "conflict" }>;
   /** True only when verifyEntry itself checks canonical bytes and stable provider identity. */
   readonly verificationIncludesPhysicalIntegrity?: boolean;
   /** Persist a verified exact source entry for bounded reuse in later reconciliations. */

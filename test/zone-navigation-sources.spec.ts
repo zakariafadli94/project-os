@@ -7,6 +7,7 @@ function harness() {
   const files = new Map<string, string>();
   const revisions = new Map<string, number>();
   let nextCatalogGate: { entered(): void; enteredPromise: Promise<void>; wait: Promise<void>; release(): void } | null = null;
+  let failDirtyDelete = false;
   const runtime: ProjectOsPersistenceRuntime = {
     providerId: "test",
     objects: {
@@ -23,6 +24,7 @@ function harness() {
       getMetadata: async (path) => files.has(path) ? { path, objectId: path, revisionToken: String(revisions.get(path)), size: files.get(path)!.length } : null,
       listChildren: async () => [], move: async () => {}, delete: async (path) => { files.delete(path); },
       deleteIfUnchanged: async (path, expected) => {
+        if (failDirtyDelete && path.includes("/dirty/")) { failDirtyDelete = false; throw new Error("simulated dirty-clear interruption"); }
         if (!files.has(path)) return "missing";
         if (path !== expected.objectId || String(revisions.get(path)) !== expected.revisionToken) return "changed";
         files.delete(path);
@@ -51,6 +53,7 @@ function harness() {
   };
   return {
     runtime, files, sources: new ZoneNavigationSources(runtime),
+    failNextDirtyDelete() { failDirtyDelete = true; },
     forkRuntime() {
       const fork = { ...runtime, objects: { ...runtime.objects } };
       return { runtime: fork as ProjectOsPersistenceRuntime, sources: new ZoneNavigationSources(fork as ProjectOsPersistenceRuntime) };
@@ -165,6 +168,120 @@ describe("ZoneNavigationSources", () => {
 
     const readyPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
     expect(JSON.parse(files.get(readyPath)!).ready_generation).toBe(0);
+  });
+
+  it("advances compact readiness across a batch of two independently verified dirty generations", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    const first = entry();
+    const second = { ...first, resource_id: "head:DOC-1123456789ABCDEF01234567", version: "VER-1123456789ABCDEF01234567" };
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    for (const initial of [first, second]) await sources.recordVerifiedCatalogEntry(initial, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+
+    const changedEntries = [] as { entry: NavigationInventoryEntry; generation: number }[];
+    for (const initial of [first, second]) {
+      const changed = { ...initial, version: `${initial.version}-NEXT`, expected: { ...initial.expected, revision_token: `${initial.expected.revision_token}-next`, content_sha256: "b".repeat(64) } };
+      const ticket = await sources.beginHeadWrite("PRJ-0002", "WORKING", initial.resource_id, b);
+      await sources.completeHeadWrite(ticket, changed, b);
+      await sources.writeCatalogEntry(changed, "PRJ-0002", "WORKING", changed.resource_id, b, ticket!.generation);
+      changedEntries.push({ entry: changed, generation: ticket!.generation });
+    }
+    for (const { entry: changed } of changedEntries) {
+      expect(await sources.finishDirty("PRJ-0002", "WORKING", changed.resource_id, changed, b)).toBe(true);
+    }
+
+    const readyPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    expect(JSON.parse(files.get(readyPath)!).ready_generation).toBe(2);
+  });
+
+  it("covers coalesced updates to one resource when recording its latest dirty proof", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    const original = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await sources.recordVerifiedCatalogEntry(original, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+
+    const first = { ...original, version: "VER-1123456789ABCDEF01234567", expected: { ...original.expected, revision_token: "rev-first", content_sha256: "b".repeat(64) } };
+    const firstTicket = await sources.beginHeadWrite("PRJ-0002", "WORKING", original.resource_id, b);
+    await sources.completeHeadWrite(firstTicket, first, b);
+    const latest = { ...first, version: "VER-2123456789ABCDEF01234567", expected: { ...first.expected, revision_token: "rev-latest", content_sha256: "c".repeat(64) } };
+    const latestTicket = await sources.beginHeadWrite("PRJ-0002", "WORKING", original.resource_id, b);
+    await sources.completeHeadWrite(latestTicket, latest, b);
+    await sources.writeCatalogEntry(latest, "PRJ-0002", "WORKING", latest.resource_id, b, latestTicket!.generation);
+    expect(await sources.finishDirty("PRJ-0002", "WORKING", latest.resource_id, latest, b)).toBe(true);
+
+    const readyPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    expect(JSON.parse(files.get(readyPath)!).ready_generation).toBe(2);
+  });
+
+  it("replays a durably acknowledged generation after interruption before dirty-marker deletion", async () => {
+    const { sources, files, failNextDirtyDelete } = harness();
+    const b = budget();
+    const original = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await sources.recordVerifiedCatalogEntry(original, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const changed = { ...original, version: "VER-1123456789ABCDEF01234567", expected: { ...original.expected, revision_token: "rev-next", content_sha256: "b".repeat(64) } };
+    const ticket = await sources.beginHeadWrite("PRJ-0002", "WORKING", original.resource_id, b);
+    await sources.completeHeadWrite(ticket, changed, b);
+    await sources.writeCatalogEntry(changed, "PRJ-0002", "WORKING", changed.resource_id, b, ticket!.generation);
+    failNextDirtyDelete();
+
+    await expect(sources.finishDirty("PRJ-0002", "WORKING", changed.resource_id, changed, b)).rejects.toThrow("simulated dirty-clear interruption");
+    const readyPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    expect(JSON.parse(files.get(readyPath)!).completed_generations).toEqual([{ start: 1, end: 1 }]);
+    expect([...files.keys()].some((path) => path.startsWith(`${zoneNavigationDirtyRoot("PRJ-0002", "WORKING")}/`))).toBe(true);
+
+    expect(await sources.finishDirty("PRJ-0002", "WORKING", changed.resource_id, changed, b)).toBe(true);
+    expect(JSON.parse(files.get(readyPath)!).ready_generation).toBe(1);
+    expect(JSON.parse(files.get(readyPath)!).completed_generations).toEqual([]);
+  });
+
+  it("invalidates compact readiness instead of stranding dirty cleanup when generation acknowledgements overflow", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    const original = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await sources.recordVerifiedCatalogEntry(original, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const readyPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    const manifest = JSON.parse(files.get(readyPath)!);
+    manifest.completed_generations = Array.from({ length: 64 }, (_, index) => ({ start: index * 2 + 3, end: index * 2 + 3 }));
+    files.set(readyPath, JSON.stringify(manifest));
+
+    const changed = { ...original, version: "VER-1123456789ABCDEF01234567", expected: { ...original.expected, revision_token: "rev-next", content_sha256: "b".repeat(64) } };
+    const ticket = await sources.beginHeadWrite("PRJ-0002", "WORKING", original.resource_id, b);
+    await sources.completeHeadWrite(ticket, changed, b);
+    await sources.writeCatalogEntry(changed, "PRJ-0002", "WORKING", changed.resource_id, b, ticket!.generation);
+
+    await expect(sources.finishDirty("PRJ-0002", "WORKING", changed.resource_id, changed, b)).resolves.toBe(true);
+    expect(JSON.parse(files.get(readyPath)!).ready_generation).toBeNull();
+    expect([...files.keys()].some((path) => path.startsWith(`${zoneNavigationDirtyRoot("PRJ-0002", "WORKING")}/`))).toBe(false);
+
+    const coalesced = harness();
+    const coalescedSources = coalesced.sources;
+    const coalescedFiles = coalesced.files;
+    await coalescedSources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await coalescedSources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-NAVIGATION-WORKING-0001", 0, b);
+    await coalescedSources.recordVerifiedCatalogEntry(original, "source:0", b);
+    await coalescedSources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const firstTicket = await coalescedSources.beginHeadWrite("PRJ-0002", "WORKING", original.resource_id, b);
+    const firstChange = { ...original, version: "VER-1123456789ABCDEF01234567", expected: { ...original.expected, revision_token: "rev-one", content_sha256: "b".repeat(64) } };
+    await coalescedSources.completeHeadWrite(firstTicket, firstChange, b);
+    const coalescedReadyPath = [...coalescedFiles.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    const coalescedManifest = JSON.parse(coalescedFiles.get(coalescedReadyPath)!);
+    coalescedManifest.coalesced_dirty = [{ resource_id: original.resource_id, latest_generation: 1, covered_generations: Array.from({ length: 64 }, (_, index) => ({ start: index * 2 + 3, end: index * 2 + 3 })) }];
+    coalescedFiles.set(coalescedReadyPath, JSON.stringify(coalescedManifest));
+    const secondTicket = await coalescedSources.beginHeadWrite("PRJ-0002", "WORKING", original.resource_id, b);
+    const secondChange = { ...firstChange, version: "VER-2123456789ABCDEF01234567", expected: { ...firstChange.expected, revision_token: "rev-two", content_sha256: "c".repeat(64) } };
+    await expect(coalescedSources.completeHeadWrite(secondTicket, secondChange, b)).resolves.toBeUndefined();
+    expect(JSON.parse(coalescedFiles.get(coalescedReadyPath)!).ready_generation).toBeNull();
   });
 
   it("pages dirty records through pagedListing and clears only the exact verified identity", async () => {

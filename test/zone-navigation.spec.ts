@@ -665,6 +665,56 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(verified).toEqual([inv.entry.resource_id]);
   });
 
+  it("does not trust a verified-entry marker from an adapter without the integrity capability", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const seeded = await seedAdoptingProgress(harness, input, 1, "next", inv.entry);
+    inv.port.listPage = async ({ budget: slice }) => { slice.beforeHttp(); return { entries: [], gaps: [], snapshot_id: "snapshot-empty-prefix", next_cursor: null }; };
+    const pagePath = `${seeded.root}/navigation/snapshot/00000000.json`;
+    const savedPage = JSON.parse(harness.files.get(pagePath)!.content);
+    savedPage.verified_entries = [{ resource_id: inv.entry.resource_id, entry_hash: await executionHash(inv.entry), persisted: true }];
+    harness.put(pagePath, JSON.stringify(savedPage));
+    harness.files.delete(inv.targetPath);
+    let verifyCalls = 0;
+    inv.port.verifyEntry = async (_entry, slice) => { slice.beforeHttp(); verifyCalls += 1; return true; };
+
+    const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, inv.port), input, project, await admissionFor(input));
+
+    expect(verifyCalls).toBe(1);
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_target_missing_or_changed" });
+  });
+
+  it("resumes a long legacy source proof with a bound cursor across 40 budgeted slices", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    inv.entry.resource_id = "package:PKG-NAVIGATION-0001";
+    const input = request();
+    const seeded = await seedAdoptingProgress(harness, input, 1, "next", inv.entry);
+    inv.port.listPage = async ({ budget: slice }) => { slice.beforeHttp(); return { entries: [], gaps: [], snapshot_id: "snapshot-empty-prefix", next_cursor: null }; };
+    const visited: number[] = [];
+    inv.port.verifyEntryPage = async (_entry, cursor, slice) => {
+      slice.beforeHttp();
+      const memberIndex = cursor === null ? 0 : Number(cursor);
+      visited.push(memberIndex);
+      return memberIndex === 39 ? { status: "verified" } : { status: "pending", cursor: String(memberIndex + 1) };
+    };
+    const admission = await admissionFor(input);
+    let result = await new ZoneNavigationEngine(harness.runtime, inv.port).reconcile(input, project, admission, budget(32));
+    for (let attempt = 0; result.status === "pending" && attempt < 60; attempt++) {
+      result = await new ZoneNavigationEngine(harness.runtime, inv.port).reconcile(input, project, admission, budget(32));
+    }
+
+    expect(result.status).toBe("finalized");
+    expect(visited).toEqual(Array.from({ length: 40 }, (_value, index) => index));
+    const savedProgress = JSON.parse(harness.files.get(`${seeded.root}/navigation-progress.json`)!.content);
+    expect(savedProgress.verify_cursor).toBeNull();
+  });
+
   it("returns an old finalized receipt without restoring its index over a newer generation", async () => {
     const harness = runtimeHarness();
     const project = state();

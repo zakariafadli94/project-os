@@ -176,6 +176,68 @@ describe("ZoneNavigationInventory", () => {
     expect(new Set([...first.entries, ...second.entries].map((entry) => entry.resource_id)).size).toBe(3);
   });
 
+  it("resumes an older persisted empty batch cursor from its provider continuation", async () => {
+    const h = harness();
+    const saved = `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: [],
+      provider_cursor: "provider-cursor-27",
+      listing_limit: 512
+    }))}`;
+    let received: { cursor: string | null; limit: number } | null = null;
+    h.runtime.pagedListing!.listPage = async ({ cursor, limit }) => {
+      received = { cursor, limit };
+      return { entries: [], cursor: "provider-cursor-28" };
+    };
+
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: saved, limit: 8, budget: budget() });
+
+    expect(received).toEqual({ cursor: "provider-cursor-27", limit: 512 });
+    expect(page.next_cursor).not.toBe(saved);
+    expect(page.next_cursor?.startsWith("initial:")).toBe(true);
+  });
+
+  it("rejects a provider continuation cursor that does not advance", async () => {
+    const h = harness();
+    const saved = `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: [],
+      provider_cursor: "provider-cursor-stuck",
+      listing_limit: 512
+    }))}`;
+    h.runtime.pagedListing!.listPage = async ({ cursor }) => ({ entries: [], cursor });
+
+    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: saved, limit: 8, budget: budget() }))
+      .rejects.toThrow("navigation_listing_stalled");
+  });
+
+  it("fetches the continuation after all saved batch entries have been consumed", async () => {
+    const h = harness();
+    const id = "DOC-3123456789ABCDEF01234567";
+    h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: id,
+      kind: "work_product", logical_path: "inactive.md", reconciliation_status: "clean"
+    }));
+    const saved = `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: [{ kind: "file", name: `${id}.json`, path: machineDocumentHeadPath(projectId, id) }],
+      provider_cursor: "provider-cursor-41",
+      listing_limit: 512
+    }))}`;
+    let received: { cursor: string | null; limit: number } | null = null;
+    h.runtime.pagedListing!.listPage = async ({ cursor, limit }) => {
+      received = { cursor, limit };
+      return { entries: [], cursor: null };
+    };
+
+    const consumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: saved, limit: 8, budget: budget() });
+    expect(consumed.next_cursor?.startsWith("initial:")).toBe(true);
+    const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: consumed.next_cursor, limit: 8, budget: budget() });
+
+    expect(received).toEqual({ cursor: "provider-cursor-41", limit: 512 });
+    expect(resumed.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
+  });
+
   it("batches managed-head scanning within each 32-call slice without losing cursor entries", async () => {
     const h = harness();
     const expected: string[] = [];

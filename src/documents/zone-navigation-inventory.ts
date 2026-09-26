@@ -126,9 +126,13 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     let listedEntries: ProviderEntry[];
     let providerCursor: string | null;
     let listingLimit: number;
-    if (savedPage) {
+    if (savedPage && savedPage.entries.length > 0) {
       listedEntries = savedPage.entries;
       providerCursor = savedPage.provider_cursor;
+      listingLimit = savedPage.listing_limit;
+    } else if (savedPage?.provider_cursor === null) {
+      listedEntries = [];
+      providerCursor = null;
       listingLimit = savedPage.listing_limit;
     } else {
       // New listings request a full engine-sized provider page. Any suffix
@@ -136,13 +140,14 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // cursor, so the provider cursor never advances past unprocessed heads.
       // A legacy opaque cursor was created with limit=1; preserve its page
       // size rather than changing pagination semantics mid-request.
-      listingLimit = cursor === null ? MAX_INITIAL_HEADS_PER_PAGE : 1;
+      const listingCursor = savedPage?.provider_cursor ?? cursor;
+      listingLimit = savedPage?.listing_limit ?? (cursor === null ? MAX_INITIAL_HEADS_PER_PAGE : 1);
       requireBudget(budget, 1);
       charge(budget);
       const page = await this.runtime.pagedListing.listPage({
-        path: `${machineDocumentRoot(projectId)}/heads`, cursor, limit: listingLimit
+        path: `${machineDocumentRoot(projectId)}/heads`, cursor: listingCursor, limit: listingLimit
       });
-      if (cursor !== null && page.cursor === cursor) throw new Error("navigation_listing_stalled");
+      if (listingCursor !== null && page.cursor === listingCursor) throw new Error("navigation_listing_stalled");
       listedEntries = page.entries;
       providerCursor = page.cursor;
     }

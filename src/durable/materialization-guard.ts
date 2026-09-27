@@ -62,6 +62,7 @@ const NAVIGATION_WORK_SCAN_LIMIT = 16;
 interface NavigationWorkSlice {
   ref: NavigationWorkRef;
   publish: boolean;
+  failure_code?: string;
 }
 
 interface NavigationWorkCandidate {
@@ -156,35 +157,12 @@ export class MaterializationGuard extends DurableObject<Env> {
         const ref = this.selectedNavigationWorkRef as NavigationWorkRef | undefined;
         this.selectedNavigationWorkRef = undefined;
         if (!ref) throw error;
-        const report = navigationWorkFailureSchema.parse({ ...ref, failure_code: "navigation_work_internal_failure" });
-        const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
-          "https://project-guard.internal/navigation-publish",
-          { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(report) }
-        );
-        const body = await response.json<Record<string, unknown>>();
-        if (!response.ok || body.project_id !== ref.project_id || body.request_id !== ref.request_id
-          || (body.status !== "retry" && body.status !== "stopped")) throw error;
-        if (body.status === "stopped") {
-          await this.serialize(async () => {
-            await this.ctx.storage.delete(this.navigationWorkKey(ref.request_id));
-            await this.ctx.storage.delete(`navigation-context:${ref.request_id}`);
-            await this.ctx.storage.put(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`, canonicalJson({ stopped: true, next_attempt_at: null }));
-          });
-          await this.withWakeScheduleLock(async () => {
-            const wakeAt = await this.navigationWorkWakeAt(Date.now());
-            if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
-          });
-        } else {
-          const retryAt = typeof body.next_attempt_at === "string" ? Date.parse(body.next_attempt_at) : Date.now() + MATERIALIZATION_ALARM_DELAY_MS;
-          await this.withWakeScheduleLock(async () => {
-            await this.ctx.storage.put(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`, canonicalJson({ stopped: false, next_attempt_at: new Date(retryAt).toISOString() }));
-            const wakeAt = await this.navigationWorkWakeAt(Date.now());
-            if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
-          });
-        }
+        await this.reportNavigationWorkFailure(ref, "navigation_work_internal_failure");
       }
       if (navigation) {
-        if (navigation.publish) {
+        if (navigation.failure_code) {
+          await this.reportNavigationWorkFailure(navigation.ref, navigation.failure_code);
+        } else if (navigation.publish) {
           const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
             "https://project-guard.internal/navigation-publish",
             { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(navigation.ref) }
@@ -445,6 +423,9 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
     const sources = new ZoneNavigationSources(runtime);
     const sourceState = await sources.readState(this.projectId, ref.zone, budget);
+    // A stale source snapshot is a terminal publication decision made by
+    // ProjectGuard, which writes the bound conflict receipt. Only conflicts
+    // discovered by preparation itself must use the failure ledger below.
     if (`source:${sourceState.generation}` !== ref.source_snapshot_id) return { ref, publish: true };
     if (sourceState.in_flight_resource_ids.length > 0) return { ref, publish: false };
     if (!sourceState.adopted && !await sources.beginAdoption(this.projectId, ref.zone, ref.request_id, sourceState.generation, budget)) {
@@ -452,7 +433,38 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
     const inventory = new ZoneNavigationInventory(runtime, sources);
     const result = await new ZoneNavigationEngine(runtime, inventory).reconcile(request, state, admission, budget, { deferPublication: true });
-    return { ref, publish: result.status !== "pending" };
+    if (result.status === "pending") return { ref, publish: false };
+    if (result.status === "prepared" || result.status === "finalized") return { ref, publish: true };
+    return { ref, publish: false, failure_code: result.code };
+  }
+
+  private async reportNavigationWorkFailure(ref: NavigationWorkRef, failureCode: string): Promise<void> {
+    const report = navigationWorkFailureSchema.parse({ ...ref, failure_code: failureCode });
+    const response = await this.env.PROJECT_GUARD.getByName(this.projectId).fetch(
+      "https://project-guard.internal/navigation-publish",
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(report) }
+    );
+    const body = await response.json<Record<string, unknown>>();
+    if (!response.ok || body.project_id !== ref.project_id || body.request_id !== ref.request_id
+      || (body.status !== "retry" && body.status !== "stopped")) throw new Error("navigation_work_failure_unacknowledged");
+    if (body.status === "stopped") {
+      await this.serialize(async () => {
+        await this.ctx.storage.delete(this.navigationWorkKey(ref.request_id));
+        await this.ctx.storage.delete(`navigation-context:${ref.request_id}`);
+        await this.ctx.storage.put(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`, canonicalJson({ stopped: true, next_attempt_at: null }));
+      });
+      await this.withWakeScheduleLock(async () => {
+        const wakeAt = await this.navigationWorkWakeAt(Date.now());
+        if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
+      });
+    } else {
+      const retryAt = typeof body.next_attempt_at === "string" ? Date.parse(body.next_attempt_at) : Date.now() + MATERIALIZATION_ALARM_DELAY_MS;
+      await this.withWakeScheduleLock(async () => {
+        await this.ctx.storage.put(`${NAVIGATION_RETRY_PREFIX}${ref.request_id}`, canonicalJson({ stopped: false, next_attempt_at: new Date(retryAt).toISOString() }));
+        const wakeAt = await this.navigationWorkWakeAt(Date.now());
+        if (Number.isFinite(wakeAt)) await this.ctx.storage.setAlarm(wakeAt);
+      });
+    }
   }
 
   /** Select at most one bounded page in durable round-robin order. Backoff

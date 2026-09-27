@@ -2032,6 +2032,7 @@ export class ProjectGuard extends DurableObject<Env> {
   ): Promise<RecoveryFailureResult> {
     const message = error instanceof Error ? error.message : "";
     const errorName = error instanceof Error ? error.name : "UnknownError";
+    const navigationFailureCode = kind === "document" && /^navigation_[A-Za-z0-9._-]{1,72}$/.test(message) ? message : null;
     const usefulContinuation = error instanceof Error
       && /(?:^|_)slice_budget_exhausted$/i.test(message);
     const networkTemporary = isTransientRecoveryFailure(error);
@@ -2050,9 +2051,9 @@ export class ProjectGuard extends DurableObject<Env> {
           : error.diagnostics?.status
             ? `provider_http_${error.diagnostics.status}`
             : "provider_operation_failed")
-      : usefulContinuation ? "slice_budget_exhausted"
+      : navigationFailureCode ?? (usefulContinuation ? "slice_budget_exhausted"
         : networkTemporary ? "network_transport_unavailable"
-          : message === "materialization_evidence_no_progress" ? message : "internal_error";
+          : message === "materialization_evidence_no_progress" ? message : "internal_error");
     const previous = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; fingerprint: string; count: number; message: string }>(
       "SELECT fingerprint, count, message FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
     ).toArray()[0];

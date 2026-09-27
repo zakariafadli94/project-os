@@ -11,6 +11,7 @@
     "check:recover-inputs-workflow": "node scripts/check-recover-inputs-workflow.mjs",
     "check:fallback-ingress-boundaries": "node scripts/check-fallback-ingress-boundaries.mjs",
     "test:recover-inputs-api": "vitest run test/admin-recover-inputs.spec.ts",
+    "test:instance-repair-v2": "PROJECT_OS_TEST_SCHEMA_WRITER_STAGE=provider_v2 vitest run test/project-guard-document.spec.ts -t 'repairs four V2 external identities'",
     "test:recover-inputs-workflow-spec": "vitest run test/recover-inputs-workflow.spec.ts",
     "test:search-sync-off": "vitest run --config vitest.search-sync-off.config.ts",
     "test:index001": "npm run check:index001-remediation && npm run test:search-sync-off && vitest run test/search-contract.spec.ts test/search-canonical-records.spec.ts test/search-document-records.spec.ts test/search-project-sync.spec.ts test/search-sync-guard-backoff.spec.ts test/search-index-store.spec.ts test/search-query.spec.ts test/search-rebuild.spec.ts test/search-worker.spec.ts test/search-read-mode.spec.ts test/search-sync-mode.spec.ts test/search-provider-neutral.spec.ts",
@@ -22,7 +23,7 @@
     "check:mutation-gate-repair-workflow": "node scripts/check-mutation-gate-repair-workflow.mjs",
     "check:control-tower-deployment": "node scripts/check-control-tower-deployment.mjs",
     "operator:submit": "node scripts/control-tower-operator.mjs",
-    "check": "npm run types && npm run typecheck && npm run check:persistence-boundary && npm run check:production-promotion-authority && npm run check:mutation-gate-repair-workflow && npm run check:index001-remediation && npm run check:binary-artifact-ingress && npm run check:recover-inputs-workflow && npm run check:fallback-ingress-boundaries && npm run test:search-sync-off && npm test",
+    "check": "npm run types && npm run typecheck && npm run check:persistence-boundary && npm run check:production-promotion-authority && npm run check:mutation-gate-repair-workflow && npm run check:index001-remediation && npm run check:binary-artifact-ingress && npm run check:recover-inputs-workflow && npm run check:fallback-ingress-boundaries && npm run test:search-sync-off && npm run test:instance-repair-v2 && npm test",
     "deploy": "wrangler deploy"
   },
   "dependencies": {

@@ -84,6 +84,46 @@ const documentArchiveSchema = z.strictObject({
   created_at: createdAt
 });
 
+const instanceRepairProvider = z.strictObject({
+  object_id: z.string().regex(/^id:[A-Za-z0-9_-]+$/),
+  revision_token: z.string().min(1).max(256),
+  path: z.string().min(1),
+  size: z.number().int().nonnegative().safe()
+}).superRefine((value, ctx) => {
+  if (!value.path.startsWith("/") || !value.path.includes("/WORKING/") || value.path.includes("..")) {
+    ctx.addIssue({ code: "custom", path: ["path"], message: "repair provider path must be a safe WORKING path" });
+  }
+});
+
+const instanceRepairSchema = z.strictObject({
+  operation: z.literal("document.instance.repair"),
+  request_id: requestId,
+  project_id: projectId,
+  document_id: documentId,
+  version_id: versionId,
+  logical_path: logicalPath,
+  expected_project_revision: z.number().int().nonnegative().safe(),
+  expected_source_generation: z.number().int().nonnegative().safe(),
+  expected_version_record_sha256: hash,
+  content_sha256: hash,
+  historical_provider: instanceRepairProvider,
+  current_provider: instanceRepairProvider,
+  created_at: createdAt
+}).superRefine((value, ctx) => {
+  if (!value.historical_provider.path.endsWith(`/WORKING/${value.logical_path}`)) {
+    ctx.addIssue({ code: "custom", path: ["historical_provider", "path"], message: "historical provider path must match the WORKING logical path" });
+  }
+  if (!value.current_provider.path.endsWith(`/WORKING/${value.logical_path}`)) {
+    ctx.addIssue({ code: "custom", path: ["current_provider", "path"], message: "current provider path must match the WORKING logical path" });
+  }
+  if (value.historical_provider.object_id === value.current_provider.object_id
+    && value.historical_provider.revision_token === value.current_provider.revision_token
+    && value.historical_provider.path === value.current_provider.path
+    && value.historical_provider.size === value.current_provider.size) {
+    ctx.addIssue({ code: "custom", path: ["current_provider"], message: "instance repair requires a distinct current provider identity" });
+  }
+});
+
 export const managedDocumentRequestSchema = z.discriminatedUnion("operation", [
   navigationReconcileSchema,
   z.strictObject({ operation: z.literal("package.replace"), request_id: requestId, project_id: projectId, candidate: packageRefSchema, zone: packageZoneSchema, expected_navigation_generation: z.number().int().nonnegative().safe(), expected_project_revision: z.number().int().nonnegative().safe(), created_at: createdAt }),
@@ -95,7 +135,8 @@ export const managedDocumentRequestSchema = z.discriminatedUnion("operation", [
   publishSchema,
   reopenSchema,
   referenceClassifySchema,
-  documentArchiveSchema
+  documentArchiveSchema,
+  instanceRepairSchema
 ]);
 
 export type ManagedDocumentRequest = z.infer<typeof managedDocumentRequestSchema>;

@@ -315,6 +315,18 @@ describe("ZoneNavigationSources", () => {
     expect(await sources.readCatalogEntry("PRJ-0002", "WORKING", resourceId, b)).toEqual(entry());
   });
 
+  it("rejects a foreign owner before changing an owned repair source fence", async () => {
+    const { sources } = harness();
+    const resourceId = entry().resource_id;
+    const ownerA = "a".repeat(64), ownerB = "b".repeat(64);
+    const owned = await sources.beginHeadWrite("PRJ-0002", "WORKING", resourceId, undefined, null, true, ownerA);
+    expect(owned?.owner_hash).toBe(ownerA);
+    await expect(sources.beginHeadWrite("PRJ-0002", "WORKING", resourceId, undefined, null, true, ownerB))
+      .rejects.toThrow("navigation_source_owner_conflict");
+    expect(await sources.readOwnedHeadWrite("PRJ-0002", "WORKING", resourceId, ownerA)).toEqual(owned);
+    expect(await sources.readState("PRJ-0002", "WORKING")).toMatchObject({ generation: 1, in_flight_resource_ids: [resourceId] });
+  });
+
   it("lets a new adoption snapshot take over after a source write invalidates the old generation", async () => {
     const { sources } = harness();
     const b = budget();

@@ -217,6 +217,14 @@ export function machineDocumentPromotionPath(projectId: string, requestId: strin
   return `${machineDocumentRoot(projectId)}/promotions/${requestId}.json`;
 }
 
+export function machineDocumentInstanceRepairPath(projectId: string, documentId: string, versionId: string, bindingSha256: string): string {
+  return `${machineDocumentRoot(projectId)}/instance-repairs/${assertSafeDocumentId(documentId)}/${assertSafeDocumentVersionId(versionId)}/${assertSafeSha256(bindingSha256)}.json`;
+}
+
+export function machineDocumentInstanceRepairFencePath(projectId: string, requestHash: string): string {
+  return `${machineDocumentRoot(projectId)}/instance-repairs/requests/${assertSafeSha256(requestHash)}.json`;
+}
+
 export function machineInputIntakePath(projectId: string, intakeId: string): string {
   return `${machineDocumentRoot(projectId)}/intakes/${assertSafeInputIntakeId(intakeId)}.json`;
 }

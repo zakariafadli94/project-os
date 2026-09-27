@@ -23,6 +23,31 @@ describe("managed document API request", () => {
     expect(parseManagedDocumentRequest(request)).toEqual(request);
     expect(() => parseManagedDocumentRequest({ ...request, content: "uncommitted payload" })).toThrow();
   });
+  it("admits an instance repair only with a complete exact version and provider binding", async () => {
+    const request = {
+      operation: "document.instance.repair",
+      request_id: "DOCREQ-INSTANCE-REPAIR-0001",
+      project_id,
+      document_id,
+      version_id: expected_version_id,
+      logical_path: "strategies/current.md",
+      expected_project_revision: 2333,
+      expected_source_generation: 5,
+      expected_version_record_sha256: "a".repeat(64),
+      content_sha256: "b".repeat(64),
+      historical_provider: { object_id: "id:history", revision_token: "rev-history", path: "/PROJECT/WORKING/strategies/current.md", size: 9 },
+      current_provider: { object_id: "id:current", revision_token: "rev-current", path: "/PROJECT/WORKING/strategies/current.md", size: 9 },
+      created_at
+    } as const;
+    const parsed = parseManagedDocumentRequest(request);
+    expect(parsed).toEqual(request);
+    const normalized = await normalizeDocumentAdmission(parsed);
+    expect(normalized).toMatchObject({ operation: "document.instance.repair", resources: [{ resource_id: document_id, resource_type: "document", zone: "WORKING" }] });
+    expect(normalized.resources[0].version).toMatch(new RegExp(`^${expected_version_id}:5:${"a".repeat(64)}:${"b".repeat(64)}:[a-f0-9]{64}$`));
+    expect(() => parseManagedDocumentRequest({ ...request, current_provider: { ...request.current_provider, path: "/PROJECT/REVIEW/strategies/current.md" } })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, expected_source_generation: -1 })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, repair_authorized: true })).toThrow();
+  });
   it("parses working writes with an optional invisible base-version token", () => {
     expect(parseManagedDocumentRequest({
       operation: "working.write",

@@ -39,7 +39,7 @@ import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata, ProviderRequestScope } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError, MutationGateRepository } from "../mutation-gate/repository";
-import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, machineMaterializationRoot, workspaceProjectRoot, type LayoutMode } from "../persistence/layout";
+import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentInstanceRepairFencePath, machineDocumentInstanceRepairPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, machineMaterializationRoot, workspaceProjectRoot, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import { ArtifactContentConflictError, ProjectRepository } from "../persistence/repository";
@@ -993,6 +993,16 @@ export class ProjectGuard extends DurableObject<Env> {
     const normalized = await normalizeDocumentAdmission(operation);
     const rulesRequired = await this.ruleAdmissionRequired(state, normalized);
     await this.verifyEffectAdmission(mutationContext, operation.project_id, state, rulesRequired);
+    if (operation.operation === "document.instance.repair") {
+      if (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext
+        || mutationContext.actor.actor_id !== "control_tower"
+        || mutationContext.actor.authority !== "control_tower_operator") {
+        return Response.json(this.documentTerminalReceipt(operation, "rejected", "DOCUMENT_INSTANCE_REPAIR_AUTHORITY_REQUIRED", "Document instance repair requires a fresh signed Control Tower operator context", operation.document_id));
+      }
+      // The service enforces the expected revision before creating a proof.
+      // If an exact, already-written proof exists for this admitted request,
+      // the service may finish the receipt after unrelated project changes.
+    }
     if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
       if (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext) return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "rejected", code: "PACKAGE_GOVERNANCE_REQUIRED" });
       if (operation.expected_project_revision !== state.revision) return Response.json({ status: "conflict", code: "PACKAGE_PROJECT_REVISION_CONFLICT" });
@@ -1536,6 +1546,8 @@ export class ProjectGuard extends DurableObject<Env> {
       case "package.freeze":
       case "package.replace":
         throw new Error("package_governance_dispatch_required");
+      case "document.instance.repair":
+        return this.executeDocumentInstanceRepair(request, state);
       case "working.write":
         return this.managedDocumentService.writeWorking(request, state);
       case "review.write":
@@ -1552,6 +1564,101 @@ export class ProjectGuard extends DurableObject<Env> {
         return this.managedDocumentService.archiveActiveDocument(request, state);
       case "reference.classify":
         return this.managedDocumentService.classifyReference(request, state);
+    }
+  }
+
+  private async executeDocumentInstanceRepair(
+    request: Extract<ManagedDocumentRequest, { operation: "document.instance.repair" }>,
+    state: ProjectState
+  ): Promise<ManagedDocumentReceipt> {
+    const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
+    const admission = await journal.readAdmission();
+    const actor = admission?.admission.actor;
+    if (!admission || admission.admission.operation !== request.operation
+      || admission.admission.request_hash !== await sha256Canonical(request)
+      || actor?.actor_id !== "control_tower" || actor.authority !== "control_tower_operator") {
+      throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_AUTHORITY_REQUIRED", "Authenticated operator admission proof is unavailable", request.document_id);
+    }
+    const sources = new ZoneNavigationSources(this.persistence);
+    const resourceId = `head:${request.document_id}`;
+    let source = await sources.readState(request.project_id, "WORKING");
+    const requestHash = await sha256Canonical(request);
+    let ticket = null;
+    if (source.generation === request.expected_source_generation) {
+      if (source.in_flight_resource_ids.includes(resourceId)) throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "A different WORKING source write is already in flight", request.document_id);
+      const headRaw = await this.persistence.objects.readText(machineDocumentHeadPath(request.project_id, request.document_id));
+      if (headRaw === null) throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_BINDING_CONFLICT", "Current document head is unavailable", request.document_id);
+      const fence = {
+        schema_version: "1.0", operation: request.operation, request_id: request.request_id,
+        request_sha256: requestHash, expected_source_generation: request.expected_source_generation,
+        target_source_generation: request.expected_source_generation + 1, head_sha256: await sha256Text(headRaw)
+      };
+      const fencePath = machineDocumentInstanceRepairFencePath(request.project_id, requestHash);
+      try { await this.persistence.objects.createText(fencePath, canonicalJson(fence)); }
+      catch (error) {
+        if (!(error instanceof ProviderConflictError) || await this.persistence.objects.readText(fencePath) !== canonicalJson(fence)) throw error;
+      }
+      try {
+        ticket = await sources.beginHeadWrite(request.project_id, "WORKING", resourceId, undefined, await sha256Text(headRaw), true, requestHash);
+      } catch (error) {
+        if (error instanceof Error && error.message === "navigation_source_owner_conflict") {
+          throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "A different WORKING source write is already in flight", request.document_id);
+        }
+        throw error;
+      }
+      source = await sources.readState(request.project_id, "WORKING");
+      if (!ticket || ticket.generation !== request.expected_source_generation + 1 || source.generation !== ticket.generation) {
+        throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "WORKING source changed during repair admission", request.document_id);
+      }
+    } else if (source.generation >= request.expected_source_generation + 1) {
+      const fencePath = machineDocumentInstanceRepairFencePath(request.project_id, requestHash);
+      const fenceRaw = await this.persistence.objects.readText(fencePath);
+      if (!fenceRaw) throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "WORKING source generation changed", request.document_id);
+      const fence = JSON.parse(fenceRaw) as Record<string, unknown>;
+      const headRaw = await this.persistence.objects.readText(machineDocumentHeadPath(request.project_id, request.document_id));
+      if (fence.operation !== request.operation || fence.request_id !== request.request_id || fence.request_sha256 !== requestHash
+        || fence.expected_source_generation !== request.expected_source_generation
+        || fence.target_source_generation !== request.expected_source_generation + 1 || !headRaw || fence.head_sha256 !== await sha256Text(headRaw)) {
+        throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "WORKING source generation changed", request.document_id);
+      }
+      if (source.in_flight_resource_ids.includes(resourceId)) {
+        const owned = await sources.readOwnedHeadWrite(request.project_id, "WORKING", resourceId, requestHash);
+        if (!owned || owned.generation > source.generation) {
+          throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "WORKING source ticket belongs to another request", request.document_id);
+        }
+        ticket = await sources.beginHeadWrite(request.project_id, "WORKING", resourceId, undefined, owned.write_hash, true, requestHash);
+        if (!ticket || ticket.generation !== owned.generation) throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "Repair source ticket changed", request.document_id);
+      } else if (await sources.hasDirtyMarker(request.project_id, "WORKING", resourceId)) {
+        const proofSha256 = await sha256Canonical({ project_id: request.project_id, document_id: request.document_id,
+          version_id: request.version_id, logical_path: request.logical_path,
+          version_record_sha256: request.expected_version_record_sha256,
+          historical_provider: request.historical_provider, current_provider: request.current_provider });
+        const proofPath = machineDocumentInstanceRepairPath(request.project_id, request.document_id, request.version_id, proofSha256);
+        const proofRaw = await this.persistence.objects.readText(proofPath);
+        const proof = proofRaw ? JSON.parse(proofRaw) as Record<string, unknown> : null;
+        if (!proof || proof.request_id !== request.request_id || proof.request_sha256 !== requestHash) {
+          throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "Completed WORKING source fence does not belong to this request", request.document_id);
+        }
+        // The same request's proof and marker establish completed work.
+        ticket = null;
+      } else {
+        throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "WORKING source generation changed", request.document_id);
+      }
+    } else {
+      throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SOURCE_GENERATION_CONFLICT", "WORKING source generation changed", request.document_id);
+    }
+
+    try {
+      const receipt = await this.managedDocumentService.repairDocumentInstance(request, state, actor);
+      if (ticket) await sources.completeHeadWrites([ticket]);
+      return receipt;
+    } catch (error) {
+      if (error instanceof ManagedDocumentConflictError && ticket) {
+        // Leave a durable source invalidation while closing the in-flight fence;
+        // a fresh request must requalify the new snapshot from current evidence.
+        await sources.completeHeadWrites([ticket]);
+      }
+      throw error;
     }
   }
 

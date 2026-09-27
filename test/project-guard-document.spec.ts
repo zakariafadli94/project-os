@@ -15,6 +15,15 @@ import { ExecutionJournal } from "../src/execution/journal";
 import { documentIdFor } from "../src/domain/managed-document";
 import { ruleFixture } from "./helpers/rule-fixtures";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineStatePath } from "../src/persistence/layout";
+import { toManagedProviderObservation } from "../src/persistence/compatibility/dropbox-v1-evidence";
+import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
+import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
+import { createSliceBudget } from "../src/convergence/budget";
+import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
+import { navigationReconcileSchema } from "../src/domain/zone-navigation";
+import { executionHash } from "../src/execution/journal";
+import { emptyProjectState } from "../src/domain/transitions";
+import { workspaceProjectRoot } from "../src/persistence/layout";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-24T19:35:00+01:00";
@@ -48,6 +57,297 @@ describe("ProjectGuard managed documents", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("rejects instance repair from a fresh signed generic ingress actor", async () => {
+    const created = await createProject("TXN-DOCUMENT-REPAIR-AUTH-01");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const signingKey = "project-document-governance";
+    const ingressToken = "generic-ingress-repair-test";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+      RULE_ADMISSION_SIGNING_KEY: signingKey,
+      INGRESS_TOKEN: ingressToken,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    const contextResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${ingressToken}` } });
+    const { context }: any = await contextResponse.json();
+    const request = {
+      operation: "document.instance.repair",
+      request_id: "DOCREQ-INSTANCE-REPAIR-AUTH-0001",
+      project_id: created.project_id,
+      document_id: "DOC-0123456789ABCDEF01234567",
+      version_id: "VER-EXT-111111111111111111111111",
+      logical_path: "strategies/current.md",
+      expected_project_revision: created.new_revision,
+      expected_source_generation: 0,
+      expected_version_record_sha256: "a".repeat(64),
+      content_sha256: "b".repeat(64),
+      historical_provider: { object_id: "id:history", revision_token: "rev-history", path: "/PROJECT/WORKING/strategies/current.md", size: 9 },
+      current_provider: { object_id: "id:current", revision_token: "rev-current", path: "/PROJECT/WORKING/strategies/current.md", size: 9 },
+      created_at: at
+    };
+    const response = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await response.json()).toMatchObject({ status: "rejected", code: "DOCUMENT_INSTANCE_REPAIR_AUTHORITY_REQUIRED" });
+  });
+
+  it("commits exact Control Tower repair evidence and lets navigation admit only that current instance", async () => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-DOCUMENT-REPAIR-REAL-01");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const signingKey = "project-document-governance";
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, created.project_id);
+    const ingressToken = "generic-ingress-setup-test";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: signingKey, RULE_ADMISSION_SIGNING_KEY: signingKey, INGRESS_TOKEN: ingressToken
+    }));
+    const setupContext: any = await (await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${ingressToken}` } })).json();
+    let content = "# Stable working document\n";
+    const writeRequest = {
+      operation: "working.write", request_id: "DOCREQ-REPAIR-WRITE-0001", project_id: created.project_id,
+      logical_path: "strategies/current.md", content, content_sha256: await sha256Text(content), created_at: at
+    };
+    const write = await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(writeRequest, setupContext.context)) });
+    const written: any = await write.json();
+    expect(written).toMatchObject({ status: "committed" });
+    const runtime = createProductionPersistence(testEnv);
+    const repository = new DocumentLedgerRepository(runtime);
+    const originalHead = await repository.readHead(created.project_id, written.document_id);
+    const originalVersion = await repository.readVersion(created.project_id, written.document_id, written.version_id);
+    expect(originalHead?.working_version_id).toBe(written.version_id);
+    content = (await runtime.objects.readText(originalVersion!.immutable_payload_path))!;
+    const visiblePath = originalHead!.provider!.working!.path;
+    const changedMetadata = await mock.writeExternal(visiblePath, content);
+    const changedObservation = toManagedProviderObservation({
+      path: visiblePath, objectId: changedMetadata!.id, revisionToken: changedMetadata!.rev,
+      integrityHash: { algorithm: "dropbox-content-hash", value: changedMetadata!.content_hash },
+      size: changedMetadata!.size
+    });
+    await repository.writeHead({ ...originalHead!, provider: { ...originalHead!.provider, working: changedObservation } });
+    const rawVersion = await runtime.objects.readText(machineDocumentVersionPath(created.project_id, written.document_id, written.version_id));
+    const source = new ZoneNavigationSources(runtime);
+    const sourceState = await source.readState(created.project_id, "WORKING");
+    const operatorToken = "authorized-control-tower-repair-test";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+      RULE_ADMISSION_SIGNING_KEY: signingKey,
+      CONTROL_TOWER_OPERATOR_TOKEN: operatorToken,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    const { context }: any = await (await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${operatorToken}` } })).json();
+    const request = {
+      operation: "document.instance.repair",
+      request_id: "DOCREQ-INSTANCE-REPAIR-REAL-0001",
+      project_id: created.project_id,
+      document_id: written.document_id,
+      version_id: written.version_id,
+      logical_path: originalHead!.logical_path,
+      expected_project_revision: created.new_revision,
+      expected_source_generation: sourceState.generation,
+      expected_version_record_sha256: await sha256Text(rawVersion!),
+      content_sha256: await sha256Text(content),
+      historical_provider: {
+        object_id: originalVersion!.provider_evidence!.object_id,
+        revision_token: originalVersion!.provider_evidence!.revision_token,
+        path: originalVersion!.provider_evidence!.path,
+        size: originalVersion!.provider_evidence!.size
+      },
+      current_provider: {
+        object_id: changedObservation.file_id, revision_token: changedObservation.rev,
+        path: changedObservation.path, size: changedObservation.size
+      },
+      created_at: at
+    };
+    let proofWritten = false;
+    let repairProofPath: string | null = null;
+    let restoreCreateText!: () => void;
+    await runInDurableObject(guard, (instance) => {
+      const objects = (instance as any).persistence.objects;
+      const createText = objects.createText.bind(objects);
+      objects.createText = async (path: string, text: string) => {
+        if (path.endsWith(`/requests/${request.request_id}/receipt.json`) && proofWritten) throw new Error("injected interruption after repair proof");
+        const result = await createText(path, text);
+        if (path.includes("/instance-repairs/") && !path.includes("/instance-repairs/requests/")) { proofWritten = true; repairProofPath = path; }
+        return result;
+      };
+      restoreCreateText = () => { objects.createText = createText; };
+    });
+    const interruptedResponse = await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, context)) });
+    expect(interruptedResponse.status).toBe(503);
+    expect(proofWritten).toBe(true);
+    expect(repairProofPath && await runtime.objects.readText(repairProofPath)).not.toBeNull();
+    expect(await runtime.objects.readText(`${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/receipt.json`)).toBeNull();
+    restoreCreateText();
+
+    // Advance both project revision and WORKING source generation on an
+    // unrelated document after the repair proof, but before its receipt.
+    const unrelatedContent = "# Unrelated successor write\n";
+    const unrelatedWrite = {
+      operation: "working.write", request_id: "DOCREQ-REPAIR-UNRELATED-0001", project_id: created.project_id,
+      logical_path: "strategies/unrelated.md", content: unrelatedContent,
+      content_sha256: await sha256Text(unrelatedContent), created_at: at
+    };
+    expect(await source.beginAdoption(created.project_id, "WORKING", "DOCREQ-REPAIR-INTERLEAVE-0001", sourceState.generation + 1)).toBe(true);
+    expect(await (await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(unrelatedWrite, setupContext.context)) })).json()).toMatchObject({ status: "committed" });
+    const interleavedTx = { schema_version: "1.0", transaction_id: "TXN-REPAIR-INTERLEAVE-0001", project_id: created.project_id,
+      base_revision: created.new_revision, operation: "project.framing.update", created_at: at,
+      payload: { success_criteria: ["Unrelated interleaved revision"] } };
+    const { context: interleaveContext }: any = await (await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${operatorToken}` } })).json();
+    const interleavedTransaction = await guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(encodeAdmission(interleavedTx, interleaveContext))
+    });
+    const interleavedReceipt: any = await interleavedTransaction.json();
+    expect(interleavedReceipt).toMatchObject({ status: "committed", new_revision: created.new_revision + 1 });
+    expect(interleavedReceipt.new_revision).toBeGreaterThan(request.expected_project_revision);
+    const { context: resumedContext }: any = await (await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${operatorToken}` } })).json();
+    const response = await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, resumedContext)) });
+    const receipt: any = await response.json();
+    expect(response.status).toBe(200);
+    expect(receipt, JSON.stringify(receipt)).toMatchObject({ operation: "document.instance.repair", status: "committed", document_id: written.document_id, version_id: written.version_id, proof_ref: expect.any(String), proof_sha256: expect.any(String), actor: { actor_id: "control_tower", authority: "control_tower_operator" } });
+    expect(await source.readState(created.project_id, "WORKING")).toMatchObject({ generation: sourceState.generation + 2, in_flight_resource_ids: [] });
+    expect(await new ExecutionJournal(runtime, created.project_id, "document", request.request_id).status()).toMatchObject({ status: "finalized", terminal: true, finalization_ref: expect.any(String) });
+    const replayResponse = await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, resumedContext)) });
+    expect(await replayResponse.json()).toEqual(receipt);
+    expect(await source.readState(created.project_id, "WORKING")).toMatchObject({ generation: sourceState.generation + 2, in_flight_resource_ids: [] });
+    expect(await repository.readVersion(created.project_id, written.document_id, written.version_id)).toEqual(originalVersion);
+    const inventory = new ZoneNavigationInventory(runtime, source);
+    const validEntry: any = {
+      project_id: created.project_id, zone: "WORKING", resource_id: `head:${written.document_id}`,
+      version: written.version_id, logical_path: originalHead!.logical_path, path: visiblePath,
+      expected: { object_id: changedObservation.file_id, revision_token: changedObservation.rev, content_sha256: await sha256Text(content), size: changedObservation.size }
+    };
+    expect(await inventory.verifyEntry(validEntry, createSliceBudget(() => Date.now(), new AbortController().signal))).toBe(true);
+    for (const invalidEntry of [
+      { ...validEntry, version: "VER-REQ-AAAAAAAAAAAAAAAAAAAAAAAA" },
+      { ...validEntry, expected: { ...validEntry.expected, object_id: "id:unbound-instance" } },
+      { ...validEntry, expected: { ...validEntry.expected, content_sha256: "0".repeat(64) } }
+    ]) {
+      expect(await inventory.verifyEntry(invalidEntry, createSliceBudget(() => Date.now(), new AbortController().signal))).toBe(false);
+    }
+  });
+
+  it.skipIf(testEnv.PROJECT_OS_SCHEMA_WRITER_STAGE !== "provider_v2")("repairs four V2 external identities without raw SHA and finalizes one successor in bounded 32-call slices", async () => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-DOCUMENT-REPAIR-CENSUS-01");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const signingKey = "project-document-governance";
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, created.project_id);
+    const ingressToken = "repair-census-ingress-test";
+    const operatorToken = "repair-census-operator-test";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: signingKey, RULE_ADMISSION_SIGNING_KEY: signingKey,
+      INGRESS_TOKEN: ingressToken, CONTROL_TOWER_OPERATOR_TOKEN: operatorToken,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    const runtime = createProductionPersistence(testEnv);
+    const repository = new DocumentLedgerRepository(runtime);
+    const sources = new ZoneNavigationSources(runtime);
+    const logicalPaths = ["strategies/repair-1.md", "strategies/repair-2.md", "strategies/repair-3.md", "strategies/repair-4.md", "strategies/matching.md"];
+    const fixtures: { document_id: string; version_id: string; logical_path: string; path: string; content: string; old: any; current: any; raw_version: string }[] = [];
+    for (let index = 0; index < logicalPaths.length; index += 1) {
+      const logical_path = logicalPaths[index];
+      const document_id = await documentIdFor(created.project_id, logical_path);
+      const version_id = `VER-EXT-${String(index + 1).padStart(24, "0")}`;
+      const content = `# External version ${index + 1}\nStable immutable bytes.\n`;
+      const path = `${workspaceProjectRoot(created.project_id, `document-${created.project_id.slice(-4).toLowerCase()}`)}/WORKING/${logical_path}`;
+      const oldMetadata = await mock.writeExternal(path, content);
+      const provider_evidence = { provider_id: "dropbox" as const, object_id: oldMetadata!.id!, revision_token: oldMetadata!.rev!, path,
+        integrity_hash: { algorithm: "dropbox-content-hash" as const, value: oldMetadata!.content_hash! }, size: oldMetadata!.size! };
+      const payloadHash = await sha256Text(content);
+      const immutable_payload_path = await repository.storeTextPayload(created.project_id, payloadHash, content);
+      await runtime.objects.createText(machineDocumentVersionPath(created.project_id, document_id, version_id), JSON.stringify({
+        schema_version: "2.0", project_id: created.project_id, document_id, version_id, kind: "work_product",
+        stage: "working", logical_path, source: "external_human", created_at: at, immutable_payload_path, provider_evidence
+      }));
+      const old = toManagedProviderObservation({ path, objectId: oldMetadata!.id!, revisionToken: oldMetadata!.rev!,
+        integrityHash: { algorithm: "dropbox-content-hash", value: oldMetadata!.content_hash! }, size: oldMetadata!.size! });
+      const toV2Provider = (observation: typeof old) => ({ provider_id: "dropbox", object_id: observation.file_id,
+        revision_token: observation.rev, path: observation.path,
+        integrity_hash: { algorithm: "dropbox-content-hash", value: observation.content_hash }, size: observation.size });
+      const head = { schema_version: "2.0" as const, project_id: created.project_id, document_id, kind: "work_product" as const, logical_path,
+        working_version_id: version_id, provider: { working: toV2Provider(old) }, reconciliation_status: "clean" as const };
+      await runtime.objects.createText(machineDocumentHeadPath(created.project_id, document_id), JSON.stringify(head));
+      const currentMetadata = index < 4 ? await mock.replaceExternal(path, content) : oldMetadata;
+      const current = toManagedProviderObservation({ path, objectId: currentMetadata!.id!, revisionToken: currentMetadata!.rev!,
+        integrityHash: { algorithm: "dropbox-content-hash", value: currentMetadata!.content_hash! }, size: currentMetadata!.size! });
+      if (index < 4) await runtime.objects.upsertText(machineDocumentHeadPath(created.project_id, document_id), JSON.stringify({ ...head, provider: { working: toV2Provider(current) } }));
+      const raw_version = await runtime.objects.readText(machineDocumentVersionPath(created.project_id, document_id, version_id));
+      expect(JSON.parse(raw_version!)).not.toHaveProperty("content_sha256");
+      fixtures.push({ document_id, version_id, logical_path, path, content, old, current, raw_version: raw_version! });
+    }
+    const { context: ingressContext }: any = await (await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${ingressToken}` } })).json();
+    const { context: initialOperatorContext }: any = await (await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${operatorToken}` } })).json();
+    expect(initialOperatorContext.actor).toMatchObject({ actor_id: "control_tower", authority: "control_tower_operator" });
+    let sourceState = await sources.readState(created.project_id, "WORKING");
+    const firstMismatch = fixtures[0];
+    const inventory = new ZoneNavigationInventory(runtime, sources);
+    const unprovedEntry = { project_id: created.project_id, zone: "WORKING" as const, resource_id: `head:${firstMismatch.document_id}`,
+      version: firstMismatch.version_id, logical_path: firstMismatch.logical_path, path: firstMismatch.path,
+      expected: { object_id: firstMismatch.current.file_id, revision_token: firstMismatch.current.rev,
+        content_sha256: await sha256Text(firstMismatch.content), size: firstMismatch.current.size } };
+    expect(await inventory.verifyEntry(unprovedEntry, createSliceBudget(() => Date.now(), new AbortController().signal))).toBe(false);
+    for (let index = 0; index < 4; index += 1) {
+      const fixture = fixtures[index];
+      const { context }: any = await (await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${operatorToken}` } })).json();
+      const request = { operation: "document.instance.repair", request_id: `DOCREQ-REPAIR-CENSUS-${index + 1}-0001`,
+        project_id: created.project_id, document_id: fixture.document_id, version_id: fixture.version_id, logical_path: fixture.logical_path,
+        expected_project_revision: created.new_revision, expected_source_generation: sourceState.generation,
+        expected_version_record_sha256: await sha256Text(fixture.raw_version), content_sha256: await sha256Text(fixture.content),
+        historical_provider: { object_id: fixture.old.file_id, revision_token: fixture.old.rev, path: fixture.path, size: fixture.old.size },
+        current_provider: { object_id: fixture.current.file_id, revision_token: fixture.current.rev, path: fixture.path, size: fixture.current.size }, created_at: at };
+      const response = await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, context)) });
+      const repairResponse = await response.json();
+      expect(repairResponse, JSON.stringify(repairResponse)).toMatchObject({ operation: "document.instance.repair", status: "committed", document_id: fixture.document_id });
+      sourceState = await sources.readState(created.project_id, "WORKING");
+    }
+    const matching = fixtures[4];
+    expect(matching.current.file_id).toBe(matching.old.file_id);
+    const matchingHeadRaw = await runtime.objects.readText(machineDocumentHeadPath(created.project_id, matching.document_id));
+    const matchingTicket = await sources.beginHeadWrite(created.project_id, "WORKING", `head:${matching.document_id}`, undefined,
+      matchingHeadRaw ? await sha256Text(matchingHeadRaw) : null, true);
+    expect(matchingTicket).not.toBeNull();
+    await sources.completeHeadWrites([matchingTicket!]);
+    expect(await sources.hasDirtyMarker(created.project_id, "WORKING", `head:${matching.document_id}`)).toBe(true);
+    sourceState = await sources.readState(created.project_id, "WORKING");
+    const state = emptyProjectState(created.project_id, "Repair census", `document-${created.project_id.slice(-4).toLowerCase()}`);
+    state.revision = created.new_revision;
+    const request = navigationReconcileSchema.parse({ operation: "navigation.reconcile", request_id: "DOCREQ-REPAIR-CENSUS-NAV-0001",
+      project_id: created.project_id, zone: "WORKING", expected_project_revision: state.revision, expected_generation: 0,
+      expected_index: null, created_at: at });
+    const requestHash = await executionHash(request);
+    const indexPath = `${workspaceProjectRoot(created.project_id, state.slug)}/WORKING/00-CURRENT.md`;
+    const admission = { project_id: created.project_id, request_id: request.request_id, kind: "document" as const, operation: request.operation,
+      request_hash: requestHash, actor: { actor_id: "control_tower", authority: "control_tower_operator" },
+      resources: [{ resource_id: "navigation:WORKING", resource_type: "navigation", zone: "WORKING", version: "0" }],
+      resource_effect_scopes: [{ resource_id: "navigation:WORKING", resource_version: "0", provider_id: runtime.providerId,
+        sources: [], destinations: [{ path: indexPath, logical_path: "WORKING/00-CURRENT.md" }], preservation_copies: [] }],
+      global_revision: 0, project_revision: state.revision,
+      ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: state.revision }, verdict: "allow" as const, results: [], gaps: [], deferred_rules: [] };
+    const callsPerSlice: number[] = [];
+    const budgetCallsPerSlice: number[] = [];
+    let result: any;
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const before = mock.providerCalls.length;
+      const sliceBudget = createSliceBudget(() => Date.now(), new AbortController().signal);
+      result = await new ZoneNavigationEngine(runtime, new ZoneNavigationInventory(runtime, sources)).reconcile(request, state, admission as never, sliceBudget);
+      callsPerSlice.push(mock.providerCalls.length - before);
+      budgetCallsPerSlice.push(32 - sliceBudget.calls_left);
+      if (result.status !== "pending") break;
+    }
+    const navProgressRoot = await new ExecutionJournal(runtime, created.project_id, "document", request.request_id).root();
+    const navProgressDebug = await runtime.objects.readText(`${navProgressRoot}/navigation-progress.json`);
+    expect(result, JSON.stringify({ result, callsPerSlice, recentProviderCalls: mock.providerCalls.slice(-32), progress: navProgressDebug })).toMatchObject({ status: "finalized", receipt: { status: "committed", source_snapshot_id: `source:${sourceState.generation}` } });
+    expect(callsPerSlice.length).toBeLessThanOrEqual(60);
+    expect(budgetCallsPerSlice.every((count) => count <= 32), JSON.stringify({ budgetCallsPerSlice, observedHttpRequestsPerSlice: callsPerSlice })).toBe(true);
+    const nav = JSON.parse(mock.files.get(`${machineDocumentRoot(created.project_id)}/navigation/WORKING/head.json`) ?? "null");
+    expect(nav.source_count).toBe(5);
+    expect(nav.coverage_gaps).toEqual([]);
+    for (const fixture of fixtures) {
+      expect(await runtime.objects.readText(machineDocumentVersionPath(created.project_id, fixture.document_id, fixture.version_id))).toBe(fixture.raw_version);
+    }
   });
 
   it("freezes a referenced document and resumes governed package effects through the existing document boundary", async () => {

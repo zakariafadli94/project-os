@@ -113,6 +113,12 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     return metadataFor(path);
   };
 
+  const replaceExternal = async (path: string, content: string) => {
+    fileIds.delete(path);
+    files.delete(path);
+    return writeExternal(path, content);
+  };
+
   const writeExternalFolder = (path: string) => {
     folders.add(path);
     changeJournal.push({
@@ -429,6 +435,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
     downloadCalls,
     conditionalDeleteCalls,
     writeExternal,
+    replaceExternal,
     writeExternalFolder,
     currentCursor: () => `cursor-${changeJournal.length}`,
     maxConcurrentUploads: () => maxConcurrentUploadCount

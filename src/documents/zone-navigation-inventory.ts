@@ -83,8 +83,29 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     return this.sources.verifySnapshot(input.project_id, input.zone, input.snapshot_id, input.budget);
   }
 
-  async completeSnapshot(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: SliceBudget }): Promise<boolean> {
-    return this.sources.markCatalogReady(input.project_id, input.zone, generationFromSnapshot(input.snapshot_id), input.budget);
+  async completeSnapshot(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: SliceBudget }): Promise<boolean | "pending" | { status: "conflict"; code: string }> {
+    const generation = generationFromSnapshot(input.snapshot_id);
+    const dirty = await this.sources.listDirtyPage(input.project_id, input.zone, null, 1, input.budget);
+    const resourceId = dirty.resource_ids[0];
+    if (!resourceId && dirty.next_cursor !== null) return "pending";
+    if (resourceId) {
+      // Adoption already enumerated and verified the entire canonical source
+      // snapshot. Re-resolve one dirty head at a time and clear only its exact
+      // CAS marker; this also proves a current zone tombstone (e.g. a working-
+      // only head during REVIEW adoption). Other source families remain fail
+      // closed until their exact resolver is available here.
+      if (!resourceId.startsWith("head:DOC-")) return { status: "conflict", code: "navigation_dirty_resource_unresolved" };
+      if (!input.budget.canStartEffect(16)) return "pending";
+      const resolved = await this.resolveHead(input.project_id, input.zone, resourceId, input.budget);
+      if (resolved.gap) return { status: "conflict", code: `navigation_dirty_${resolved.gap.code}` };
+      await this.sources.writeCatalogEntry(resolved.entry, input.project_id, input.zone, resourceId, input.budget, generation);
+      if (!resolved.entry) await this.sources.recordVerifiedCatalogTombstone(input.project_id, input.zone, resourceId, input.snapshot_id, input.budget);
+      if (!await this.sources.finishDirty(input.project_id, input.zone, resourceId, resolved.entry, input.budget)) {
+        return { status: "conflict", code: "navigation_dirty_identity_changed" };
+      }
+      return "pending";
+    }
+    return this.sources.markCatalogReady(input.project_id, input.zone, generation, input.budget);
   }
 
   async recordVerifiedEntry(entry: NavigationInventoryEntry, snapshot_id: string, budget: SliceBudget): Promise<void> {

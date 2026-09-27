@@ -25,6 +25,7 @@ import { ProjectRepository } from "../src/persistence/repository";
 import { ExecutionJournal } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
+import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
 import { ProviderConflictError, ProviderOperationError } from "../src/persistence/provider/errors";
 
@@ -2161,6 +2162,46 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await publish.json()).toMatchObject({ status: "conflict", code: "navigation_snapshot_changed" });
     expect([...mock.files.keys()].some((path) => path.endsWith("/navigation/WORKING/head.json"))).toBe(false);
     expect([...mock.files.keys()].some((path) => path.endsWith("/WORKING/00-CURRENT.md"))).toBe(false);
+  });
+
+  it("routes preparation conflicts through the alarm failure ledger and stops six no-progress repeats", async () => {
+    const projectId = "PRJ-8402";
+    const request = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAV-PREPARATION-CONFLICT-8402",
+      project_id: projectId, zone: "WORKING" as const, expected_project_revision: 1,
+      expected_generation: 0, expected_index: null, created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    vi.spyOn(ZoneNavigationEngine.prototype, "reconcile").mockResolvedValue({ status: "conflict", code: "navigation_snapshot_changed" } as never);
+
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    await runInDurableObject(materialization, (instance) => (instance as any).alarm());
+    const workValue = await runInDurableObject(materialization, (_instance, state) =>
+      state.storage.list<string>({ prefix: "navigation-work:" }).then((items) => [...items.values()][0])
+    );
+    expect(workValue).toBeDefined();
+    const ref = JSON.parse(workValue!) as Record<string, unknown>;
+    const firstFailure = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{ count: number; stopped: number; message: string }>(
+      "SELECT count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+    ).toArray()[0]);
+    expect(firstFailure).toMatchObject({ count: 1, stopped: 0 });
+    expect(JSON.parse(firstFailure!.message)).toMatchObject({ code: "navigation_snapshot_changed" });
+    for (let attempt = 1; attempt < 6; attempt += 1) {
+      await guard.fetch("https://project-guard.internal/navigation-publish", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...ref, failure_code: "navigation_snapshot_changed" })
+      });
+    }
+    const stopped = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{ count: number; stopped: number; message: string }>(
+      "SELECT count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+    ).toArray()[0]);
+    expect(stopped).toMatchObject({ count: 6, stopped: 1 });
+    expect(JSON.parse(stopped!.message)).toMatchObject({ code: "identical_internal_failure_limit" });
+    expect([...mock.files.keys()].some((path) => path.endsWith(`/requests/${request.request_id}/receipt.json`))).toBe(false);
   });
 
   it("releases only the matching unadopted owner after terminal navigation conflict", async () => {

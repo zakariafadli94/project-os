@@ -121,8 +121,11 @@ export class ZoneNavigationEngine {
       const verified = await this.verifyEntries(request, state, progress, progressPath, pagesRoot, verifiedRoot, budget);
       if (verified.status === "pending" || verified.status === "conflict") return verified;
       progress = verified.progress;
-      if (this.inventory.completeSnapshot && !await this.inventory.completeSnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id!, budget })) {
-        return { status: "conflict", code: "navigation_snapshot_changed" };
+      if (this.inventory.completeSnapshot) {
+        const completion = await this.inventory.completeSnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id!, budget });
+        if (completion === "pending") return { status: "pending", cursor: progress.cursor };
+        if (typeof completion === "object") return completion;
+        if (!completion) return { status: "conflict", code: "navigation_snapshot_changed" };
       }
 
       const generated = this.render(request.zone, progress.rendered_links, progress.coverage_gaps);

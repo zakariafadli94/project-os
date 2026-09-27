@@ -1,10 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { SliceBudget } from "../src/convergence/contract";
 import { navigationReconcileSchema, type NavigationInventoryEntry, type NavigationInventoryPort } from "../src/domain/zone-navigation";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "../src/documents/zone-navigation-sources";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
-import { executionHash } from "../src/execution/journal";
+import { ExecutionJournal, executionHash } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, workspaceProjectRoot } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
@@ -143,6 +143,18 @@ async function addWorkingHead(h: ReturnType<typeof harness>, content: string, re
 }
 
 describe("ZoneNavigationInventory", () => {
+  it("keeps snapshot completion pending when an empty dirty page has a continuation", async () => {
+    const h = harness();
+    const listDirtyPage = vi.spyOn(h.sources, "listDirtyPage").mockResolvedValue({ resource_ids: [], next_cursor: "opaque-next" });
+    const markReady = vi.spyOn(h.sources, "markCatalogReady").mockResolvedValue(false);
+
+    const result = await h.inventory.completeSnapshot({ project_id: projectId, zone: "REVIEW", snapshot_id: "source:0", budget: budget() });
+
+    expect(result).toBe("pending");
+    expect(listDirtyPage).toHaveBeenCalledTimes(1);
+    expect(markReady).not.toHaveBeenCalled();
+  });
+
   it("enumerates only current canonical zone heads from a bounded provider page", async () => {
     const h = harness();
     const visiblePath = await addWorkingHead(h, "current body");
@@ -544,6 +556,126 @@ describe("ZoneNavigationInventory", () => {
     let result = await new ZoneNavigationEngine(runtime, legacyPort).reconcile(request, state, admission as never, budget(32));
     for (let attempt = 0; result.status === "pending" && attempt < 160; attempt += 1) result = await new ZoneNavigationEngine(runtime, legacyPort).reconcile(request, state, admission as never, budget(32));
     expect(result.status).toBe("finalized");
+  });
+
+  it("clears a pre-existing dirty REVIEW head only after the census proves its zone tombstone", async () => {
+    const h = harness();
+    const state = emptyProjectState(projectId, "Project OS", slug);
+    await addWorkingHead(h, "working-only canonical head");
+    const request = navigationReconcileSchema.parse({
+      operation: "navigation.reconcile", request_id: "DOCREQ-NAV-INITIAL-DIRTY-PRJ0002", project_id: projectId,
+      zone: "REVIEW", expected_project_revision: state.revision, expected_generation: 0,
+      expected_index: null, created_at: "2026-09-27T12:00:00.000Z"
+    });
+    const requestHash = await executionHash(request);
+    const indexPath = `${workspaceProjectRoot(projectId, slug)}/REVIEW/00-CURRENT.md`;
+    const admission = {
+      project_id: projectId, request_id: request.request_id, kind: "document", operation: "navigation.reconcile",
+      request_hash: requestHash, actor: { actor_id: "operator:test", authority: "project_guard" },
+      resources: [{ resource_id: "navigation:REVIEW", resource_type: "navigation", zone: "REVIEW", version: "0" }],
+      resource_effect_scopes: [{ resource_id: "navigation:REVIEW", resource_version: "0", provider_id: h.runtime.providerId,
+        sources: [], destinations: [{ path: indexPath, logical_path: "REVIEW/00-CURRENT.md" }], preservation_copies: [] }],
+      global_revision: 0, project_revision: state.revision,
+      ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: state.revision },
+      verdict: "allow", results: [], gaps: [], deferred_rules: []
+    };
+    expect(await h.sources.beginAdoption(projectId, "REVIEW", "DOCREQ-NAV-PRIOR-PRJ0002", 0, budget())).toBe(true);
+    const ticket = await h.sources.beginHeadWrite(projectId, "REVIEW", `head:${documentId}`, budget());
+    await h.sources.completeHeadWrite(ticket, null, budget());
+    expect(await h.sources.readState(projectId, "REVIEW", budget())).toMatchObject({ generation: 1, adopted: false, adoption_request_id: "DOCREQ-NAV-PRIOR-PRJ0002" });
+    expect((await h.sources.listDirtyPage(projectId, "REVIEW", null, 1, budget())).resource_ids).toEqual([`head:${documentId}`]);
+    expect(await h.sources.beginAdoption(projectId, "REVIEW", request.request_id, 1, budget())).toBe(true);
+    const progressPath = `${await new ExecutionJournal(h.runtime, projectId, "document", request.request_id).root()}/navigation-progress.json`;
+    let result = await new ZoneNavigationEngine(h.runtime, h.inventory).reconcile(request, state, admission as never, budget(), { deferPublication: true });
+    let afterCensus: { inventory_complete: boolean; verify_page: number; page_count: number; snapshot_id: string; source_ids: string[] } | undefined;
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      const rawProgress = h.files.get(progressPath)?.content;
+      if (rawProgress) {
+        const candidate = JSON.parse(rawProgress) as typeof afterCensus;
+        if (candidate?.inventory_complete && candidate.verify_page === candidate.page_count) {
+          afterCensus = candidate;
+          break;
+        }
+      }
+      result = await new ZoneNavigationEngine(h.runtime, h.inventory).reconcile(request, state, admission as never, budget(), { deferPublication: true });
+    }
+    expect(afterCensus).toMatchObject({ inventory_complete: true, verify_page: afterCensus?.page_count, snapshot_id: "source:1", source_ids: [] });
+    const completedPageCount = afterCensus!.page_count;
+    for (let attempt = 0; result.status === "pending" && attempt < 24; attempt += 1) result = await new ZoneNavigationEngine(h.runtime, h.inventory).reconcile(request, state, admission as never, budget(), { deferPublication: true });
+
+    expect(result.status, JSON.stringify(result)).toBe("prepared");
+    const finalProgress = JSON.parse(h.files.get(progressPath)!.content) as { inventory_complete: boolean; verify_page: number; page_count: number; snapshot_id: string };
+    expect(finalProgress).toMatchObject({ inventory_complete: true, verify_page: completedPageCount, page_count: completedPageCount, snapshot_id: "source:1" });
+    expect(await h.sources.listDirtyPage(projectId, "REVIEW", null, 1, budget())).toMatchObject({ resource_ids: [], next_cursor: null });
+    expect(await h.sources.readState(projectId, "REVIEW", budget())).toMatchObject({ generation: 1, adoption_request_id: request.request_id });
+  });
+
+  it("clears a pre-existing active WORKING head and finalizes in bounded 32-call slices", async () => {
+    const h = harness();
+    const state = emptyProjectState(projectId, "Project OS", slug);
+    const content = "# active dirty working head\n";
+    await addWorkingHead(h, content);
+    const request = navigationReconcileSchema.parse({
+      operation: "navigation.reconcile", request_id: "DOCREQ-NAV-INITIAL-ACTIVE-PRJ0002", project_id: projectId,
+      zone: "WORKING", expected_project_revision: state.revision, expected_generation: 0,
+      expected_index: null, created_at: "2026-09-27T12:00:00.000Z"
+    });
+    const requestHash = await executionHash(request);
+    const indexPath = `${workspaceProjectRoot(projectId, slug)}/WORKING/00-CURRENT.md`;
+    const admission = {
+      project_id: projectId, request_id: request.request_id, kind: "document", operation: "navigation.reconcile",
+      request_hash: requestHash, actor: { actor_id: "operator:test", authority: "project_guard" },
+      resources: [{ resource_id: "navigation:WORKING", resource_type: "navigation", zone: "WORKING", version: "0" }],
+      resource_effect_scopes: [{ resource_id: "navigation:WORKING", resource_version: "0", provider_id: h.runtime.providerId,
+        sources: [], destinations: [{ path: indexPath, logical_path: "WORKING/00-CURRENT.md" }], preservation_copies: [] }],
+      global_revision: 0, project_revision: state.revision,
+      ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: state.revision },
+      verdict: "allow", results: [], gaps: [], deferred_rules: []
+    };
+    expect(await h.sources.beginAdoption(projectId, "WORKING", "DOCREQ-NAV-PRIOR-WORKING-PRJ0002", 0, budget())).toBe(true);
+    const ticket = await h.sources.beginHeadWrite(projectId, "WORKING", `head:${documentId}`, budget());
+    await h.sources.completeHeadWrite(ticket, null, budget());
+    expect(await h.sources.beginAdoption(projectId, "WORKING", request.request_id, 1, budget())).toBe(true);
+
+    const progressPath = `${await new ExecutionJournal(h.runtime, projectId, "document", request.request_id).root()}/navigation-progress.json`;
+    const sliceCalls: number[] = [];
+    let sliceBudget = budget(32);
+    let before = h.providerCalls;
+    let result = await new ZoneNavigationEngine(h.runtime, h.inventory).reconcile(request, state, admission as never, sliceBudget, { deferPublication: true });
+    sliceCalls.push(h.providerCalls - before);
+    for (let attempt = 0; result.status === "pending" && attempt < 24; attempt += 1) {
+      sliceBudget = budget(32);
+      before = h.providerCalls;
+      result = await new ZoneNavigationEngine(h.runtime, h.inventory).reconcile(request, state, admission as never, sliceBudget, { deferPublication: true });
+      sliceCalls.push(h.providerCalls - before);
+    }
+
+    expect(result.status, JSON.stringify(result)).toBe("prepared");
+    expect(sliceCalls.length).toBeLessThanOrEqual(24);
+    expect(sliceCalls.every((count) => count <= 32)).toBe(true);
+    const preparationSlices = sliceCalls.length;
+    const publicationCalls: number[] = [];
+    for (let attempt = 0; result.status !== "finalized" && attempt < 24; attempt += 1) {
+      sliceBudget = budget(32);
+      before = h.providerCalls;
+      result = await new ZoneNavigationEngine(h.runtime, h.inventory).publishPrepared(request, state, admission as never, sliceBudget, "source:1");
+      publicationCalls.push(h.providerCalls - before);
+    }
+    expect(result.status, JSON.stringify({ result, preparationSlices, sliceCalls, publicationCalls })).toBe("finalized");
+    expect(result).toMatchObject({ status: "finalized", receipt: { status: "committed", project_id: projectId,
+      request_id: request.request_id, zone: "WORKING", generation: 1, source_snapshot_id: "source:1" } });
+    expect(publicationCalls.length).toBeLessThanOrEqual(24);
+    expect(publicationCalls.every((count) => count <= 32)).toBe(true);
+    const progress = JSON.parse(h.files.get(progressPath)!.content) as { snapshot_id: string; inventory_complete: boolean; verify_page: number; page_count: number };
+    expect(progress).toMatchObject({ snapshot_id: "source:1", inventory_complete: true, verify_page: progress.page_count });
+    expect(progress).toMatchObject({ status: "finalized" });
+    const catalog = await h.sources.readCatalogEntry(projectId, "WORKING", `head:${documentId}`, budget());
+    expect(catalog?.expected.content_sha256).toBe(await sha256Text(content));
+    expect(await h.sources.listDirtyPage(projectId, "WORKING", null, 1, budget())).toMatchObject({ resource_ids: [], next_cursor: null });
+    expect(await h.sources.readState(projectId, "WORKING", budget())).toMatchObject({ generation: 1, adoption_request_id: request.request_id });
+    const headPath = `${machineDocumentRoot(projectId)}/navigation/WORKING/head.json`;
+    expect(JSON.parse(h.files.get(headPath)!.content)).toMatchObject({ generation: 1, source_request_id: request.request_id });
+    expect(h.files.get(indexPath)?.content).toContain("](./draft.md)");
   });
 
   it("includes a committed artifact only from its exact current destination and receipt", async () => {

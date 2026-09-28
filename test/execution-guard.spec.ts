@@ -1279,7 +1279,7 @@ describe("canonical execution boundary in ProjectGuard", () => {
       await state.storage.deleteAlarm();
       expect(await state.storage.getAlarm()).toBeNull();
     });
-    const { deadlineResponse, preinstalledAlarmAt } = await runInDurableObject(guard, (instance, state) => {
+    await runInDurableObject(guard, (instance, state) => {
       const object = instance as any;
       return object.serialize(async () => {
         const deadlineResponse = await object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
@@ -1294,6 +1294,15 @@ describe("canonical execution boundary in ProjectGuard", () => {
         const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
         expect(work?.candidates.map(({ revision }) => revision)).toEqual([9102, 9103, 9104, 9105]);
         expect(await state.storage.getAlarm()).not.toBeNull();
+      });
+    });
+
+    sliceBudget.mockRestore();
+    commitReads.mockRestore();
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const { providerBudgetResponse, scopedProviderCalls } = await runInDurableObject(guard, (instance, state) => {
+      const object = instance as any;
+      return object.serialize(async () => {
         await state.storage.put("materialization-finalization-work", {
           coverage_version: 2,
           head: {
@@ -1309,19 +1318,11 @@ describe("canonical execution boundary in ProjectGuard", () => {
             completed_at: completed.completed_at, source_event_id: completed.source_event_id
           }]
         });
-        // The previous phase advanced fake Date past its alarm. Keep that alarm
-        // from racing this explicitly invoked provider-budget slice.
-        const alarmAt = Date.now() + 60_000;
-        await state.storage.setAlarm(alarmAt);
-        return { deadlineResponse, preinstalledAlarmAt: alarmAt };
-      });
-    });
-
-    sliceBudget.mockRestore();
-    commitReads.mockRestore();
-    const { providerBudgetResponse, scopedProviderCalls } = await runInDurableObject(guard, (instance, state) => {
-      const object = instance as any;
-      return object.serialize(async () => {
+        // Install the comparison alarm after acquiring the serialization lock,
+        // so the controlled alarm delivery in the inter-callback gap cannot
+        // consume the candidate being tested below.
+        const preinstalledAlarmAt = Date.now() + 60_000;
+        await state.storage.setAlarm(preinstalledAlarmAt);
         const budgetSpy = vi.spyOn(object, "materializationFinalizationProviderCallBudget").mockReturnValue(2);
         const originalSlice = object.finalizeCurrentMaterializationSlice.bind(object);
         let scopedProviderCalls = -1;

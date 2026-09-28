@@ -11,7 +11,7 @@ import type { CurrentManagedDocumentHead, CurrentDocumentVersionRecord } from ".
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderEntry, ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderOperationError } from "../persistence/provider/errors";
-import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot } from "../persistence/layout";
+import { machineDocumentHeadPath, machineDocumentInstanceRepairPath, machineDocumentRoot, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot } from "../persistence/layout";
 import { sha256Text } from "./hash";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "./zone-navigation-sources";
 import { packageIdFor, packageManifestPath, packageNavigationLedgerSchema, packageNavigationPath, packageRefSchema, packageResourceVersion, parsePackageManifest, type PackageNavigationHead, type PackageRef } from "../domain/document-package";
@@ -19,6 +19,9 @@ import { DocumentLedgerRepository } from "./repository";
 import { canonicalJson } from "../rules/contract";
 import { MutationGateRepository } from "../mutation-gate/repository";
 import { MutationGateService } from "../mutation-gate/service";
+import { machineConvergenceRoot } from "../persistence/layout";
+import { executionHash } from "../execution/journal";
+import { sha256Canonical } from "../materialization/hash";
 
 type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "artifact-finalize" | "dirty" | "dirty-package" | "dirty-artifacts" | "dirty-finish" | "catalog" | "catalog-compact";
 interface PageCursor { phase: PagePhase; cursor: string | null }
@@ -30,7 +33,12 @@ const MAX_VISIBLE_SOURCE_BYTES = 2_000_000;
 // PRJ-0003 has fewer than 512 heads, so this avoids a Dropbox continuation
 // cursor that can return the same page indefinitely without losing resumability.
 const MAX_INITIAL_HEADS_PER_PAGE = 512;
+// A mismatched provider identity needs the head/version records, its repair
+// proof, receipt wrapper, admitted execution, visible bytes and stable metadata.
+// Keep an additional checkpoint window after that bounded per-head proof so a
+// saved provider page can advance under the shared 32-call slice.
 const MAX_INITIAL_HEAD_PROVIDER_CALLS = 10;
+const MAX_INITIAL_MISMATCHED_HEAD_PROVIDER_CALLS = 19;
 const MIN_INACTIVE_HEAD_PROVIDER_CALLS = 2;
 
 interface InitialHeadPageCursor {
@@ -729,12 +737,20 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     if (version.project_id !== projectId || version.document_id !== documentId || version.version_id !== pointer.versionId || version.kind !== head.kind || version.stage !== pointer.stage || version.logical_path !== head.logical_path) {
       return { entry: null, gap: { resource_id: resourceId, code: "active_version_binding_mismatch" } };
     }
-    if (version.provider_file_id !== observation.object_id || version.provider_rev !== observation.revision_token || version.provider_path !== observation.path || version.size !== observation.size) {
-      return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
-    }
+    const providerMismatch = version.provider_file_id !== observation.object_id || version.provider_rev !== observation.revision_token || version.provider_path !== observation.path || version.size !== observation.size;
     if (!observation.path.endsWith(`/${zone}/${version.logical_path}`)) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_path_mismatch" } };
+    // Only a real mismatch can trigger proof/receipt/admission lookups. Keep
+    // ordinary active heads on their existing reservation; for mismatches,
+    // reserve enough of this existing slice for those three records, visible
+    // content verification, and the page/checkpoint continuation.
+    if (reserveActiveProof && providerMismatch) requireBudget(budget, MAX_INITIAL_MISMATCHED_HEAD_PROVIDER_CALLS - 2);
+    const repairProof = providerMismatch
+      ? await this.readCommittedInstanceRepair(projectId, documentId, head.logical_path, pointer.versionId, observation, version, rawVersion, budget)
+      : null;
+    if (providerMismatch && !repairProof) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
     const verified = await this.readVisible(observation.path, observation, version, budget);
     if (!verified) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_content_unverified" } };
+    if (repairProof && verified.sha256 !== repairProof.content_sha256) return { entry: null, gap: { resource_id: resourceId, code: "active_instance_repair_content_mismatch" } };
     return {
       entry: navigationInventoryEntrySchema.parse({
         project_id: projectId,
@@ -751,6 +767,90 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         }
       })
     };
+  }
+
+  private async readCommittedInstanceRepair(
+    projectId: string, documentId: string, logicalPath: string, versionId: string,
+    current: { path: string; object_id: string; revision_token: string; size: number },
+    version: CurrentDocumentVersionRecord, rawVersion: string, budget: SliceBudget
+  ): Promise<{ content_sha256: string } | null> {
+    const historical = {
+      object_id: version.provider_file_id ?? version.provider_evidence?.object_id,
+      revision_token: version.provider_rev ?? version.provider_evidence?.revision_token,
+      path: version.provider_path ?? version.provider_evidence?.path,
+      size: version.size ?? version.provider_evidence?.size
+    };
+    if (typeof historical.object_id !== "string" || typeof historical.revision_token !== "string"
+      || typeof historical.path !== "string" || typeof historical.size !== "number") return null;
+    const currentProvider = { object_id: current.object_id, revision_token: current.revision_token, path: current.path, size: current.size };
+    const versionRecordSha256 = await sha256Text(rawVersion);
+    const contentBinding = {
+      project_id: projectId,
+      document_id: documentId,
+      version_id: versionId,
+      logical_path: logicalPath,
+      version_record_sha256: versionRecordSha256,
+      historical_provider: historical,
+      current_provider: currentProvider
+    };
+    const bindingSha256 = await sha256Canonical(contentBinding);
+    const proofPath = machineDocumentInstanceRepairPath(projectId, documentId, versionId, bindingSha256);
+    charge(budget);
+    const proofRaw = await this.runtime.objects.readText(proofPath);
+    if (!proofRaw) return null;
+    let proof: Record<string, unknown>;
+    try { proof = JSON.parse(proofRaw) as Record<string, unknown>; }
+    catch { return null; }
+    if (proof.schema_version !== "1.0" || proof.operation !== "document.instance.repair"
+      || proof.project_id !== projectId || proof.document_id !== documentId || proof.version_id !== versionId
+      || proof.logical_path !== logicalPath || proof.version_record_sha256 !== versionRecordSha256
+      || canonicalJson(proof.historical_provider) !== canonicalJson(historical)
+      || canonicalJson(proof.current_provider) !== canonicalJson(currentProvider)
+      || typeof proof.request_id !== "string" || !/^DOCREQ-[A-Z0-9-]{8,}$/.test(proof.request_id)
+      || typeof proof.request_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(proof.request_sha256)
+      || typeof proof.content_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(proof.content_sha256)
+      || !Number.isSafeInteger(proof.source_generation)) return null;
+    charge(budget);
+    const receiptRaw = await this.runtime.objects.readText(`${machineDocumentRoot(projectId)}/requests/${proof.request_id}/receipt.json`);
+    if (!receiptRaw) return null;
+    let receiptRecord: Record<string, unknown>;
+    let receipt: Record<string, unknown>;
+    try {
+      receiptRecord = JSON.parse(receiptRaw) as Record<string, unknown>;
+      if (receiptRecord.project_id !== projectId || receiptRecord.request_id !== proof.request_id
+        || receiptRecord.request_sha256 !== proof.request_payload_sha256 || typeof receiptRecord.receipt_json !== "string") return null;
+      receipt = JSON.parse(receiptRecord.receipt_json) as Record<string, unknown>;
+    }
+    catch { return null; }
+    const proofSha256 = await sha256Text(proofRaw);
+    if (receipt.operation !== "document.instance.repair" || receipt.status !== "committed"
+      || receipt.request_id !== proof.request_id || receipt.project_id !== projectId
+      || receipt.document_id !== documentId || receipt.version_id !== versionId || receipt.logical_path !== logicalPath
+      || receipt.admission_request_sha256 !== proof.request_sha256 || receipt.request_payload_sha256 !== proof.request_payload_sha256
+      || receipt.proof_ref !== proofPath || receipt.proof_sha256 !== proofSha256
+      || canonicalJson(receipt.actor) !== canonicalJson(proof.actor)) return null;
+    charge(budget);
+    const executionRoot = `${machineConvergenceRoot(projectId)}/executions/${await executionHash({ kind: "document", request_id: proof.request_id })}`;
+    const admissionRaw = await this.runtime.objects.readText(`${executionRoot}/admission.json`);
+    if (!admissionRaw) return null;
+    let admissionRecord: Record<string, unknown>;
+    try { admissionRecord = JSON.parse(admissionRaw) as Record<string, unknown>; }
+    catch { return null; }
+    const admission = admissionRecord.admission as Record<string, unknown> | undefined;
+    const actor = admission?.actor as Record<string, unknown> | undefined;
+    const resources = admission?.resources;
+    const repairResourceVersion = `${versionId}:${String(proof.source_generation)}:${versionRecordSha256}:${String(proof.content_sha256)}:${await sha256Canonical({ historical_provider: historical, current_provider: currentProvider })}`;
+    if (!admission || admission.kind !== "document" || admission.project_id !== projectId
+      || admission.request_id !== proof.request_id || admission.operation !== "document.instance.repair"
+      || admission.request_hash !== proof.request_sha256 || actor?.actor_id !== "control_tower"
+      || actor.authority !== "control_tower_operator" || canonicalJson(actor) !== canonicalJson(proof.actor)
+      || !Array.isArray(resources) || !resources.some((value) => {
+        if (!value || typeof value !== "object") return false;
+        const resource = value as Record<string, unknown>;
+        return resource.resource_id === documentId && resource.resource_type === "document" && resource.zone === "WORKING"
+          && resource.version === repairResourceVersion;
+      })) return null;
+    return { content_sha256: proof.content_sha256 };
   }
 
   private async readVisible(

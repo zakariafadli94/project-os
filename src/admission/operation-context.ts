@@ -42,6 +42,17 @@ export async function normalizeArtifactAdmission(request: ArtifactWriteRequest |
 
 export async function normalizeDocumentAdmission(request: ManagedDocumentRequest): Promise<NormalizedAdmissionOperation> {
   if (request.operation === "navigation.reconcile") return normalized(request.project_id, request.operation, [{ resource_id: `navigation:${request.zone}`, resource_type: "navigation", zone: request.zone, version: String(request.expected_generation) }], request);
+  if (request.operation === "document.instance.repair") {
+    const providerBinding = await sha256Canonical({ historical_provider: request.historical_provider, current_provider: request.current_provider });
+    return normalized(request.project_id, request.operation, [{
+      resource_id: request.document_id,
+      resource_type: "document",
+      zone: "WORKING",
+      version: `${request.version_id}:${request.expected_source_generation}:${request.expected_version_record_sha256}:${request.content_sha256}:${providerBinding}`,
+      expected_version: request.version_id,
+      relative_path: request.logical_path
+    }], request);
+  }
   if (request.operation === "package.replace") return normalized(request.project_id, request.operation, [{ resource_id: request.candidate.package_id, resource_type: "package", zone: request.zone, version: packageResourceVersion(request.candidate) }], request);
   if (request.operation === "document.archive") {
     return normalized(request.project_id, request.operation, [{

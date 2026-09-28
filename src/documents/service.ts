@@ -31,6 +31,12 @@ import { ManagedDocumentPromotionJournal } from "./promotion-journal";
 import { DocumentPackageReplacement, type PackageReplaceRequest, type PackageExecutionOptions } from "./package-replacement";
 import type { ExecutionAdmission } from "../execution/contract";
 import type { ManagedDocumentRequest } from "../domain/managed-document-request";
+import { readDocumentVersionRecord, readManagedDocumentHead } from "../schema/managed-document";
+import { machineDocumentHeadPath, machineDocumentInstanceRepairPath, machineDocumentVersionPath } from "../persistence/layout";
+import { canonicalJson } from "../rules/contract";
+import { sha256Canonical } from "../materialization/hash";
+
+const MAX_INSTANCE_REPAIR_BYTES = 2_000_000;
 
 export interface ManagedTextWriteRequest {
   request_id: string;
@@ -89,6 +95,13 @@ export interface ManagedDocumentReceipt {
   published?: true;
   archived_stage?: "working" | "review" | "published";
   archive_path?: string;
+  operation?: "document.instance.repair";
+  request_sha256?: string;
+  request_payload_sha256?: string;
+  admission_request_sha256?: string;
+  proof_ref?: string;
+  proof_sha256?: string;
+  actor?: { actor_id: string; authority: string };
 }
 
 export class ManagedDocumentConflictError extends Error {
@@ -126,6 +139,170 @@ export class ManagedDocumentService {
     this.ledger = new DocumentLedgerRepository(this.runtime);
     this.reviewCandidates = new ReviewCandidateJournal(this.runtime);
     this.promotions = new ManagedDocumentPromotionJournal(this.runtime);
+  }
+
+  async repairDocumentInstance(
+    request: Extract<ManagedDocumentRequest, { operation: "document.instance.repair" }>,
+    state: ProjectState,
+    actor: { actor_id: string; authority: string }
+  ): Promise<ManagedDocumentReceipt> {
+    if (actor.actor_id !== "control_tower" || actor.authority !== "control_tower_operator") throw new Error("document_instance_repair_authority_required");
+    const requestSha256 = await sha256Canonical(request);
+    const requestPayloadSha256 = await sha256Text(JSON.stringify(request));
+    const bindingSha256 = await sha256Canonical({
+      project_id: request.project_id, document_id: request.document_id, version_id: request.version_id,
+      logical_path: request.logical_path, version_record_sha256: request.expected_version_record_sha256,
+      historical_provider: request.historical_provider, current_provider: request.current_provider
+    });
+    const proofRef = machineDocumentInstanceRepairPath(request.project_id, request.document_id, request.version_id, bindingSha256);
+    const priorProof = await this.runtime.objects.readText(proofRef);
+    if (priorProof !== null) {
+      const prior = JSON.parse(priorProof) as Record<string, unknown>;
+      if (prior.request_id !== request.request_id || prior.request_sha256 !== requestSha256
+        || prior.request_payload_sha256 !== requestPayloadSha256 || prior.project_id !== request.project_id
+        || prior.document_id !== request.document_id || prior.version_id !== request.version_id
+        || prior.logical_path !== request.logical_path || prior.version_record_sha256 !== request.expected_version_record_sha256
+        || prior.content_sha256 !== request.content_sha256
+        || canonicalJson(prior.historical_provider) !== canonicalJson(request.historical_provider)
+        || canonicalJson(prior.current_provider) !== canonicalJson(request.current_provider)
+        || canonicalJson(prior.actor) !== canonicalJson(actor)) {
+        throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_PROOF_CONFLICT", "A different repair proof already exists for this provider instance", request.document_id);
+      }
+      return this.instanceRepairReceipt(request, actor, proofRef, await sha256Text(priorProof), requestSha256, requestPayloadSha256);
+    }
+    if (request.project_id !== state.project_id || request.expected_project_revision !== state.revision) throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_PROJECT_REVISION_CONFLICT", "Project revision changed", request.document_id);
+
+    const headPath = machineDocumentHeadPath(request.project_id, request.document_id);
+    const versionPath = machineDocumentVersionPath(request.project_id, request.document_id, request.version_id);
+    const headRaw = await this.readStableText(headPath);
+    const versionRaw = await this.readStableText(versionPath);
+    if (!headRaw || !versionRaw) throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_EVIDENCE_UNAVAILABLE", "Current head or immutable version record is unavailable", request.document_id);
+    const head = readManagedDocumentHead(JSON.parse(headRaw.text)).head;
+    const version = readDocumentVersionRecord(JSON.parse(versionRaw.text)).record;
+    const headProvider = head.provider?.working;
+    const versionProvider = version.provider_evidence;
+    if (head.project_id !== request.project_id || head.document_id !== request.document_id
+      || head.kind !== "work_product" || head.reconciliation_status !== "clean"
+      || head.logical_path !== request.logical_path || head.working_version_id !== request.version_id
+      || version.project_id !== request.project_id || version.document_id !== request.document_id
+      || version.version_id !== request.version_id || version.kind !== "work_product" || version.stage !== "working"
+      || version.logical_path !== request.logical_path
+      || await sha256Text(versionRaw.text) !== request.expected_version_record_sha256
+      || !headProvider || !versionProvider
+      || headProvider.file_id !== request.current_provider.object_id || headProvider.rev !== request.current_provider.revision_token
+      || headProvider.path !== request.current_provider.path || headProvider.size !== request.current_provider.size
+      || versionProvider.object_id !== request.historical_provider.object_id || versionProvider.revision_token !== request.historical_provider.revision_token
+      || versionProvider.path !== request.historical_provider.path || versionProvider.size !== request.historical_provider.size) {
+      throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_BINDING_CONFLICT", "Current head or immutable version identity changed", request.document_id);
+    }
+    if (request.historical_provider.size > MAX_INSTANCE_REPAIR_BYTES || request.current_provider.size > MAX_INSTANCE_REPAIR_BYTES) {
+      throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_SIZE_LIMIT", "Repair evidence exceeds the bounded source size", request.document_id);
+    }
+    const currentBytes = await this.readStableBytes(request.current_provider.path, request.current_provider);
+    const immutableBytes = await this.readStableBytes(version.immutable_payload_path);
+    if (!currentBytes || !immutableBytes || !sameBytes(currentBytes.bytes, immutableBytes.bytes)) {
+      throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_CONTENT_CONFLICT", "Current and immutable version bytes are not identical", request.document_id);
+    }
+    const contentSha256 = await sha256Bytes(currentBytes.bytes);
+    if (contentSha256 !== request.content_sha256 || immutableBytes.bytes.byteLength !== request.historical_provider.size
+      || currentBytes.bytes.byteLength !== request.current_provider.size) {
+      throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_CONTENT_CONFLICT", "Current bytes do not match the bound SHA-256 and size", request.document_id);
+    }
+
+    const finalHead = await this.readStableText(headPath);
+    const finalVersion = await this.readStableText(versionPath);
+    if (!finalHead || !finalVersion || finalHead.text !== headRaw.text || finalVersion.text !== versionRaw.text) {
+      throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_BINDING_CONFLICT", "Head or immutable version changed during repair verification", request.document_id);
+    }
+    const finalCurrent = await this.readStableBytes(request.current_provider.path, request.current_provider);
+    if (!finalCurrent || await sha256Bytes(finalCurrent.bytes) !== contentSha256 || !sameBytes(finalCurrent.bytes, currentBytes.bytes)) {
+      throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_CONTENT_CONFLICT", "Current provider object changed during repair verification", request.document_id);
+    }
+    const proof = {
+      schema_version: "1.0",
+      operation: "document.instance.repair",
+      request_id: request.request_id,
+      request_sha256: requestSha256,
+      request_payload_sha256: requestPayloadSha256,
+      project_id: request.project_id,
+      document_id: request.document_id,
+      version_id: request.version_id,
+      logical_path: request.logical_path,
+      expected_project_revision: request.expected_project_revision,
+      source_generation: request.expected_source_generation,
+      version_record_sha256: request.expected_version_record_sha256,
+      content_sha256: contentSha256,
+      historical_provider: request.historical_provider,
+      current_provider: request.current_provider,
+      actor
+    };
+    const proofText = canonicalJson(proof);
+    try {
+      const existingProof = await this.runtime.objects.readText(proofRef);
+      if (existingProof !== null) {
+        const existing = JSON.parse(existingProof) as Record<string, unknown>;
+        if (existing.request_id !== request.request_id || existing.request_sha256 !== requestSha256
+          || existing.request_payload_sha256 !== requestPayloadSha256
+          || existing.project_id !== request.project_id || existing.document_id !== request.document_id
+          || existing.version_id !== request.version_id || existing.version_record_sha256 !== request.expected_version_record_sha256
+          || existing.content_sha256 !== contentSha256 || canonicalJson(existing.current_provider) !== canonicalJson(request.current_provider)
+          || canonicalJson(existing.historical_provider) !== canonicalJson(request.historical_provider)
+          || existing.actor === null || canonicalJson(existing.actor) !== canonicalJson(actor)) {
+          throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_PROOF_CONFLICT", "A different repair proof already exists for this provider instance", request.document_id);
+        }
+        const existingProofSha256 = await sha256Text(existingProof);
+        return this.instanceRepairReceipt(request, actor, proofRef, existingProofSha256, requestSha256, requestPayloadSha256);
+      }
+      await this.runtime.objects.createText(proofRef, proofText);
+    } catch (error) {
+      if (!(error instanceof ProviderConflictError)) throw error;
+      if (await this.runtime.objects.readText(proofRef) !== proofText) throw new ManagedDocumentConflictError("DOCUMENT_INSTANCE_REPAIR_PROOF_CONFLICT", "A different repair proof already exists for this provider instance", request.document_id);
+    }
+    return this.instanceRepairReceipt(request, actor, proofRef, await sha256Text(proofText), requestSha256, requestPayloadSha256);
+  }
+
+  private instanceRepairReceipt(
+    request: Extract<ManagedDocumentRequest, { operation: "document.instance.repair" }>,
+    actor: { actor_id: string; authority: string }, proofRef: string, proofSha256: string, requestSha256: string, requestPayloadSha256: string
+  ): ManagedDocumentReceipt {
+    return {
+      operation: "document.instance.repair",
+      request_id: request.request_id,
+      project_id: request.project_id,
+      document_id: request.document_id,
+      version_id: request.version_id,
+      stage: "working",
+      logical_path: request.logical_path,
+      status: "committed",
+      provider_rev: request.current_provider.revision_token,
+      admission_request_sha256: requestSha256,
+      request_payload_sha256: requestPayloadSha256,
+      proof_ref: proofRef,
+      proof_sha256: proofSha256,
+      actor
+    };
+  }
+
+  private async readStableText(path: string): Promise<{ text: string; metadata: ProviderObjectMetadata } | null> {
+    const before = await this.runtime.objects.getMetadata(path);
+    const text = await this.runtime.objects.readText(path);
+    const after = await this.runtime.objects.getMetadata(path);
+    if (text === null || !before || !after || before.objectId !== after.objectId || before.revisionToken !== after.revisionToken
+      || new TextEncoder().encode(text).byteLength !== before.size || before.size !== after.size) return null;
+    return { text, metadata: after };
+  }
+
+  private async readStableBytes(path: string, expected?: { object_id: string; revision_token: string; size: number }): Promise<{ bytes: Uint8Array; metadata: ProviderObjectMetadata } | null> {
+    const before = await this.runtime.objects.getMetadata(path);
+    if (!before || before.size > MAX_INSTANCE_REPAIR_BYTES || (expected && (before.objectId !== expected.object_id || before.revisionToken !== expected.revision_token || before.size !== expected.size))) return null;
+    const bytes = this.runtime.objects.readBytes
+      ? await this.runtime.objects.readBytes(path, Math.max(1, before.size))
+      : await this.runtime.objects.readText(path).then((text) => text === null ? null : new TextEncoder().encode(text));
+    const after = await this.runtime.objects.getMetadata(path);
+    if (!bytes || bytes.byteLength !== before.size || !after || before.objectId !== after.objectId
+      || before.revisionToken !== after.revisionToken || before.size !== after.size
+      || (expected && (after.objectId !== expected.object_id || after.revisionToken !== expected.revision_token || after.size !== expected.size))) return null;
+    return { bytes, metadata: after };
   }
 
   status(projectId: string, documentId: string): Promise<ManagedDocumentHead | null> {
@@ -977,6 +1154,15 @@ function providerVersionFields(metadata: ProviderObjectMetadata, path: string): 
 
 function providerObservation(metadata: ProviderObjectMetadata, path: string): ManagedProviderObservation {
   return toManagedProviderObservation({ ...metadata, path });
+}
+
+async function sha256Bytes(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes)));
+  return Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.byteLength === right.byteLength && left.every((value, index) => value === right[index]);
 }
 
 function archiveTarget(stage: "working" | "review" | "published"): {

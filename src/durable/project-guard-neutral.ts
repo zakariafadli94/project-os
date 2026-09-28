@@ -3785,6 +3785,29 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async handleMaterializationMutation(request: Request, targetPath: string, operation: "project.materialize" | "project.repair", fleetReconcile = false): Promise<Response> {
     const body = await request.text();
+    if (fleetReconcile) {
+      try {
+        const preflight = await this.serialize(async (): Promise<Response | null> => {
+          const projectId = this.ctx.id.name;
+          if (!projectId || projectId === AUTO_PROJECT_ID) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+          const state = await this.loadOrRecoverState();
+          if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
+          const normalized = await normalizeSystemAdmission(
+            projectId, operation, "MATERIALIZATION", `${targetPath}@${state.revision}`, String(state.revision), { target_path: targetPath, body }
+          );
+          if (await this.ruleAdmissionRequired(state, normalized)) {
+            const proof = await this.admitRules(state, normalized);
+            await this.persistAdmissionProof("materialization", `${targetPath}@${state.revision}`, proof);
+          }
+          return null;
+        });
+        if (preflight) return preflight;
+        this.releaseScheduledReconcileAdmissionBoundary();
+        return await this.forwardMaterializationRequest(request, targetPath, body);
+      } catch (error) {
+        return this.admissionErrorResponse(error);
+      }
+    }
     return this.serialize(async () => {
       const projectId = this.ctx.id.name;
       if (!projectId || projectId === AUTO_PROJECT_ID) return Response.json({ error: "project_not_initialized" }, { status: 404 });
@@ -3803,6 +3826,9 @@ export class ProjectGuard extends DurableObject<Env> {
       return this.forwardMaterializationRequest(request, targetPath, body);
     }).catch((error) => this.admissionErrorResponse(error));
   }
+
+  /** Called only after fleet reconcile has completed all PG-side state/rule I/O. */
+  protected releaseScheduledReconcileAdmissionBoundary(): void {}
 
   private async handleTypedRepair(request: Request, state: ProjectState): Promise<Response> {
     let decoded;

@@ -57,6 +57,12 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    // Fleet reconciliation carries no INDEX001 side effects. Let the base
+    // guard release its admission queues after its PG-side rule proof, before
+    // waiting on the independent MaterializationGuard.
+    if (request.method === "POST" && url.pathname === "/scheduled-reconcile-materialization") {
+      return super.fetch(request);
+    }
     // These reads do not mutate search state. Keep them outside the derived
     // search queue so a long finalization cannot delay admission/status reads.
     if (request.method === "GET" && OBSERVATION_PATHS.has(url.pathname)) {

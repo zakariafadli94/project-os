@@ -13,7 +13,8 @@ import type { AlertDelivery, AlertRecord } from "./observability";
 export class ConvergenceJournal {
   constructor(
     private readonly runtime: ProjectOsPersistenceRuntime,
-    private readonly projectId: string
+    private readonly projectId: string,
+    private readonly onObserved?: (progress: Progress, token: string) => void
   ) {}
 
   async load(): Promise<{ progress: Progress; token: string } | null> {
@@ -23,6 +24,7 @@ export class ConvergenceJournal {
     const progress = parseProgress(raw, this.projectId);
     const metadata = await this.runtime.objects.getMetadata(path);
     if (!metadata?.revisionToken) throw new Error("journal_progress_token_unavailable");
+    this.onObserved?.(progress, metadata.revisionToken);
     return { progress, token: metadata.revisionToken };
   }
 
@@ -40,11 +42,13 @@ export class ConvergenceJournal {
       }
       const metadata = await this.runtime.objects.getMetadata(path);
       if (!metadata?.revisionToken) throw new Error("journal_progress_token_unavailable");
+      this.onObserved?.(progress, metadata.revisionToken);
       return metadata.revisionToken;
     }
 
     const metadata = await this.runtime.conditionalWrite.writeTextConditional(path, content, expectedToken);
     if (!metadata.revisionToken) throw new Error("journal_progress_token_unavailable");
+    this.onObserved?.(progress, metadata.revisionToken);
     return metadata.revisionToken;
   }
 
@@ -195,7 +199,7 @@ export function initialProgress(projectId: string, now: string, incarnation: str
   };
 }
 
-function parseProgress(raw: string, projectId: string): Progress {
+export function parseProgress(raw: string, projectId: string): Progress {
   let value: unknown;
   try {
     value = JSON.parse(raw);

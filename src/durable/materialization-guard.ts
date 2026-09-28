@@ -29,7 +29,7 @@ import {
   parseMaterializationCoverageCursor,
   type MaterializationCoverageCursor
 } from "../materialization/coverage";
-import { initializeMaterializationSchema, MaterializationLedger } from "../materialization/ledger";
+import { initializeMaterializationSchema, MaterializationLedger, type CapacityLedgerSnapshot, type CapacityReservation } from "../materialization/ledger";
 import {
   MaterializationOutputConflictError,
   parseProjectionConcurrency,
@@ -49,6 +49,7 @@ import { machineDocumentRoot } from "../persistence/layout";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
 import { sha256Canonical } from "../materialization/hash";
 import { canonicalJson } from "../rules/contract";
+import type { RuleResource } from "../rules/contract";
 
 const MATERIALIZATION_ALARM_DELAY_MS = 1_000;
 const MATERIALIZATION_DEFER_DELAY_MS = 300_000;
@@ -58,6 +59,17 @@ const NAVIGATION_WORK_PREFIX = "navigation-work:";
 const NAVIGATION_RETRY_PREFIX = "navigation-retry:";
 const NAVIGATION_WORK_CURSOR_KEY = "navigation-work-cursor";
 const NAVIGATION_WORK_SCAN_LIMIT = 16;
+
+interface CapacityReservationRequest {
+  request_id: string;
+  request_hash: string;
+  reservation_kind: "transaction" | "document" | "artifact";
+  output_cost: number;
+  canonical_revision: number;
+  operation: string;
+  resources: RuleResource[];
+  dependency_classification: "resource_bound" | "unknown";
+}
 
 interface NavigationWorkSlice {
   ref: NavigationWorkRef;
@@ -108,7 +120,7 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
     this.projectId = projectId;
     initializeMaterializationSchema(ctx.storage);
-    this.ledger = new MaterializationLedger(ctx.storage);
+    this.ledger = new MaterializationLedger(ctx.storage, projectId);
     this.layoutMode = parseLayoutMode(env.PROJECT_OS_LAYOUT_MODE);
     this.projectionConcurrency = parseProjectionConcurrency(env.PROJECT_OS_PROJECTION_CONCURRENCY);
   }
@@ -132,8 +144,24 @@ export class MaterializationGuard extends DurableObject<Env> {
       return this.serialize(() => this.handleDiagnosticStatus());
     }
     if (request.method === "GET" && url.pathname === "/capacity") {
-      if (this.queueDepth > 0) return this.busyReadResponse();
-      return this.serialize(() => this.handleCapacity());
+      // Capacity is a read-only projection of durable ledger/journal state.
+      // Do not queue it behind the long-running maintenance serializer: callers
+      // must be able to make an admission decision while effects are suspended.
+      // Any missing or inconsistent durable evidence still fails closed in
+      // handleCapacity/the admission caller.
+      return this.handleCapacity();
+    }
+    if (request.method === "POST" && url.pathname === "/capacity-reservation") {
+      return this.handleCapacityReservation(request);
+    }
+    if (request.method === "POST" && url.pathname === "/capacity-committed") {
+      return this.handleCapacityReservationTransition(request, "reserved", "committed");
+    }
+    if (request.method === "POST" && url.pathname === "/capacity-handoff") {
+      return this.handleCapacityReservationTransition(request, "committed", "handed_off");
+    }
+    if (request.method === "POST" && url.pathname === "/capacity-release") {
+      return this.handleCapacityReservationTransition(request, "reserved", "released");
     }
     if (request.method === "POST" && url.pathname === "/reconcile") {
       return this.serialize(() => this.handleReconcile());
@@ -148,6 +176,12 @@ export class MaterializationGuard extends DurableObject<Env> {
     let notifying = false;
     this.selectedNavigationWorkRef = undefined;
     try {
+      // Cloudflare consumes the firing alarm before invoking this handler. Keep
+      // a durable retry in place before entering any long external I/O so a
+      // crash cannot leave admitted work without its existing continuation.
+      if (await this.ctx.storage.getAlarm() === null) {
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+      }
       let navigation: NavigationWorkSlice | null = null;
       try {
         navigation = await this.serialize(() => this.runNavigationWorkSlice());
@@ -557,9 +591,8 @@ export class MaterializationGuard extends DurableObject<Env> {
     const canonicalState = state.state;
     if (!canonicalState) return Response.json({ error: "project_not_initialized" }, { status: 404 });
     const status = this.ledger.status();
-    const saved = await new ConvergenceJournal(
+    const saved = await this.convergenceJournal(
       createProductionPersistence(this.env, this.projectId),
-      this.projectId
     ).load();
     const human = Object.values(saved?.progress.obligations ?? {}).find((obligation) =>
       obligation.layer === "human_handoff" && obligation.target.revision === canonicalState.revision
@@ -608,9 +641,8 @@ export class MaterializationGuard extends DurableObject<Env> {
     if (!head || head.revision !== target.revision || head.projection_version !== target.projection_version) {
       return false;
     }
-    const saved = await new ConvergenceJournal(
+    const saved = await this.convergenceJournal(
       createProductionPersistence(this.env, this.projectId),
-      this.projectId
     ).load();
     if (!saved) return false;
     const progress = saved.progress;
@@ -656,7 +688,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       || localHead.projection_version !== CURRENT_PROJECTION_VERSION
       || !await this.hasCanonicallyBoundCurrentHead(record)) return false;
     const runtime = createProductionPersistence(this.env, this.projectId);
-    const saved = await new ConvergenceJournal(runtime, this.projectId).load();
+    const saved = await this.convergenceJournal(runtime).load();
     return saved !== null && saved.progress.canonical_observed_revision >= record.new_revision;
   }
 
@@ -666,69 +698,181 @@ export class MaterializationGuard extends DurableObject<Env> {
    * durable alarm while work is pending is an unavailable continuation.
    */
   private async handleCapacity(): Promise<Response> {
-    const status = this.ledger.status();
-    const saved = await new ConvergenceJournal(
-      createProductionPersistence(this.env, this.projectId),
-      this.projectId
-    ).load();
-    const outstanding = Object.values(saved?.progress.obligations ?? {})
-      .filter((obligation) => obligation.state !== "verified");
-    const work = classifyCapacityWork(outstanding, Date.now());
-    const pending = work.executable;
-    const continuationRequired = status.active !== null || status.requested !== null || pending.length > 0;
-    const alarm = await this.ctx.storage.getAlarm();
-    const queuedOutputs = Math.max(
-      pending.length,
+    const snapshot = this.ledger.capacitySnapshot();
+    const required = snapshot.progress === null || this.capacityHasPendingWork(snapshot);
+    const continuationAvailable = await this.ensureCapacityWake(required);
+    const current = this.ledger.capacitySnapshot();
+    const observation = this.capacityObservation(current, continuationAvailable);
+    if (!observation) return this.capacityUnavailableResponse("capacity_proof_unavailable");
+    return Response.json(observation);
+  }
+
+  private async handleCapacityReservation(request: Request): Promise<Response> {
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    const input = parseCapacityReservationRequest(body, this.projectId);
+    if (!input) return Response.json({ error: "invalid_capacity_reservation" }, { status: 400 });
+    const before = this.ledger.capacitySnapshot();
+    const continuationAvailable = await this.ensureCapacityWake(this.capacityHasPendingWork(before));
+    if (!continuationAvailable) return this.capacityUnavailableResponse("continuation_unavailable");
+
+    let result: { observation: CapacityObservation | null; code?: string; replay?: boolean };
+    try {
+      result = this.ledger.withCapacityReservation<{ observation: CapacityObservation | null; code?: string; replay?: boolean }>((snapshot) => {
+        const existing = snapshot.reservations.find((item) => item.request_id === input.request_id);
+        if (existing) {
+          if (existing.request_hash !== input.request_hash || existing.operation !== input.operation
+            || existing.dependency_classification !== input.dependency_classification
+            || JSON.stringify(existing.resources) !== JSON.stringify(input.resources)
+            || existing.reservation_kind !== input.reservation_kind
+            || existing.output_cost !== input.output_cost) {
+            return { value: { observation: null, code: "idempotency_payload_mismatch" } };
+          }
+          return { value: { observation: this.capacityObservation(snapshot, continuationAvailable), replay: true } };
+        }
+        if (snapshot.reservations.some((item) => item.state === "reserved")) {
+          return { value: { observation: null, code: "capacity_reservation_in_progress" } };
+        }
+        const observation = this.capacityObservation(snapshot, continuationAvailable, input.canonical_revision);
+        if (!observation) return { value: { observation: null, code: "capacity_proof_unavailable" } };
+        if (this.hasPendingDependency(snapshot, input)) {
+          return { value: { observation: { ...observation, reason: "dependency_pending" }, code: "dependency_pending" } };
+        }
+        if (!observation.within_qualified_envelope || !observation.continuation_available) {
+          return { value: { observation, code: "convergence_capacity_exceeded" } };
+        }
+      const reservation = { ...input,
+        target_revision: input.reservation_kind === "transaction" ? input.canonical_revision + 1 : null,
+          created_at: new Date().toISOString()
+        };
+        const withReservation = { ...observation, queued_outputs: observation.queued_outputs + input.output_cost,
+          within_qualified_envelope: observation.queued_outputs + input.output_cost <= 200 };
+        if (!withReservation.within_qualified_envelope) {
+          return { value: { observation: withReservation, code: "convergence_capacity_exceeded" } };
+        }
+        return { value: { observation: withReservation }, reservation };
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "capacity_reservation_identity_conflict") {
+        return Response.json({ error: "idempotency_payload_mismatch" }, { status: 409 });
+      }
+      return this.capacityUnavailableResponse("capacity_proof_unavailable");
+    }
+    if (result.code === "idempotency_payload_mismatch") return Response.json({ error: result.code }, { status: 409 });
+    if (result.code === "capacity_proof_unavailable") return this.capacityUnavailableResponse(result.code);
+    if (result.code || !result.observation) {
+      return Response.json({ error: result.code ?? "capacity_proof_unavailable", ...(result.observation ?? {}) }, { status: 503 });
+    }
+    return Response.json({ status: result.replay ? "reserved" : "admitted", ...result.observation });
+  }
+
+  private async handleCapacityReservationTransition(
+    request: Request,
+    from: CapacityReservation["state"],
+    to: CapacityReservation["state"] | "released"
+  ): Promise<Response> {
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    const requestId = body?.request_id;
+    const requestHash = body?.request_hash;
+    if (typeof requestId !== "string" || !/^(?:TXN|DOCREQ|ART)-[A-Z0-9-]{8,}$/.test(requestId)
+      || typeof requestHash !== "string" || !/^[a-f0-9]{64}$/.test(requestHash)) {
+      return Response.json({ error: "invalid_capacity_reservation_transition" }, { status: 400 });
+    }
+    const targetRevision = body?.target_revision;
+    if (to !== "released" && (!Number.isSafeInteger(targetRevision) || (targetRevision as number) < 1)) {
+      return Response.json({ error: "invalid_capacity_reservation_transition" }, { status: 400 });
+    }
+    const reservation = this.ledger.capacitySnapshot().reservations.find((item) => item.request_id === requestId);
+    if (reservation && to !== "released" && reservation.target_revision !== targetRevision) {
+      return Response.json({ error: "capacity_reservation_revision_conflict" }, { status: 409 });
+    }
+    if (to === "handed_off") {
+      const status = this.ledger.status();
+      const present = Number.isSafeInteger(targetRevision)
+        && [status.head?.revision, status.active?.revision, status.requested?.revision]
+          .some((revision) => revision !== null && revision !== undefined && revision >= (targetRevision as number));
+      if (!present) return Response.json({ error: "materialization_handoff_unproven" }, { status: 503 });
+    }
+    try { this.ledger.transitionCapacityReservation(requestId, requestHash, from, to); }
+    catch { return Response.json({ error: "capacity_reservation_state_conflict" }, { status: 409 }); }
+    return Response.json({ status: to });
+  }
+
+  private capacityObservation(snapshot: CapacityLedgerSnapshot, continuationAvailable: boolean,
+    expectedCanonicalRevision?: number): CapacityObservation | null {
+    const progress = snapshot.progress;
+    if (!progress || !snapshot.provider_token) return null;
+    const status = snapshot.status;
+    const obligations = Object.values(progress.obligations).filter((obligation) => obligation.state !== "verified");
+    const work = classifyCapacityWork(obligations, Date.now());
+    const knownRevision = Math.max(progress.canonical_observed_revision, status.head?.revision ?? 0,
+      status.active?.revision ?? 0, status.requested?.revision ?? 0,
+      ...snapshot.reservations.filter((reservation) => reservation.state !== "reserved" && reservation.target_revision !== null)
+        .map((reservation) => reservation.target_revision as number));
+    if (expectedCanonicalRevision !== undefined && expectedCanonicalRevision !== knownRevision) return null;
+    if (progress.canonical_observed_revision < (status.head?.revision ?? 0)) return null;
+    const representedRevision = Math.max(progress.canonical_observed_revision, status.head?.revision ?? 0,
+      status.active?.revision ?? 0, status.requested?.revision ?? 0);
+    const unrepresented = snapshot.reservations.filter((reservation) => reservation.reservation_kind === "transaction"
+      && reservation.state !== "reserved" && reservation.target_revision !== null
+      && reservation.target_revision > representedRevision);
+    const inFlightEffects = snapshot.reservations.filter((reservation) => reservation.reservation_kind !== "transaction");
+    const queuedOutputs = Math.max(work.executable.length,
       status.active === null ? 0 : status.attempt_output_count,
-      status.requested === null ? 0 : Math.max(1, status.output_count)
-    );
-    const oldestPendingSeconds = work.oldest_pending_seconds;
-    const runtime = createProductionPersistence(this.env, this.projectId);
-    const repository = new ProjectRepository(runtime, this.layoutMode);
-    const [head, canonicalState] = await Promise.all([
-      repository.readMaterializationHead(this.projectId),
-      repository.readProjectState(this.projectId)
-    ]);
-    const blocking = work.terminal[0]
-      ?? pending[0]
-      ?? outstanding[0]
-      ?? null;
-    const continuationAvailable = !continuationRequired || alarm !== null;
-    const withinQualifiedEnvelope = queuedOutputs <= 200 && oldestPendingSeconds <= 600;
-    const reason = !continuationAvailable
-      ? "continuation_unavailable"
-      : queuedOutputs > 200
-        ? "queued_outputs_exceeded"
-        : oldestPendingSeconds > 600
-          ? "oldest_pending_exceeded"
-          : work.terminal.length > 0
-            ? "repair_required"
-            : undefined;
-    const observation: CapacityObservation = {
-      queued_outputs: queuedOutputs,
-      oldest_pending_seconds: oldestPendingSeconds,
-      continuation_available: continuationAvailable,
-      within_qualified_envelope: withinQualifiedEnvelope,
-      reason,
-      canonical_revision: Math.max(
-        canonicalState?.revision ?? 0,
-        saved?.progress.canonical_observed_revision ?? 0,
-        status.active?.revision ?? 0,
-        status.requested?.revision ?? 0,
-        ...outstanding.map((obligation) => obligation.target.revision)
-      ),
-      materialized_revision: head?.target_revision ?? null,
-      blocking_obligation: blocking === null ? null : {
-        layer: blocking.layer,
-        target_revision: blocking.target.revision,
-        code: blocking.code
-      },
+      status.requested === null ? 0 : Math.max(1, status.output_count)) + unrepresented.length
+        + inFlightEffects.reduce((total, reservation) => total + reservation.output_cost, 0);
+    const oldestPendingSeconds = Math.max(work.oldest_pending_seconds, ...[...unrepresented, ...inFlightEffects].map((reservation) =>
+      Math.max(0, (Date.now() - Date.parse(reservation.created_at)) / 1_000)));
+    const continuationRequired = status.active !== null || status.requested !== null
+      || work.executable.length > 0 || unrepresented.length > 0 || inFlightEffects.length > 0;
+    const blocking = work.terminal[0] ?? work.executable[0] ?? obligations[0] ?? null;
+    return {
+      queued_outputs: queuedOutputs, oldest_pending_seconds: oldestPendingSeconds,
+      continuation_available: !continuationRequired || continuationAvailable,
+      within_qualified_envelope: queuedOutputs <= 200 && oldestPendingSeconds <= 600,
+      reason: continuationRequired && !continuationAvailable ? "continuation_unavailable"
+        : queuedOutputs > 200 ? "queued_outputs_exceeded"
+          : oldestPendingSeconds > 600 ? "oldest_pending_exceeded"
+            : work.terminal.length > 0 ? "repair_required" : undefined,
+      canonical_revision: knownRevision, materialized_revision: status.head?.revision ?? null,
+      blocking_obligation: blocking ? { layer: blocking.layer, target_revision: blocking.target.revision, code: blocking.code } : null,
       retry_after_seconds: blocking?.next_attempt_at && !work.terminal.includes(blocking)
         && Number.isFinite(Date.parse(blocking.next_attempt_at))
-        ? Math.max(0, Math.ceil((Date.parse(blocking.next_attempt_at) - Date.now()) / 1_000))
-        : null
+        ? Math.max(0, Math.ceil((Date.parse(blocking.next_attempt_at) - Date.now()) / 1_000)) : null
     };
-    return Response.json(observation);
+  }
+
+  private async ensureCapacityWake(required: boolean): Promise<boolean> {
+    let alarm = await this.ctx.storage.getAlarm();
+    if (required && alarm === null) {
+      try { await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS); }
+      catch { return false; }
+      alarm = await this.ctx.storage.getAlarm();
+    }
+    return !required || alarm !== null;
+  }
+
+  private capacityHasPendingWork(snapshot: CapacityLedgerSnapshot): boolean {
+    return snapshot.status.active !== null || snapshot.status.requested !== null
+      || Object.values(snapshot.progress?.obligations ?? {}).some((obligation) => obligation.state !== "verified")
+      || snapshot.reservations.length > 0;
+  }
+
+  private hasPendingDependency(snapshot: CapacityLedgerSnapshot, input: CapacityReservationRequest): boolean {
+    const live = snapshot.reservations.filter((reservation) => reservation.state !== "reserved");
+    if (live.length === 0) return false;
+    if (input.dependency_classification !== "resource_bound") return true;
+    // Canonical task/decision/deliverable references describe business state,
+    // not a dependency on the projected physical document. Physical publish
+    // requests retain their exact provider/version checks at the document
+    // service boundary; only an explicit physical resource can be gated here.
+    const physical = input.resources.filter((resource) => resource.resource_type === "document" || resource.resource_type === "package");
+    if (physical.length === 0) return false;
+    const prior = new Set(live.flatMap((reservation) => reservation.resources.map((resource) => `${resource.resource_type}:${resource.resource_id}`)));
+    return physical.some((resource) => prior.has(`${resource.resource_type}:${resource.resource_id}`));
+  }
+
+  private capacityUnavailableResponse(code: string): Response {
+    return Response.json({ status: "unavailable", freshness: "unknown", error: code }, { status: 503, headers: { "Retry-After": "1" } });
   }
 
   private async handleReconcile(): Promise<Response> {
@@ -742,9 +886,8 @@ export class MaterializationGuard extends DurableObject<Env> {
       this.projectId
     );
     if (convergenceMode === "repair") {
-      const journal = new ConvergenceJournal(
+      const journal = this.convergenceJournal(
         createProductionPersistence(this.env, this.projectId),
-        this.projectId
       );
       if (!await this.resumeConvergenceFromVerifiedHead()) {
         return Response.json({ project_id: this.projectId, status: "pending", reason: "baseline_reconstruction_pending" }, { status: 202 });
@@ -869,9 +1012,8 @@ export class MaterializationGuard extends DurableObject<Env> {
           });
         }
         const target = { revision: canonicalState.revision, projection_version: CURRENT_PROJECTION_VERSION };
-        const journal = new ConvergenceJournal(
+        const journal = this.convergenceJournal(
           createProductionPersistence(this.env, this.projectId),
-          this.projectId
         );
         const saved = await journal.load();
         const targetKnown = [saved?.progress.active, saved?.progress.requested].some((candidate) =>
@@ -1081,7 +1223,7 @@ export class MaterializationGuard extends DurableObject<Env> {
   private async resumeConvergenceFromVerifiedHead(): Promise<boolean> {
     const { coordinator, repository, budget } = this.coordinatorForSlice();
     const runtime = createProductionPersistence(this.env, this.projectId, providerRequestScopeFor(budget));
-    const journal = new ConvergenceJournal(runtime, this.projectId);
+    const journal = this.convergenceJournal(runtime);
     const head = await repository.readMaterializationHead(this.projectId);
     if (head === null || head.projection_version !== CURRENT_PROJECTION_VERSION) return true;
     const tip = await repository.readMaterializationRecord(
@@ -1159,7 +1301,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       providerCheckpointScopeFor(budget)
     );
     const repository = new ProjectRepository(readRuntime, this.layoutMode);
-    const journal = new ConvergenceJournal(readRuntime, this.projectId);
+    const journal = this.convergenceJournal(readRuntime);
     const saved = await journal.load();
     if (!saved) return;
     const storedCursor = await this.ctx.storage.get<string>(MATERIALIZATION_COVERAGE_CURSOR_KEY);
@@ -1204,7 +1346,7 @@ export class MaterializationGuard extends DurableObject<Env> {
     // acknowledgement. Persist it first so a crash can only cause harmless
     // re-verification, never an acknowledged target with a missing cursor.
     await this.ctx.storage.put(MATERIALIZATION_COVERAGE_CURSOR_KEY, JSON.stringify(cursor));
-    await new ConvergenceJournal(checkpointRuntime, this.projectId).save(saved.progress, saved.token);
+    await this.convergenceJournal(checkpointRuntime).save(saved.progress, saved.token);
     if ((!cursor.complete || cursor.lineage_verification !== null)
       && await this.ctx.storage.getAlarm() === null) {
       await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
@@ -1356,9 +1498,8 @@ export class MaterializationGuard extends DurableObject<Env> {
       ? { revision: status.active.revision, projection_version: status.active.projection_version }
       : null);
     if (!target) return false;
-    const saved = await new ConvergenceJournal(
+    const saved = await this.convergenceJournal(
       createProductionPersistence(this.env, this.projectId),
-      this.projectId
     ).load();
     const known = [saved?.progress.active, saved?.progress.requested].some((candidate) =>
       candidate !== null
@@ -1540,7 +1681,7 @@ export class MaterializationGuard extends DurableObject<Env> {
         effectRuntime: effectPersistence,
         humanRepository,
         humanProjectionConcurrency: this.projectionConcurrency,
-        journal: new ConvergenceJournal(checkpointPersistence, this.projectId),
+        journal: this.convergenceJournal(checkpointPersistence),
         ledger: this.ledger,
         now: () => Date.now(),
         deploymentSha: deploymentIdentity(this.env).git_sha ?? "unknown",
@@ -1556,6 +1697,12 @@ export class MaterializationGuard extends DurableObject<Env> {
     };
   }
 
+  private convergenceJournal(runtime: ProjectOsPersistenceRuntime): ConvergenceJournal {
+    return new ConvergenceJournal(runtime, this.projectId, (progress, token) => {
+      this.ledger.restoreConvergenceCheckpoint(progress, token);
+    });
+  }
+
 }
 
 function isMaterializationTargetRequestBody(value: unknown): value is MaterializationTargetRequestBody {
@@ -1567,6 +1714,49 @@ function isMaterializationTargetRequestBody(value: unknown): value is Materializ
     && (candidate.revision as number) >= 0
     && Number.isSafeInteger(candidate.projection_version)
     && (candidate.projection_version as number) >= 1;
+}
+
+function parseCapacityReservationRequest(value: Record<string, unknown> | null, projectId: string): CapacityReservationRequest | null {
+  if (!value || value.project_id !== projectId
+    || typeof value.request_id !== "string" || !/^(?:TXN|DOCREQ|ART)-[A-Z0-9-]{8,}$/.test(value.request_id)
+    || typeof value.request_hash !== "string" || !/^[a-f0-9]{64}$/.test(value.request_hash)
+    || !Number.isSafeInteger(value.canonical_revision) || (value.canonical_revision as number) < 0
+    || typeof value.operation !== "string" || !/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/.test(value.operation)
+    || (value.reservation_kind !== undefined && !["transaction", "document", "artifact"].includes(String(value.reservation_kind)))
+    || (value.output_cost !== undefined && (!Number.isSafeInteger(value.output_cost) || (value.output_cost as number) < 1 || (value.output_cost as number) > 200))
+    || (value.dependency_classification !== "resource_bound" && value.dependency_classification !== "unknown")
+    || !Array.isArray(value.resources) || value.resources.length < 1 || value.resources.length > 32) return null;
+  const resources: RuleResource[] = [];
+  for (const candidate of value.resources) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+    const item = candidate as Record<string, unknown>;
+    if (typeof item.resource_id !== "string" || item.resource_id.length < 1 || item.resource_id.length > 512
+      || typeof item.resource_type !== "string" || !/^[a-z][a-z0-9_]*$/.test(item.resource_type)
+      || typeof item.zone !== "string" || item.zone.length < 1 || item.zone.length > 64
+      || typeof item.version !== "string" || item.version.length > 512
+      || (item.expected_version !== undefined && typeof item.expected_version !== "string")
+      || (item.relative_path !== undefined && typeof item.relative_path !== "string")
+      || (item.artifact_operation !== undefined && item.artifact_operation !== "REVIEW_CANDIDATE")) return null;
+    resources.push({
+      resource_id: item.resource_id,
+      resource_type: item.resource_type,
+      zone: item.zone,
+      version: item.version,
+      ...(typeof item.expected_version === "string" ? { expected_version: item.expected_version } : {}),
+      ...(typeof item.relative_path === "string" ? { relative_path: item.relative_path } : {}),
+      ...(item.artifact_operation === "REVIEW_CANDIDATE" ? { artifact_operation: "REVIEW_CANDIDATE" } : {})
+    });
+  }
+  return {
+    request_id: value.request_id,
+    request_hash: value.request_hash,
+    reservation_kind: (value.reservation_kind ?? "transaction") as CapacityReservationRequest["reservation_kind"],
+    output_cost: (value.output_cost ?? 1) as number,
+    canonical_revision: value.canonical_revision as number,
+    operation: value.operation,
+    resources,
+    dependency_classification: value.dependency_classification
+  };
 }
 
 function structuredMaterializationError(projectId: string, error: unknown) {

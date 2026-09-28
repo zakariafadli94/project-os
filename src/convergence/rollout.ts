@@ -19,7 +19,7 @@ export interface CapacityObservation {
   oldest_pending_seconds: number;
   continuation_available: boolean;
   within_qualified_envelope: boolean;
-  reason?: "continuation_unavailable" | "queued_outputs_exceeded" | "oldest_pending_exceeded" | "blocked_obligation" | "repair_required";
+  reason?: "continuation_unavailable" | "queued_outputs_exceeded" | "oldest_pending_exceeded" | "blocked_obligation" | "repair_required" | "dependency_pending" | "capacity_proof_unavailable";
   canonical_revision?: number | null;
   materialized_revision?: number | null;
   blocking_obligation?: { layer: string; target_revision: number; code: string | null } | null;

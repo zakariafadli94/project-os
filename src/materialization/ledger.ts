@@ -1,5 +1,7 @@
 import type { MaterializationGenerationRef, ProjectionOutputEvidence } from "../domain/materialization";
 import type { Progress } from "../convergence/contract";
+import { parseProgress } from "../convergence/journal";
+import type { RuleResource } from "../rules/contract";
 
 export interface MaterializationTargetRequest {
   revision: number;
@@ -84,6 +86,27 @@ interface ConvergenceCheckpointRow {
   provider_token: string;
 }
 
+export interface CapacityReservation {
+  request_id: string;
+  request_hash: string;
+  reservation_kind: "transaction" | "document" | "artifact";
+  output_cost: number;
+  canonical_revision: number;
+  target_revision: number | null;
+  operation: string;
+  resources: RuleResource[];
+  dependency_classification: "resource_bound" | "unknown";
+  state: "reserved" | "committed" | "handed_off";
+  created_at: string;
+}
+
+export interface CapacityLedgerSnapshot {
+  status: MaterializationLedgerStatus;
+  progress: Progress | null;
+  provider_token: string | null;
+  reservations: CapacityReservation[];
+}
+
 export function initializeMaterializationSchema(storage: DurableObjectStorage): void {
   storage.sql.exec(`
     CREATE TABLE IF NOT EXISTS materialization_control (
@@ -137,6 +160,20 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
       reservation_json TEXT NOT NULL,
       PRIMARY KEY(obligation_id, attempt_number)
     );
+
+    CREATE TABLE IF NOT EXISTS capacity_reservations (
+      request_id TEXT PRIMARY KEY,
+      request_hash TEXT NOT NULL,
+      reservation_kind TEXT NOT NULL CHECK(reservation_kind IN ('transaction', 'document', 'artifact')),
+      output_cost INTEGER NOT NULL CHECK(output_cost > 0),
+      canonical_revision INTEGER NOT NULL,
+      target_revision INTEGER,
+      operation TEXT NOT NULL,
+      resources_json TEXT NOT NULL,
+      dependency_classification TEXT NOT NULL CHECK(dependency_classification IN ('resource_bound', 'unknown')),
+      state TEXT NOT NULL CHECK(state IN ('reserved', 'committed', 'handed_off')),
+      created_at TEXT NOT NULL
+    );
   `);
   try {
     storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_immutable_revision INTEGER");
@@ -171,7 +208,7 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
 }
 
 export class MaterializationLedger {
-  constructor(private readonly storage: DurableObjectStorage) {}
+  constructor(private readonly storage: DurableObjectStorage, private readonly boundProjectId?: string) {}
 
   requestTarget(target: MaterializationTargetRequest): void {
     validateTarget(target);
@@ -554,8 +591,120 @@ export class MaterializationLedger {
       "SELECT progress_json, provider_token FROM convergence_checkpoint WHERE singleton = 1"
     ).toArray()[0];
     if (!row) return null;
-    const progress = JSON.parse(row.progress_json) as Progress;
+    const progress = this.parseLocalProgress(row.progress_json);
     return { progress, token: row.provider_token };
+  }
+
+  capacitySnapshot(): CapacityLedgerSnapshot {
+    const checkpoint = this.storage.sql.exec<ConvergenceCheckpointRow>(
+      "SELECT progress_json, provider_token FROM convergence_checkpoint WHERE singleton = 1"
+    ).toArray()[0];
+    const reservations = this.storage.sql.exec<{
+      [key: string]: SqlStorageValue;
+      request_id: string;
+      request_hash: string;
+      reservation_kind: CapacityReservation["reservation_kind"];
+      output_cost: number;
+      canonical_revision: number;
+      target_revision: number | null;
+      operation: string;
+      resources_json: string;
+      dependency_classification: CapacityReservation["dependency_classification"];
+      state: CapacityReservation["state"];
+      created_at: string;
+    }>("SELECT request_id, request_hash, reservation_kind, output_cost, canonical_revision, target_revision, operation, resources_json, dependency_classification, state, created_at FROM capacity_reservations ORDER BY target_revision, request_id")
+      .toArray();
+    return {
+      status: this.status(),
+      progress: checkpoint ? this.parseLocalProgress(checkpoint.progress_json) : null,
+      provider_token: checkpoint?.provider_token ?? null,
+      reservations: reservations.map((row) => ({
+        request_id: row.request_id,
+        request_hash: row.request_hash,
+        reservation_kind: row.reservation_kind,
+        output_cost: row.output_cost,
+        canonical_revision: row.canonical_revision,
+        target_revision: row.target_revision,
+        operation: row.operation,
+        resources: JSON.parse(row.resources_json) as RuleResource[],
+        dependency_classification: row.dependency_classification,
+        state: row.state,
+        created_at: row.created_at
+      }))
+    };
+  }
+
+  withCapacityReservation<T>(
+    evaluate: (snapshot: CapacityLedgerSnapshot) => { value: T; reservation?: Omit<CapacityReservation, "state"> }
+  ): T {
+    let result!: T;
+    this.storage.transactionSync(() => {
+      const evaluated = evaluate(this.capacitySnapshot());
+      result = evaluated.value;
+      if (evaluated.reservation) {
+        const reservation = evaluated.reservation;
+        const existing = this.capacitySnapshot().reservations.find((item) => item.request_id === reservation.request_id);
+        if (existing) {
+          if (existing.request_hash !== reservation.request_hash
+            || existing.reservation_kind !== reservation.reservation_kind
+            || existing.output_cost !== reservation.output_cost
+            || existing.canonical_revision !== reservation.canonical_revision
+            || existing.target_revision !== reservation.target_revision
+            || existing.operation !== reservation.operation
+            || existing.dependency_classification !== reservation.dependency_classification
+            || JSON.stringify(existing.resources) !== JSON.stringify(reservation.resources)) {
+            throw new Error("capacity_reservation_identity_conflict");
+          }
+        } else {
+          this.storage.sql.exec(
+            `INSERT INTO capacity_reservations (request_id, request_hash, reservation_kind, output_cost, canonical_revision, target_revision, operation, resources_json, dependency_classification, state, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)`,
+            reservation.request_id,
+            reservation.request_hash,
+            reservation.reservation_kind,
+            reservation.output_cost,
+            reservation.canonical_revision,
+            reservation.target_revision,
+            reservation.operation,
+            JSON.stringify(reservation.resources),
+            reservation.dependency_classification,
+            reservation.created_at
+          );
+        }
+      }
+    });
+    return result;
+  }
+
+  transitionCapacityReservation(
+    requestId: string,
+    requestHash: string,
+    from: CapacityReservation["state"],
+    to: CapacityReservation["state"] | "released"
+  ): void {
+    this.storage.transactionSync(() => {
+      const row = this.storage.sql.exec<{ [key: string]: SqlStorageValue; request_hash: string; state: string }>(
+        "SELECT request_hash, state FROM capacity_reservations WHERE request_id = ?", requestId
+      ).toArray()[0];
+      if (!row) return;
+      if (row.request_hash !== requestHash) throw new Error("capacity_reservation_state_conflict");
+      if (to === "released") {
+        if (row.state !== from) throw new Error("capacity_reservation_state_conflict");
+      } else {
+        const rank = { reserved: 0, committed: 1, handed_off: 2 } as const;
+        if (rank[row.state as CapacityReservation["state"]] >= rank[to]) return;
+        if (row.state !== from) throw new Error("capacity_reservation_state_conflict");
+      }
+      if (to === "released") this.storage.sql.exec("DELETE FROM capacity_reservations WHERE request_id = ?", requestId);
+      else this.storage.sql.exec("UPDATE capacity_reservations SET state = ? WHERE request_id = ?", to, requestId);
+    });
+  }
+
+  private parseLocalProgress(raw: string): Progress {
+    const value = JSON.parse(raw) as { project_id?: unknown };
+    const projectId = this.boundProjectId ?? (typeof value.project_id === "string" ? value.project_id : "");
+    if (!/^PRJ-[0-9]{4,}$/.test(projectId)) throw new Error("capacity_checkpoint_project_binding_unavailable");
+    return parseProgress(raw, projectId);
   }
 
   readRepairScanCheckpoint(canonicalRevision: number): MaterializationRepairScanCheckpoint | null {
@@ -593,15 +742,28 @@ export class MaterializationLedger {
 
   restoreConvergenceCheckpoint(progress: Progress, token: string): void {
     if (!token) throw new Error("Convergence checkpoint requires a provider token");
-    this.storage.sql.exec(
-      `INSERT INTO convergence_checkpoint (singleton, progress_json, provider_token)
-       VALUES (1, ?, ?)
-       ON CONFLICT(singleton) DO UPDATE SET
-         progress_json = excluded.progress_json,
-         provider_token = excluded.provider_token`,
-      JSON.stringify(progress),
-      token
-    );
+    this.storage.transactionSync(() => {
+      this.storage.sql.exec(
+        `INSERT INTO convergence_checkpoint (singleton, progress_json, provider_token)
+         VALUES (1, ?, ?)
+         ON CONFLICT(singleton) DO UPDATE SET
+           progress_json = excluded.progress_json,
+           provider_token = excluded.provider_token`,
+        JSON.stringify(progress),
+        token
+      );
+      for (const reservation of this.capacitySnapshot().reservations) {
+        const targetRevision = reservation.target_revision;
+        if (reservation.reservation_kind !== "transaction" || reservation.state !== "handed_off"
+          || targetRevision === null || targetRevision > progress.canonical_observed_revision) continue;
+        const pendingThroughTarget = Object.values(progress.obligations).some((obligation) =>
+          obligation.target.revision >= targetRevision && obligation.state !== "verified"
+        );
+        if (!pendingThroughTarget) {
+          this.storage.sql.exec("DELETE FROM capacity_reservations WHERE request_id = ?", reservation.request_id);
+        }
+      }
+    });
   }
 
   private control(): ControlRow {

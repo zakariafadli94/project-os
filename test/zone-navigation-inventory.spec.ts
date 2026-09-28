@@ -893,6 +893,39 @@ describe("ZoneNavigationInventory", () => {
     expect(pages.flatMap((page) => page.gaps)).toContainEqual(expect.objectContaining({ code: "artifact_destination_outside_navigation_zones" }));
   });
 
+  it("batches outside-zone artifact gaps and replays the same bounded page", async () => {
+    const h = harness();
+    const expected: Array<{ resource_id: string; code: string }> = [];
+    for (let index = 1; index <= 4; index += 1) {
+      const requestId = `ART-NAVIGATION-BATCH-${String(index).padStart(4, "0")}`;
+      const destination = `${workspaceProjectRoot(projectId, slug)}/ARCHIVE/${index}.md`;
+      await seedCommittedArtifact(h, requestId, destination, `archived artifact ${index}`);
+      expected.push({ resource_id: `artifact:${await sha256Text(destination)}`, code: "artifact_destination_outside_navigation_zones" });
+    }
+
+    const cursor = "artifacts:";
+    const before = h.providerCalls;
+    const pages = [];
+    let nextCursor: string | null = cursor;
+    do {
+      const slice = budget(32);
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: nextCursor, limit: 8, budget: slice });
+      expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+      pages.push(page);
+      nextCursor = page.next_cursor;
+    } while (nextCursor !== null);
+    const callsUsed = h.providerCalls - before;
+    const first = pages[0]!;
+    const replay = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget(32) });
+
+    expect(first).toEqual(replay);
+    expect(first.entries).toEqual([]);
+    expect(pages.flatMap((page) => page.gaps)).toEqual(expected);
+    expect(callsUsed).toBeLessThan(16);
+    expect(first.next_cursor).toBeNull();
+    expect(pages).toHaveLength(1);
+  });
+
   it.each([
     ["missing catalog record", null, true, "canonical_catalog_entry_unavailable"],
     ["invalid schema version", JSON.stringify({ schema_version: "9.0", resource_id: `head:${documentId}`, entry: {} }), false, "canonical_catalog_entry_invalid"],

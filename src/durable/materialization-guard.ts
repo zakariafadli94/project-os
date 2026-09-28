@@ -733,9 +733,6 @@ export class MaterializationGuard extends DurableObject<Env> {
           }
           return { value: { observation: this.capacityObservation(snapshot, continuationAvailable), replay: true } };
         }
-        if (snapshot.reservations.some((item) => item.state === "reserved")) {
-          return { value: { observation: null, code: "capacity_reservation_in_progress" } };
-        }
         const observation = this.capacityObservation(snapshot, continuationAvailable, input.canonical_revision);
         if (!observation) return { value: { observation: null, code: "capacity_proof_unavailable" } };
         if (this.hasPendingDependency(snapshot, input)) {
@@ -749,7 +746,8 @@ export class MaterializationGuard extends DurableObject<Env> {
           created_at: new Date().toISOString()
         };
         const withReservation = { ...observation, queued_outputs: observation.queued_outputs + input.output_cost,
-          within_qualified_envelope: observation.queued_outputs + input.output_cost <= 200 };
+          within_qualified_envelope: observation.queued_outputs + input.output_cost <= 200,
+          reason: observation.queued_outputs + input.output_cost > 200 ? "queued_outputs_exceeded" as const : observation.reason };
         if (!withReservation.within_qualified_envelope) {
           return { value: { observation: withReservation, code: "convergence_capacity_exceeded" } };
         }
@@ -817,7 +815,7 @@ export class MaterializationGuard extends DurableObject<Env> {
     const representedRevision = Math.max(progress.canonical_observed_revision, status.head?.revision ?? 0,
       status.active?.revision ?? 0, status.requested?.revision ?? 0);
     const unrepresented = snapshot.reservations.filter((reservation) => reservation.reservation_kind === "transaction"
-      && reservation.state !== "reserved" && reservation.target_revision !== null
+      && reservation.target_revision !== null
       && reservation.target_revision > representedRevision);
     const inFlightEffects = snapshot.reservations.filter((reservation) => reservation.reservation_kind !== "transaction");
     const queuedOutputs = Math.max(work.executable.length,
@@ -862,7 +860,8 @@ export class MaterializationGuard extends DurableObject<Env> {
   }
 
   private hasPendingDependency(snapshot: CapacityLedgerSnapshot, input: CapacityReservationRequest): boolean {
-    const live = snapshot.reservations.filter((reservation) => reservation.state !== "reserved");
+    const live = snapshot.reservations.filter((reservation) => reservation.state !== "reserved"
+      || reservation.reservation_kind !== "transaction");
     if (live.length === 0) return false;
     if (input.dependency_classification !== "resource_bound") return true;
     // Canonical task/decision/deliverable references describe business state,

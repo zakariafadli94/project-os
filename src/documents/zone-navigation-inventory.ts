@@ -350,9 +350,11 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       }
       const match = /^(ART-[A-Z0-9-]{10,})\.json$/.exec(item.name);
       if (item.kind !== "file" || !item.path || item.path !== `${root}/${item.name}` || !match) {
-        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        if (lastSkippedCursor !== null && gaps.length === 0) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
         gaps.push({ resource_id: item.name, code: "artifact_intent_listing_invalid" });
-        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+        lastSkippedCursor = null;
+        if (providerCursor === null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: null };
+        continue;
       }
       let intent: Awaited<ReturnType<MutationGateRepository["readArtifactIntent"]>>;
       try {
@@ -360,28 +362,34 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         if (!intent || intent.request_id !== match[1] || intent.project_id !== projectId) throw new Error("artifact_intent_binding");
       } catch (error) {
         if (isBudgetError(error)) throw error;
-        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        if (lastSkippedCursor !== null && gaps.length === 0) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
         gaps.push({ resource_id: `artifact:${match[1]}`, code: "committed_artifact_intent_unavailable" });
-        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+        lastSkippedCursor = null;
+        if (providerCursor === null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: null };
+        continue;
       }
       const target = artifactNavigationTarget(projectId, intent.destination_path);
       if (target.kind === "outside") {
-        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        if (lastSkippedCursor !== null && gaps.length === 0) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
         gaps.push({ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_outside_navigation_zones" });
-        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+        lastSkippedCursor = null;
+        if (providerCursor === null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: null };
+        continue;
       }
       if (target.kind === "invalid") {
-        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        if (lastSkippedCursor !== null && gaps.length === 0) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
         gaps.push({ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_binding_invalid" });
-        return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: providerCursor === null ? null : encodeCursor("artifacts", providerCursor) };
+        lastSkippedCursor = null;
+        if (providerCursor === null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: null };
+        continue;
       }
       if (target.zone === zone) {
-        if (lastSkippedCursor !== null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
+        if (lastSkippedCursor !== null && gaps.length === 0) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
         const state: ArtifactBindingCursor = { next_intent_cursor: providerCursor, request_id: intent.request_id, destination_path: intent.destination_path, binding_cursor: null, eligible_request_ids: [], gaps: [] };
         const result = await this.scanArtifactBindings(projectId, zone, state, snapshotId, budget);
         return { ...result, gaps: [...gaps, ...result.gaps] };
       }
-      lastSkippedCursor = providerCursor;
+      if (gaps.length === 0) lastSkippedCursor = providerCursor;
       if (providerCursor === null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: null };
     }
   }

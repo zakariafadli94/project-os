@@ -189,7 +189,38 @@ describe("MaterializationGuard isolation boundary", () => {
     const changed = await guard.fetch(makeRequest(winnerId, "c".repeat(64)));
     expect(changed.status).toBe(409);
     const competing = pair[1 - winnerIndex]!;
-    await expect(competing.json()).resolves.toMatchObject({ error: "capacity_reservation_in_progress" });
+    await expect(competing.json()).resolves.toMatchObject({ error: "convergence_capacity_exceeded", reason: "queued_outputs_exceeded" });
+  });
+
+  it("counts an in-flight document reservation without globally blocking independent work", async () => {
+    const projectId = "PRJ-3931";
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, async (_instance, state) => {
+      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(initialProgress(projectId, at, "capacity-physical-proof"), "capacity-token-physical");
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+    const makeRequest = (input: Record<string, unknown>) => new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ project_id: projectId, canonical_revision: 0, ...input })
+    });
+    const documentResource = { resource_id: "DOC-1123456789ABCDEF01234567", resource_type: "document", zone: "DELIVERABLES", version: "VER-1123456789ABCDEF01234567" };
+    const document = await guard.fetch(makeRequest({
+      request_id: "DOCREQ-CAP-PHYS-0001", request_hash: "a".repeat(64), operation: "document.publish",
+      reservation_kind: "document", output_cost: 1, dependency_classification: "resource_bound", resources: [documentResource]
+    }));
+    expect(document.status).toBe(200);
+
+    const independent = await guard.fetch(makeRequest({
+      request_id: "TXN-CAP-PHYS-INDEP-0001", request_hash: "b".repeat(64), operation: "task.create",
+      dependency_classification: "resource_bound", resources: [{ resource_id: "TSK-1123456789ABCDEF01234567", resource_type: "task", zone: "PROJECT", version: "0" }]
+    }));
+    expect(independent.status).toBe(200);
+
+    const sameDocument = await guard.fetch(makeRequest({
+      request_id: "TXN-CAP-PHYS-DEP-0001", request_hash: "c".repeat(64), operation: "document.publish",
+      dependency_classification: "resource_bound", resources: [documentResource]
+    }));
+    expect(sameDocument.status).toBe(503);
+    await expect(sameDocument.json()).resolves.toMatchObject({ error: "dependency_pending" });
   });
 
   it("durably acknowledges exact navigation work while the MG serialization queue is held", async () => {
@@ -318,6 +349,7 @@ describe("MaterializationGuard isolation boundary", () => {
     const makeGuard = (environment: Env = testEnv) => Object.assign(Object.create(MaterializationGuard.prototype), {
       projectId, env: environment, queue: Promise.resolve(), queueDepth: 0, wakeScheduleQueue: undefined,
       layoutMode: "v2", notifyProjectGuardOfCurrentHead: async () => true,
+      ledger: { capacitySnapshot: () => ({ status: { active: null, requested: null }, progress: null, reservations: [] }) },
       ctx: { id: { name: projectId }, storage }
     }) as MaterializationGuard;
     let guard = makeGuard();
@@ -780,6 +812,7 @@ describe("MaterializationGuard isolation boundary", () => {
       projectId: "PRJ-3919",
       layoutMode: "v2",
       env: {},
+      ledger: { capacitySnapshot: () => ({ status: { active: null, requested: null }, progress: null, reservations: [] }) },
       ctx: { storage: {
         get: async () => undefined,
         list: async () => new Map(),

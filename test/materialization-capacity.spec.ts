@@ -1,10 +1,12 @@
 import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { initialProgress, ConvergenceJournal } from "../src/convergence/journal";
 import type { Obligation } from "../src/convergence/contract";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import type { Env } from "../src/env";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { MaterializationLedger } from "../src/materialization/ledger";
 
 const testEnv = env as unknown as Env;
 
@@ -25,6 +27,7 @@ describe("MaterializationGuard admission capacity diagnostics", () => {
     const projectId = "PRJ-8393";
     const now = new Date().toISOString();
     const progress = initialProgress(projectId, now, "capacity-diagnostic");
+    progress.canonical_observed_revision = 3;
     progress.obligations = {
       ["a".repeat(64)]: obligation("a".repeat(64), { state: "verified", continuation: "done" }),
       ["b".repeat(64)]: obligation("b".repeat(64), { state: "running", continuation: "" }),
@@ -34,6 +37,9 @@ describe("MaterializationGuard admission capacity diagnostics", () => {
     };
     const journal = new ConvergenceJournal(createProductionPersistence(testEnv, projectId), projectId);
     await journal.save(progress, null);
+    await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (_instance, state) => {
+      new MaterializationLedger(state.storage, projectId).restoreConvergenceCheckpoint(progress, "capacity-diagnostic-token");
+    });
 
     const response = await testEnv.MATERIALIZATION_GUARD.getByName(projectId)
       .fetch("https://materialization-guard.internal/capacity");

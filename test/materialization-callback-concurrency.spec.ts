@@ -6,6 +6,15 @@ import { ProviderOperationError } from "../src/persistence/provider/errors";
 
 afterEach(() => vi.restoreAllMocks());
 
+function idleCapacitySnapshot() {
+  return {
+    status: { active: null, requested: null },
+    progress: null,
+    provider_token: null,
+    reservations: []
+  };
+}
+
 it("preserves a wake scheduled by another request while finalization is unavailable", async () => {
   const before = Date.now();
   const targetWake = before + 2_000;
@@ -16,6 +25,7 @@ it("preserves a wake scheduled by another request while finalization is unavaila
   const pending = new Promise<void>((resolve) => { fail = resolve; });
   const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
     projectId: "PRJ-0007", layoutMode: "legacy", env: {},
+    ledger: { capacitySnapshot: idleCapacitySnapshot },
     ctx: { storage: {
       get: async () => undefined,
       list: async () => new Map(),
@@ -41,6 +51,7 @@ it("rearms immediately when ProjectGuard bounds a finalization callback", async 
   const before = Date.now();
   const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
     projectId: "PRJ-0008", layoutMode: "legacy", env: {},
+    ledger: { capacitySnapshot: idleCapacitySnapshot },
     ctx: { storage: {
       get: async () => undefined,
       list: async () => new Map(),
@@ -63,6 +74,7 @@ it("preserves provider Retry-After values above two minutes for MaterializationG
   const before = Date.now();
   const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
     projectId: "PRJ-0009", layoutMode: "legacy", env: {},
+    ledger: { capacitySnapshot: idleCapacitySnapshot },
     ctx: { storage: {
       get: async () => undefined,
       list: async () => new Map(),
@@ -90,7 +102,7 @@ it("notifies ProjectGuard of an existing head while repair convergence continues
     layoutMode: "v2",
     env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: '{"PRJ-0003":"repair"}' },
     ctx: { storage: { get: async () => undefined, list: async () => new Map(), setAlarm: async () => {} } },
-    ledger: { finalVerificationActive: () => false },
+    ledger: { capacitySnapshot: idleCapacitySnapshot, finalVerificationActive: () => false },
     resumeConvergenceFromVerifiedHead: async () => true,
     ensureConvergenceRequestedFromLedger: async () => false,
     convergenceEngineForSlice: () => ({
@@ -118,6 +130,7 @@ it.each(["repair", "legacy"])("finishes %s finalization while ProjectGuard is wa
   }) as DiagnosticProjectGuard;
   const materialization = Object.assign(Object.create(MaterializationGuard.prototype), {
     projectId: "PRJ-0007",
+    ledger: { capacitySnapshot: idleCapacitySnapshot },
     layoutMode: mode === "legacy" ? "legacy" : "v2",
     env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: mode === "repair" ? '{"PRJ-0007":"repair"}' : undefined },
     ctx: { storage: { get: async () => undefined, list: async () => new Map(), setAlarm: async () => {} } },

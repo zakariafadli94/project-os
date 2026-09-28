@@ -38,6 +38,7 @@ describe("server-owned admission normalization", () => {
     expect(document.resources[0]).toMatchObject({ resource_id: "DOC-ABCDEF0123456789ABCDEF01", resource_type: "document", zone: "DOCUMENTS" });
     expect(transaction.operation).toBe("task.create");
     expect(transaction.resources[0]).toMatchObject({ resource_id: request.transaction_id, resource_type: "task", zone: "PROJECT" });
+    expect(transaction.dependency_resources).toMatchObject([{ resource_id: request.payload.task_id, resource_type: "task", zone: "PROJECT" }]);
   });
 
   it("maps review-candidate promotion to the registered review promotion control", async () => {

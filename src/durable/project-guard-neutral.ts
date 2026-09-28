@@ -16,7 +16,7 @@ import {
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
 import { navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema, type NavigationReconcileRequest, type NavigationWorkRef, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
-import type { PackageRef } from "../domain/document-package";
+import { packageIdFor, packageManifestPath, parsePackageManifest, type PackageRef } from "../domain/document-package";
 import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH, type CompletedMaterializationRecord } from "../domain/materialization";
 import type { Env } from "../env";
 import type { ProjectState } from "../domain/project-state";
@@ -671,18 +671,37 @@ export class ProjectGuard extends DurableObject<Env> {
         proof = await this.admitRules(admissionState, normalized, mutationContext!.actor);
       }
 
-      // Capacity refusal is pre-admission: it must not reserve an idempotency
-      // intent that can serialize or conflict with otherwise independent work.
-      await this.assertCommitCapacity(tx.project_id);
+      const capacityReservationRequired = convergenceModeForProject(
+        this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, tx.project_id
+      ) === "repair";
+      const stagedRequest = canonicalJson({ request: tx, actor: proof?.actor ?? null });
+      if (capacityReservationRequired) {
+        // Stage exact replay material before the cross-DO reservation. A crash
+        // at either side of the acquire can then only replay this same request.
+        await this.enqueueRequestRecovery("transaction", tx.transaction_id, stagedRequest);
+        try {
+          await this.assertCommitCapacity(normalized, tx.transaction_id, admissionState?.revision ?? tx.base_revision);
+        } catch (error) {
+          const provenRefusal = error instanceof AdmissionError
+            && (error.code === "idempotency_payload_mismatch"
+              || (error.code === "convergence_capacity_exceeded" && error.detail?.reservation_outcome === "refused"));
+          if (provenRefusal) await this.clearTransactionRecovery(tx.transaction_id);
+          else await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+          throw error;
+        }
+      }
 
-      // Bind exact, server-admitted bytes before the journal can describe an
-      // admission. An interrupted provider write leaves an alarm, not a
-      // receipt-shaped progress record without any replayable request.
-      await this.enqueueRequestRecovery("transaction", tx.transaction_id, canonicalJson({ request: tx, actor: proof?.actor ?? null }));
+      // Capacity refusal is pre-admission and leaves no transaction intent.
+      // Existing non-repair projects retain their prior admission sequence.
+      if (!capacityReservationRequired) await this.enqueueRequestRecovery("transaction", tx.transaction_id, stagedRequest);
       try {
         await this.transactionRequests.ensureTransactionRequest(tx.project_id, tx, proof?.actor);
       } catch (error) {
-        if (error instanceof Error && error.message === "idempotency_payload_mismatch") throw new AdmissionError(error.message, 409);
+        if (error instanceof Error && error.message === "idempotency_payload_mismatch") {
+          const released = !capacityReservationRequired || await this.releaseCapacityReservation(normalized, tx.transaction_id);
+          if (released) await this.clearTransactionRecovery(tx.transaction_id);
+          throw new AdmissionError(error.message, 409);
+        }
         throw error;
       }
       if (proof) await this.persistAdmissionProof("transaction", tx.transaction_id, proof);
@@ -709,7 +728,8 @@ export class ProjectGuard extends DurableObject<Env> {
         const receipt = this.terminalReceipt(tx, result.kind, result.code, result.message, state?.revision ?? 0);
         await this.repository.writeTerminalTransaction(tx, receipt);
         this.persistReceipt(receipt);
-        await this.clearTransactionRecovery(tx.transaction_id);
+        const released = !capacityReservationRequired || await this.releaseCapacityReservation(normalized, tx.transaction_id);
+        if (released) await this.clearTransactionRecovery(tx.transaction_id);
         return Response.json(receipt);
       }
 
@@ -737,6 +757,10 @@ export class ProjectGuard extends DurableObject<Env> {
         };
         await this.repository.writeCommitRecord(record);
         this.persistCommit(result.state, receipt);
+        if (capacityReservationRequired && !await this.markCapacityReservationCommitted(normalized, tx.transaction_id, receipt.new_revision)) {
+          await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+          return Response.json(receipt, { headers: { "x-project-os-recovery-pending": "true" } });
+        }
         try {
           await this.storeCommittedRequestObservation(tx, receipt, machineCommitRecordPath(tx.project_id, result.state.revision), record);
         } catch (error) {
@@ -759,6 +783,11 @@ export class ProjectGuard extends DurableObject<Env> {
           return Response.json(receipt);
         }
         if (!await this.requestMaterializationSafely(result.state.revision)) {
+          await this.ensureTransactionRecovery(tx);
+          await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+          return Response.json(receipt, { headers: { "x-project-os-recovery-pending": "true" } });
+        }
+        if (capacityReservationRequired && !await this.markCapacityReservationHandedOff(normalized, tx.transaction_id, receipt.new_revision)) {
           await this.ensureTransactionRecovery(tx);
           await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
           return Response.json(receipt, { headers: { "x-project-os-recovery-pending": "true" } });
@@ -876,6 +905,13 @@ export class ProjectGuard extends DurableObject<Env> {
       );
     }
 
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, artifact.project_id) === "repair") {
+      await this.reserveCapacityBeforeEffect(
+        "artifact", artifact.request_id, serialized, normalized, state.revision, 1,
+        canonicalJson({ request: artifact, actor: mutationContext?.actor ?? null })
+      );
+    }
+
     try {
       // In V2 the mutation-gate intent is the canonical artifact admission
       // record. Establish it before the destination effect, so a status read
@@ -964,6 +1000,10 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.settleNavigationReceipt(operation, cached as NavigationDocumentReceipt);
         return Response.json(await this.currentNavigationReceipt(operation, cached as NavigationDocumentReceipt));
       }
+      if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, operation.project_id) === "repair") {
+        await this.settleDocumentReceipt(operation, cached);
+        await this.ensureDocumentCapacityReleased(operation, cached);
+      }
       return Response.json(cached);
     }
 
@@ -1018,7 +1058,12 @@ export class ProjectGuard extends DurableObject<Env> {
       const proof = existingProof ?? await this.admitRules(state, normalized, mutationContext.actor);
       if (!existingProof) await this.persistAdmissionProof(operation.operation === "package.freeze" ? "document" : "package-admission", operation.request_id, proof);
       try {
-        await this.enqueueRequestRecovery("document", operation.request_id, serialized);
+        if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, operation.project_id) === "repair") {
+          await this.reserveCapacityBeforeEffect("document", operation.request_id, serialized, normalized, state.revision,
+            await this.managedDocumentOutputCost(operation));
+        } else {
+          await this.enqueueRequestRecovery("document", operation.request_id, serialized);
+        }
       } catch (error) {
         if (error instanceof ManagedDocumentRequestIntentConflictError) {
           return Response.json(this.documentTerminalReceipt(operation, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH", "The same request_id was reused with a different managed-document payload"));
@@ -1042,8 +1087,10 @@ export class ProjectGuard extends DurableObject<Env> {
       await this.storeAdmittedDocumentObservation(operation, serialized);
       const durable = await this.managedDocumentRequests.readReceipt(operation.project_id, operation.request_id);
       if (durable) {
-        this.clearRequestRecovery("document", operation.request_id);
-        return Response.json(JSON.parse(durable.receipt_json));
+        const receipt = JSON.parse(durable.receipt_json) as ManagedDocumentOperationReceipt;
+        await this.settleDocumentReceipt(operation, receipt);
+        await this.ensureDocumentCapacityReleased(operation, receipt);
+        return Response.json(receipt);
       }
       try {
         return Response.json(await this.resumePackageManagedDocument(operation));
@@ -1072,7 +1119,12 @@ export class ProjectGuard extends DurableObject<Env> {
     if (rulesRequired) await this.persistAdmissionProof("document", operation.request_id, await this.admitRules(state, normalized, mutationContext!.actor));
 
     try {
-      await this.enqueueRequestRecovery("document", operation.request_id, serialized);
+      if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, operation.project_id) === "repair") {
+        await this.reserveCapacityBeforeEffect("document", operation.request_id, serialized, normalized, state.revision,
+          await this.managedDocumentOutputCost(operation));
+      } else {
+        await this.enqueueRequestRecovery("document", operation.request_id, serialized);
+      }
     } catch (error) {
       if (error instanceof ManagedDocumentRequestIntentConflictError) {
         return Response.json(this.documentTerminalReceipt(operation, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH", "The same request_id was reused with a different managed-document payload"));
@@ -1101,6 +1153,7 @@ export class ProjectGuard extends DurableObject<Env> {
     if (durableReceipt) {
       const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
       await this.settleDocumentReceipt(operation, receipt);
+      await this.ensureDocumentCapacityReleased(operation, receipt);
       return Response.json(receipt);
     }
 
@@ -1688,6 +1741,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       await this.settleArtifactReceipt(request, receipt);
       if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
+      await this.ensureArtifactCapacityReleased(request, receipt);
       return Response.json(receipt);
     } catch (error) {
       if (receipt.status !== "committed") throw error;
@@ -1785,7 +1839,20 @@ export class ProjectGuard extends DurableObject<Env> {
     // is deliberately a separate retryable step and can now be resumed by the
     // alarm if the initial invocation ends between receipt and certificate.
     await this.settleDocumentReceipt(request, receipt);
+    await this.ensureDocumentCapacityReleased(request, receipt);
     return Response.json(receipt);
+  }
+
+  private async ensureDocumentCapacityReleased(request: ManagedDocumentRequest, receipt: ManagedDocumentOperationReceipt): Promise<void> {
+    if (!await this.releaseManagedDocumentCapacity(request)) {
+      await this.enqueueRequestRecovery("document", request.request_id, JSON.stringify(request));
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return;
+    }
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) !== "repair") return;
+    if (receipt.status === "committed" && this.strictAdmissionEnabled(request.project_id)
+      && !(await new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id).status())?.terminal) return;
+    this.clearRequestRecovery("document", request.request_id);
   }
 
   /** Store the response cache before verification, then keep a wake signal
@@ -1802,8 +1869,9 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     this.persistDocumentRequest(request, receipt);
     if (receipt.status === "committed") await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
+    const capacityManaged = convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) === "repair";
     if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
-      this.clearRequestRecovery("document", request.request_id);
+      if (!capacityManaged) this.clearRequestRecovery("document", request.request_id);
       return;
     }
     await this.enqueueRequestRecovery("document", request.request_id);
@@ -1813,19 +1881,20 @@ export class ProjectGuard extends DurableObject<Env> {
       `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`
     );
     await this.finalizeVerifiedDocument(journal);
-    if ((await journal.status())?.terminal) this.clearRequestRecovery("document", request.request_id);
+    if ((await journal.status())?.terminal && !capacityManaged) this.clearRequestRecovery("document", request.request_id);
   }
 
   private async settleArtifactReceipt(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<void> {
     if (receipt.status === "committed") await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
+    const capacityManaged = convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) === "repair";
     if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
-      this.clearRequestRecovery("artifact", request.request_id);
+      if (!capacityManaged) this.clearRequestRecovery("artifact", request.request_id);
       return;
     }
     const journal = new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id);
     await journal.recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
     await this.finalizeVerifiedArtifact(journal);
-    if ((await journal.status())?.terminal) this.clearRequestRecovery("artifact", request.request_id);
+    if ((await journal.status())?.terminal && !capacityManaged) this.clearRequestRecovery("artifact", request.request_id);
   }
 
   private async enqueueNavigationRefreshForDirtyZones(projectId: string): Promise<void> {
@@ -1978,7 +2047,7 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async enqueueRequestRecovery(kind: "artifact" | "document" | "transaction", requestId: string, requestJson?: string): Promise<void> {
-    if ((kind === "document" || kind === "transaction") && requestJson) {
+    if ((kind === "artifact" || kind === "document" || kind === "transaction") && requestJson) {
       const digest = await sha256Text(requestJson);
       const canonical = kind === "document" && this.ctx.id.name ? await this.managedDocumentRequests.readIntent(this.ctx.id.name, requestId) : null;
       if (canonical && canonical.request_sha256 !== digest) throw new ManagedDocumentRequestIntentConflictError(requestId);
@@ -2513,6 +2582,7 @@ export class ProjectGuard extends DurableObject<Env> {
       try {
         let tx = await this.transactionRequests.readRecoverableTransaction(projectId, item.request_id);
         let intent = await this.transactionRequests.readIntent(projectId, item.request_id);
+        let stagedActor: { actor_id: string; authority: string } | null = null;
         if (!intent) {
           const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
             "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'transaction' AND request_id = ?", item.request_id
@@ -2521,9 +2591,9 @@ export class ProjectGuard extends DurableObject<Env> {
           const envelope = JSON.parse(staged.request_json) as { request?: unknown; actor?: { actor_id: string; authority: string } | null };
           tx = parseTransaction(envelope.request);
           if (tx.project_id !== projectId || tx.transaction_id !== item.request_id) throw new Error("transaction_staged_identity_mismatch");
-          intent = await this.transactionRequests.ensureTransactionRequest(projectId, tx, envelope.actor ?? undefined);
+          stagedActor = envelope.actor ?? null;
         }
-        if (!tx || !intent) throw new Error("transaction_intent_unavailable");
+        if (!tx) throw new Error("transaction_intent_unavailable");
         const committed = this.findReceipt(item.request_id) ?? await this.repository.readReceipt(item.request_id);
         if (committed?.status === "committed" && committed.project_id === projectId) {
           const replay = await this.replayCommittedTransactionResponse(tx, committed, false);
@@ -2533,7 +2603,7 @@ export class ProjectGuard extends DurableObject<Env> {
           continue;
         }
         const admitted = await new ExecutionJournal(this.persistence, projectId, "transaction", item.request_id).readAdmission();
-        const actor = admitted?.admission.actor ?? intent.actor;
+        const actor = admitted?.admission.actor ?? intent?.actor ?? stagedActor;
         const state = await this.loadOrRecoverState();
         if (this.strictAdmissionEnabled(projectId) && !actor) throw new Error("transaction_admission_actor_unavailable");
         const context = state && actor && this.env.MUTATION_CONTEXT_SIGNING_KEY
@@ -2719,6 +2789,14 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.blockRequestRecovery("document", requestId, "document_staged_identity_invalid");
         return;
       }
+      const durableReceipt = await this.managedDocumentRequests.readReceipt(projectId, requestId);
+      if (!durableReceipt && parsed.operation !== "navigation.reconcile"
+        && convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, projectId) === "repair") {
+        const state = await this.loadOrRecoverState();
+        if (!state) throw new Error("project_not_initialized");
+        await this.reserveCapacityBeforeEffect("document", requestId, staged.request_json,
+          await normalizeDocumentAdmission(parsed), state.revision, await this.managedDocumentOutputCost(parsed));
+      }
       await this.managedDocumentRequests.ensureIntent(projectId, requestId, staged.request_json);
       const persisted = await this.managedDocumentRequests.readIntent(projectId, requestId);
       if (!persisted || persisted.request_sha256 !== staged.request_sha256) throw new Error("document_intent_unavailable_after_stage");
@@ -2736,6 +2814,20 @@ export class ProjectGuard extends DurableObject<Env> {
     if (operation.project_id !== projectId || operation.request_id !== requestId) {
       await this.blockRequestRecovery("document", requestId, "document_intent_identity_invalid");
       return;
+    }
+    const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, requestId);
+    if (durableReceipt) {
+      const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
+      await this.settleDocumentReceipt(operation, receipt);
+      await this.ensureDocumentCapacityReleased(operation, receipt);
+      return;
+    }
+    if (operation.operation !== "navigation.reconcile"
+      && convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, operation.project_id) === "repair") {
+      const state = await this.loadOrRecoverState();
+      if (!state) throw new Error("project_not_initialized");
+      await this.reserveCapacityBeforeEffect("document", requestId, intent.request_json,
+        await normalizeDocumentAdmission(operation), state.revision, await this.managedDocumentOutputCost(operation));
     }
     if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
       try {
@@ -2770,11 +2862,6 @@ export class ProjectGuard extends DurableObject<Env> {
       await this.executeNavigationSlice(operation, frozen, admitted.admission);
       return;
     }
-    const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, requestId);
-    if (durableReceipt) {
-      await this.settleDocumentReceipt(operation, JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt);
-      return;
-    }
     const state = await this.loadOrRecoverState();
     if (!state) throw new Error("project_not_initialized");
     try {
@@ -2801,13 +2888,42 @@ export class ProjectGuard extends DurableObject<Env> {
   private async resumeArtifactFinalization(requestId: string): Promise<void> {
     const row = this.findArtifact(requestId);
     if (!row) {
-      this.clearRequestRecovery("artifact", requestId);
+      const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+        "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'artifact' AND request_id = ?", requestId
+      ).toArray()[0];
+      if (!staged) {
+        this.clearRequestRecovery("artifact", requestId);
+        return;
+      }
+      if (await sha256Text(staged.request_json) !== staged.request_sha256) throw new Error("artifact_staged_payload_invalid");
+      const stagedEnvelope = JSON.parse(staged.request_json) as {
+        request?: unknown;
+        actor?: { actor_id?: unknown; authority?: unknown } | null;
+      };
+      const request = parseArtifactWriteRequest(stagedEnvelope.request ?? stagedEnvelope);
+      const projectId = this.ctx.id.name;
+      if (!projectId || request.project_id !== projectId || request.request_id !== requestId) throw new Error("artifact_staged_identity_invalid");
+      const state = await this.loadOrRecoverState();
+      if (!state) throw new Error("project_not_initialized");
+      const admission = await new ExecutionJournal(this.persistence, projectId, "artifact", requestId).readAdmission();
+      const actor = admission?.admission.actor ?? (stagedEnvelope.actor
+        && typeof stagedEnvelope.actor.actor_id === "string" && typeof stagedEnvelope.actor.authority === "string"
+        ? { actor_id: stagedEnvelope.actor.actor_id, authority: stagedEnvelope.actor.authority }
+        : null);
+      if (!actor || !this.env.MUTATION_CONTEXT_SIGNING_KEY) throw new Error("artifact_staged_admission_unavailable");
+      const mutationContext = await issueMutationContext(state, this.env.MUTATION_CONTEXT_SIGNING_KEY, Date.now(), actor);
+      const response = await this.handleArtifact(new Request("https://project-guard.internal/artifact", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ admission_version: "1.0", request, mutation_context: mutationContext })
+      }));
+      if (!response.ok) throw new Error("artifact_capacity_or_recovery_pending");
       return;
     }
     const request = parseArtifactWriteRequest(JSON.parse(row.request_json));
     const receipt = JSON.parse(row.receipt_json) as ArtifactWriteReceipt;
     await this.repository.writeArtifactReceipt(receipt);
     await this.settleArtifactReceipt(request, receipt);
+    await this.ensureArtifactCapacityReleased(request, receipt);
   }
 
   private loadState(): ProjectState | null {
@@ -3150,24 +3266,56 @@ export class ProjectGuard extends DurableObject<Env> {
    * Capacity gates new canonical work only once the explicit repair writer is
    * enabled for this project. Existing durable repairs bypass this path.
    */
-  private async assertCommitCapacity(projectId: string): Promise<void> {
+  private async assertCommitCapacity(
+    admission: NormalizedAdmissionOperation,
+    requestId: string,
+    canonicalRevision: number,
+    reservationKind: "transaction" | "document" | "artifact" = "transaction",
+    outputCost = 1
+  ): Promise<void> {
+    const projectId = admission.project_id;
     if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, projectId) !== "repair") return;
     let response: Response;
     try {
       response = await this.env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
-        "https://materialization-guard.internal/capacity"
+        "https://materialization-guard.internal/capacity-reservation",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            project_id: projectId,
+            request_id: requestId,
+            request_hash: admission.request_hash,
+            reservation_kind: reservationKind,
+            output_cost: outputCost,
+            canonical_revision: canonicalRevision,
+            operation: admission.operation,
+            resources: admission.dependency_resources?.length ? admission.dependency_resources : admission.resources,
+            dependency_classification: admission.dependency_classification ?? "unknown"
+          })
+        }
       );
     } catch {
-      throw new AdmissionError("convergence_capacity_exceeded", 503);
+      throw new AdmissionError("convergence_capacity_exceeded", 503, { reservation_outcome: "unknown" });
     }
-    if (!response.ok) throw new AdmissionError("convergence_capacity_exceeded", 503);
     let observation: unknown;
     try {
       observation = await response.json();
     } catch {
-      throw new AdmissionError("convergence_capacity_exceeded", 503);
+      throw new AdmissionError("convergence_capacity_exceeded", 503, { reservation_outcome: "unknown" });
     }
-    if (!isCapacityObservation(observation)) throw new AdmissionError("convergence_capacity_exceeded", 503);
+    const body = observation as Record<string, unknown> | null;
+    if (response.status === 409 && body?.error === "idempotency_payload_mismatch") {
+      throw new AdmissionError("idempotency_payload_mismatch", 409);
+    }
+    if (!response.ok || !isCapacityObservation(observation)) {
+      const details = body && typeof body === "object" ? body : {};
+      const definitiveRefusal = response.status === 503 && details.error === "convergence_capacity_exceeded";
+      throw new AdmissionError("convergence_capacity_exceeded", 503, {
+        ...details, reservation_outcome: definitiveRefusal ? "refused" : "unknown"
+      });
+    }
+    if (body?.status === "reserved") return;
     try {
       assertCapacity(observation);
     } catch (error) {
@@ -3176,6 +3324,109 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       throw error;
     }
+  }
+
+  private async capacityReservationAction(
+    admission: NormalizedAdmissionOperation,
+    requestId: string,
+    route: "capacity-committed" | "capacity-handoff" | "capacity-release",
+    targetRevision?: number
+  ): Promise<boolean> {
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, admission.project_id) !== "repair") return true;
+    try {
+      const response = await this.env.MATERIALIZATION_GUARD.getByName(admission.project_id).fetch(
+        `https://materialization-guard.internal/${route}`,
+        {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ request_id: requestId, request_hash: admission.request_hash, target_revision: targetRevision })
+        }
+      );
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  private async markCapacityReservationCommitted(admission: NormalizedAdmissionOperation, requestId: string, targetRevision: number): Promise<boolean> {
+    return this.capacityReservationAction(admission, requestId, "capacity-committed", targetRevision);
+  }
+
+  private async markCapacityReservationHandedOff(admission: NormalizedAdmissionOperation, requestId: string, targetRevision: number): Promise<boolean> {
+    return this.capacityReservationAction(admission, requestId, "capacity-handoff", targetRevision);
+  }
+
+  private async releaseCapacityReservation(admission: NormalizedAdmissionOperation, requestId: string): Promise<boolean> {
+    return this.capacityReservationAction(admission, requestId, "capacity-release");
+  }
+
+  private async reserveCapacityBeforeEffect(
+    kind: "document" | "artifact",
+    requestId: string,
+    serializedRequest: string,
+    admission: NormalizedAdmissionOperation,
+    canonicalRevision: number,
+    outputCost = 1,
+    recoveryPayload = serializedRequest
+  ): Promise<void> {
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, admission.project_id) !== "repair") return;
+    await this.enqueueRequestRecovery(kind, requestId, recoveryPayload);
+    try {
+      await this.assertCommitCapacity(admission, requestId, canonicalRevision, kind, outputCost);
+    } catch (error) {
+      const provenRefusal = error instanceof AdmissionError
+        && (error.code === "idempotency_payload_mismatch"
+          || (error.code === "convergence_capacity_exceeded" && error.detail?.reservation_outcome === "refused"));
+      if (provenRefusal) this.clearRequestRecovery(kind, requestId);
+      else await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      throw error;
+    }
+  }
+
+  private async managedDocumentOutputCost(operation: ManagedDocumentRequest): Promise<number> {
+    if (operation.operation !== "package.replace") return 1;
+    const ref = operation.candidate;
+    const raw = await this.persistence.objects.readText(packageManifestPath(ref));
+    if (raw === null || await sha256Text(raw) !== ref.manifest_sha256) {
+      throw new AdmissionError("canonical_unavailable", 503, { capacity_cost_unavailable: true });
+    }
+    try {
+      const manifest = parsePackageManifest(JSON.parse(raw));
+      if (manifest.project_id !== ref.project_id || manifest.version !== ref.version
+        || await packageIdFor(manifest.project_id, manifest.creation_request_id) !== ref.package_id
+        || manifest.members.length < 1 || manifest.members.length > 200) throw new Error("package_manifest_identity_mismatch");
+      return manifest.members.length;
+    } catch {
+      throw new AdmissionError("canonical_unavailable", 503, { capacity_cost_unavailable: true });
+    }
+  }
+
+  private async releaseManagedDocumentCapacity(operation: ManagedDocumentRequest): Promise<boolean> {
+    if (operation.operation === "navigation.reconcile"
+      || convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, operation.project_id) !== "repair") return true;
+    return this.releaseCapacityReservation(await normalizeDocumentAdmission(operation), operation.request_id);
+  }
+
+  private async releaseArtifactCapacity(request: ArtifactWriteRequest): Promise<boolean> {
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) !== "repair") return true;
+    return this.releaseCapacityReservation({
+      project_id: request.project_id,
+      operation: "artifact.write",
+      resources: [],
+      request_hash: await sha256Canonical(request),
+      dependency_classification: "resource_bound"
+    }, request.request_id);
+  }
+
+  private async ensureArtifactCapacityReleased(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<void> {
+    if (!await this.releaseArtifactCapacity(request)) {
+      await this.enqueueRequestRecovery("artifact", request.request_id, JSON.stringify(request));
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return;
+    }
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) !== "repair") return;
+    if (receipt.status === "committed" && this.strictAdmissionEnabled(request.project_id)
+      && !(await new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id).status())?.terminal) return;
+    this.clearRequestRecovery("artifact", request.request_id);
   }
 
   private async verifyAdmission(context: MutationContext | null, tx: Transaction, state: ProjectState): Promise<void> {
@@ -4460,8 +4711,13 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async replayStatusSideEffects(tx: Transaction, receipt: Receipt): Promise<boolean> {
     await this.recordTransactionExecutionReceipt(tx, receipt);
-    if (receipt.status !== "committed") return true;
-    if (this.layoutMode === "v2" && !await this.requestMaterializationSafely(receipt.new_revision)) return false;
+    const normalized = await normalizeTransactionAdmission(tx);
+    if (receipt.status !== "committed") return await this.releaseCapacityReservation(normalized, tx.transaction_id);
+    if (this.layoutMode === "v2") {
+      if (!await this.markCapacityReservationCommitted(normalized, tx.transaction_id, receipt.new_revision)) return false;
+      if (!await this.requestMaterializationSafely(receipt.new_revision)) return false;
+      if (!await this.markCapacityReservationHandedOff(normalized, tx.transaction_id, receipt.new_revision)) return false;
+    }
     if (!PROJECT_STATUS_OPERATIONS.has(tx.operation)) return true;
     const currentState = await this.loadOrRecoverState();
     if (!currentState) return false;
@@ -4478,6 +4734,10 @@ export class ProjectGuard extends DurableObject<Env> {
     // opted-in caller receives that same receipt without waiting for views;
     // any still-durable request row remains responsible for maintenance.
     if (receipt.status === "committed" && prefersAsync && !PROJECT_STATUS_OPERATIONS.has(tx.operation)) {
+      const normalized = await normalizeTransactionAdmission(tx);
+      if (!await this.markCapacityReservationCommitted(normalized, tx.transaction_id, receipt.new_revision)) {
+        return Response.json(receipt, { headers: { "x-project-os-recovery-pending": "true" } });
+      }
       return Response.json(receipt);
     }
     if (receipt.status === "committed" && this.layoutMode === "v2") await this.ensureTransactionRecovery(tx);

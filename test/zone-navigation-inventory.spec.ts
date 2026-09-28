@@ -893,6 +893,144 @@ describe("ZoneNavigationInventory", () => {
     expect(pages.flatMap((page) => page.gaps)).toContainEqual(expect.objectContaining({ code: "artifact_destination_outside_navigation_zones" }));
   });
 
+  it("batches outside-zone artifact gaps and replays the same bounded page", async () => {
+    const h = harness();
+    await addWorkingHead(h, "current valid head", "rev-valid", "DOC-1123456789ABCDEF01234567", "VER-REQ-1123456789ABCDEF01234567", "valid.md");
+    const inactiveId = "DOC-2123456789ABCDEF01234567";
+    h.put(machineDocumentHeadPath(projectId, inactiveId), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: inactiveId,
+      kind: "work_product", logical_path: "inactive.md", reconciliation_status: "clean"
+    }));
+    const mismatchedPath = await addWorkingHead(h, "recorded mismatch", "rev-mismatch", "DOC-3123456789ABCDEF01234567", "VER-REQ-3123456789ABCDEF01234567", "mismatch.md");
+    h.put(mismatchedPath, "physical bytes changed after the head", "id:physical-mismatch");
+    const expected: Array<{ resource_id: string; code: string }> = [];
+    for (let index = 1; index <= 4; index += 1) {
+      const requestId = `ART-NAVIGATION-BATCH-${String(index).padStart(4, "0")}`;
+      const destination = `${workspaceProjectRoot(projectId, slug)}/ARCHIVE/${index}.md`;
+      await seedCommittedArtifact(h, requestId, destination, `archived artifact ${index}`);
+      expected.push({ resource_id: `artifact:${await sha256Text(destination)}`, code: "artifact_destination_outside_navigation_zones" });
+    }
+
+    const cursor = "artifacts:";
+    const before = h.providerCalls;
+    const pages = [];
+    let nextCursor: string | null = cursor;
+    do {
+      const slice = budget(32);
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: nextCursor, limit: 8, budget: slice });
+      expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+      pages.push(page);
+      nextCursor = page.next_cursor;
+    } while (nextCursor !== null);
+    const callsUsed = h.providerCalls - before;
+    const first = pages[0]!;
+    const replay = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget(32) });
+
+    expect(first).toEqual(replay);
+    expect(first.entries).toEqual([]);
+    expect(pages.flatMap((page) => page.gaps)).toEqual(expected);
+    expect(callsUsed).toBe(10);
+    expect(first.next_cursor).toBeNull();
+    expect(pages).toHaveLength(1);
+
+    const interruptedPrefix = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget(24) });
+    expect(interruptedPrefix.gaps).toHaveLength(2);
+    expect(interruptedPrefix.next_cursor).not.toBeNull();
+    const listPage = h.runtime.pagedListing!.listPage;
+    let faulted = false;
+    h.runtime.pagedListing!.listPage = async (input) => {
+      if (!faulted) { faulted = true; throw new Error("injected provider interruption after acknowledged prefix"); }
+      return listPage(input);
+    };
+    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: interruptedPrefix.next_cursor, limit: 8, budget: budget(32) }))
+      .rejects.toThrow("injected provider interruption after acknowledged prefix");
+    h.runtime.pagedListing!.listPage = listPage;
+    const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: interruptedPrefix.next_cursor, limit: 8, budget: budget(32) });
+    expect(resumed.entries).toEqual([]);
+    const recoveredGaps = [...interruptedPrefix.gaps, ...resumed.gaps];
+    let recoveredCursor = resumed.next_cursor;
+    let recoveryPages = 0;
+    while (recoveredCursor !== null) {
+      const recovery = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: recoveredCursor, limit: 8, budget: budget(32) });
+      recoveredGaps.push(...recovery.gaps);
+      recoveredCursor = recovery.next_cursor;
+      if (++recoveryPages > 4) throw new Error("artifact_gap_recovery_unbounded");
+    }
+    expect(recoveredGaps).toEqual(expected);
+
+    const fullBefore = h.providerCalls;
+    const fullPages = [];
+    let fullCursor: string | null = null;
+    let fullSteps = 0;
+    let fullFaultInjected = false;
+    do {
+      const isArtifactPhase = fullCursor?.startsWith("artifacts:") ?? false;
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: fullCursor, limit: 8, budget: budget(isArtifactPhase ? 24 : 32) });
+      fullPages.push(page);
+      fullCursor = page.next_cursor;
+      if (isArtifactPhase && page.gaps.filter((gap) => gap.code === "artifact_destination_outside_navigation_zones").length === 2 && fullCursor !== null) {
+        const acknowledgedCursor = fullCursor;
+        const providerListPage = h.runtime.pagedListing!.listPage;
+        h.runtime.pagedListing!.listPage = async () => { throw new Error("injected full-traversal provider interruption"); };
+        await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: acknowledgedCursor, limit: 8, budget: budget(32) }))
+          .rejects.toThrow("injected full-traversal provider interruption");
+        h.runtime.pagedListing!.listPage = providerListPage;
+        const retry = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: acknowledgedCursor, limit: 8, budget: budget(32) });
+        fullPages.push(retry);
+        fullCursor = retry.next_cursor;
+        fullFaultInjected = true;
+      }
+      fullSteps += 1;
+      if (fullSteps > 20) throw new Error("mixed_initial_navigation_unbounded");
+    } while (fullCursor !== null);
+    const fullCallsUsed = h.providerCalls - fullBefore;
+    const fullEntries = fullPages.flatMap((page) => page.entries);
+    const fullGaps = fullPages.flatMap((page) => page.gaps);
+    expect(fullFaultInjected).toBe(true);
+    expect(fullEntries.map((entry) => entry.resource_id)).toContain("head:DOC-1123456789ABCDEF01234567");
+    expect(fullEntries.map((entry) => entry.resource_id)).not.toContain(`head:${inactiveId}`);
+    expect(fullGaps.some((gap) => gap.resource_id === "head:DOC-3123456789ABCDEF01234567")).toBe(true);
+    expect(fullGaps.filter((gap) => gap.code === "artifact_destination_outside_navigation_zones")).toHaveLength(4);
+    expect({ calls: fullCallsUsed, tranches: fullPages.length }).toEqual({ calls: 36, tranches: 4 });
+  });
+
+  it("measures the full initial traversal for mixed heads and outside-zone artifacts", async () => {
+    const h = harness();
+    await addWorkingHead(h, "current valid head", "rev-valid", "DOC-1123456789ABCDEF01234567", "VER-REQ-1123456789ABCDEF01234567", "valid.md");
+    const inactiveId = "DOC-2123456789ABCDEF01234567";
+    h.put(machineDocumentHeadPath(projectId, inactiveId), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: inactiveId,
+      kind: "work_product", logical_path: "inactive.md", reconciliation_status: "clean"
+    }));
+    const mismatchedPath = await addWorkingHead(h, "recorded mismatch", "rev-mismatch", "DOC-3123456789ABCDEF01234567", "VER-REQ-3123456789ABCDEF01234567", "mismatch.md");
+    h.put(mismatchedPath, "physical bytes changed after the head", "id:physical-mismatch");
+    const expectedArtifacts: string[] = [];
+    for (let index = 1; index <= 4; index += 1) {
+      const requestId = `ART-NAVIGATION-FULL-${String(index).padStart(4, "0")}`;
+      const destination = `${workspaceProjectRoot(projectId, slug)}/ARCHIVE/${index}.md`;
+      await seedCommittedArtifact(h, requestId, destination, `archived artifact ${index}`);
+      expectedArtifacts.push(`artifact:${await sha256Text(destination)}`);
+    }
+
+    const before = h.providerCalls;
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget(32) });
+      pages.push(page);
+      cursor = page.next_cursor;
+      if (pages.length > 20) throw new Error("mixed_full_traversal_unbounded");
+    } while (cursor !== null);
+    const calls = h.providerCalls - before;
+    const entries = pages.flatMap((page) => page.entries);
+    const gaps = pages.flatMap((page) => page.gaps);
+    expect(entries.map((entry) => entry.resource_id)).toContain("head:DOC-1123456789ABCDEF01234567");
+    expect(entries.map((entry) => entry.resource_id)).not.toContain(`head:${inactiveId}`);
+    expect(gaps.some((gap) => gap.resource_id === "head:DOC-3123456789ABCDEF01234567")).toBe(true);
+    expect(gaps.filter((gap) => gap.code === "artifact_destination_outside_navigation_zones").map((gap) => gap.resource_id)).toEqual(expectedArtifacts);
+    expect({ calls, tranches: pages.length }).toEqual({ calls: 32, tranches: 3 });
+  });
+
   it.each([
     ["missing catalog record", null, true, "canonical_catalog_entry_unavailable"],
     ["invalid schema version", JSON.stringify({ schema_version: "9.0", resource_id: `head:${documentId}`, entry: {} }), false, "canonical_catalog_entry_invalid"],

@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
-import { ConvergenceJournal } from "../src/convergence/journal";
+import { ConvergenceJournal, initialProgress } from "../src/convergence/journal";
 import { MaterializationGuard } from "../src/durable/materialization-guard";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
@@ -14,13 +14,14 @@ import {
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
-import { commitFixture } from "./helpers/convergence-fixture";
+import { commitFixture, seedCommits } from "./helpers/convergence-fixture";
 import type { SliceBudget } from "../src/convergence/contract";
 import { ExecutionJournal } from "../src/execution/journal";
 import { navigationWorkRefSchema } from "../src/domain/zone-navigation";
 import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { sha256Canonical } from "../src/materialization/hash";
+import { MaterializationLedger } from "../src/materialization/ledger";
 import { canonicalJson } from "../src/rules/contract";
 
 const testEnv = env as unknown as Env;
@@ -66,17 +67,23 @@ describe("MaterializationGuard isolation boundary", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("does not queue capacity or diagnostics reads behind maintenance I/O", async () => {
-    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
-      projectId: "PRJ-3913", queue: Promise.resolve(), queueDepth: 0,
-      ctx: { id: { name: "PRJ-3913" }, storage: {} }
-    }) as MaterializationGuard;
+    installDropboxMock();
+    const projectId = "PRJ-3913";
+    const progress = initialProgress(projectId, at, "capacity-empty-proof");
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (_instance, state) => {
+      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(progress, "capacity-token-0");
+    });
     let entered!: () => void;
     let release!: () => void;
     const enteredMaintenance = new Promise<void>((resolve) => { entered = resolve; });
     const maintenance = new Promise<void>((resolve) => { release = resolve; });
-    const held = (guard as unknown as { serialize<T>(operation: () => Promise<T>): Promise<T> })
-      .serialize(async () => { entered(); await maintenance; });
-    await enteredMaintenance;
+    let held!: Promise<void>;
+    await runInDurableObject(guard, async (instance) => {
+      held = (instance as unknown as { serialize<T>(operation: () => Promise<T>): Promise<T> })
+        .serialize(async () => { entered(); await maintenance; });
+      await enteredMaintenance;
+    });
 
     try {
       for (const path of ["/capacity", "/diagnostic-status"]) {
@@ -85,13 +92,229 @@ describe("MaterializationGuard isolation boundary", () => {
           .then((response) => { finished = true; return response; });
         await vi.waitFor(() => expect(finished).toBe(true), { timeout: 150 });
         const response = await read;
-        expect(response.status).toBe(503);
-        await expect(response.json()).resolves.toMatchObject({ status: "unavailable", freshness: "unknown" });
+        if (path === "/capacity") {
+          expect(response.status).toBe(200);
+          await expect(response.json()).resolves.toMatchObject({
+            queued_outputs: 0, oldest_pending_seconds: 0,
+            continuation_available: true, within_qualified_envelope: true
+          });
+        } else {
+          expect(response.status).toBe(503);
+          await expect(response.json()).resolves.toMatchObject({ status: "unavailable", freshness: "unknown" });
+        }
       }
     } finally {
       release();
       await held;
     }
+  });
+
+  it("fails closed when capacity cannot prove a current baseline", async () => {
+    installDropboxMock();
+    const absent = await materializationNamespace().getByName("PRJ-3914")
+      .fetch(new Request("https://materialization-guard.internal/capacity"));
+    expect(absent.status).toBe(503);
+    await expect(absent.json()).resolves.toMatchObject({
+      status: "unavailable", freshness: "unknown"
+    });
+
+    const projectId = "PRJ-3915";
+    const mock = installDropboxMock();
+    const records = commitFixture(projectId, 2);
+    seedCommits(mock, records);
+    const stale = initialProgress(projectId, at, "capacity-stale-proof");
+    stale.canonical_observed_revision = 1;
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (_instance, state) => {
+      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(stale, "capacity-token-1");
+    });
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId,
+        request_id: "TXN-CAPACITY-STALE-0001",
+        request_hash: "a".repeat(64),
+        canonical_revision: 2,
+        operation: "task.create",
+        dependency_classification: "resource_bound",
+        resources: [{ resource_id: "TASK-CAP1001", resource_type: "task", zone: "PROJECT", version: "2" }]
+      })
+    }));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      status: "unavailable", freshness: "unknown"
+    });
+  });
+
+  it("arms bounded reconstruction for an unknown reservation without admitting non-create work", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3917";
+    const guard = materializationNamespace().getByName(projectId);
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId,
+        request_id: "TXN-CAPACITY-COLD-0001",
+        request_hash: "e".repeat(64),
+        canonical_revision: 1,
+        operation: "task.create",
+        dependency_classification: "resource_bound",
+        resources: [{ resource_id: "TASK-COLD-0001", resource_type: "task", zone: "PROJECT", version: "1" }]
+      })
+    }));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ status: "unavailable", freshness: "unknown" });
+    await runInDurableObject(guard, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+
+    const degradedProjectId = "PRJ-3919";
+    const degradedGuard = materializationNamespace().getByName(degradedProjectId);
+    await runInDurableObject(degradedGuard, (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO convergence_checkpoint (singleton, progress_json, provider_token) VALUES (1, ?, '')",
+        JSON.stringify(initialProgress(degradedProjectId, at, "capacity-missing-token"))
+      );
+    });
+    const degraded = await degradedGuard.fetch(new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: degradedProjectId,
+        request_id: "TXN-CAPACITY-NOTOKEN-0001",
+        request_hash: "c".repeat(64),
+        canonical_revision: 0,
+        operation: "project.create",
+        dependency_classification: "resource_bound",
+        resources: [{ resource_id: "TXN-CAPACITY-NOTOKEN-0001", resource_type: "project", zone: "PROJECT", version: "0" }]
+      })
+    }));
+    expect(degraded.status).toBe(503);
+    await runInDurableObject(degradedGuard, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("admits and exactly replays only the zero-state project-create bootstrap reservation", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3918";
+    const guard = materializationNamespace().getByName(projectId);
+    const request = (requestId: string, hash: string, operation: string, revision: number) => new Request(
+      "https://materialization-guard.internal/capacity-reservation", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectId, request_id: requestId, request_hash: hash,
+          canonical_revision: revision, operation,
+          dependency_classification: "resource_bound",
+          resources: [{ resource_id: requestId, resource_type: "project", zone: "PROJECT", version: String(revision) }]
+        })
+      }
+    );
+    const first = await guard.fetch(request("TXN-CREATE-COLD-0001", "f".repeat(64), "project.create", 0));
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({ status: "admitted", canonical_revision: 0 });
+
+    const replay = await guard.fetch(request("TXN-CREATE-COLD-0001", "f".repeat(64), "project.create", 0));
+    expect(replay.status).toBe(200);
+    await expect(replay.json()).resolves.toMatchObject({ status: "reserved", queued_outputs: 1 });
+
+    const competing = await guard.fetch(request("TXN-CREATE-COLD-0002", "a".repeat(64), "project.create", 0));
+    expect(competing.status).toBe(503);
+    const nonCreate = await guard.fetch(request("TXN-CREATE-COLD-0003", "b".repeat(64), "task.create", 0));
+    expect(nonCreate.status).toBe(503);
+  });
+
+  it("atomically reserves capacity at the limit and replays only the exact request", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3916";
+    const guard = materializationNamespace().getByName(projectId);
+    const progress = initialProgress(projectId, at, "capacity-boundary-proof");
+    const recent = new Date().toISOString();
+    progress.obligations = Object.fromEntries(Array.from({ length: 199 }, (_, index) => {
+      const id = index.toString(16).padStart(64, "0");
+      return [id, {
+        id, layer: "state", from_revision: 0,
+        target: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION },
+        incident: 1, state: "pending", first_pending_at: recent,
+        next_attempt_at: null, failure_count: 0, last_attempt_number: 0,
+        last_closed_attempt_number: 0, last_verified_at: null, code: null,
+        lease_until: null, continuation: null
+      }];
+    }));
+    await runInDurableObject(guard, async (_instance, state) => {
+      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(progress, "capacity-token-199");
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+    const makeRequest = (requestId: string, requestHash: string) => new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId, request_id: requestId, request_hash: requestHash,
+        canonical_revision: 0, operation: "task.create",
+        dependency_classification: "resource_bound",
+        resources: [{ resource_id: requestId, resource_type: "task", zone: "PROJECT", version: "0" }]
+      })
+    });
+    const pair = await Promise.all([
+      guard.fetch(makeRequest("TXN-CAPACITY-BOUNDARY-0001", "b".repeat(64))),
+      guard.fetch(makeRequest("TXN-CAPACITY-BOUNDARY-0002", "d".repeat(64)))
+    ]);
+    expect(pair.map((response) => response.status).sort()).toEqual([200, 503]);
+    const winnerIndex = pair[0]!.status === 200 ? 0 : 1;
+    const winnerId = winnerIndex === 0 ? "TXN-CAPACITY-BOUNDARY-0001" : "TXN-CAPACITY-BOUNDARY-0002";
+    const winnerHash = winnerIndex === 0 ? "b".repeat(64) : "d".repeat(64);
+    const replay = await guard.fetch(makeRequest(winnerId, winnerHash));
+    expect(replay.status).toBe(200);
+    const changed = await guard.fetch(makeRequest(winnerId, "c".repeat(64)));
+    expect(changed.status).toBe(409);
+    const competing = pair[1 - winnerIndex]!;
+    await expect(competing.json()).resolves.toMatchObject({ error: "convergence_capacity_exceeded", reason: "queued_outputs_exceeded" });
+  });
+
+  it("counts an in-flight document reservation without globally blocking independent work", async () => {
+    const projectId = "PRJ-3931";
+    const guard = materializationNamespace().getByName(projectId);
+    const progress = initialProgress(projectId, at, "capacity-physical-proof");
+    await runInDurableObject(guard, async (_instance, state) => {
+      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(progress, "capacity-token-physical");
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+    const makeRequest = (input: Record<string, unknown>) => new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ project_id: projectId, canonical_revision: 0, ...input })
+    });
+    const documentResource = { resource_id: "DOC-1123456789ABCDEF01234567", resource_type: "document", zone: "DELIVERABLES", version: "VER-1123456789ABCDEF01234567" };
+    const document = await guard.fetch(makeRequest({
+      request_id: "DOCREQ-CAP-PHYS-0001", request_hash: "a".repeat(64), operation: "document.publish",
+      reservation_kind: "document", output_cost: 1, dependency_classification: "resource_bound", resources: [documentResource]
+    }));
+    expect(document.status).toBe(200);
+
+    const independent = await guard.fetch(makeRequest({
+      request_id: "TXN-CAP-PHYS-INDEP-0001", request_hash: "b".repeat(64), operation: "task.create",
+      dependency_classification: "resource_bound", resources: [{ resource_id: "TSK-1123456789ABCDEF01234567", resource_type: "task", zone: "PROJECT", version: "0" }]
+    }));
+    expect(independent.status).toBe(200);
+
+    // A committed independent revision can advance the canonical proof while
+    // the physical document effect remains in flight. Reacquiring the same
+    // document request must stay idempotent even though its current revision
+    // hint is newer than the one recorded at first acquire.
+    progress.canonical_observed_revision = 1;
+    await runInDurableObject(guard, (_instance, state) => {
+      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(progress, "capacity-token-physical-1");
+    });
+    const sameEffectReplay = await guard.fetch(makeRequest({
+      request_id: "DOCREQ-CAP-PHYS-0001", request_hash: "a".repeat(64), canonical_revision: 1,
+      operation: "document.publish", reservation_kind: "document", output_cost: 1,
+      dependency_classification: "resource_bound", resources: [documentResource]
+    }));
+    expect(sameEffectReplay.status).toBe(200);
+    await expect(sameEffectReplay.json()).resolves.toMatchObject({ status: "reserved", queued_outputs: 1 });
+
+    const sameDocument = await guard.fetch(makeRequest({
+      request_id: "TXN-CAP-PHYS-DEP-0001", request_hash: "c".repeat(64), canonical_revision: 1, operation: "document.publish",
+      dependency_classification: "resource_bound", resources: [documentResource]
+    }));
+    expect(sameDocument.status).toBe(503);
+    await expect(sameDocument.json()).resolves.toMatchObject({ error: "dependency_pending" });
   });
 
   it("durably acknowledges exact navigation work while the MG serialization queue is held", async () => {
@@ -220,6 +443,7 @@ describe("MaterializationGuard isolation boundary", () => {
     const makeGuard = (environment: Env = testEnv) => Object.assign(Object.create(MaterializationGuard.prototype), {
       projectId, env: environment, queue: Promise.resolve(), queueDepth: 0, wakeScheduleQueue: undefined,
       layoutMode: "v2", notifyProjectGuardOfCurrentHead: async () => true,
+      ledger: { capacitySnapshot: () => ({ status: { active: null, requested: null }, progress: null, reservations: [] }) },
       ctx: { id: { name: projectId }, storage }
     }) as MaterializationGuard;
     let guard = makeGuard();
@@ -682,9 +906,12 @@ describe("MaterializationGuard isolation boundary", () => {
       projectId: "PRJ-3919",
       layoutMode: "v2",
       env: {},
+      ledger: { capacitySnapshot: () => ({ status: { active: null, requested: null }, progress: null, reservations: [] }) },
       ctx: { storage: {
         get: async () => undefined,
-        list: async () => new Map()
+        list: async () => new Map(),
+        getAlarm: async () => null,
+        setAlarm: vi.fn(async () => undefined)
       } },
       queue: Promise.resolve()
     }) as MaterializationGuard;

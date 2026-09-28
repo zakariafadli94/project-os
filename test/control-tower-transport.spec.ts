@@ -72,4 +72,35 @@ describe("Control Tower MCP wire transport", () => {
     } });
     expect(calls[1]?.body).not.toHaveProperty("response_mode");
   }, 5000);
+
+  it("uses the short transaction path by default while preserving explicit wait", async () => {
+    const calls: Array<{ path: string; prefer: string | null }> = [];
+    const owner = { getByName: () => ({ fetch: async (url: string, init?: RequestInit) => {
+      const path = new URL(url).pathname;
+      calls.push({ path, prefer: new Headers(init?.headers).get("prefer") });
+      if (path === "/mutation-context") return Response.json({ context: {
+        actor: { actor_id: "tower-test", authority: "operator" }, project_id: "PRJ-0007", canonical_revision: 1,
+        state_hash: "a".repeat(64), observed_at: "2026-09-26T10:00:00.000Z", expiry: "2026-09-26T10:05:00.000Z", token: "a.b"
+      } });
+      const request = JSON.parse(String(init?.body)).request;
+      return Response.json({ schema_version: "1.0", transaction_id: request.transaction_id, project_id: "PRJ-0007",
+        status: "committed", previous_revision: 1, new_revision: 2, event_id: "EVT-000002", committed_at: "2026-09-26T10:01:00.000Z" });
+    } }) } as unknown as DurableObjectNamespace;
+    const makeCall = (id: number, response_mode?: "wait") => {
+      const handler = createMcpHandler(() => createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }));
+      return handler.fetch(new Request("https://project-os-control-tower.example/mcp", {
+        method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-06-18" },
+        body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "project_os_submit_transaction", arguments: {
+          project_id: "PRJ-0007", ...(response_mode ? { response_mode } : {}), request: {
+            schema_version: "1.0", transaction_id: `TXN-TOWER-DEFAULT-000${id}`, project_id: "PRJ-0007", base_revision: 1,
+            operation: "task.create", created_at: "2026-09-26T10:01:00.000Z",
+            payload: { task_id: `TASK-TOWERDEFAULT${id}`, title: "Use the bounded response" }
+          }
+        } } })
+      }));
+    };
+    expect((await makeCall(1)).status).toBe(200);
+    expect((await makeCall(2, "wait")).status).toBe(200);
+    await vi.waitFor(() => expect(calls.filter((call) => call.path === "/transaction").map((call) => call.prefer)).toEqual(["respond-async", null]));
+  }, 5000);
 });

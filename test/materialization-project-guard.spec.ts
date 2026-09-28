@@ -4,6 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import type { Receipt } from "../src/domain/receipt";
+import type { MutationContext } from "../src/admission/mutation-context";
+import { encodeAdmission } from "../src/admission/transport";
+import { MaterializationGuard } from "../src/durable/materialization-guard";
+import { ProjectGuard as NeutralProjectGuard } from "../src/durable/project-guard-neutral";
 import {
   machineCommitRecordPath,
   machineMaterializationHeadPath,
@@ -14,6 +18,7 @@ import {
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-24T17:40:00+01:00";
@@ -330,4 +335,104 @@ describe("ProjectGuard asynchronous materialization", () => {
       expect(await state.storage.getAlarm()).not.toBeNull();
     });
   });
+
+  it("admits an independent governed transaction while scheduled materialization waits on MG", async () => {
+    const projectId = "PRJ-3610";
+    await createSyntheticProject(projectId, "fleet-does-not-block-admission", "TXN-MATERIAL-PG-3610-CREATE");
+    const project = testEnv.PROJECT_GUARD.getByName(projectId);
+    const signingKey = "fleet-materialization-admission-fixture";
+    await runInDurableObject(project, (instance) => {
+      Object.assign((instance as unknown as { env: Env }).env, {
+        PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }),
+        MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+        RULE_ADMISSION_SIGNING_KEY: signingKey
+      });
+    });
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
+
+    const contextResponse = await project.fetch("https://project-guard.internal/mutation-context?include_state=false");
+    expect(contextResponse.status).toBe(200);
+    const { context } = await contextResponse.json<{ context: MutationContext }>();
+
+    let reconcileEntered = false;
+    let holdReconcile = false;
+    let reconcileCalls = 0;
+    let releaseReconcile!: () => void;
+    const reconcileGate = new Promise<void>((resolve) => { releaseReconcile = resolve; });
+    const original = (MaterializationGuard.prototype as unknown as { handleReconcile: () => Promise<Response> }).handleReconcile;
+    vi.spyOn(MaterializationGuard.prototype as unknown as { handleReconcile: () => Promise<Response> }, "handleReconcile")
+      .mockImplementation(async function (this: MaterializationGuard) {
+        reconcileCalls += 1;
+        if (holdReconcile) {
+          reconcileEntered = true;
+          await reconcileGate;
+        }
+        return original.call(this);
+      });
+
+    let materializationProofPersisted = false;
+    const proofPrototype = NeutralProjectGuard.prototype as unknown as {
+      persistAdmissionProof(kind: string, requestId: string, proof: unknown): Promise<void>;
+    };
+    const persistAdmissionProof = proofPrototype.persistAdmissionProof;
+    vi.spyOn(proofPrototype, "persistAdmissionProof").mockImplementation(async function (this: unknown, kind, requestId, proof) {
+      await persistAdmissionProof.call(this, kind, requestId, proof);
+      if (kind === "materialization" && requestId === "/reconcile@1") materializationProofPersisted = true;
+    });
+
+    const missing = testEnv.PROJECT_GUARD.getByName("PRJ-3611");
+    const missingResponse = await missing.fetch("https://project-guard.internal/scheduled-reconcile-materialization", { method: "POST" });
+    expect(missingResponse.status).toBe(404);
+    expect(reconcileCalls).toBe(0);
+
+    const noRuleAuthorityId = "PRJ-3612";
+    await createSyntheticProject(noRuleAuthorityId, "fleet-rule-authority-unavailable", "TXN-MATERIAL-PG-3612-CREATE");
+    await runInDurableObject(testEnv.PROJECT_GUARD.getByName(noRuleAuthorityId), (instance) => {
+      Object.assign((instance as unknown as { env: Env }).env, {
+        PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [noRuleAuthorityId]: "strict" }),
+        RULE_ADMISSION_SIGNING_KEY: ""
+      });
+    });
+    const unavailableGovernance = await testEnv.PROJECT_GUARD.getByName(noRuleAuthorityId).fetch(
+      "https://project-guard.internal/scheduled-reconcile-materialization", { method: "POST" }
+    );
+    expect(unavailableGovernance.status).toBe(503);
+    expect(reconcileCalls).toBe(0);
+
+    holdReconcile = true;
+    const fleet = project.fetch("https://project-guard.internal/scheduled-reconcile-materialization", { method: "POST" });
+    let attempt: Promise<{ status: number; receipt: Receipt }> | null = null;
+    try {
+      await vi.waitFor(() => expect(reconcileEntered).toBe(true));
+      expect(materializationProofPersisted).toBe(true);
+      const transactionId = "TXN-MATERIAL-PG-3610-INDEPENDENT";
+      attempt = project.fetch("https://project-guard.internal/transaction", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(encodeAdmission({
+          schema_version: "1.0",
+          transaction_id: transactionId,
+          project_id: projectId,
+          base_revision: 1,
+          operation: "decision.accept",
+          created_at: new Date().toISOString(),
+          payload: { decision_id: "DEC-MAT3610", title: "Independent decision", decision: "Keep admissions live", reason: "A projection is pending", impacts: [] }
+        }, context))
+      }).then(async (response) => ({ status: response.status, receipt: await response.json<Receipt>() }));
+      await vi.waitFor(() => expect(dropbox.files.has(machineCommitRecordPath(projectId, 2))).toBe(true), { timeout: 5_000 });
+      const commit = JSON.parse(dropbox.files.get(machineCommitRecordPath(projectId, 2)) ?? "null");
+      expect(commit).toMatchObject({ transaction: { transaction_id: transactionId }, receipt: { status: "committed", new_revision: 2 } });
+    } finally {
+      releaseReconcile();
+      const response = await fleet;
+      expect(response.status).toBe(200);
+    }
+    expect(attempt).not.toBeNull();
+    await expect(attempt!).resolves.toMatchObject({ status: 200, receipt: { status: "committed", new_revision: 2 } });
+    const proof = await runInDurableObject(project, (_instance, state) => state.storage.sql.exec<{ proof_json: string }>(
+      "SELECT proof_json FROM admission_proofs WHERE kind = ? AND request_id = ?",
+      "materialization", "/reconcile@1"
+    ).one());
+    expect(JSON.parse(proof.proof_json)).toMatchObject({ operation: "project.materialize", verdict: "allow", project_revision: 1 });
+  }, 30_000);
 });

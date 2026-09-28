@@ -12,6 +12,7 @@ import { SearchSyncProjectGuard } from "./project-guard-search-sync";
  */
 export class DiagnosticProjectGuard extends SearchSyncProjectGuard {
   private diagnosticsQueue: Promise<void> = Promise.resolve();
+  private scheduledReconcileRelease: (() => void) | null = null;
 
   override async fetch(request: Request): Promise<Response> {
     const started = Date.now();
@@ -34,9 +35,11 @@ export class DiagnosticProjectGuard extends SearchSyncProjectGuard {
         throw error;
       }
     }
-    return this.serializeDiagnostics(async () => {
+    const scheduledReconcile = request.method === "POST" && url.pathname === "/scheduled-reconcile-materialization";
+    return this.serializeDiagnostics(async (release) => {
       if (trace) console.log("project_os_guard_acquired", { ...trace, queue_ms: Date.now() - started });
       this.persistence.diagnostics?.beginOperation(`ProjectGuard ${request.method} ${url.pathname}`);
+      if (scheduledReconcile) this.scheduledReconcileRelease = release;
       try {
         const response = await super.fetch(request);
         if (trace) console.log("project_os_guard_finished", { ...trace, status: response.status, elapsed_ms: Date.now() - started });
@@ -44,19 +47,33 @@ export class DiagnosticProjectGuard extends SearchSyncProjectGuard {
       } catch (error) {
         if (trace) console.warn("project_os_guard_failed", { ...trace, elapsed_ms: Date.now() - started });
         throw error;
+      } finally {
+        if (scheduledReconcile && this.scheduledReconcileRelease === release) this.scheduledReconcileRelease = null;
       }
     });
   }
 
-  private async serializeDiagnostics<T>(operation: () => Promise<T>): Promise<T> {
+  protected override releaseScheduledReconcileAdmissionBoundary(): void {
+    const release = this.scheduledReconcileRelease;
+    this.scheduledReconcileRelease = null;
+    release?.();
+  }
+
+  private async serializeDiagnostics<T>(operation: (release: () => void) => Promise<T>): Promise<T> {
     const previous = this.diagnosticsQueue;
     let release!: () => void;
     this.diagnosticsQueue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
-    try {
-      return await operation();
-    } finally {
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
       release();
+    };
+    try {
+      return await operation(releaseOnce);
+    } finally {
+      releaseOnce();
     }
   }
 }

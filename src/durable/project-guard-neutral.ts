@@ -1000,6 +1000,10 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.settleNavigationReceipt(operation, cached as NavigationDocumentReceipt);
         return Response.json(await this.currentNavigationReceipt(operation, cached as NavigationDocumentReceipt));
       }
+      if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, operation.project_id) === "repair") {
+        await this.settleDocumentReceipt(operation, cached);
+        await this.ensureDocumentCapacityReleased(operation, cached);
+      }
       return Response.json(cached);
     }
 
@@ -1085,7 +1089,7 @@ export class ProjectGuard extends DurableObject<Env> {
       if (durable) {
         const receipt = JSON.parse(durable.receipt_json) as ManagedDocumentOperationReceipt;
         await this.settleDocumentReceipt(operation, receipt);
-        await this.ensureDocumentCapacityReleased(operation);
+        await this.ensureDocumentCapacityReleased(operation, receipt);
         return Response.json(receipt);
       }
       try {
@@ -1149,7 +1153,7 @@ export class ProjectGuard extends DurableObject<Env> {
     if (durableReceipt) {
       const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
       await this.settleDocumentReceipt(operation, receipt);
-      await this.ensureDocumentCapacityReleased(operation);
+      await this.ensureDocumentCapacityReleased(operation, receipt);
       return Response.json(receipt);
     }
 
@@ -1737,7 +1741,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       await this.settleArtifactReceipt(request, receipt);
       if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
-      await this.ensureArtifactCapacityReleased(request);
+      await this.ensureArtifactCapacityReleased(request, receipt);
       return Response.json(receipt);
     } catch (error) {
       if (receipt.status !== "committed") throw error;
@@ -1835,14 +1839,20 @@ export class ProjectGuard extends DurableObject<Env> {
     // is deliberately a separate retryable step and can now be resumed by the
     // alarm if the initial invocation ends between receipt and certificate.
     await this.settleDocumentReceipt(request, receipt);
-    await this.ensureDocumentCapacityReleased(request);
+    await this.ensureDocumentCapacityReleased(request, receipt);
     return Response.json(receipt);
   }
 
-  private async ensureDocumentCapacityReleased(request: ManagedDocumentRequest): Promise<void> {
-    if (await this.releaseManagedDocumentCapacity(request)) return;
-    await this.enqueueRequestRecovery("document", request.request_id, JSON.stringify(request));
-    await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+  private async ensureDocumentCapacityReleased(request: ManagedDocumentRequest, receipt: ManagedDocumentOperationReceipt): Promise<void> {
+    if (!await this.releaseManagedDocumentCapacity(request)) {
+      await this.enqueueRequestRecovery("document", request.request_id, JSON.stringify(request));
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return;
+    }
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) !== "repair") return;
+    if (receipt.status === "committed" && this.strictAdmissionEnabled(request.project_id)
+      && !(await new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id).status())?.terminal) return;
+    this.clearRequestRecovery("document", request.request_id);
   }
 
   /** Store the response cache before verification, then keep a wake signal
@@ -1859,8 +1869,9 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     this.persistDocumentRequest(request, receipt);
     if (receipt.status === "committed") await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
+    const capacityManaged = convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) === "repair";
     if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
-      this.clearRequestRecovery("document", request.request_id);
+      if (!capacityManaged) this.clearRequestRecovery("document", request.request_id);
       return;
     }
     await this.enqueueRequestRecovery("document", request.request_id);
@@ -1870,19 +1881,20 @@ export class ProjectGuard extends DurableObject<Env> {
       `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`
     );
     await this.finalizeVerifiedDocument(journal);
-    if ((await journal.status())?.terminal) this.clearRequestRecovery("document", request.request_id);
+    if ((await journal.status())?.terminal && !capacityManaged) this.clearRequestRecovery("document", request.request_id);
   }
 
   private async settleArtifactReceipt(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<void> {
     if (receipt.status === "committed") await this.enqueueNavigationRefreshForDirtyZones(request.project_id);
+    const capacityManaged = convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) === "repair";
     if (!this.strictAdmissionEnabled(request.project_id) || receipt.status !== "committed") {
-      this.clearRequestRecovery("artifact", request.request_id);
+      if (!capacityManaged) this.clearRequestRecovery("artifact", request.request_id);
       return;
     }
     const journal = new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id);
     await journal.recordReceipt(receipt.status, machineArtifactReceiptPath(request.request_id));
     await this.finalizeVerifiedArtifact(journal);
-    if ((await journal.status())?.terminal) this.clearRequestRecovery("artifact", request.request_id);
+    if ((await journal.status())?.terminal && !capacityManaged) this.clearRequestRecovery("artifact", request.request_id);
   }
 
   private async enqueueNavigationRefreshForDirtyZones(projectId: string): Promise<void> {
@@ -2805,8 +2817,9 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     const durableReceipt = await this.managedDocumentRequests.readReceipt(operation.project_id, requestId);
     if (durableReceipt) {
-      await this.settleDocumentReceipt(operation, JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt);
-      await this.ensureDocumentCapacityReleased(operation);
+      const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
+      await this.settleDocumentReceipt(operation, receipt);
+      await this.ensureDocumentCapacityReleased(operation, receipt);
       return;
     }
     if (operation.operation !== "navigation.reconcile"
@@ -2910,7 +2923,7 @@ export class ProjectGuard extends DurableObject<Env> {
     const receipt = JSON.parse(row.receipt_json) as ArtifactWriteReceipt;
     await this.repository.writeArtifactReceipt(receipt);
     await this.settleArtifactReceipt(request, receipt);
-    await this.ensureArtifactCapacityReleased(request);
+    await this.ensureArtifactCapacityReleased(request, receipt);
   }
 
   private loadState(): ProjectState | null {
@@ -3404,10 +3417,16 @@ export class ProjectGuard extends DurableObject<Env> {
     }, request.request_id);
   }
 
-  private async ensureArtifactCapacityReleased(request: ArtifactWriteRequest): Promise<void> {
-    if (await this.releaseArtifactCapacity(request)) return;
-    await this.enqueueRequestRecovery("artifact", request.request_id, JSON.stringify(request));
-    await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+  private async ensureArtifactCapacityReleased(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<void> {
+    if (!await this.releaseArtifactCapacity(request)) {
+      await this.enqueueRequestRecovery("artifact", request.request_id, JSON.stringify(request));
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return;
+    }
+    if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, request.project_id) !== "repair") return;
+    if (receipt.status === "committed" && this.strictAdmissionEnabled(request.project_id)
+      && !(await new ExecutionJournal(this.persistence, request.project_id, "artifact", request.request_id).status())?.terminal) return;
+    this.clearRequestRecovery("artifact", request.request_id);
   }
 
   private async verifyAdmission(context: MutationContext | null, tx: Transaction, state: ProjectState): Promise<void> {

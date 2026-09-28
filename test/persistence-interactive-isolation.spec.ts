@@ -103,6 +103,70 @@ describe("interactive persistence isolation", () => {
     expect(mock.files.has(`/PROJECT_OS/.project-os/artifacts/${projectId}/requests/ART-ISO-9606-SATURATED/intent.json`)).toBe(false);
   });
 
+  it("retains document and artifact recovery until cached terminal replay releases capacity", async () => {
+    const mock = installDropboxMock();
+    const runTerminalCapacityRecovery = async (projectId: string, family: "document" | "artifact") => {
+      const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+      const materializer = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+      const created = await submit(projectId, {
+        schema_version: "1.0", transaction_id: `TXN-ISO-${projectId.slice(-4)}-CREATE`, project_id: projectId,
+        base_revision: 0, operation: "project.create", created_at: createdAt,
+        payload: { name: `capacity-recovery-${projectId.slice(-4)}`, slug: `capacity-recovery-${projectId.slice(-4)}`, aliases: [], objective: "Retain terminal capacity recovery" }
+      });
+      await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(created);
+      const modes = JSON.stringify({ [projectId]: "repair" });
+      const checkpoint = initialProgress(projectId, createdAt, `capacity-recovery-proof-${projectId}`);
+      checkpoint.canonical_observed_revision = 1;
+      await runInDurableObject(guard, (instance) => { (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = modes; });
+      await runInDurableObject(materializer, async (instance, state) => {
+        (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = modes;
+        new MaterializationLedger(state.storage, projectId).restoreConvergenceCheckpoint(checkpoint, `capacity-recovery-token-${projectId}`);
+        await state.storage.setAlarm(Date.now() + 60_000);
+      });
+
+      const requestId = family === "document" ? `DOCREQ-ISO-${projectId.slice(-4)}-WRITE001` : `ART-ISO-${projectId.slice(-4)}-WRITE001`;
+      const body = family === "document"
+        ? { operation: "working.write", request_id: requestId, project_id: projectId, logical_path: "recovery/work.md", content: "# Retained recovery", content_sha256: await sha256Text("# Retained recovery"), created_at: createdAt }
+        : { request_id: requestId, project_id: projectId, relative_path: "recovery/work.md", content: "# Retained recovery", content_sha256: await sha256Text("# Retained recovery"), mode: "create" };
+      const physicalPath = `${workspaceProjectRoot(projectId, `capacity-recovery-${projectId.slice(-4)}`)}/${family === "document" ? "WORKING" : "DELIVERABLES"}/recovery/work.md`;
+      const url = family === "document" ? "https://project-guard.internal/document" : "https://project-guard.internal/artifact";
+      let restore!: () => void;
+      await runInDurableObject(guard, (instance) => {
+        const method = family === "document" ? "ensureDocumentCapacityReleased" : "ensureArtifactCapacityReleased";
+        const spy = vi.spyOn(instance as any, method).mockImplementationOnce(async () => { throw new Error("simulated crash before capacity release"); });
+        restore = () => spy.mockRestore();
+      });
+      const interrupted = await guard.fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      expect(interrupted.status).toBe(503);
+      const staged = await runInDurableObject(guard, (instance) => (instance as any).ctx.storage.sql.exec(
+        "SELECT request_json FROM request_recovery_payload WHERE kind = ? AND request_id = ?", family, requestId
+      ).toArray());
+      expect(staged).toHaveLength(1);
+      const wake = await runInDurableObject(guard, (_instance, state) => state.storage.getAlarm());
+      expect(wake).not.toBeNull();
+      const held = await runInDurableObject(materializer, (instance) => (instance as any).ledger.capacitySnapshot().reservations.some((item: { request_id: string }) => item.request_id === requestId));
+      expect(held).toBe(true);
+
+      restore();
+      if (family === "document") await runDurableObjectAlarm(guard);
+      const writesBeforeReplay = mock.uploadCalls.filter((path) => path === physicalPath).length;
+      const replay = await guard.fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      expect(replay.status).toBe(200);
+      await expect(replay.json()).resolves.toMatchObject({ status: "committed", request_id: requestId });
+      expect(mock.uploadCalls.filter((path) => path === physicalPath)).toHaveLength(writesBeforeReplay);
+      const remaining = await runInDurableObject(guard, (instance) => (instance as any).ctx.storage.sql.exec(
+        "SELECT 1 AS present FROM request_recovery_payload WHERE kind = ? AND request_id = ?", family, requestId
+      ).toArray());
+      expect(remaining).toHaveLength(0);
+      const released = await runInDurableObject(materializer, (instance) => (instance as any).ledger.capacitySnapshot().reservations.some((item: { request_id: string }) => item.request_id === requestId));
+      expect(released).toBe(false);
+    };
+
+    await runTerminalCapacityRecovery("PRJ-9610", "document");
+    await runTerminalCapacityRecovery("PRJ-9611", "artifact");
+    expect(mock.files.size).toBeGreaterThan(0);
+  });
+
   it("commits independent work during suspended maintenance while physical publication still checks its exact provider", async () => {
     const mock = installDropboxMock();
     const projectId = "PRJ-9605";

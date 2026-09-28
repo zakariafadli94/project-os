@@ -895,6 +895,14 @@ describe("ZoneNavigationInventory", () => {
 
   it("batches outside-zone artifact gaps and replays the same bounded page", async () => {
     const h = harness();
+    await addWorkingHead(h, "current valid head", "rev-valid", "DOC-1123456789ABCDEF01234567", "VER-REQ-1123456789ABCDEF01234567", "valid.md");
+    const inactiveId = "DOC-2123456789ABCDEF01234567";
+    h.put(machineDocumentHeadPath(projectId, inactiveId), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: inactiveId,
+      kind: "work_product", logical_path: "inactive.md", reconciliation_status: "clean"
+    }));
+    const mismatchedPath = await addWorkingHead(h, "recorded mismatch", "rev-mismatch", "DOC-3123456789ABCDEF01234567", "VER-REQ-3123456789ABCDEF01234567", "mismatch.md");
+    h.put(mismatchedPath, "physical bytes changed after the head", "id:physical-mismatch");
     const expected: Array<{ resource_id: string; code: string }> = [];
     for (let index = 1; index <= 4; index += 1) {
       const requestId = `ART-NAVIGATION-BATCH-${String(index).padStart(4, "0")}`;
@@ -921,9 +929,26 @@ describe("ZoneNavigationInventory", () => {
     expect(first).toEqual(replay);
     expect(first.entries).toEqual([]);
     expect(pages.flatMap((page) => page.gaps)).toEqual(expected);
-    expect(callsUsed).toBeLessThan(16);
+    expect(callsUsed).toBe(10);
     expect(first.next_cursor).toBeNull();
     expect(pages).toHaveLength(1);
+
+    const interruptedPrefix = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget(24) });
+    expect(interruptedPrefix.gaps).toHaveLength(2);
+    expect(interruptedPrefix.next_cursor).not.toBeNull();
+    const listPage = h.runtime.pagedListing!.listPage;
+    let faulted = false;
+    h.runtime.pagedListing!.listPage = async (input) => {
+      if (!faulted) { faulted = true; throw new Error("injected provider interruption after acknowledged prefix"); }
+      return listPage(input);
+    };
+    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: interruptedPrefix.next_cursor, limit: 8, budget: budget(32) }))
+      .rejects.toThrow("injected provider interruption after acknowledged prefix");
+    h.runtime.pagedListing!.listPage = listPage;
+    const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: interruptedPrefix.next_cursor, limit: 8, budget: budget(32) });
+    expect([...interruptedPrefix.gaps, ...resumed.gaps]).toEqual(expected);
+    expect(resumed.entries).toEqual([]);
+    expect(resumed.next_cursor).toBeNull();
   });
 
   it.each([

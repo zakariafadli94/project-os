@@ -7,6 +7,8 @@ import type { MutationContext } from "../src/admission/mutation-context";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import { ExecutionJournal } from "../src/execution/journal";
 import { createProductionPersistence } from "../src/persistence/production-factory";
+import { ProjectRepository } from "../src/persistence/repository";
+import { MaterializationLedger } from "../src/materialization/ledger";
 import { machineMaterializationHeadPath, machineMaterializationRecordPath, machineStatePath } from "../src/persistence/layout";
 import { commitFixture, seedCommits } from "./helpers/convergence-fixture";
 import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
@@ -24,6 +26,7 @@ it("finalizes three strict commits using alarms, with the middle revision explic
   const initial = commitFixture(projectId, 1)[0]!;
   seedCommits(mock, [initial]);
   mock.files.set(machineStatePath(projectId), JSON.stringify(initial.state));
+  await new ProjectRepository(createProductionPersistence(environment, projectId), "v2").writeReceipt(initial.receipt);
   const project = environment.PROJECT_GUARD.getByName(projectId);
   const materializer = environment.MATERIALIZATION_GUARD.getByName(projectId);
   const settings = {
@@ -36,6 +39,24 @@ it("finalizes three strict commits using alarms, with the middle revision explic
     await runInDurableObject(stub, instance => Object.assign((instance as unknown as { env: Env }).env, settings));
   }
   await bootstrapRuleAdmissionGovernance(environment, settings.RULE_ADMISSION_SIGNING_KEY, projectId);
+
+  // This fixture seeds revision 1 outside the live materializer. Reconstruct
+  // its real local checkpoint before testing admission of later revisions;
+  // missing proof must remain unavailable until this bounded pass completes.
+  for (let slice = 0; slice < 64; slice += 1) {
+    const response = await materializer.fetch("https://materialization-guard.internal/materialize", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "workspace-v2" })
+    });
+    if (response.status === 200) break;
+    expect(response.status).toBe(202);
+    if (slice === 63) throw new Error("initial_materialization_checkpoint_not_reconstructed");
+  }
+  await runInDurableObject(materializer, (_instance, state) => {
+    const checkpoint = new MaterializationLedger(state.storage).capacitySnapshot();
+    expect(checkpoint.progress?.canonical_observed_revision).toBe(1);
+    expect(checkpoint.provider_token).toBeTruthy();
+  });
 
   const requestIds: string[] = [];
   async function submit(baseRevision: number) {

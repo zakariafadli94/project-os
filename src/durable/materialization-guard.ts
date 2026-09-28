@@ -704,7 +704,7 @@ export class MaterializationGuard extends DurableObject<Env> {
    */
   private async handleCapacity(): Promise<Response> {
     const snapshot = this.ledger.capacitySnapshot();
-    const required = snapshot.progress === null || this.capacityHasPendingWork(snapshot);
+    const required = snapshot.progress === null || !snapshot.provider_token || this.capacityHasPendingWork(snapshot);
     const continuationAvailable = await this.ensureCapacityWake(required);
     const current = this.ledger.capacitySnapshot();
     const observation = this.capacityObservation(current, continuationAvailable);
@@ -717,7 +717,9 @@ export class MaterializationGuard extends DurableObject<Env> {
     const input = parseCapacityReservationRequest(body, this.projectId);
     if (!input) return Response.json({ error: "invalid_capacity_reservation" }, { status: 400 });
     const before = this.ledger.capacitySnapshot();
-    const continuationAvailable = await this.ensureCapacityWake(this.capacityHasPendingWork(before));
+    const continuationAvailable = await this.ensureCapacityWake(
+      before.progress === null || !before.provider_token || this.capacityHasPendingWork(before)
+    );
 
     let result: { observation: CapacityObservation | null; code?: string; replay?: boolean };
     try {
@@ -731,9 +733,9 @@ export class MaterializationGuard extends DurableObject<Env> {
             || existing.output_cost !== input.output_cost) {
             return { value: { observation: null, code: "idempotency_payload_mismatch" } };
           }
-          return { value: { observation: this.capacityObservation(snapshot, continuationAvailable), replay: true } };
+          return { value: { observation: this.capacityObservation(snapshot, continuationAvailable, undefined, input), replay: true } };
         }
-        const observation = this.capacityObservation(snapshot, continuationAvailable, input.canonical_revision);
+        const observation = this.capacityObservation(snapshot, continuationAvailable, input.canonical_revision, input);
         if (!observation) return { value: { observation: null, code: "capacity_proof_unavailable" } };
         if (this.hasPendingDependency(snapshot, input)) {
           return { value: { observation: { ...observation, reason: "dependency_pending" }, code: "dependency_pending" } };
@@ -800,9 +802,40 @@ export class MaterializationGuard extends DurableObject<Env> {
   }
 
   private capacityObservation(snapshot: CapacityLedgerSnapshot, continuationAvailable: boolean,
-    expectedCanonicalRevision?: number): CapacityObservation | null {
+    expectedCanonicalRevision?: number, bootstrapRequest?: CapacityReservationRequest): CapacityObservation | null {
     const progress = snapshot.progress;
-    if (!progress || !snapshot.provider_token) return null;
+    if (!progress || !snapshot.provider_token) {
+      if (!bootstrapRequest || bootstrapRequest.reservation_kind !== "transaction"
+        || progress !== null || snapshot.provider_token !== null
+        || bootstrapRequest.operation !== "project.create" || bootstrapRequest.canonical_revision !== 0
+        || bootstrapRequest.resources.length !== 1
+        || bootstrapRequest.resources[0]?.resource_type !== "project"
+        || bootstrapRequest.resources[0]?.resource_id !== bootstrapRequest.request_id
+        || bootstrapRequest.resources[0]?.zone !== "PROJECT"
+        || bootstrapRequest.resources[0]?.version !== "0"
+        || snapshot.status.head !== null || snapshot.status.requested !== null || snapshot.status.active !== null
+        || snapshot.status.active_status !== null || snapshot.status.output_count !== 0
+        || snapshot.status.attempt_output_count !== 0 || snapshot.status.last_error !== null) return null;
+      const replay = snapshot.reservations.length === 1
+        && snapshot.reservations[0]?.request_id === bootstrapRequest.request_id
+        && snapshot.reservations[0]?.request_hash === bootstrapRequest.request_hash
+        && snapshot.reservations[0]?.reservation_kind === "transaction"
+        && snapshot.reservations[0]?.operation === "project.create"
+        && snapshot.reservations[0]?.canonical_revision === 0
+        && snapshot.reservations[0]?.target_revision === 1
+        && snapshot.reservations[0]?.state === "reserved";
+      if (snapshot.reservations.length > 0 && !replay) return null;
+      return {
+        queued_outputs: replay ? snapshot.reservations[0]!.output_cost : 0,
+        oldest_pending_seconds: 0,
+        continuation_available: continuationAvailable,
+        within_qualified_envelope: true,
+        canonical_revision: 0,
+        materialized_revision: null,
+        blocking_obligation: null,
+        retry_after_seconds: null
+      };
+    }
     const status = snapshot.status;
     const obligations = Object.values(progress.obligations).filter((obligation) => obligation.state !== "verified");
     const work = classifyCapacityWork(obligations, Date.now());

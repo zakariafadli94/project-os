@@ -146,6 +146,83 @@ describe("MaterializationGuard isolation boundary", () => {
     });
   });
 
+  it("arms bounded reconstruction for an unknown reservation without admitting non-create work", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3917";
+    const guard = materializationNamespace().getByName(projectId);
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId,
+        request_id: "TXN-CAPACITY-COLD-0001",
+        request_hash: "e".repeat(64),
+        canonical_revision: 1,
+        operation: "task.create",
+        dependency_classification: "resource_bound",
+        resources: [{ resource_id: "TASK-COLD-0001", resource_type: "task", zone: "PROJECT", version: "1" }]
+      })
+    }));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ status: "unavailable", freshness: "unknown" });
+    await runInDurableObject(guard, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+
+    const degradedProjectId = "PRJ-3919";
+    const degradedGuard = materializationNamespace().getByName(degradedProjectId);
+    await runInDurableObject(degradedGuard, (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO convergence_checkpoint (singleton, progress_json, provider_token) VALUES (1, ?, '')",
+        JSON.stringify(initialProgress(degradedProjectId, at, "capacity-missing-token"))
+      );
+    });
+    const degraded = await degradedGuard.fetch(new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: degradedProjectId,
+        request_id: "TXN-CAPACITY-NOTOKEN-0001",
+        request_hash: "c".repeat(64),
+        canonical_revision: 0,
+        operation: "project.create",
+        dependency_classification: "resource_bound",
+        resources: [{ resource_id: "TXN-CAPACITY-NOTOKEN-0001", resource_type: "project", zone: "PROJECT", version: "0" }]
+      })
+    }));
+    expect(degraded.status).toBe(503);
+    await runInDurableObject(degradedGuard, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("admits and exactly replays only the zero-state project-create bootstrap reservation", async () => {
+    installDropboxMock();
+    const projectId = "PRJ-3918";
+    const guard = materializationNamespace().getByName(projectId);
+    const request = (requestId: string, hash: string, operation: string, revision: number) => new Request(
+      "https://materialization-guard.internal/capacity-reservation", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectId, request_id: requestId, request_hash: hash,
+          canonical_revision: revision, operation,
+          dependency_classification: "resource_bound",
+          resources: [{ resource_id: requestId, resource_type: "project", zone: "PROJECT", version: String(revision) }]
+        })
+      }
+    );
+    const first = await guard.fetch(request("TXN-CREATE-COLD-0001", "f".repeat(64), "project.create", 0));
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({ status: "admitted", canonical_revision: 0 });
+
+    const replay = await guard.fetch(request("TXN-CREATE-COLD-0001", "f".repeat(64), "project.create", 0));
+    expect(replay.status).toBe(200);
+    await expect(replay.json()).resolves.toMatchObject({ status: "reserved", queued_outputs: 1 });
+
+    const competing = await guard.fetch(request("TXN-CREATE-COLD-0002", "a".repeat(64), "project.create", 0));
+    expect(competing.status).toBe(503);
+    const nonCreate = await guard.fetch(request("TXN-CREATE-COLD-0003", "b".repeat(64), "task.create", 0));
+    expect(nonCreate.status).toBe(503);
+  });
+
   it("atomically reserves capacity at the limit and replays only the exact request", async () => {
     installDropboxMock();
     const projectId = "PRJ-3916";
@@ -195,8 +272,9 @@ describe("MaterializationGuard isolation boundary", () => {
   it("counts an in-flight document reservation without globally blocking independent work", async () => {
     const projectId = "PRJ-3931";
     const guard = materializationNamespace().getByName(projectId);
+    const progress = initialProgress(projectId, at, "capacity-physical-proof");
     await runInDurableObject(guard, async (_instance, state) => {
-      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(initialProgress(projectId, at, "capacity-physical-proof"), "capacity-token-physical");
+      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(progress, "capacity-token-physical");
       await state.storage.setAlarm(Date.now() + 60_000);
     });
     const makeRequest = (input: Record<string, unknown>) => new Request("https://materialization-guard.internal/capacity-reservation", {
@@ -215,8 +293,24 @@ describe("MaterializationGuard isolation boundary", () => {
     }));
     expect(independent.status).toBe(200);
 
+    // A committed independent revision can advance the canonical proof while
+    // the physical document effect remains in flight. Reacquiring the same
+    // document request must stay idempotent even though its current revision
+    // hint is newer than the one recorded at first acquire.
+    progress.canonical_observed_revision = 1;
+    await runInDurableObject(guard, (_instance, state) => {
+      new MaterializationLedger(state.storage).restoreConvergenceCheckpoint(progress, "capacity-token-physical-1");
+    });
+    const sameEffectReplay = await guard.fetch(makeRequest({
+      request_id: "DOCREQ-CAP-PHYS-0001", request_hash: "a".repeat(64), canonical_revision: 1,
+      operation: "document.publish", reservation_kind: "document", output_cost: 1,
+      dependency_classification: "resource_bound", resources: [documentResource]
+    }));
+    expect(sameEffectReplay.status).toBe(200);
+    await expect(sameEffectReplay.json()).resolves.toMatchObject({ status: "reserved", queued_outputs: 1 });
+
     const sameDocument = await guard.fetch(makeRequest({
-      request_id: "TXN-CAP-PHYS-DEP-0001", request_hash: "c".repeat(64), operation: "document.publish",
+      request_id: "TXN-CAP-PHYS-DEP-0001", request_hash: "c".repeat(64), canonical_revision: 1, operation: "document.publish",
       dependency_classification: "resource_bound", resources: [documentResource]
     }));
     expect(sameDocument.status).toBe(503);

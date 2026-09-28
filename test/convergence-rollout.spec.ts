@@ -8,6 +8,7 @@ import { machineCommitRecordPath, machineReceiptPath } from "../src/dropbox/layo
 import { sha256Text } from "../src/documents/hash";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
+import { MaterializationLedger } from "../src/materialization/ledger";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import {
@@ -93,7 +94,6 @@ describe("convergence rollout gates", () => {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(create)
     })).status).toBe(200);
 
-    const journal = new ConvergenceJournal(createProductionPersistence(testEnv, projectId), projectId);
     const pendingAt = new Date().toISOString();
     const progress = initialProgress(projectId, pendingAt, "capacity-floor");
     progress.obligations["b".repeat(64)] = {
@@ -104,9 +104,14 @@ describe("convergence rollout gates", () => {
       last_attempt_number: 1, last_closed_attempt_number: 1, last_verified_at: null,
       code: "human_write_failed", lease_until: null, continuation: null
     };
-    await journal.save(progress, null);
     await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), async (_instance, state) => {
+      new MaterializationLedger(state.storage, projectId).restoreConvergenceCheckpoint(progress, "capacity-floor-token");
       await state.storage.deleteAlarm();
+    });
+    let restoreWake!: () => void;
+    await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (instance) => {
+      const spy = vi.spyOn(instance as any, "ensureCapacityWake").mockResolvedValue(false);
+      restoreWake = () => spy.mockRestore();
     });
 
     await runInDurableObject(guard, (instance) => {
@@ -159,6 +164,7 @@ describe("convergence rollout gates", () => {
         payload: { task_id: "TASK-9978", title: "Public capacity detail" }
       })
     }), testEnv, createExecutionContext());
+    restoreWake();
     expect(publicBlocked.status).toBe(503);
     await expect(publicBlocked.json()).resolves.toMatchObject({
       error: "convergence_capacity_exceeded",

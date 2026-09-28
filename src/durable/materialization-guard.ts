@@ -179,7 +179,12 @@ export class MaterializationGuard extends DurableObject<Env> {
       // Cloudflare consumes the firing alarm before invoking this handler. Keep
       // a durable retry in place before entering any long external I/O so a
       // crash cannot leave admitted work without its existing continuation.
-      if (await this.ctx.storage.getAlarm() === null) {
+      const convergenceMode = convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, this.projectId);
+      const navigationPending = (await this.ctx.storage.list({ prefix: NAVIGATION_WORK_PREFIX })).size > 0;
+      const localWorkPending = this.capacityHasPendingWork(this.ledger.capacitySnapshot());
+      const thisAlarmOwnsWork = navigationPending
+        || ((this.layoutMode !== "v2" || convergenceMode === "repair") && localWorkPending);
+      if (thisAlarmOwnsWork && await this.ctx.storage.getAlarm() === null) {
         await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
       }
       let navigation: NavigationWorkSlice | null = null;
@@ -713,7 +718,6 @@ export class MaterializationGuard extends DurableObject<Env> {
     if (!input) return Response.json({ error: "invalid_capacity_reservation" }, { status: 400 });
     const before = this.ledger.capacitySnapshot();
     const continuationAvailable = await this.ensureCapacityWake(this.capacityHasPendingWork(before));
-    if (!continuationAvailable) return this.capacityUnavailableResponse("continuation_unavailable");
 
     let result: { observation: CapacityObservation | null; code?: string; replay?: boolean };
     try {

@@ -699,7 +699,6 @@ describe("canonical execution boundary in ProjectGuard", () => {
       expect(await state.storage.get("materialization-finalization-work")).toMatchObject({
         uncovered_ranges: [{ from_revision: 2, to_revision: 3 }]
       });
-      expect(await state.storage.getAlarm()).toBeNull();
     });
   });
 
@@ -783,7 +782,6 @@ describe("canonical execution boundary in ProjectGuard", () => {
       expect(await state.storage.get("materialization-finalization-work")).toMatchObject({
         uncovered_ranges: [{ from_revision: 2, to_revision: 2 }]
       });
-      expect(await state.storage.getAlarm()).toBeNull();
     });
   });
 

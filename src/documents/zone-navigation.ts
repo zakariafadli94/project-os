@@ -473,7 +473,11 @@ export class ZoneNavigationEngine {
         const entry = page.entries[progress.verify_entry];
         const entryHash = await executionHash(entry);
         const recordedProof = page.verified_entries?.find((item) => item.resource_id === entry.resource_id && item.entry_hash === entryHash);
-        const proof = this.inventory.verificationIncludesPhysicalIntegrity ? recordedProof : undefined;
+        const hasUnresolvedGap = progress.coverage_gaps.some((gap) => gap.resource_id === entry.resource_id);
+        // A persisted catalog proof may predate a dirty-head gap and describe
+        // an older provider identity. Recheck that exact resource during this
+        // request before letting it retire any prior gap.
+        const proof = this.inventory.verificationIncludesPhysicalIntegrity && !hasUnresolvedGap ? recordedProof : undefined;
         if (!proof && this.inventory.verifyEntryPage) {
           const savedCursor = progress.verify_cursor?.resource_id === entry.resource_id && progress.verify_cursor.entry_hash === entryHash ? progress.verify_cursor.cursor : null;
           const verification = await this.inventory.verifyEntryPage(entry, savedCursor, budget);
@@ -490,6 +494,11 @@ export class ZoneNavigationEngine {
         const evidence = { schema_version: "1.0", project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entry };
         await this.immutable(`${verifiedRoot}/${progress.source_count.toString().padStart(8, "0")}-${progress.verify_page.toString().padStart(8, "0")}-${progress.verify_entry.toString().padStart(8, "0")}.json`, evidence, budget);
         progress.rendered_links.push(renderLink(entry));
+        // Old adopting runs may have persisted the same unresolved head gap on
+        // several identical dirty cursors. Only a later exact inventory entry
+        // that passes this physical verification can retire that mutable
+        // warning; immutable snapshot pages remain historical evidence.
+        progress.coverage_gaps = progress.coverage_gaps.filter((gap) => gap.resource_id !== entry.resource_id);
         progress.verify_entry += 1;
         progress.verify_cursor = null;
         progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);

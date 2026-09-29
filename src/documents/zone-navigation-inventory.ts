@@ -20,8 +20,9 @@ import { canonicalJson } from "../rules/contract";
 import { MutationGateRepository } from "../mutation-gate/repository";
 import { MutationGateService } from "../mutation-gate/service";
 import { machineConvergenceRoot } from "../persistence/layout";
-import { executionHash } from "../execution/journal";
+import { ExecutionJournal, executionHash } from "../execution/journal";
 import { sha256Canonical } from "../materialization/hash";
+import { parseManagedDocumentRequest } from "../domain/managed-document-request";
 
 type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "artifact-finalize" | "dirty" | "dirty-package" | "dirty-artifacts" | "dirty-finish" | "catalog" | "catalog-compact";
 interface PageCursor { phase: PagePhase; cursor: string | null }
@@ -501,21 +502,24 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const gaps: NavigationCoverageGap[] = [];
     const resourceId = dirtyPage.resource_ids[0];
     if (!resourceId) return await this.catalogPage(projectId, zone, null, requestedLimit, snapshotId, budget, true);
+    const afterCurrentDirtyResource = dirtyPage.next_cursor === null
+      ? encodeCursor("catalog", "")
+      : encodeCursor("dirty", dirtyPage.next_cursor);
     if (resourceId.startsWith("package:")) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-package", JSON.stringify({ resource_id: resourceId, dirty_cursor: dirtyPage.next_cursor, member_index: 0 })) };
     if (resourceId.startsWith("artifact:")) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-artifacts", JSON.stringify({ resource_id: resourceId, dirty_cursor: dirtyPage.next_cursor, intent_cursor: null, destination_path: null, binding_cursor: null, eligible_request_ids: [], gaps: [] })) };
     if (!resourceId.startsWith("head:DOC-")) {
       await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
-      return { entries: [], gaps: [{ resource_id: resourceId, code: unsupportedSourceCode(resourceId) }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
+      return { entries: [], gaps: [{ resource_id: resourceId, code: unsupportedSourceCode(resourceId) }], snapshot_id: snapshotId, next_cursor: afterCurrentDirtyResource };
     }
     requireBudget(budget, 12);
     try {
       const resolved = await this.resolveHead(projectId, zone, resourceId, budget);
-      if (resolved.gap) return { entries: [], gaps: [resolved.gap], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
+      if (resolved.gap) return { entries: [], gaps: [resolved.gap], snapshot_id: snapshotId, next_cursor: afterCurrentDirtyResource };
       await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
       return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: resourceId, dirty_cursor: dirtyPage.next_cursor, entry: resolved.entry })) };
     } catch (error) {
       if (isBudgetError(error)) throw error;
-      return { entries: [], gaps: [{ resource_id: resourceId, code: classifyGap(error) }], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty", cursor ?? "") };
+      return { entries: [], gaps: [{ resource_id: resourceId, code: classifyGap(error) }], snapshot_id: snapshotId, next_cursor: afterCurrentDirtyResource };
     }
   }
 
@@ -747,7 +751,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     }
     const providerMismatch = version.provider_file_id !== observation.object_id || version.provider_rev !== observation.revision_token || version.provider_path !== observation.path || version.size !== observation.size;
     if (!observation.path.endsWith(`/${zone}/${version.logical_path}`)) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_path_mismatch" } };
-    // Only a real mismatch can trigger proof/receipt/admission lookups. Keep
+    // Only a real mismatch can trigger request/receipt/admission lookups. Keep
     // ordinary active heads on their existing reservation; for mismatches,
     // reserve enough of this existing slice for those three records, visible
     // content verification, and the page/checkpoint continuation.
@@ -755,7 +759,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const repairProof = providerMismatch
       ? await this.readCommittedInstanceRepair(projectId, documentId, head.logical_path, pointer.versionId, observation, version, rawVersion, budget)
       : null;
-    if (providerMismatch && !repairProof) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
+    const reviewPromotionProven = providerMismatch && zone === "REVIEW"
+      ? await this.hasCommittedReviewPromotion(projectId, documentId, head.logical_path, pointer.versionId, observation, version, budget)
+      : false;
+    if (providerMismatch && !repairProof && !reviewPromotionProven) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
     const verified = await this.readVisible(observation.path, observation, version, budget);
     if (!verified) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_content_unverified" } };
     if (repairProof && verified.sha256 !== repairProof.content_sha256) return { entry: null, gap: { resource_id: resourceId, code: "active_instance_repair_content_mismatch" } };
@@ -775,6 +782,68 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         }
       })
     };
+  }
+
+  private async hasCommittedReviewPromotion(
+    projectId: string, documentId: string, logicalPath: string, versionId: string,
+    current: { path: string; object_id: string; revision_token: string; size: number },
+    version: CurrentDocumentVersionRecord, budget: SliceBudget
+  ): Promise<boolean> {
+    const historical = version.provider_evidence;
+    if (!historical || historical.object_id !== current.object_id || historical.size !== current.size
+      || historical.provider_id !== this.runtime.providerId || historical.path.replace("/WORKING/", "/REVIEW/") !== current.path
+      || historical.path.split("/WORKING/").length !== 2
+      || !historical.path.endsWith(`/${logicalPath}`)
+      || !current.path.endsWith(`/REVIEW/${logicalPath}`)
+      || !version.parent_version_id || !version.request_id
+      || !/^DOCREQ-[A-Z0-9-]{8,}$/.test(version.request_id)) return false;
+    const expectedVersionId = `VER-REQ-${(await sha256Text(`${version.request_id}\nreview`)).slice(0, 24).toUpperCase()}`;
+    if (version.version_id !== versionId || versionId !== expectedVersionId) return false;
+
+    const requestPath = `${machineDocumentRoot(projectId)}/requests/${version.request_id}/intent.json`;
+    charge(budget);
+    const intentRaw = await this.runtime.objects.readText(requestPath);
+    if (!intentRaw) return false;
+    let intent: Record<string, unknown>;
+    let request: Record<string, unknown>;
+    try {
+      intent = JSON.parse(intentRaw) as Record<string, unknown>;
+      if (intent.schema_version !== "1.0" || intent.project_id !== projectId || intent.request_id !== version.request_id
+        || typeof intent.request_json !== "string" || typeof intent.request_sha256 !== "string"
+        || await sha256Text(intent.request_json) !== intent.request_sha256) return false;
+      request = parseManagedDocumentRequest(JSON.parse(intent.request_json)) as unknown as Record<string, unknown>;
+    } catch { return false; }
+    if (request.operation !== "review.promote" || request.request_id !== version.request_id
+      || request.project_id !== projectId || request.document_id !== documentId
+      || request.expected_version_id !== version.parent_version_id) return false;
+
+    const receiptPath = `${machineDocumentRoot(projectId)}/requests/${version.request_id}/receipt.json`;
+    charge(budget);
+    const receiptRaw = await this.runtime.objects.readText(receiptPath);
+    if (!receiptRaw) return false;
+    let receiptRecord: Record<string, unknown>;
+    let receipt: Record<string, unknown>;
+    try {
+      receiptRecord = JSON.parse(receiptRaw) as Record<string, unknown>;
+      if (receiptRecord.schema_version !== "1.0" || receiptRecord.project_id !== projectId
+        || receiptRecord.request_id !== version.request_id || receiptRecord.request_sha256 !== intent.request_sha256
+        || receiptRecord.request_json !== intent.request_json || typeof receiptRecord.receipt_json !== "string") return false;
+      receipt = JSON.parse(receiptRecord.receipt_json) as Record<string, unknown>;
+    } catch { return false; }
+    if (receipt.status !== "committed" || receipt.request_id !== version.request_id || receipt.project_id !== projectId
+      || receipt.document_id !== documentId || receipt.version_id !== versionId || receipt.stage !== "review"
+      || receipt.logical_path !== logicalPath || receipt.provider_rev !== current.revision_token) return false;
+
+    charge(budget);
+    let admission: Awaited<ReturnType<ExecutionJournal["readAdmission"]>>;
+    try { admission = await new ExecutionJournal(this.runtime, projectId, "document", version.request_id).readAdmission(); }
+    catch { return false; }
+    if (!admission || admission.admission.operation !== "review.promote"
+      || admission.admission.request_hash !== await executionHash(request) || admission.admission.verdict !== "allow") return false;
+    const matchingResources = admission.admission.resources.filter((resource) => resource.resource_id === documentId
+      && resource.resource_type === "document" && resource.zone === "DOCUMENTS"
+      && resource.version === version.parent_version_id && resource.expected_version === version.parent_version_id);
+    return matchingResources.length === 1;
   }
 
   private async readCommittedInstanceRepair(

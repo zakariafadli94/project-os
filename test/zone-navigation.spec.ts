@@ -260,6 +260,86 @@ async function reconcileUntilTerminal(engine: ZoneNavigationEngine, input: Navig
 }
 
 describe("zone navigation identity and resumable reconciliation", () => {
+  it("removes stale gap duplicates only after a resumed head is physically verified", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request("REVIEW");
+    const inv = await inventoryHarness(project, "REVIEW");
+    inv.entry.resource_id = `head:${inv.entry.resource_id}`;
+    const staleGap = { resource_id: inv.entry.resource_id, code: "active_version_provider_mismatch" };
+    const seeded = await seedAdoptingProgress(harness, input, 9, "dirty:");
+    const progress = seeded.progress as Omit<typeof seeded.progress, "coverage_gaps"> & {
+      coverage_gaps: { resource_id: string; code: string }[];
+    };
+    progress.snapshot_id = "snapshot-empty-prefix";
+    progress.coverage_gaps = Array.from({ length: 9 }, () => staleGap);
+    harness.put(`${seeded.root}/navigation-progress.json`, JSON.stringify(progress));
+    for (let page = 0; page < 9; page++) {
+      harness.put(`${seeded.root}/navigation/snapshot/${page.toString().padStart(8, "0")}.json`, JSON.stringify({
+        schema_version: "1.0", page, project_id: input.project_id, request_id: input.request_id,
+        snapshot_id: "snapshot-empty-prefix", entries: [], gaps: [staleGap]
+      }));
+    }
+    const port: NavigationInventoryPort = { ...inv.port, verificationIncludesPhysicalIntegrity: true };
+    let freshVerifyCalls = 0;
+    port.verifyEntry = async (_entry, slice) => { freshVerifyCalls += 1; slice.beforeHttp(); return true; };
+    port.listPage = async ({ budget: slice }) => {
+      slice.beforeHttp();
+      return {
+        entries: [inv.entry],
+        verified_entries: [{ resource_id: inv.entry.resource_id, entry_hash: await executionHash(inv.entry), persisted: true }],
+        gaps: [], snapshot_id: "snapshot-empty-prefix", next_cursor: null
+      };
+    };
+    const engine = new ZoneNavigationEngine(harness.runtime, port);
+    const result = await engine.reconcile(input, project, await admissionFor(input), budget(512));
+
+    expect(result.status).toBe("finalized");
+    expect(freshVerifyCalls).toBe(1);
+    const saved = JSON.parse(harness.files.get(`${seeded.root}/navigation-progress.json`)!.content);
+    expect(saved.coverage_gaps).toEqual([]);
+    expect(harness.files.get(`${seeded.root}/navigation/generated-index.md`)?.content).not.toContain("## Coverage gaps");
+    expect(JSON.parse(harness.files.get(`${seeded.root}/navigation/snapshot/00000000.json`)!.content).gaps).toEqual([staleGap]);
+  });
+
+  it("does not let an old persisted catalog proof clear a gap when fresh verification fails", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request("REVIEW");
+    const inv = await inventoryHarness(project, "REVIEW");
+    inv.entry.resource_id = `head:${inv.entry.resource_id}`;
+    const staleGap = { resource_id: inv.entry.resource_id, code: "active_version_provider_mismatch" };
+    const seeded = await seedAdoptingProgress(harness, input, 1, "dirty:");
+    const progress = seeded.progress as Omit<typeof seeded.progress, "coverage_gaps"> & {
+      coverage_gaps: { resource_id: string; code: string }[];
+    };
+    progress.coverage_gaps = [staleGap];
+    harness.put(`${seeded.root}/navigation-progress.json`, JSON.stringify(progress));
+    harness.put(`${seeded.root}/navigation/snapshot/00000000.json`, JSON.stringify({
+      schema_version: "1.0", page: 0, project_id: input.project_id, request_id: input.request_id,
+      snapshot_id: "snapshot-empty-prefix", entries: [], gaps: [staleGap]
+    }));
+    const port: NavigationInventoryPort = { ...inv.port, verificationIncludesPhysicalIntegrity: true };
+    let freshVerifyCalls = 0;
+    port.verifyEntry = async (_entry, slice) => { freshVerifyCalls += 1; slice.beforeHttp(); return false; };
+    port.listPage = async ({ budget: slice }) => {
+      slice.beforeHttp();
+      return {
+        entries: [inv.entry],
+        verified_entries: [{ resource_id: inv.entry.resource_id, entry_hash: await executionHash(inv.entry), persisted: true }],
+        gaps: [], snapshot_id: "snapshot-empty-prefix", next_cursor: null
+      };
+    };
+
+    const result = await new ZoneNavigationEngine(harness.runtime, port)
+      .reconcile(input, project, await admissionFor(input), budget(512));
+
+    expect(freshVerifyCalls).toBe(1);
+    expect(result).toEqual({ status: "conflict", code: "navigation_source_changed" });
+    expect(JSON.parse(harness.files.get(`${seeded.root}/navigation-progress.json`)!.content).coverage_gaps).toEqual([staleGap]);
+    expect(harness.files.has(`${seeded.root}/navigation/generated-index.md`)).toBe(false);
+  });
+
   it("advances a persisted legacy artifact cursor across several provider entries in one engine slice", async () => {
     const harness = runtimeHarness();
     const project = state();

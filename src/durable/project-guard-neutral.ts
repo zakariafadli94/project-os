@@ -4251,6 +4251,9 @@ export class ProjectGuard extends DurableObject<Env> {
     try {
       const execution = await new ExecutionJournal(runtime, projectId, kind, requestId).status();
       const receipt = await this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository);
+      const canonicalCommitVerified = requireFinalizationProof && kind === "transaction"
+        ? await this.hasVerifiedCanonicalTransactionCommit(projectId, requestId, receipt, execution, runtime, repository)
+        : false;
       if (requireFinalizationProof && execution?.status === "finalized") {
         if (!await this.hasValidFinalizationEvidence(projectId, kind, requestId, receipt, execution, runtime)) {
           return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "finalization_proof_unavailable");
@@ -4388,6 +4391,7 @@ export class ProjectGuard extends DurableObject<Env> {
         kind,
         request_id: requestId,
         status,
+        ...(canonicalCommitVerified ? { canonical_commit_verified: true } : {}),
         observation,
         ...(receipt ? { receipt } : {}),
         ...(execution ? { execution } : {}),
@@ -4582,6 +4586,42 @@ export class ProjectGuard extends DurableObject<Env> {
     }
   }
 
+  private async hasVerifiedCanonicalTransactionCommit(
+    projectId: string,
+    requestId: string,
+    receiptValue: unknown,
+    execution: Awaited<ReturnType<ExecutionJournal["status"]>>,
+    runtime: ProjectOsPersistenceRuntime,
+    repository: ProjectRepository
+  ): Promise<boolean> {
+    if (!receiptValue || typeof receiptValue !== "object") return false;
+    try {
+      const receipt = receiptValue as Record<string, unknown>;
+      if (receipt.project_id !== projectId || receipt.transaction_id !== requestId || receipt.status !== "committed"
+        || !Number.isSafeInteger(receipt.new_revision) || typeof receipt.new_revision !== "number"
+        || (execution && (!(["admitted", "committed", "finalizing"].includes(execution.status)) || execution.terminal !== false
+          || execution.project_id !== projectId || execution.kind !== "transaction" || execution.request_id !== requestId
+          || (execution.status === "admitted" ? execution.receipt_ref !== null
+            : execution.receipt_ref !== `${machineCommitRecordPath(projectId, receipt.new_revision)}#receipt`)))) return false;
+      const record = await repository.readCommitRecord(projectId, receipt.new_revision);
+      if (!record || record.project_id !== projectId || record.new_revision !== receipt.new_revision || record.transaction.transaction_id !== requestId
+        || record.receipt.transaction_id !== requestId || record.receipt.event_id !== receipt.event_id
+        || canonicalJson(record.receipt) !== canonicalJson(receipt)) return false;
+      if (!execution) return true;
+      const journal = new ExecutionJournal(runtime, projectId, "transaction", requestId);
+      const admissionRecord = await journal.readAdmission();
+      if (!admissionRecord) return false;
+      const admission = admissionRecord.admission;
+      if (admission.project_id !== projectId || admission.kind !== "transaction" || admission.request_id !== requestId
+        || admission.project_revision !== record.previous_revision || admission.request_hash !== execution.request_hash
+        || execution.admission_ref !== `${await journal.root()}/admission.json`
+        || await sha256Canonical(record.transaction) !== admission.request_hash) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   protected async readBoundedRequestStatusReceipt(
     projectId: string,
     kind: RequestKind,
@@ -4686,6 +4726,27 @@ export class ProjectGuard extends DurableObject<Env> {
         && observation.status === "finalized" && observation.receipt_status === "committed"
         && observation.execution_status === "finalized" && observation.terminal === true;
       if (finalizedAndBound) return response;
+      const committedAndBound = kind === "transaction" && body.canonical_commit_verified === true
+        && body.project_id === projectId && body.kind === kind && body.request_id === requestId
+        && body.status === "committed" && receipt?.project_id === projectId && receiptId === requestId
+        && receipt.status === "committed"
+        && (!execution || (execution.project_id === projectId && execution.kind === kind && execution.request_id === requestId
+          && ["admitted", "committed", "finalizing"].includes(String(execution.status)) && execution.terminal === false
+          && execution.admission_ref === `${executionRoot}/admission.json`
+          && typeof execution.request_hash === "string" && /^[a-f0-9]{64}$/.test(execution.request_hash)
+          && (execution.status === "admitted" ? execution.receipt_ref === null
+            : Number.isSafeInteger(receipt.new_revision) && typeof receipt.new_revision === "number"
+              && execution.receipt_ref === `${machineCommitRecordPath(projectId, receipt.new_revision)}#receipt`)))
+        && (!execution || Number.isSafeInteger(receipt.new_revision) && typeof receipt.new_revision === "number")
+        && observation?.project_id === projectId && observation.kind === kind && observation.request_id === requestId
+        && observation.status === (execution?.status === "finalizing" ? "finalizing" : "committed")
+        && observation.receipt_status === "committed"
+        && observation.execution_status === (execution?.status ?? null) && observation.terminal === false
+        && observation.freshness === "verified";
+      if (committedAndBound) {
+        delete body.canonical_commit_verified;
+        return Response.json(body);
+      }
     } catch {
       // A bounded read that is absent, malformed, mismatched, or unavailable
       // is still unknown while work is queued; it must never imply absence.

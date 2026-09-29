@@ -270,6 +270,17 @@ it.each(["project_queue", "search_queue"] as const)(
       observation: { status: "unknown", code: "PROJECT_OS_READ_BUSY" }
     });
     expect(mock.uploadCalls).toHaveLength(0);
+    await runInDurableObject(guard, (instance) => {
+      const state = instance as unknown as { queueDepth: number; searchQueueDepth: number };
+      state.queueDepth = 0;
+      state.searchQueueDepth = 0;
+    });
+    const idle = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    expect(idle.status).toBe(200);
+    await expect(idle.json()).resolves.toMatchObject({
+      status: "not_received", observation: { status: "not_received", freshness: "verified" }
+    });
+    expect(mock.uploadCalls).toHaveLength(0);
   }
 );
 
@@ -662,6 +673,57 @@ it("returns a locally committed receipt before waiting on an unrelated long muta
   expect(response.status).toBe(200);
   await expect(response.json()).resolves.toEqual(receipt);
 });
+
+it.each(["legacy", "finalizing", "foreign_commit", "corrupt_commit", "admission_hash_mismatch"] as const)(
+  "validates cold committed transaction evidence during maintenance: %s",
+  async (scenario) => {
+    const projectId = `PRJ-${8450 + ["legacy", "finalizing", "foreign_commit", "corrupt_commit", "admission_hash_mismatch"].indexOf(scenario)}`;
+    const mock = installDropboxMock();
+    const record = commitFixture(projectId, 2)[1]!;
+    const requestId = record.transaction.transaction_id;
+    const commitPath = machineCommitRecordPath(projectId, 2);
+    mock.files.set(commitPath, JSON.stringify(record));
+    mock.files.set(machineReceiptPath(requestId), JSON.stringify(record.receipt));
+    if (scenario === "finalizing" || scenario === "admission_hash_mismatch") {
+      const hash = await sha256Text(canonicalJson(record.transaction));
+      const admission: ExecutionAdmission = {
+        project_id: projectId, operation: record.transaction.operation, request_id: requestId, kind: "transaction",
+        request_hash: scenario === "admission_hash_mismatch" ? "f".repeat(64) : hash,
+        actor: { actor_id: "qualification-fixture", authority: "test" },
+        global_revision: 1, project_revision: 1,
+        ruleset: { digest: hash, rules: [], global_revision: 1, project_revision: 1 },
+        verdict: "allow", results: [], gaps: [], deferred_rules: [],
+        resources: [{ resource_id: "research", resource_type: "research", zone: "RESEARCH", version: hash }]
+      };
+      const journal = new ExecutionJournal(createProductionPersistence(env as unknown as Env, projectId), projectId, "transaction", requestId);
+      await journal.commit(admission, null);
+      await journal.recordReceipt("committed", `${commitPath}#receipt`);
+    }
+    if (scenario === "foreign_commit") mock.files.set(commitPath, JSON.stringify(commitFixture("PRJ-9999", 2)[1]));
+    if (scenario === "corrupt_commit") mock.files.set(commitPath, JSON.stringify({ ...record, previous_revision: 0 }));
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      (instance as unknown as { queueDepth: number }).queueDepth = 1;
+    });
+    const writesBeforeRead = mock.uploadCalls.length;
+    const started = Date.now();
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
+    const body = await response.json<Record<string, any>>();
+    if (scenario === "legacy" || scenario === "finalizing") {
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({ status: "committed", receipt: record.receipt,
+        observation: { status: scenario === "finalizing" ? "finalizing" : "committed", freshness: "verified", terminal: false } });
+      expect(body).not.toHaveProperty("canonical_commit_verified");
+      if (scenario === "finalizing") expect(body.execution).toMatchObject({ status: "finalizing", terminal: false, finalization_ref: null });
+      else expect(body).not.toHaveProperty("execution");
+    } else {
+      expect(response.status).toBe(503);
+      expect(body).toMatchObject({ status: "unknown", code: "PROJECT_OS_READ_BUSY" });
+    }
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(mock.uploadCalls).toHaveLength(writesBeforeRead);
+  }
+);
 
 it("returns a canonical committed receipt on cache miss while unrelated project work is busy", async () => {
   const projectId = "PRJ-8409";

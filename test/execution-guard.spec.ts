@@ -1153,6 +1153,10 @@ describe("canonical execution boundary in ProjectGuard", () => {
   });
 
   it("bounds every examined finalization candidate, including missing commits", async () => {
+    // Keep setup alarms beyond the host clock so Miniflare does not deliver
+    // them before this fixture explicitly drives its serialized slices.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.now() + 86_400_000));
     const projectId = "PRJ-8298";
     const { guard } = await setup(projectId);
     const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");
@@ -1260,7 +1264,6 @@ describe("canonical execution boundary in ProjectGuard", () => {
 
     // Keep the wall-clock abort timer out of this fixture; advance only Date
     // after the first candidate so runner load cannot expire the slice early.
-    vi.useFakeTimers({ toFake: ["Date"] });
     const sliceBudget = await runInDurableObject(guard, instance =>
       vi.spyOn(instance as any, "materializationFinalizationSliceBudgetMs").mockReturnValue(60_000)
     );
@@ -1361,6 +1364,9 @@ describe("canonical execution boundary in ProjectGuard", () => {
   });
 
   it("counts terminal and unadmitted candidates in a mixed finalization batch", async () => {
+    // Prevent an alarm from setup being autonomously consumed while this
+    // fixture inspects the persisted candidate cursor.
+    vi.setSystemTime(new Date(Date.now() + 86_400_000));
     const projectId = "PRJ-8299";
     const { guard } = await setup(projectId);
     const repository = new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2");

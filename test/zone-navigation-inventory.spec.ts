@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SliceBudget } from "../src/convergence/contract";
+import type { ExecutionAdmission } from "../src/execution/contract";
 import { navigationReconcileSchema, type NavigationInventoryEntry, type NavigationInventoryPort } from "../src/domain/zone-navigation";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "../src/documents/zone-navigation-sources";
@@ -172,6 +173,101 @@ describe("ZoneNavigationInventory", () => {
       expected: { object_id: "id:visible", revision_token: "rev-visible", content_sha256: await sha256Text("current body"), size: 12 }
     });
     expect(page.entries[0].expected.content_sha256).toBe(await sha256Text("current body"));
+  });
+
+  it("accepts a REVIEW head whose exact committed promotion proves the WORKING-to-REVIEW provider move", async () => {
+    const h = harness();
+    const content = "promoted review body";
+    const contentHash = await sha256Text(content);
+    const requestId = "DOCREQ-NAV-AUTO-REVIEW-S27-R439-G1";
+    const request = {
+      operation: "review.promote",
+      request_id: requestId,
+      project_id: projectId,
+      document_id: documentId,
+      expected_version_id: versionId,
+      created_at: "2026-09-29T10:00:00.000Z"
+    };
+    const requestJson = JSON.stringify(request);
+    const promotedVersionId = `VER-REQ-${(await sha256Text(`${requestId}\nreview`)).slice(0, 24).toUpperCase()}`;
+    const workingPath = `${workspaceProjectRoot(projectId, slug)}/WORKING/draft.md`;
+    const reviewPath = `${workspaceProjectRoot(projectId, slug)}/REVIEW/draft.md`;
+    h.put(reviewPath, content, "id:shared-review-object");
+    h.files.set(reviewPath, { ...h.files.get(reviewPath)!, revision_token: "rev-review" });
+    h.put(machineDocumentTextPayloadPath(projectId, contentHash), content);
+    const size = new TextEncoder().encode(content).byteLength;
+    h.put(machineDocumentHeadPath(projectId, documentId), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: documentId, kind: "work_product", logical_path: "draft.md",
+      review_version_id: promotedVersionId,
+      provider: { review: { path: reviewPath, file_id: "id:shared-review-object", rev: "rev-review", content_hash: contentHash, size } },
+      reconciliation_status: "clean"
+    }));
+    const rawVersion = JSON.stringify({
+      schema_version: "2.0", project_id: projectId, document_id: documentId, version_id: promotedVersionId,
+      parent_version_id: versionId, kind: "work_product", stage: "review", logical_path: "draft.md", source: "project_os",
+      created_at: request.created_at, request_id: requestId, immutable_payload_path: machineDocumentTextPayloadPath(projectId, contentHash),
+      content_sha256: contentHash, provider_evidence: {
+        provider_id: "test", object_id: "id:shared-review-object", revision_token: "rev-working", path: workingPath,
+        integrity_hash: { algorithm: "sha256", value: contentHash }, size
+      }
+    });
+    h.put(machineDocumentVersionPath(projectId, documentId, promotedVersionId), rawVersion);
+    const requestHash = await executionHash(request);
+    const admission = {
+      project_id: projectId, request_id: requestId, kind: "document", operation: "review.promote", request_hash: requestHash,
+      actor: { actor_id: "operator:test", authority: "project_guard" },
+      resources: [{ resource_id: documentId, resource_type: "document", zone: "DOCUMENTS", version: versionId, expected_version: versionId }],
+      global_revision: 0, project_revision: 0,
+      ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 },
+      verdict: "allow", results: [], gaps: [], deferred_rules: []
+    };
+    await new ExecutionJournal(h.runtime, projectId, "document", requestId).commit(admission as unknown as ExecutionAdmission, null);
+    h.put(`${machineDocumentRoot(projectId)}/requests/${requestId}/intent.json`, JSON.stringify({
+      schema_version: "1.0", project_id: projectId, request_id: requestId,
+      request_sha256: await sha256Text(requestJson), request_json: requestJson
+    }));
+    h.put(`${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`, JSON.stringify({
+      schema_version: "1.0", project_id: projectId, request_id: requestId,
+      request_sha256: await sha256Text(requestJson), request_json: requestJson,
+      receipt_json: JSON.stringify({
+        request_id: requestId, project_id: projectId, document_id: documentId, version_id: promotedVersionId,
+        stage: "review", logical_path: "draft.md", status: "committed", provider_rev: "rev-review"
+      })
+    }));
+    const savedAdmission = await new ExecutionJournal(h.runtime, projectId, "document", requestId).readAdmission();
+    expect(savedAdmission?.admission).toMatchObject({ operation: "review.promote", request_hash: requestHash, verdict: "allow" });
+    expect(savedAdmission?.admission.resources).toContainEqual(expect.objectContaining({
+      resource_id: documentId, resource_type: "document", zone: "DOCUMENTS", version: versionId, expected_version: versionId
+    }));
+
+    const entry: NavigationInventoryEntry = {
+      project_id: projectId, zone: "REVIEW", resource_id: `head:${documentId}`, version: promotedVersionId,
+      logical_path: "draft.md", path: reviewPath,
+      expected: { object_id: "id:shared-review-object", revision_token: "rev-review", content_sha256: contentHash, size }
+    };
+
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+    const receiptPath = `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`;
+    const savedReceipt = JSON.parse(h.files.get(receiptPath)!.content);
+    const forgedReceipt = JSON.parse(savedReceipt.receipt_json);
+    forgedReceipt.provider_rev = "rev-unrelated";
+    h.put(receiptPath, JSON.stringify({ ...savedReceipt, receipt_json: JSON.stringify(forgedReceipt) }));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+  });
+
+  it("advances past a dirty head that cannot be proven instead of emitting the same gap cursor forever", async () => {
+    const h = harness();
+    const firstId = documentId;
+    h.put(machineDocumentHeadPath(projectId, firstId), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: firstId, kind: "work_product", logical_path: "draft.md",
+      review_version_id: "VER-REQ-1123456789ABCDEF01234567", provider: {}, reconciliation_status: "clean"
+    }));
+    vi.spyOn(h.sources, "listDirtyPage").mockResolvedValue({ resource_ids: [`head:${firstId}`], next_cursor: null });
+
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "REVIEW", cursor: "dirty:", limit: 8, budget: budget() });
+
+    expect(page.gaps).toEqual([{ resource_id: `head:${firstId}`, code: "active_provider_binding_missing" }]);
+    expect(page.next_cursor).toBe("catalog:");
   });
 
   it("persists head-page cursors and does not skip entries after a provider batch", async () => {

@@ -16,7 +16,7 @@ const ingressToken = "postcheck-public-route-ingress-token";
 afterEach(() => vi.restoreAllMocks());
 
 async function checkAdmission(check_id: string, check_stage: "post_execution" | "both", enforcement: "automatic" | "explicit_approval", operation = "package.replace") {
-  const resource_type = operation === "artifact.write" ? "artifact" : "package";
+  const resource_type = operation === "artifact.write" ? "artifact" : operation === "navigation.reconcile" ? "navigation" : "package";
   const rule = ruleVersionSchema.parse(ruleFixture("GLOBAL", {
     rule_id: "RULE-POSTCHECK-9861", status: "active", operations: [operation],
     resource_scope: { resource_types: [resource_type], zones: ["WORKING"] },
@@ -26,7 +26,7 @@ async function checkAdmission(check_id: string, check_stage: "post_execution" | 
   state.revision = 4;
   const normalized = {
     project_id: projectId, operation, request_hash: hash,
-    resources: [{ resource_id: resource_type === "package" ? "PKG-9861" : "ART-9861", resource_type, zone: "WORKING", version: "1:" + hash }]
+    resources: [{ resource_id: resource_type === "package" ? "PKG-9861" : resource_type === "navigation" ? "navigation:WORKING" : "ART-9861", resource_type, zone: "WORKING", version: resource_type === "navigation" ? "0" : "1:" + hash }]
   };
   const stub = testEnv.PROJECT_GUARD.getByName(projectId + "-" + check_id + "-" + enforcement);
   return runInDurableObject(stub, async (instance) => {
@@ -62,4 +62,11 @@ it("admits only the exact automatic package check/stage tuples with a deferred p
   expect(result.error).toBeUndefined();
   expect(result.permit).toHaveBeenCalledTimes(1);
   expect(result.proof).toMatchObject({ verdict: "allow", deferred_rules: [{ rule_id: "RULE-POSTCHECK-9861", version: 1 }] });
+});
+
+it("refuses navigation valid-links admission before permit while no physical postcheck is qualified", async () => {
+  const result = await checkAdmission("valid_links", "post_execution", "automatic", "navigation.reconcile");
+  expect(result.error).toMatchObject({ message: "UNSUPPORTED_CHECK_OPERATION" });
+  expect(result.permit).not.toHaveBeenCalled();
+  expect(result.proof).toBeUndefined();
 });

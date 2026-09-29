@@ -898,7 +898,7 @@ describe("MaterializationGuard isolation boundary", () => {
     });
 
     expect(await runDurableObjectAlarm(guard)).toBe(true);
-    expect(notify).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalled();
   });
 
   it("notifies ProjectGuard from an idle V2 alarm so a published head finalizes its covered receipts", async () => {

@@ -7,7 +7,7 @@ import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "../src/documen
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { ExecutionJournal, executionHash } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
-import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, workspaceProjectRoot } from "../src/persistence/layout";
+import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, machineStatePath, workspaceProjectRoot } from "../src/persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderOperationError } from "../src/persistence/provider/errors";
@@ -143,6 +143,82 @@ async function addWorkingHead(h: ReturnType<typeof harness>, content: string, re
   return path;
 }
 
+async function seedHistoricalPublishedHead(
+  h: ReturnType<typeof harness>,
+  options: { currentObjectId?: string; receiptRevision?: string; providerSlug?: string } = {}
+) {
+  const requestId = "DOCREQ-NAV-AUTO-PUBLISH-S27-R439-G1";
+  const parentVersionId = "VER-REQ-1123456789ABCDEF01234567";
+  const publishedVersionId = `VER-REQ-${(await sha256Text(`${requestId}\npublished`)).slice(0, 24).toUpperCase()}`;
+  const content = "historically published body";
+  const contentHash = await sha256Text(content);
+  const size = new TextEncoder().encode(content).byteLength;
+  const workingPath = `${workspaceProjectRoot(projectId, options.providerSlug ?? slug)}/WORKING/draft.md`;
+  const deliverablesPath = `${workspaceProjectRoot(projectId, options.providerSlug ?? slug)}/DELIVERABLES/draft.md`;
+  const request = {
+    operation: "publish", request_id: requestId, project_id: projectId, document_id: documentId,
+    expected_version_id: parentVersionId, created_at: "2026-09-29T10:00:00.000Z"
+  };
+  const requestJson = JSON.stringify(request);
+  const requestHash = await executionHash(request);
+
+  h.put(machineStatePath(projectId), JSON.stringify(emptyProjectState(projectId, "Project OS", slug)));
+  h.put(deliverablesPath, content, options.currentObjectId ?? "id:shared-published-object");
+  h.files.set(deliverablesPath, { ...h.files.get(deliverablesPath)!, revision_token: "rev-published" });
+  h.put(machineDocumentTextPayloadPath(projectId, contentHash), content);
+  h.put(machineDocumentHeadPath(projectId, documentId), JSON.stringify({
+    schema_version: "1.0", project_id: projectId, document_id: documentId, kind: "work_product", logical_path: "draft.md",
+    published_version_id: publishedVersionId,
+    provider: { published: { path: deliverablesPath, file_id: options.currentObjectId ?? "id:shared-published-object", rev: "rev-published", content_hash: contentHash, size } },
+    reconciliation_status: "clean"
+  }));
+  h.put(machineDocumentVersionPath(projectId, documentId, parentVersionId), JSON.stringify({
+    schema_version: "2.0", project_id: projectId, document_id: documentId, version_id: parentVersionId,
+    kind: "work_product", stage: "review", logical_path: "draft.md", source: "project_os",
+    created_at: "2026-09-29T09:00:00.000Z", immutable_payload_path: machineDocumentTextPayloadPath(projectId, contentHash),
+    content_sha256: contentHash, provider_evidence: {
+      provider_id: "test", object_id: "id:shared-published-object", revision_token: "rev-working",
+      path: workingPath, integrity_hash: { algorithm: "dropbox-content-hash", value: "d".repeat(64) }, size
+    }
+  }));
+  h.put(machineDocumentVersionPath(projectId, documentId, publishedVersionId), JSON.stringify({
+    schema_version: "2.0", project_id: projectId, document_id: documentId, version_id: publishedVersionId,
+    parent_version_id: parentVersionId, kind: "work_product", stage: "published", logical_path: "draft.md", source: "project_os",
+    created_at: request.created_at, request_id: requestId, immutable_payload_path: machineDocumentTextPayloadPath(projectId, contentHash),
+    content_sha256: contentHash, provider_evidence: {
+      provider_id: "test", object_id: "id:shared-published-object", revision_token: "rev-working", path: workingPath,
+      integrity_hash: { algorithm: "dropbox-content-hash", value: "d".repeat(64) }, size
+    }
+  }));
+  await new ExecutionJournal(h.runtime, projectId, "document", requestId).commit({
+    project_id: projectId, request_id: requestId, kind: "document", operation: "document.publish", request_hash: requestHash,
+    actor: { actor_id: "operator:test", authority: "project_guard" },
+    resources: [{ resource_id: documentId, resource_type: "document", zone: "DOCUMENTS", version: parentVersionId, expected_version: parentVersionId }],
+    global_revision: 0, project_revision: 0,
+    ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 },
+    verdict: "allow", results: [], gaps: [], deferred_rules: []
+  } as unknown as ExecutionAdmission, null);
+  h.put(`${machineDocumentRoot(projectId)}/requests/${requestId}/intent.json`, JSON.stringify({
+    schema_version: "1.0", project_id: projectId, request_id: requestId,
+    request_sha256: await sha256Text(requestJson), request_json: requestJson
+  }));
+  h.put(`${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`, JSON.stringify({
+    schema_version: "1.0", project_id: projectId, request_id: requestId,
+    request_sha256: await sha256Text(requestJson), request_json: requestJson,
+    receipt_json: JSON.stringify({
+      request_id: requestId, project_id: projectId, document_id: documentId, version_id: publishedVersionId,
+      stage: "published", logical_path: "draft.md", status: "committed", provider_rev: options.receiptRevision ?? "rev-published"
+    })
+  }));
+  return {
+    entry: {
+      project_id: projectId, zone: "DELIVERABLES" as const, resource_id: `head:${documentId}`, version: publishedVersionId,
+      logical_path: "draft.md", path: deliverablesPath,
+      expected: { object_id: options.currentObjectId ?? "id:shared-published-object", revision_token: "rev-published", content_sha256: contentHash, size }
+    } satisfies NavigationInventoryEntry
+  };
+}
+
 describe("ZoneNavigationInventory", () => {
   it("keeps snapshot completion pending when an empty dirty page has a continuation", async () => {
     const h = harness();
@@ -252,6 +328,63 @@ describe("ZoneNavigationInventory", () => {
     const forgedReceipt = JSON.parse(savedReceipt.receipt_json);
     forgedReceipt.provider_rev = "rev-unrelated";
     h.put(receiptPath, JSON.stringify({ ...savedReceipt, receipt_json: JSON.stringify(forgedReceipt) }));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+  });
+
+  it("accepts a DELIVERABLES head only when its exact committed publication proves the provider move", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h);
+
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+  });
+
+  it("rejects a published version whose immutable bytes differ from its REVIEW parent", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h);
+    const parentPath = machineDocumentVersionPath(projectId, documentId, "VER-REQ-1123456789ABCDEF01234567");
+    const parent = JSON.parse(h.files.get(parentPath)!.content) as Record<string, unknown>;
+    const unrelated = "different reviewed bytes";
+    const unrelatedHash = await sha256Text(unrelated);
+    h.put(machineDocumentTextPayloadPath(projectId, unrelatedHash), unrelated);
+    h.put(parentPath, JSON.stringify({ ...parent,
+      content_sha256: unrelatedHash,
+      immutable_payload_path: machineDocumentTextPayloadPath(projectId, unrelatedHash)
+    }));
+
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+  });
+
+  it("rejects a published move when both provider paths are outside the canonical project workspace root", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h, { providerSlug: "another-project" });
+
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+  });
+
+  it("rejects a published move when its committed receipt binds a different provider revision", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h);
+    const savedReceipt = JSON.parse(h.files.get(`${machineDocumentRoot(projectId)}/requests/DOCREQ-NAV-AUTO-PUBLISH-S27-R439-G1/receipt.json`)!.content);
+    const receipt = JSON.parse(savedReceipt.receipt_json);
+    receipt.provider_rev = "rev-unrelated";
+    h.put(`${machineDocumentRoot(projectId)}/requests/DOCREQ-NAV-AUTO-PUBLISH-S27-R439-G1/receipt.json`, JSON.stringify({ ...savedReceipt, receipt_json: JSON.stringify(receipt) }));
+
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+  });
+
+  it("does not accept a published move from its receipt when the execution admission is absent", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h);
+    const journal = new ExecutionJournal(h.runtime, projectId, "document", "DOCREQ-NAV-AUTO-PUBLISH-S27-R439-G1");
+    h.files.delete(`${await journal.root()}/admission.json`);
+
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+  });
+
+  it("rejects an otherwise valid publication proof when the current provider object is unrelated", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h, { currentObjectId: "id:unrelated-object" });
+
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
 

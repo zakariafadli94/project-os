@@ -59,6 +59,7 @@ it("finalizes three strict commits using alarms, with the middle revision explic
   });
 
   const requestIds: string[] = [];
+  const requests: Array<Record<string, unknown>> = [];
   async function submit(baseRevision: number) {
     const contextResponse = await project.fetch("https://guard.internal/mutation-context?include_state=false");
     expect(contextResponse.status).toBe(200);
@@ -69,6 +70,7 @@ it("finalizes three strict commits using alarms, with the middle revision explic
       base_revision: baseRevision, operation: "task.create", created_at: new Date().toISOString(),
       payload: { task_id: `TASK-8460SEQ${baseRevision}`, title: `Sequence ${baseRevision}` }
     };
+    requests.push(request);
     const response = await project.fetch("https://guard.internal/transaction", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify(encodeAdmission(request, context))
@@ -109,4 +111,54 @@ it("finalizes three strict commits using alarms, with the middle revision explic
     expect(status?.finalization_ref).toBeTruthy();
     expect(mock.files.has(status!.finalization_ref!)).toBe(true);
   }
+
+  const repeatedCommitReads = vi.spyOn(ProjectRepository.prototype, "readCommitRecord");
+  const repeatedJournalStatusReads = vi.spyOn(ExecutionJournal.prototype, "status");
+  const repeated = await project.fetch("https://guard.internal/finalize-materialization", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ target_revision: 4, projection_version: CURRENT_PROJECTION_VERSION })
+  });
+  expect(repeated.status).toBe(200);
+  await expect(repeated.json()).resolves.toMatchObject({ target_revision: 4, finalization_pending: false });
+  expect(repeatedCommitReads).not.toHaveBeenCalled();
+  expect(repeatedJournalStatusReads).not.toHaveBeenCalled();
+
+  await submit(4);
+  const headBeforeAdvance = JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "null");
+  expect(headBeforeAdvance?.target_revision).toBe(4);
+  repeatedCommitReads.mockClear();
+  repeatedJournalStatusReads.mockClear();
+  const sameHeadAfterAdmission = await project.fetch("https://guard.internal/finalize-materialization", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ target_revision: 4, projection_version: CURRENT_PROJECTION_VERSION })
+  });
+  expect(sameHeadAfterAdmission.status).toBe(200);
+  expect(repeatedCommitReads).toHaveBeenCalled();
+  expect(repeatedJournalStatusReads).toHaveBeenCalled();
+
+  await drainThrough(5);
+  const advancedHead = JSON.parse(mock.files.get(machineMaterializationHeadPath(projectId)) ?? "null");
+  expect(advancedHead?.target_revision).toBe(5);
+
+  const latestCommit = await new ProjectRepository(createProductionPersistence(environment, projectId), "v2").readCommitRecord(projectId, 5);
+  expect(latestCommit).not.toBeNull();
+  await runInDurableObject(project, (instance) => (instance as any).recordTransactionExecutionReceipt(requests.at(-1), latestCommit!.receipt));
+  const receiptInvalidatedHead = await runInDurableObject(project, (_instance, state) =>
+    state.storage.get("materialization-finalization-completed-head"));
+  expect(receiptInvalidatedHead).toBeUndefined();
+  repeatedCommitReads.mockClear();
+  repeatedJournalStatusReads.mockClear();
+  const afterReceipt = await project.fetch("https://guard.internal/finalize-materialization", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ target_revision: 5, projection_version: CURRENT_PROJECTION_VERSION })
+  });
+  expect(afterReceipt.status).toBe(202);
+  await expect(afterReceipt.json()).resolves.toMatchObject({ target_revision: 5, finalization_pending: true });
+  expect(repeatedCommitReads).toHaveBeenCalled();
+  expect(repeatedJournalStatusReads).toHaveBeenCalled();
+  await drainThrough(5);
+  const latestExecution = await new ExecutionJournal(
+    createProductionPersistence(environment, projectId), projectId, "transaction", requestIds.at(-1)!
+  ).status();
+  expect(latestExecution).toMatchObject({ status: "finalized", terminal: true });
 }, 60_000);

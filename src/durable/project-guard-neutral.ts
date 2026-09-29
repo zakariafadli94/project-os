@@ -200,6 +200,7 @@ const REQUEST_RECOVERY_BATCH_SIZE = 4;
 const REQUEST_RECOVERY_RETRY_DELAY_MS = 30_000;
 const MATERIALIZATION_FINALIZATION_WORK_KEY = "materialization-finalization-work";
 const MATERIALIZATION_FINALIZATION_REQUEST_KEY = "materialization-finalization-request";
+const MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY = "materialization-finalization-completed-head";
 const MATERIALIZATION_FINALIZATION_LINEAGE_BATCH_SIZE = 4;
 const MATERIALIZATION_FINALIZATION_CERTIFICATE_BATCH_SIZE = 4;
 const MATERIALIZATION_FINALIZATION_PROVIDER_CALL_BUDGET = 32;
@@ -252,6 +253,12 @@ interface MaterializationFinalizationWork {
   candidates: MaterializationFinalizationCandidate[];
   uncovered_ranges?: Array<{ from_revision: number; to_revision: number }>;
   legacy_range_cursor?: LegacyRangeVerificationCursor | null;
+}
+
+interface MaterializationFinalizationCompletedHead {
+  coverage_version: number;
+  head: MaterializationFinalizationWork["head"];
+  record_sha256: string;
 }
 
 interface LegacyRangeVerificationCursor {
@@ -2063,6 +2070,7 @@ export class ProjectGuard extends DurableObject<Env> {
         kind, requestId, requestJson, digest
       );
     }
+    if (kind === "transaction") await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
     this.ctx.storage.sql.exec(
       "INSERT INTO request_recovery (kind, request_id) VALUES (?, ?) ON CONFLICT(kind, request_id) DO NOTHING",
       kind,
@@ -3605,6 +3613,7 @@ export class ProjectGuard extends DurableObject<Env> {
 
   protected async persistAdmissionProof(kind: string, requestId: string, proof: AdmissionProof): Promise<void> {
     const admission: ExecutionAdmission = { ...proof, kind, request_id: requestId };
+    if (kind === "transaction") await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
     // The canonical journal is authority. SQL is only a cache; awaiting this
     // boundary is mandatory before every admitted family starts an effect.
     try {
@@ -4867,6 +4876,7 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async recordTransactionExecutionReceipt(tx: Transaction, receipt: Receipt): Promise<void> {
     if (!this.strictAdmissionEnabled(tx.project_id)) return;
+    await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
     const ref = receipt.status === "committed" && this.layoutMode === "v2"
       ? `${machineCommitRecordPath(tx.project_id, receipt.new_revision)}#receipt`
       : machineReceiptPath(tx.transaction_id);
@@ -5217,6 +5227,21 @@ export class ProjectGuard extends DurableObject<Env> {
       completed_at: head.completed_at
     };
     let work = await this.ctx.storage.get<MaterializationFinalizationWork>(MATERIALIZATION_FINALIZATION_WORK_KEY);
+    const completedHead = await this.ctx.storage.get<MaterializationFinalizationCompletedHead>(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
+    if (!work && completedHead
+      && completedHead.coverage_version === MATERIALIZATION_FINALIZATION_COVERAGE_VERSION
+      && sameFinalizationHead(completedHead.head, expectedHead)
+      && /^[a-f0-9]{64}$/.test(completedHead.record_sha256)
+      && completedHead.record_sha256 === await sha256Canonical(record)) {
+      await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_WORK_KEY);
+      await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_REQUEST_KEY);
+      return Response.json({
+        project_id: projectId,
+        target_revision: head.target_revision,
+        finalized_revisions: [],
+        finalization_pending: false
+      });
+    }
     if (
       !work
       || work.coverage_version !== MATERIALIZATION_FINALIZATION_COVERAGE_VERSION
@@ -5363,9 +5388,15 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     const finalizationPending = !work.scan_complete || work.candidates.length > 0;
     if (finalizationPending) {
+      await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
       await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_WORK_KEY, work);
       await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_REQUEST_KEY, target);
     } else {
+      await this.ctx.storage.put(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY, {
+        coverage_version: MATERIALIZATION_FINALIZATION_COVERAGE_VERSION,
+        head: expectedHead,
+        record_sha256: await sha256Canonical(record)
+      } satisfies MaterializationFinalizationCompletedHead);
       await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_WORK_KEY);
       await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_REQUEST_KEY);
     }

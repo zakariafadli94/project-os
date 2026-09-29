@@ -1159,7 +1159,7 @@ export class ManagedDocumentService {
       || !expectedRev
       || evidence.rev !== expectedRev
       || (version.provider_file_id !== undefined && evidence.file_id !== version.provider_file_id)
-      || (version.provider_rev !== undefined && evidence.rev !== version.provider_rev)
+      || (observation === undefined && version.provider_rev !== undefined && evidence.rev !== version.provider_rev)
       || (observation !== undefined && (
         evidence.file_id !== observation.file_id
         || evidence.rev !== observation.rev
@@ -1387,8 +1387,11 @@ function versionFromParent(
   parent: DocumentVersionRecord,
   changes: Partial<DocumentVersionRecord> & Pick<DocumentVersionRecord, "version_id" | "stage" | "source" | "created_at">
 ): DocumentVersionRecord {
+  // A governed move creates fresh flat provider fields. Never carry the
+  // parent's V2 provider observation into the new version's encoded record.
+  const { provider_evidence: _previousProviderEvidence, ...base } = parent as DocumentVersionRecord & { provider_evidence?: unknown };
   return {
-    ...parent,
+    ...base,
     ...changes,
     project_id: parent.project_id,
     document_id: parent.document_id,

@@ -3,7 +3,8 @@ import { emptyProjectState } from "../src/domain/transitions";
 import { sha256Text } from "../src/documents/hash";
 import { ManagedDocumentService } from "../src/documents/service";
 import { ManagedWorkingHeadService } from "../src/documents/working-head-service";
-import { workspaceManagedDocumentPath } from "../src/persistence/layout";
+import { machineDocumentVersionPath, workspaceManagedDocumentPath } from "../src/persistence/layout";
+import { withSchemaRuntimePolicy } from "../src/schema/runtime-policy";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../src/persistence/provider/errors";
@@ -266,5 +267,60 @@ describe("one active working head", () => {
     expect(files.has(workspaceManagedDocumentPath(project.project_id, project.slug, "deliverables", "passage/published.md"))).toBe(false);
     expect(files.get(archivedPublished.archive_path!)?.content).toContain(publishedContent);
     expect((await documents.status(project.project_id, published.document_id))?.published_version_id).toBeUndefined();
+  });
+
+  it("records the current REVIEW provider observation in a V2 promotion", async () => {
+    const { runtime, files } = runtimeHarness();
+    const documents = new ManagedDocumentService(withSchemaRuntimePolicy(runtime, "provider_v2"));
+    const project = state();
+    const content = "# V2 review candidate";
+    const working = await documents.writeWorking({
+      request_id: "DOCREQ-V2-REVIEW-WRITE-0001", project_id: project.project_id,
+      logical_path: "passage/v2-review.md", content, content_sha256: await sha256Text(content), created_at: createdAt
+    }, project);
+    const review = await documents.promoteToReview({
+      request_id: "DOCREQ-V2-REVIEW-PROMOTE-0001", project_id: project.project_id,
+      document_id: working.document_id, expected_version_id: working.version_id, created_at: createdAt
+    }, project);
+    const reviewPath = workspaceManagedDocumentPath(project.project_id, project.slug, "review", "passage/v2-review.md");
+    const versionPath = machineDocumentVersionPath(project.project_id, review.document_id, review.version_id);
+    const version = JSON.parse(files.get(versionPath)?.content ?? "{}");
+    expect(version.schema_version).toBe("2.0");
+    expect(version.provider_evidence).toMatchObject({
+      path: reviewPath,
+      object_id: files.get(reviewPath)?.objectId,
+      revision_token: files.get(reviewPath)?.revisionToken
+    });
+  });
+
+  it("archives a legacy V2 REVIEW record after a governed move changed its provider revision", async () => {
+    const { runtime, files } = runtimeHarness();
+    const documents = new ManagedDocumentService(withSchemaRuntimePolicy(runtime, "provider_v2"));
+    const project = state();
+    const content = "# Historical review candidate";
+    const working = await documents.writeWorking({
+      request_id: "DOCREQ-V2-LEGACY-WRITE-0001", project_id: project.project_id,
+      logical_path: "passage/legacy-v2.md", content, content_sha256: await sha256Text(content), created_at: createdAt
+    }, project);
+    const review = await documents.promoteToReview({
+      request_id: "DOCREQ-V2-LEGACY-PROMOTE-0001", project_id: project.project_id,
+      document_id: working.document_id, expected_version_id: working.version_id, created_at: createdAt
+    }, project);
+    const workingRecord = JSON.parse(files.get(machineDocumentVersionPath(project.project_id, working.document_id, working.version_id))?.content ?? "{}");
+    const reviewRecordPath = machineDocumentVersionPath(project.project_id, review.document_id, review.version_id);
+    const reviewRecord = files.get(reviewRecordPath);
+    if (!reviewRecord) throw new Error("review_version_fixture_missing");
+    reviewRecord.content = JSON.stringify({ ...JSON.parse(reviewRecord.content), provider_evidence: workingRecord.provider_evidence });
+    const request = {
+      operation: "document.archive" as const, request_id: "DOCREQ-V2-LEGACY-ARCHIVE-0001",
+      project_id: project.project_id, document_id: review.document_id,
+      stage: "review" as const, expected_version_id: review.version_id,
+      archive_group: "RESET-AGENCY-OS-2026-09/DEPUIS-REVIEW", created_at: createdAt
+    };
+    const archived = await documents.archiveActiveDocument(request, project);
+    const reviewPath = workspaceManagedDocumentPath(project.project_id, project.slug, "review", "passage/legacy-v2.md");
+    expect(archived).toMatchObject({ status: "committed", archived_stage: "review" });
+    expect(files.has(reviewPath)).toBe(false);
+    expect(files.get(archived.archive_path!)?.content).toContain(content);
   });
 });

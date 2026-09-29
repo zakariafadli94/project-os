@@ -67,7 +67,7 @@ describe("managed document governance acceptance", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("supports section-by-section work, human edits, stale conflict, review, publish, reopen and second publish", async () => {
-    const mock = installDropboxMock();
+    const mock = installDropboxMock({ immutableRevisions: true });
     const created = await createProject();
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
 

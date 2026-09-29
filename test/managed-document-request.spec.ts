@@ -82,6 +82,22 @@ describe("managed document API request", () => {
     expect(() => parseManagedDocumentRequest({ ...request, stage: "reference" })).toThrow();
   });
 
+  it("binds a safe archive grouping to the request without accepting an arbitrary destination", async () => {
+    const request = {
+      operation: "document.archive", request_id: "DOCREQ-ARCHIVE-GROUP-0001", project_id,
+      document_id, stage: "working", expected_version_id, created_at,
+      archive_group: "RESET-AGENCY-OS-2026-09/DEPUIS-WORKING"
+    };
+    const parsed = parseManagedDocumentRequest(request);
+    expect(parsed).toEqual(request);
+    const grouped = await normalizeDocumentAdmission(parsed);
+    const other = await normalizeDocumentAdmission(parseManagedDocumentRequest({ ...request, archive_group: "OTHER" }));
+    expect(grouped.request_hash).not.toBe(other.request_hash);
+    for (const archive_group of ["../WORKING", "/OTHER", "RESET/../OTHER", "RESET//OTHER", "RESET/file.md", "RESET\\OTHER"]) {
+      expect(() => parseManagedDocumentRequest({ ...request, archive_group })).toThrow();
+    }
+  });
+
   it.each([
     { operation: "review.promote", request_id: "DOCREQ-REVIEW-000001", project_id, document_id, expected_version_id, created_at },
     { operation: "review.write", request_id: "DOCREQ-REVIEW-000002", project_id, document_id, content: "candidate", content_sha256: "b".repeat(64), expected_version_id, created_at },

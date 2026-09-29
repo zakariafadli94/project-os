@@ -61,6 +61,28 @@ async function qualifyViaCommitInventory(f: Awaited<ReturnType<typeof fixture>>)
   });
 }
 
+it.each([
+  { name: "coherent phase completion", change: { check_id: "coherent_phase", parameters: {}, operations: ["plan.phase.complete"], resource_scope: { resource_types: ["plan"], zones: ["PROJECT"] }, enforcement: "automatic", check_stage: "pre_admission" } },
+  { name: "document publication approval", change: { check_id: "exact_approval", parameters: {}, operations: ["document.publish"], resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] }, enforcement: "explicit_approval", check_stage: "pre_admission" } },
+  { name: "review promotion approval", change: { check_id: "exact_approval", parameters: {}, operations: ["review.promote"], resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] }, enforcement: "explicit_approval", check_stage: "pre_admission" } }
+])("qualifies only the code-owned pre-admission control slice: $name", async ({ change }) => {
+  const f = await fixture(change);
+  const response = await f.activate();
+  expect(response.status).toBe(200);
+  const receipt: any = await response.json();
+  expect(receipt).toMatchObject({ status: "committed" });
+  const governance = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+  const activation: any = governance.journal[receipt.transaction_id];
+  expect(activation.qualification.proof.audit.control_probes.length).toBeGreaterThan(0);
+  const evidence = activation.qualification.proof.evidence;
+  expect(evidence.entry_coverage[0].not_applicable_entries).toBeDefined();
+  expect(evidence.negative_test_refs.some((ref: string) => /#entry=(CF|AD|RP):/.test(ref))).toBe(false);
+  expect(evidence.entry_coverage[0].evidence_refs.some((ref: string) => /#entry=(CF|AD|RP):/.test(ref))).toBe(true);
+  expect(governance.rules["RULE-PRODUCTION01@1"].status).toBe("active");
+  const projectCommit = JSON.parse(f.mock.files.get(machineCommitRecordPath(f.project, 3))!);
+  expect(projectCommit.state.approvals).toEqual({});
+});
+
 async function reviewInventoryFixture(filesPerProject: number, faults: DropboxMockFault[] = []) {
   const f = await fixture({ resource_scope: { resource_types: ["artifact"], zones: ["REVIEW"] }, parameters: { allowed_zones: ["REVIEW"] } }, false, faults);
   const registry = JSON.parse(f.mock.files.get(machineRegistryJsonPath())!);
@@ -365,13 +387,35 @@ it("extends production enforcement data-only with cumulative global and local al
     expect(receipt).toMatchObject({ status: "committed", new_revision: revision + 1 });
     return receipt;
   };
+  const governanceTransaction = async (operation: string, payload: unknown, revision: number) => {
+    const tx = governanceTx(operation, payload, revision, f.project);
+    return worker.fetch(new Request("https://example.com/v1/rule-governance/transactions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${f.environment.RULE_GOVERNANCE_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(tx)
+    }), f.environment, createExecutionContext());
+  };
   // Existing typed route configuration supplies a third physical zone for independent refusals.
   await transaction("artifact.route.configure", { route_id: "ROUTE-QUALIFICATION02", source_prefix: "STUDY", target_prefix: "RESEARCH/attachments", exclusive: true, decision_ids: ["DEC-QUALIFICATION01"] }, 3);
   expect(await (await f.activate()).json()).toMatchObject({ status: "committed" });
   const local = ruleFixture(f.project, { ...f.rule, scope: { kind: "project", project_id: f.project }, rule_id: "RULE-PRODUCTION-LOCAL01", parameters: { allowed_zones: ["WORKING", "RESEARCH"] } });
-  await transaction("rule.propose", { rule: local }, 4);
-  const accepted = await transaction("rule.accept", { rule_id: local.rule_id, version: 1 }, 5);
-  const activated = await transaction("rule.activate", { rule_id: local.rule_id, version: 1, activation_evidence: [machineCommitRecordPath(f.project, accepted.new_revision)] }, 6);
+  const proposal = governanceTx("rule.propose", { rule: local }, 4, f.project);
+  const ordinaryAttempt = await f.guard.fetch("https://internal/transaction", {
+    method: "POST",
+    body: JSON.stringify(encodeAdmission(proposal, await mutationContext()))
+  });
+  expect(ordinaryAttempt.status).toBe(403);
+  expect(await ordinaryAttempt.json()).toMatchObject({ error: "LOCAL_GOVERNANCE_AUTHORITY_REQUIRED" });
+  const proposedResponse = await governanceTransaction("rule.propose", { rule: local }, 4);
+  expect(proposedResponse.status).toBe(200);
+  const proposed: any = await proposedResponse.json();
+  expect(proposed).toMatchObject({ status: "committed", new_revision: 5 });
+  const acceptedResponse = await governanceTransaction("rule.accept", { rule_id: local.rule_id, version: 1 }, 5);
+  const accepted: any = await acceptedResponse.json();
+  expect(accepted).toMatchObject({ status: "committed", new_revision: 6 });
+  const activatedResponse = await governanceTransaction("rule.activate", { rule_id: local.rule_id, version: 1, activation_evidence: [machineCommitRecordPath(f.project, accepted.new_revision)] }, 6);
+  const activated: any = await activatedResponse.json();
+  expect(activated).toMatchObject({ status: "committed", new_revision: 7 });
   const canonical = JSON.parse(f.mock.files.get(machineCommitRecordPath(f.project, activated.new_revision))!);
   expect(canonical.state.local_rules["RULE-PRODUCTION-LOCAL01@1"].status).toBe("active");
   const localProof = canonical.state.local_rule_qualifications["RULE-PRODUCTION-LOCAL01@1"].qualification.proof;
@@ -451,6 +495,8 @@ it.each([
   { change: { parameters: { allowed_zones: [] } }, code: "INVALID_CHECK_PARAMETERS" },
   { change: { check_id: "unknown" }, code: "UNKNOWN_ACTIVE_CHECK" },
   { change: { check_id: "expected_version", parameters: { required: true } }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
+  { change: { check_id: "exact_approval", parameters: {}, operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, enforcement: "explicit_approval", check_stage: "pre_admission" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
+  { change: { check_id: "exact_approval", parameters: {}, operations: ["document.publish"], resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] }, enforcement: "explicit_approval", check_stage: "both" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
   { change: { operations: ["project.materialize"] }, code: "UNSUPPORTED_CHECK_OPERATION" },
   { change: { source_refs: ["client:accepted"] }, code: "QUALIFICATION_SOURCE_UNVERIFIED" }
 ])("keeps an unequipped/inexact rule accepted_unenforced: $code", async ({ change, code }) => {

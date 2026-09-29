@@ -140,7 +140,10 @@ export class DocumentPackageReplacement {
     return new ExecutionCoordinator(commitJournal).resume(committed.plan!, this.adapter(commitJournal, committed.admission, budgetPort, async (checkId) => {
       if (checkId !== "package_presence_links_navigation") {
         const rule = options.postcheckRules?.find((r) => checkId === `rule:${canonicalJson(ruleReference(r))}`);
-        if (!rule || rule.status !== "active" || validateCheck(rule) || (rule.scope.kind === "project" && rule.scope.project_id !== state.project_id) || !rule.operations.includes("package.replace") || !admission.resources.some((r) => matchesResource(rule, r)) || !["verified_presence", "valid_links", "current_uniqueness", "verified_archive"].includes(rule.check_id)) return { verdict: "unavailable", evidence_refs: [] };
+        const postcheckStage: Readonly<Record<string, string>> = { verified_presence: "post_execution", valid_links: "post_execution", current_uniqueness: "both", verified_archive: "post_execution" };
+        if (!rule || !["active", "superseded", "retired"].includes(rule.status) || rule.enforcement !== "automatic" || postcheckStage[rule.check_id] !== rule.check_stage
+          || validateCheck(rule) || (rule.scope.kind === "project" && rule.scope.project_id !== state.project_id)
+          || !rule.operations.includes("package.replace") || !admission.resources.some((r) => matchesResource(rule, r))) return { verdict: "unavailable", evidence_refs: [] };
       }
       const evidence: string[] = [];
       for (const head of Object.values(navigation)) {

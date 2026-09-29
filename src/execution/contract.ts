@@ -1,4 +1,5 @@
 import type { EvaluationResult, RuleResource } from "../rules/contract";
+import type { ApprovalChange } from "../domain/approval";
 
 /** Server-created admission only. Never decode this interface from a public payload. */
 export interface ExecutionAdmission {
@@ -20,6 +21,8 @@ export interface ExecutionAdmission {
   results: EvaluationResult["results"];
   gaps: EvaluationResult["gaps"];
   deferred_rules: EvaluationResult["deferred_rules"];
+  /** Exact server-derived grant/revocation metadata, persisted before the commit for deterministic recovery. */
+  approval_change?: ApprovalChange;
 }
 
 export interface ExecutionStep {

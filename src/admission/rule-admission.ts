@@ -24,7 +24,7 @@ export interface RuleAdmissionPermit extends RuleAdmissionClaims {
 
 const nonEmpty = z.string().trim().min(1);
 const scope = z.discriminatedUnion("kind", [z.strictObject({ kind: z.literal("global") }), z.strictObject({ kind: z.literal("project"), project_id: nonEmpty })]);
-const resource = z.strictObject({ resource_id: nonEmpty, resource_type: nonEmpty, zone: nonEmpty, version: nonEmpty, expected_version: nonEmpty.optional(), relative_path: nonEmpty.optional(), artifact_operation: z.literal("REVIEW_CANDIDATE").optional() });
+const resource = z.strictObject({ resource_id: nonEmpty, resource_type: nonEmpty, zone: nonEmpty, version: nonEmpty, expected_version: nonEmpty.optional(), relative_path: nonEmpty.optional(), phase_id: z.string().regex(/^PHASE-[A-Z0-9]{4,}$/).optional(), artifact_operation: z.literal("REVIEW_CANDIDATE").optional() });
 const ruleset = z.strictObject({ digest: z.string().regex(/^[a-f0-9]{64}$/), rules: z.array(z.strictObject({ rule_id: nonEmpty, version: z.number().int().positive(), scope })), global_revision: z.number().int().nonnegative().nullable(), project_revision: z.number().int().nonnegative() });
 const inputSchema = z.strictObject({ actor: z.strictObject({ actor_id: nonEmpty, authority: nonEmpty }), project_id: z.string().regex(/^PRJ-[0-9]{4,}$/), operation: nonEmpty, resources: z.array(resource).min(1), request_hash: z.string().regex(/^[a-f0-9]{64}$/), global_revision: z.number().int().nonnegative(), ruleset });
 

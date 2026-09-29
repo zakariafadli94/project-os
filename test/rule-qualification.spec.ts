@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ruleVersionSchema } from "../src/domain/rule-governance";
+import { resolvedQualificationProofSchema } from "../src/rules/qualification";
 import { ruleFixture, ruleAt } from "./helpers/rule-fixtures";
 
 async function qualification() {
@@ -24,7 +25,23 @@ function proof(changes: Record<string, unknown> = {}) {
 async function qualify(rule = candidate(), evidence: unknown = proof(), active_rules: unknown[] = []) {
   return (await qualification()).qualifyRuleActivation({ rule, evidence, active_rules, requested_evidence_refs: ["qualification:7101"], now: ruleAt });
 }
+function controlCandidate() {
+  return candidate({ check_id: "coherent_phase", operations: ["plan.phase.complete"], resource_scope: { resource_types: ["plan"], zones: ["PROJECT"] }, parameters: {}, check_stage: "pre_admission" });
+}
+function controlProof(changes: Record<string, unknown> = {}) {
+  const binding = { status: "verified", evidence_ref: "phase:7101", verification_ref: "tasks:7101" };
+  return proof({
+    deployed_check_id: "coherent_phase",
+    check_evidence: { canonical_phase: binding, attached_task_statuses: binding },
+    entry_coverage: [{ operation: "plan.phase.complete", entries: ["API", "CT", "FB", "IN", "GI"], not_applicable_entries: ["CF", "AD", "RP"], evidence_refs: ["coverage:phase-routes"] }],
+    ...changes
+  });
+}
 describe("activation qualification", () => {
+  it("preserves the historical artifact proof schema when its optional audit is absent", async () => {
+    const historicalProof = proof({ deployed_check_id: "allowed_destination" });
+    expect(resolvedQualificationProofSchema.safeParse({ evidence: historicalProof }).success).toBe(true);
+  });
   it("distinguishes malformed server audit from an unavailable canonical reader without disclosing values", async () => {
     const module = await qualification();
     const result = await module.resolveAndQualifyRuleActivation({ resolve: async () => ({ evidence: proof(), active_rules: [], audit: { objects: "secret-malformed-audit-value" } }) }, {
@@ -59,6 +76,17 @@ describe("activation qualification", () => {
   });
   it("qualifies exact server evidence covering source, deployed check, entries, tests and drift", async () => {
     expect(await qualify()).toMatchObject({ verdict: "allow", code: "RULE_QUALIFIED" });
+  });
+  it("accepts the exact code-owned exercised/non-route partition for a control operation", async () => {
+    expect(await qualify(controlCandidate(), controlProof())).toMatchObject({ verdict: "allow", code: "RULE_QUALIFIED" });
+  });
+  it.each([
+    { entries: ["API", "CT", "FB", "IN"], not_applicable_entries: ["CF", "AD", "RP"] },
+    { entries: ["API", "CT", "FB", "IN", "GI", "CF"], not_applicable_entries: ["CF", "AD", "RP"] },
+    { entries: ["API", "CT", "FB", "IN", "GI", "GI"], not_applicable_entries: ["CF", "AD", "RP"] }
+  ])("rejects a missing, overlapping, or duplicate control entry partition %j", async coverage => {
+    const result = await qualify(controlCandidate(), controlProof({ entry_coverage: [{ operation: "plan.phase.complete", ...coverage, evidence_refs: ["coverage:phase-routes"] }] }));
+    expect(result).not.toMatchObject({ verdict: "allow" });
   });
   it.each([
     { accepted_source_refs: [] }, { deployment_ref: "" }, { deployed_check_id: "unknown" }, { entry_coverage: [] },

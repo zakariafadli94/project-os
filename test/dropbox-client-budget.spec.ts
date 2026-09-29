@@ -33,6 +33,17 @@ describe("DropboxClient bounded request scope", () => {
     await expect(client.listFolderPage("/empty", null, 10)).resolves.toEqual({ entries: [], cursor: null });
   });
 
+  it("rejects a change page without an explicit provider completion flag", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      return Promise.resolve(url.pathname === "/oauth2/token"
+        ? Response.json({ access_token: "test-access-token", expires_in: 14_400 })
+        : Response.json({ entries: [], cursor: "incomplete-change-page" }));
+    });
+    const client = new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" });
+    await expect(client.listFolderChanges("/PROJECT_OS")).rejects.toThrow("Invalid Dropbox change page");
+  });
+
   it("aborts an in-flight provider request at the scope deadline and clears its timer", async () => {
     vi.useFakeTimers();
     let metadataRequestStarted!: () => void;

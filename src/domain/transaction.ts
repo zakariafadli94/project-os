@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { governanceOperationSchemas, governanceOperationValues } from "./rule-governance";
+import { approvalGrantPayloadSchema, approvalRevokePayloadSchema } from "./approval";
 
 const projectId = z.string().regex(/^PRJ-[0-9]{4,}$/);
 const transactionId = z.string().regex(/^TXN-[A-Z0-9-]{10,}$/);
@@ -20,6 +21,8 @@ export const AUTO_PROJECT_ID = "PRJ-AUTO" as const;
 
 export const operationValues = [
   ...governanceOperationValues,
+  "approval.grant",
+  "approval.revoke",
   "project.create",
   "project.pause",
   "project.resume",
@@ -114,6 +117,9 @@ const decisionSupersede = z.strictObject({
   payload: z.strictObject({ decision_id: stableId("DEC"), replacement_decision_id: stableId("DEC"), reason: nonEmpty })
 });
 
+const approvalGrant = z.strictObject({ ...common, operation: z.literal("approval.grant"), payload: approvalGrantPayloadSchema });
+const approvalRevoke = z.strictObject({ ...common, operation: z.literal("approval.revoke"), payload: approvalRevokePayloadSchema });
+
 const taskCreate = z.strictObject({
   ...common,
   operation: z.literal("task.create"),
@@ -205,6 +211,8 @@ const deliverableComplete = z.strictObject({ ...common, operation: z.literal("de
 
 export const transactionSchema = z.discriminatedUnion("operation", [
   ...governanceOperationSchemas(common),
+  approvalGrant,
+  approvalRevoke,
   projectCreate,
   projectPause,
   projectResume,

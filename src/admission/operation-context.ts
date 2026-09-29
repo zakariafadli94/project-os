@@ -19,11 +19,13 @@ export interface NormalizedAdmissionOperation {
   request_hash: string;
   dependency_classification?: "resource_bound" | "unknown";
   dependency_resources?: RuleResource[];
+  canonical_resource_version?: boolean;
 }
 
 export async function normalizeTransactionAdmission(request: Transaction): Promise<NormalizedAdmissionOperation> {
   const resourceType = request.operation.split(".")[0] ?? "project";
-  const ruleResources = [{ resource_id: request.transaction_id, resource_type: resourceType, zone: "PROJECT", version: String(request.base_revision) }];
+  const ruleResources: RuleResource[] = [{ resource_id: request.transaction_id, resource_type: resourceType, zone: "PROJECT", version: String(request.base_revision),
+    ...(request.operation === "plan.phase.complete" ? { phase_id: request.payload.phase_id } : {}) }];
   const payload = request.payload as Record<string, unknown>;
   const refs: Array<{ resource_id: string; resource_type: string }> = [];
   const add = (key: string, type: string) => {
@@ -99,7 +101,10 @@ export async function normalizeArtifactAdmission(request: ArtifactWriteRequest |
   return { ...await normalized(request.project_id, "artifact.write", resources, request), dependency_classification: "resource_bound", dependency_resources: resources };
 }
 
-export async function normalizeDocumentAdmission(request: ManagedDocumentRequest): Promise<NormalizedAdmissionOperation> {
+export async function normalizeDocumentAdmission(
+  request: ManagedDocumentRequest,
+  options: { canonical_resource_version?: string } = {}
+): Promise<NormalizedAdmissionOperation> {
   if (request.operation === "navigation.reconcile") {
     const resources = [{ resource_id: `navigation:${request.zone}`, resource_type: "navigation", zone: request.zone, version: String(request.expected_generation) }];
     return { ...await normalized(request.project_id, request.operation, resources, request), dependency_classification: "resource_bound", dependency_resources: resources };
@@ -140,9 +145,16 @@ export async function normalizeDocumentAdmission(request: ManagedDocumentRequest
   const resourceId = "document_id" in request
     ? request.document_id
     : await documentIdFor(request.project_id, request.logical_path);
-  const version = "expected_version_id" in request && request.expected_version_id ? request.expected_version_id : request.request_id;
-  const resources = [{ resource_id: resourceId, resource_type: "document", zone: "DOCUMENTS", version, expected_version: "expected_version_id" in request ? request.expected_version_id : undefined, relative_path: "logical_path" in request ? request.logical_path : undefined }];
-  return { ...await normalized(request.project_id, operation, resources, request), dependency_classification: "resource_bound", dependency_resources: resources };
+  const canonicalVersionRequired = request.operation === "publish" || request.operation === "review.promote";
+  const version = canonicalVersionRequired && options.canonical_resource_version
+    ? options.canonical_resource_version
+    : "expected_version_id" in request && request.expected_version_id ? request.expected_version_id : request.request_id;
+  const expectedVersion = canonicalVersionRequired && options.canonical_resource_version
+    ? (("expected_version_id" in request && request.expected_version_id) || options.canonical_resource_version)
+    : "expected_version_id" in request ? request.expected_version_id : undefined;
+  const resources = [{ resource_id: resourceId, resource_type: "document", zone: "DOCUMENTS", version, expected_version: expectedVersion, relative_path: "logical_path" in request ? request.logical_path : undefined }];
+  return { ...await normalized(request.project_id, operation, resources, request), dependency_classification: "resource_bound", dependency_resources: resources,
+    ...(canonicalVersionRequired ? { canonical_resource_version: Boolean(options.canonical_resource_version) } : {}) };
 }
 
 export async function normalizeCandidateResolutionAdmission(request: MutationCandidateResolutionRequest): Promise<NormalizedAdmissionOperation> {

@@ -81,6 +81,7 @@ const documentArchiveSchema = z.strictObject({
   document_id: documentId,
   stage: z.enum(["working", "review", "published"]),
   expected_version_id: versionId,
+  archive_group: z.string().max(323).regex(/^[A-Z0-9][A-Z0-9_-]{0,79}(?:\/[A-Z0-9][A-Z0-9_-]{0,79}){0,3}$/).optional(),
   created_at: createdAt
 });
 

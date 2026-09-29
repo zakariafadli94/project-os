@@ -12,11 +12,14 @@ import { RuleGovernanceRepository } from "../src/persistence/rule-governance-rep
 import { machineCommitRecordPath, machineRegistryJsonPath } from "../src/persistence/layout";
 import { readProjectState, encodeProjectState } from "../src/schema/project-state";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { issueMutationContext } from "../src/admission/mutation-context";
+import { LOCAL_GOVERNANCE_ACTOR, prepareLocalGovernanceAuthority } from "../src/domain/local-governance-authority";
 import { governanceTx, ruleFixture, ruleAt } from "./helpers/rule-fixtures";
 import type { ProjectState } from "../src/domain/project-state";
 
 afterEach(() => vi.restoreAllMocks());
 const project = "PRJ-9751";
+const governanceSigningKey = "local-rule-qualification-governance-signing-key";
 const context = (state: ProjectState) => ({ actor: { actor_id: "server", authority: "guard" }, project_id: project, operation: "artifact.write", expected_project_revision: state.revision, stage: "pre_admission" as const, now: ruleAt, state, global_governance: { revision: 1, rules: {}, exceptions: {} }, resources: [{ resource_id: "ART-LOCAL-QUALIFIED01", resource_type: "artifact", zone: "ARTIFACTS", version: "a".repeat(64), relative_path: "file.md" }], observations: [], approvals: [] });
 
 it.each(["1.0", "2.0"])("keeps legacy %s local activation readable but unavailable to evaluation", async schema_version => {
@@ -39,7 +42,13 @@ async function fixture() {
   let state: ProjectState | null = null;
   const transact = async (operation: string, payload: unknown, options?: unknown) => {
     const tx = parseTransaction(governanceTx(operation, payload, state?.revision ?? 0, project));
-    const result = (applyTransaction as any)(state, tx, options);
+    let transitionOptions = options as Record<string, unknown> | undefined;
+    if (state && operation.startsWith("rule.")) {
+      const context = await issueMutationContext(state, governanceSigningKey, Date.parse(ruleAt), LOCAL_GOVERNANCE_ACTOR);
+      const localGovernanceAuthority = await prepareLocalGovernanceAuthority(state, tx, context, governanceSigningKey, Date.parse(ruleAt));
+      transitionOptions = { ...transitionOptions, localGovernanceAuthority };
+    }
+    const result = (applyTransaction as any)(state, tx, transitionOptions);
     if (result.kind !== "commit") throw new Error(JSON.stringify(result));
     state = result.state;
     await mock.writeExternal(machineCommitRecordPath(project, state!.revision), JSON.stringify({ schema_version: "1.0", project_id: project, previous_revision: tx.base_revision, new_revision: state!.revision, transaction: tx, state, event: result.event, receipt: receipt(tx, state!.revision) }));
@@ -60,7 +69,9 @@ async function helpers() { return vi.importActual<any>("../src/rules/local-rule-
 it("persists a production-qualified local attestation and preserves it through both schema writers", async () => {
   const f = await fixture(), h = await helpers();
   const capability = await h.prepareLocalRuleActivation(f.state, f.tx, f.resolver, ruleAt);
-  const result = (applyTransaction as any)(f.state, f.tx, { localRuleActivation: capability });
+  const signedContext = await issueMutationContext(f.state, governanceSigningKey, Date.parse(ruleAt), LOCAL_GOVERNANCE_ACTOR);
+  const localGovernanceAuthority = await prepareLocalGovernanceAuthority(f.state, f.tx, signedContext, governanceSigningKey, Date.parse(ruleAt));
+  const result = (applyTransaction as any)(f.state, f.tx, { localRuleActivation: capability, localGovernanceAuthority });
   expect(result.kind).toBe("commit");
   expect(result.state.local_rule_qualifications["RULE-LOCAL01@1"].qualification.proof.audit).toBeDefined();
   for (const stage of ["v1_only", "core_v2"] as const) {
@@ -74,15 +85,20 @@ it("refuses forged capabilities, transaction reuse and non-production resolvers"
   const f = await fixture(), h = await helpers();
   await expect(h.prepareLocalRuleActivation(f.state, f.tx, { resolve: async () => null }, ruleAt)).rejects.toThrow("LOCAL_RULE_QUALIFICATION_UNAVAILABLE");
   const capability = await h.prepareLocalRuleActivation(f.state, f.tx, f.resolver, ruleAt);
-  for (const [tx, token] of [[{ ...f.tx, transaction_id: "TXN-LOCAL-OTHER-0001" }, capability], [f.tx, JSON.parse(JSON.stringify(capability))]]) {
-    expect((applyTransaction as any)(f.state, tx, { localRuleActivation: token })).toMatchObject({ kind: "rejected", code: "LOCAL_RULE_QUALIFICATION_MISMATCH" });
-  }
+  const signedContext = await issueMutationContext(f.state, governanceSigningKey, Date.parse(ruleAt), LOCAL_GOVERNANCE_ACTOR);
+  const localGovernanceAuthority = await prepareLocalGovernanceAuthority(f.state, f.tx, signedContext, governanceSigningKey, Date.parse(ruleAt));
+  expect((applyTransaction as any)(f.state, { ...f.tx, transaction_id: "TXN-LOCAL-OTHER-0001" }, { localRuleActivation: capability, localGovernanceAuthority }))
+    .toMatchObject({ kind: "rejected", code: "LOCAL_RULE_GOVERNANCE_AUTHORITY_REQUIRED" });
+  expect((applyTransaction as any)(f.state, f.tx, { localRuleActivation: JSON.parse(JSON.stringify(capability)), localGovernanceAuthority }))
+    .toMatchObject({ kind: "rejected", code: "LOCAL_RULE_QUALIFICATION_MISMATCH" });
 });
 
 it.each(["proof", "rule", "project"])("detects canonical local attestation tampering: %s", async attack => {
   const f = await fixture(), h = await helpers();
   const capability = await h.prepareLocalRuleActivation(f.state, f.tx, f.resolver, ruleAt);
-  const result = (applyTransaction as any)(f.state, f.tx, { localRuleActivation: capability });
+  const signedContext = await issueMutationContext(f.state, governanceSigningKey, Date.parse(ruleAt), LOCAL_GOVERNANCE_ACTOR);
+  const localGovernanceAuthority = await prepareLocalGovernanceAuthority(f.state, f.tx, signedContext, governanceSigningKey, Date.parse(ruleAt));
+  const result = (applyTransaction as any)(f.state, f.tx, { localRuleActivation: capability, localGovernanceAuthority });
   const state = structuredClone(result.state);
   if (attack === "proof") state.local_rule_qualifications["RULE-LOCAL01@1"].qualification.proof.evidence.negative_test_refs = ["forged"];
   if (attack === "rule") state.local_rules["RULE-LOCAL01@1"].parameters.allowed_zones = ["ARTIFACTS"];
@@ -98,8 +114,14 @@ it("requalifies a successor without granting authority to the historical active 
   const accepted = await f.transact("rule.accept", { rule_id: f.rule.rule_id, version: 2 });
   const tx = parseTransaction(governanceTx("rule.activate", { rule_id: f.rule.rule_id, version: 2, activation_evidence: [machineCommitRecordPath(project, accepted.state.revision)] }, accepted.state.revision, project));
   const capability = await h.prepareLocalRuleActivation(accepted.state, tx, f.resolver, ruleAt);
-  expect((applyTransaction as any)({ ...accepted.state, name: "Changed after qualification" }, tx, { localRuleActivation: capability })).toMatchObject({ kind: "rejected", code: "LOCAL_RULE_QUALIFICATION_MISMATCH" });
-  const result = (applyTransaction as any)(accepted.state, tx, { localRuleActivation: capability });
+  const signedContext = await issueMutationContext(accepted.state, governanceSigningKey, Date.parse(ruleAt), LOCAL_GOVERNANCE_ACTOR);
+  const localGovernanceAuthority = await prepareLocalGovernanceAuthority(accepted.state, tx, signedContext, governanceSigningKey, Date.parse(ruleAt));
+  const changedState = { ...accepted.state, name: "Changed after qualification" };
+  const changedContext = await issueMutationContext(changedState, governanceSigningKey, Date.parse(ruleAt), LOCAL_GOVERNANCE_ACTOR);
+  const changedGovernanceAuthority = await prepareLocalGovernanceAuthority(changedState, tx, changedContext, governanceSigningKey, Date.parse(ruleAt));
+  expect((applyTransaction as any)(changedState, tx, { localRuleActivation: capability, localGovernanceAuthority: changedGovernanceAuthority }))
+    .toMatchObject({ kind: "rejected", code: "LOCAL_RULE_QUALIFICATION_MISMATCH" });
+  const result = (applyTransaction as any)(accepted.state, tx, { localRuleActivation: capability, localGovernanceAuthority });
   expect(result.kind).toBe("commit");
   expect(result.state.local_rules["RULE-LOCAL01@1"].status).toBe("superseded");
   expect(result.state.local_rule_qualifications["RULE-LOCAL01@1"]).toBeUndefined();

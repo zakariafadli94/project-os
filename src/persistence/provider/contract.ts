@@ -28,6 +28,8 @@ export interface ProviderChangeEntry {
 export interface ProviderChangePage {
   entries: ProviderChangeEntry[];
   cursor: string;
+  /** True keeps a bounded verification open until the remaining pages are consumed. */
+  has_more?: boolean;
 }
 
 export interface ProviderRequestScope {

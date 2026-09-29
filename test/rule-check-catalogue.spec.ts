@@ -19,4 +19,17 @@ describe("coded check catalogue", () => {
     const rule = ruleVersionSchema.parse(ruleFixture("GLOBAL", { check_id: "coherent_phase", parameters: {}, operations: ["artifact.write"] }));
     expect(validateCheck(rule)).toMatchObject({ verdict: "unavailable", code: "UNSUPPORTED_CHECK_OPERATION" });
   });
+  it("accepts coherent_phase only for its pre-admission phase-completion control", () => {
+    const rule = ruleVersionSchema.parse(ruleFixture("GLOBAL", {
+      check_id: "coherent_phase", parameters: {}, operations: ["plan.phase.complete"],
+      resource_scope: { resource_types: ["plan"], zones: ["PROJECT"] }, check_stage: "pre_admission"
+    }));
+    expect(checkCatalogue.coherent_phase).toMatchObject({
+      operations: ["plan.phase.complete"], required_evidence: ["canonical_phase", "attached_task_statuses"],
+      stages: ["pre_admission"], adapter: "pure"
+    });
+    expect(validateCheck(rule)).toBeNull();
+    expect(validateCheck({ ...rule, check_stage: "post_execution" })).toMatchObject({ verdict: "unavailable", code: "UNSUPPORTED_CHECK_STAGE" });
+    expect(validateCheck({ ...rule, enforcement: "explicit_approval" })).toMatchObject({ verdict: "unavailable", code: "UNSUPPORTED_CHECK_ENFORCEMENT" });
+  });
 });

@@ -1,4 +1,5 @@
 import type { RuleVersion, RuleException } from "./rule-governance";
+import type { ApprovalRecord } from "./approval";
 
 export type ProjectStatus = "active" | "paused" | "completed" | "archived";
 export type TaskStatus = "pending" | "active" | "blocked" | "completed";
@@ -132,6 +133,7 @@ export interface ProjectState {
   local_rules: Record<string, RuleVersion>;
   local_rule_qualifications?: Record<string, LocalRuleQualification>;
   rule_exceptions: Record<string, RuleException>;
+  approvals: Record<string, ApprovalRecord>;
   constraints: Record<string, ConstraintRecord>;
   tasks: Record<string, TaskRecord>;
   plan_phases: Record<string, PlanPhaseRecord>;

@@ -11,7 +11,7 @@ import type { CurrentManagedDocumentHead, CurrentDocumentVersionRecord } from ".
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderEntry, ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderOperationError } from "../persistence/provider/errors";
-import { machineDocumentHeadPath, machineDocumentInstanceRepairPath, machineDocumentRoot, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot } from "../persistence/layout";
+import { machineDocumentHeadPath, machineDocumentInstanceRepairPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot, machineStatePath, workspaceProjectRoot } from "../persistence/layout";
 import { sha256Text } from "./hash";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "./zone-navigation-sources";
 import { packageIdFor, packageManifestPath, packageNavigationLedgerSchema, packageNavigationPath, packageRefSchema, packageResourceVersion, parsePackageManifest, type PackageNavigationHead, type PackageRef } from "../domain/document-package";
@@ -23,6 +23,7 @@ import { machineConvergenceRoot } from "../persistence/layout";
 import { ExecutionJournal, executionHash } from "../execution/journal";
 import { sha256Canonical } from "../materialization/hash";
 import { parseManagedDocumentRequest } from "../domain/managed-document-request";
+import { readProjectState } from "../schema/project-state";
 
 type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "artifact-finalize" | "dirty" | "dirty-package" | "dirty-artifacts" | "dirty-finish" | "catalog" | "catalog-compact";
 interface PageCursor { phase: PagePhase; cursor: string | null }
@@ -762,7 +763,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const reviewPromotionProven = providerMismatch && zone === "REVIEW"
       ? await this.hasCommittedReviewPromotion(projectId, documentId, head.logical_path, pointer.versionId, observation, version, budget)
       : false;
-    if (providerMismatch && !repairProof && !reviewPromotionProven) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
+    const publishedMoveProven = providerMismatch && zone === "DELIVERABLES"
+      ? await this.hasCommittedPublishedMove(projectId, documentId, head.logical_path, pointer.versionId, observation, version, budget)
+      : false;
+    if (providerMismatch && !repairProof && !reviewPromotionProven && !publishedMoveProven) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
     const verified = await this.readVisible(observation.path, observation, version, budget);
     if (!verified) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_content_unverified" } };
     if (repairProof && verified.sha256 !== repairProof.content_sha256) return { entry: null, gap: { resource_id: resourceId, code: "active_instance_repair_content_mismatch" } };
@@ -839,6 +843,95 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     try { admission = await new ExecutionJournal(this.runtime, projectId, "document", version.request_id).readAdmission(); }
     catch { return false; }
     if (!admission || admission.admission.operation !== "review.promote"
+      || admission.admission.request_hash !== await executionHash(request) || admission.admission.verdict !== "allow") return false;
+    const matchingResources = admission.admission.resources.filter((resource) => resource.resource_id === documentId
+      && resource.resource_type === "document" && resource.zone === "DOCUMENTS"
+      && resource.version === version.parent_version_id && resource.expected_version === version.parent_version_id);
+    return matchingResources.length === 1;
+  }
+
+  private async hasCommittedPublishedMove(
+    projectId: string, documentId: string, logicalPath: string, versionId: string,
+    current: { path: string; object_id: string; revision_token: string; size: number },
+    version: CurrentDocumentVersionRecord, budget: SliceBudget
+  ): Promise<boolean> {
+    const historical = version.provider_evidence;
+    charge(budget);
+    const stateRaw = await this.runtime.objects.readText(machineStatePath(projectId));
+    if (!stateRaw) return false;
+    let canonicalRoot: string;
+    try {
+      const state = readProjectState(JSON.parse(stateRaw)).state;
+      if (state.project_id !== projectId) return false;
+      canonicalRoot = workspaceProjectRoot(projectId, state.slug);
+    } catch { return false; }
+    if (!historical || historical.object_id !== current.object_id || historical.size !== current.size
+      || historical.provider_id !== this.runtime.providerId || historical.path !== `${canonicalRoot}/WORKING/${logicalPath}`
+      || current.path !== `${canonicalRoot}/DELIVERABLES/${logicalPath}`
+      || !historical.path.endsWith(`/${logicalPath}`)
+      || !version.parent_version_id || !version.request_id
+      || !/^DOCREQ-[A-Z0-9-]{8,}$/.test(version.request_id)) return false;
+    const expectedVersionId = `VER-REQ-${(await sha256Text(`${version.request_id}\npublished`)).slice(0, 24).toUpperCase()}`;
+    if (version.version_id !== versionId || versionId !== expectedVersionId) return false;
+
+    const parentPath = machineDocumentVersionPath(projectId, documentId, version.parent_version_id);
+    charge(budget);
+    const parentRaw = await this.runtime.objects.readText(parentPath);
+    if (!parentRaw) return false;
+    let parent: CurrentDocumentVersionRecord;
+    try { parent = readDocumentVersionRecord(JSON.parse(parentRaw)).record; }
+    catch { return false; }
+    const reviewedEvidence = parent.provider_evidence;
+    if (parent.project_id !== projectId || parent.document_id !== documentId || parent.version_id !== version.parent_version_id
+      || parent.kind !== version.kind || parent.stage !== "review" || parent.logical_path !== logicalPath
+      || typeof parent.content_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(parent.content_sha256)
+      || parent.content_sha256 !== version.content_sha256 || parent.immutable_payload_path !== version.immutable_payload_path
+      || parent.immutable_payload_path !== machineDocumentTextPayloadPath(projectId, parent.content_sha256)
+      || !reviewedEvidence || reviewedEvidence.provider_id !== historical.provider_id
+      || reviewedEvidence.object_id !== historical.object_id || reviewedEvidence.revision_token !== historical.revision_token
+      || reviewedEvidence.path !== historical.path || reviewedEvidence.integrity_hash.algorithm !== historical.integrity_hash.algorithm
+      || reviewedEvidence.integrity_hash.value !== historical.integrity_hash.value || reviewedEvidence.size !== historical.size
+      || reviewedEvidence.path !== `${canonicalRoot}/WORKING/${logicalPath}`) return false;
+
+    const requestPath = `${machineDocumentRoot(projectId)}/requests/${version.request_id}/intent.json`;
+    charge(budget);
+    const intentRaw = await this.runtime.objects.readText(requestPath);
+    if (!intentRaw) return false;
+    let intent: Record<string, unknown>;
+    let request: Record<string, unknown>;
+    try {
+      intent = JSON.parse(intentRaw) as Record<string, unknown>;
+      if (intent.schema_version !== "1.0" || intent.project_id !== projectId || intent.request_id !== version.request_id
+        || typeof intent.request_json !== "string" || typeof intent.request_sha256 !== "string"
+        || await sha256Text(intent.request_json) !== intent.request_sha256) return false;
+      request = parseManagedDocumentRequest(JSON.parse(intent.request_json)) as unknown as Record<string, unknown>;
+    } catch { return false; }
+    if (request.operation !== "publish" || request.request_id !== version.request_id
+      || request.project_id !== projectId || request.document_id !== documentId
+      || request.expected_version_id !== version.parent_version_id) return false;
+
+    const receiptPath = `${machineDocumentRoot(projectId)}/requests/${version.request_id}/receipt.json`;
+    charge(budget);
+    const receiptRaw = await this.runtime.objects.readText(receiptPath);
+    if (!receiptRaw) return false;
+    let receiptRecord: Record<string, unknown>;
+    let receipt: Record<string, unknown>;
+    try {
+      receiptRecord = JSON.parse(receiptRaw) as Record<string, unknown>;
+      if (receiptRecord.schema_version !== "1.0" || receiptRecord.project_id !== projectId
+        || receiptRecord.request_id !== version.request_id || receiptRecord.request_sha256 !== intent.request_sha256
+        || receiptRecord.request_json !== intent.request_json || typeof receiptRecord.receipt_json !== "string") return false;
+      receipt = JSON.parse(receiptRecord.receipt_json) as Record<string, unknown>;
+    } catch { return false; }
+    if (receipt.status !== "committed" || receipt.request_id !== version.request_id || receipt.project_id !== projectId
+      || receipt.document_id !== documentId || receipt.version_id !== versionId || receipt.stage !== "published"
+      || receipt.logical_path !== logicalPath || receipt.provider_rev !== current.revision_token) return false;
+
+    charge(budget);
+    let admission: Awaited<ReturnType<ExecutionJournal["readAdmission"]>>;
+    try { admission = await new ExecutionJournal(this.runtime, projectId, "document", version.request_id).readAdmission(); }
+    catch { return false; }
+    if (!admission || admission.admission.operation !== "document.publish"
       || admission.admission.request_hash !== await executionHash(request) || admission.admission.verdict !== "allow") return false;
     const matchingResources = admission.admission.resources.filter((resource) => resource.resource_id === documentId
       && resource.resource_type === "document" && resource.zone === "DOCUMENTS"

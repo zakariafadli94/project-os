@@ -2,6 +2,10 @@ import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
+import { applyRuleGovernance, globalGovernanceTransactionSchema } from "../src/domain/rule-governance";
+import { eventIdForRevision } from "../src/domain/event";
+import { RuleGovernanceRepository, globalGovernanceBootstrapPath, globalGovernancePath } from "../src/persistence/rule-governance-repository";
+import { packageRuntime } from "./helpers/package-runtime";
 import { governanceTx, ruleFixture } from "./helpers/rule-fixtures";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 const testEnv = env as unknown as Env;
@@ -19,6 +23,18 @@ async function submit(tx: unknown, token: string = authority) {
 describe("RegistryGuard global governance", () => {
   let dropbox: ReturnType<typeof installDropboxMock>;
   const canonicalPath = "/PROJECT_OS/.project-os/registry/RULE_GOVERNANCE.json";
+  async function seededRepository() {
+    const { runtime, files } = packageRuntime();
+    const repository = new RuleGovernanceRepository(runtime);
+    const transaction = globalGovernanceTransactionSchema.parse(governanceTx("rule.propose", { rule: ruleFixture("GLOBAL") }, 0, "GLOBAL"));
+    const result = applyRuleGovernance({ rules: {}, exceptions: {} }, transaction, "GLOBAL");
+    if (result.kind !== "commit") throw new Error("Governance fixture did not commit");
+    const eventId = eventIdForRevision(1);
+    const event = { schema_version: "1.0" as const, event_id: eventId, project_id: "GLOBAL" as const, revision: 1, transaction_id: transaction.transaction_id, type: transaction.operation, timestamp: transaction.created_at, payload: transaction.payload };
+    const receipt = { schema_version: "1.0" as const, transaction_id: transaction.transaction_id, project_id: "GLOBAL" as const, status: "committed" as const, previous_revision: 0, new_revision: 1, event_id: eventId, committed_at: transaction.created_at };
+    await repository.write({ ...result.state, revision: 1, journal: { [transaction.transaction_id]: { transaction, receipt, event } } }, null);
+    return { repository, runtime, files };
+  }
   beforeEach(() => { dropbox = installDropboxMock(); registryName = `governance-${crypto.randomUUID()}`; });
   afterEach(() => vi.restoreAllMocks());
   it("fails closed without dedicated authority and refuses ordinary ingress authority", async () => {
@@ -42,6 +58,48 @@ describe("RegistryGuard global governance", () => {
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ error: "governance_unavailable" });
     expect((await submit(governanceTx("rule.propose", { rule: ruleFixture("GLOBAL", { rule_id: "RULE-NOT-NEW" }) }, 0, "GLOBAL"))).status).toBe(503);
+  });
+  it("overlaps the canonical and bootstrap stable-read chains", async () => {
+    const { repository, runtime } = await seededRepository();
+    const firstReads = new Set<string>();
+    let released = false;
+    let overlapped = false;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const originalGetMetadata = runtime.objects.getMetadata.bind(runtime.objects);
+    runtime.objects.getMetadata = async path => {
+      if (!released && (path === globalGovernancePath || path === globalGovernanceBootstrapPath)) {
+        firstReads.add(path);
+        if (firstReads.size === 2) {
+          overlapped = true;
+          released = true;
+          release();
+        } else {
+          // Concurrent Promise.all starts the second chain before this microtask.
+          // A sequential implementation releases first and fails the overlap assertion.
+          await Promise.resolve();
+          if (!released) { released = true; release(); }
+          await gate;
+        }
+      }
+      return originalGetMetadata(path);
+    };
+
+    await expect(repository.read()).resolves.toMatchObject({ state: { revision: 1 } });
+    expect(overlapped).toBe(true);
+  });
+  it.each([globalGovernancePath, globalGovernanceBootstrapPath])("fails closed if %s changes during its stable read", async changedPath => {
+    const { repository, runtime } = await seededRepository();
+    const originalGetMetadata = runtime.objects.getMetadata.bind(runtime.objects);
+    let reads = 0;
+    runtime.objects.getMetadata = async path => {
+      const metadata = await originalGetMetadata(path);
+      if (path !== changedPath || !metadata) return metadata;
+      reads += 1;
+      return reads === 2 ? { ...metadata, revisionToken: `${metadata.revisionToken}-changed` } : metadata;
+    };
+
+    await expect(repository.read()).rejects.toThrow(/changed during read/);
   });
   it.each(["CONTROL_TOWER_OPERATOR_TOKEN", "INPUT_RECOVERY_OPERATOR_TOKEN", "MUTATION_GATE_OPERATOR_TOKEN", "MUTATION_CONTEXT_SIGNING_KEY", "RULE_ADMISSION_SIGNING_KEY"] as const)("refuses shared authority with %s", async (binding) => {
     await configure(authority);

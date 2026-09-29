@@ -41,6 +41,21 @@ describe("server-owned admission normalization", () => {
     expect(transaction.dependency_resources).toMatchObject([{ resource_id: request.payload.task_id, resource_type: "task", zone: "PROJECT" }]);
   });
 
+  it("binds the phase-completion control to the typed target without accepting a client-selected phase", async () => {
+    const request = {
+      schema_version: "1.0" as const, transaction_id: "TXN-PHASE-CONTROL-81010001", project_id: "PRJ-8101",
+      base_revision: 4, created_at: "2026-09-12T12:00:00.000Z", operation: "plan.phase.complete" as const,
+      payload: { phase_id: "PHASE-TARGET001" }
+    };
+    const normalized = await normalizeTransactionAdmission(request);
+    expect(normalized.resources[0]).toMatchObject({
+      resource_id: request.transaction_id, resource_type: "plan", zone: "PROJECT", version: "4", phase_id: "PHASE-TARGET001"
+    });
+    const changedTarget = await normalizeTransactionAdmission({ ...request, payload: { phase_id: "PHASE-TARGET002" } });
+    expect(changedTarget.resources[0]).toMatchObject({ phase_id: "PHASE-TARGET002" });
+    expect(changedTarget.request_hash).not.toBe(normalized.request_hash);
+  });
+
   it("maps review-candidate promotion to the registered review promotion control", async () => {
     const normalized = await normalizeDocumentAdmission({ operation: "review_candidate.promote", request_id: "DOCREQ-81010001", project_id: "PRJ-8101", candidate_request_id: "ART-81010001", logical_path: "reports/candidate.pdf", expected_project_revision: 4, accepted: true, created_at: "2026-09-12T12:00:00.000Z" });
 

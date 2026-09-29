@@ -497,4 +497,33 @@ describe("durable managed-document change jobs", () => {
     expect(late).toMatchObject({ due: true, late_since: "2026-09-13T00:00:00.000Z" });
     expect(cleared).toMatchObject({ due: false, late_since: null, last_verified_at: "2026-09-13T00:00:01.000Z" });
   });
+
+  it("keeps daily verification due until the final provider change page is consumed", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-PROJECT-PAGED-0001", "change-job-paged-daily");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    const previousFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    let page = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder/continue") {
+        page += 1;
+        return Promise.resolve(Response.json({ entries: [], cursor: `daily-page-${page}`, has_more: page === 1 }));
+      }
+      return previousFetch(input, init);
+    });
+
+    const first = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({ scheduled_due: true, last_scheduled_verified_at: null });
+
+    const second = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
+    expect(second.status).toBe(200);
+    const result = await second.json<{ scheduled_due: boolean; last_scheduled_verified_at: string | null }>();
+    expect(result.scheduled_due).toBe(true);
+    expect(result.last_scheduled_verified_at).not.toBeNull();
+    const third = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
+    expect(await third.json()).toMatchObject({ scheduled_due: false });
+  });
 });

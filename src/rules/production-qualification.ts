@@ -5,11 +5,15 @@ import { parseCanonicalCommitRecord } from "../domain/commit-record";
 import { ruleVersionSchema, ruleVersionKey, type RuleVersion } from "../domain/rule-governance";
 import { deploymentIdentity } from "../deployment/identity";
 import { sha256Text } from "../documents/hash";
-import { normalizeArtifactAdmission, type ArtifactAdmissionIntent } from "../admission/operation-context";
+import { normalizeArtifactAdmission, normalizeDocumentAdmission, normalizeTransactionAdmission, type ArtifactAdmissionIntent } from "../admission/operation-context";
 import { AdmissionError, parseMutationContextOrNull, verifyMutationContext } from "../admission/mutation-context";
 import { readProjectState } from "../schema/project-state";
 import { admissionModeForProject } from "../convergence/rollout";
-import { archiveProjectRoot, machineCommitRecordPath, machineRegistryJsonPath, workspaceProjectRoot } from "../persistence/layout";
+import { archiveProjectRoot, machineCommitRecordPath, machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineRegistryJsonPath, workspaceProjectRoot } from "../persistence/layout";
+import { parseDocumentVersionRecord, parseManagedDocumentHead } from "../domain/managed-document";
+import { approvalRecordSchema } from "../domain/approval";
+import { DocumentLedgerRepository } from "../documents/repository";
+import { parseManagedDocumentRequest } from "../domain/managed-document-request";
 import { globalGovernancePath, RuleGovernanceRepository } from "../persistence/rule-governance-repository";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
@@ -17,7 +21,7 @@ import { ProviderOperationError } from "../persistence/provider/errors";
 import { canonicalJson, compareCodePoints, sameScope, verdict } from "./contract";
 import { checkCatalogue, normalizedMutationOperations, validateCheck } from "./check-catalogue";
 import { evaluateRules } from "./evaluator";
-import { QualificationResolutionFailure, qualificationEntries, type QualificationAudit, type QualificationEvidence, type RuleQualificationEvidenceResolver } from "./qualification";
+import { QualificationResolutionFailure, qualificationEntries, type ControlProbe, type QualificationAudit, type QualificationEvidence, type RuleQualificationEvidenceResolver } from "./qualification";
 
 /** Build-owned coverage of the shared artifact admission boundary. This is not Markdown/client evidence.
  * Artifact current_version and approval readers are not supplied by production admission yet, so those checks
@@ -33,6 +37,52 @@ export const deployedQualificationCoverage = Object.freeze({
     negative: "forbidden-canonical-artifact-route",
     artifact_intents: Object.freeze(["ordinary", "REVIEW_CANDIDATE"]),
     review_negative: "reject-nested-review-candidate-destination"
+  }),
+  coherent_phase: Object.freeze({
+    operations: Object.freeze(["plan.phase.complete"]),
+    entries: Object.freeze(["API", "CT", "FB", "IN", "GI"]),
+    not_applicable_entries: Object.freeze(["CF", "AD", "RP"]),
+    resource_types: Object.freeze(["plan"]), zones: Object.freeze(["PROJECT"]),
+    enforcement: "automatic", check_stage: "pre_admission", parameters: Object.freeze({}),
+    normalizer: "src/admission/operation-context.ts#normalizeTransactionAdmission",
+    boundary: "src/durable/project-guard-neutral.ts#applyTransaction",
+    positive_route: "src/index-neutral.ts#/v1/transactions;src/control-tower/mcp.ts#project_os_submit_transaction;src/fallback/contract.ts#transaction;src/inbox/runtime.ts#processTransactionInbox;src/durable/project-guard-neutral.ts#transaction",
+    negative_route: "src/index-neutral.ts#scheduled-reconcile;src/durable/project-guard-neutral.ts#request-status;src/mutation-gate/classifier.ts#candidate-resolution",
+    positive_test_ref: "test/sop-phase-entry-parity.spec.ts#qualifies-coherent-phase-completion-and-checks-a-fresh-refusal-allow-through-API",
+    negative_test_ref: "test/sop-phase-entry-parity.spec.ts#qualifies-coherent-phase-completion-and-checks-a-fresh-refusal-allow-through-API",
+    entry_evidence: Object.freeze({
+      API: "test/sop-phase-entry-parity.spec.ts#qualifies-coherent-phase-completion-and-checks-a-fresh-refusal-allow-through-API",
+      CT: "test/sop-phase-entry-parity.spec.ts#qualifies-coherent-phase-completion-and-checks-a-fresh-refusal-allow-through-CT",
+      FB: "test/sop-phase-entry-parity.spec.ts#qualifies-coherent-phase-completion-and-checks-a-fresh-refusal-allow-through-FB",
+      IN: "test/sop-phase-entry-parity.spec.ts#qualifies-coherent-phase-completion-and-checks-a-fresh-refusal-allow-through-IN",
+      CF: "src/index-neutral.ts#scheduled-reconcile",
+      AD: "src/durable/project-guard-neutral.ts#request-status",
+      RP: "src/mutation-gate/classifier.ts#candidate-resolution",
+      GI: "test/sop-phase-entry-parity.spec.ts#qualifies-coherent-phase-completion-and-checks-a-fresh-refusal-allow-through-GI"
+    })
+  }),
+  exact_approval: Object.freeze({
+    operations: Object.freeze(["document.publish", "review.promote"]),
+    entries: Object.freeze(["API", "CT", "GI"]),
+    not_applicable_entries: Object.freeze(["FB", "IN", "CF", "AD", "RP"]),
+    resource_types: Object.freeze(["document"]), zones: Object.freeze(["DOCUMENTS"]),
+    enforcement: "explicit_approval", check_stage: "pre_admission", parameters: Object.freeze({}),
+    normalizer: "src/admission/operation-context.ts#normalizeDocumentAdmission",
+    boundary: "src/durable/project-guard-neutral.ts#handleManagedDocument",
+    positive_route: "src/index-neutral.ts#/v1/documents;src/control-tower/mcp.ts#project_os_write_working_document;src/durable/project-guard-neutral.ts#/document",
+    negative_route: "src/fallback/contract.ts#transaction-only;src/inbox/runtime.ts#typed-transaction-or-artifact;src/index-neutral.ts#scheduled-reconcile;src/durable/project-guard-neutral.ts#request-status;src/mutation-gate/classifier.ts#candidate-resolution",
+    positive_test_ref: "test/sop-document-entry-parity.spec.ts#requires-an-exact-live-grant-before-review-promotion-and-publication-via-API",
+    negative_test_ref: "test/sop-document-entry-parity.spec.ts#requires-an-exact-live-grant-before-review-promotion-and-publication-via-API",
+    entry_evidence: Object.freeze({
+      API: "test/sop-document-entry-parity.spec.ts#requires-an-exact-live-grant-before-review-promotion-and-publication-via-API",
+      CT: "test/sop-document-entry-parity.spec.ts#requires-an-exact-live-grant-before-review-promotion-and-publication-via-Control-Tower",
+      GI: "test/sop-document-entry-parity.spec.ts#requires-an-exact-live-grant-before-review-promotion-and-publication-via-ProjectGuard",
+      FB: "src/fallback/contract.ts#transaction-only",
+      IN: "src/inbox/runtime.ts#typed-transaction-or-artifact",
+      CF: "src/index-neutral.ts#scheduled-reconcile",
+      AD: "src/durable/project-guard-neutral.ts#request-status",
+      RP: "src/mutation-gate/classifier.ts#candidate-resolution"
+    })
   }) })
 });
 const registrySchema = z.object({ schema_version: z.literal("1.0"), projects: z.array(z.object({ project_id: z.string().regex(/^PRJ-[0-9]{4,}$/), slug: z.string().min(1), status: z.enum(["active", "paused", "completed", "archived"]) })) });
@@ -49,8 +99,19 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     if (!deployment.worker_version_id || !deployment.git_sha) return null;
     const invalid = validateCheck(rule);
     if (invalid) throw new QualificationResolutionFailure(invalid);
-    const coverage = deployedQualificationCoverage.checks[rule.check_id as keyof typeof deployedQualificationCoverage.checks];
-    if (!coverage || rule.enforcement !== "automatic" || rule.operations.some(operation => !coverage.operations.includes(operation)) || rule.resource_scope.resource_types.some(type => type !== "artifact") || rule.resource_scope.zones.some(zone => !/^(WORKING|ARTIFACTS|DELIVERABLES|ARCHIVES|RESEARCH|REFERENCES|SPECS|MEETINGS|REVIEW)$/.test(zone))) fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "No deployed coverage for this check, operation, resource, zone or enforcement mode");
+    const coverage: any = deployedQualificationCoverage.checks[rule.check_id as keyof typeof deployedQualificationCoverage.checks];
+    const exactList = (actual: string[], expected: readonly string[]) => actual.length === expected.length && [...actual].sort().every((value, index) => value === [...expected].sort()[index]);
+    const isArtifactCoverage = rule.check_id === "allowed_destination";
+    if (!coverage || rule.operations.some(operation => !coverage.operations.includes(operation))) fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "No deployed coverage for this check or operation");
+    if (isArtifactCoverage) {
+      if (rule.enforcement !== "automatic" || rule.resource_scope.resource_types.some(type => type !== "artifact") || rule.resource_scope.zones.some(zone => !/^(WORKING|ARTIFACTS|DELIVERABLES|ARCHIVES|RESEARCH|REFERENCES|SPECS|MEETINGS|REVIEW)$/.test(zone))) fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "No deployed coverage for this check, operation, resource, zone or enforcement mode");
+    } else if (rule.enforcement !== coverage.enforcement || rule.check_stage !== coverage.check_stage
+      || canonicalJson(rule.parameters) !== canonicalJson(coverage.parameters)
+      || !exactList(rule.resource_scope.resource_types, coverage.resource_types)
+      || !exactList(rule.resource_scope.zones, coverage.zones)
+      || (rule.check_id === "coherent_phase" && !exactList(rule.operations, coverage.operations))) {
+      fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "No deployed coverage for this exact pre-admission check/resource tuple");
+    }
     const observed = new Map<string, ProviderObjectMetadata>();
     const hashes = new Map<string, string>();
     const listings = new Map<string, string>();
@@ -174,6 +235,172 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     }
     const applicable = states.filter(state => rule.scope.kind === "global" || rule.scope.project_id === state.project_id);
     if (!applicable.length || applicable.some(state => admissionModeForProject(env.PROJECT_OS_ADMISSION_PROJECT_MODES, state.project_id) !== "strict")) fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "Every governed project must have strict production admission configured");
+    if (!isArtifactCoverage) {
+      const control = coverage as typeof deployedQualificationCoverage.checks.coherent_phase | typeof deployedQualificationCoverage.checks.exact_approval;
+      const positive: string[] = [], negative: string[] = [];
+      const controlProbes: ControlProbe[] = [];
+      const probeRule: RuleVersion = { ...rule, scope: { kind: "global" }, status: "active" };
+      const probeGovernance = { revision: governance!.state.revision, rules: { [ruleVersionKey(probeRule.rule_id, probeRule.version)]: probeRule }, exceptions: {} };
+      const probeResult = async (state: ProjectState, operation: string, resources: any[], approvals: unknown[] = []) => {
+        const evaluation = await evaluateRules({ actor: { actor_id: "qualification-probe", authority: "server" }, project_id: state.project_id,
+          operation, expected_project_revision: state.revision, stage: "pre_admission", now, state: { ...state, local_rules: {} },
+          global_governance: probeGovernance, resources, observations: [], approvals });
+        const result = evaluation.results.find(item => item.rule?.rule_id === rule.rule_id && item.rule.version === rule.version);
+        if (!result) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", "Read-only production evaluator did not return the exact candidate check");
+        return result!;
+      };
+      const probeRef = async (state: ProjectState, value: unknown) => `${stateReferences.get(state.project_id) ?? machineCommitRecordPath(state.project_id, state.revision)}#control-probe=${await sha256Text(canonicalJson({ value, coverage: deployedQualificationCoverage.version }))}`;
+      const entryCoverage = control.operations.filter(operation => rule.operations.includes(operation)).map(operation => ({
+        operation,
+        entries: [...control.entries] as (typeof qualificationEntries)[number][],
+        not_applicable_entries: [...control.not_applicable_entries] as (typeof qualificationEntries)[number][],
+        evidence_refs: [deployedQualificationCoverage.version, ...control.entries.map(entry => control.entry_evidence[entry as keyof typeof control.entry_evidence]), ...control.not_applicable_entries.map(entry => control.entry_evidence[entry as keyof typeof control.entry_evidence])]
+      }));
+      if (!entryCoverage.length) fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "No operation-specific control coverage");
+      const expectedCaseCodes = new Map<string, { code: string; verdict: "approval_required" | "allow" }>([
+        ["missing", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }],
+        ["exact_live", { code: "EXACT_APPROVAL_VERIFIED", verdict: "allow" }],
+        ["wrong_actor", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }],
+        ["wrong_project", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }],
+        ["wrong_rule_version", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }],
+        ["wrong_resource_version", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }],
+        ["wrong_operation", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }],
+        ["expired", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }],
+        ["revoked", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }]
+      ]);
+      const documents = new Map<string, Array<{ document_id: string; working?: string; review?: string }>>();
+      if (rule.check_id === "exact_approval") {
+        const ledger = new DocumentLedgerRepository(runtime);
+        for (const state of applicable) {
+          const headsPath = `${machineDocumentRoot(state.project_id)}/heads`;
+          const headEntries = await list(headsPath);
+          if (headEntries.length > 256) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Managed document head inventory exceeds the synchronous qualification bound");
+          const heads: Array<{ document_id: string; working?: string; review?: string }> = [];
+          const headIds = await ledger.listHeadIds(state.project_id);
+          const listedIds = headEntries.filter(entry => entry.kind === "file").map(entry => /^((?:DOC-)[A-F0-9]{24})\.json$/.exec(entry.name)?.[1] ?? null).filter((id): id is string => id !== null).sort();
+          if (canonicalJson(headIds) !== canonicalJson(listedIds)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Managed document head inventory changed during qualification");
+          for (const documentId of headIds) {
+            const headPath = machineDocumentHeadPath(state.project_id, documentId);
+            const rawHead = await read(headPath, "QUALIFICATION_INVENTORY_UNAVAILABLE");
+            const head = parseManagedDocumentHead(JSON.parse(rawHead));
+            if (head.project_id !== state.project_id || head.document_id !== documentId || head.kind !== "work_product") fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Managed document head identity is malformed");
+            const bound: { document_id: string; working?: string; review?: string } = { document_id: documentId };
+            for (const versionId of [head.working_version_id, head.review_version_id, head.published_version_id].filter((id): id is string => Boolean(id))) {
+              const versionPath = machineDocumentVersionPath(state.project_id, documentId, versionId);
+              const record = parseDocumentVersionRecord(JSON.parse(await read(versionPath, "QUALIFICATION_INVENTORY_UNAVAILABLE")));
+              if (record.project_id !== state.project_id || record.document_id !== documentId || record.version_id !== versionId || record.kind !== "work_product") fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Managed document version identity is malformed");
+              if (!identity(await metadata(record.immutable_payload_path))) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Immutable managed document payload is unavailable");
+              if (versionId === head.working_version_id) bound.working = versionId;
+              if (versionId === head.review_version_id) bound.review = versionId;
+            }
+            heads.push(bound);
+          }
+          documents.set(state.project_id, heads);
+        }
+      }
+      const positiveRouteRefs = applicable.flatMap(state => [control.positive_test_ref, ...control.entries.map(entry => `${stateReferences.get(state.project_id) ?? machineCommitRecordPath(state.project_id, state.revision)}#entry=${entry}:${control.entry_evidence[entry as keyof typeof control.entry_evidence]}`)]);
+      const nonApplicableRouteRefs = applicable.flatMap(state => control.not_applicable_entries.map(entry => `${stateReferences.get(state.project_id) ?? machineCommitRecordPath(state.project_id, state.revision)}#entry=${entry}:${control.entry_evidence[entry as keyof typeof control.entry_evidence]}`));
+      const negativeRouteRefs = applicable.map(() => control.negative_test_ref);
+
+      for (const state of applicable) {
+        const stateRef = stateReferences.get(state.project_id) ?? machineCommitRecordPath(state.project_id, state.revision);
+        if (rule.check_id === "coherent_phase") {
+          if (!state.last_event_id) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Canonical phase state has no event provenance");
+          const taskDigest = await sha256Text(canonicalJson(Object.values(state.tasks).map(task => ({ task_id: task.task_id, phase_id: task.phase_id, status: task.status })).sort((a, b) => compareCodePoints(a.task_id, b.task_id))));
+          const realPhase = state.current_phase_id && state.plan_phases[state.current_phase_id] ? state.current_phase_id : `PHASE-${(await sha256Text(state.project_id)).slice(0, 24).toUpperCase()}`;
+          const positiveState = structuredClone(state);
+          positiveState.current_phase_id = realPhase;
+          positiveState.last_event_id ??= `EVT-QUALIFICATION-${state.revision}`;
+          for (const [id, phase] of Object.entries(positiveState.plan_phases)) positiveState.plan_phases[id] = { ...phase, status: id === realPhase ? "active" : phase.status === "active" ? "pending" : phase.status };
+          positiveState.plan_phases[realPhase] = positiveState.plan_phases[realPhase] ?? { phase_id: realPhase, title: "Qualification vector", next_actions: [], status: "active", created_at: now, updated_at: now };
+          positiveState.plan_phases[realPhase] = { ...positiveState.plan_phases[realPhase], status: "active" };
+          positiveState.tasks = Object.fromEntries(Object.entries(positiveState.tasks).map(([id, task]) => [id, task.phase_id === realPhase ? { ...task, status: "completed" } : task]));
+          const negativePhase = `PHASE-${(await sha256Text(`${state.project_id}:missing`)).slice(0, 24).toUpperCase()}`;
+          for (const entry of control.entries) for (const positiveCase of [true, false]) {
+            const phaseId = positiveCase ? realPhase : negativePhase;
+            const normalized = await normalizeTransactionAdmission({ transaction_id: `TXN-QUALIFICATION-${positiveCase ? "ALLOW" : "DENY"}-${entry}-${state.project_id.slice(-4)}`,
+              project_id: state.project_id, base_revision: state.revision, operation: "plan.phase.complete", payload: { phase_id: phaseId }, created_at: now } as any);
+            const outcome = await probeResult(positiveCase ? positiveState : structuredClone(state), "plan.phase.complete", normalized.resources);
+            if (positiveCase && (outcome.verdict !== "allow" || outcome.code !== "PHASE_COMPLETION_ALLOWED")) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", "Shared phase evaluator failed its positive ephemeral vector");
+            if (!positiveCase && (outcome.verdict !== "deny" || outcome.code !== "PHASE_NOT_FOUND")) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", "Shared phase evaluator failed its negative ephemeral vector");
+            const vectorHash = await sha256Text(canonicalJson({ project: state.project_id, revision: state.revision, phase: phaseId, positiveCase, taskDigest }));
+            const ref = `${stateRef}#control-probe=${vectorHash}`;
+            (positiveCase ? positive : negative).push(ref);
+            controlProbes.push({ check_id: "coherent_phase", rule_id: rule.rule_id, rule_version: rule.version, project_id: state.project_id,
+              project_revision: state.revision, operation: "plan.phase.complete", entry: entry as typeof qualificationEntries[number], resource_id: normalized.resources[0].resource_id, resource_type: "plan", zone: "PROJECT",
+              resource_version: String(state.revision), stage: "pre_admission", verdict: outcome.verdict as "allow" | "deny", code: outcome.code, evidence_ref: ref,
+              phase_id: phaseId, phase_status: positiveCase ? "active" : null,
+              current_phase_id: positiveCase ? realPhase : state.current_phase_id, attached_task_count: positiveCase ? Object.values(positiveState.tasks).filter(task => task.phase_id === realPhase).length : 0,
+              attached_task_statuses_sha256: taskDigest, probe_source: "ephemeral_evaluator_vector" });
+          }
+        } else {
+          for (const operation of rule.operations) {
+            const op = operation as "document.publish" | "review.promote";
+            const versionField = op === "document.publish" ? "review" : "working";
+            const actual = (documents.get(state.project_id) ?? []).find(head => head[versionField]);
+            const documentId = actual?.document_id ?? `DOC-${(await sha256Text(`${state.project_id}:${op}:ephemeral`)).slice(0, 24).toUpperCase()}`;
+            const resourceVersion = actual?.[versionField] ?? `VER-REQ-${(await sha256Text(`${state.project_id}:${op}:ephemeral-version`)).slice(0, 24).toUpperCase()}`;
+            const request = parseManagedDocumentRequest({ operation: op === "document.publish" ? "publish" : "review.promote",
+              request_id: `DOCREQ-QUALIFICATION-${op === "document.publish" ? "PUBLISH" : "PROMOTE"}01`, project_id: state.project_id,
+              document_id: documentId, expected_version_id: resourceVersion, created_at: now });
+            const normalized = await normalizeDocumentAdmission(request, { canonical_resource_version: resourceVersion });
+            for (const entry of control.entries) for (const [probeCase, expected] of expectedCaseCodes) {
+              const actorId = "qualification-probe";
+              const baseApproval = {
+                approval_id: "APR-QUALIFICATION01", project_id: state.project_id, actor_id: actorId, approved_by: "control_tower",
+                rule_id: rule.rule_id, rule_version: rule.version, rule_scope: rule.scope, resource_id: normalized.resources[0].resource_id,
+                resource_type: normalized.resources[0].resource_type, resource_zone: normalized.resources[0].zone, resource_version: normalized.resources[0].version,
+                operation: op, status: "approved" as const, granted_at: new Date(Date.parse(now) - 1_000).toISOString(), expires_at: new Date(Date.parse(now) + 60_000).toISOString(),
+                evidence_refs: [`canonical:qualification-vector/${rule.rule_id}@${rule.version}`], grant_transaction_id: "TXN-QUALIFICATION-GRANT01"
+              };
+              const record = probeCase === "missing" ? undefined : approvalRecordSchema.parse({ ...baseApproval,
+                ...(probeCase === "wrong_actor" ? { actor_id: "some-other-actor" } : {}),
+                ...(probeCase === "wrong_project" ? { project_id: "PRJ-9999" } : {}),
+                ...(probeCase === "wrong_rule_version" ? { rule_version: rule.version + 1 } : {}),
+                ...(probeCase === "wrong_resource_version" ? { resource_version: `${normalized.resources[0].version}-stale` } : {}),
+                ...(probeCase === "wrong_operation" ? { operation: op === "document.publish" ? "review.promote" : "document.publish" } : {}),
+                ...(probeCase === "expired" ? { granted_at: new Date(Date.parse(now) - 120_000).toISOString(), expires_at: new Date(Date.parse(now) - 60_000).toISOString() } : {}),
+                ...(probeCase === "revoked" ? { status: "revoked", revoked_at: now, revoked_by: "control_tower", revocation_reason: "qualification vector", revoke_transaction_id: "TXN-QUALIFICATION-REVOKE01" } : {})
+              });
+              const outcome = await probeResult(state, op, normalized.resources, record ? [record] : []);
+              if (outcome.verdict !== expected.verdict || outcome.code !== expected.code) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", `Shared exact-approval evaluator failed the ${probeCase} vector`);
+              const valueHash = record ? await sha256Text(canonicalJson(record)) : undefined;
+              const ref = `${stateRef}#control-probe=${await sha256Text(canonicalJson({ operation: op, entry, probeCase, resources: normalized.resources, valueHash }))}`;
+              (probeCase === "exact_live" ? positive : negative).push(ref);
+              controlProbes.push({ check_id: "exact_approval", rule_id: rule.rule_id, rule_version: rule.version, project_id: state.project_id,
+                project_revision: state.revision, operation: op, entry: entry as typeof qualificationEntries[number], resource_id: normalized.resources[0].resource_id, resource_type: normalized.resources[0].resource_type,
+                zone: normalized.resources[0].zone, resource_version: normalized.resources[0].version, stage: "pre_admission", verdict: outcome.verdict as "allow" | "approval_required",
+                code: outcome.code, evidence_ref: ref, actor_id: actorId, probe_case: probeCase as Extract<ControlProbe, { check_id: "exact_approval" }>['probe_case'], ...(valueHash ? { approval_record_sha256: valueHash } : {}),
+                probe_source: "ephemeral_evaluator_vector" } as ControlProbe);
+            }
+          }
+        }
+      }
+      if (!positive.length || !negative.length) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", "Read-only control evaluator probes lack positive or negative outcomes");
+      for (const [path, priorMetadata] of observed) if (identity(await metadata(path, "metadata_revalidation")) !== identity(priorMetadata)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Canonical evidence changed before qualification completed");
+      for (const path of listings.keys()) await list(path);
+      const current = await io("governance_revalidation", globalGovernancePath, () => new RuleGovernanceRepository(runtime).read());
+      if (current?.token !== governance!.token) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Global governance changed during qualification");
+      const snapshot = await sha256Text(canonicalJson({ observed: [...observed], listings: [...listings], active_rules, project_states: projectStates }));
+      const build = `deployment:${deployment.worker_version_id}:${deployment.git_sha}:${deployedQualificationCoverage.version}`;
+      const stateEvidence = applicable.map(state => stateReferences.get(state.project_id) ?? machineCommitRecordPath(state.project_id, state.revision));
+      const evidence: QualificationEvidence = {
+        rule_id: rule.rule_id, rule_version: rule.version, rule_scope: rule.scope, evidence_refs: request.requested_evidence_refs,
+        accepted_source_refs: rule.source_refs, deployed_check_id: rule.check_id, deployment_ref: build,
+        check_evidence: Object.fromEntries(checkCatalogue[rule.check_id].required_evidence.map((key, index) => [key, { status: "verified", evidence_ref: stateEvidence[0] ?? `${machineRegistryJsonPath()}#inventory=${snapshot}`, verification_ref: index === 0 ? positive[0] : negative[0] }])),
+        entry_coverage: entryCoverage.map(row => ({ ...row, evidence_refs: [...row.evidence_refs, ...positiveRouteRefs, ...nonApplicableRouteRefs, ...negativeRouteRefs] })),
+        positive_test_refs: [...new Set([...positiveRouteRefs, ...positive])], negative_test_refs: [...new Set([...negativeRouteRefs, ...negative])],
+        contradiction_scan_ref: `${globalGovernancePath}#inventory=${snapshot}`, historical_drift_ref: `${machineRegistryJsonPath()}#inventory=${snapshot}`,
+        qualified_at: now, expires_at: new Date(Date.parse(now) + 60_000).toISOString()
+      };
+      const audit: QualificationAudit = {
+        catalogue_version: deployedQualificationCoverage.version, catalogue_sha256: await sha256Text(canonicalJson(deployedQualificationCoverage)),
+        objects: [...observed].map(([path, metadata]) => ({ path, object_id: metadata.objectId!, revision_token: metadata.revisionToken!, size: metadata.size, ...(hashes.has(path) ? { content_sha256: hashes.get(path)! } : {}) })),
+        directories: await Promise.all([...listings].map(async ([path, signature]) => ({ path, listing_sha256: await sha256Text(signature) }))),
+        ...(projectStates.length ? { project_states: projectStates } : {}), control_probes: controlProbes, active_rules_sha256: await sha256Text(canonicalJson(active_rules))
+      };
+      return { evidence, active_rules, audit };
+    }
     let count = 0;
     const inventory = async (path: string, zone: string): Promise<void> => {
       if (++count > 256) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Synchronous inventory limit reached; no partial qualification");

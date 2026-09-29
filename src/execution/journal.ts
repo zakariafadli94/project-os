@@ -4,6 +4,7 @@ import { canonicalJson } from "../rules/contract";
 import { sha256Text } from "../documents/hash";
 import { machineConvergenceRoot, machineDocumentRoot } from "../persistence/layout";
 import { z } from "zod";
+import { approvalRecordSchema } from "../domain/approval";
 import { assertEffectBindings, parseExecutionPlan } from "./effects";
 import { zoneNavigationHeadSchema, zoneNavigationReceiptSchema } from "../domain/zone-navigation";
 
@@ -40,6 +41,9 @@ export class ExecutionJournal {
 
   async commit(admission: ExecutionAdmission, plan: ExecutionPlan | null): Promise<void> {
     this.assertAdmission(admission);
+    if (!plan && requiredRulePostchecks(admission).length > 0) {
+      throw new Error("execution_required_postcheck_adapter_missing");
+    }
     if (plan) {
       plan = parseExecutionPlan(plan);
       assertEffectBindings(plan, admission, this.runtime.providerId);
@@ -194,6 +198,7 @@ export class ExecutionJournal {
       || !input.source_event_id
       || !/^[a-f0-9]{64}$/.test(input.result_root_hash)
     ) throw new Error("execution_transaction_finalization_invalid");
+    this.assertSpecializedPostchecksUnavailable(admitted.admission);
     const record = {
       schema_version: "1.0",
       project_id: progress.project_id,
@@ -248,6 +253,7 @@ export class ExecutionJournal {
       || !input.mutation_intent_ref
       || !input.destination_path
     ) throw new Error("execution_artifact_finalization_invalid");
+    this.assertSpecializedPostchecksUnavailable(admitted.admission);
     const record = {
       schema_version: "1.0",
       project_id: progress.project_id,
@@ -301,6 +307,7 @@ export class ExecutionJournal {
       || !input.logical_path
       || !input.provider_rev
     ) throw new Error("execution_document_finalization_invalid");
+    this.assertSpecializedPostchecksUnavailable(admitted.admission);
     const record = {
       schema_version: "1.0",
       project_id: progress.project_id,
@@ -356,6 +363,14 @@ export class ExecutionJournal {
       || receipt.finalization_ref !== `${await this.root()}/navigation/finalizations/${await executionHash(certificate)}.json`) {
       throw new Error("execution_navigation_certificate_invalid");
     }
+    const navigationPostchecks = z.array(z.strictObject({
+      check_id: nonempty,
+      verdict: z.enum(["allow", "deny", "unavailable"]),
+      evidence_refs: z.array(nonempty)
+    })).parse(certificate.postchecks);
+    if (requiredRulePostchecks(admitted.admission).some((id) => !navigationPostchecks.some(
+      (check) => check.check_id === id && check.verdict === "allow" && check.evidence_refs.length > 0
+    ))) throw new Error("execution_required_postcheck_missing");
     // The engine durably marks this request finalized only after conditionally
     // publishing and rereading the generation-specific zone head. That
     // request-local evidence preserves history when a later valid generation
@@ -444,7 +459,20 @@ export class ExecutionJournal {
       || value.ruleset?.global_revision !== value.global_revision || value.ruleset?.project_revision !== value.project_revision
       || !/^[a-f0-9]{64}$/.test(value.ruleset?.digest) || !Array.isArray(value.ruleset.rules)
       || !Array.isArray(value.results) || !Array.isArray(value.gaps) || !Array.isArray(value.deferred_rules)) throw new Error("execution_admission_invalid");
+    if (value.operation === "approval.grant" || value.operation === "approval.revoke") {
+      const change = value.approval_change;
+      const record = change && approvalRecordSchema.safeParse(change.record);
+      if (!change || !record?.success || change.kind !== (value.operation === "approval.grant" ? "grant" : "revoke")
+        || record.data.project_id !== this.projectId || record.data.approved_by !== "control_tower"
+        || record.data.grant_transaction_id !== (change.kind === "grant" ? this.requestId : record.data.grant_transaction_id)
+        || (change.kind === "revoke" && (record.data.status !== "revoked" || record.data.revoke_transaction_id !== this.requestId))
+        || (change.kind === "grant" && record.data.status !== "approved")) throw new Error("execution_approval_admission_invalid");
+    } else if (value.approval_change !== undefined) throw new Error("execution_approval_admission_invalid");
     if (value.operation === "project.repair" && !value.diagnosed_drift_refs?.length) throw new Error("repair_diagnosed_drift_required");
+  }
+
+  private assertSpecializedPostchecksUnavailable(admission: ExecutionAdmission): void {
+    if (requiredRulePostchecks(admission).length > 0) throw new Error("execution_required_postcheck_adapter_missing");
   }
 }
 

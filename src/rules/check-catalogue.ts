@@ -27,7 +27,7 @@ const definitions = [
   definition("current_uniqueness", physical, empty, ["current_head_inventory", "canonical_head_version"], both, ["RULE_CONTROL_UNAVAILABLE"], "src/documents/working-head-service.ts"),
   definition("verified_archive", physical, empty, ["source_metadata", "archive_metadata", "integrity_hash", "archive_provenance"], ["post_execution"], ["RULE_CONTROL_UNAVAILABLE"], "src/artifacts/staged-publication.ts#samePayload"),
   definition("valid_links", physical, empty, ["declared_links", "resolved_target_versions"], ["post_execution"], ["RULE_CONTROL_UNAVAILABLE"], "docs/superpowers/specs/2026-09-12-sop-runtime-coverage-matrix.md#L5"),
-  definition("coherent_phase", ["plan.phase.complete"], empty, ["canonical_phase", "attached_task_statuses"], ["pre_admission"], ["RULE_CONTROL_UNAVAILABLE"], "src/domain/transitions.ts"),
+  definition("coherent_phase", ["plan.phase.complete"], empty, ["canonical_phase", "attached_task_statuses"], ["pre_admission"], ["RULE_EVIDENCE_UNAVAILABLE", "UNSUPPORTED_CHECK_ENFORCEMENT", "PHASE_COMPLETION_ALLOWED", "PHASE_NOT_FOUND", "PHASE_COMPLETED", "PHASE_NOT_CURRENT", "PHASE_STATE_INCONSISTENT", "PHASE_HAS_UNFINISHED_TASKS"], "src/domain/phase-completion-check.ts#checkPhaseCompletion", "pure"),
   definition("useful_resume", normalizedMutationOperations, empty, ["exact_server_approval_or_objective_resume_control"], both, ["RULE_CONTROL_UNAVAILABLE", "EXACT_APPROVAL_REQUIRED", "EXACT_APPROVAL_VERIFIED"], "docs/superpowers/specs/2026-09-12-sop-runtime-coverage-matrix.md#L4"),
   definition("terminal_staging", physical, empty, ["staging_inventory", "terminal_effect_receipts"], ["post_execution"], ["RULE_CONTROL_UNAVAILABLE"], "src/documents/input-intake-service.ts"),
   definition("verified_presence", physical, empty, ["expected_object_version", "verified_provider_metadata"], ["post_execution"], ["RULE_CONTROL_UNAVAILABLE"], "src/convergence/fenced-effects.ts#observeText")
@@ -37,6 +37,7 @@ export function validateCheck(rule: RuleVersion): RuleResult | null {
   const check = checkCatalogue[rule.check_id];
   if (!check) return verdict("unavailable", "UNKNOWN_ACTIVE_CHECK", rule, "Registered deployed check", rule.check_id, "Deploy and qualify a supported check before activation");
   if (!check.parameters.safeParse(rule.parameters).success) return verdict("unavailable", "INVALID_CHECK_PARAMETERS", rule, "Parameters matching the strict check schema", JSON.stringify(rule.parameters), "Propose and qualify a corrected rule version");
+  if (rule.check_id === "coherent_phase" && rule.enforcement !== "automatic") return verdict("unavailable", "UNSUPPORTED_CHECK_ENFORCEMENT", rule, "Automatic deterministic phase completion control", rule.enforcement, "Use automatic enforcement for the canonical phase predicate");
   if (rule.operations.some(op => !check.operations.includes(op))) return verdict("unavailable", "UNSUPPORTED_CHECK_OPERATION", rule, check.operations.join(", "), rule.operations.join(", "), "Qualify a supported operation adapter");
   const stages = rule.check_stage === "both" ? both : [rule.check_stage];
   if (stages.some(stage => !check.stages.includes(stage))) return verdict("unavailable", "UNSUPPORTED_CHECK_STAGE", rule, check.stages.join(", "), rule.check_stage, "Qualify a supported check stage");

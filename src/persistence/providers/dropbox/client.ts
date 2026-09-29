@@ -48,6 +48,7 @@ export interface DropboxChangeEntry {
 export interface DropboxChangePage {
   entries: DropboxChangeEntry[];
   cursor: string;
+  has_more?: boolean;
 }
 
 export interface DropboxListPage {
@@ -489,7 +490,10 @@ export class DropboxClient implements DropboxTransport {
       cursor: string;
       has_more: boolean;
     };
-    return { entries: parsed.entries.map(parseChangeEntry), cursor: parsed.cursor };
+    if (!Array.isArray(parsed.entries) || typeof parsed.cursor !== "string" || !parsed.cursor || typeof parsed.has_more !== "boolean") {
+      throw new Error("Invalid Dropbox change page");
+    }
+    return { entries: parsed.entries.map(parseChangeEntry), cursor: parsed.cursor, has_more: parsed.has_more };
   }
 
   private async uploadRequest(

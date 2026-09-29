@@ -27,6 +27,16 @@ describe("RegistryGuard rule-admission permit", () => {
     const altered = { ...review, resources: review.resources.map(({ artifact_operation: _, ...resource }: any) => resource) };
     await expect(verifyRuleAdmissionPermit(permit, altered, secret, now + 1)).rejects.toMatchObject({ code: "rule_admission_scope_mismatch" });
   });
+  it("retains and signs the exact normalized phase target", async () => {
+    const phase = parseRuleAdmissionInput({ ...input, operation: "plan.phase.complete", resources: [{
+      resource_id: "TXN-PHASE-01", resource_type: "plan", zone: "PROJECT", version: "12", phase_id: "PHASE-8101"
+    }] });
+    const permit = await issueRuleAdmissionPermit(phase, secret, now);
+    expect(permit.resources[0]).toHaveProperty("phase_id", "PHASE-8101");
+    await expect(verifyRuleAdmissionPermit(permit, phase, secret, now + 1)).resolves.toBeUndefined();
+    const altered = { ...phase, resources: phase.resources.map(({ phase_id: _phaseId, ...resource }) => resource) };
+    await expect(verifyRuleAdmissionPermit(permit, altered, secret, now + 1)).rejects.toMatchObject({ code: "rule_admission_scope_mismatch" });
+  });
   it("binds one signed permit to its actor, project, operation, resources, request and global rules revision", async () => {
     const permit = await issueRuleAdmissionPermit(input, secret, now);
 

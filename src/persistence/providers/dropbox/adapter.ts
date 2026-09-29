@@ -119,7 +119,8 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
         );
         return {
           entries: page.entries.map(mapChangeEntry),
-          cursor: page.cursor
+          cursor: page.cursor,
+          ...(page.has_more === undefined ? {} : { has_more: page.has_more })
         };
       }
     };

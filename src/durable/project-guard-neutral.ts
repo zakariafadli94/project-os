@@ -25,6 +25,8 @@ import type { Receipt } from "../domain/receipt";
 import { AUTO_PROJECT_ID, parseTransaction, type Transaction } from "../domain/transaction";
 import { applyTransaction } from "../domain/transitions";
 import { ruleVersionKey } from "../domain/rule-governance";
+import { isLocalGovernanceOperation, prepareLocalGovernanceAuthority, type LocalGovernanceAuthorityCapability } from "../domain/local-governance-authority";
+import { approvalChangeForTransition, prepareApprovalTransition, type ApprovalChange, type ApprovalTransitionCapability } from "../domain/approval";
 import { unavailableQualificationResolver, type RuleQualificationEvidenceResolver } from "../rules/qualification";
 import { prepareLocalRuleActivation, type LocalRuleActivationCapability } from "../rules/local-rule-qualification";
 import { createProductionRuleQualificationResolver } from "../rules/production-qualification";
@@ -62,8 +64,8 @@ import {
 import { freshnessRejectionMetric, workerLogConvergenceTelemetry } from "../convergence/observability";
 import { deploymentIdentity } from "../deployment/identity";
 import { evaluateRules } from "../rules/evaluator";
-import { canonicalJson, type EvaluationResult, type RuleObservation } from "../rules/contract";
-import type { GlobalGovernanceState } from "../domain/rule-governance";
+import { canonicalJson, type EvaluationResult, type RuleObservation, type RuleReference } from "../rules/contract";
+import type { GlobalGovernanceState, RuleVersion } from "../domain/rule-governance";
 import { ruleVersionSchema } from "../domain/rule-governance";
 import { matchesResource } from "../rules/resolution";
 import { ExecutionJournal } from "../execution/journal";
@@ -308,6 +310,7 @@ interface AdmissionProof {
   results: EvaluationResult["results"];
   gaps: EvaluationResult["gaps"];
   deferred_rules: EvaluationResult["deferred_rules"];
+  approval_change?: ApprovalChange;
 }
 
 export class ProjectGuard extends DurableObject<Env> {
@@ -670,12 +673,58 @@ export class ProjectGuard extends DurableObject<Env> {
       }
 
       const admissionState = reconciledState ?? await this.loadOrRecoverState();
+      let localGovernanceAuthority: LocalGovernanceAuthorityCapability | undefined;
+      if (isLocalGovernanceOperation(tx.operation)) {
+        if (!admissionState) throw new AdmissionError("canonical_unavailable", 503);
+        const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
+        if (!secret || !mutationContext) throw new AdmissionError("mutation_context_missing", 428);
+        try {
+          localGovernanceAuthority = await prepareLocalGovernanceAuthority(
+            admissionState, tx, mutationContext, secret, Date.now()
+          );
+        } catch (error) {
+          if (error instanceof Error && error.message === "LOCAL_GOVERNANCE_AUTHORITY_REQUIRED") {
+            throw new Error("LOCAL_GOVERNANCE_AUTHORITY_REQUIRED");
+          }
+          throw error;
+        }
+      }
       const normalized = await normalizeTransactionAdmission(tx);
       if (!admissionState && this.strictAdmissionEnabled(tx.project_id)) throw new AdmissionError("canonical_unavailable", 503);
+      const isApprovalMutation = tx.operation === "approval.grant" || tx.operation === "approval.revoke";
       let proof: AdmissionProof | null = null;
-      if (admissionState && await this.ruleAdmissionRequired(admissionState, normalized)) {
+      if (admissionState && (isApprovalMutation || await this.ruleAdmissionRequired(admissionState, normalized))) {
         await this.verifyAdmission(mutationContext, tx, admissionState);
         proof = await this.admitRules(admissionState, normalized, mutationContext!.actor);
+      }
+      if (isApprovalMutation && !admissionState) throw new AdmissionError("canonical_unavailable", 503);
+
+      let approvalTransition: ApprovalTransitionCapability | undefined;
+      if (isApprovalMutation) {
+        const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
+        if (!secret || !mutationContext || !proof) throw new AdmissionError("mutation_context_missing", 428);
+        if (proof.actor.actor_id !== "control_tower" || proof.actor.authority !== "control_tower_operator") {
+          throw new Error("APPROVAL_AUTHORITY_REQUIRED");
+        }
+        const priorAdmission = await new ExecutionJournal(this.persistence, tx.project_id, "transaction", tx.transaction_id).readAdmission();
+        let priorChange: ApprovalChange | undefined;
+        if (priorAdmission) {
+          const prior = priorAdmission.admission as AdmissionProof;
+          if (prior.operation !== tx.operation || prior.project_id !== tx.project_id || prior.request_hash !== normalized.request_hash
+            || prior.actor.actor_id !== proof.actor.actor_id || prior.actor.authority !== proof.actor.authority || !prior.approval_change) {
+            throw new Error("APPROVAL_ADMISSION_CONFLICT");
+          }
+          priorChange = prior.approval_change;
+        }
+        const global = await this.readGlobalGovernance();
+        if (global.revision !== proof.global_revision) throw new RuleAdmissionRejection({
+          ...this.unavailableGlobalResult(), code: "RULE_ADMISSION_STALE", expected: String(proof.global_revision), observed: String(global.revision),
+          required_action: "Refresh the approval transaction under the current ruleset"
+        });
+        approvalTransition = await prepareApprovalTransition(admissionState!, tx, mutationContext, secret, global, Date.now(), priorChange);
+        const change = approvalChangeForTransition(approvalTransition, admissionState!, tx);
+        if (!change) throw new Error("APPROVAL_TRANSITION_UNAVAILABLE");
+        proof.approval_change = change;
       }
 
       const capacityReservationRequired = convergenceModeForProject(
@@ -729,7 +778,7 @@ export class ProjectGuard extends DurableObject<Env> {
           return Response.json({ error: code }, { status: code.endsWith("MISMATCH") ? 409 : 503 });
         }
       }
-      const result = applyTransaction(state, tx, { localRuleActivation });
+      const result = applyTransaction(state, tx, { localRuleActivation, approvalTransition, localGovernanceAuthority });
 
       if (result.kind === "rejected" || result.kind === "conflict") {
         const receipt = this.terminalReceipt(tx, result.kind, result.code, result.message, state?.revision ?? 0);
@@ -1037,7 +1086,14 @@ export class ProjectGuard extends DurableObject<Env> {
       ));
     }
 
-    const normalized = await normalizeDocumentAdmission(operation);
+    const canonicalResourceVersion = operation.operation === "publish" || operation.operation === "review.promote"
+      ? (await this.managedDocumentService.status(state.project_id, operation.document_id))?.[
+        operation.operation === "publish" ? "review_version_id" : "working_version_id"
+      ]
+      : undefined;
+    const normalized = await normalizeDocumentAdmission(operation, {
+      ...(canonicalResourceVersion ? { canonical_resource_version: canonicalResourceVersion } : {})
+    });
     const rulesRequired = await this.ruleAdmissionRequired(state, normalized);
     await this.verifyEffectAdmission(mutationContext, operation.project_id, state, rulesRequired);
     if (operation.operation === "document.instance.repair") {
@@ -2724,14 +2780,14 @@ export class ProjectGuard extends DurableObject<Env> {
         candidate
       });
     }
-    await this.beginPackageNavigationSource(operation);
     const global = await this.readGlobalGovernance();
-    if (global.revision !== proof.global_revision) throw new Error("package_ruleset_changed");
+    const postcheckRules = this.resolveAdmittedPackagePostcheckRules(operation, state, proof, global);
+    await this.beginPackageNavigationSource(operation);
     const progress = await this.managedDocumentService.replacePackage(
       operation,
       state,
       { ...proof, kind: "document", request_id: operation.request_id },
-      { effectBudget: 20, postcheckRules: [...Object.values(global.rules), ...Object.values(state.local_rules)] }
+      { effectBudget: 20, postcheckRules }
     );
     if (progress.status === "conflict" || progress.status === "failed" || progress.status === "rejected") {
       return this.finalizePackageDocument(operation, {
@@ -2750,6 +2806,49 @@ export class ProjectGuard extends DurableObject<Env> {
       candidate: operation.candidate,
       finalization_ref: progress.finalization_ref
     });
+  }
+
+  private resolveAdmittedPackagePostcheckRules(
+    operation: Extract<ManagedDocumentRequest, { operation: "package.replace" }>,
+    state: ProjectState,
+    proof: AdmissionProof,
+    currentGlobal: GlobalGovernanceState
+  ): RuleVersion[] {
+    if (proof.ruleset.global_revision !== proof.global_revision
+      || proof.ruleset.project_revision !== proof.project_revision
+      || proof.project_revision !== operation.expected_project_revision) {
+      throw new Error("package_admission_binding");
+    }
+    const supportedPackageChecks: Readonly<Record<string, string>> = {
+      verified_presence: "post_execution",
+      valid_links: "post_execution",
+      current_uniqueness: "both",
+      verified_archive: "post_execution"
+    };
+    const result: RuleVersion[] = [];
+    for (const reference of proof.deferred_rules) {
+      if (!proof.ruleset.rules.some(rule => canonicalJson(rule) === canonicalJson(reference))) {
+        throw new Error("package_admission_binding");
+      }
+      const key = ruleVersionKey(reference.rule_id, reference.version);
+      const source = reference.scope.kind === "global"
+        ? currentGlobal.rules[key]
+        : state.local_rules?.[key];
+      const parsed = ruleVersionSchema.safeParse(source);
+      if (!parsed.success) throw new Error("package_rule_history_unavailable");
+      const rule = parsed.data;
+      if (key !== ruleVersionKey(rule.rule_id, rule.version)
+        || canonicalJson(rule.scope) !== canonicalJson(reference.scope)
+        || !["active", "superseded", "retired"].includes(rule.status)
+        || rule.enforcement !== "automatic"
+        || supportedPackageChecks[rule.check_id] !== rule.check_stage
+        || !rule.operations.includes("package.replace")
+        || !proof.resources.some(resource => matchesResource(rule, resource))) {
+        throw new Error("package_rule_history_unavailable");
+      }
+      result.push(rule);
+    }
+    return result;
   }
 
   private async resumeManagedDocument(requestId: string): Promise<void> {
@@ -3217,7 +3316,21 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private contextActor(request: Request): { actor_id: string; authority: string } {
     const authorization = request.headers.get("authorization") ?? "";
-    if (this.env.CONTROL_TOWER_OPERATOR_TOKEN && authorization === `Bearer ${this.env.CONTROL_TOWER_OPERATOR_TOKEN}`) return { actor_id: "control_tower", authority: "control_tower_operator" };
+    const governanceToken = this.env.RULE_GOVERNANCE_TOKEN;
+    const ordinaryTokens = [this.env.INGRESS_TOKEN, this.env.CONTROL_TOWER_OPERATOR_TOKEN,
+      this.env.INPUT_RECOVERY_OPERATOR_TOKEN, this.env.MUTATION_GATE_OPERATOR_TOKEN,
+      this.env.MUTATION_CONTEXT_SIGNING_KEY, this.env.RULE_ADMISSION_SIGNING_KEY];
+    if (governanceToken?.trim()
+      && !ordinaryTokens.some(token => token && governanceToken === token)
+      && authorization === `Bearer ${governanceToken}`) {
+      return { actor_id: "rule_governance", authority: "rule_governance_operator" };
+    }
+    const controlTowerToken = this.env.CONTROL_TOWER_OPERATOR_TOKEN;
+    const lowerAuthorityTokens = [this.env.INGRESS_TOKEN, this.env.INPUT_RECOVERY_OPERATOR_TOKEN,
+      this.env.MUTATION_GATE_OPERATOR_TOKEN, this.env.RULE_GOVERNANCE_TOKEN,
+      this.env.MUTATION_CONTEXT_SIGNING_KEY, this.env.RULE_ADMISSION_SIGNING_KEY];
+    if (controlTowerToken?.trim() && !lowerAuthorityTokens.some(token => token?.trim() && token === controlTowerToken)
+      && authorization === "Bearer " + controlTowerToken) return { actor_id: "control_tower", authority: "control_tower_operator" };
     if (this.env.INGRESS_TOKEN && authorization === `Bearer ${this.env.INGRESS_TOKEN}`) return { actor_id: "ingress", authority: "ingress_token" };
     return { actor_id: "project_guard", authority: "durable_object" };
   }
@@ -3497,6 +3610,13 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   protected admissionErrorResponse(error: unknown): Response {
+    if (error instanceof Error && error.message === "LOCAL_GOVERNANCE_AUTHORITY_REQUIRED") {
+      return Response.json({ error: error.message }, { status: 403 });
+    }
+    if (error instanceof Error && error.message.startsWith("APPROVAL_")) {
+      const forbidden = error.message === "APPROVAL_AUTHORITY_REQUIRED";
+      return Response.json({ error: error.message }, { status: forbidden ? 403 : 409 });
+    }
     if (error instanceof Error && error.message === "repair_diagnosed_drift_required") return Response.json({ error: "REPAIR_INTENT_REQUIRED" }, { status: 409 });
     if (error instanceof Error && error.message.startsWith("execution_")) return Response.json({ error: error.message }, { status: error.message.endsWith("conflict") ? 409 : 503 });
     if (error instanceof Error && error.message.startsWith("repair_")) return Response.json({ error: error.message }, { status: error.message.endsWith("unavailable") ? 503 : 409 });
@@ -3514,7 +3634,28 @@ export class ProjectGuard extends DurableObject<Env> {
 
   protected async admitRules(state: ProjectState, normalized: NormalizedAdmissionOperation, actor = { actor_id: "project_guard", authority: "durable_object" }): Promise<AdmissionProof> {
     const global = await this.readGlobalGovernance();
-    const evaluate = async (global_governance: GlobalGovernanceState): Promise<EvaluationResult> => evaluateRules({
+    const evaluate = async (global_governance: GlobalGovernanceState): Promise<EvaluationResult> => {
+      const approvalRule = [...Object.values(global_governance.rules), ...Object.values(state.local_rules ?? {})].find(rule =>
+        rule.status === "active" && rule.operations.includes(normalized.operation)
+        && (rule.enforcement === "explicit_approval" || rule.check_id === "exact_approval")
+        && normalized.resources.some(resource => matchesResource(rule, resource))
+      );
+      if ((normalized.operation === "document.publish" || normalized.operation === "review.promote") && approvalRule) {
+        const resource = normalized.resources[0]!;
+        if (!normalized.canonical_resource_version) return {
+          ...this.unavailableGlobalResult(), verdict: "unavailable", code: "EXACT_APPROVAL_RESOURCE_VERSION_UNAVAILABLE",
+          rule: { rule_id: approvalRule.rule_id, version: approvalRule.version, scope: approvalRule.scope },
+          resource_id: resource.resource_id, expected: "Canonical immutable review/working version", observed: resource.version,
+          required_action: "Refresh the serialized managed-document head before evaluating exact approval"
+        };
+        if (resource.expected_version !== resource.version) return {
+          ...this.unavailableGlobalResult(), verdict: "deny", code: "STALE_DOCUMENT_VERSION",
+          rule: { rule_id: approvalRule.rule_id, version: approvalRule.version, scope: approvalRule.scope },
+          resource_id: resource.resource_id, expected: resource.version, observed: resource.expected_version ?? "No expected version",
+          required_action: "Refresh the canonical document head and submit the exact reviewed version"
+        };
+      }
+      return evaluateRules({
       actor,
       project_id: normalized.project_id,
       operation: normalized.operation,
@@ -3525,10 +3666,31 @@ export class ProjectGuard extends DurableObject<Env> {
       global_governance,
       resources: normalized.resources,
       observations: await this.resolveServerObservations(state, normalized),
-      approvals: []
-    });
+      approvals: Object.values(state.approvals ?? {})
+      });
+    };
     const first = await evaluate(global);
     if (first.verdict !== "allow") throw new RuleAdmissionRejection(first);
+    const equippedPackageCheckStages: Readonly<Record<string, string>> = {
+      verified_presence: "post_execution",
+      valid_links: "post_execution",
+      current_uniqueness: "both",
+      verified_archive: "post_execution"
+    };
+    const unsupportedDeferred = (evaluation: EvaluationResult) => evaluation.deferred_rules.find(reference => {
+      const rule = [...Object.values(global.rules), ...Object.values(state.local_rules ?? {})].find(candidate =>
+        candidate.rule_id === reference.rule_id && candidate.version === reference.version
+        && canonicalJson(candidate.scope) === canonicalJson(reference.scope) && candidate.status === "active");
+      return normalized.operation !== "package.replace" || !rule || rule.enforcement !== "automatic"
+        || equippedPackageCheckStages[rule.check_id] !== rule.check_stage;
+    });
+    const firstUnsupported = unsupportedDeferred(first);
+    if (firstUnsupported) throw new RuleAdmissionRejection({
+      ...first, verdict: "unavailable", code: "RULE_POSTCHECK_ADAPTER_UNAVAILABLE", rule: firstUnsupported,
+      expected: "A qualified post-effect adapter for every deferred rule before this operation can be admitted",
+      observed: normalized.operation + " has no production adapter for " + firstUnsupported.rule_id + "@" + firstUnsupported.version,
+      required_action: "Keep this rule unenforced for this operation until its deterministic post-effect adapter is qualified"
+    });
     const input: RuleAdmissionInput = {
       actor,
       project_id: normalized.project_id,
@@ -3549,6 +3711,13 @@ export class ProjectGuard extends DurableObject<Env> {
         ? { ...final, verdict: "unavailable", code: "RULE_ADMISSION_STALE", expected: permit.ruleset.digest, observed: final.ruleset.digest, required_action: "Refresh the operation under the current ruleset" }
         : final);
     }
+    const finalUnsupported = unsupportedDeferred(final);
+    if (finalUnsupported) throw new RuleAdmissionRejection({
+      ...final, verdict: "unavailable", code: "RULE_POSTCHECK_ADAPTER_UNAVAILABLE", rule: finalUnsupported,
+      expected: "A qualified post-effect adapter for every deferred rule before this operation can be admitted",
+      observed: normalized.operation + " has no production adapter for " + finalUnsupported.rule_id + "@" + finalUnsupported.version,
+      required_action: "Keep this rule unenforced for this operation until its deterministic post-effect adapter is qualified"
+    });
     return {
       project_id: normalized.project_id,
       operation: normalized.operation,

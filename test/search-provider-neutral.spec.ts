@@ -18,6 +18,7 @@ function minimalState(): ProjectState {
   return {
     local_rules: {},
     rule_exceptions: {},
+    approvals: {},
     schema_version: "2.0",
     project_id: "PRJ-0002",
     name: "Project OS",

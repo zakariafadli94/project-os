@@ -18,20 +18,85 @@ export const qualificationEvidenceSchema = z.strictObject({
   rule_id: text, rule_version: z.number().int().positive(), rule_scope: ruleScopeSchema,
   evidence_refs: refs, accepted_source_refs: refs, deployed_check_id: text, deployment_ref: text,
   check_evidence: z.record(text, qualifiedCheckEvidenceSchema),
-  entry_coverage: z.array(z.strictObject({ operation: text, entries: z.array(z.enum(qualificationEntries)).min(1), evidence_refs: refs })).min(1),
+  entry_coverage: z.array(z.strictObject({ operation: text, entries: z.array(z.enum(qualificationEntries)).min(1), not_applicable_entries: z.array(z.enum(qualificationEntries)).optional(), evidence_refs: refs })).min(1),
   positive_test_refs: refs, negative_test_refs: refs, contradiction_scan_ref: text, historical_drift_ref: text,
   qualified_at: z.string().datetime({ offset: true }), expires_at: z.string().datetime({ offset: true })
 });
 export type QualificationEvidence = z.infer<typeof qualificationEvidenceSchema>;
+const controlProbeCommon = {
+  rule_id: text, rule_version: z.number().int().positive(), project_id: text,
+  project_revision: z.number().int().nonnegative(), operation: text,
+  entry: z.enum(qualificationEntries), resource_id: text, resource_type: text, zone: text,
+  resource_version: text, stage: z.literal("pre_admission"),
+  verdict: z.enum(["allow", "deny", "approval_required"]), code: text, evidence_ref: text
+};
+const controlProbeBaseSchema = z.discriminatedUnion("check_id", [
+  z.strictObject({ check_id: z.literal("coherent_phase"), ...controlProbeCommon,
+    phase_id: text, phase_status: z.enum(["pending", "active", "completed"]).nullable(),
+    current_phase_id: text.nullable(), attached_task_count: z.number().int().nonnegative(),
+    attached_task_statuses_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    probe_source: z.enum(["canonical_observation", "ephemeral_evaluator_vector"]) }),
+  z.strictObject({ check_id: z.literal("exact_approval"), ...controlProbeCommon,
+    actor_id: text,
+    probe_case: z.enum(["missing", "exact_live", "wrong_actor", "wrong_project", "wrong_rule_version", "wrong_resource_version", "wrong_operation", "expired", "revoked"]),
+    approval_record_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    probe_source: z.literal("ephemeral_evaluator_vector") })
+]);
+export const controlProbeSchema = controlProbeBaseSchema.superRefine((probe, ctx) => {
+  if (probe.check_id === "coherent_phase") {
+    const allowed = probe.verdict === "allow" && probe.code === "PHASE_COMPLETION_ALLOWED";
+    const denied = probe.verdict === "deny" && ["PHASE_NOT_FOUND", "PHASE_COMPLETED", "PHASE_NOT_CURRENT", "PHASE_STATE_INCONSISTENT", "PHASE_HAS_UNFINISHED_TASKS"].includes(probe.code);
+    if (!allowed && !denied) ctx.addIssue({ code: "custom", path: ["code"], message: "Phase probe outcome must match the shared completion predicate" });
+  } else {
+    const exact = probe.probe_case === "exact_live" && probe.verdict === "allow" && probe.code === "EXACT_APPROVAL_VERIFIED";
+    const required = probe.probe_case !== "exact_live" && probe.verdict === "approval_required" && probe.code === "EXACT_APPROVAL_REQUIRED";
+    if (!exact && !required) ctx.addIssue({ code: "custom", path: ["code"], message: "Approval probe outcome must match the exact approval evaluator" });
+  }
+});
+export type ControlProbe = z.infer<typeof controlProbeSchema>;
 export const qualificationAuditSchema = z.strictObject({
   catalogue_version: text, catalogue_sha256: z.string().regex(/^[a-f0-9]{64}$/),
   objects: z.array(z.strictObject({ path: text, object_id: text, revision_token: text, size: z.number().int().nonnegative(), content_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional() })).min(1),
   directories: z.array(z.strictObject({ path: text, listing_sha256: z.string().regex(/^[a-f0-9]{64}$/) })),
   project_states: z.array(z.strictObject({ project_id: text, revision: z.number().int().nonnegative(), state_hash: z.string().regex(/^[a-f0-9]{64}$/), observed_at: z.string().datetime({ offset: true }), authority: z.literal("ProjectGuard") })).optional(),
-  probes: z.array(z.strictObject({ project_id: text, relative_path: text, artifact_operation: z.literal("REVIEW_CANDIDATE").optional(), code: text, verdict: z.enum(["allow", "deny"]), evidence_ref: text })).min(2),
+  probes: z.array(z.strictObject({ project_id: text, relative_path: text, artifact_operation: z.literal("REVIEW_CANDIDATE").optional(), code: text, verdict: z.enum(["allow", "deny"]), evidence_ref: text })).optional(),
+  control_probes: z.array(controlProbeSchema).optional(),
   active_rules_sha256: z.string().regex(/^[a-f0-9]{64}$/)
 });
-export const resolvedQualificationProofSchema = z.strictObject({ evidence: qualificationEvidenceSchema, audit: qualificationAuditSchema.optional() });
+export const resolvedQualificationProofSchema = z.strictObject({ evidence: qualificationEvidenceSchema, audit: qualificationAuditSchema.optional() }).superRefine((proof, ctx) => {
+  const checkId = proof.evidence.deployed_check_id;
+  if (checkId !== "coherent_phase" && checkId !== "exact_approval") return;
+  const probes = proof.audit?.control_probes;
+  if (!probes?.length || probes.some(probe => probe.check_id !== checkId)) {
+    ctx.addIssue({ code: "custom", path: ["audit", "control_probes"], message: "Control qualification requires matching typed probes" });
+    return;
+  }
+  const coverage = proof.evidence.entry_coverage;
+  const expected = coverage.flatMap(row => row.entries.map(entry => `${row.operation}\n${entry}`));
+  const actual = [...new Set(probes.map(probe => `${probe.operation}\n${probe.entry}`))];
+  if (new Set(expected).size !== expected.length || expected.length !== actual.length || expected.some(tuple => !actual.includes(tuple))) {
+    ctx.addIssue({ code: "custom", path: ["audit", "control_probes"], message: "Control probes must cover every exercised operation/entry" });
+  }
+  if (checkId === "exact_approval") {
+    const cases = ["missing", "exact_live", "wrong_actor", "wrong_project", "wrong_rule_version", "wrong_resource_version", "wrong_operation", "expired", "revoked"];
+    for (const tuple of expected) for (const probeCase of cases) {
+      const [operation, entry] = tuple.split("\n");
+      if (!probes.some(probe => probe.check_id === checkId && probe.operation === operation && probe.entry === entry && probe.probe_case === probeCase)) {
+        ctx.addIssue({ code: "custom", path: ["audit", "control_probes"], message: "Exact-approval probes must include every mismatch and exact-live case" });
+        return;
+      }
+    }
+  } else {
+    for (const tuple of expected) {
+      const [operation, entry] = tuple.split("\n");
+      const matching = probes.filter(probe => probe.check_id === checkId && probe.operation === operation && probe.entry === entry);
+      if (!matching.some(probe => probe.verdict === "allow") || !matching.some(probe => probe.verdict === "deny")) {
+        ctx.addIssue({ code: "custom", path: ["audit", "control_probes"], message: "Phase probes must include positive and negative predicate vectors" });
+        return;
+      }
+    }
+  }
+});
 export type ResolvedQualificationProof = z.infer<typeof resolvedQualificationProofSchema>;
 export type QualificationAudit = z.infer<typeof qualificationAuditSchema>;
 export interface QualificationRequest {
@@ -70,7 +135,18 @@ export function qualifyRuleActivation(input: QualificationRequest & { evidence: 
     proof.deployed_check_id === rule.check_id && liveAt(proof.qualified_at, proof.expires_at, input.now) &&
     input.requested_evidence_refs.length > 0 && input.requested_evidence_refs.every(ref => proof.evidence_refs.includes(ref)) &&
     rule.source_refs.every(ref => proof.accepted_source_refs.includes(ref)) &&
-    rule.operations.every(operation => proof.entry_coverage.some(coverage => coverage.operation === operation && qualificationEntries.every(entry => coverage.entries.includes(entry))));
+    rule.operations.every(operation => {
+      const matches = proof.entry_coverage.filter(coverage => coverage.operation === operation);
+      if (matches.length !== 1) return false;
+      const coverage = matches[0];
+      if (new Set(coverage.entries).size !== coverage.entries.length) return false;
+      if (coverage.not_applicable_entries === undefined) return qualificationEntries.every(entry => coverage.entries.includes(entry));
+      if (new Set(coverage.not_applicable_entries).size !== coverage.not_applicable_entries.length) return false;
+      const exercised = new Set(coverage.entries);
+      if (coverage.not_applicable_entries.some(entry => exercised.has(entry))) return false;
+      const partition = [...coverage.entries, ...coverage.not_applicable_entries];
+      return partition.length === qualificationEntries.length && qualificationEntries.every(entry => partition.includes(entry));
+    });
   if (!exact) return verdict("deny", "QUALIFICATION_SCOPE_MISMATCH", rule, "Live exact rule/source/check/entry qualification", "Proof does not cover the exact activation", "Resolve current server proofs for every declared operation and entry");
   const active = input.active_rules.filter(other => other.status === "active" && !(sameScope(other.scope, rule.scope) && other.rule_id === rule.rule_id && other.version === rule.supersedes));
   for (const other of active) {

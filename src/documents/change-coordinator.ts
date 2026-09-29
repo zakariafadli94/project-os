@@ -204,7 +204,7 @@ export class ManagedDocumentChangeCoordinator {
     const remainingJobBudget = Math.max(0, jobLimit - summary.jobs_completed - summary.job_failures);
     if (remainingJobBudget > 0) await this.drainPending(state, summary, remainingJobBudget);
     summary.jobs_pending = this.jobs.pendingCount();
-    if (options.scheduled && summary.jobs_pending === 0 && summary.job_failures === 0) {
+    if (options.scheduled && !page.has_more && summary.jobs_pending === 0 && summary.job_failures === 0) {
       const completedAt = options.now ?? new Date().toISOString();
       this.jobs.completeScheduledVerification(completedAt);
       summary.late_since = null;

@@ -5,6 +5,9 @@ import { mayRebaseStaleOperation } from "./concurrency-policy";
 import type { ProjectState } from "./project-state";
 import type { Transaction } from "./transaction";
 import { localRuleQualificationForTransition, type LocalRuleActivationCapability } from "../rules/local-rule-qualification";
+import { approvalChangeForTransition, type ApprovalTransitionCapability } from "./approval";
+import { localGovernanceAuthorityForTransition, type LocalGovernanceAuthorityCapability } from "./local-governance-authority";
+import { checkPhaseCompletion } from "./phase-completion-check";
 
 export type TransitionResult =
   | { kind: "commit"; state: ProjectState; event: DomainEvent }
@@ -46,6 +49,7 @@ export function emptyProjectState(
     artifact_routes: {},
     local_rules: {},
     rule_exceptions: {},
+    approvals: {},
     constraints: {},
     tasks: {},
     plan_phases: {},
@@ -66,7 +70,7 @@ function conflict(code: string, message: string): TransitionResult {
   return { kind: "conflict", code, message };
 }
 
-function commit(state: ProjectState, tx: Transaction): TransitionResult {
+function commit(state: ProjectState, tx: Transaction, eventPayload?: Record<string, unknown>): TransitionResult {
   const revision = state.revision + 1;
   const eventId = eventIdForRevision(revision);
   const next: ProjectState = {
@@ -83,12 +87,12 @@ function commit(state: ProjectState, tx: Transaction): TransitionResult {
     transaction_id: tx.transaction_id,
     type: tx.operation,
     timestamp: tx.created_at,
-    payload: { ...tx.payload } as Record<string, unknown>
+    payload: { ...tx.payload, ...eventPayload } as Record<string, unknown>
   };
   return { kind: "commit", state: next, event };
 }
 
-export function applyTransaction(state: ProjectState | null, tx: Transaction, options: { localRuleActivation?: LocalRuleActivationCapability } = {}): TransitionResult {
+export function applyTransaction(state: ProjectState | null, tx: Transaction, options: { localRuleActivation?: LocalRuleActivationCapability; approvalTransition?: ApprovalTransitionCapability; localGovernanceAuthority?: LocalGovernanceAuthorityCapability } = {}): TransitionResult {
   if (tx.operation === "project.create") {
     if (state !== null) return rejected("PROJECT_EXISTS", "Project already exists");
     if (tx.base_revision !== 0) return conflict("REVISION_MISMATCH", "Project creation requires base revision 0");
@@ -120,12 +124,22 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction, op
   const next = structuredClone(state);
 
   switch (tx.operation) {
+    case "approval.grant":
+    case "approval.revoke": {
+      const change = approvalChangeForTransition(options.approvalTransition, state, tx);
+      if (!change) return rejected("APPROVAL_AUTHORITY_REQUIRED", "Approval changes require a fresh signed Control Tower authority");
+      next.approvals = { ...(next.approvals ?? {}), [change.record.approval_id]: change.record };
+      return commit(next, tx, { approval_record: change.record });
+    }
     case "rule.propose":
     case "rule.accept":
     case "rule.activate":
     case "rule.retire":
     case "rule.exception.grant":
     case "rule.exception.revoke": {
+      if (!localGovernanceAuthorityForTransition(options.localGovernanceAuthority, state, tx)) {
+        return rejected("LOCAL_RULE_GOVERNANCE_AUTHORITY_REQUIRED", "Local rule changes require a fresh signed governance capability");
+      }
       const result = applyRuleGovernance({ rules: next.local_rules ?? {}, exceptions: next.rule_exceptions ?? {} }, tx, next.project_id);
       if (result.kind !== "commit") return result;
       next.local_rules = result.state.rules;
@@ -329,21 +343,9 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction, op
     }
 
     case "plan.phase.complete": {
+      const issue = checkPhaseCompletion(next, tx.payload.phase_id);
+      if (issue) return rejected(issue.code, issue.message);
       const phase = next.plan_phases[tx.payload.phase_id];
-      if (!phase) return rejected("PHASE_NOT_FOUND", `Phase ${tx.payload.phase_id} does not exist`);
-      if (phase.status === "completed") return rejected("PHASE_COMPLETED", `Phase ${phase.phase_id} is already completed`);
-      if (phase.status !== "active" || next.current_phase_id !== phase.phase_id) {
-        return rejected("PHASE_NOT_CURRENT", `Only the active current phase can be completed: ${phase.phase_id}`);
-      }
-      const otherActive = Object.values(next.plan_phases).find(
-        (candidate) => candidate.phase_id !== phase.phase_id && candidate.status === "active"
-      );
-      if (otherActive) {
-        return rejected("PHASE_STATE_INCONSISTENT", `Multiple active phases exist: ${phase.phase_id}, ${otherActive.phase_id}`);
-      }
-      if (Object.values(next.tasks).some((task) => task.phase_id === phase.phase_id && task.status !== "completed")) {
-        return rejected("PHASE_HAS_UNFINISHED_TASKS", `Phase ${phase.phase_id} has unfinished attached tasks`);
-      }
       phase.status = "completed";
       phase.updated_at = tx.created_at;
       const nextPhase = Object.values(next.plan_phases)

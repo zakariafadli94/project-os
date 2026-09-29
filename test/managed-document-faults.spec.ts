@@ -77,7 +77,7 @@ describe("managed document crash recovery", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("replays the same publish after Dropbox CAS succeeded but immutable version persistence failed", async () => {
-    const mock = installDropboxMock({ faults });
+    const mock = installDropboxMock({ faults, immutableRevisions: true });
     const created = await createProject();
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
 

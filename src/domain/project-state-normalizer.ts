@@ -1,4 +1,5 @@
 import { normalizeRuleMap, normalizeExceptionMap } from "./rule-governance";
+import { normalizeApprovalMap } from "./approval";
 import { normalizeLocalRuleQualifications } from "./local-rule-qualification";
 import type {
   ArtifactRouteRecord,
@@ -285,6 +286,7 @@ export function normalizeProjectState(input: unknown): ProjectState {
     local_rules: normalizeRuleMap(raw.local_rules, projectId),
     ...(raw.local_rule_qualifications !== undefined ? { local_rule_qualifications: normalizeLocalRuleQualifications(raw.local_rule_qualifications, projectId) } : {}),
     rule_exceptions: normalizeExceptionMap(raw.rule_exceptions, projectId),
+    approvals: normalizeApprovalMap(raw.approvals, projectId),
     constraints: normalizeRecordMap(raw.constraints, "constraints", normalizeConstraint),
     tasks: normalizeRecordMap(raw.tasks, "tasks", normalizeTask),
     plan_phases: planPhases,

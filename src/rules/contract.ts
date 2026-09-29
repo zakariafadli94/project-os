@@ -14,12 +14,21 @@ export interface RuleResult {
 export interface RuleResource {
   resource_id: string; resource_type: string; zone: string; version: string;
   expected_version?: string; relative_path?: string;
+  /** Target of a typed phase completion, supplied by the server normalizer. */
+  phase_id?: string;
   artifact_operation?: "REVIEW_CANDIDATE";
 }
 export interface RuleObservation {
   project_id: string; resource_id: string; resource_version: string;
   observed_at: string; expires_at: string; evidence_refs: string[];
   current_version?: string;
+}
+/** Server-only snapshot loaded from the canonical execution journal for a post-effect check. */
+export interface InitialAdmissionProof {
+  project_id: string; operation: string; request_hash: string;
+  actor: { actor_id: string; authority: string }; resources: RuleResource[];
+  project_revision: number; ruleset: EvaluationResult["ruleset"];
+  verdict: Verdict; results: RuleResult[]; deferred_rules: RuleReference[];
 }
 /** Server-created context only. Ingress must never deserialize client-selected rules/proofs into this interface. */
 export interface OperationContext {
@@ -28,6 +37,8 @@ export interface OperationContext {
   stage: CheckStage; now: string; state: ProjectState;
   global_governance: GlobalGovernanceState | null;
   resources: RuleResource[]; observations: RuleObservation[]; approvals: unknown[];
+  /** Present only when the caller has loaded the immutable initial admission from ExecutionJournal. */
+  request_hash?: string; initial_admission?: InitialAdmissionProof;
 }
 export interface EvaluationResult extends RuleResult {
   ruleset: { digest: string; rules: RuleReference[]; global_revision: number | null; project_revision: number };

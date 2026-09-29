@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ExecutionJournal } from "../src/execution/journal";
 import { ExecutionCoordinator, InternalExecutionFailure } from "../src/execution/coordinator";
 import type { ExecutionAdmission, ExecutionAdapter, ExecutionPlan, ExecutionStep, StepObservation } from "../src/execution/contract";
+import { emptyProjectState } from "../src/domain/transitions";
+import { evaluateRules } from "../src/rules/evaluator";
 import { parseRepairIntent } from "../src/execution/repair";
 import { DropboxClient } from "../src/persistence/providers/dropbox/client";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
@@ -271,8 +273,66 @@ describe("durable governed execution", () => {
   it("cannot finalize when a frozen plan omits a deferred rule postcheck", async () => {
     const { journal } = setup();
     const a = admission();
-    a.deferred_rules = [{ rule_id: "RULE-POSTCHECK", version: 1, scope: { kind: "global" } }];
+    a.deferred_rules = [{ rule_id: "RULE-BOTH", version: 1, scope: { kind: "global" } }];
     await expect(journal.commit(a, plan)).rejects.toThrow("execution_required_postcheck_missing");
+  });
+
+  it("does not admit deferred rule obligations to a null-plan family without its own adapter", async () => {
+    const { journal } = setup();
+    const a = admission();
+    a.deferred_rules = [{ rule_id: "RULE-BOTH", version: 1, scope: { kind: "global" } }];
+
+    await expect(journal.commit(a, null)).rejects.toThrow("execution_required_postcheck_adapter_missing");
+    expect(await journal.readAdmission()).toBeNull();
+  });
+
+  it("requires allow evidence from each exact both-stage postcheck before generic finalization", async () => {
+    const { journal, coordinator, adapter } = setup();
+    const a = admission();
+    const ref = { rule_id: "RULE-BOTH", version: 1, scope: { kind: "global" as const } };
+    a.deferred_rules = [ref];
+    const checkId = 'rule:{"rule_id":"RULE-BOTH","scope":{"kind":"global"},"version":1}';
+    const checkedPlan = { ...plan, postchecks: [...plan.postchecks, checkId] };
+    await journal.commit(a, checkedPlan);
+
+    adapter.postcheck = vi.fn(async (id) => id === checkId
+      ? { verdict: "allow" as const, evidence_refs: [] }
+      : { verdict: "allow" as const, evidence_refs: ["proof:destination"] });
+
+    const result = await coordinator.resume(checkedPlan, adapter);
+    expect(result).toMatchObject({ status: "finalizing", terminal: false, code: "EXECUTION_POSTCHECK_UNAVAILABLE" });
+    expect(result.postchecks).toContainEqual({ check_id: checkId, verdict: "unavailable", evidence_refs: [] });
+  });
+
+  it("finalizes an exact approval postcheck from the immutable initial journal proof after expiry or revocation", async () => {
+    const { journal, coordinator, adapter } = setup();
+    const a = admission();
+    const ref = { rule_id: "RULE-BOTH", version: 1, scope: { kind: "global" as const } };
+    const checkId = 'rule:{"rule_id":"RULE-BOTH","scope":{"kind":"global"},"version":1}';
+    a.deferred_rules = [ref];
+    a.ruleset.rules = [ref];
+    a.results = [{ verdict: "allow", code: "EXACT_APPROVAL_VERIFIED", rule: ref, resource_id: "artifact-1",
+      expected: "Exact approval", observed: "APR-9258", required_action: "None", approval_id: "APR-9258",
+      evidence_refs: ["canonical:project/PRJ-9258/transaction/TXN-APPROVAL-9258"] }];
+    const checkedPlan = { ...plan, postchecks: [...plan.postchecks, checkId] };
+    await journal.commit(a, checkedPlan);
+    const state = emptyProjectState("PRJ-9258", "Test", "test");
+    state.revision = a.project_revision;
+    adapter.postcheck = vi.fn(async (id) => {
+      if (id !== checkId) return { verdict: "allow" as const, evidence_refs: ["proof:destination"] };
+      const stored = (await journal.readAdmission())!.admission;
+      const evaluated = await evaluateRules({
+        actor: stored.actor, project_id: stored.project_id, operation: stored.operation,
+        expected_project_revision: state.revision, stage: "post_execution", now: "2026-09-14T10:00:00.000Z",
+        state, global_governance: null, resources: stored.resources, observations: [], approvals: [],
+        request_hash: stored.request_hash, initial_admission: stored as any
+      });
+      return { verdict: evaluated.verdict === "allow" ? "allow" as const : "unavailable" as const,
+        evidence_refs: evaluated.results.flatMap(result => result.evidence_refs ?? []) };
+    });
+    const result = await coordinator.resume(checkedPlan, adapter);
+    expect(result).toMatchObject({ status: "finalized", terminal: true });
+    expect(result.postchecks).toContainEqual(expect.objectContaining({ check_id: checkId, verdict: "allow", evidence_refs: ["canonical:project/PRJ-9258/transaction/TXN-APPROVAL-9258"] }));
   });
 
   it("rejects a repair without exact resources or diagnosed drift", () => {

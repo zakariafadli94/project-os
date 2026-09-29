@@ -37,6 +37,7 @@ import { canonicalJson } from "../rules/contract";
 import { sha256Canonical } from "../materialization/hash";
 
 const MAX_INSTANCE_REPAIR_BYTES = 2_000_000;
+const MAX_PUBLISHED_ARCHIVE_BYTES = 10 * 1024 * 1024;
 
 export interface ManagedTextWriteRequest {
   request_id: string;
@@ -485,7 +486,72 @@ export class ManagedDocumentService {
     this.assertMutableProject(request.project_id, state);
     const versionId = await requestVersionIdFor(request.request_id, "published");
     const replay = await this.ledger.readVersion(request.project_id, request.document_id, versionId);
-    if (replay) return receiptFor(request.request_id, replay);
+    if (replay) {
+      if (
+        replay.request_id !== request.request_id
+        || replay.stage !== "published"
+        || replay.parent_version_id !== request.expected_version_id
+        || replay.created_at !== request.created_at
+      ) {
+        throw new ManagedDocumentConflictError(
+          "DOCUMENT_REQUEST_REPLAY_CONFLICT",
+          "Publication request id is already bound to a different candidate or timestamp",
+          request.document_id
+        );
+      }
+      const replayHead = await this.ledger.readHead(request.project_id, request.document_id);
+      if (
+        replayHead?.published_version_id
+        && replayHead.published_version_id !== versionId
+        && replayHead.review_version_id === replay.parent_version_id
+        && replay.parent_version_id === request.expected_version_id
+      ) {
+        const priorPublished = await this.requireVersion(request.project_id, request.document_id, replayHead.published_version_id);
+        const archivePath = managedArchivePath(
+          state,
+          request.document_id,
+          priorPublished.version_id,
+          "published",
+          request.request_id,
+          replay.logical_path
+        );
+        const publishedPath = workspaceManagedDocumentPath(state.project_id, state.slug, "deliverables", replay.logical_path);
+        const currentPublished = await this.runtime.objects.getMetadata(publishedPath);
+        const archived = await this.runtime.objects.getMetadata(archivePath);
+        const currentEvidence = currentPublished ? requireDropboxV1Evidence(currentPublished) : undefined;
+        if (
+          replay.provider_path === publishedPath
+          && currentPublished
+          && currentPublished.path === publishedPath
+          && providerContentMatches(currentPublished, replay)
+          && currentEvidence?.file_id === replay.provider_file_id
+          && currentEvidence?.rev === replay.provider_rev
+          && archived
+          && providerContentMatches(archived, priorPublished)
+        ) {
+          await this.ledger.writeHead({
+            ...replayHead,
+            working_version_id: undefined,
+            review_version_id: undefined,
+            published_version_id: versionId,
+            provider: compactProviderState({
+              ...replayHead.provider,
+              working: undefined,
+              review: undefined,
+              published: providerObservation(currentPublished, publishedPath)
+            }),
+            reconciliation_status: "clean"
+          });
+        } else {
+          throw new ManagedDocumentConflictError(
+            "DOCUMENT_PUBLICATION_HEAD_NOT_FINALIZED",
+            "A published version record exists, but the exact replacement effect cannot be proven to advance the document head",
+            request.document_id
+          );
+        }
+      }
+      return receiptFor(request.request_id, replay);
+    }
 
     const head = await this.requireWorkProductHead(request.project_id, request.document_id);
     if (!head.review_version_id) {
@@ -525,6 +591,28 @@ export class ManagedDocumentService {
 
     const visibleReview = await this.runtime.objects.getMetadata(reviewPath);
     if (!visibleReview) {
+      if (head.published_version_id) {
+        const priorPublished = await this.requireVersion(request.project_id, request.document_id, head.published_version_id);
+        const archivePath = managedArchivePath(
+          state,
+          request.document_id,
+          priorPublished.version_id,
+          "published",
+          request.request_id,
+          head.logical_path
+        );
+        const visiblePublished = await this.runtime.objects.getMetadata(publishedPath);
+        const archived = await this.runtime.objects.getMetadata(archivePath);
+        if (visiblePublished && visiblePublished.path === publishedPath && providerContentMatches(visiblePublished, review)
+          && archived && archived.path === archivePath && providerContentMatches(archived, priorPublished)) {
+          return persistPublished(visiblePublished);
+        }
+        throw new ManagedDocumentConflictError(
+          "REVIEW_CONTENT_MISSING",
+          "Review candidate is missing and the replacement archive does not prove this interrupted publication",
+          request.document_id
+        );
+      }
       const visiblePublished = await this.runtime.objects.getMetadata(publishedPath);
       if (visiblePublished && review.provider_content_hash && review.size !== undefined) {
         const publishedEvidence = requireDropboxV1Evidence(visiblePublished);
@@ -542,28 +630,67 @@ export class ManagedDocumentService {
       );
     }
 
-    const visibleReviewEvidence = requireDropboxV1Evidence(visibleReview);
-    const expectedReviewRev = head.provider?.review?.rev ?? review.provider_rev;
-    if (!expectedReviewRev || visibleReviewEvidence.rev !== expectedReviewRev) {
-      throw new ManagedDocumentConflictError(
-        "PROVIDER_VERSION_CHANGED",
-        `Managed document visible file changed outside Project OS: ${reviewPath}`,
-        request.document_id
-      );
+    this.assertVisibleVersionMatches(reviewPath, visibleReview, review, head.provider?.review, request.document_id);
+    const originalReviewEvidence = requireDropboxV1Evidence(visibleReview);
+    const reviewContent = await this.runtime.objects.readText(reviewPath);
+    if (reviewContent === null) {
+      throw new ManagedDocumentConflictError("REVIEW_CONTENT_MISSING", "Review candidate content is missing", request.document_id);
     }
 
     let metadata: ProviderObjectMetadata;
     if (head.published_version_id) {
       const priorPublished = await this.requireVersion(request.project_id, request.document_id, head.published_version_id);
+      if (!this.runtime.objects.deleteIfUnchanged) {
+        throw new ManagedDocumentConflictError(
+          "CONDITIONAL_REVIEW_DELETE_UNAVAILABLE",
+          "Cannot safely remove the review candidate after publication without conditional-delete support",
+          request.document_id
+        );
+      }
+      const archivePath = managedArchivePath(
+        state,
+        request.document_id,
+        priorPublished.version_id,
+        "published",
+        request.request_id,
+        head.logical_path
+      );
+      const currentAtEntry = await this.runtime.objects.getMetadata(publishedPath);
+      const archivedAtEntry = await this.runtime.objects.getMetadata(archivePath);
+      if (
+        currentAtEntry
+        && providerContentMatches(currentAtEntry, review)
+        && archivedAtEntry
+        && providerContentMatches(archivedAtEntry, priorPublished)
+      ) {
+        await this.deleteReviewConditionally(reviewPath, visibleReview, request.document_id);
+        return persistPublished(currentAtEntry);
+      }
+      await this.ensurePublishedVersionArchived(
+        publishedPath,
+        archivePath,
+        priorPublished,
+        head.provider?.published,
+        request.document_id
+      );
       const currentPublished = await this.assertProviderStillMatches(
         publishedPath,
         priorPublished,
         head.provider?.published,
         request.document_id
       );
-      const reviewContent = await this.runtime.objects.readText(reviewPath);
-      if (reviewContent === null) {
-        throw new ManagedDocumentConflictError("REVIEW_CONTENT_MISSING", "Review candidate content is missing", request.document_id);
+      const currentReview = await this.requireMetadata(reviewPath);
+      this.assertVisibleVersionMatches(reviewPath, currentReview, review, head.provider?.review, request.document_id);
+      const currentReviewEvidence = requireDropboxV1Evidence(currentReview);
+      if (
+        currentReviewEvidence.file_id !== originalReviewEvidence.file_id
+        || currentReviewEvidence.rev !== originalReviewEvidence.rev
+      ) {
+        throw new ManagedDocumentConflictError(
+          "PROVIDER_VERSION_CHANGED",
+          `Review candidate changed while publication was being prepared: ${reviewPath}`,
+          request.document_id
+        );
       }
       const currentPublishedEvidence = requireDropboxV1Evidence(currentPublished);
       try {
@@ -580,7 +707,7 @@ export class ManagedDocumentService {
           request.document_id
         );
       }
-      await this.runtime.objects.delete(reviewPath);
+      await this.deleteReviewConditionally(reviewPath, currentReview, request.document_id);
     } else {
       await this.runtime.objects.move(reviewPath, publishedPath);
       metadata = await this.requireMetadata(publishedPath);
@@ -850,12 +977,13 @@ export class ManagedDocumentService {
       request.expected_version_id,
       request.stage,
       request.request_id,
-      head.logical_path
+      head.logical_path,
+      request.archive_group
     );
     if (!versionId) {
       const archivedVersion = await this.requireVersion(request.project_id, request.document_id, request.expected_version_id);
       const archived = await this.runtime.objects.getMetadata(archivePath);
-      if (archived && providerContentMatches(archived, archivedVersion)) {
+      if (archived && archived.path === archivePath && providerContentMatches(archived, archivedVersion)) {
         return archiveReceipt(request, archivedVersion, archivePath);
       }
       throw new ManagedDocumentConflictError(
@@ -1017,6 +1145,159 @@ export class ManagedDocumentService {
     return metadata;
   }
 
+  private assertVisibleVersionMatches(
+    path: string,
+    metadata: ProviderObjectMetadata,
+    version: DocumentVersionRecord,
+    observation: ManagedProviderObservation | undefined,
+    documentId: string
+  ): ReturnType<typeof requireDropboxV1Evidence> {
+    const evidence = requireDropboxV1Evidence(metadata);
+    const expectedRev = observation?.rev ?? version.provider_rev;
+    if (
+      metadata.path !== path
+      || !expectedRev
+      || evidence.rev !== expectedRev
+      || (version.provider_file_id !== undefined && evidence.file_id !== version.provider_file_id)
+      || (version.provider_rev !== undefined && evidence.rev !== version.provider_rev)
+      || (observation !== undefined && (
+        evidence.file_id !== observation.file_id
+        || evidence.rev !== observation.rev
+        || evidence.content_hash !== observation.content_hash
+        || evidence.size !== observation.size
+      ))
+      || !providerContentMatches(metadata, version)
+    ) {
+      throw new ManagedDocumentConflictError(
+        "PROVIDER_VERSION_CHANGED",
+        `Managed document visible file changed outside Project OS: ${path}`,
+        documentId
+      );
+    }
+    return evidence;
+  }
+
+  private async ensurePublishedVersionArchived(
+    visiblePath: string,
+    archivePath: string,
+    version: DocumentVersionRecord,
+    observation: ManagedProviderObservation | undefined,
+    documentId: string
+  ): Promise<void> {
+    const source = await this.requireMetadata(visiblePath);
+    this.assertVisibleVersionMatches(visiblePath, source, version, observation, documentId);
+    const existing = await this.runtime.objects.getMetadata(archivePath);
+    if (existing) {
+      if (existing.path !== archivePath || !providerContentMatches(existing, version)) {
+        throw new ManagedDocumentConflictError(
+          "DOCUMENT_ARCHIVE_DESTINATION_CONFLICT",
+          `Archive destination contains different content: ${archivePath}`,
+          documentId
+        );
+      }
+    } else {
+      if (!this.runtime.objects.readBytes || !this.runtime.serverSideCopy.copyObjectVersion) {
+        throw new ManagedDocumentConflictError(
+          "EXACT_PUBLISHED_ARCHIVE_UNAVAILABLE",
+          "Provider cannot preserve the prior published revision with an exact immutable copy",
+          documentId
+        );
+      }
+      if (!Number.isSafeInteger(source.size) || source.size > MAX_PUBLISHED_ARCHIVE_BYTES) {
+        throw new ManagedDocumentConflictError(
+          "EXACT_PUBLISHED_ARCHIVE_UNAVAILABLE",
+          "Prior published version exceeds the exact archive-copy size limit",
+          documentId
+        );
+      }
+      const bytes = await this.runtime.objects.readBytes(visiblePath, MAX_PUBLISHED_ARCHIVE_BYTES);
+      if (!bytes || bytes.length !== source.size) {
+        throw new ManagedDocumentConflictError(
+          "DOCUMENT_ARCHIVE_VERIFICATION_FAILED",
+          `Unable to read the exact prior published bytes: ${visiblePath}`,
+          documentId
+        );
+      }
+      const digest = await sha256Bytes(bytes);
+      if (version.content_sha256 && digest !== version.content_sha256) {
+        throw new ManagedDocumentConflictError(
+          "DOCUMENT_ARCHIVE_VERIFICATION_FAILED",
+          `Prior published bytes do not match their immutable SHA-256: ${visiblePath}`,
+          documentId
+        );
+      }
+      await this.runtime.directoryProvisioning?.ensureDirectory(archivePath.slice(0, archivePath.lastIndexOf("/")));
+      let copied: ProviderObjectMetadata | undefined;
+      try {
+        const exactCopy = await this.runtime.serverSideCopy.copyObjectVersion(visiblePath, archivePath, {
+          objectId: requireDropboxV1Evidence(source).file_id,
+          revisionToken: requireDropboxV1Evidence(source).rev,
+          contentSha256: digest
+        });
+        if (
+          exactCopy.source.objectId !== requireDropboxV1Evidence(source).file_id
+          || exactCopy.source.revisionToken !== requireDropboxV1Evidence(source).rev
+          || exactCopy.source.contentSha256 !== digest
+        ) {
+          throw new ManagedDocumentConflictError(
+            "DOCUMENT_ARCHIVE_VERIFICATION_FAILED",
+            `Provider did not confirm the exact source revision copied to ${archivePath}`,
+            documentId
+          );
+        }
+        copied = exactCopy.destination;
+      } catch (error) {
+        if (!(error instanceof ProviderConflictError)) throw error;
+        const raced = await this.runtime.objects.getMetadata(archivePath);
+        if (!raced || raced.path !== archivePath || !providerContentMatches(raced, version)) {
+          throw new ManagedDocumentConflictError(
+            "DOCUMENT_ARCHIVE_DESTINATION_CONFLICT",
+            `Unable to verify the existing archive: ${archivePath}`,
+            documentId
+          );
+        }
+      }
+      const archived = await this.runtime.objects.getMetadata(archivePath);
+      if (!archived || archived.path !== archivePath || !providerContentMatches(archived, version)
+        || (copied && (copied.path !== archivePath || !providerContentMatches(copied, version)))) {
+        throw new ManagedDocumentConflictError(
+          "DOCUMENT_ARCHIVE_VERIFICATION_FAILED",
+          `Archived published version does not match its immutable record: ${archivePath}`,
+          documentId
+        );
+      }
+    }
+    const afterCopy = await this.requireMetadata(visiblePath);
+    this.assertVisibleVersionMatches(visiblePath, afterCopy, version, observation, documentId);
+  }
+
+  private async deleteReviewConditionally(
+    reviewPath: string,
+    reviewMetadata: ProviderObjectMetadata,
+    documentId: string,
+    purpose: "review" | "archive" = "review"
+  ): Promise<void> {
+    if (!this.runtime.objects.deleteIfUnchanged) {
+      throw new ManagedDocumentConflictError(
+        purpose === "archive" ? "CONDITIONAL_ARCHIVE_DELETE_UNAVAILABLE" : "CONDITIONAL_REVIEW_DELETE_UNAVAILABLE",
+        `Cannot safely remove the ${purpose} source without conditional-delete support`,
+        documentId
+      );
+    }
+    const evidence = requireDropboxV1Evidence(reviewMetadata);
+    const result = await this.runtime.objects.deleteIfUnchanged(reviewPath, {
+      objectId: evidence.file_id,
+      revisionToken: evidence.rev
+    });
+    if (result === "changed" || (result === "missing" && await this.runtime.objects.getMetadata(reviewPath) !== null)) {
+      throw new ManagedDocumentConflictError(
+        "PROVIDER_VERSION_CHANGED",
+        `${purpose} source changed before it could be safely removed: ${reviewPath}`,
+        documentId
+      );
+    }
+  }
+
   private async ensureActiveVersionArchived(
     visiblePath: string,
     archivePath: string,
@@ -1027,7 +1308,7 @@ export class ManagedDocumentService {
     const source = await this.runtime.objects.getMetadata(visiblePath);
     const archived = await this.runtime.objects.getMetadata(archivePath);
     if (!source) {
-      if (!archived || !providerContentMatches(archived, version)) {
+      if (!archived || archived.path !== archivePath || !providerContentMatches(archived, version)) {
         throw new ManagedDocumentConflictError(
           "DOCUMENT_ARCHIVE_SOURCE_MISSING",
           `Active document is missing without a verified archive: ${visiblePath}`,
@@ -1036,37 +1317,15 @@ export class ManagedDocumentService {
       }
       return;
     }
-    await this.assertProviderStillMatches(visiblePath, version, currentObservation, documentId);
-    if (archived) {
+    if (!this.runtime.objects.deleteIfUnchanged) {
       throw new ManagedDocumentConflictError(
-        "DOCUMENT_ARCHIVE_DESTINATION_CONFLICT",
-        `Archive destination already exists: ${archivePath}`,
+        "CONDITIONAL_ARCHIVE_DELETE_UNAVAILABLE",
+        "Cannot safely remove the archive source without conditional-delete support",
         documentId
       );
     }
-    await this.runtime.directoryProvisioning?.ensureDirectory(archivePath.slice(0, archivePath.lastIndexOf("/")));
-    try {
-      await this.runtime.objects.move(visiblePath, archivePath);
-    } catch (error) {
-      if (!(error instanceof ProviderConflictError)) throw error;
-      const retriedSource = await this.runtime.objects.getMetadata(visiblePath);
-      const retriedArchive = await this.runtime.objects.getMetadata(archivePath);
-      if (retriedSource || !retriedArchive || !providerContentMatches(retriedArchive, version)) {
-        throw new ManagedDocumentConflictError(
-          "DOCUMENT_ARCHIVE_DESTINATION_CONFLICT",
-          `Unable to verify archival transition: ${archivePath}`,
-          documentId
-        );
-      }
-    }
-    const verified = await this.runtime.objects.getMetadata(archivePath);
-    if (!verified || !providerContentMatches(verified, version)) {
-      throw new ManagedDocumentConflictError(
-        "DOCUMENT_ARCHIVE_VERIFICATION_FAILED",
-        `Archived document does not match the active version: ${archivePath}`,
-        documentId
-      );
-    }
+    await this.ensurePublishedVersionArchived(visiblePath, archivePath, version, currentObservation, documentId);
+    await this.deleteReviewConditionally(visiblePath, source, documentId, "archive");
   }
 
   private async writeTextAtStage(
@@ -1181,9 +1440,13 @@ function managedArchivePath(
   versionId: string,
   stage: "working" | "review" | "published",
   requestId: string,
-  logicalPath: string
+  logicalPath: string,
+  archiveGroup?: string
 ): string {
-  return `${workspaceProjectRoot(state.project_id, state.slug)}/ARCHIVES/MANAGED-DOCUMENTS/${documentId}/${versionId}/${stage}/${requestId}/${logicalPath}`;
+  if (archiveGroup !== undefined && !/^[A-Z0-9][A-Z0-9_-]{0,79}(?:\/[A-Z0-9][A-Z0-9_-]{0,79}){0,3}$/.test(archiveGroup)) {
+    throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_GROUP_INVALID", "Archive grouping must be a safe relative folder name", documentId);
+  }
+  return `${workspaceProjectRoot(state.project_id, state.slug)}/ARCHIVES/${archiveGroup ?? "MANAGED-DOCUMENTS"}/${documentId}/${versionId}/${stage}/${requestId}/${logicalPath}`;
 }
 
 function providerContentMatches(metadata: ProviderObjectMetadata, version: DocumentVersionRecord): boolean {

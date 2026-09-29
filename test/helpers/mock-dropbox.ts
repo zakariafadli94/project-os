@@ -82,12 +82,14 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       name: path.split("/").at(-1) ?? path,
       path_display: path,
       path_lower: path.toLowerCase(),
-      rev: options.immutableRevisions ? `${ensureIdentity(path).replace(/\D/g, "")}a${(revisions.get(path) ?? 1).toString(16)}` : `mock-rev-${revisions.get(path) ?? 1}`,
+      rev: options.immutableRevisions
+        ? `${ensureIdentity(path).replace(/\D/g, "")}a${(revisions.get(path) ?? 1).toString(16)}`
+        : `mock-rev-${ensureIdentity(path).replace(/\D/g, "")}-${revisions.get(path) ?? 1}`,
       content_hash: await contentHash(content),
       size: bytes.byteLength,
       server_modified: "2026-08-24T22:00:00Z"
     };
-    if (options.immutableRevisions) revisionContents.set(`rev:${metadata.rev}`, { content, metadata });
+    revisionContents.set(`rev:${metadata.rev}`, { content, metadata });
     return metadata;
   };
 
@@ -340,7 +342,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
 
     if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/copy_v2") {
       const body = JSON.parse(await request.text()) as { from_path: string; to_path: string };
-      const content = files.get(body.from_path);
+      const content = files.get(body.from_path) ?? revisionContents.get(body.from_path)?.content;
       if (content === undefined) {
         return respond(new Response(JSON.stringify({ error_summary: "from_lookup/not_found/" }), { status: 409 }));
       }

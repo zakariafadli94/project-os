@@ -38,6 +38,12 @@ function runtimeHarness() {
     providerId: "dropbox",
     objects: {
       readText: async (path) => files.get(path)?.content ?? null,
+      readBytes: async (path, maxBytes) => {
+        const file = files.get(path);
+        if (!file) return null;
+        const bytes = new TextEncoder().encode(file.content);
+        return bytes.length <= maxBytes ? bytes : null;
+      },
       createText: async (path, content) => {
         if (files.has(path)) throw new ProviderConflictError("exists");
         put(path, content);
@@ -52,7 +58,14 @@ function runtimeHarness() {
         files.delete(from);
         put(to, source.content, source.objectId);
       },
-      delete: async (path) => { files.delete(path); }
+      delete: async (path) => { files.delete(path); },
+      deleteIfUnchanged: async (path, expected) => {
+        const file = files.get(path);
+        if (!file) return "missing";
+        if (file.objectId !== expected.objectId || file.revisionToken !== expected.revisionToken) return "changed";
+        files.delete(path);
+        return "deleted";
+      }
     },
     conditionalWrite: {
       writeTextConditional: async (path, content, expectedRevisionToken) => {
@@ -62,6 +75,13 @@ function runtimeHarness() {
       }
     },
     serverSideCopy: {
+      copyObjectVersion: async (from, to, expected) => {
+        const source = files.get(from);
+        if (!source || source.objectId !== expected.objectId || source.revisionToken !== expected.revisionToken
+          || await sha256Text(source.content) !== expected.contentSha256) throw new ProviderPreconditionFailedError("stale");
+        if (files.has(to)) throw new ProviderConflictError("exists");
+        return { source: { ...expected }, destination: put(to, source.content) };
+      },
       copyObject: async (from, to) => {
         const source = files.get(from);
         if (!source) throw new ProviderConflictError("missing");

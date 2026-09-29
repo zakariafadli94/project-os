@@ -8,6 +8,7 @@ import { installDropboxMock } from "./helpers/mock-dropbox";
 import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 import { encodeAdmission } from "../src/admission/transport";
 import { normalizeDocumentAdmission } from "../src/admission/operation-context";
+import { canonicalJson } from "../src/rules/contract";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { ManagedDocumentRequestLedger } from "../src/documents/request-ledger";
@@ -439,6 +440,85 @@ describe("ProjectGuard managed documents", () => {
     await expect(terminalStatus.json()).resolves.toMatchObject({ status: "conflict" });
   });
 
+  it.each(["superseded", "retired"] as const)("resumes committed package effects with the exact %s global rule version from its admission", async (historicalStatus) => {
+    const suffix = historicalStatus === "retired" ? "RETR" : "SUPR";
+    installDropboxMock({ immutableRevisions: true });
+    await bootstrapRuleAdmissionGovernance(testEnv, governanceSigningKey);
+    const created = await createProject(`TXN-PACKAGE-HISTORICAL-${suffix}`);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const write = async (request_id: string, logical_path: string, content: string) => {
+      const response = await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify({ operation: "working.write", request_id, project_id: created.project_id, logical_path, content, content_sha256: await sha256Text(content), created_at: at }) });
+      const receipt: any = await response.json(); expect(receipt.status).toBe("committed"); return receipt;
+    };
+    const member = await write(`DOCREQ-PACKAGE-HISTORICAL-${suffix}-MEMBER-01`, "member.md", "# Member");
+    const repository = new DocumentLedgerRepository(createProductionPersistence(testEnv));
+    const version = (await repository.readVersion(created.project_id, member.document_id, member.version_id))!;
+    const manifest = { schema_version: "1.0", project_id: created.project_id, creation_request_id: `DOCREQ-PACKAGE-HISTORICAL-${suffix}-CREATE-01`, version: 1, members: [{ relative_path: "member.md", document_id: member.document_id, document_version_id: member.version_id, immutable_payload_path: version.immutable_payload_path, content_sha256: version.content_sha256, size: version.size }], links: [], source_refs: ["accepted:fixture"], created_by: "operator", created_at: at };
+    const content = JSON.stringify(manifest);
+    const descriptor = await write(`DOCREQ-PACKAGE-HISTORICAL-${suffix}-MANIFEST-01`, "manifest.json", content);
+    await runInDurableObject(guard, instance => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: governanceSigningKey,
+      RULE_ADMISSION_SIGNING_KEY: governanceSigningKey,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    const { context }: any = await (await guard.fetch("https://internal/mutation-context")).json();
+    const submit = async (request: unknown) => (await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, context)) })).json<any>();
+    const freezeRequest = { operation: "package.freeze" as const, request_id: `DOCREQ-PACKAGE-HISTORICAL-${suffix}-FREEZE-01`, project_id: created.project_id, document_id: descriptor.document_id, expected_version_id: descriptor.version_id, content_sha256: await sha256Text(content), expected_project_revision: created.new_revision, created_at: at };
+    const frozen = await submit(freezeRequest);
+    expect(frozen).toMatchObject({ status: "committed" });
+
+    const request = { operation: "package.replace" as const, request_id: `DOCREQ-PACKAGE-HISTORICAL-${suffix}-REPLACE-01`, project_id: created.project_id, candidate: frozen.candidate, zone: "WORKING" as const, expected_navigation_generation: 0, expected_project_revision: created.new_revision, created_at: at };
+    const oldRule: any = ruleFixture("GLOBAL", { rule_id: `RULE-PACKAGE-HISTORICAL-${suffix}`, operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, check_id: "verified_presence", parameters: {}, check_stage: "post_execution", status: "active", activation_evidence: ["server:qualified"] });
+    const successorRule: any = { ...oldRule, version: 2, supersedes: 1, status: "active" };
+    const reference = { rule_id: oldRule.rule_id, version: oldRule.version, scope: oldRule.scope };
+    const newerGovernance = {
+      revision: 11,
+      rules: {
+        [`${oldRule.rule_id}@1`]: { ...oldRule, status: historicalStatus },
+        [`${successorRule.rule_id}@2`]: successorRule
+      },
+      exceptions: {}
+    };
+    let governance: any = { revision: 10, rules: { [`${oldRule.rule_id}@1`]: oldRule }, exceptions: {} };
+    let governanceReader: any;
+    await runInDurableObject(guard, async instance => {
+      const normalized = await normalizeDocumentAdmission(request);
+      const proof = {
+        project_id: request.project_id, operation: request.operation, resources: normalized.resources,
+        request_hash: normalized.request_hash, actor: context.actor,
+        global_revision: 10, project_revision: request.expected_project_revision,
+        ruleset: { digest: "a".repeat(64), rules: [reference], global_revision: 10, project_revision: request.expected_project_revision },
+        verdict: "allow", results: [{ verdict: "allow", code: "RULE_ADMITTED", rule: reference, expected: "Initial active rule", observed: "admitted", required_action: "None", resource_id: request.candidate.package_id, evidence_refs: ["canonical:initial-admission"] }],
+        gaps: [], deferred_rules: [reference]
+      };
+      vi.spyOn(instance as any, "readPackageAdmissionProof").mockResolvedValue(proof);
+      const service = (instance as any).managedDocumentService;
+      const replace = service.replacePackage.bind(service);
+      vi.spyOn(service, "replacePackage").mockImplementationOnce((operation: any, state: any, admission: any, options: any) => replace(operation, state, admission, { ...options, effectBudget: 2 }));
+      governanceReader = vi.spyOn(instance as any, "readGlobalGovernance").mockImplementation(async () => governance);
+    });
+
+    const first = await submit(request);
+    expect(first).toMatchObject({ status: "finalizing" });
+    const committedJournal = new ExecutionJournal(createProductionPersistence(testEnv), created.project_id, "document", request.request_id);
+    expect(await committedJournal.readAdmission()).not.toBeNull();
+    expect((await committedJournal.status())?.status).toBe("finalizing");
+
+    governance = newerGovernance;
+    governanceReader.mockImplementation(async () => governance);
+    const resumed = await submit(request);
+    expect(resumed).toMatchObject({ status: "committed", execution_status: "finalized", candidate: frozen.candidate });
+    const progress = await committedJournal.status();
+    expect(progress?.status).toBe("finalized");
+    expect(progress?.postchecks).toContainEqual({
+      check_id: `rule:${canonicalJson(reference)}`,
+      verdict: "allow",
+      evidence_refs: expect.arrayContaining([expect.any(String)])
+    });
+    expect(await runInDurableObject(guard, async instance => (await (instance as any).loadOrRecoverState()).revision)).toBe(created.new_revision);
+    expect((await repository.readPackageNavigation(created.project_id)).WORKING?.packages[0].ref).toEqual(frozen.candidate);
+  });
+
   it("package transport refuses legacy ungoverned execution even with a well-formed manifest reference", async () => {
     const created = await createProject("TXN-PACKAGE-PROJECT-0091");
     const response = await testEnv.PROJECT_GUARD.getByName(created.project_id).fetch("https://project-guard.internal/document", {
@@ -506,7 +586,7 @@ describe("ProjectGuard managed documents", () => {
   });
 
   it("archives one exact active working version without a caller-selected path or later restoration", async () => {
-    const mock = installDropboxMock();
+    const mock = installDropboxMock({ immutableRevisions: true });
     const created = await createProject("TXN-DOCUMENT-ARCHIVE-9051");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     const signing = "document-archive-governance";
@@ -605,6 +685,7 @@ describe("ProjectGuard managed documents", () => {
       project_id: created.project_id,
       document_id: recoveryWrite.document_id,
       stage: "working" as const,
+      archive_group: "RESET-AGENCY-OS-2026-09/DEPUIS-WORKING",
       expected_version_id: recoveryWrite.version_id,
       created_at: at
     };
@@ -624,7 +705,10 @@ describe("ProjectGuard managed documents", () => {
     const recovered = await (await guard.fetch("https://project-guard.internal/document", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(recoveryRequest, context))
     })).json<any>();
-    expect(recovered).toMatchObject({ status: "committed", archived_stage: "working", version_id: recoveryWrite.version_id });
+    expect(recovered).toMatchObject({
+      status: "committed", archived_stage: "working", version_id: recoveryWrite.version_id,
+      archive_path: expect.stringContaining("/ARCHIVES/RESET-AGENCY-OS-2026-09/DEPUIS-WORKING/")
+    });
   });
 
   it("resumes an interrupted working write from its durable intent without a client replay", async () => {

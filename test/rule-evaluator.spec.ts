@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
 import { ruleVersionSchema } from "../src/domain/rule-governance";
+import type { OperationContext } from "../src/rules/contract";
 import { resolveEffectiveRules } from "../src/rules/resolution";
 import { ruleFixture, exceptionFixture, ruleAt } from "./helpers/rule-fixtures";
 import { normalizeDocumentAdmission } from "../src/admission/operation-context";
@@ -30,9 +31,11 @@ function context(globalRules = [rule()], localRules: ReturnType<typeof rule>[] =
   };
 }
 function approval(changes: Record<string, unknown> = {}) {
-  return { approval_id: "APP-7101", actor_id: "founder", approved_by: "reviewer", project_id: "PRJ-7101",
-    rule_id: "RULE-GLOBAL", rule_version: 1, rule_scope: { kind: "global" }, resource_id: "ART-7101", resource_version: "v2",
-    operation: "artifact.write", status: "approved", granted_at: ruleAt, expires_at: "2026-09-12T11:00:00.000Z", evidence_refs: ["approval:7101"], ...changes };
+  return { approval_id: "APR-7101", actor_id: "founder", approved_by: "reviewer", project_id: "PRJ-7101",
+    rule_id: "RULE-GLOBAL", rule_version: 1, rule_scope: { kind: "global" }, resource_id: "ART-7101",
+    resource_type: "artifact", resource_zone: "WORKING", resource_version: "v2",
+    operation: "artifact.write", status: "approved", granted_at: ruleAt, expires_at: "2026-09-12T11:00:00.000Z",
+    evidence_refs: ["canonical:project/PRJ-7101/transaction/TXN-APPROVAL-7101"], grant_transaction_id: "TXN-APPROVAL-7101", ...changes };
 }
 async function evaluate(input: unknown) { return (await runtime()).evaluateRules(input); }
 
@@ -71,6 +74,58 @@ describe("server-side effective rule evaluation", () => {
 
     expect(await evaluate(input)).toMatchObject({ verdict: "approval_required", code: "EXACT_APPROVAL_REQUIRED" });
   });
+  it("uses the typed target phase and canonical task state for coherent_phase", async () => {
+    const phaseRule = rule("RULE-PHASE", "GLOBAL", {
+      operations: ["plan.phase.complete"],
+      resource_scope: { resource_types: ["plan"], zones: ["PROJECT"] },
+      check_id: "coherent_phase", parameters: {}, check_stage: "pre_admission"
+    });
+    const input = context([phaseRule]) as OperationContext;
+    input.operation = "plan.phase.complete";
+    input.resources = [{ resource_id: "TXN-PHASE-7101", resource_type: "plan", zone: "PROJECT", version: "9", phase_id: "PHASE-7101" }];
+    input.observations = [];
+    input.state.last_event_id = "EVT-PHASE-7101";
+    input.state.current_phase_id = "PHASE-7101";
+    input.state.plan_phases = { "PHASE-7101": {
+      phase_id: "PHASE-7101", title: "Current phase", next_actions: [], status: "active",
+      created_at: ruleAt, updated_at: ruleAt
+    } };
+    input.state.tasks = {
+      "TASK-PENDING": { task_id: "TASK-PENDING", title: "Pending", phase_id: "PHASE-7101", status: "pending", created_at: ruleAt, updated_at: ruleAt },
+      "TASK-ACTIVE": { task_id: "TASK-ACTIVE", title: "Active", phase_id: "PHASE-7101", status: "active", created_at: ruleAt, updated_at: ruleAt },
+      "TASK-BLOCKED": { task_id: "TASK-BLOCKED", title: "Blocked", phase_id: "PHASE-7101", status: "blocked", blocked_reason: "Waiting", created_at: ruleAt, updated_at: ruleAt }
+    };
+
+    expect(await evaluate(input)).toMatchObject({
+      verdict: "deny", code: "PHASE_HAS_UNFINISHED_TASKS",
+      results: [{ verdict: "deny", code: "PHASE_HAS_UNFINISHED_TASKS", rule: { rule_id: "RULE-PHASE", version: 1 }, resource_id: "TXN-PHASE-7101" }]
+    });
+
+    input.state.tasks = Object.fromEntries(Object.entries(input.state.tasks).map(([key, task]) => [key, { ...task, status: "completed" }]));
+    const allowed = await evaluate(input);
+    expect(allowed).toMatchObject({ verdict: "allow", results: [{ code: "PHASE_COMPLETION_ALLOWED", verdict: "allow",
+      evidence_refs: ["canonical:project/PRJ-7101/revision/9/event/EVT-PHASE-7101/phase/PHASE-7101"] }] });
+  });
+  it("fails closed when coherent_phase has no exact normalized target", async () => {
+    const phaseRule = rule("RULE-PHASE", "GLOBAL", {
+      operations: ["plan.phase.complete"],
+      resource_scope: { resource_types: ["plan"], zones: ["PROJECT"] },
+      check_id: "coherent_phase", parameters: {}, check_stage: "pre_admission"
+    });
+    const input = context([phaseRule]) as OperationContext;
+    input.operation = "plan.phase.complete";
+    input.resources = [{ resource_id: "TXN-PHASE-7101", resource_type: "plan", zone: "PROJECT", version: "9" }];
+    input.observations = [];
+    input.state.last_event_id = "EVT-PHASE-7101";
+    expect(await evaluate(input)).toMatchObject({ verdict: "unavailable", code: "RULE_EVIDENCE_UNAVAILABLE", results: [{ resource_id: "TXN-PHASE-7101" }] });
+    input.resources[0].phase_id = "PHASE-MISSING";
+    expect(await evaluate(input)).toMatchObject({ verdict: "deny", code: "PHASE_NOT_FOUND" });
+    input.state.plan_phases["PHASE-MISSING"] = {
+      phase_id: "PHASE-MISSING", title: "Other pending phase", next_actions: [], status: "pending",
+      created_at: ruleAt, updated_at: ruleAt
+    };
+    expect(await evaluate(input)).toMatchObject({ verdict: "deny", code: "PHASE_NOT_CURRENT" });
+  });
   it("returns stable ordering and digest independent of map insertion order", async () => {
     const first = await evaluate(context([rule("RULE-ZZZZ"), rule("RULE-AAAA")]));
     const second = await evaluate(context([rule("RULE-AAAA"), rule("RULE-ZZZZ")]));
@@ -78,6 +133,97 @@ describe("server-side effective rule evaluation", () => {
     expect(first.ruleset.digest).toBe(second.ruleset.digest);
     expect(first.results.map((r: any) => r.rule.rule_id)).toEqual(["RULE-AAAA", "RULE-ZZZZ"]);
     expect((await evaluate(context([rule("RULE-AAAA", "GLOBAL", { version: 2 })]))).ruleset.digest).not.toBe(first.ruleset.digest);
+  });
+  it("retains both-stage rules as exact postchecks only after pre-admission evaluation", async () => {
+    const both = rule("RULE-BOTH", "GLOBAL", { check_stage: "both", check_id: "exact_approval", parameters: {}, enforcement: "explicit_approval" });
+    const input = context([both]) as OperationContext;
+    input.approvals = [approval({ rule_id: "RULE-BOTH" })];
+
+    const admitted = await evaluate(input);
+    expect(admitted).toMatchObject({ verdict: "allow", deferred_rules: [{ rule_id: "RULE-BOTH", version: 1, scope: { kind: "global" } }] });
+    expect(admitted.results).toHaveLength(1);
+
+    input.request_hash = "e".repeat(64);
+    input.initial_admission = {
+      project_id: input.project_id, operation: input.operation, request_hash: input.request_hash,
+      actor: input.actor, resources: input.resources, project_revision: input.state.revision,
+      ruleset: admitted.ruleset, verdict: admitted.verdict, results: admitted.results, deferred_rules: admitted.deferred_rules
+    };
+    input.stage = "post_execution";
+    const completed = await evaluate(input);
+    expect(completed).toMatchObject({ verdict: "allow", code: "INITIAL_ADMISSION_PROOF_RETAINED", deferred_rules: [] });
+    expect(completed.results).toHaveLength(1);
+
+    const preOnly = await evaluate(context([rule("RULE-PRE", "GLOBAL", { check_stage: "pre_admission" })]));
+    expect(preOnly.deferred_rules).toEqual([]);
+
+    const postContext = context([rule("RULE-PRE", "GLOBAL", { check_stage: "pre_admission" })]) as OperationContext;
+    const preAdmission = await evaluate(postContext);
+    postContext.request_hash = "f".repeat(64);
+    postContext.initial_admission = {
+      project_id: postContext.project_id, operation: postContext.operation, request_hash: postContext.request_hash,
+      actor: postContext.actor, resources: postContext.resources, project_revision: postContext.state.revision,
+      ruleset: preAdmission.ruleset, verdict: preAdmission.verdict, results: preAdmission.results,
+      deferred_rules: preAdmission.deferred_rules
+    };
+    postContext.stage = "post_execution";
+    const afterEffects = await evaluate(postContext);
+    expect(afterEffects.deferred_rules).toEqual([]);
+    expect(afterEffects.results).toEqual([]);
+  });
+  it("retains the exact approval admitted before effects after that approval expires or is revoked", async () => {
+    const both = rule("RULE-GLOBAL", "GLOBAL", { check_stage: "both", check_id: "exact_approval", parameters: {}, enforcement: "explicit_approval" });
+    const admittedContext = context([both]);
+    admittedContext.approvals = [approval()];
+    const admitted = await evaluate(admittedContext);
+    expect(admitted).toMatchObject({ verdict: "allow", results: [{ code: "EXACT_APPROVAL_VERIFIED", approval_id: "APR-7101", evidence_refs: ["canonical:project/PRJ-7101/transaction/TXN-APPROVAL-7101"] }] });
+
+    const post = { ...admittedContext, stage: "post_execution", now: "2026-09-14T10:00:00.000Z", approvals: [],
+      request_hash: "a".repeat(64), initial_admission: {
+        project_id: admittedContext.project_id, operation: admittedContext.operation, request_hash: "a".repeat(64),
+        actor: admittedContext.actor, resources: admittedContext.resources, project_revision: admittedContext.state.revision,
+        ruleset: admitted.ruleset, verdict: admitted.verdict, results: admitted.results, deferred_rules: admitted.deferred_rules
+      } } as any;
+    expect(await evaluate(post)).toMatchObject({ verdict: "allow", code: "INITIAL_ADMISSION_PROOF_RETAINED",
+      results: [{ verdict: "allow", code: "INITIAL_ADMISSION_PROOF_RETAINED", approval_id: "APR-7101",
+        evidence_refs: ["canonical:project/PRJ-7101/transaction/TXN-APPROVAL-7101"] }] });
+  });
+  it("retains an exact pre-effect exception after the canonical exception is revoked", async () => {
+    const both = rule("RULE-GLOBAL", "GLOBAL", { check_stage: "both", check_id: "exact_approval", parameters: {}, enforcement: "explicit_approval" });
+    const admittedContext = context([both]);
+    admittedContext.observations[0].current_version = "v0";
+    admittedContext.global_governance!.exceptions = { "EXC-7101": {
+      ...exceptionFixture({ rule_id: "RULE-GLOBAL", resources: ["ART-7101"], operations: ["artifact.write"] }), status: "granted"
+    } };
+    const admitted = await evaluate(admittedContext);
+    expect(admitted).toMatchObject({ verdict: "allow", results: [{ code: "RULE_EXCEPTION_APPLIED", exception_id: "EXC-7101" }] });
+
+    const post = { ...admittedContext, stage: "post_execution", now: "2026-09-14T10:00:00.000Z", global_governance: {
+      ...admittedContext.global_governance, exceptions: {}
+    }, request_hash: "b".repeat(64), initial_admission: {
+      project_id: admittedContext.project_id, operation: admittedContext.operation, request_hash: "b".repeat(64),
+      actor: admittedContext.actor, resources: admittedContext.resources, project_revision: admittedContext.state.revision,
+      ruleset: admitted.ruleset, verdict: admitted.verdict, results: admitted.results, deferred_rules: admitted.deferred_rules
+    } } as any;
+    expect(await evaluate(post)).toMatchObject({ verdict: "allow", code: "INITIAL_ADMISSION_PROOF_RETAINED",
+      results: [{ verdict: "allow", code: "INITIAL_ADMISSION_PROOF_RETAINED", exception_id: "EXC-7101",
+        evidence_refs: ["DEC-7102"] }] });
+  });
+  it("does not retain an initial approval proof with a different request or actor binding", async () => {
+    const both = rule("RULE-GLOBAL", "GLOBAL", { check_stage: "both", check_id: "exact_approval", parameters: {}, enforcement: "explicit_approval" });
+    const admittedContext = context([both]);
+    admittedContext.approvals = [approval()];
+    const admitted = await evaluate(admittedContext);
+    const initial_admission = { project_id: admittedContext.project_id, operation: admittedContext.operation,
+      request_hash: "c".repeat(64), actor: admittedContext.actor, resources: admittedContext.resources,
+      project_revision: admittedContext.state.revision, ruleset: admitted.ruleset, verdict: admitted.verdict,
+      results: admitted.results, deferred_rules: admitted.deferred_rules };
+    const post = { ...admittedContext, stage: "post_execution", now: "2026-09-14T10:00:00.000Z", approvals: [],
+      request_hash: "d".repeat(64), initial_admission } as any;
+    expect(await evaluate(post)).toMatchObject({ verdict: "unavailable", code: "INITIAL_ADMISSION_PROOF_UNAVAILABLE" });
+    post.request_hash = "c".repeat(64);
+    post.actor = { actor_id: "other", authority: admittedContext.actor.authority };
+    expect(await evaluate(post)).toMatchObject({ verdict: "unavailable", code: "INITIAL_ADMISSION_PROOF_UNAVAILABLE" });
   });
   it("orders Unicode rule identities by code point and keeps digest independent of locale collation", async () => {
     const input = context([rule("RULE-😀"), rule("RULE-é"), rule("RULE-a"), rule("RULE-\uE000"), rule("RULE-Z")]);
@@ -135,7 +281,9 @@ describe("server-side effective rule evaluation", () => {
     input.approvals = [approval()];
     expect(await evaluate(input)).toMatchObject({ verdict: "allow" });
   });
-  it.each([{ rule_version: 2 }, { resource_version: "v1" }, { actor_id: "another" }, { project_id: "PRJ-7102" }, { status: "revoked" }, { expires_at: "2026-09-11T10:00:00.000Z" }, { rule_scope: { kind: "project", project_id: "PRJ-7101" } }])("rejects stale or mismatched approvals %j", async (changes) => {
+  it.each([{ rule_version: 2 }, { resource_version: "v1" }, { actor_id: "another" }, { project_id: "PRJ-7102" },
+    { status: "revoked", revoked_at: "2026-09-12T10:30:00.000Z", revoked_by: "reviewer", revocation_reason: "Withdrawn", revoke_transaction_id: "TXN-APPROVAL-REVOKE-7101" },
+    { expires_at: "2026-09-11T10:00:00.000Z" }, { rule_scope: { kind: "project", project_id: "PRJ-7101" } }])("rejects stale or mismatched approvals %j", async (changes) => {
     const input = context([rule("RULE-GLOBAL", "GLOBAL", { enforcement: "explicit_approval" })]);
     input.approvals = [approval(changes)];
     expect(await evaluate(input)).toMatchObject({ verdict: "approval_required" });
@@ -181,6 +329,6 @@ describe("server-side effective rule evaluation", () => {
     const input = context([rule("RULE-GLOBAL", "GLOBAL", { check_id: "valid_links", parameters: {}, check_stage: "post_execution" })]);
     expect(await evaluate(input)).toMatchObject({ verdict: "allow", deferred_rules: [{ rule_id: "RULE-GLOBAL", version: 1 }] });
     input.stage = "post_execution";
-    expect(await evaluate(input)).toMatchObject({ verdict: "unavailable", code: "RULE_CONTROL_UNAVAILABLE" });
+    expect(await evaluate(input)).toMatchObject({ verdict: "unavailable", code: "INITIAL_ADMISSION_PROOF_UNAVAILABLE" });
   });
 });

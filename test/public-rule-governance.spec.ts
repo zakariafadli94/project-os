@@ -48,6 +48,29 @@ it("public governance forwards typed global transactions and exposes fresh canon
   expect(await (await f.post(governanceTx("rule.accept", { rule_id: "RULE-7101", version: 1 }, 1, "GLOBAL"))).json()).toMatchObject({ status: "conflict", code: "STALE_REVISION" });
 });
 
+it("uses the dedicated governance route to authorize a project-local rule transaction", async () => {
+  const signingKey = "public-local-rule-context-signing-key";
+  const f = await fixture({ MUTATION_CONTEXT_SIGNING_KEY: signingKey });
+  const projectId = "PRJ-7188";
+  const guard = f.environment.PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, instance => Object.assign((instance as any).env, f.environment));
+  const createResponse = await guard.fetch("https://project-guard.internal/transaction", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ schema_version: "1.0", transaction_id: "TXN-LOCAL-GOVERNANCE-CREATE-7188", project_id: projectId,
+      base_revision: 0, created_at: "2026-09-29T12:00:00.000Z", operation: "project.create",
+      payload: { name: "Local governance", slug: "local-governance", objective: "Use dedicated rule authority", aliases: [] } })
+  });
+  expect(await createResponse.json()).toMatchObject({ status: "committed", new_revision: 1 });
+
+  const transaction = governanceTx("rule.propose", { rule: ruleFixture(projectId) }, 1, projectId);
+  const response = await f.post(transaction);
+  expect(response.status).toBe(200);
+  const receipt = await response.json();
+  expect(receipt).toMatchObject({ status: "committed", project_id: projectId, new_revision: 2, transaction_id: transaction.transaction_id });
+  expect(await (await f.post(transaction)).json()).toEqual(receipt);
+});
+
 it("authenticates before parsing and refuses absent, wrong, or ordinary ingress authority on reads and writes", async () => {
   const f = await fixture(Object.fromEntries(ordinaryBindings.map(binding => [binding, `${Date.now()}.ordinary-${binding}`])));
   for (const token of [null, "incorrect-authority", ...ordinaryBindings.map(binding => f.environment[binding]!)]) {
@@ -84,9 +107,9 @@ it.each(ordinaryBindings)("rejects a governance secret shared with ordinary auth
   expect(f.mock.files.has(globalGovernancePath)).toBe(false);
 });
 
-it("rejects non-global, non-governance and extended payloads before durable forwarding", async () => {
+it("rejects non-governance and extended payloads before durable forwarding", async () => {
   const f = await fixture();
-  for (const body of ["not-json", { ...f.tx, project_id: "PRJ-7101" }, { ...f.tx, operation: "project.create" }, { ...f.tx, qualification: { verified: true } }, { request: f.tx, mutation_context: {} }]) {
+  for (const body of ["not-json", { ...f.tx, operation: "project.create" }, { ...f.tx, qualification: { verified: true } }, { request: f.tx, mutation_context: {} }]) {
     const response = await f.post(body);
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: "invalid_governance_transaction" });

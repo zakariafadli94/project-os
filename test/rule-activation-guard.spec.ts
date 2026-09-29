@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
+import { encodeAdmission } from "../src/admission/transport";
 import { governanceTx, ruleFixture } from "./helpers/rule-fixtures";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { qualificationEntries, type QualificationEvidence, type RuleQualificationEvidenceResolver } from "../src/rules/qualification";
@@ -15,6 +16,10 @@ describe("Guard activation qualification", () => {
     const project = scope === "global" ? "GLOBAL" : `PRJ-${7201 + modes.indexOf(mode)}`;
     const stub = scope === "global" ? testEnv.REGISTRY_GUARD.getByName(`qualification-${crypto.randomUUID()}`) : testEnv.PROJECT_GUARD.getByName(project);
     if (scope === "global") await runInDurableObject(stub as any, instance => { (instance as unknown as { env: Env }).env.RULE_GOVERNANCE_TOKEN = "qualification-test-only"; });
+    if (scope === "project") await runInDurableObject(stub as any, instance => Object.assign((instance as any).env, {
+      RULE_GOVERNANCE_TOKEN: "qualification-test-only",
+      MUTATION_CONTEXT_SIGNING_KEY: "qualification-test-signing-key"
+    }));
     // A project guard only accepts its constructor-owned production resolver.
     // Supplying this synthetic resolver therefore tests that it cannot
     // manufacture local authority; it remains useful for Registry cases.
@@ -32,9 +37,18 @@ describe("Guard activation qualification", () => {
       } };
     });
     async function submit(operation: string, payload: unknown, revision: number) {
+      const transaction = governanceTx(operation, payload, revision, project);
+      let body: unknown = transaction;
+      if (scope === "project" && operation.startsWith("rule.")) {
+        const contextResponse = await stub.fetch("https://guard.internal/mutation-context", {
+          headers: { authorization: "Bearer qualification-test-only" }
+        });
+        const { context } = await contextResponse.json<{ context: Parameters<typeof encodeAdmission>[1] }>();
+        body = encodeAdmission(transaction, context);
+      }
       return stub.fetch(`https://guard.internal/${scope === "global" ? "governance/transaction" : "transaction"}`, {
         method: "POST", headers: { "content-type": "application/json", authorization: "Bearer qualification-test-only" },
-        body: JSON.stringify(governanceTx(operation, payload, revision, project))
+        body: JSON.stringify(body)
       });
     }
     let base = 0;

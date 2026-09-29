@@ -29,6 +29,8 @@ import { searchSyncEnabled } from "./search/sync-mode";
 import { verifyDropboxSignature } from "./webhook/dropbox";
 import { AdmissionError, type MutationContext, type MutationContextResponse } from "./admission/mutation-context";
 import { decodeAdmission } from "./admission/transport";
+import { encodeAdmission } from "./admission/transport";
+import { isLocalGovernanceOperation } from "./domain/local-governance-authority";
 import { renderState } from "./render/state";
 import { renderHandoff } from "./render/handoff";
 import { persistenceCapabilities } from "./persistence/capabilities";
@@ -66,16 +68,59 @@ const worker = {
     if ((request.method === "POST" && url.pathname === "/v1/rule-governance/transactions") ||
         (request.method === "GET" && url.pathname === "/v1/rule-governance")) {
       if (!governanceAuthorized(request, env)) return Response.json({ error: "governance_authority_required" }, { status: 403 });
-      let transaction: GlobalGovernanceTransaction | undefined;
       if (request.method === "POST") {
-        try { transaction = globalGovernanceTransactionSchema.parse(await request.json()); }
+        let body: unknown;
+        try { body = await request.json(); }
         catch { return Response.json({ error: "invalid_governance_transaction" }, { status: 400 }); }
+        const projectId = body && typeof body === "object" && "project_id" in body
+          ? (body as { project_id?: unknown }).project_id
+          : undefined;
+        if (projectId !== "GLOBAL") {
+          let transaction: Transaction;
+          try { transaction = parseTransaction(body); }
+          catch { return Response.json({ error: "invalid_governance_transaction" }, { status: 400 }); }
+          if (!isLocalGovernanceOperation(transaction.operation)) {
+            return Response.json({ error: "invalid_governance_transaction" }, { status: 400 });
+          }
+          const guard = env.PROJECT_GUARD.getByName(transaction.project_id);
+          try {
+            const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context", {
+              headers: { authorization: request.headers.get("authorization")! }
+            });
+            if (!contextResponse.ok) return Response.json({ error: "governance_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+            const { context } = await contextResponse.json<{ context: NonNullable<Parameters<typeof encodeAdmission>[1]> }>();
+            const response = await guard.fetch("https://project-guard.internal/transaction", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(encodeAdmission(transaction, context))
+            });
+            const headers = new Headers(response.headers);
+            headers.set("cache-control", "no-store");
+            return new Response(response.body, { status: response.status, headers });
+          } catch {
+            return Response.json({ error: "governance_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+          }
+        }
+        let transaction: GlobalGovernanceTransaction;
+        try { transaction = globalGovernanceTransactionSchema.parse(body); }
+        catch { return Response.json({ error: "invalid_governance_transaction" }, { status: 400 }); }
+        try {
+          const response = await env.REGISTRY_GUARD.getByName("global").fetch(
+            "https://registry-guard.internal/governance/transaction",
+            { method: "POST", headers: { "content-type": "application/json", authorization: request.headers.get("authorization")! }, body: JSON.stringify(transaction) }
+          );
+          const headers = new Headers(response.headers);
+          headers.set("cache-control", "no-store");
+          return new Response(response.body, { status: response.status, headers });
+        } catch {
+          return Response.json({ error: "governance_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+        }
       }
       try {
         const response = await env.REGISTRY_GUARD.getByName("global").fetch(
-          `https://registry-guard.internal/governance${transaction ? "/transaction" : ""}`,
+          "https://registry-guard.internal/governance",
           { method: request.method, headers: { "content-type": "application/json", authorization: request.headers.get("authorization")! },
-            ...(transaction ? { body: JSON.stringify(transaction) } : {}) }
+          }
         );
         const headers = new Headers(response.headers);
         headers.set("cache-control", "no-store");
@@ -735,13 +780,7 @@ async function routeStableTransaction(env: Env, transaction: Transaction, contex
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ admission_version: "1.0", request: transaction, mutation_context: context })
   });
-  if (!response.ok) {
-    const body: { error?: string; detail?: Record<string, unknown> } = await response.json<{ error?: string; detail?: Record<string, unknown> }>().catch(() => ({}));
-    if (body.error && ["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error)) {
-      throw new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"], body.detail);
-    }
-    throw new Error(`ProjectGuard returned ${response.status}`);
-  }
+  if (!response.ok) throw await projectGuardRouteError(response, "transaction");
   return response.json<Receipt>();
 }
 
@@ -770,9 +809,22 @@ export async function routeManagedDocument(env: Env, document: ManagedDocumentRe
 }
 
 async function projectGuardRouteError(response: Response, route: string): Promise<Error> {
-    const body: { error?: string; detail?: Record<string, unknown> } = await response.json<{ error?: string; detail?: Record<string, unknown> }>().catch(() => ({}));
-  if (body.error && [409, 428, 503].includes(response.status) && (["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "ARTIFACT_DESTINATION_FORBIDDEN", "idempotency_payload_mismatch", "convergence_capacity_exceeded"].includes(body.error) || Object.values(checkCatalogue).some(check => check.result_codes.includes(body.error!)))) {
-    return new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"], body.detail);
+  const body: { error?: string; detail?: Record<string, unknown>; rule?: unknown; expected?: unknown; observed?: unknown; required_action?: unknown } =
+    await response.json<{ error?: string; detail?: Record<string, unknown>; rule?: unknown; expected?: unknown; observed?: unknown; required_action?: unknown }>().catch(() => ({}));
+  const systemAdmissionCodes = ["RULESET_CONFLICT", "UNKNOWN_ACTIVE_CHECK", "INVALID_CHECK_PARAMETERS", "UNSUPPORTED_CHECK_OPERATION", "UNSUPPORTED_CHECK_STAGE", "RULE_POSTCHECK_ADAPTER_UNAVAILABLE"];
+  if (body.error && [409, 428, 503].includes(response.status) && (["mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale", "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE", "ARTIFACT_DESTINATION_FORBIDDEN", "idempotency_payload_mismatch", "convergence_capacity_exceeded", ...systemAdmissionCodes].includes(body.error) || Object.values(checkCatalogue).some(check => check.result_codes.includes(body.error!)))) {
+    const detail: Record<string, unknown> = { ...(body.detail ?? {}) };
+    if (body.rule && typeof body.rule === "object" && !Array.isArray(body.rule)) {
+      const rule = body.rule as Record<string, unknown>;
+      if (typeof rule.rule_id === "string" && rule.rule_id.length <= 128 && Number.isSafeInteger(rule.version)) {
+        detail.rule = { rule_id: rule.rule_id, version: rule.version };
+      }
+    }
+    for (const key of ["expected", "observed", "required_action"] as const) {
+      const value = body[key];
+      if (typeof value === "string" && value.length > 0) detail[key] = value.slice(0, 512);
+    }
+    return new AdmissionError(body.error as AdmissionError["code"], response.status as AdmissionError["status"], Object.keys(detail).length ? detail : undefined);
   }
   return new Error(`ProjectGuard ${route} route returned ${response.status}`);
 }

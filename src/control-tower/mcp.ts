@@ -324,6 +324,7 @@ function validSubmissionResponse(payload: unknown, kind: "transaction" | "docume
 const safeAdmissionRefusals = new Set([
   ...Object.values(checkCatalogue).flatMap(check => [...check.result_codes]),
   "RULESET_CONFLICT", "UNKNOWN_ACTIVE_CHECK", "INVALID_CHECK_PARAMETERS", "UNSUPPORTED_CHECK_OPERATION", "UNSUPPORTED_CHECK_STAGE",
+  "RULE_POSTCHECK_ADAPTER_UNAVAILABLE",
   "mutation_context_missing", "mutation_context_expired", "mutation_context_invalid", "mutation_context_stale",
   "canonical_unavailable", "GLOBAL_GOVERNANCE_UNAVAILABLE", "RULE_ADMISSION_STALE",
   "ARTIFACT_DESTINATION_FORBIDDEN", "idempotency_payload_mismatch", "convergence_capacity_exceeded"

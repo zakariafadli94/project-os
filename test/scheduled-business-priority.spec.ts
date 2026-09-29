@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, runDurableObjectAlarm, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index-mutation-gate";
 import { runScheduledMaintenance } from "../src/index-neutral";
@@ -108,7 +108,7 @@ function researchTransaction(
 }
 
 describe("business ingress priority", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
   it("starts scheduled maintenance while inbox work is blocked", async () => {
     let releaseInbox!: () => void;
@@ -141,6 +141,10 @@ describe("business ingress priority", () => {
   });
 
   it("resumes blocked scheduled inbox work and keeps webhook maintenance behind it", async () => {
+    // Keep alarms created during project/transaction setup in the future so
+    // Miniflare cannot deliver them autonomously while this test attributes
+    // provider calls to the explicitly blocked webhook path.
+    vi.setSystemTime(new Date(Date.now() + 86_400_000));
     const mock = installDropboxMock();
     const created = await createProject();
 
@@ -196,13 +200,22 @@ describe("business ingress priority", () => {
     expect(response.status).toBe(200);
 
     const webhookBlocked = await webhookGate.waitUntilBlocked();
+    // Deliver the webhook's actual maintenance alarm while the inbox owns
+    // the guard queue. It must wait, rather than pass only because time froze.
+    let maintenanceFinished = false;
+    const maintenance = runDurableObjectAlarm(testEnv.DROPBOX_CHANGE_GUARD.getByName("global"))
+      .then((delivered) => { maintenanceFinished = true; return delivered; });
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    const maintenanceFinishedWhileBlocked = maintenanceFinished;
     const webhookCallsWhileBlocked = maintenanceCallsWhileInboxBlocked(mock.calls.slice(webhookBaseline));
 
     webhookGate.releaseInbox();
     await waitOnExecutionContext(webhookCtx);
+    expect(await maintenance).toBe(true);
 
     expect.soft(scheduledBlocked, "scheduled inbox scan should block").toBe(true);
     expect.soft(webhookBlocked, "webhook inbox scan should block").toBe(true);
+    expect.soft(maintenanceFinishedWhileBlocked, "maintenance must wait for the inbox queue").toBe(false);
     expect.soft(webhookCallsWhileBlocked, "webhook maintenance overtook inbox processing").toHaveLength(0);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/committed/${webhookTransaction.transaction_id}.json`)).toBe(true);
     expect(mock.files.has(`/PROJECT_OS/.project-os/transactions/incoming/${webhookTransaction.transaction_id}.json`)).toBe(false);

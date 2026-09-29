@@ -14,6 +14,10 @@ import { MaterializationLedger } from "../src/materialization/ledger";
 import { sha256Text } from "../src/documents/hash";
 import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import { AdmissionError } from "../src/admission/mutation-context";
+import { createControlTowerServer } from "../src/control-tower/mcp";
+import { encodeAdmission } from "../src/admission/transport";
+import type { MutationContext } from "../src/admission/mutation-context";
+import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 
 const testEnv = env as unknown as Env;
 const createdAt = "2026-09-26T09:00:00.000Z";
@@ -360,6 +364,19 @@ describe("interactive persistence isolation", () => {
     });
     expect(created).toMatchObject({ status: "committed", new_revision: 1 });
     await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(created);
+    const signingKey = "interactive-status-admission-fixture";
+    const originalAdmissionBindings = await runInDurableObject(guard, (instance) => {
+      const bindings = (instance as any).env;
+      return { PROJECT_OS_ADMISSION_PROJECT_MODES: bindings.PROJECT_OS_ADMISSION_PROJECT_MODES,
+        MUTATION_CONTEXT_SIGNING_KEY: bindings.MUTATION_CONTEXT_SIGNING_KEY,
+        RULE_ADMISSION_SIGNING_KEY: bindings.RULE_ADMISSION_SIGNING_KEY };
+    });
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }),
+      MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+      RULE_ADMISSION_SIGNING_KEY: signingKey
+    }));
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
     const contextResponse = await guard.fetch("https://project-guard.internal/context");
     const contextPage = await contextResponse.json<Record<string, any>>();
     expect(contextResponse.status).toBe(200);
@@ -381,8 +398,11 @@ describe("interactive persistence isolation", () => {
       restore = () => spy.mockRestore();
     });
 
+    const mutationContextResponse = await guard.fetch("https://project-guard.internal/mutation-context?include_state=false");
+    expect(mutationContextResponse.status).toBe(200);
+    const { context } = await mutationContextResponse.json<{ context: MutationContext }>();
     const submission = guard.fetch("https://project-guard.internal/transaction", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request)
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(request, context))
     }).then(async (response) => {
       // Simulate the client losing a successful response after the server has
       // completed its canonical and maintenance work.
@@ -390,6 +410,9 @@ describe("interactive persistence isolation", () => {
       throw new Error("simulated_lost_commit_response");
     });
     await vi.waitFor(() => expect(mock.files.has(machineCommitRecordPath(projectId, 2))).toBe(true));
+    const tower = createControlTowerServer(testEnv as unknown as Parameters<typeof createControlTowerServer>[0], { read: true, mutate: true }) as unknown as {
+      _registeredTools: Record<string, { handler(input: unknown): Promise<{ isError?: boolean; content: Array<{ text: string }> }> }>;
+    };
     let observed!: { status: number; body: Record<string, unknown> };
     let receiptObserved!: { status: number; body: Record<string, unknown> };
     let executionObserved!: { status: number; body: Record<string, unknown> };
@@ -397,37 +420,50 @@ describe("interactive persistence isolation", () => {
     let contextDuringMaintenance!: Response;
     try {
       contextDuringMaintenance = await guard.fetch("https://project-guard.internal/context");
-      const status = await guard.fetch(
-        `https://project-guard.internal/request-status?kind=transaction&request_id=${request.transaction_id}`
-      );
-      observed = { status: status.status, body: await status.json<Record<string, unknown>>() };
+      await runInDurableObject(guard, (instance) => (instance as any).ctx.storage.delete(
+        persistenceObservationStorageKey("transaction", request.transaction_id)
+      ));
+      const status = await tower._registeredTools.project_os_get_request_status!.handler({
+        project_id: projectId, request_id: request.transaction_id, kind: "transaction"
+      });
+      observed = { status: status.isError ? 503 : 200, body: JSON.parse(status.content[0]!.text) as Record<string, unknown> };
       cacheReceipt = await runInDurableObject(guard, async (instance) => {
         const cached = await (instance as any).readStoredRequestObservation(projectId, "transaction", request.transaction_id) as Response | null;
         return cached ? cached.json() : null;
       });
-      const receipt = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${request.transaction_id}`);
-      receiptObserved = { status: receipt.status, body: await receipt.json<Record<string, unknown>>() };
+      const receipt = await tower._registeredTools.project_os_get_receipt!.handler({
+        project_id: projectId, request_id: request.transaction_id, kind: "transaction"
+      });
+      receiptObserved = { status: receipt.isError ? 503 : 200, body: JSON.parse(receipt.content[0]!.text) as Record<string, unknown> };
       const execution = await guard.fetch(`https://project-guard.internal/execution-status?kind=transaction&request_id=${request.transaction_id}`);
       executionObserved = { status: execution.status, body: await execution.json<Record<string, unknown>>() };
     } finally {
       releaseMaintenance();
       await expect(submission).rejects.toThrow("simulated_lost_commit_response");
       restore();
+      await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, originalAdmissionBindings));
+      // This fixture's mock Dropbox is replaced by the next test. Do not
+      // retain a registry pointer to a governance commit in that old mock.
+      await runInDurableObject(testEnv.REGISTRY_GUARD.getByName("global"), (_instance, ctx) => {
+        ctx.storage.sql.exec("DELETE FROM meta WHERE key = 'rule_governance'");
+        ctx.storage.sql.exec("DELETE FROM requests WHERE project_id = 'GLOBAL'");
+        ctx.storage.sql.exec("DELETE FROM governance_events");
+      });
     }
 
     // The commit is already canonical; unrelated navigation/finalization work
     // must not turn its known status into READ_BUSY/unknown.
-    expect(observed.status).toBe(200);
+    expect(observed).toMatchObject({ status: 200, body: { status: "committed" } });
     expect(contextDuringMaintenance.status).toBe(200);
     expect(observed.body).toMatchObject({
       project_id: projectId, kind: "transaction", request_id: request.transaction_id,
       status: "committed", receipt: { status: "committed", new_revision: 2 }
     });
-    expect(cacheReceipt).toMatchObject({ status: "committed", receipt: { transaction_id: request.transaction_id } });
+    expect(cacheReceipt).toBeNull();
     expect(receiptObserved).toMatchObject({ status: 200, body: { transaction_id: request.transaction_id, status: "committed", new_revision: 2 } });
-    expect(executionObserved.status).toBe(503);
-    expect(executionObserved.body).toMatchObject({ status: "unknown", code: "PROJECT_OS_READ_BUSY" });
-    expect(executionObserved.body).not.toHaveProperty("finalization_ref");
+    expect(executionObserved.status).toBe(200);
+    expect(executionObserved.body).toMatchObject({ status: "admitted", terminal: false });
+    expect(executionObserved.body).toHaveProperty("finalization_ref", null);
 
     // A later runtime wake and an exact client retry are recovery, not a new
     // transaction. The immutable canonical history must remain at revision 2.

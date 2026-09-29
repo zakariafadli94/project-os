@@ -13,6 +13,7 @@ export const globalGovernanceBootstrapPath = `${MACHINE_ROOT}/registry/RULE_GOVE
 const bootstrapSchema = z.strictObject({ status: z.enum(["pending", "initialized"]), transaction: globalGovernanceTransactionSchema });
 export interface GovernanceJournalEntry { transaction: GlobalGovernanceTransaction; receipt: Receipt; event?: DomainEvent; qualification?: GovernanceQualification; qualification_required?: true }
 export interface CanonicalGovernance extends GlobalGovernanceState { journal: Record<string, GovernanceJournalEntry> }
+interface StableBootstrap { value: z.infer<typeof bootstrapSchema>; token: string }
 const recordSchema = z.strictObject({
   revision: z.number().int().nonnegative(), rules: z.unknown(), exceptions: z.unknown(), journal: z.record(z.string(), z.unknown())
 });
@@ -41,7 +42,7 @@ export class RuleGovernanceRepository {
     if (bootstrap && (bootstrap.value.status === "initialized" || JSON.stringify(bootstrap.value.transaction) !== JSON.stringify(transaction))) throw new Error("Canonical global governance is missing after initialization");
   }
 
-  private async readBootstrap() {
+  private async readBootstrap(): Promise<StableBootstrap | null> {
     const before = await this.runtime.objects.getMetadata(globalGovernanceBootstrapPath);
     if (!before) return null;
     if (!before.revisionToken) throw new Error("Governance bootstrap revision missing");
@@ -61,8 +62,8 @@ export class RuleGovernanceRepository {
     }
   }
 
-  private async confirmBootstrap(state: CanonicalGovernance): Promise<void> {
-    const bootstrap = await this.readBootstrap();
+  private async confirmBootstrap(state: CanonicalGovernance, verifiedBootstrap?: StableBootstrap | null): Promise<void> {
+    const bootstrap = verifiedBootstrap === undefined ? await this.readBootstrap() : verifiedBootstrap;
     if (!bootstrap) throw new Error("Governance initialization evidence missing");
     const initial = Object.values(state.journal)[0];
     if (!initial || JSON.stringify(initial.transaction) !== JSON.stringify(bootstrap.value.transaction)) throw new Error("Governance initialization evidence mismatch");
@@ -78,16 +79,30 @@ export class RuleGovernanceRepository {
 
   async read(): Promise<{ state: CanonicalGovernance; token: string } | null> {
     this.verifiedBootstrap = null;
+    const [canonicalResult, bootstrapResult] = await Promise.all([
+      this.readCanonicalStable().then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
+      this.readBootstrap().then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }))
+    ]);
+    if (!canonicalResult.ok) throw canonicalResult.error;
+    // Match the historical behavior: absent canonical governance is uninitialized,
+    // regardless of any orphaned bootstrap evidence read in parallel.
+    if (!canonicalResult.value) return null;
+    const { text, token } = canonicalResult.value;
+    const state = await parseCanonicalGovernance(JSON.parse(text));
+    if (!bootstrapResult.ok) throw bootstrapResult.error;
+    await this.confirmBootstrap(state, bootstrapResult.value);
+    this.verifiedBootstrap = { canonicalToken: token, initialTransaction: JSON.stringify(Object.values(state.journal)[0].transaction) };
+    return { state, token };
+  }
+
+  private async readCanonicalStable(): Promise<{ text: string; token: string } | null> {
     const before = await this.runtime.objects.getMetadata(globalGovernancePath);
     if (!before) return null;
     if (!before.revisionToken) throw new Error("Global governance revision token missing");
     const text = await this.runtime.objects.readText(globalGovernancePath);
     const after = await this.runtime.objects.getMetadata(globalGovernancePath);
     if (text === null || !after || before.revisionToken !== after.revisionToken) throw new ProviderConflictError("Global governance changed during read");
-    const state = await parseCanonicalGovernance(JSON.parse(text));
-    await this.confirmBootstrap(state);
-    this.verifiedBootstrap = { canonicalToken: before.revisionToken, initialTransaction: JSON.stringify(Object.values(state.journal)[0].transaction) };
-    return { state, token: before.revisionToken };
+    return { text, token: before.revisionToken };
   }
 
   async write(state: CanonicalGovernance, expectedToken: string | null): Promise<void> {

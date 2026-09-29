@@ -1260,17 +1260,23 @@ describe("canonical execution boundary in ProjectGuard", () => {
       });
     });
 
-    // Keep the wall-clock abort timer out of this fixture; advance only Date
-    // after the first candidate so runner load cannot expire the slice early.
+    // Keep the wall-clock abort timer out of this fixture. Force the next
+    // provider read to exhaust the slice after the missing candidate is
+    // checkpointed, independently of runner scheduling or fake timers.
     const sliceBudget = await runInDurableObject(guard, instance =>
       vi.spyOn(instance as any, "materializationFinalizationSliceBudgetMs").mockReturnValue(60_000)
     );
     commitReads.mockClear();
+    let sawMissingCandidate = false;
     commitReads.mockImplementation(async function (this: ProjectRepository, candidateProjectId, revision) {
       if (candidateProjectId !== projectId || revision < 9101 || revision > 9105) {
         return originalReadCommitRecord.call(this, candidateProjectId, revision);
       }
-      if (revision === 9101) vi.setSystemTime(Date.now() + 60_001);
+      if (revision === 9101) {
+        sawMissingCandidate = true;
+        return null;
+      }
+      if (revision === 9102 && sawMissingCandidate) throw new Error("materialization_finalization_slice_budget_exhausted");
       return null;
     });
     // The production route and alarm both use this serialized queue. This

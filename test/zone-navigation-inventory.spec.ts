@@ -1109,7 +1109,24 @@ describe("ZoneNavigationInventory", () => {
     expect(await h.inventory.verifyEntry(entries[0], budget())).toBe(true);
   });
 
-  it("does not choose by timestamp when multiple committed receipts prove identical destination bytes", async () => {
+  it("ignores a committed artifact in the same project's ARTIFACTS folder when rebuilding REVIEW", async () => {
+    const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/ARTIFACTS/roadmap.md`;
+    await seedCommittedArtifact(h, "ART-NAVIGATION-OUTSIDE-001", destination, "roadmap");
+
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "REVIEW", cursor, limit: 8, budget: budget() });
+      pages.push(page);
+      cursor = page.next_cursor;
+    } while (cursor !== null);
+
+    expect(pages.flatMap((page) => page.entries)).toEqual([]);
+    expect(pages.flatMap((page) => page.gaps)).toEqual([]);
+  });
+
+  it("uses one deterministic receipt witness when multiple committed receipts prove identical destination bytes", async () => {
     const h = harness();
     const destination = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/report.md`;
     await seedCommittedArtifact(h, "ART-NAVIGATION-001", destination, "same bytes", "2026-09-25T00:00:00Z");
@@ -1123,10 +1140,14 @@ describe("ZoneNavigationInventory", () => {
       cursor = page.next_cursor;
     } while (cursor !== null);
 
-    expect(pages.flatMap((page) => page.entries)).toEqual([]);
-    expect(pages.flatMap((page) => page.gaps)).toContainEqual(expect.objectContaining({
-      resource_id: `artifact:${await sha256Text(destination)}`, code: "artifact_destination_ambiguous"
-    }));
+    const entries = pages.flatMap((page) => page.entries);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      resource_id: `artifact:${await sha256Text(destination)}`,
+      version: `ART-NAVIGATION-001:${await sha256Text("same bytes")}`
+    });
+    expect(pages.flatMap((page) => page.gaps)).toEqual([]);
+    expect(await h.inventory.verifyEntry(entries[0], budget())).toBe(true);
   });
 
   it("refreshes the stable artifact catalog entry after a committed same-destination replacement", async () => {
@@ -1300,7 +1321,7 @@ describe("ZoneNavigationInventory", () => {
     } while (cursor !== null);
 
     expect(pages.flatMap((page) => page.entries)).toEqual([]);
-    expect(pages.flatMap((page) => page.gaps)).toContainEqual(expect.objectContaining({ code: "artifact_destination_outside_navigation_zones" }));
+    expect(pages.flatMap((page) => page.gaps)).toEqual([]);
   });
 
   it("batches outside-zone artifact gaps and replays the same bounded page", async () => {

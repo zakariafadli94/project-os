@@ -830,14 +830,19 @@ it("serves a canonical context read while a document reconciliation is waiting o
   let release!: () => void;
   const pending = new Promise<void>((resolve) => { release = resolve; });
   const fetch = vi.spyOn(SearchSyncProjectGuard.prototype, "fetch")
-    .mockImplementationOnce(async () => { await pending; return Response.json({}); })
-    .mockResolvedValueOnce(Response.json({ context: { canonical_revision: 12 } }));
+    .mockImplementation(async (request) => {
+      if (new URL(request.url).pathname === "/reconcile-documents") {
+        await pending;
+        return Response.json({});
+      }
+      return Response.json({ context: { canonical_revision: 12 } });
+    });
   const guard = Object.assign(Object.create(DiagnosticProjectGuard.prototype), {
     ctx: { id: { name: "PRJ-0007" } },
     persistence: { diagnostics: { beginOperation: vi.fn() } }
   }) as DiagnosticProjectGuard;
   const reconciliation = guard.fetch(new Request("https://guard.internal/reconcile-documents?scheduled=1"));
-  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(fetch.mock.calls.some(([request]) => new URL(request.url).pathname === "/reconcile-documents")).toBe(true));
   let readFinished = false;
   const contextRead = guard.fetch(new Request("https://guard.internal/mutation-context"))
     .then((response) => { readFinished = true; return response; });

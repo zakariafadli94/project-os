@@ -11,7 +11,7 @@ import type { CurrentManagedDocumentHead, CurrentDocumentVersionRecord } from ".
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderEntry, ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderOperationError } from "../persistence/provider/errors";
-import { machineDocumentHeadPath, machineDocumentInstanceRepairPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot, machineStatePath, workspaceProjectRoot } from "../persistence/layout";
+import { machineDocumentHeadPath, machineDocumentInstanceRepairPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, machineMutationGateRoot, machineMutationIntentDestinationBindingRoot, machineStatePath, workspaceArtifactPath, workspaceProjectRoot } from "../persistence/layout";
 import { sha256Text } from "./hash";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "./zone-navigation-sources";
 import { packageIdFor, packageManifestPath, packageNavigationLedgerSchema, packageNavigationPath, packageRefSchema, packageResourceVersion, parsePackageManifest, type PackageNavigationHead, type PackageRef } from "../domain/document-package";
@@ -393,6 +393,13 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         continue;
       }
       const target = artifactNavigationTarget(projectId, intent.destination_path);
+      if (target.kind === "outside" && isGenericArtifactDestination(projectId, intent.destination_path)) {
+        // The supported generic artifact route writes to ARTIFACTS, which is
+        // not a member of WORKING, REVIEW or DELIVERABLES navigation.
+        if (gaps.length === 0) lastSkippedCursor = providerCursor;
+        if (providerCursor === null) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: null };
+        continue;
+      }
       if (target.kind === "outside") {
         if (lastSkippedCursor !== null && gaps.length === 0) return { entries: [], gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifacts", lastSkippedCursor) };
         gaps.push({ resource_id: `artifact:${await sha256Text(intent.destination_path)}`, code: "artifact_destination_outside_navigation_zones" });
@@ -482,13 +489,27 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     requireBudget(budget, 16);
     const resourceId = `artifact:${await sha256Text(state.destination_path)}`;
     const distinct = [...new Set(state.eligible_request_ids)];
+    let winningRequestId = distinct.length === 1 ? distinct[0] : null;
     if (distinct.length > 1) {
-      if (persistCatalog) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
-      state.gaps.push({ resource_id: resourceId, code: "artifact_destination_ambiguous" });
-      return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.dirty ? null : state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
+      // Several committed replacements can prove the *same visible bytes*.
+      // An index needs one receipt witness, not a claim about which identical
+      // write happened last. Never choose among different content hashes or
+      // an unbounded set of historical receipts.
+      if (distinct.length <= 8) {
+        const intents = await Promise.all(distinct.map((requestId) =>
+          new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, requestId)));
+        const contentHash = intents[0]?.expected_content_sha256;
+        if (contentHash && intents.every((intent) => intent?.destination_path === state.destination_path && intent.expected_content_sha256 === contentHash)) {
+          winningRequestId = [...distinct].sort()[0];
+        }
+      }
+      if (!winningRequestId) {
+        if (persistCatalog) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        state.gaps.push({ resource_id: resourceId, code: "artifact_destination_ambiguous" });
+        return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.dirty ? null : state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
+      }
     }
-    if (distinct.length === 1 && (state.dirty || distinct[0] === state.request_id)) {
-      const winningRequestId = distinct[0];
+    if (winningRequestId && (state.dirty || winningRequestId === state.request_id)) {
       const intent = await new MutationGateRepository(budgetedRuntime(this.runtime, budget)).readArtifactIntent(projectId, winningRequestId);
       if (!intent) throw new Error("committed_artifact_intent_unavailable");
       const target = artifactNavigationTarget(projectId, state.destination_path);
@@ -1484,6 +1505,13 @@ function artifactNavigationTarget(projectId: string, path: string): { kind: "zon
   try {
     return { kind: "zone", zone: match[3] as NavigationZone, logical_path: match[4] };
   } catch { return { kind: "invalid" }; }
+}
+
+function isGenericArtifactDestination(projectId: string, path: string): boolean {
+  const match = /^\/PROJECT_OS\/WORKSPACE\/PROJECTS\/(PRJ-[0-9]{4,})-([A-Za-z0-9][A-Za-z0-9_-]*)\/ARTIFACTS\/(.+)$/.exec(path);
+  if (match?.[1] !== projectId) return false;
+  try { return workspaceArtifactPath(projectId, match[2], match[3]) === path; }
+  catch { return false; }
 }
 
 async function resolveArtifactEntry(

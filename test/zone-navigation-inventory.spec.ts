@@ -20,6 +20,7 @@ import { packageNavigationPath } from "../src/domain/document-package";
 import { machineArtifactReceiptPath, machineMutationIntentPath } from "../src/persistence/layout";
 import { mutationIntentIdFor } from "../src/domain/mutation-gate";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
+import { enforceManagedMarkdownIdentity } from "../src/documents/identity-frontmatter";
 
 const projectId = "PRJ-0002";
 const documentId = "DOC-0123456789ABCDEF01234567";
@@ -383,6 +384,66 @@ describe("ZoneNavigationInventory", () => {
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
 
+  it("accepts a legacy REVIEW write with stale WORKING evidence only when its exact write and immutable bytes are proven", async () => {
+    const h = harness();
+    const requestId = "DOCREQ-NAV-LEGACY-REVIEW-WRITE-001";
+    const parentId = "VER-REQ-1123456789ABCDEF01234567";
+    const reviewId = `VER-REQ-${(await sha256Text(`${requestId}\nreview`)).slice(0, 24).toUpperCase()}`;
+    const content = "# Revised review body\n";
+    const managed = enforceManagedMarkdownIdentity(content, { projectId, documentId, logicalPath: "draft.md" });
+    const contentHash = await sha256Text(managed);
+    const workingPath = `${workspaceProjectRoot(projectId, slug)}/WORKING/draft.md`;
+    const reviewPath = `${workspaceProjectRoot(projectId, slug)}/REVIEW/draft.md`;
+    const oldEvidence = { provider_id: "test", object_id: "id:review-write", revision_token: "rev-working",
+      path: workingPath, integrity_hash: { algorithm: "dropbox-content-hash", value: "d".repeat(64) }, size: 12 };
+    const request = { operation: "review.write", request_id: requestId, project_id: projectId, document_id: documentId,
+      expected_version_id: parentId, content, content_sha256: await sha256Text(content), created_at: "2026-09-29T10:00:00.000Z" };
+    const requestJson = JSON.stringify(request);
+    const requestDigest = await sha256Text(requestJson);
+    h.put(machineStatePath(projectId), JSON.stringify(emptyProjectState(projectId, "Project OS", slug)));
+    h.put(reviewPath, managed, "id:review-write");
+    h.files.set(reviewPath, { ...h.files.get(reviewPath)!, revision_token: "rev-review-write" });
+    h.put(machineDocumentTextPayloadPath(projectId, contentHash), managed);
+    h.put(machineDocumentHeadPath(projectId, documentId), JSON.stringify({ schema_version: "1.0", project_id: projectId,
+      document_id: documentId, kind: "work_product", logical_path: "draft.md", review_version_id: reviewId,
+      provider: { review: { path: reviewPath, file_id: "id:review-write", rev: "rev-review-write", content_hash: contentHash, size: new TextEncoder().encode(managed).byteLength } },
+      reconciliation_status: "clean" }));
+    h.put(machineDocumentVersionPath(projectId, documentId, parentId), JSON.stringify({ schema_version: "2.0", project_id: projectId,
+      document_id: documentId, version_id: parentId, kind: "work_product", stage: "review", logical_path: "draft.md",
+      source: "project_os", created_at: "2026-09-29T09:00:00.000Z", immutable_payload_path: machineDocumentTextPayloadPath(projectId, await sha256Text("old content")),
+      content_sha256: await sha256Text("old content"), provider_evidence: oldEvidence }));
+    h.put(machineDocumentVersionPath(projectId, documentId, reviewId), JSON.stringify({ schema_version: "2.0", project_id: projectId,
+      document_id: documentId, version_id: reviewId, parent_version_id: parentId, kind: "work_product", stage: "review", logical_path: "draft.md",
+      source: "project_os", created_at: request.created_at, request_id: requestId, immutable_payload_path: machineDocumentTextPayloadPath(projectId, contentHash),
+      content_sha256: contentHash, provider_evidence: oldEvidence }));
+    await new ExecutionJournal(h.runtime, projectId, "document", requestId).commit({ project_id: projectId, request_id: requestId,
+      kind: "document", operation: "review.write", request_hash: await executionHash(request),
+      actor: { actor_id: "operator:test", authority: "project_guard" }, resources: [{ resource_id: documentId, resource_type: "document", zone: "DOCUMENTS", version: parentId, expected_version: parentId }],
+      global_revision: 0, project_revision: 0, ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 },
+      verdict: "allow", results: [], gaps: [], deferred_rules: [] } as unknown as ExecutionAdmission, null);
+    const intentPath = `${machineDocumentRoot(projectId)}/requests/${requestId}/intent.json`;
+    const receiptPath = `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`;
+    h.put(intentPath, JSON.stringify({ schema_version: "1.0", project_id: projectId, request_id: requestId, request_sha256: requestDigest, request_json: requestJson }));
+    const receipt = { request_id: requestId, project_id: projectId, document_id: documentId, version_id: reviewId,
+      stage: "review", logical_path: "draft.md", status: "committed", provider_rev: "rev-review-write" };
+    h.put(receiptPath, JSON.stringify({ schema_version: "1.0", project_id: projectId, request_id: requestId,
+      request_sha256: requestDigest, request_json: requestJson, receipt_json: JSON.stringify(receipt) }));
+    const entry: NavigationInventoryEntry = { project_id: projectId, zone: "REVIEW", resource_id: `head:${documentId}`,
+      version: reviewId, logical_path: "draft.md", path: reviewPath,
+      expected: { object_id: "id:review-write", revision_token: "rev-review-write", content_sha256: contentHash, size: new TextEncoder().encode(managed).byteLength } };
+
+    const slice = budget();
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "REVIEW", cursor: null, limit: 8, budget: slice });
+    expect(page.entries).toEqual([entry]);
+    expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+    h.put(machineDocumentTextPayloadPath(projectId, contentHash), "corrupted immutable review payload");
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+    h.put(machineDocumentTextPayloadPath(projectId, contentHash), managed);
+    h.put(receiptPath, JSON.stringify({ schema_version: "1.0", project_id: projectId, request_id: requestId,
+      request_sha256: requestDigest, request_json: requestJson, receipt_json: JSON.stringify({ ...receipt, provider_rev: "wrong-rev" }) }));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+  });
+
   it("accepts a DELIVERABLES head only when its exact committed publication proves the provider move", async () => {
     const h = harness();
     const { entry } = await seedHistoricalPublishedHead(h);
@@ -399,6 +460,27 @@ describe("ZoneNavigationInventory", () => {
     h.put(receiptPath, JSON.stringify(receipt));
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
     h.put(receiptPath, JSON.stringify({ ...receipt, request_sha256: "0".repeat(64) }));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+  });
+
+  it("accepts a published payload whose historical WORKING evidence has an older size only with immutable byte proof", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h);
+    const path = machineDocumentVersionPath(projectId, documentId, entry.version);
+    const published = JSON.parse(h.files.get(path)!.content);
+    const parentPath = machineDocumentVersionPath(projectId, documentId, published.parent_version_id);
+    const parent = JSON.parse(h.files.get(parentPath)!.content);
+    published.provider_evidence.size -= 4;
+    parent.provider_evidence.size -= 4;
+    h.put(path, JSON.stringify(published));
+    h.put(parentPath, JSON.stringify(parent));
+
+    const slice = budget();
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor: null, limit: 8, budget: slice });
+    expect(page.entries).toEqual([entry]);
+    expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+    h.put(published.immutable_payload_path, "corrupted immutable payload");
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
 

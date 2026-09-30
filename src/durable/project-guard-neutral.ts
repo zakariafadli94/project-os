@@ -15,7 +15,7 @@ import {
 } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
-import { navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema, type NavigationReconcileRequest, type NavigationWorkRef, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
+import { navigationCatalogRebuildCertificateSchema, navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema, type NavigationCatalogRebuildRequest, type NavigationReconcileRequest, type NavigationWorkRef, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
 import { packageIdFor, packageManifestPath, parsePackageManifest, type PackageRef } from "../domain/document-package";
 import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH, type CompletedMaterializationRecord } from "../domain/materialization";
 import type { Env } from "../env";
@@ -36,7 +36,7 @@ import { TransactionRequestLedger } from "../transactions/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
 import { ZoneNavigationEngine, zoneNavigationHeadPath } from "../documents/zone-navigation";
 import { ZoneNavigationInventory } from "../documents/zone-navigation-inventory";
-import { ZoneNavigationSources } from "../documents/zone-navigation-sources";
+import { ZoneNavigationSources, zoneNavigationCompactCatalogRoot, ZONE_NAVIGATION_CATALOG_SHARDS } from "../documents/zone-navigation-sources";
 import { DocumentLedgerRepository } from "../documents/repository";
 import type { ProviderObjectMetadata, ProviderRequestScope } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
@@ -182,6 +182,7 @@ interface NavigationDocumentReceipt {
   status: "committed" | "conflict";
   execution_status: "pending" | "finalized" | "conflict";
   navigation_receipt?: ZoneNavigationReceipt;
+  catalog_rebuild_certificate_ref?: string;
   code?: string;
   finalization_ref?: string | null;
 }
@@ -1293,6 +1294,19 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       if (!mutationContext) return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "rejected", code: "NAVIGATION_GOVERNANCE_REQUIRED" });
       await this.verifyEffectAdmission(mutationContext, request.project_id, current, true);
+      if (request.purpose === "compact_catalog_rebuild") {
+        const sources = new ZoneNavigationSources(this.persistence);
+        const actualSource = await sources.readState(request.project_id, request.zone);
+        if (actualSource.generation !== request.expected_source_generation || actualSource.in_flight_resource_ids.length > 0) {
+          return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+            status: "conflict", code: "navigation_catalog_rebuild_source_changed" }, { status: 409 });
+        }
+        const actualManifest = await sources.compactCatalogManifestIdentity(request.project_id, request.zone);
+        if (!actualManifest || canonicalJson(actualManifest) !== canonicalJson(request.expected_catalog_manifest)) {
+          return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+            status: "conflict", code: "navigation_catalog_rebuild_manifest_conflict" }, { status: 409 });
+        }
+      }
       const normalized = await normalizeDocumentAdmission(request);
       const proof = await this.admitRules(current, normalized, mutationContext.actor);
       const indexPath = `${workspaceProjectRoot(current.project_id, current.slug)}/${request.zone}/${request.expected_index?.basename ?? "00-CURRENT.md"}`;
@@ -1300,14 +1314,29 @@ export class ProjectGuard extends DurableObject<Env> {
       const preservationPath = request.expected_index
         ? `${workspaceProjectRoot(current.project_id, current.slug)}/ARCHIVES/NAVIGATION/${request.zone}/${request.expected_generation + 1}-${request.expected_index.content_sha256}.md`
         : null;
-      proof.resource_effect_scopes = [{
-        resource_id: resourceId,
-        resource_version: String(request.expected_generation),
-        provider_id: this.persistence.providerId,
-        sources: request.expected_index ? [{ path: indexPath, logical_path: `${request.zone}/${request.expected_index.basename}` }] : [],
-        destinations: [{ path: indexPath, logical_path: `${request.zone}/${request.expected_index?.basename ?? "00-CURRENT.md"}` }],
-        preservation_copies: preservationPath ? [{ path: preservationPath, logical_path: `ARCHIVES/NAVIGATION/${request.zone}/${request.expected_generation + 1}-${request.expected_index!.content_sha256}.md` }] : []
-      }];
+      if (request.purpose === "compact_catalog_rebuild") {
+        const root = zoneNavigationCompactCatalogRoot(request.project_id, request.zone);
+        const manifest = `${root}/ready.json`;
+        const chunks = Array.from({ length: ZONE_NAVIGATION_CATALOG_SHARDS }, (_, shard) =>
+          `${root}/${shard.toString(16).padStart(2, "0")}.json`);
+        const staged = chunks.map((path) => path.replace(`${root}/`, `${root}/rebuilds/${request.request_id}/chunks/`));
+        proof.resource_effect_scopes = [{
+          resource_id: resourceId, resource_version: String(request.expected_generation), provider_id: this.persistence.providerId,
+          sources: [{ path: manifest, logical_path: manifest }],
+          destinations: [manifest, `${root}/rebuilds/${request.request_id}/intent.json`, ...chunks, ...staged]
+            .map((path) => ({ path, logical_path: path })),
+          preservation_copies: []
+        }];
+      } else {
+        proof.resource_effect_scopes = [{
+          resource_id: resourceId,
+          resource_version: String(request.expected_generation),
+          provider_id: this.persistence.providerId,
+          sources: request.expected_index ? [{ path: indexPath, logical_path: `${request.zone}/${request.expected_index.basename}` }] : [],
+          destinations: [{ path: indexPath, logical_path: `${request.zone}/${request.expected_index?.basename ?? "00-CURRENT.md"}` }],
+          preservation_copies: preservationPath ? [{ path: preservationPath, logical_path: `ARCHIVES/NAVIGATION/${request.zone}/${request.expected_generation + 1}-${request.expected_index!.content_sha256}.md` }] : []
+        }];
+      }
       frozenState = current;
       await this.writeFrozenNavigationState(request, requestHash, frozenState);
       await this.persistAdmissionProof("document", request.request_id, proof);
@@ -1334,7 +1363,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     // This also runs on replay of an already persisted, exact admission so an
     // interruption after admission cannot strand the governed successor.
-    await this.releaseTerminalNavigationAdoptionOwner(request);
+    if (request.purpose !== "compact_catalog_rebuild") await this.releaseTerminalNavigationAdoptionOwner(request);
     return this.executeNavigationSlice(request, frozenState, existingAdmission.admission as ExecutionAdmission);
   }
 
@@ -1502,7 +1531,8 @@ export class ProjectGuard extends DurableObject<Env> {
     const sourceState = await sources.readState(nav.project_id, nav.zone, budget);
     const sourceGeneration = Number(ref.source_snapshot_id.slice("source:".length));
     if (`source:${sourceState.generation}` !== ref.source_snapshot_id
-      || (!sourceState.adopted && sourceState.adoption_request_id !== nav.request_id)) {
+      || (nav.purpose === "compact_catalog_rebuild" && sourceState.generation !== nav.expected_source_generation)
+      || (nav.purpose !== "compact_catalog_rebuild" && !sourceState.adopted && sourceState.adoption_request_id !== nav.request_id)) {
       if (!sourceState.adopted && sourceState.generation === sourceGeneration
         && sourceState.adoption_request_id === nav.request_id) {
         await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceGeneration, budget);
@@ -1513,6 +1543,34 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json(receipt, { status: 409 });
     }
     const inventory = new ZoneNavigationInventory(this.persistence, sources);
+    if (nav.purpose === "compact_catalog_rebuild") {
+      const result = await new ZoneNavigationEngine(this.persistence, inventory)
+        .publishPreparedCompactCatalogRebuild(nav as NavigationCatalogRebuildRequest, frozenState, admitted.admission, ref.source_snapshot_id, budget);
+      if (result.status === "pending") {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id,
+          status: "pending", code: "NAVIGATION_CATALOG_REBUILD_PENDING", cursor: result.cursor }, { status: 503 });
+      }
+      if (result.status === "conflict") {
+        const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id,
+          project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: result.code };
+        await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
+        await this.settleNavigationReceipt(nav, receipt);
+        return Response.json(receipt, { status: 409 });
+      }
+      const certificate = navigationCatalogRebuildCertificateSchema.parse(result.certificate);
+      if (certificate.project_id !== nav.project_id || certificate.request_id !== nav.request_id
+        || certificate.request_hash !== requestHash || certificate.source_snapshot_id !== ref.source_snapshot_id) {
+        throw new Error("navigation_catalog_rebuild_certificate_binding_invalid");
+      }
+      const certificateRef = `${await journal.root()}/navigation/catalog-rebuild/finalizations/${requestHash}.json`;
+      const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id,
+        project_id: nav.project_id, status: "committed", execution_status: "pending",
+        catalog_rebuild_certificate_ref: certificateRef };
+      await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
+      await this.settleNavigationReceipt(nav, receipt);
+      return Response.json(await this.currentNavigationReceipt(nav, receipt));
+    }
     const result = await new ZoneNavigationEngine(this.persistence, inventory, undefined, postcheckRules).publishPrepared(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
     if (result.status === "pending") {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
@@ -1642,6 +1700,12 @@ export class ProjectGuard extends DurableObject<Env> {
     await journal.recordReceipt(receipt.status, receiptPath);
     if (receipt.status === "conflict") {
       this.clearRequestRecovery("document", request.request_id);
+      return;
+    }
+    if (request.purpose === "compact_catalog_rebuild") {
+      if (!receipt.catalog_rebuild_certificate_ref) throw new Error("navigation_catalog_rebuild_certificate_unavailable");
+      await journal.finalizeVerifiedCatalogRebuild({ receipt_ref: receiptPath, certificate_ref: receipt.catalog_rebuild_certificate_ref });
+      if ((await journal.status())?.terminal) this.clearRequestRecovery("document", request.request_id);
       return;
     }
     const navigationReceipt = zoneNavigationReceiptSchema.parse(receipt.navigation_receipt);
@@ -4783,6 +4847,22 @@ export class ProjectGuard extends DurableObject<Env> {
       if (kind === "document") {
         const expectedReceiptRef = `${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`;
         if (receipt.operation === "navigation.reconcile") {
+          if (typeof receipt.catalog_rebuild_certificate_ref === "string") {
+            const expectedCertificateRef = `${root}/navigation/catalog-rebuild/finalizations/${execution.request_hash}.json`;
+            if (execution.receipt_ref !== expectedReceiptRef
+              || receipt.catalog_rebuild_certificate_ref !== expectedCertificateRef
+              || record.catalog_rebuild_certificate_ref !== expectedCertificateRef) return false;
+            const certificateRaw = await runtime.objects.readText(expectedCertificateRef);
+            if (certificateRaw === null) return false;
+            const parsed = navigationCatalogRebuildCertificateSchema.safeParse(JSON.parse(certificateRaw));
+            if (!parsed.success || canonicalJson(parsed.data) !== certificateRaw) return false;
+            const certificate = parsed.data;
+            return certificate.project_id === projectId && certificate.request_id === requestId
+              && certificate.request_hash === execution.request_hash && record.zone === certificate.zone
+              && record.source_snapshot_id === certificate.source_snapshot_id
+              && record.source_count === certificate.source_count
+              && canonicalJson(record.published_manifest) === canonicalJson(certificate.published_manifest);
+          }
           const navigationReceipt = zoneNavigationReceiptSchema.safeParse(receipt.navigation_receipt);
           return navigationReceipt.success && execution.receipt_ref === expectedReceiptRef
             && navigationReceipt.data.project_id === projectId && navigationReceipt.data.request_id === requestId

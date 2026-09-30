@@ -19,6 +19,13 @@ export const navigationIndexIdentitySchema = z.strictObject({
 });
 export type NavigationIndexIdentity = z.infer<typeof navigationIndexIdentitySchema>;
 
+export const navigationCatalogManifestIdentitySchema = z.strictObject({
+  object_id: z.string().min(1).max(512),
+  revision_token: z.string().min(1).max(512),
+  content_sha256: z.string().regex(/^[a-f0-9]{64}$/)
+});
+export type NavigationCatalogManifestIdentity = z.infer<typeof navigationCatalogManifestIdentitySchema>;
+
 export const navigationReconcileSchema = z.strictObject({
   operation: z.literal("navigation.reconcile"),
   request_id: requestId,
@@ -27,9 +34,96 @@ export const navigationReconcileSchema = z.strictObject({
   expected_project_revision: z.number().int().nonnegative().safe(),
   expected_generation: z.number().int().nonnegative().safe(),
   expected_index: navigationIndexIdentitySchema.nullable(),
+  purpose: z.literal("compact_catalog_rebuild").optional(),
+  expected_source_generation: z.number().int().nonnegative().safe().optional(),
+  expected_catalog_manifest: navigationCatalogManifestIdentitySchema.optional(),
   created_at: z.string().min(1).max(128)
+}).superRefine((request, ctx) => {
+  const isRebuild = request.purpose === "compact_catalog_rebuild";
+  if (isRebuild !== (request.expected_catalog_manifest !== undefined) || isRebuild !== (request.expected_source_generation !== undefined)) {
+    ctx.addIssue({ code: "custom", path: ["purpose"], message: "compact catalog rebuild requires source generation and exact manifest identity" });
+  }
+  if (request.purpose === "compact_catalog_rebuild" && request.expected_index !== null) {
+    ctx.addIssue({ code: "custom", path: ["expected_index"], message: "compact catalog rebuild cannot target a zone index" });
+  }
 });
 export type NavigationReconcileRequest = z.infer<typeof navigationReconcileSchema>;
+export type NavigationCatalogRebuildRequest = NavigationReconcileRequest & {
+  purpose: "compact_catalog_rebuild";
+  expected_source_generation: number;
+  expected_catalog_manifest: NavigationCatalogManifestIdentity;
+};
+
+export const navigationCatalogChunkEvidenceSchema = z.strictObject({
+  shard: z.number().int().nonnegative().max(63),
+  object_id: objectId,
+  revision_token: revisionToken,
+  content_sha256: hash
+});
+
+export const navigationCatalogRebuildCertificateSchema = z.strictObject({
+  schema_version: z.literal("1.0"),
+  purpose: z.literal("compact_catalog_rebuild"),
+  project_id: projectId,
+  request_id: requestId,
+  request_hash: hash,
+  zone: navigationZoneSchema,
+  source_generation: z.number().int().nonnegative().safe(),
+  source_snapshot_id: z.string().regex(/^source:[0-9]+$/),
+  source_count: z.number().int().nonnegative().safe(),
+  shards: z.array(z.number().int().nonnegative().max(63)).max(64),
+  expected_manifest: navigationCatalogManifestIdentitySchema,
+  published_manifest: navigationCatalogManifestIdentitySchema,
+  chunk_evidence: z.array(navigationCatalogChunkEvidenceSchema).max(64),
+  coverage_gaps: z.array(z.never()).length(0)
+}).superRefine((certificate, ctx) => {
+  if (certificate.source_snapshot_id !== `source:${certificate.source_generation}`) ctx.addIssue({ code: "custom", path: ["source_snapshot_id"], message: "catalog rebuild certificate snapshot does not match its source generation" });
+  if (new Set(certificate.shards).size !== certificate.shards.length || certificate.shards.some((shard, index) => index > 0 && certificate.shards[index - 1] >= shard)) {
+    ctx.addIssue({ code: "custom", path: ["shards"], message: "catalog rebuild certificate shards must be unique and ordered" });
+  }
+  if (certificate.shards.join(",") !== certificate.chunk_evidence.map((item) => item.shard).join(",")) {
+    ctx.addIssue({ code: "custom", path: ["chunk_evidence"], message: "catalog rebuild certificate must contain physical evidence for every shard" });
+  }
+});
+export type NavigationCatalogRebuildCertificate = z.infer<typeof navigationCatalogRebuildCertificateSchema>;
+
+export const navigationCatalogRebuildProgressSchema = z.strictObject({
+  schema_version: z.literal("1.0"),
+  purpose: z.literal("compact_catalog_rebuild"),
+  project_id: projectId,
+  request_id: requestId,
+  request_hash: hash,
+  zone: navigationZoneSchema,
+  source_generation: z.number().int().nonnegative().safe(),
+  source_snapshot_id: z.string().regex(/^source:[0-9]+$/).nullable(),
+  cursor: z.string().nullable(),
+  page_count: z.number().int().nonnegative().safe(),
+  source_count: z.number().int().nonnegative().safe(),
+  source_ids: z.array(z.string().min(1).max(512)).max(4096).default([]),
+  shard_cursor: z.number().int().nonnegative().max(64),
+  shard_count: z.number().int().nonnegative().max(64),
+  publish_cursor: z.number().int().nonnegative().max(64).default(0),
+  verify_shard_cursor: z.number().int().nonnegative().max(64).default(0),
+  post_publish_verify_cursor: z.number().int().nonnegative().max(64).default(0),
+  post_publish_failure_count: z.number().int().nonnegative().max(6).default(0),
+  verify_page: z.number().int().nonnegative().safe().default(0),
+  verify_entry: z.number().int().nonnegative().safe().default(0),
+  verify_cursor: z.string().nullable().default(null),
+  stage_page: z.number().int().nonnegative().safe().default(0),
+  staging_entries: z.array(z.lazy(() => navigationInventoryEntrySchema)).max(256).default([]),
+  staged_shards: z.array(z.number().int().nonnegative().max(63)).max(64).default([]),
+  invalidated_manifest: navigationCatalogManifestIdentitySchema.nullable().default(null),
+  chunk_evidence: z.array(navigationCatalogChunkEvidenceSchema).max(64).default([]),
+  status: z.enum(["scanning", "verifying", "staging", "prepared", "publishing", "finalized", "conflict"]),
+  finalization_ref: z.string().min(1).nullable(),
+  coverage_gaps: z.array(z.strictObject({ resource_id: z.string().min(1).max(512), code: z.string().min(1).max(128) }))
+}).superRefine((progress, ctx) => {
+  if (progress.source_snapshot_id !== null && progress.source_snapshot_id !== `source:${progress.source_generation}`) ctx.addIssue({ code: "custom", path: ["source_snapshot_id"], message: "catalog rebuild progress snapshot does not match its source generation" });
+  if (progress.status === "finalized" && !progress.finalization_ref) ctx.addIssue({ code: "custom", path: ["finalization_ref"], message: "finalized catalog rebuild must reference its certificate" });
+  if (progress.status !== "finalized" && progress.finalization_ref !== null) ctx.addIssue({ code: "custom", path: ["finalization_ref"], message: "unfinished catalog rebuild cannot expose a certificate" });
+  if (progress.coverage_gaps.length > 0 && progress.status === "prepared") ctx.addIssue({ code: "custom", path: ["coverage_gaps"], message: "catalog rebuild with source gaps cannot be prepared" });
+});
+export type NavigationCatalogRebuildProgress = z.infer<typeof navigationCatalogRebuildProgressSchema>;
 
 export const navigationWorkRefSchema = z.strictObject({
   project_id: projectId,
@@ -88,6 +182,7 @@ export interface NavigationInventoryPort {
     zone: NavigationZone;
     cursor: string | null;
     limit: number;
+    mode?: "canonical_catalog_rebuild";
     budget: import("../convergence/contract").SliceBudget;
   }): Promise<{
     entries: NavigationInventoryEntry[];

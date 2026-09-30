@@ -64,6 +64,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     zone: NavigationZone;
     cursor: string | null;
     limit: number;
+    mode?: "canonical_catalog_rebuild";
     budget: SliceBudget;
   }): Promise<{ entries: NavigationInventoryEntry[]; verified_entries?: { resource_id: string; entry_hash: string; persisted: boolean }[]; gaps: NavigationCoverageGap[]; snapshot_id: string; next_cursor: string | null }> {
     const { project_id: projectId, zone, budget } = input;
@@ -74,19 +75,32 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     }
 
     const saved = input.cursor === null ? null : decodeCursor(input.cursor);
-    const phase: PagePhase = saved?.phase ?? (state.adopted ? "dirty" : "initial");
-    const providerCursor = saved?.cursor ?? null;
-    if (phase === "initial") return this.initialPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
-    if (phase === "packages") return this.packagePage(projectId, zone, providerCursor, snapshot_id, budget);
-    if (phase === "artifacts") return this.artifactPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
+    const rebuild = input.mode === "canonical_catalog_rebuild";
+    let phase: PagePhase = saved?.phase ?? (rebuild ? "initial" : state.adopted ? "dirty" : "initial");
+    let providerCursor = saved?.cursor ?? null;
+    if (!rebuild && state.adopted && saved && (saved.phase === "initial" || saved.phase === "packages" || saved.phase === "artifacts")) {
+      // Adoption can complete while an older full-scan cursor is in flight.
+      // Resume through dirty/compact state rather than returning a partial
+      // pre-adoption enumeration as if it were current.
+      phase = "dirty";
+      providerCursor = null;
+    }
+    if (phase === "initial") return this.initialPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget, !rebuild);
+    if (phase === "packages") return this.packagePage(projectId, zone, providerCursor, snapshot_id, budget, !rebuild);
+    if (phase === "artifacts") return this.artifactPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget, !rebuild);
     if (phase === "artifact-bindings") return this.artifactBindingsPage(projectId, zone, providerCursor, snapshot_id, budget);
-    if (phase === "artifact-finalize") return this.finalizeArtifactBindings(projectId, zone, providerCursor, snapshot_id, budget);
-    if (phase === "dirty") return this.dirtyAndCatalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
+    if (phase === "artifact-finalize") return this.finalizeArtifactBindings(projectId, zone, providerCursor, snapshot_id, budget, !rebuild);
+    if (phase === "dirty") return this.dirtyAndCatalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget, state.adopted);
     if (phase === "dirty-package") return this.dirtyPackagePage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
     if (phase === "dirty-artifacts") return this.dirtyArtifactPage(projectId, zone, providerCursor, snapshot_id, budget);
     if (phase === "dirty-finish") return this.dirtyFinishPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget);
-    if (phase === "catalog-compact") return this.compactCatalogPage(projectId, zone, providerCursor, snapshot_id, budget, false);
-    return this.catalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget, input.cursor === null);
+    if (phase === "catalog-compact") {
+      // A saved compact cursor is not proof that the canonical source was
+      // adopted. Restart from sidecars if adoption was revoked/reset.
+      if (state.adopted) return this.compactCatalogPage(projectId, zone, providerCursor, snapshot_id, budget, false);
+      return this.catalogPage(projectId, zone, null, input.limit, snapshot_id, budget, false, false);
+    }
+    return this.catalogPage(projectId, zone, providerCursor, input.limit, snapshot_id, budget, input.cursor === null, state.adopted);
   }
 
   async verifySnapshot(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: SliceBudget }): Promise<boolean> {
@@ -176,7 +190,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     cursor: string | null,
     _requestedLimit: number,
     snapshotId: string,
-    budget: SliceBudget
+    budget: SliceBudget,
+    persistCatalog = true
   ) {
     if (!this.runtime.pagedListing) return {
       entries: [], gaps: [{ resource_id: "heads", code: "paged_listing_unavailable" }, ...unresolvedSourceFamilyGaps()], snapshot_id: snapshotId, next_cursor: null
@@ -216,11 +231,13 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     let offset = 0;
     for (const item of listedEntries) {
       if (item.kind !== "file" || !item.path) {
+        if (!persistCatalog) gaps.push({ resource_id: item.name || "head-listing-entry", code: "head_listing_entry_invalid" });
         offset += 1;
         continue;
       }
       const match = /^(DOC-[A-F0-9]{24})\.json$/.exec(item.name);
       if (!match) {
+        if (!persistCatalog) gaps.push({ resource_id: item.name, code: "head_listing_entry_unrecognized" });
         offset += 1;
         continue;
       }
@@ -241,21 +258,23 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         const resolved = await this.resolveHead(projectId, zone, resourceId, budget, true);
         if (resolved.gap) gaps.push(resolved.gap);
         if (resolved.entry) {
-          await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+          if (persistCatalog) await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
           entries.push(resolved.entry);
         } else {
           // Clean inactive heads need no catalog tombstone unless a prior
           // partial adoption left an active row behind. Gaps are retained
           // independently below, and stale rows are still cleared exactly.
-          const prior = await this.sources.readCatalogEntry(projectId, zone, resourceId, budget);
-          if (prior) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+          if (persistCatalog) {
+            const prior = await this.sources.readCatalogEntry(projectId, zone, resourceId, budget);
+            if (prior) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+          }
         }
       } catch (error) {
         if (isBudgetError(error)) {
           if (offset === 0 && reusingSavedListing) throw error;
           break;
         }
-        await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        if (persistCatalog) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         gaps.push({ resource_id: resourceId, code: classifyGap(error) });
       }
       offset += 1;
@@ -275,7 +294,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     };
   }
 
-  private async packagePage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget) {
+  private async packagePage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget, persistCatalog = true) {
     // Guard/engine already spend calls on admission and source-state checks;
     // package proof is paged one member at a time and may start with 25 calls.
     requireBudget(budget, 17);
@@ -308,8 +327,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         entries: [], gaps, snapshot_id: snapshotId,
         next_cursor: encodeCursor("packages", JSON.stringify({ package_index: packageIndex, member_index: memberIndex + 1 }))
       };
-      if (resolved.entry) await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resolved.entry.resource_id, budget, generationFromSnapshot(snapshotId));
-      else await this.sources.writeCatalogEntry(null, projectId, zone, `package:${selected.ref.package_id}`, budget, generationFromSnapshot(snapshotId));
+      if (persistCatalog) {
+        if (resolved.entry) await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resolved.entry.resource_id, budget, generationFromSnapshot(snapshotId));
+        else await this.sources.writeCatalogEntry(null, projectId, zone, `package:${selected.ref.package_id}`, budget, generationFromSnapshot(snapshotId));
+      }
       return {
         entries: resolved.entry ? [resolved.entry] : [],
         ...(resolved.entry ? { verified_entries: [{ resource_id: resolved.entry.resource_id, entry_hash: await sha256Text(canonicalJson(resolved.entry)), persisted: false }] } : {}),
@@ -323,7 +344,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     }
   }
 
-  private async artifactPage(projectId: string, zone: NavigationZone, cursor: string | null, _requestedLimit: number, snapshotId: string, budget: SliceBudget) {
+  private async artifactPage(projectId: string, zone: NavigationZone, cursor: string | null, _requestedLimit: number, snapshotId: string, budget: SliceBudget, persistCatalog = true) {
     if (!this.runtime.pagedListing) return { entries: [], gaps: [{ resource_id: "artifacts", code: "paged_listing_unavailable" }], snapshot_id: snapshotId, next_cursor: null };
     const root = `${machineMutationGateRoot(projectId)}/intents/artifacts`;
     let providerCursor = cursor;
@@ -451,7 +472,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifact-finalize", JSON.stringify(state)) };
   }
 
-  private async finalizeArtifactBindings(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget) {
+  private async finalizeArtifactBindings(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget, persistCatalog = true) {
     let state: ArtifactBindingCursor;
     try {
       state = JSON.parse(cursor ?? "") as ArtifactBindingCursor;
@@ -461,7 +482,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const resourceId = `artifact:${await sha256Text(state.destination_path)}`;
     const distinct = [...new Set(state.eligible_request_ids)];
     if (distinct.length > 1) {
-      await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+      if (persistCatalog) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
       state.gaps.push({ resource_id: resourceId, code: "artifact_destination_ambiguous" });
       return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.dirty ? null : state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
     }
@@ -475,7 +496,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       const entry = status?.verification_state === "canonical_verified" && status.receipt_status === "committed" && status.operation !== "REVIEW_CANDIDATE"
         ? await resolveArtifactEntry(this.runtime, projectId, zone, intent, target.logical_path, budget) : null;
       if (entry) {
-        await this.sources.writeCatalogEntry(entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        if (persistCatalog) await this.sources.writeCatalogEntry(entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
         if (state.dirty) {
           return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: resourceId, dirty_cursor: state.dirty.dirty_cursor, entry })) };
         }
@@ -484,7 +505,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       }
     }
     if (state.dirty && state.gaps.length === 0) {
-      await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+      if (persistCatalog) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
       return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: resourceId, dirty_cursor: state.dirty.dirty_cursor, entry: null })) };
     }
     return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
@@ -496,13 +517,14 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     cursor: string | null,
     requestedLimit: number,
     snapshotId: string,
-    budget: SliceBudget
+    budget: SliceBudget,
+    adopted: boolean
   ) {
     requireBudget(budget, 15);
     const dirtyPage = await this.sources.listDirtyPage(projectId, zone, cursor, 1, budget);
     const gaps: NavigationCoverageGap[] = [];
     const resourceId = dirtyPage.resource_ids[0];
-    if (!resourceId) return await this.catalogPage(projectId, zone, null, requestedLimit, snapshotId, budget, true);
+    if (!resourceId) return await this.catalogPage(projectId, zone, null, requestedLimit, snapshotId, budget, true, adopted);
     const afterCurrentDirtyResource = dirtyPage.next_cursor === null
       ? encodeCursor("catalog", "")
       : encodeCursor("dirty", dirtyPage.next_cursor);
@@ -615,10 +637,11 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     _requestedLimit: number,
     snapshotId: string,
     budget: SliceBudget,
-    includeFamilyGaps: boolean
+    includeFamilyGaps: boolean,
+    adopted: boolean
   ) {
-    const compactManifest = await this.sources.compactCatalogManifest(projectId, zone, budget);
-    if (compactManifest?.ready_generation === generationFromSnapshot(snapshotId)) {
+    const compactManifest = adopted ? await this.sources.compactCatalogManifest(projectId, zone, budget) : null;
+    if (adopted && compactManifest?.ready_generation === generationFromSnapshot(snapshotId)) {
       return this.compactCatalogPage(projectId, zone, cursor, snapshotId, budget, includeFamilyGaps);
     }
     if (!this.runtime.pagedListing) return {

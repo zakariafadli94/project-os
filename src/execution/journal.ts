@@ -6,7 +6,7 @@ import { machineConvergenceRoot, machineDocumentRoot } from "../persistence/layo
 import { z } from "zod";
 import { approvalRecordSchema } from "../domain/approval";
 import { assertEffectBindings, parseExecutionPlan } from "./effects";
-import { zoneNavigationHeadSchema, zoneNavigationReceiptSchema } from "../domain/zone-navigation";
+import { navigationCatalogRebuildCertificateSchema, navigationCatalogRebuildProgressSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema } from "../domain/zone-navigation";
 
 const nonempty = z.string().min(1);
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -398,6 +398,62 @@ export class ExecutionJournal {
       request_hash: progress.request_hash, receipt_ref: input.receipt_ref, navigation_head_ref: exactHeadPath,
       navigation_finalization_ref: receipt.finalization_ref, generation: receipt.generation,
       index: receipt.index, source_snapshot_id: receipt.source_snapshot_id
+    };
+    const finalizationRef = `${await this.root()}/finalizations/${await executionHash(record)}.json`;
+    await this.immutable(finalizationRef, record);
+    progress.status = "finalized";
+    progress.terminal = true;
+    progress.code = null;
+    progress.finalization_ref = finalizationRef;
+    progress.next_attempt_at = null;
+    progress.lease = null;
+    progress.sequence++;
+    await this.save(progress, saved.token);
+    return progress;
+  }
+
+  /** A catalog rebuild repairs only the source inventory. Its physical proof
+   * is separate from a navigation index/head receipt, so it cannot certify a
+   * new current index or hide an uncovered source. */
+  async finalizeVerifiedCatalogRebuild(input: { receipt_ref: string; certificate_ref: string }): Promise<ExecutionProgress> {
+    const admitted = await this.readAdmission();
+    const saved = await this.load();
+    if (!admitted || admitted.plan !== null || admitted.admission.kind !== "document"
+      || admitted.admission.operation !== "navigation.reconcile" || !saved) throw new Error("execution_catalog_rebuild_finalization_invalid");
+    const progress = saved.progress;
+    if (progress.terminal) return progress;
+    if (progress.status !== "finalizing" || progress.receipt_ref !== input.receipt_ref
+      || progress.request_hash !== admitted.admission.request_hash
+      || input.receipt_ref !== `${machineDocumentRoot(this.projectId)}/requests/${this.requestId}/receipt.json`
+      || input.certificate_ref !== `${await this.root()}/navigation/catalog-rebuild/finalizations/${progress.request_hash}.json`) {
+      throw new Error("execution_catalog_rebuild_finalization_invalid");
+    }
+    this.assertSpecializedPostchecksUnavailable(admitted.admission);
+    const certificateRaw = await this.runtime.objects.readText(input.certificate_ref);
+    if (certificateRaw === null) throw new Error("execution_catalog_rebuild_certificate_unavailable");
+    const certificate = navigationCatalogRebuildCertificateSchema.parse(JSON.parse(certificateRaw));
+    const resource = admitted.admission.resources.find((candidate) => candidate.resource_id === `navigation:${certificate.zone}`);
+    if (certificate.project_id !== this.projectId || certificate.request_id !== this.requestId
+      || certificate.request_hash !== progress.request_hash || resource?.resource_type !== "navigation"
+      || resource.zone !== certificate.zone || canonicalJson(certificate) !== certificateRaw) {
+      throw new Error("execution_catalog_rebuild_certificate_invalid");
+    }
+    const engineProgressRaw = await this.runtime.objects.readText(`${await this.root()}/navigation-catalog-rebuild-progress.json`);
+    if (engineProgressRaw === null) throw new Error("execution_catalog_rebuild_progress_unavailable");
+    const engineProgress = navigationCatalogRebuildProgressSchema.parse(JSON.parse(engineProgressRaw));
+    if (engineProgress.project_id !== this.projectId || engineProgress.request_id !== this.requestId
+      || engineProgress.request_hash !== progress.request_hash || engineProgress.zone !== certificate.zone
+      || engineProgress.status !== "finalized" || engineProgress.finalization_ref !== input.certificate_ref
+      || engineProgress.source_generation !== certificate.source_generation
+      || engineProgress.source_snapshot_id !== certificate.source_snapshot_id
+      || engineProgress.source_count !== certificate.source_count || engineProgress.coverage_gaps.length !== 0
+      || canonicalJson(engineProgress) !== engineProgressRaw) throw new Error("execution_catalog_rebuild_progress_invalid");
+    const record = {
+      schema_version: "1.0", project_id: this.projectId, kind: this.kind, request_id: this.requestId,
+      request_hash: progress.request_hash, receipt_ref: input.receipt_ref,
+      catalog_rebuild_certificate_ref: input.certificate_ref, zone: certificate.zone,
+      source_snapshot_id: certificate.source_snapshot_id, source_count: certificate.source_count,
+      published_manifest: certificate.published_manifest
     };
     const finalizationRef = `${await this.root()}/finalizations/${await executionHash(record)}.json`;
     await this.immutable(finalizationRef, record);

@@ -7,6 +7,12 @@ import {
   navigationIndexIdentitySchema,
   navigationInventoryEntrySchema,
   navigationReconcileSchema,
+  navigationCatalogRebuildProgressSchema,
+  navigationCatalogRebuildCertificateSchema,
+  navigationCatalogManifestIdentitySchema,
+  type NavigationCatalogRebuildCertificate,
+  type NavigationCatalogRebuildProgress,
+  type NavigationCatalogRebuildRequest,
   zoneNavigationHeadSchema,
   zoneNavigationReceiptSchema,
   type NavigationIndexIdentity,
@@ -27,6 +33,7 @@ import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabi
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../persistence/provider/errors";
 import type { RuleVersion } from "../domain/rule-governance";
+import { ZoneNavigationSources, zoneNavigationCatalogShardForResource, type CompactCatalogManifestIdentity } from "./zone-navigation-sources";
 
 const PAGE_LIMIT = 8;
 const navigationProgressSchema = z.strictObject({
@@ -91,6 +98,341 @@ export class ZoneNavigationEngine {
     private readonly postcheckRules: readonly RuleVersion[] = []
   ) {}
 
+  async prepareCompactCatalogRebuild(
+    rawRequest: NavigationCatalogRebuildRequest,
+    state: ProjectState,
+    admission: ExecutionAdmission,
+    budget: SliceBudget
+  ): Promise<{ status: "pending"; cursor: string | null } | { status: "prepared"; source_snapshot_id: string; source_count: number; shard_count: number } | { status: "conflict"; code: string }> {
+    let request: NavigationCatalogRebuildRequest;
+    try { request = navigationReconcileSchema.parse(rawRequest) as NavigationCatalogRebuildRequest; }
+    catch { return { status: "conflict", code: "navigation_catalog_rebuild_request_invalid" }; }
+    if (request.purpose !== "compact_catalog_rebuild" || request.expected_index !== null || !request.expected_catalog_manifest) return { status: "conflict", code: "navigation_catalog_rebuild_request_invalid" };
+    const sourceGeneration = request.expected_source_generation;
+    const requestHash = await executionHash(request);
+    const journal = new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id);
+    const root = await journal.root();
+    const progressPath = `${root}/navigation-catalog-rebuild-progress.json`;
+    const pagesRoot = `${root}/navigation/catalog-rebuild/snapshot`;
+    const sources = new ZoneNavigationSources(this.runtime);
+    try {
+      this.assertCatalogRebuildAdmission(request, state, admission, requestHash);
+      let progress = navigationCatalogRebuildProgressSchema.safeParse(await this.readJson(progressPath, budget));
+      let current = progress.success ? progress.data : null;
+      if (current && (current.request_hash !== requestHash || current.project_id !== request.project_id || current.request_id !== request.request_id || current.zone !== request.zone || current.source_generation !== sourceGeneration)) {
+        return { status: "conflict", code: "navigation_catalog_rebuild_request_conflict" };
+      }
+      if (!current) {
+        const snapshot = await sources.beginCompactCatalogRebuild({
+          project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+          expected_generation: sourceGeneration, expected_manifest: request.expected_catalog_manifest
+        }, budget);
+        current = navigationCatalogRebuildProgressSchema.parse({
+          schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: request.project_id, request_id: request.request_id,
+          request_hash: requestHash, zone: request.zone, source_generation: sourceGeneration,
+          source_snapshot_id: snapshot.snapshot_id, cursor: null, page_count: 0, source_count: 0,
+          shard_cursor: 0, shard_count: 0, verify_page: 0, verify_entry: 0, verify_cursor: null,
+          stage_page: 0, staging_entries: [], staged_shards: [], invalidated_manifest: null, chunk_evidence: [],
+          status: "scanning", finalization_ref: null, coverage_gaps: []
+        });
+        await this.saveCatalogRebuildProgress(progressPath, current, null, budget);
+      }
+      if (current.status === "prepared" || current.status === "publishing" || current.status === "finalized") {
+        return { status: "prepared", source_snapshot_id: current.source_snapshot_id!, source_count: current.source_count, shard_count: current.shard_count };
+      }
+      if (current.status === "conflict") return { status: "conflict", code: current.coverage_gaps[0]?.code ?? "navigation_catalog_rebuild_conflict" };
+
+      while (current.status === "scanning") {
+        if (!budget.canStartEffect(5)) return { status: "pending", cursor: current.cursor };
+        const page = await this.inventory.listPage({ project_id: request.project_id, zone: request.zone, cursor: current.cursor, limit: PAGE_LIMIT, mode: "canonical_catalog_rebuild", budget });
+        if (page.snapshot_id !== current.source_snapshot_id) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_changed", budget);
+        const entries = page.entries.map((entry) => navigationInventoryEntrySchema.parse(entry));
+        const gaps = page.gaps.map((gap) => navigationCoverageGapSchema.parse(gap));
+        if (gaps.length) {
+          current.coverage_gaps.push(...gaps);
+          current.status = "conflict";
+          await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+          return { status: "conflict", code: gaps[0].code };
+        }
+        for (const entry of entries) this.assertEntry(entry, state, request.zone);
+        const seen = new Set(current.source_ids ?? []);
+        if (entries.some((entry) => seen.has(entry.resource_id)) || new Set(entries.map((entry) => entry.resource_id)).size !== entries.length) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_duplicate_source", budget);
+        const pageRecord: SnapshotPage = { schema_version: "1.0", page: current.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, verified_entries: page.verified_entries, gaps: [] };
+        await this.immutableSnapshotPage(`${pagesRoot}/${current.page_count.toString().padStart(8, "0")}.json`, pageRecord, budget);
+        current.cursor = page.next_cursor;
+        current.page_count += 1;
+        current.source_count += entries.length;
+        current.source_ids = [...(current.source_ids ?? []), ...entries.map((entry) => entry.resource_id)];
+        if (page.next_cursor === null) current.status = "verifying";
+        current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+      }
+
+      while (current.status === "verifying" && current.verify_page < current.page_count) {
+        const pagePath = `${pagesRoot}/${current.verify_page.toString().padStart(8, "0")}.json`;
+        const page = await this.readJson(pagePath, budget) as SnapshotPage | null;
+        if (!page || page.snapshot_id !== current.source_snapshot_id) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_page_invalid", budget);
+        while (current.verify_entry < page.entries.length) {
+          if (!budget.canStartEffect(12)) return { status: "pending", cursor: `verify:${current.verify_page}:${current.verify_entry}` };
+          const entry = page.entries[current.verify_entry];
+          const verification = this.inventory.verifyEntryPage
+            ? await this.inventory.verifyEntryPage(entry, current.verify_cursor, budget)
+            : (await this.inventory.verifyEntry(entry, budget) ? { status: "verified" as const } : { status: "conflict" as const });
+          if (verification.status === "conflict") return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_physical_source_unverified", budget);
+          if (verification.status === "pending") {
+            current.verify_cursor = verification.cursor;
+            current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+            return { status: "pending", cursor: `verify:${current.verify_page}:${current.verify_entry}` };
+          }
+          current.verify_cursor = null;
+          const evidence = { schema_version: "1.0", project_id: request.project_id, request_id: request.request_id, snapshot_id: current.source_snapshot_id, entry };
+          await this.immutable(`${root}/navigation/catalog-rebuild/verified/${current.verify_page.toString().padStart(8, "0")}-${current.verify_entry.toString().padStart(8, "0")}.json`, evidence, budget);
+          current.verify_entry += 1;
+          current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+        }
+        current.verify_page += 1;
+        current.verify_entry = 0;
+        current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+      }
+      if (current.status === "verifying") {
+        if (!await this.inventory.verifySnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: current.source_snapshot_id!, budget })) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_changed", budget);
+        current.status = "staging";
+        current.stage_page = 0;
+        current.staging_entries = [];
+        current.shard_cursor = 0;
+        current.staged_shards = [];
+        current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+      }
+
+      const shards = [...new Set((current.source_ids ?? []).map(zoneNavigationCatalogShardForResource))].sort((left, right) => left - right);
+      current.shard_count = shards.length;
+      while (current.status === "staging" && current.shard_cursor < shards.length) {
+        const shard = shards[current.shard_cursor];
+        while (current.stage_page < current.page_count) {
+          if (!budget.canStartEffect(3)) return { status: "pending", cursor: `stage:${current.shard_cursor}:${current.stage_page}` };
+          const page = await this.readJson(`${pagesRoot}/${current.stage_page.toString().padStart(8, "0")}.json`, budget) as SnapshotPage | null;
+          if (!page || page.snapshot_id !== current.source_snapshot_id) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_page_invalid", budget);
+          current.staging_entries.push(...page.entries.filter((entry) => zoneNavigationCatalogShardForResource(entry.resource_id) === shard));
+          if (current.staging_entries.length > 256) return await this.catalogRebuildConflict(progressPath, current, "navigation_compact_catalog_chunk_full", budget);
+          current.stage_page += 1;
+          current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+        }
+        if (current.staging_entries.length) await sources.stageCompactCatalogRebuildShard({ project_id: request.project_id, zone: request.zone, request_id: request.request_id, snapshot_id: current.source_snapshot_id!, shard, entries: current.staging_entries }, budget);
+        current.staged_shards.push(shard);
+        current.shard_cursor += 1;
+        current.stage_page = 0;
+        current.staging_entries = [];
+        current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+      }
+      if (current.status === "staging") {
+        if (!await this.inventory.verifySnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: current.source_snapshot_id!, budget })) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_changed", budget);
+        const manifest = await sources.compactCatalogManifestIdentity(request.project_id, request.zone, budget);
+        if (!manifest || canonicalJson(manifest) !== canonicalJson(request.expected_catalog_manifest)) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_manifest_conflict", budget);
+        current.status = "prepared";
+        current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+      }
+      return current.status === "prepared"
+        ? { status: "prepared", source_snapshot_id: current.source_snapshot_id!, source_count: current.source_count, shard_count: current.shard_count }
+        : { status: "pending", cursor: current.cursor };
+    } catch (error) {
+      if (isBudgetExhausted(error)) return { status: "pending", cursor: null };
+      if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
+      if (error instanceof ProviderConflictError || error instanceof ProviderPreconditionFailedError) return { status: "conflict", code: "navigation_catalog_rebuild_provider_conflict" };
+      throw error;
+    }
+  }
+
+  async publishPreparedCompactCatalogRebuild(
+    rawRequest: NavigationCatalogRebuildRequest,
+    state: ProjectState,
+    admission: ExecutionAdmission,
+    snapshotId: string,
+    budget: SliceBudget
+  ): Promise<{ status: "pending"; cursor: string | null } | { status: "conflict"; code: string } | { status: "finalized"; certificate: NavigationCatalogRebuildCertificate }> {
+    let request: NavigationCatalogRebuildRequest;
+    try { request = navigationReconcileSchema.parse(rawRequest) as NavigationCatalogRebuildRequest; }
+    catch { return { status: "conflict", code: "navigation_catalog_rebuild_request_invalid" }; }
+    const requestHash = await executionHash(request);
+    const journal = new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id);
+    const root = await journal.root();
+    const progressPath = `${root}/navigation-catalog-rebuild-progress.json`;
+    const certificatePath = `${root}/navigation/catalog-rebuild/finalizations/${requestHash}.json`;
+    const sources = new ZoneNavigationSources(this.runtime);
+    try {
+      this.assertCatalogRebuildAdmission(request, state, admission, requestHash);
+      const parsed = navigationCatalogRebuildProgressSchema.safeParse(await this.readJson(progressPath, budget));
+      if (!parsed.success) {
+        const held = await this.abandonOrHoldUnboundCatalogRebuild(sources, request, budget);
+        if (held) return held;
+        const release = await this.releaseCatalogRebuildFenceBeforeConflict(sources, request, budget);
+        return release ?? { status: "conflict", code: "navigation_catalog_rebuild_progress_missing" };
+      }
+      let progress = parsed.data;
+      if (progress.request_hash !== requestHash || progress.source_generation !== request.expected_source_generation
+        || progress.source_snapshot_id !== snapshotId || progress.status === "scanning" || progress.status === "verifying" || progress.status === "staging") {
+        const held = await this.abandonOrHoldUnboundCatalogRebuild(sources, request, budget);
+        if (held) return held;
+        return { status: "conflict", code: "navigation_catalog_rebuild_not_prepared" };
+      }
+      if (progress.coverage_gaps.length) {
+        const release = await this.releaseCatalogRebuildFenceBeforeConflict(sources, request, budget);
+        return release ?? { status: "conflict", code: progress.coverage_gaps[0].code };
+      }
+      if (progress.status === "conflict") {
+        if (progress.invalidated_manifest) {
+          const abandoned = await sources.abandonFailedCompactCatalogRebuild({
+            project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+            expected_unready_manifest: progress.invalidated_manifest
+          }, budget);
+          if (abandoned.status === "pending") return { status: "pending", cursor: "abandon-rebuild" };
+        }
+        return { status: "conflict", code: "navigation_catalog_rebuild_conflict" };
+      }
+      if (progress.status === "finalized") {
+        const cert = navigationCatalogRebuildCertificateSchema.safeParse(await this.readJson(certificatePath, budget));
+        if (cert.success && progress.finalization_ref === certificatePath) {
+          if (!await sources.releaseCompactCatalogRebuildFence(request.project_id, request.zone, request.request_id, budget)) {
+            return { status: "pending", cursor: "release-fence" };
+          }
+          return { status: "finalized", certificate: cert.data };
+        }
+        return { status: "pending", cursor: "certificate-recovery" };
+      }
+      const shards = progress.staged_shards;
+      if (shards.length !== progress.shard_count || shards.some((shard, i) => i > 0 && shards[i - 1] >= shard)) {
+        return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_staging_incomplete", budget);
+      }
+      const publication = {
+        project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+        expected_generation: request.expected_source_generation, expected_manifest: request.expected_catalog_manifest,
+        snapshot_id: snapshotId, shards
+      };
+      if (progress.status === "prepared") {
+        const invalidated = await sources.invalidateCompactCatalogRebuild(publication, budget);
+        progress.invalidated_manifest = invalidated;
+        progress.status = "publishing";
+        progress.publish_cursor = 0;
+        progress.verify_shard_cursor = 0;
+        progress.post_publish_verify_cursor = 0;
+        progress.chunk_evidence = [];
+        progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        return { status: "pending", cursor: "publish:0" };
+      }
+      if (!progress.invalidated_manifest) return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_manifest_invalidation_missing", budget);
+      if (progress.post_publish_failure_count >= 6) {
+        const abandoned = await sources.abandonFailedCompactCatalogRebuild({
+          project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+          expected_unready_manifest: progress.invalidated_manifest
+        }, budget);
+        return abandoned.status === "pending"
+          ? { status: "pending", cursor: "abandon-rebuild" }
+          : { status: "conflict", code: "navigation_catalog_rebuild_integrity_failure_limit" };
+      }
+      // Recover an interruption after withdrawing a failed published manifest
+      // but before the reset cursor was durably recorded.
+      if (progress.publish_cursor >= shards.length) {
+        const manifest = await sources.compactCatalogManifest(request.project_id, request.zone, budget);
+        const identity = await sources.compactCatalogManifestIdentity(request.project_id, request.zone, budget);
+        if (manifest?.ready_generation === null && manifest.rebuilding_request_id === request.request_id
+          && identity && canonicalJson(identity) !== canonicalJson(progress.invalidated_manifest)) {
+          progress.invalidated_manifest = identity;
+          progress.publish_cursor = 0;
+          progress.verify_shard_cursor = 0;
+          progress.post_publish_verify_cursor = 0;
+          progress.chunk_evidence = [];
+          progress.post_publish_failure_count += 1;
+          progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+          return { status: "pending", cursor: "republish:0" };
+        }
+      }
+      if (progress.publish_cursor < shards.length) {
+        if (!budget.canStartEffect(14)) return { status: "pending", cursor: `publish:${progress.publish_cursor}` };
+        const shard = shards[progress.publish_cursor];
+        const evidence = await sources.publishCompactCatalogRebuildShard({ ...publication, invalidated_manifest: progress.invalidated_manifest, shard }, budget);
+        progress.chunk_evidence = [...progress.chunk_evidence.filter((item) => item.shard !== shard), evidence].sort((a, b) => a.shard - b.shard);
+        progress.publish_cursor += 1;
+        progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        return { status: "pending", cursor: `publish:${progress.publish_cursor}` };
+      }
+      if (progress.verify_shard_cursor < shards.length) {
+        if (!budget.canStartEffect(12)) return { status: "pending", cursor: `verify-shard:${progress.verify_shard_cursor}` };
+        const shard = shards[progress.verify_shard_cursor];
+        const evidence = progress.chunk_evidence.find((item) => item.shard === shard);
+        if (!evidence) return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_chunk_evidence_missing", budget);
+        await sources.verifyCompactCatalogRebuildShard({ ...publication, invalidated_manifest: progress.invalidated_manifest, shard, evidence }, budget);
+        progress.verify_shard_cursor += 1;
+        progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        return { status: "pending", cursor: `verify-shard:${progress.verify_shard_cursor}` };
+      }
+      if (progress.chunk_evidence.length !== shards.length || progress.coverage_gaps.length) {
+        return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_chunk_evidence_incomplete", budget);
+      }
+      const published = await sources.publishCompactCatalogRebuildManifest({ ...publication, invalidated_manifest: progress.invalidated_manifest, chunk_evidence: progress.chunk_evidence }, budget);
+      if (progress.post_publish_verify_cursor < shards.length) {
+        if (!budget.canStartEffect(14)) return { status: "pending", cursor: `post-publish-verify:${progress.post_publish_verify_cursor}` };
+        const shard = shards[progress.post_publish_verify_cursor];
+        const evidence = progress.chunk_evidence.find((item) => item.shard === shard);
+        if (!evidence) return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_chunk_evidence_missing", budget);
+        try {
+          await sources.verifyPublishedCompactCatalogRebuildShard({ ...publication, invalidated_manifest: progress.invalidated_manifest, shard, evidence }, budget);
+        } catch (error) {
+          if (isBudgetExhausted(error)) throw error;
+          const withdrawn = await sources.invalidateFailedPublishedCompactCatalogRebuild({
+            project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+            expected_final_manifest: published.identity
+          }, budget);
+          if (withdrawn.status === "pending") return { status: "pending", cursor: "withdraw-published-manifest" };
+          progress.invalidated_manifest = withdrawn.identity;
+          progress.publish_cursor = 0;
+          progress.verify_shard_cursor = 0;
+          progress.post_publish_verify_cursor = 0;
+          progress.chunk_evidence = [];
+          progress.post_publish_failure_count += 1;
+          progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+          if (progress.post_publish_failure_count >= 6) {
+            const abandoned = await sources.abandonFailedCompactCatalogRebuild({
+              project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+              expected_unready_manifest: withdrawn.identity
+            }, budget);
+            return abandoned.status === "pending"
+              ? { status: "pending", cursor: "abandon-rebuild" }
+              : { status: "conflict", code: "navigation_catalog_rebuild_integrity_failure_limit" };
+          }
+          return { status: "pending", cursor: "republish:0" };
+        }
+        progress.post_publish_verify_cursor += 1;
+        progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        return { status: "pending", cursor: `post-publish-verify:${progress.post_publish_verify_cursor}` };
+      }
+      const certificate = navigationCatalogRebuildCertificateSchema.parse({
+        schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: request.project_id,
+        request_id: request.request_id, request_hash: requestHash, zone: request.zone,
+        source_generation: request.expected_source_generation, source_snapshot_id: snapshotId,
+        source_count: progress.source_count, shards, expected_manifest: request.expected_catalog_manifest,
+        published_manifest: published.identity, chunk_evidence: published.chunk_evidence, coverage_gaps: []
+      });
+      await this.immutable(certificatePath, certificate, budget);
+      progress.status = "finalized";
+      progress.finalization_ref = certificatePath;
+      progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+      if (!await sources.releaseCompactCatalogRebuildFence(request.project_id, request.zone, request.request_id, budget)) {
+        return { status: "pending", cursor: "release-fence" };
+      }
+      return { status: "finalized", certificate };
+    } catch (error) {
+      if (isBudgetExhausted(error)) return { status: "pending", cursor: null };
+      const message = error instanceof Error ? error.message : "navigation_catalog_rebuild_failed";
+      if (message === "navigation_catalog_rebuild_writer_fence_conflict") return { status: "pending", cursor: "writer-fence" };
+      const held = await this.abandonOrHoldUnboundCatalogRebuild(sources, request, budget);
+      if (held) return held;
+      const release = await this.releaseCatalogRebuildFenceBeforeConflict(sources, request, budget);
+      if (release) return release;
+      if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
+      if (error instanceof ProviderConflictError || error instanceof ProviderPreconditionFailedError) return { status: "conflict", code: "navigation_catalog_rebuild_provider_conflict" };
+      if (message.startsWith("navigation_catalog_rebuild_")) return { status: "conflict", code: message };
+      throw error;
+    }
+  }
+
   async reconcile(
     rawRequest: NavigationReconcileRequest,
     state: ProjectState,
@@ -115,6 +457,9 @@ export class ZoneNavigationEngine {
       const intent = await this.prepare(request, state, requestHash, indexPath, headPath, intentPath, progressPath, budget);
       if (intent.status === "conflict") return intent;
       let progress = intent.progress;
+      if (progress.status === "publishing" && !options.deferPublication && progress.snapshot_id) {
+        return this.publishPrepared(request, state, admission, budget, progress.snapshot_id);
+      }
       if (progress.status === "adopting" && !progress.inventory_complete
         && progress.source_count === 0 && progress.source_ids.length === 0
         && progress.rendered_links.length === 0 && progress.verify_entry === 0
@@ -763,6 +1108,103 @@ export class ZoneNavigationEngine {
       const checkId = `rule:${canonicalJson(reference)}`;
       return !this.validLinksRule(admission, checkId);
     })) throw new NavigationConflict("navigation_postchecks_unavailable");
+  }
+
+  private assertCatalogRebuildAdmission(request: NavigationCatalogRebuildRequest, state: ProjectState, admission: ExecutionAdmission, requestHash: string): void {
+    const resourceId = `navigation:${request.zone}`;
+    const manifestPath = `${machineDocumentRoot(request.project_id)}/navigation-sources/${request.zone}/catalog/compact/ready.json`;
+    const resources = admission.resources?.filter((resource) => resource.resource_id === resourceId && resource.resource_type === "navigation"
+      && resource.zone === request.zone && resource.version === String(request.expected_generation));
+    const scopes = admission.resource_effect_scopes?.filter((scope) => scope.resource_id === resourceId
+      && scope.resource_version === String(request.expected_generation) && scope.provider_id === this.runtime.providerId);
+    const scope = scopes?.[0];
+    if (state.project_id !== request.project_id || state.revision !== request.expected_project_revision
+      || admission.project_id !== request.project_id || admission.request_id !== request.request_id
+      || admission.kind !== "document" || admission.operation !== "navigation.reconcile" || admission.request_hash !== requestHash
+      || admission.verdict !== "allow" || admission.project_revision !== request.expected_project_revision
+      || resources?.length !== 1 || scopes?.length !== 1 || !scope
+      || !scope.sources.some((source) => source.path === manifestPath)
+      || !scope.destinations.some((destination) => destination.path === manifestPath)) {
+      throw new NavigationConflict("navigation_catalog_rebuild_admission_binding_mismatch");
+    }
+  }
+
+  private async saveCatalogRebuildProgress(path: string, progress: NavigationCatalogRebuildProgress, token: string | null, budget: SliceBudget): Promise<NavigationCatalogRebuildProgress> {
+    const parsed = navigationCatalogRebuildProgressSchema.parse(progress);
+    const content = canonicalJson(parsed);
+    if (token === null) {
+      await this.immutable(path, parsed, budget);
+      return parsed;
+    }
+    budget.beforeHttp();
+    await this.runtime.conditionalWrite.writeTextConditional(path, content, token);
+    return parsed;
+  }
+
+  private async catalogRebuildConflict(path: string, progress: NavigationCatalogRebuildProgress, code: string, budget: SliceBudget): Promise<{ status: "pending"; cursor: string | null } | { status: "conflict"; code: string }> {
+    if (progress.invalidated_manifest) {
+      const abandoned = await new ZoneNavigationSources(this.runtime).abandonFailedCompactCatalogRebuild({
+        project_id: progress.project_id, zone: progress.zone, request_id: progress.request_id,
+        expected_unready_manifest: progress.invalidated_manifest
+      }, budget);
+      if (abandoned.status === "pending") return { status: "pending", cursor: "abandon-rebuild" };
+    }
+    progress.status = "conflict";
+    progress.coverage_gaps.push({ resource_id: "catalog-rebuild", code });
+    await this.saveCatalogRebuildProgress(path, progress, await this.token(path, budget), budget);
+    return { status: "conflict", code };
+  }
+
+  private async abandonOrHoldUnboundCatalogRebuild(
+    sources: ZoneNavigationSources,
+    request: NavigationCatalogRebuildRequest,
+    budget: SliceBudget
+  ): Promise<{ status: "pending"; cursor: string | null } | null> {
+    try {
+      const manifest = await sources.compactCatalogManifest(request.project_id, request.zone, budget);
+      if (manifest?.ready_generation === request.expected_source_generation) {
+        const identity = await sources.compactCatalogManifestIdentity(request.project_id, request.zone, budget);
+        if (!identity || canonicalJson(identity) !== canonicalJson(request.expected_catalog_manifest)) {
+          if (!identity) return { status: "pending", cursor: "withdraw-published-manifest" };
+          const withdrawn = await sources.invalidateFailedPublishedCompactCatalogRebuild({
+            project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+            expected_final_manifest: identity
+          }, budget);
+          if (withdrawn.status === "pending") return { status: "pending", cursor: "withdraw-published-manifest" };
+          const abandoned = await sources.abandonFailedCompactCatalogRebuild({
+            project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+            expected_unready_manifest: withdrawn.identity
+          }, budget);
+          return abandoned.status === "pending" ? { status: "pending", cursor: "abandon-rebuild" } : null;
+        }
+        return null;
+      }
+      if (manifest?.ready_generation === null && manifest.rebuilding_request_id === request.request_id) {
+        const identity = await sources.compactCatalogManifestIdentity(request.project_id, request.zone, budget);
+        if (!identity) return { status: "pending", cursor: "abandon-rebuild" };
+        const abandoned = await sources.abandonFailedCompactCatalogRebuild({
+          project_id: request.project_id, zone: request.zone, request_id: request.request_id,
+          expected_unready_manifest: identity
+        }, budget);
+        if (abandoned.status === "pending") return { status: "pending", cursor: "abandon-rebuild" };
+      }
+      return null;
+    } catch {
+      return { status: "pending", cursor: "abandon-rebuild" };
+    }
+  }
+
+  private async releaseCatalogRebuildFenceBeforeConflict(
+    sources: ZoneNavigationSources,
+    binding: { project_id: string; zone: NavigationZone; request_id: string },
+    budget: SliceBudget
+  ): Promise<{ status: "pending"; cursor: string | null } | { status: "conflict"; code: string } | null> {
+    try {
+      const released = await sources.releaseCompactCatalogRebuildFence(binding.project_id, binding.zone, binding.request_id, budget);
+      return released ? null : { status: "conflict", code: "navigation_catalog_rebuild_fence_owned_by_other_request" };
+    } catch {
+      return { status: "pending", cursor: "release-fence" };
+    }
   }
 
   private async runPostchecks(

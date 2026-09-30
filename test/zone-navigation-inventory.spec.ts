@@ -26,6 +26,27 @@ const documentId = "DOC-0123456789ABCDEF01234567";
 const versionId = "VER-REQ-0123456789ABCDEF01234567";
 const slug = "project-os";
 
+describe("compact catalog adoption gate", () => {
+  it("does not resume a saved compact cursor from an unadopted source state", async () => {
+    const h = harness();
+    const staleCompactEntry: NavigationInventoryEntry = {
+      project_id: projectId, zone: "WORKING", resource_id: "head:DOC-AAAAAAAAAAAAAAAAAAAAAAAA",
+      version: "VER-STALE-COMPACT", logical_path: "stale.md", path: "/stale.md",
+      expected: { object_id: "id:stale", revision_token: "rev:stale", content_sha256: "a".repeat(64), size: 5 }
+    };
+    await h.sources.recordVerifiedCatalogEntry(staleCompactEntry, "source:0", budget(2000));
+    await h.sources.markCatalogReady(projectId, "WORKING", 0, budget(2000));
+
+    const page = await h.inventory.listPage({
+      project_id: projectId, zone: "WORKING", cursor: "catalog-compact:0", limit: 8, budget: budget(2000)
+    });
+
+    expect(page.entries).toEqual([]);
+    expect(typeof page.next_cursor === "string" && page.next_cursor.startsWith("catalog-compact:")).toBe(false);
+    expect(h.pagePaths).toContain(zoneNavigationCatalogRoot(projectId, "WORKING"));
+  });
+});
+
 function budget(calls = 32): SliceBudget {
   return {
     deadline_ms: 25_000,

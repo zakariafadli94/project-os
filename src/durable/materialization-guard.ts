@@ -18,7 +18,7 @@ import {
 import { classifyCapacityWork } from "../convergence/capacity-work";
 import { CURRENT_PROJECTION_VERSION } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
-import { navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, type NavigationReconcileRequest, type NavigationWorkRef } from "../domain/zone-navigation";
+import { navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, type NavigationCatalogRebuildRequest, type NavigationReconcileRequest, type NavigationWorkRef } from "../domain/zone-navigation";
 import type { Env } from "../env";
 import { MaterializationCoordinator } from "../materialization/coordinator";
 import { ProviderOperationError } from "../persistence/provider/errors";
@@ -467,6 +467,14 @@ export class MaterializationGuard extends DurableObject<Env> {
     // discovered by preparation itself must use the failure ledger below.
     if (`source:${sourceState.generation}` !== ref.source_snapshot_id) return { ref, publish: true };
     if (sourceState.in_flight_resource_ids.length > 0) return { ref, publish: false };
+    if (request.purpose === "compact_catalog_rebuild") {
+      const inventory = new ZoneNavigationInventory(runtime, sources);
+      const result = await new ZoneNavigationEngine(runtime, inventory)
+        .prepareCompactCatalogRebuild(request as NavigationCatalogRebuildRequest, state, admission, budget);
+      if (result.status === "pending") return { ref, publish: false };
+      if (result.status === "prepared") return { ref, publish: true };
+      return { ref, publish: false, failure_code: result.code };
+    }
     if (!sourceState.adopted && !await sources.beginAdoption(this.projectId, ref.zone, ref.request_id, sourceState.generation, budget)) {
       return { ref, publish: false };
     }

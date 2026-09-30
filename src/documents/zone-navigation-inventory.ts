@@ -476,7 +476,9 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
             continue;
           }
           if (metadata.size > MAX_VISIBLE_SOURCE_BYTES) throw new Error("artifact_visible_out_of_bounds");
-          if (status.verification_state !== "canonical_verified") throw new Error("artifact_visible_out_of_bounds");
+          // A committed predecessor can remain in the binding history after
+          // a visible replacement. Only absence needs quarantine proof.
+          if (status.verification_state !== "canonical_verified") continue;
           // Finalization below rechecks this status and resolves the visible
           // bytes once. Avoid doing the same physical source verification here
           // and then again in the engine after the final entry is returned.

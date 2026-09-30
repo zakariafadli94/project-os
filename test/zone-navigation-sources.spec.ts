@@ -125,7 +125,21 @@ describe("ZoneNavigationSources", () => {
     const path = `${zoneNavigationCatalogRoot("PRJ-0002", "WORKING")}/compact/${shard.toString(16).padStart(2, "0")}.json`;
     files.delete(path);
 
+    await sources.recordVerifiedCatalogTombstone("PRJ-0002", "WORKING", e.resource_id, "source:0", b);
+    expect(JSON.parse(files.get(manifestPath)!).shards).toContain(shard);
     await expect(sources.readCompactCatalogShard("PRJ-0002", "WORKING", shard, 0, b)).rejects.toThrow("navigation_compact_catalog_missing");
+  });
+
+  it("does not add a compact shard for a tombstone with no compact entry", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    await expect(sources.markCatalogReady("PRJ-0002", "WORKING", 0, b)).resolves.toBe(true);
+
+    await sources.writeCatalogEntry(null, "PRJ-0002", "WORKING", entry().resource_id, b, 0);
+
+    const manifestPath = [...files.keys()].find((path) => path.endsWith("/compact/ready.json"))!;
+    expect(JSON.parse(files.get(manifestPath)!).shards).toEqual([]);
+    expect([...files.keys()].filter((path) => /\/compact\/[0-9a-f]{2}\.json$/.test(path))).toEqual([]);
   });
 
   it("rejects compact entries whose persisted identity hash no longer matches", async () => {

@@ -500,6 +500,10 @@ export class ZoneNavigationSources {
   private async updateCompactCatalogEntry(entry: NavigationInventoryEntry | null, projectId: string, zone: NavigationZone, resourceId: string, generation: number, budget?: SliceBudget): Promise<void> {
     if (entry && (entry.project_id !== projectId || entry.zone !== zone || entry.resource_id !== resourceId)) throw new Error("navigation_catalog_binding");
     const shard = shardFor(resourceId);
+    if (entry === null) {
+      const manifest = await this.readCompactManifest(projectId, zone, budget);
+      if (!manifest?.shards.includes(shard)) return;
+    }
     const path = compactChunkPath(projectId, zone, shard);
     await this.ensureCompactShard(projectId, zone, shard, budget);
     const before = await this.readWriteToken(path, budget);

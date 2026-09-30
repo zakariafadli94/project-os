@@ -780,16 +780,20 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     // reserve enough of this existing slice for those three records, visible
     // content verification, and the page/checkpoint continuation.
     if (reserveActiveProof && providerMismatch) requireBudget(budget, MAX_INITIAL_MISMATCHED_HEAD_PROVIDER_CALLS - 2);
-    const repairProof = providerMismatch
+    // Legacy external publications can retain an older provider identity after
+    // an out-of-band move. Accept that identity change only when readVisible
+    // proves the current bytes are exactly the immutable version bytes.
+    const legacyExternalPublishedContentProof = providerMismatch && zone === "DELIVERABLES" && version.source === "external_human" && version.version_id.startsWith("VER-EXT-");
+    const repairProof = providerMismatch && !legacyExternalPublishedContentProof
       ? await this.readCommittedInstanceRepair(projectId, documentId, head.logical_path, pointer.versionId, observation, version, rawVersion, budget)
       : null;
     const reviewPromotionProven = providerMismatch && zone === "REVIEW"
       ? await this.hasCommittedReviewPromotion(projectId, documentId, head.logical_path, pointer.versionId, observation, version, budget)
       : false;
-    const publishedMoveProven = providerMismatch && zone === "DELIVERABLES"
+    const publishedMoveProven = providerMismatch && zone === "DELIVERABLES" && !legacyExternalPublishedContentProof
       ? await this.hasCommittedPublishedMove(projectId, documentId, head.logical_path, pointer.versionId, observation, version, budget)
       : false;
-    if (providerMismatch && !repairProof && !reviewPromotionProven && !publishedMoveProven) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
+    if (providerMismatch && !repairProof && !reviewPromotionProven && !publishedMoveProven && !legacyExternalPublishedContentProof) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
     const verified = await this.readVisible(observation.path, observation, version, budget);
     if (!verified) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_content_unverified" } };
     if (repairProof && verified.sha256 !== repairProof.content_sha256) return { entry: null, gap: { resource_id: resourceId, code: "active_instance_repair_content_mismatch" } };

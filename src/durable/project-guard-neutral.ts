@@ -1114,6 +1114,13 @@ export class ProjectGuard extends DurableObject<Env> {
       // If an exact, already-written proof exists for this admitted request,
       // the service may finish the receipt after unrelated project changes.
     }
+    if (operation.operation === "document.quarantine_instance"
+      && (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext
+        || mutationContext.actor.actor_id !== "control_tower"
+        || mutationContext.actor.authority !== "control_tower_operator")) {
+      return Response.json(this.documentTerminalReceipt(operation, "rejected", "DOCUMENT_QUARANTINE_AUTHORITY_REQUIRED",
+        "Published instance quarantine requires a fresh signed Control Tower operator context", operation.document_id));
+    }
     if (operation.operation === "package.freeze" || operation.operation === "package.replace") {
       if (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext) return Response.json({ request_id: operation.request_id, project_id: operation.project_id, status: "rejected", code: "PACKAGE_GOVERNANCE_REQUIRED" });
       if (operation.expected_project_revision !== state.revision) return Response.json({ status: "conflict", code: "PACKAGE_PROJECT_REVISION_CONFLICT" });
@@ -1756,6 +1763,8 @@ export class ProjectGuard extends DurableObject<Env> {
         throw new Error("package_governance_dispatch_required");
       case "document.instance.repair":
         return this.executeDocumentInstanceRepair(request, state);
+      case "document.quarantine_instance":
+        return this.executeDocumentQuarantineInstance(request, state);
       case "working.write":
         return this.managedDocumentService.writeWorking(request, state);
       case "review.write":
@@ -1868,6 +1877,21 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       throw error;
     }
+  }
+
+  private async executeDocumentQuarantineInstance(
+    request: Extract<ManagedDocumentRequest, { operation: "document.quarantine_instance" }>,
+    state: ProjectState
+  ): Promise<ManagedDocumentReceipt> {
+    const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
+    const admission = await journal.readAdmission();
+    const actor = admission?.admission.actor;
+    if (!admission || admission.admission.operation !== request.operation
+      || admission.admission.request_hash !== await sha256Canonical(request)
+      || actor?.actor_id !== "control_tower" || actor.authority !== "control_tower_operator") {
+      throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_AUTHORITY_REQUIRED", "Authenticated operator admission proof is unavailable", request.document_id);
+    }
+    return this.managedDocumentService.quarantinePublishedInstance(request, state, actor);
   }
 
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {

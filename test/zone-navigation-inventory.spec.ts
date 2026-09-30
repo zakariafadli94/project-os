@@ -372,6 +372,41 @@ describe("ZoneNavigationInventory", () => {
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
   });
 
+  it("accepts a legacy external published head only while its visible bytes equal the immutable payload", async () => {
+    const h = harness();
+    const content = "external import index";
+    const hash = await sha256Text(content);
+    const externalVersionId = "VER-EXT-0123456789ABCDEF01234567";
+    const path = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/import-index.md`;
+    const payloadPath = machineDocumentTextPayloadPath(projectId, hash);
+    h.put(path, content, "id:current-import");
+    h.files.set(path, { ...h.files.get(path)!, revision_token: "rev-current-import" });
+    h.put(payloadPath, content);
+    h.put(machineDocumentHeadPath(projectId, documentId), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: documentId, kind: "work_product", logical_path: "import-index.md",
+      published_version_id: externalVersionId,
+      provider: { published: { path, file_id: "id:current-import", rev: "rev-current-import", content_hash: hash, size: content.length } },
+      reconciliation_status: "clean"
+    }));
+    h.put(machineDocumentVersionPath(projectId, documentId, externalVersionId), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: documentId, version_id: externalVersionId,
+      kind: "work_product", stage: "published", logical_path: "import-index.md", source: "external_human",
+      created_at: "2026-09-01T00:00:00Z", immutable_payload_path: payloadPath,
+      provider_content_hash: hash, provider_file_id: "id:historical-import", provider_rev: "rev-historical-import",
+      provider_path: path, size: content.length
+    }));
+    const entry: NavigationInventoryEntry = {
+      project_id: projectId, zone: "DELIVERABLES", resource_id: `head:${documentId}`, version: externalVersionId,
+      logical_path: "import-index.md", path,
+      expected: { object_id: "id:current-import", revision_token: "rev-current-import", content_sha256: hash, size: content.length }
+    };
+
+    await expect(h.inventory.verifyEntry(entry, budget(100))).resolves.toBe(true);
+    h.put(path, "different import data", "id:current-import");
+    h.files.set(path, { ...h.files.get(path)!, revision_token: "rev-current-import" });
+    await expect(h.inventory.verifyEntry(entry, budget(100))).resolves.toBe(false);
+  });
+
   it("rejects a published version whose immutable bytes differ from its REVIEW parent", async () => {
     const h = harness();
     const { entry } = await seedHistoricalPublishedHead(h);

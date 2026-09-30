@@ -250,6 +250,107 @@ describe("ProjectGuard managed documents", () => {
     expect(await response.json()).toMatchObject({ status: "rejected", code: "DOCUMENT_INSTANCE_REPAIR_AUTHORITY_REQUIRED" });
   });
 
+  it("rejects published instance quarantine from a signed generic ingress actor", async () => {
+    const created = await createProject(`TXN-DOCUMENT-QUARANTINE-AUTH-${Date.now().toString(36).toUpperCase()}`);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const ingressToken = "generic-ingress-quarantine-test";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: governanceSigningKey,
+      RULE_ADMISSION_SIGNING_KEY: governanceSigningKey,
+      INGRESS_TOKEN: ingressToken,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    const contextResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${ingressToken}` } });
+    const { context }: any = await contextResponse.json();
+    const request = {
+      operation: "document.quarantine_instance",
+      request_id: "DOCREQ-QUARANTINE-AUTH-0001",
+      project_id: created.project_id,
+      document_id: "DOC-0123456789ABCDEF01234567",
+      version_id: "VER-EXT-111111111111111111111111",
+      logical_path: "strategies/current.md",
+      expected_project_revision: created.new_revision,
+      expected_source_generation: 0,
+      observed_provider: { object_id: "id:current", revision_token: "rev-current", path: "/PROJECT/DELIVERABLES/strategies/current.md", size: 9, provider_hash: "a".repeat(64) },
+      content_sha256: "b".repeat(64),
+      created_at: at
+    };
+    const response = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await response.json()).toMatchObject({ status: "rejected", code: "DOCUMENT_QUARANTINE_AUTHORITY_REQUIRED" });
+  });
+
+  it("commits quarantine only through a signed Control Tower operator admission", async () => {
+    const created = await createProject(`TXN-DOCUMENT-QUARANTINE-OK-${Date.now().toString(36).toUpperCase()}`);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const mock = installDropboxMock();
+    const runtime = createProductionPersistence(testEnv, created.project_id);
+    const signingKey = governanceSigningKey;
+    const ingressToken = `quarantine-ingress-${Date.now()}`;
+    const operatorToken = `quarantine-operator-${Date.now()}`;
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+      RULE_ADMISSION_SIGNING_KEY: signingKey,
+      INGRESS_TOKEN: ingressToken,
+      CONTROL_TOWER_OPERATOR_TOKEN: operatorToken,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, created.project_id);
+    await runInDurableObject(guard, (instance) => {
+      const persistence = (instance as any).persistence;
+      persistence.serverSideCopy.copyObjectVersion = async (from: string, to: string, expected: { objectId: string; revisionToken: string; contentSha256: string }) => {
+        const source = await persistence.objects.getMetadata(from);
+        const bytes = await persistence.objects.readBytes(from, 10 * 1024 * 1024);
+        if (!source || source.objectId !== expected.objectId || source.revisionToken !== expected.revisionToken || !bytes) throw new Error("test_exact_copy_source_changed");
+        const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+        if (digest !== expected.contentSha256) throw new Error("test_exact_copy_hash_changed");
+        await persistence.objects.createText(to, new TextDecoder().decode(bytes));
+        const destination = await persistence.objects.getMetadata(to);
+        if (!destination) throw new Error("test_exact_copy_destination_missing");
+        return { source: { objectId: expected.objectId, revisionToken: expected.revisionToken, contentSha256: digest }, destination };
+      };
+    });
+    const setupResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${ingressToken}` } });
+    const { context: setupContext }: any = await setupResponse.json();
+    const content = "# Drift quarantine fixture\n";
+    const writeRequest = { operation: "working.write", request_id: "DOCREQ-QUARANTINE-GUARD-WRITE-0001", project_id: created.project_id,
+      logical_path: "strategies/quarantine.md", content, content_sha256: await sha256Text(content), created_at: at };
+    const written: any = await (await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(writeRequest, setupContext)) })).json();
+    expect(written).toMatchObject({ status: "committed", stage: "working" });
+    const reviewRequest = { operation: "review.promote", request_id: "DOCREQ-QUARANTINE-GUARD-REVIEW-0001", project_id: created.project_id,
+      document_id: written.document_id, expected_version_id: written.version_id, created_at: at };
+    const reviewed: any = await (await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(reviewRequest, setupContext)) })).json();
+    expect(reviewed).toMatchObject({ status: "committed", stage: "review" });
+    const publishRequest = { operation: "publish", request_id: "DOCREQ-QUARANTINE-GUARD-PUBLISH-0001", project_id: created.project_id,
+      document_id: written.document_id, expected_version_id: reviewed.version_id, created_at: at };
+    const published: any = await (await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(publishRequest, setupContext)) })).json();
+    expect(published).toMatchObject({ status: "committed", stage: "published" });
+
+    const head = await new DocumentLedgerRepository(runtime).readHead(created.project_id, written.document_id);
+    const sourcePath = head!.provider!.published!.path;
+    const driftedBytes = "external edit requiring operator review";
+    const metadataBefore = await runtime.objects.getMetadata(sourcePath);
+    expect(metadataBefore).not.toBeNull();
+    // The test's installed provider mock exposes external writes through its shared backing store.
+    const external = await mock.writeExternal(sourcePath, driftedBytes);
+    expect(external).not.toBeNull();
+    const current = await runtime.objects.getMetadata(sourcePath);
+    const sourceState = await new ZoneNavigationSources(runtime).readState(created.project_id, "DELIVERABLES");
+    const operatorResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${operatorToken}` } });
+    const { context: operatorContext }: any = await operatorResponse.json();
+    const request = { operation: "document.quarantine_instance", request_id: "DOCREQ-QUARANTINE-GUARD-0001", project_id: created.project_id,
+      document_id: written.document_id, version_id: published.version_id, logical_path: head!.logical_path,
+      expected_project_revision: created.new_revision, expected_source_generation: sourceState.generation,
+      observed_provider: { object_id: current!.objectId!, revision_token: current!.revisionToken!, path: sourcePath,
+        size: current!.size, provider_hash: current!.integrityHash!.value },
+      content_sha256: await sha256Text(driftedBytes), created_at: at };
+    const response = await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, operatorContext)) });
+    const quarantineReceipt: any = await response.json();
+    expect(quarantineReceipt, JSON.stringify(quarantineReceipt)).toMatchObject({ operation: "document.quarantine_instance", status: "committed", accepted: false,
+      actor: { actor_id: "control_tower", authority: "control_tower_operator" }, archive_path: expect.stringContaining("/ARCHIVES/QUARANTINED-PUBLISHED/") });
+  });
+
   it("rejects external archive reconciliation from a generic ingress actor", async () => {
     const created = await createProject("TXN-DOCUMENT-ARCHIVE-AUTH-9103");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);

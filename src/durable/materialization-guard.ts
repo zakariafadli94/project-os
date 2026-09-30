@@ -473,7 +473,9 @@ export class MaterializationGuard extends DurableObject<Env> {
         .prepareCompactCatalogRebuild(request as NavigationCatalogRebuildRequest, state, admission, budget);
       if (result.status === "pending") return { ref, publish: false };
       if (result.status === "prepared") return { ref, publish: true };
-      return { ref, publish: false, failure_code: result.code };
+      // The publisher verifies and settles a deterministic rebuild conflict.
+      // Retrying it as an internal failure strands the admitted request.
+      return { ref, publish: true };
     }
     if (!sourceState.adopted && !await sources.beginAdoption(this.projectId, ref.zone, ref.request_id, sourceState.generation, budget)) {
       return { ref, publish: false };

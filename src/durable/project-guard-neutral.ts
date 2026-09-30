@@ -15,7 +15,7 @@ import {
 } from "../domain/artifact-write";
 import type { CanonicalCommitRecord } from "../domain/commit-record";
 import { parseManagedDocumentRequest, type ManagedDocumentRequest } from "../domain/managed-document-request";
-import { navigationCatalogRebuildCertificateSchema, navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema, type NavigationCatalogRebuildRequest, type NavigationReconcileRequest, type NavigationWorkRef, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
+import { navigationCatalogRebuildCertificateSchema, navigationCatalogRebuildProgressSchema, navigationReconcileSchema, navigationWorkFailureSchema, navigationWorkRefSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema, type NavigationCatalogRebuildRequest, type NavigationReconcileRequest, type NavigationWorkRef, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
 import { packageIdFor, packageManifestPath, parsePackageManifest, type PackageRef } from "../domain/document-package";
 import { CURRENT_PROJECTION_VERSION, MATERIALIZATION_SNAPSHOT_MAX_CHAIN_DEPTH, type CompletedMaterializationRecord } from "../domain/materialization";
 import type { Env } from "../env";
@@ -1097,6 +1097,13 @@ export class ProjectGuard extends DurableObject<Env> {
     });
     const rulesRequired = await this.ruleAdmissionRequired(state, normalized);
     await this.verifyEffectAdmission(mutationContext, operation.project_id, state, rulesRequired);
+    if (operation.operation === "document.archive" && operation.observed_archive
+      && (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext
+        || mutationContext.actor.actor_id !== "control_tower"
+        || mutationContext.actor.authority !== "control_tower_operator")) {
+      return Response.json(this.documentTerminalReceipt(operation, "rejected", "DOCUMENT_EXTERNAL_ARCHIVE_AUTHORITY_REQUIRED",
+        "External archive reconciliation requires a fresh signed Control Tower operator context", operation.document_id));
+    }
     if (operation.operation === "document.instance.repair") {
       if (!this.strictAdmissionEnabled(operation.project_id) || !mutationContext
         || mutationContext.actor.actor_id !== "control_tower"
@@ -1459,23 +1466,39 @@ export class ProjectGuard extends DurableObject<Env> {
     const stopped = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; stopped: number; message: string }>(
       "SELECT stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
     ).toArray()[0];
-    if (stopped?.stopped) {
-      const diagnostic = this.parseRecoveryFailureDiagnostic(stopped.message);
-      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id,
-        status: "pending", code: diagnostic?.code ?? "EXECUTION_RECOVERY_STOPPED" }, { status: 503 });
-    }
     const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
     const sources = new ZoneNavigationSources(this.persistence);
     const sourceState = await sources.readState(request.project_id, request.zone, budget);
+    const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
     const ref: NavigationWorkRef = navigationWorkRefSchema.parse({
       project_id: request.project_id,
       request_id: request.request_id,
       zone: request.zone,
       expected_generation: request.expected_generation,
-      source_snapshot_id: `source:${sourceState.generation}`,
-      authority_ref: `${await new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id).root()}/admission.json`,
+      source_snapshot_id: `source:${request.purpose === "compact_catalog_rebuild" ? request.expected_source_generation : sourceState.generation}`,
+      authority_ref: `${await journal.root()}/admission.json`,
       request_hash: await sha256Canonical(request)
     });
+    if (stopped?.stopped) {
+      if (request.purpose === "compact_catalog_rebuild") {
+        let progress: ReturnType<typeof navigationCatalogRebuildProgressSchema.safeParse> | null = null;
+        try {
+          const raw = await this.persistence.objects.readText(`${await journal.root()}/navigation-catalog-rebuild-progress.json`);
+          if (raw !== null) progress = navigationCatalogRebuildProgressSchema.safeParse(JSON.parse(raw));
+        } catch { /* An unavailable proof cannot override a stopped recovery. */ }
+        if (progress?.success && progress.data.status === "conflict" && progress.data.coverage_gaps.length > 0
+          && progress.data.project_id === request.project_id && progress.data.request_id === request.request_id
+          && progress.data.request_hash === ref.request_hash && progress.data.zone === request.zone
+          && progress.data.source_generation === request.expected_source_generation) {
+          return this.handleNavigationPublish(new Request("https://project-guard.internal/navigation-publish", {
+            method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ref)
+          }));
+        }
+      }
+      const diagnostic = this.parseRecoveryFailureDiagnostic(stopped.message);
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+        status: "pending", code: diagnostic?.code ?? "EXECUTION_RECOVERY_STOPPED" }, { status: 503 });
+    }
     let response: Response;
     try {
       response = await this.env.MATERIALIZATION_GUARD.getByName(request.project_id).fetch("https://materialization-guard.internal/navigation-work", {

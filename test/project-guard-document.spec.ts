@@ -21,7 +21,7 @@ import { ZoneNavigationInventory } from "../src/documents/zone-navigation-invent
 import { ZoneNavigationSources, zoneNavigationCompactCatalogRoot } from "../src/documents/zone-navigation-sources";
 import { createSliceBudget } from "../src/convergence/budget";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
-import { navigationReconcileSchema } from "../src/domain/zone-navigation";
+import { navigationCatalogRebuildProgressSchema, navigationReconcileSchema } from "../src/domain/zone-navigation";
 import { executionHash } from "../src/execution/journal";
 import { emptyProjectState } from "../src/domain/transitions";
 import { workspaceProjectRoot } from "../src/persistence/layout";
@@ -113,6 +113,109 @@ describe("ProjectGuard managed documents", () => {
     expect(await runtime.objects.readText(`${machineDocumentRoot(projectId)}/navigation/REVIEW/head.json`)).toBeNull();
   });
 
+  it("turns a deterministic catalog census gap into a terminal conflict receipt", async () => {
+    const created = await createProject("TXN-CATALOG-REBUILD-GAP-9101");
+    const projectId = created.project_id;
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    const runtime = createProductionPersistence(testEnv, projectId);
+    const sources = new ZoneNavigationSources(runtime);
+    const sourceBudget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    expect(await sources.beginAdoption(projectId, "REVIEW", "DOCREQ-CATALOG-GAP-SETUP", 0, sourceBudget)).toBe(true);
+    expect(await sources.finishAdoption(projectId, "REVIEW", "DOCREQ-CATALOG-GAP-SETUP", 0, sourceBudget)).toBe(true);
+    const manifestPath = `${zoneNavigationCompactCatalogRoot(projectId, "REVIEW")}/ready.json`;
+    const manifest = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone: "REVIEW",
+      ready_generation: 0, shards: [], completed_generations: [], coalesced_dirty: [] });
+    await runtime.objects.createText(manifestPath, manifest);
+    const metadata = await runtime.objects.getMetadata(manifestPath);
+    expect(metadata).not.toBeNull();
+    vi.spyOn(ZoneNavigationEngine.prototype, "prepareCompactCatalogRebuild")
+      .mockResolvedValue({ status: "conflict", code: "active_version_provider_mismatch" });
+    vi.spyOn(ZoneNavigationEngine.prototype, "publishPreparedCompactCatalogRebuild")
+      .mockResolvedValue({ status: "conflict", code: "active_version_provider_mismatch" });
+    const token = "catalog-gap-operator-test";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: governanceSigningKey,
+      RULE_ADMISSION_SIGNING_KEY: governanceSigningKey,
+      INGRESS_TOKEN: token,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" })
+    }));
+    const contextResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${token}` } });
+    const { context }: any = await contextResponse.json();
+    const request = navigationReconcileSchema.parse({
+      operation: "navigation.reconcile", request_id: "DOCREQ-CATALOG-GAP-0001", project_id: projectId,
+      zone: "REVIEW", expected_project_revision: created.new_revision, expected_generation: 0,
+      expected_source_generation: 0, expected_index: null, purpose: "compact_catalog_rebuild",
+      expected_catalog_manifest: { object_id: metadata!.objectId, revision_token: metadata!.revisionToken,
+        content_sha256: await sha256Text(manifest) }, created_at: at
+    });
+    const response = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await response.json()).toMatchObject({ request_id: request.request_id, status: "pending" });
+    for (let attempt = 0; attempt < 6; attempt += 1) await runDurableObjectAlarm(materialization);
+    const receipt = await new ManagedDocumentRequestLedger(runtime.objects).readReceipt(projectId, request.request_id);
+    expect(receipt).not.toBeNull();
+    expect(JSON.parse(receipt!.receipt_json)).toMatchObject({ status: "conflict", code: "active_version_provider_mismatch" });
+    expect(await new ExecutionJournal(runtime, projectId, "document", request.request_id).status())
+      .toMatchObject({ status: "conflict", terminal: true });
+  });
+
+  it("settles an already-stopped catalog rebuild only from its bound conflict progress", async () => {
+    const created = await createProject("TXN-CATALOG-STOPPED-GAP-9102");
+    const projectId = created.project_id;
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const runtime = createProductionPersistence(testEnv, projectId);
+    const sources = new ZoneNavigationSources(runtime);
+    const sourceBudget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    expect(await sources.beginAdoption(projectId, "REVIEW", "DOCREQ-CATALOG-STOPPED-SETUP", 0, sourceBudget)).toBe(true);
+    expect(await sources.finishAdoption(projectId, "REVIEW", "DOCREQ-CATALOG-STOPPED-SETUP", 0, sourceBudget)).toBe(true);
+    const manifestPath = `${zoneNavigationCompactCatalogRoot(projectId, "REVIEW")}/ready.json`;
+    const manifest = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone: "REVIEW",
+      ready_generation: 0, shards: [], completed_generations: [], coalesced_dirty: [] });
+    await runtime.objects.createText(manifestPath, manifest);
+    const metadata = await runtime.objects.getMetadata(manifestPath);
+    expect(metadata).not.toBeNull();
+    vi.spyOn(ZoneNavigationEngine.prototype, "publishPreparedCompactCatalogRebuild")
+      .mockResolvedValue({ status: "conflict", code: "active_version_provider_mismatch" });
+    const token = "catalog-stopped-operator-test";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: governanceSigningKey,
+      RULE_ADMISSION_SIGNING_KEY: governanceSigningKey,
+      INGRESS_TOKEN: token,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" })
+    }));
+    const contextResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${token}` } });
+    const { context }: any = await contextResponse.json();
+    const request = navigationReconcileSchema.parse({
+      operation: "navigation.reconcile", request_id: "DOCREQ-CATALOG-STOPPED-0001", project_id: projectId,
+      zone: "REVIEW", expected_project_revision: created.new_revision, expected_generation: 0,
+      expected_source_generation: 0, expected_index: null, purpose: "compact_catalog_rebuild",
+      expected_catalog_manifest: { object_id: metadata!.objectId, revision_token: metadata!.revisionToken,
+        content_sha256: await sha256Text(manifest) }, created_at: at
+    });
+    const envelope = JSON.stringify(encodeAdmission(request, context));
+    expect(await (await guard.fetch("https://internal/document", { method: "POST", body: envelope })).json())
+      .toMatchObject({ status: "pending" });
+    const journal = new ExecutionJournal(runtime, projectId, "document", request.request_id);
+    const progress = navigationCatalogRebuildProgressSchema.parse({
+      schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: projectId,
+      request_id: request.request_id, request_hash: await executionHash(request), zone: "REVIEW",
+      source_generation: 0, source_snapshot_id: "source:0", cursor: null, page_count: 0,
+      source_count: 0, shard_cursor: 0, shard_count: 0, status: "conflict", finalization_ref: null,
+      coverage_gaps: [{ resource_id: "head:DOC-0123456789ABCDEF01234567", code: "active_version_provider_mismatch" }]
+    });
+    await runtime.objects.createText(`${await journal.root()}/navigation-catalog-rebuild-progress.json`, canonicalJson(progress));
+    await runInDurableObject(guard, (instance) => (instance as any).ctx.storage.sql.exec(
+      "INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message) VALUES (?, ?, ?, ?, ?, ?)",
+      "document", request.request_id, "old-failure", 6, 1, JSON.stringify({ code: "identical_internal_failure_limit" })
+    ));
+    const replay = await guard.fetch("https://internal/document", { method: "POST", body: envelope });
+    expect(await replay.json()).toMatchObject({ status: "conflict", code: "active_version_provider_mismatch" });
+    const receipt = await new ManagedDocumentRequestLedger(runtime.objects).readReceipt(projectId, request.request_id);
+    expect(JSON.parse(receipt!.receipt_json)).toMatchObject({ status: "conflict", code: "active_version_provider_mismatch" });
+  });
+
   it("rejects instance repair from a fresh signed generic ingress actor", async () => {
     const created = await createProject("TXN-DOCUMENT-REPAIR-AUTH-01");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
@@ -145,6 +248,32 @@ describe("ProjectGuard managed documents", () => {
       method: "POST", body: JSON.stringify(encodeAdmission(request, context))
     });
     expect(await response.json()).toMatchObject({ status: "rejected", code: "DOCUMENT_INSTANCE_REPAIR_AUTHORITY_REQUIRED" });
+  });
+
+  it("rejects external archive reconciliation from a generic ingress actor", async () => {
+    const created = await createProject("TXN-DOCUMENT-ARCHIVE-AUTH-9103");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const ingressToken = "generic-ingress-external-archive";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: governanceSigningKey,
+      RULE_ADMISSION_SIGNING_KEY: governanceSigningKey,
+      INGRESS_TOKEN: ingressToken,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+    }));
+    const contextResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${ingressToken}` } });
+    const { context }: any = await contextResponse.json();
+    const request = {
+      operation: "document.archive", request_id: "DOCREQ-EXTERNAL-ARCHIVE-AUTH-0001", project_id: created.project_id,
+      document_id: "DOC-0123456789ABCDEF01234567", expected_version_id: "VER-EXT-111111111111111111111111",
+      stage: "review", expected_project_revision: created.new_revision,
+      observed_archive: { path: `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-document-0001/ARCHIVES/example.md`,
+        object_id: "id:archive", revision_token: "rev-archive", content_hash: "a".repeat(64), size: 9 },
+      created_at: at
+    };
+    const response = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await response.json()).toMatchObject({ status: "rejected", code: "DOCUMENT_EXTERNAL_ARCHIVE_AUTHORITY_REQUIRED" });
   });
 
   it("commits exact Control Tower repair evidence and lets navigation admit only that current instance", async () => {

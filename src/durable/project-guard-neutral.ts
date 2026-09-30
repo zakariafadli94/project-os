@@ -328,6 +328,9 @@ export class ProjectGuard extends DurableObject<Env> {
   protected readonly layoutMode: LayoutMode;
   private queue: Promise<void> = Promise.resolve();
   private queueDepth = 0;
+  private pendingRequestKeys = new Map<string, number>();
+  private unidentifiedPendingRequestSubmissions = 0;
+  private trackedIncomingRequests = new WeakSet<Request>();
   /** One fresh canonical read is shared by concurrent callers. This prevents a
    * second legitimate request from being rejected while the first is verifying
    * the same Dropbox state. */
@@ -438,15 +441,18 @@ export class ProjectGuard extends DurableObject<Env> {
     const pathname = url.pathname;
 
     if (request.method === "POST" && pathname === "/artifact") {
-      return this.serialize(() => this.handleArtifact(request)).catch((error) => this.admissionErrorResponse(error));
+      return this.trackIncomingRequest(request, "artifact", () =>
+        this.serialize(() => this.handleArtifact(request)).catch((error) => this.admissionErrorResponse(error)));
     }
 
     if (request.method === "POST" && pathname === "/document") {
-      return this.serialize(() => this.handleManagedDocument(request)).catch((error) => this.admissionErrorResponse(error));
+      return this.trackIncomingRequest(request, "document", () =>
+        this.serialize(() => this.handleManagedDocument(request)).catch((error) => this.admissionErrorResponse(error)));
     }
 
     if (request.method === "POST" && pathname === "/navigation-publish") {
-      return this.serialize(() => this.handleNavigationPublish(request)).catch((error) => this.admissionErrorResponse(error));
+      return this.trackIncomingRequest(request, "document", () =>
+        this.serialize(() => this.handleNavigationPublish(request)).catch((error) => this.admissionErrorResponse(error)));
     }
 
     if (request.method === "GET" && pathname === "/document-status") {
@@ -493,7 +499,14 @@ export class ProjectGuard extends DurableObject<Env> {
         if (observed) return observed;
         return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId);
       }
-      return this.readWhenIdle(() => this.readBoundedRequestStatus(url, correlationId));
+      return this.readWhenIdle(async () => {
+        const status = await this.readBoundedRequestStatus(url, correlationId);
+        if (status.ok && this.hasPendingRequestIdentity(kind as RequestKind, requestId)
+          && this.isVerifiedNotReceivedStatus(
+            await status.clone().json() as Record<string, any>, projectId, kind, requestId, correlationId
+          )) return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
+        return status;
+      });
     }
 
     if (request.method === "POST" && pathname === "/finalize-materialization") {
@@ -598,6 +611,18 @@ export class ProjectGuard extends DurableObject<Env> {
         } catch {
           return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
         }
+        if (!this.hasPendingRequestIdentity(kind as RequestKind, requestId)) {
+          try {
+            const status = await this.readBoundedRequestStatus(url, correlationId, true);
+            if (status.ok && this.isVerifiedNotReceivedStatus(
+              await status.clone().json() as Record<string, any>, projectId, kind, requestId, correlationId
+            ) && !this.hasPendingRequestIdentity(kind as RequestKind, requestId)) {
+              return Response.json({ error: "receipt_not_found" }, { status: 404 });
+            }
+          } catch {
+            // A null receipt alone is not proof of absence; retain busy status.
+          }
+        }
         return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
       }
       return this.readWhenIdle(async () => {
@@ -606,6 +631,9 @@ export class ProjectGuard extends DurableObject<Env> {
         try {
           const canonicalReceipt = await this.readBoundedRequestStatusReceipt(projectId, kind as RequestKind, requestId);
           if (canonicalReceipt) return Response.json(canonicalReceipt);
+          if (this.hasPendingRequestIdentity(kind as RequestKind, requestId)) {
+            return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
+          }
           return Response.json({ error: "receipt_not_found" }, { status: 404 });
         } catch {
           return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "canonical_receipt_unavailable");
@@ -617,7 +645,7 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ error: "not_found" }, { status: 404 });
     }
 
-    return this.serialize(async () => {
+    return this.trackIncomingRequest(request, "transaction", () => this.serialize(async () => {
       let tx: Transaction;
       let mutationContext: MutationContext | null;
       try {
@@ -863,7 +891,7 @@ export class ProjectGuard extends DurableObject<Env> {
       await this.recordTransactionExecutionReceipt(tx, receipt);
       await this.clearTransactionRecovery(tx.transaction_id);
       return Response.json(receipt);
-    }).catch((error) => this.admissionErrorResponse(error));
+    }).catch((error) => this.admissionErrorResponse(error)));
   }
 
   async alarm(): Promise<void> {
@@ -5024,6 +5052,8 @@ export class ProjectGuard extends DurableObject<Env> {
       const body = await response.clone().json() as Record<string, any>;
       const observation = body.observation as Record<string, any> | undefined;
       const recovery = body.recovery as Record<string, any> | undefined;
+      if (!this.hasPendingRequestIdentity(kind as RequestKind, requestId)
+        && this.isVerifiedNotReceivedStatus(body, projectId, kind, requestId, correlationId)) return response;
       const admittedAndBound = body.project_id === projectId && body.kind === kind && body.request_id === requestId
         && body.receipt == null
         && ["admitted_uncommitted", "recovery_scheduled"].includes(String(body.status))
@@ -5896,6 +5926,66 @@ export class ProjectGuard extends DurableObject<Env> {
       release();
     }
   }
+
+  /** Track only an incoming typed request's identity while it waits for or
+   * holds the serializer. Unidentifiable input fails closed until it drains;
+   * payload bytes are never retained. */
+  protected async trackIncomingRequest<T>(request: Request, kind: RequestKind, operation: () => Promise<T>): Promise<T> {
+    this.trackedIncomingRequests ??= new WeakSet<Request>();
+    if (this.trackedIncomingRequests.has(request)) return operation();
+    this.trackedIncomingRequests.add(request);
+    this.unidentifiedPendingRequestSubmissions = (this.unidentifiedPendingRequestSubmissions ?? 0) + 1;
+    let key: string | null = null;
+    try {
+      const raw = await request.clone().json() as unknown;
+      const envelope = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
+      const candidate = envelope?.request && typeof envelope.request === "object"
+        ? envelope.request as Record<string, unknown> : envelope;
+      const requestId = kind === "transaction" ? candidate?.transaction_id : candidate?.request_id;
+      if (typeof requestId === "string" && requestId.length > 0 && requestId.length <= 512) {
+        key = `${kind}\u0000${requestId}`;
+        this.pendingRequestKeys ??= new Map<string, number>();
+        this.pendingRequestKeys.set(key, (this.pendingRequestKeys.get(key) ?? 0) + 1);
+        this.unidentifiedPendingRequestSubmissions -= 1;
+      }
+    } catch {
+      // Keep an anonymous in-flight marker for malformed input until it exits.
+    }
+    try {
+      return await operation();
+    } finally {
+      this.trackedIncomingRequests.delete(request);
+      if (key !== null) {
+        const count = this.pendingRequestKeys?.get(key) ?? 0;
+        if (count <= 1) this.pendingRequestKeys?.delete(key);
+        else this.pendingRequestKeys?.set(key, count - 1);
+      } else {
+        this.unidentifiedPendingRequestSubmissions = Math.max(0, (this.unidentifiedPendingRequestSubmissions ?? 1) - 1);
+      }
+    }
+  }
+
+  protected hasPendingRequestIdentity(kind: RequestKind, requestId: string): boolean {
+    if ((this.unidentifiedPendingRequestSubmissions ?? 0) > 0) return true;
+    return (this.pendingRequestKeys?.get(`${kind}\u0000${requestId}`) ?? 0) > 0;
+  }
+
+  protected isVerifiedNotReceivedStatus(
+    body: Record<string, any>, projectId: string, kind: string, requestId: string, correlationId: string
+  ): boolean {
+    const observation = body.observation as Record<string, any> | undefined;
+    const recovery = observation?.recovery as Record<string, any> | undefined;
+    return body.project_id === projectId && body.kind === kind && body.request_id === requestId
+      && body.status === "not_received" && body.receipt == null && body.execution == null
+      && observation?.project_id === projectId && observation.kind === kind && observation.request_id === requestId
+      && observation.status === "not_received" && observation.freshness === "verified"
+      && observation.receipt == null && observation.receipt_status === null
+      && observation.execution_status === null && observation.terminal === false
+      && observation.correlation_id === correlationId && observation.code === null
+      && recovery?.durable_intent === false && recovery.state === "none"
+      && recovery.action === "retry_same_request" && recovery.owner === "client";
+  }
+
 }
 
 function sameFinalizationHead(

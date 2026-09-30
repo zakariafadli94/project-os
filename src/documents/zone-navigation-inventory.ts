@@ -25,6 +25,8 @@ import { sha256Canonical } from "../materialization/hash";
 import { parseManagedDocumentRequest } from "../domain/managed-document-request";
 import { readProjectState } from "../schema/project-state";
 import { enforceManagedMarkdownIdentity } from "./identity-frontmatter";
+import { documentIdFor } from "../domain/managed-document";
+import type { CurrentMutationIntentRecord } from "../schema/mutation-gate";
 
 type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "artifact-finalize" | "dirty" | "dirty-package" | "dirty-artifacts" | "dirty-finish" | "catalog" | "catalog-compact";
 interface PageCursor { phase: PagePhase; cursor: string | null }
@@ -430,7 +432,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     try {
       state = JSON.parse(cursor ?? "") as ArtifactBindingCursor;
       if (!state || typeof state.request_id !== "string" || typeof state.destination_path !== "string" || !Array.isArray(state.eligible_request_ids) || !Array.isArray(state.gaps)
-        || (state.next_intent_cursor !== null && typeof state.next_intent_cursor !== "string") || (state.binding_cursor !== null && typeof state.binding_cursor !== "string")) throw new Error("invalid");
+        || (state.next_intent_cursor !== null && typeof state.next_intent_cursor !== "string") || (state.binding_cursor !== null && typeof state.binding_cursor !== "string")
+        || (state.quarantine_cursor !== undefined && state.quarantine_cursor !== null && typeof state.quarantine_cursor !== "string")) throw new Error("invalid");
     } catch { throw new Error("navigation_inventory_cursor_invalid"); }
     return this.scanArtifactBindings(projectId, zone, state, snapshotId, budget);
   }
@@ -459,10 +462,21 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         if (!intent || intent.destination_path !== state.destination_path || intent.intent_id !== binding.intent_id) throw new Error("artifact_destination_binding_conflict");
         const target = artifactNavigationTarget(projectId, state.destination_path);
         if (target.kind !== "zone" || target.zone !== zone) throw new Error("artifact_destination_zone_mismatch");
-        const metadata = await budgetedRuntime(this.runtime, budget).objects.getMetadata(state.destination_path);
-        if (!metadata || metadata.size > MAX_VISIBLE_SOURCE_BYTES) throw new Error("artifact_visible_out_of_bounds");
         const status = await new MutationGateService(budgetedRuntime(this.runtime, budget), "observe").artifactStatus(projectId, match[1]);
-        if (status?.verification_state === "canonical_verified" && status.receipt_status === "committed" && status.operation !== "REVIEW_CANDIDATE") {
+        if (status?.receipt_status === "committed" && status.operation !== "REVIEW_CANDIDATE") {
+          const metadata = await budgetedRuntime(this.runtime, budget).objects.getMetadata(state.destination_path);
+          if (!metadata) {
+            const quarantine = await this.provenQuarantinedArtifact(projectId, zone, state.destination_path, target.logical_path, intent, state.quarantine_cursor ?? null, budget);
+            if (quarantine.next_cursor !== null) {
+              state.quarantine_cursor = quarantine.next_cursor;
+              return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifact-bindings", JSON.stringify(state)) };
+            }
+            if (!quarantine.proven) throw new Error("artifact_visible_out_of_bounds");
+            delete state.quarantine_cursor;
+            continue;
+          }
+          if (metadata.size > MAX_VISIBLE_SOURCE_BYTES) throw new Error("artifact_visible_out_of_bounds");
+          if (status.verification_state !== "canonical_verified") throw new Error("artifact_visible_out_of_bounds");
           // Finalization below rechecks this status and resolves the visible
           // bytes once. Avoid doing the same physical source verification here
           // and then again in the engine after the final entry is returned.
@@ -478,6 +492,69 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifact-bindings", JSON.stringify(state)) };
     }
     return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: encodeCursor("artifact-finalize", JSON.stringify(state)) };
+  }
+
+  private async provenQuarantinedArtifact(projectId: string, zone: NavigationZone, destinationPath: string, logicalPath: string, intent: CurrentMutationIntentRecord, cursor: string | null, budget: SliceBudget): Promise<{ proven: boolean; next_cursor: string | null }> {
+    if (zone !== "DELIVERABLES" || !this.runtime.pagedListing) return { proven: false, next_cursor: null };
+    // Scan one historical quarantine per durable slice. A missing record or
+    // interrupted listing never becomes permission to hide a visible file.
+    requireBudget(budget, 12);
+    const documentId = await documentIdFor(projectId, logicalPath);
+    const headRaw = await budgetedRuntime(this.runtime, budget).objects.readText(machineDocumentHeadPath(projectId, documentId));
+    if (!headRaw) return { proven: false, next_cursor: null };
+    let head: CurrentManagedDocumentHead;
+    try {
+      const read = readManagedDocumentHead(JSON.parse(headRaw));
+      if (!("head" in read)) return { proven: false, next_cursor: null };
+      head = read.head;
+    } catch { return { proven: false, next_cursor: null }; }
+    if (head.project_id !== projectId || head.document_id !== documentId || head.logical_path !== logicalPath
+      || head.reconciliation_status !== "clean" || head.published_version_id || head.provider?.published) return { proven: false, next_cursor: null };
+    const root = `${machineDocumentRoot(projectId)}/quarantines`;
+    charge(budget);
+    const page = await this.runtime.pagedListing.listPage({ path: root, cursor, limit: 1 });
+    if (page.cursor !== null && page.cursor === cursor) throw new Error("navigation_listing_stalled");
+    for (const item of page.entries) {
+      if (item.kind !== "folder" || item.path !== `${root}/${item.name}` || !/^DOCREQ-[A-Z0-9-]+$/.test(item.name)) continue;
+      const proofPath = `${item.path}/receipt.json`;
+      const proofText = await budgetedRuntime(this.runtime, budget).objects.readText(proofPath);
+      if (!proofText) continue;
+      let proof: Record<string, unknown>;
+      try { proof = JSON.parse(proofText) as Record<string, unknown>; } catch { continue; }
+      const provider = proof.provider as Record<string, unknown> | undefined;
+      const expectedArchive = `${destinationPath.split("/DELIVERABLES/")[0]}/ARCHIVES/QUARANTINED-PUBLISHED/${documentId}/${proof.version_id}/${item.name}/${logicalPath}`;
+      if (proof.operation !== "document.quarantine_instance" || proof.project_id !== projectId || proof.request_id !== item.name
+        || proof.document_id !== documentId || proof.logical_path !== logicalPath || provider?.path !== destinationPath
+        || (intent.provider_precondition.kind === "existing" && intent.provider_precondition.object_id !== provider.object_id)
+        || !/^VER-(?:EXT|REQ)-[A-F0-9]{24}$/.test(String(proof.version_id)) || proof.archive_path !== expectedArchive) continue;
+      const wrapperText = await budgetedRuntime(this.runtime, budget).objects.readText(`${machineDocumentRoot(projectId)}/requests/${item.name}/receipt.json`);
+      if (!wrapperText) continue;
+      let wrapper: Record<string, unknown>, receipt: Record<string, unknown>, quarantineRequest: Record<string, unknown>;
+      try {
+        wrapper = JSON.parse(wrapperText) as Record<string, unknown>;
+        receipt = JSON.parse(String(wrapper.receipt_json)) as Record<string, unknown>;
+        quarantineRequest = JSON.parse(String(wrapper.request_json)) as Record<string, unknown>;
+      } catch { continue; }
+      const recordedAt = Date.parse(intent.recorded_at);
+      const quarantinedAt = Date.parse(String(quarantineRequest.created_at));
+      const observed = quarantineRequest.observed_provider as Record<string, unknown> | undefined;
+      if (wrapper.project_id !== projectId || wrapper.request_id !== item.name || receipt.status !== "committed"
+        || typeof wrapper.request_json !== "string" || wrapper.request_sha256 !== await sha256Text(wrapper.request_json)
+        || receipt.request_payload_sha256 !== wrapper.request_sha256
+        || receipt.operation !== "document.quarantine_instance" || receipt.project_id !== projectId
+        || receipt.request_id !== item.name || receipt.document_id !== documentId || receipt.proof_ref !== proofPath
+        || receipt.proof_sha256 !== await sha256Text(proofText) || receipt.archive_path !== proof.archive_path
+        || receipt.content_sha256 !== proof.content_sha256 || receipt.provider_rev !== provider.revision_token
+        || quarantineRequest.operation !== "document.quarantine_instance" || quarantineRequest.project_id !== projectId
+        || quarantineRequest.request_id !== item.name || quarantineRequest.document_id !== documentId
+        || observed?.path !== destinationPath || observed.object_id !== provider.object_id
+        || !Number.isFinite(recordedAt) || !Number.isFinite(quarantinedAt) || quarantinedAt < recordedAt
+        || !Number.isSafeInteger(quarantineRequest.expected_project_revision)
+        || (quarantineRequest.expected_project_revision as number) < intent.base_project_revision) continue;
+      const archive = await budgetedRuntime(this.runtime, budget).objects.getMetadata(proof.archive_path);
+      if (archive?.path === proof.archive_path && archive.size === provider.size) return { proven: true, next_cursor: null };
+    }
+    return { proven: false, next_cursor: page.cursor };
   }
 
   private async finalizeArtifactBindings(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget, persistCatalog = true) {
@@ -1359,6 +1436,7 @@ interface ArtifactBindingCursor {
   binding_cursor: string | null;
   eligible_request_ids: string[];
   gaps: NavigationCoverageGap[];
+  quarantine_cursor?: string | null;
   dirty?: { resource_id: string; dirty_cursor: string | null };
 }
 

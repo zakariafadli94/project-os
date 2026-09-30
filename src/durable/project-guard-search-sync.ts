@@ -81,11 +81,11 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
             return this.readExecutionStatusWhileBusy(projectId, kind, requestId,
               this.observationCorrelationId(request, url));
           }
-          if (url.pathname === "/request-status") {
-            const observed = await this.readStoredOrRefreshRequestObservation(url, projectId, kind as RequestKind, requestId,
+        if (url.pathname === "/request-status") {
+          const observed = await this.readStoredOrRefreshRequestObservation(url, projectId, kind as RequestKind, requestId,
               this.observationCorrelationId(request, url));
-            if (observed) return observed;
-            return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId,
+          if (observed) return observed;
+          return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId,
               this.observationCorrelationId(request, url));
           }
           if (url.pathname === "/receipt") {
@@ -103,6 +103,19 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
               if (canonical) return Response.json(canonical);
             } catch {
               // Absence is not proven while outer work is queued.
+            }
+            if (!this.hasPendingRequestIdentity(kind as RequestKind, requestId)) {
+              try {
+                const correlationId = this.observationCorrelationId(request, url);
+                const status = await this.readBoundedRequestStatus(url, correlationId, true);
+                if (status.ok && this.isVerifiedNotReceivedStatus(
+                  await status.clone().json() as Record<string, any>, projectId, kind, requestId, correlationId
+                ) && !this.hasPendingRequestIdentity(kind as RequestKind, requestId)) {
+                  return Response.json({ error: "receipt_not_found" }, { status: 404 });
+                }
+              } catch {
+                // A missing receipt alone is not proof of request absence.
+              }
             }
           }
           return this.unknownObservationResponse(projectId, kind, requestId,
@@ -126,13 +139,18 @@ export class SearchSyncProjectGuard extends SubrequestResilientProjectGuard {
       return this.serializeSearch(() => this.handleSearchDrain());
     }
 
-    return this.serializeSearch(async () => {
+    const kind = request.method === "POST" && url.pathname === "/transaction" ? "transaction"
+      : request.method === "POST" && url.pathname === "/document" ? "document"
+        : request.method === "POST" && url.pathname === "/artifact" ? "artifact"
+          : request.method === "POST" && url.pathname === "/navigation-publish" ? "document" : null;
+    const serialized = () => this.serializeSearch(async () => {
       const response = await super.fetch(request);
       if (SEARCH_SIDE_EFFECT_PATHS.has(url.pathname)) {
         await this.captureSearchSideEffects(url.pathname, response.clone());
       }
       return response;
     });
+    return kind ? this.trackIncomingRequest(request, kind, serialized) : serialized();
   }
 
   private async handleSearchSyncStatus(): Promise<Response> {

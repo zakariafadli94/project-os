@@ -136,6 +136,72 @@ it.each(["project_queue", "search_queue"] as const)(
   }
 );
 
+it.each(["project_queue", "search_queue"] as const)(
+  "returns receipt absence only after full bound status proof during an unrelated %s operation",
+  async (queue) => {
+    const projectId = queue === "project_queue" ? "PRJ-8434" : "PRJ-8435";
+    const requestId = `TXN-${projectId}-ABSENT-RECEIPT`;
+    const mock = installDropboxMock();
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(guard, (instance) => {
+      const state = instance as unknown as { queueDepth: number; searchQueueDepth: number };
+      if (queue === "project_queue") state.queueDepth = 1;
+      else state.searchQueueDepth = 1;
+    });
+
+    const response = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${requestId}`);
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({ error: "receipt_not_found" });
+    expect(mock.uploadCalls).toHaveLength(0);
+  }
+);
+
+it("keeps the matching ProjectGuard request unknown while its mutation is in flight", async () => {
+  const projectId = "PRJ-8436";
+  const requestId = "ART-PRJ8436-PENDING";
+  installDropboxMock();
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  const observed = await runInDurableObject(guard, async (instance) => {
+    const subject = instance as unknown as {
+      handleArtifact(request: Request): Promise<Response>;
+      fetch(request: Request): Promise<Response>;
+    };
+    let release!: () => void;
+    let entered!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    vi.spyOn(subject, "handleArtifact").mockImplementation(async () => {
+      entered();
+      await hold;
+      return Response.json({ request_id: requestId, project_id: projectId, status: "committed" });
+    });
+    const submit = subject.fetch(new Request("https://project-guard.internal/artifact", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, project_id: projectId, mode: "create" })
+    }));
+    try {
+      await started;
+      const status = await subject.fetch(new Request(
+        `https://project-guard.internal/request-status?kind=artifact&request_id=${requestId}`
+      ));
+      const response = { status: status.status, body: await status.json() };
+      release();
+      await submit;
+      return response;
+    } catch (error) {
+      release();
+      await submit;
+      throw error;
+    }
+  });
+
+  expect(observed.status).toBe(503);
+  expect(observed.body).toMatchObject({
+    status: "unknown", code: "PROJECT_OS_READ_BUSY", request_id: requestId
+  });
+});
+
 it.each(["project_queue", "search_queue"] as const)("refreshes a stale admitted observation with bounded canonical status while %s is busy", async (queue) => {
   const projectId = queue === "project_queue" ? "PRJ-8440" : "PRJ-8442";
   const requestId = `DOCREQ-STALE-STATUS-${projectId}`;
@@ -248,7 +314,7 @@ it("refreshes a stale nonterminal committed observation to the certified finaliz
 });
 
 it.each(["project_queue", "search_queue"] as const)(
-  "keeps an absent request unknown while %s is occupied",
+  "returns verified absence while an unrelated %s operation is occupied",
   async (queue) => {
     const projectId = queue === "project_queue" ? "PRJ-8424" : "PRJ-8425";
     const requestId = `TXN-${projectId}-ABSENT`;
@@ -263,11 +329,11 @@ it.each(["project_queue", "search_queue"] as const)(
     const response = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${requestId}`);
     const body = await response.json<Record<string, unknown>>();
 
-    expect(response.status).toBe(503);
+    expect(response.status).toBe(200);
     expect(body).toMatchObject({
       project_id: projectId, kind: "transaction", request_id: requestId,
-      status: "unknown", code: "PROJECT_OS_READ_BUSY",
-      observation: { status: "unknown", code: "PROJECT_OS_READ_BUSY" }
+      status: "not_received",
+      observation: { status: "not_received", freshness: "verified", recovery: { durable_intent: false, state: "none" } }
     });
     expect(mock.uploadCalls).toHaveLength(0);
     await runInDurableObject(guard, (instance) => {
@@ -427,9 +493,22 @@ it("does not report false absence for a transaction waiting at the search bounda
   const guard = Object.assign(Object.create(SearchSyncProjectGuard.prototype), {
     ctx: { id: { name: "PRJ-0007" } },
     searchQueue: Promise.resolve(),
-    searchQueueDepth: 0
+    searchQueueDepth: 0,
+    readStoredOrRefreshRequestObservation: vi.fn().mockResolvedValue(null),
+    readBoundedRequestStatus: vi.fn().mockResolvedValue(Response.json({
+      project_id: "PRJ-0007", kind: "transaction", request_id: "TXN-QUEUED", status: "not_received",
+      observation: {
+        project_id: "PRJ-0007", kind: "transaction", request_id: "TXN-QUEUED", status: "not_received",
+        freshness: "verified", receipt: null, receipt_status: null, execution_status: null, terminal: false,
+        correlation_id: "corr-queued", code: null,
+        recovery: { durable_intent: false, state: "none", action: "retry_same_request", owner: "client" }
+      }
+    }))
   }) as SearchSyncProjectGuard;
-  const submitted = guard.fetch(new Request("https://guard.internal/transaction", { method: "POST" }));
+  const submitted = guard.fetch(new Request("https://guard.internal/transaction", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ project_id: "PRJ-0007", transaction_id: "TXN-QUEUED" })
+  }));
   await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
   try {
     const status = await guard.fetch(new Request(
@@ -446,6 +525,174 @@ it("does not report false absence for a transaction waiting at the search bounda
     await submitted;
   }
 });
+
+it("does not report absence for the exact ProjectGuard identity waiting on its serializer", async () => {
+  const projectId = "PRJ-8437";
+  const requestId = "ART-PRJ8437-PENDING";
+  let release!: () => void;
+  let entered!: () => void;
+  const hold = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const statusEvidence = {
+    project_id: projectId, kind: "artifact", request_id: requestId, status: "not_received",
+    observation: {
+      project_id: projectId, kind: "artifact", request_id: requestId, status: "not_received",
+      freshness: "verified", receipt: null, receipt_status: null, execution_status: null, terminal: false,
+      correlation_id: "corr-base-queue", code: null,
+      recovery: { durable_intent: false, state: "none", action: "retry_same_request", owner: "client" }
+    }
+  };
+  const guard = Object.assign(Object.create(ProjectGuard.prototype), {
+    ctx: { id: { name: projectId } },
+    queue: Promise.resolve(),
+    queueDepth: 0,
+    readStoredOrRefreshRequestObservation: vi.fn().mockResolvedValue(null),
+    readBoundedRequestStatus: vi.fn().mockResolvedValue(Response.json(statusEvidence)),
+    handleArtifact: vi.fn(async () => {
+      entered();
+      await hold;
+      return Response.json({ request_id: requestId, project_id: projectId, status: "committed" });
+    })
+  }) as unknown as ProjectGuard;
+
+  const submitted = guard.fetch(new Request("https://guard.internal/artifact", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ request_id: requestId, project_id: projectId, mode: "create" })
+  }));
+  try {
+    await started;
+    const status = await guard.fetch(new Request(
+      `https://guard.internal/request-status?kind=artifact&request_id=${requestId}&correlation_id=corr-base-queue`
+    ));
+    expect(status.status).toBe(503);
+    await expect(status.json()).resolves.toMatchObject({
+      status: "unknown", code: "PROJECT_OS_READ_BUSY", request_id: requestId
+    });
+  } finally {
+    release();
+    await submitted;
+  }
+});
+
+it.each(["request-status", "receipt"] as const)(
+  "does not report absence for the matching identity while incoming JSON parsing is pending (%s)",
+  async (route) => {
+    const projectId = route === "request-status" ? "PRJ-8438" : "PRJ-8439";
+    const requestId = `ART-${projectId}-PARSING`;
+    let releaseParsing!: () => void;
+    let parsingStarted!: () => void;
+    const parsingGate = new Promise<void>((resolve) => { releaseParsing = resolve; });
+    const parsingEntered = new Promise<void>((resolve) => { parsingStarted = resolve; });
+    const statusFor = (correlationId: string) => Response.json({
+      project_id: projectId, kind: "artifact", request_id: requestId, status: "not_received",
+      observation: {
+        project_id: projectId, kind: "artifact", request_id: requestId, status: "not_received",
+        freshness: "verified", receipt: null, receipt_status: null, execution_status: null, terminal: false,
+        correlation_id: correlationId, code: null,
+        recovery: { durable_intent: false, state: "none", action: "retry_same_request", owner: "client" }
+      }
+    });
+    const guard = Object.assign(Object.create(ProjectGuard.prototype), {
+      ctx: { id: { name: projectId } },
+      queue: Promise.resolve(),
+      queueDepth: 0,
+      handleArtifact: vi.fn(async () => Response.json({ request_id: requestId, project_id: projectId, status: "committed" })),
+      handleReceiptRead: vi.fn(async () => Response.json({ error: "receipt_not_found" }, { status: 404 })),
+      readStoredRequestObservation: vi.fn().mockResolvedValue(null),
+      readBoundedRequestStatusReceipt: vi.fn().mockResolvedValue(null),
+      readBoundedRequestStatus: vi.fn((url: URL, correlationId: string) => Promise.resolve(statusFor(correlationId)))
+    }) as unknown as ProjectGuard;
+    const submittedRequest = new Request("https://guard.internal/artifact", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, project_id: projectId, mode: "create" })
+    });
+    Object.defineProperty(submittedRequest, "clone", {
+      value: () => ({ json: async () => { parsingStarted(); await parsingGate; return { request_id: requestId, project_id: projectId }; } })
+    });
+
+    const submitted = guard.fetch(submittedRequest);
+    await parsingEntered;
+    try {
+      const status = await guard.fetch(new Request(
+        `https://guard.internal/${route}?kind=artifact&request_id=${requestId}&correlation_id=corr-parse-race`
+      ));
+      expect(status.status).toBe(503);
+      await expect(status.json()).resolves.toMatchObject({
+        project_id: projectId, kind: "artifact", request_id: requestId,
+        status: "unknown", code: "PROJECT_OS_READ_BUSY"
+      });
+    } finally {
+      releaseParsing();
+      await submitted;
+    }
+  }
+);
+
+it.each(["project_queue", "search_queue"] as const)(
+  "rechecks pending identity before returning receipt absence during %s status I/O",
+  async (queue) => {
+    const projectId = queue === "project_queue" ? "PRJ-8443" : "PRJ-8444";
+    const kind = queue === "project_queue" ? "artifact" : "document";
+    const requestId = `${kind === "artifact" ? "ART" : "DOC"}-${projectId}-RACING`;
+    let releaseQueue!: () => void;
+    let resolveStatus!: (response: Response) => void;
+    let statusReadStarted!: () => void;
+    const heldQueue = new Promise<void>((resolve) => { releaseQueue = resolve; });
+    const statusRead = new Promise<Response>((resolve) => { resolveStatus = resolve; });
+    const statusStarted = new Promise<void>((resolve) => { statusReadStarted = resolve; });
+    const guardPrototype = queue === "project_queue" ? ProjectGuard.prototype : SearchSyncProjectGuard.prototype;
+    const guard = Object.assign(Object.create(guardPrototype), {
+      ctx: { id: { name: projectId } },
+      queue: queue === "project_queue" ? heldQueue : Promise.resolve(),
+      queueDepth: queue === "project_queue" ? 1 : 0,
+      searchQueue: queue === "search_queue" ? heldQueue : Promise.resolve(),
+      searchQueueDepth: queue === "search_queue" ? 1 : 0,
+      handleReceiptRead: vi.fn(async () => Response.json({ error: "receipt_not_found" }, { status: 404 })),
+      readStoredRequestObservation: vi.fn().mockResolvedValue(null),
+      readBoundedRequestStatusReceipt: vi.fn().mockResolvedValue(null),
+      readBoundedRequestStatus: vi.fn(async () => { statusReadStarted(); return statusRead; }),
+      handleArtifact: vi.fn(async () => Response.json({ request_id: requestId, project_id: projectId, status: "committed" }))
+    });
+    const expectedAbsence = (correlationId: string) => Response.json({
+      project_id: projectId, kind, request_id: requestId, status: "not_received",
+      observation: {
+        project_id: projectId, kind, request_id: requestId, status: "not_received",
+        freshness: "verified", receipt: null, receipt_status: null, execution_status: null, terminal: false,
+        correlation_id: correlationId, code: null,
+        recovery: { durable_intent: false, state: "none", action: "retry_same_request", owner: "client" }
+      }
+    });
+    const submittingPath = queue === "project_queue" ? "/artifact" : "/navigation-publish";
+    if (queue === "search_queue") {
+      vi.spyOn(SubrequestResilientProjectGuard.prototype, "fetch")
+        .mockResolvedValue(Response.json({ request_id: requestId, project_id: projectId, status: "committed" }));
+    }
+
+    const receiptRead = guard.fetch(new Request(
+      `https://guard.internal/receipt?kind=${kind}&request_id=${requestId}&correlation_id=corr-racing-read`
+    ));
+    await statusStarted;
+    const submitted = guard.fetch(new Request(`https://guard.internal${submittingPath}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, project_id: projectId, mode: "create" })
+    }));
+    const pendingFor = (guard as unknown as { hasPendingRequestIdentity(kind: string, requestId: string): boolean })
+      .hasPendingRequestIdentity.bind(guard);
+    try {
+      await vi.waitFor(() => expect(pendingFor(kind, requestId)).toBe(true));
+      resolveStatus(expectedAbsence("corr-racing-read"));
+      const response = await receiptRead;
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        project_id: projectId, kind, request_id: requestId, status: "unknown", code: "PROJECT_OS_READ_BUSY"
+      });
+    } finally {
+      releaseQueue();
+      resolveStatus(expectedAbsence("corr-racing-read"));
+      await Promise.all([receiptRead, submitted]);
+    }
+  }
+);
 
 it("serves an exact locally committed receipt while unrelated search work is queued", async () => {
   let release!: () => void;
@@ -595,7 +842,7 @@ it("serves a canonical context read while a document reconciliation is waiting o
   const contextRead = guard.fetch(new Request("https://guard.internal/mutation-context"))
     .then((response) => { readFinished = true; return response; });
   try {
-    await vi.waitFor(() => expect(readFinished).toBe(true), { timeout: 150 });
+    await vi.waitFor(() => expect(readFinished).toBe(true), { timeout: 2_000 });
     expect((await contextRead).status).toBe(200);
   } finally {
     release();
@@ -809,7 +1056,7 @@ it("returns an exactly bound terminal navigation conflict on a busy cold cache",
   }
 });
 
-it("returns an identity-bound unknown observation when a busy receipt lookup cannot prove absence", async () => {
+it("returns receipt absence when a full status read proves it despite a receipt-read retry", async () => {
   const projectId = "PRJ-8410";
   const requestId = "TXN-8410-UNKNOWN";
   const mock = installDropboxMock({ faults: [{
@@ -824,14 +1071,8 @@ it("returns an identity-bound unknown observation when a busy receipt lookup can
   const response = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${requestId}`, {
     headers: { "x-project-os-correlation-id": "corr-8410" }
   });
-  const body = await response.json<Record<string, unknown>>();
-
-  expect(response.status).toBe(503);
-  expect(body).toMatchObject({
-    project_id: projectId, kind: "transaction", request_id: requestId, status: "unknown",
-    correlation_id: "corr-8410",
-    observation: { status: "unknown", recovery: { action: "check_status" } }
-  });
+  expect(response.status).toBe(404);
+  await expect(response.json()).resolves.toEqual({ error: "receipt_not_found" });
   expect(mock.uploadCalls).toHaveLength(0);
   expect(mock.downloadCalls.length).toBeGreaterThan(0);
 });

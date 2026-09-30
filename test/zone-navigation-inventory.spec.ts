@@ -388,6 +388,18 @@ describe("ZoneNavigationInventory", () => {
     const { entry } = await seedHistoricalPublishedHead(h);
 
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+    const version = JSON.parse(h.files.get(machineDocumentVersionPath(projectId, documentId, entry.version))!.content);
+    const intentPath = `${machineDocumentRoot(projectId)}/requests/${version.request_id}/intent.json`;
+    const receiptPath = `${machineDocumentRoot(projectId)}/requests/${version.request_id}/receipt.json`;
+    const intent = JSON.parse(h.files.get(intentPath)!.content);
+    const receipt = JSON.parse(h.files.get(receiptPath)!.content);
+    delete intent.request_json;
+    delete receipt.request_json;
+    h.put(intentPath, JSON.stringify(intent));
+    h.put(receiptPath, JSON.stringify(receipt));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+    h.put(receiptPath, JSON.stringify({ ...receipt, request_sha256: "0".repeat(64) }));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
 
   it("accepts a legacy external published head only while its visible bytes equal the immutable payload", async () => {

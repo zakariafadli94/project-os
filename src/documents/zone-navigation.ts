@@ -182,6 +182,61 @@ export class ZoneNavigationEngine {
         const pagePath = `${pagesRoot}/${current.verify_page.toString().padStart(8, "0")}.json`;
         const page = await this.readJson(pagePath, budget) as SnapshotPage | null;
         if (!page || page.snapshot_id !== current.source_snapshot_id) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_page_invalid", budget);
+        // Independent managed heads have no shared effects. Verify two exact
+        // physical sources concurrently, then durably advance the cursor only
+        // after both immutable proofs exist. A torn pair is safe to recheck.
+        if (current.verify_entry === 0 && current.verify_cursor === null && page.entries.length === 1 && page.entries[0].resource_id.startsWith("head:")
+          && current.verify_page + 1 < current.page_count && budget.canStartEffect(18)) {
+          const nextPageNumber = current.verify_page + 1;
+          const nextPage = await this.readJson(`${pagesRoot}/${nextPageNumber.toString().padStart(8, "0")}.json`, budget) as SnapshotPage | null;
+          if (!nextPage || nextPage.snapshot_id !== current.source_snapshot_id) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_page_invalid", budget);
+          if (nextPage.entries.length === 1 && nextPage.entries[0].resource_id.startsWith("head:")) {
+            const first = page.entries[0];
+            const second = nextPage.entries[0];
+            const firstPageNumber = current.verify_page;
+            const snapshotId = current.source_snapshot_id;
+            // Reserve enough provider calls and time to persist a fallback
+            // cursor if two expensive physical checks cannot fit this slice.
+            const pairBudget: SliceBudget = {
+              get deadline_ms() { return budget.deadline_ms - 8_000; },
+              get calls_left() { return Math.max(0, budget.calls_left - 4); },
+              now: budget.now,
+              signal: budget.signal,
+              beforeHttp() {
+                if (budget.calls_left <= 4 || budget.now() >= budget.deadline_ms - 8_000) throw new Error("slice_budget_exhausted");
+                budget.beforeHttp();
+              },
+              canStartEffect(required) {
+                return budget.calls_left >= required + 4 && budget.now() < budget.deadline_ms - 8_000 && !budget.signal.aborted;
+              }
+            };
+            const verified = await Promise.allSettled([
+              this.inventory.verifyEntry(first, pairBudget), this.inventory.verifyEntry(second, pairBudget)
+            ]);
+            const verificationError = verified.find((item) => item.status === "rejected");
+            if (verificationError?.status === "rejected") {
+              if (!isBudgetExhausted(verificationError.reason)) throw verificationError.reason;
+              current.verify_cursor = "single-head";
+              current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+              return { status: "pending", cursor: `verify:${current.verify_page}:0` };
+            }
+            if (verified.some((item) => item.status === "fulfilled" && !item.value)) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_physical_source_unverified", budget);
+            const proofs = await Promise.allSettled([first, second].map((entry, index) => this.immutable(
+              `${root}/navigation/catalog-rebuild/verified/${(firstPageNumber + index).toString().padStart(8, "0")}-00000000.json`,
+              { schema_version: "1.0", project_id: request.project_id, request_id: request.request_id, snapshot_id: snapshotId, entry }, pairBudget
+            )));
+            const proofError = proofs.find((item) => item.status === "rejected");
+            if (proofError?.status === "rejected") {
+              if (!isBudgetExhausted(proofError.reason)) throw proofError.reason;
+              current.verify_cursor = "single-head";
+              current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+              return { status: "pending", cursor: `verify:${current.verify_page}:0` };
+            }
+            current.verify_page += 2;
+            current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+            continue;
+          }
+        }
         while (current.verify_entry < page.entries.length) {
           if (!budget.canStartEffect(12)) return { status: "pending", cursor: `verify:${current.verify_page}:${current.verify_entry}` };
           const entry = page.entries[current.verify_entry];

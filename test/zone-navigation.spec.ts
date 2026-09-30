@@ -369,6 +369,72 @@ async function runSparseCatalogRebuildWithLegacyProgress(includeOmittedSourceId 
 }
 
 describe("zone navigation identity and resumable reconciliation", () => {
+  it("verifies independent catalog rebuild pages concurrently before advancing their cursor", async () => {
+    const h = runtimeHarness();
+    const project = state();
+    const input = navigationReconcileSchema.parse({
+      ...request("REVIEW"), request_id: "DOCREQ-NAV-CATALOG-VERIFY-BATCH-0001",
+      purpose: "compact_catalog_rebuild", expected_source_generation: 0,
+      expected_catalog_manifest: { object_id: "manifest-object", revision_token: "manifest-rev", content_sha256: "a".repeat(64) }
+    }) as NavigationCatalogRebuildRequest;
+    const root = await new ExecutionJournal(h.runtime, input.project_id, "document", input.request_id).root();
+    const entries = [0, 1].map((index) => ({
+      project_id: input.project_id, zone: input.zone, resource_id: `head:DOC-${String(index + 1).padStart(24, "0")}`,
+      version: `VER-${index + 1}`, logical_path: `plans/${index + 1}.md`,
+      path: `${workspaceProjectRoot(input.project_id, project.slug)}/REVIEW/plans/${index + 1}.md`,
+      expected: { object_id: `id:${index + 1}`, revision_token: `rev:${index + 1}`, content_sha256: "b".repeat(64), size: 1 }
+    })) as NavigationInventoryEntry[];
+    for (const [page, entry] of entries.entries()) h.put(`${root}/navigation/catalog-rebuild/snapshot/${String(page).padStart(8, "0")}.json`, JSON.stringify({
+      schema_version: "1.0", page, project_id: input.project_id, request_id: input.request_id,
+      snapshot_id: "source:0", entries: [entry], gaps: []
+    }));
+    const verifyingProgress = {
+      schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: input.project_id, request_id: input.request_id,
+      request_hash: await executionHash(input), zone: input.zone, source_generation: 0, source_snapshot_id: "source:0",
+      cursor: null, page_count: 2, source_count: 2, source_ids: entries.map((entry) => entry.resource_id),
+      shard_cursor: 0, shard_count: 0, stage_page: 0, staging_entries: [], staged_shards: [],
+      invalidated_manifest: null, chunk_evidence: [], status: "verifying", finalization_ref: null, coverage_gaps: []
+    };
+    h.put(`${root}/navigation-catalog-rebuild-progress.json`, JSON.stringify(verifyingProgress));
+    const manifestPath = `${machineDocumentRoot(input.project_id)}/navigation-sources/REVIEW/catalog/compact/ready.json`;
+    const admission = { ...(await admissionFor(input)), resource_effect_scopes: [{
+      resource_id: "navigation:REVIEW", resource_version: "0", provider_id: "test-provider",
+      sources: [{ path: manifestPath, logical_path: manifestPath }], destinations: [{ path: manifestPath, logical_path: manifestPath }], preservation_copies: []
+    }] } as ExecutionAdmission;
+    let active = 0;
+    let peak = 0;
+    const port: NavigationInventoryPort = {
+      listPage: async () => { throw new Error("scan already complete"); },
+      verifySnapshot: async () => true,
+      verifyEntry: async () => {
+        active += 1; peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        active -= 1; return true;
+      }
+    };
+    // The fixture intentionally omits the later staging intent: this test
+    // stops at the persisted verification cursor, before publication.
+    await new ZoneNavigationEngine(h.runtime, port).prepareCompactCatalogRebuild(input, project, admission, budget(64))
+      .catch((error) => expect((error as Error).message).toBe("navigation_catalog_rebuild_intent_missing"));
+    expect(peak).toBe(2);
+    expect(JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content)).toMatchObject({ verify_page: 2, verify_entry: 0 });
+
+    // A pair that cannot fit in one slice must switch durably to the
+    // sequential path; otherwise every wake repeats the same pair forever.
+    h.put(`${root}/navigation-catalog-rebuild-progress.json`, JSON.stringify(verifyingProgress));
+    const expensivePort: NavigationInventoryPort = {
+      ...port,
+      verifyEntry: async (_entry, slice) => {
+        for (let index = 0; index < 20; index += 1) slice.beforeHttp();
+        return true;
+      }
+    };
+    const expensiveEngine = new ZoneNavigationEngine(h.runtime, expensivePort);
+    await expensiveEngine.prepareCompactCatalogRebuild(input, project, admission, budget(32));
+    expect(JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content)).toMatchObject({ verify_page: 0, verify_cursor: "single-head" });
+    await expensiveEngine.prepareCompactCatalogRebuild(input, project, admission, budget(32));
+    expect(JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content)).toMatchObject({ verify_page: 1, verify_cursor: null });
+  });
   it("keeps legacy reconcile requests compatible and binds catalog rebuild purpose to the exact manifest", () => {
     const normal = request();
     expect(normal.purpose).toBeUndefined();

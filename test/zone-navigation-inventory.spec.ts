@@ -350,6 +350,19 @@ describe("ZoneNavigationInventory", () => {
     forgedReceipt.provider_rev = "rev-unrelated";
     h.put(receiptPath, JSON.stringify({ ...savedReceipt, receipt_json: JSON.stringify(forgedReceipt) }));
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+
+    // Earlier committed promotions retained the exact request digest but not
+    // its JSON envelope. They remain provable from the immutable version.
+    const intentPath = `${machineDocumentRoot(projectId)}/requests/${requestId}/intent.json`;
+    const legacyIntent = JSON.parse(h.files.get(intentPath)!.content);
+    delete legacyIntent.request_json;
+    h.put(intentPath, JSON.stringify(legacyIntent));
+    const legacyReceipt = { ...savedReceipt };
+    delete legacyReceipt.request_json;
+    h.put(receiptPath, JSON.stringify(legacyReceipt));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+    h.put(receiptPath, JSON.stringify({ ...legacyReceipt, request_sha256: "0".repeat(64) }));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
 
   it("accepts a DELIVERABLES head only when its exact committed publication proves the provider move", async () => {

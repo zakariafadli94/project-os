@@ -836,9 +836,18 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     try {
       intent = JSON.parse(intentRaw) as Record<string, unknown>;
       if (intent.schema_version !== "1.0" || intent.project_id !== projectId || intent.request_id !== version.request_id
-        || typeof intent.request_json !== "string" || typeof intent.request_sha256 !== "string"
-        || await sha256Text(intent.request_json) !== intent.request_sha256) return false;
-      request = parseManagedDocumentRequest(JSON.parse(intent.request_json)) as unknown as Record<string, unknown>;
+        || typeof intent.request_sha256 !== "string") return false;
+      // Legacy committed promotions stored only the raw request digest. The
+      // immutable version contains every field needed to reconstruct that
+      // minimal request; require its exact raw digest before trusting it.
+      const requestJson = typeof intent.request_json === "string" ? intent.request_json
+        : intent.request_json === undefined ? JSON.stringify({
+          operation: "review.promote", request_id: version.request_id, project_id: projectId,
+          document_id: documentId, expected_version_id: version.parent_version_id,
+          created_at: version.created_at
+        }) : null;
+      if (!requestJson || await sha256Text(requestJson) !== intent.request_sha256) return false;
+      request = parseManagedDocumentRequest(JSON.parse(requestJson)) as unknown as Record<string, unknown>;
     } catch { return false; }
     if (request.operation !== "review.promote" || request.request_id !== version.request_id
       || request.project_id !== projectId || request.document_id !== documentId

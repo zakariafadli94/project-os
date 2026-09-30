@@ -1202,6 +1202,36 @@ describe("ZoneNavigationInventory", () => {
     expect(await h.inventory.verifyEntry(entries[0], budget())).toBe(true);
   });
 
+  it("ignores a superseded committed artifact while the newer visible file still exists", async () => {
+    const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/report.md`;
+    await seedCommittedArtifact(h, "ART-NAVIGATION-OLD-001", destination, "old report");
+    await seedCommittedArtifact(h, "ART-NAVIGATION-NEW-001", destination, "new report");
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, mode: "canonical_catalog_rebuild", budget: budget() });
+      pages.push(page); cursor = page.next_cursor;
+    } while (cursor !== null);
+    expect(pages.flatMap((page) => page.gaps)).toEqual([]);
+    expect(pages.flatMap((page) => page.entries)).toHaveLength(1);
+    expect(pages.flatMap((page) => page.entries)[0].version).toBe(`ART-NAVIGATION-NEW-001:${await sha256Text("new report")}`);
+  });
+
+  it("does not silently omit a changed artifact with no current receipt or managed head", async () => {
+    const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/report.md`;
+    await seedCommittedArtifact(h, "ART-NAVIGATION-OLD-001", destination, "old report");
+    h.put(destination, "unreceived change");
+    const gaps = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, mode: "canonical_catalog_rebuild", budget: budget() });
+      gaps.push(...page.gaps); cursor = page.next_cursor;
+    } while (cursor !== null);
+    expect(gaps).toContainEqual({ resource_id: `artifact:${await sha256Text(destination)}`, code: "committed_artifact_source_unverified" });
+  });
+
   it("refreshes the stable artifact catalog entry after a committed same-destination replacement", async () => {
     const h = harness();
     const destination = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/report.md`;

@@ -111,6 +111,12 @@ export const navigationCatalogRebuildProgressSchema = z.strictObject({
   verify_cursor: z.string().nullable().default(null),
   stage_page: z.number().int().nonnegative().safe().default(0),
   staging_entries: z.array(z.lazy(() => navigationInventoryEntrySchema)).max(256).default([]),
+  staging_index_page: z.number().int().nonnegative().safe().nullable().default(null),
+  staging_page_index: z.array(z.strictObject({
+    shard: z.number().int().nonnegative().max(63),
+    pages: z.array(z.number().int().nonnegative().safe()).max(4096)
+  })).max(64).default([]),
+  staging_index_complete: z.boolean().default(false),
   staged_shards: z.array(z.number().int().nonnegative().max(63)).max(64).default([]),
   invalidated_manifest: navigationCatalogManifestIdentitySchema.nullable().default(null),
   chunk_evidence: z.array(navigationCatalogChunkEvidenceSchema).max(64).default([]),
@@ -119,6 +125,11 @@ export const navigationCatalogRebuildProgressSchema = z.strictObject({
   coverage_gaps: z.array(z.strictObject({ resource_id: z.string().min(1).max(512), code: z.string().min(1).max(128) }))
 }).superRefine((progress, ctx) => {
   if (progress.source_snapshot_id !== null && progress.source_snapshot_id !== `source:${progress.source_generation}`) ctx.addIssue({ code: "custom", path: ["source_snapshot_id"], message: "catalog rebuild progress snapshot does not match its source generation" });
+  if (new Set(progress.staging_page_index.map((item) => item.shard)).size !== progress.staging_page_index.length
+    || progress.staging_page_index.some((item) => item.pages.some((page, index) => page >= progress.page_count || (index > 0 && item.pages[index - 1] >= page)))) {
+    ctx.addIssue({ code: "custom", path: ["staging_page_index"], message: "catalog rebuild staging page index must contain unique shards and ordered in-range pages" });
+  }
+  if (progress.staging_index_complete && progress.staging_index_page !== null) ctx.addIssue({ code: "custom", path: ["staging_index_page"], message: "completed catalog rebuild staging index cannot have a cursor" });
   if (progress.status === "finalized" && !progress.finalization_ref) ctx.addIssue({ code: "custom", path: ["finalization_ref"], message: "finalized catalog rebuild must reference its certificate" });
   if (progress.status !== "finalized" && progress.finalization_ref !== null) ctx.addIssue({ code: "custom", path: ["finalization_ref"], message: "unfinished catalog rebuild cannot expose a certificate" });
   if (progress.coverage_gaps.length > 0 && progress.status === "prepared") ctx.addIssue({ code: "custom", path: ["coverage_gaps"], message: "catalog rebuild with source gaps cannot be prepared" });

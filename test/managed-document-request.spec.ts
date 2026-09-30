@@ -82,6 +82,38 @@ describe("managed document API request", () => {
     expect(() => parseManagedDocumentRequest({ ...request, stage: "reference" })).toThrow();
   });
 
+  it("admits quarantine only with exact published provider identity and both content hashes", async () => {
+    const request = {
+      operation: "document.quarantine_instance",
+      request_id: "DOCREQ-QUARANTINE-0001",
+      project_id,
+      document_id,
+      version_id: expected_version_id,
+      logical_path: "strategies/current.md",
+      expected_project_revision: 2333,
+      expected_source_generation: 5,
+      observed_provider: {
+        object_id: "id:drifted", revision_token: "rev-drifted",
+        path: "/PROJECT/DELIVERABLES/strategies/current.md", size: 9,
+        provider_hash: "d".repeat(64)
+      },
+      content_sha256: "b".repeat(64),
+      created_at
+    } as const;
+
+    const parsed = parseManagedDocumentRequest(request);
+    expect(parsed).toEqual(request);
+    const normalized = await normalizeDocumentAdmission(parsed);
+    expect(normalized).toMatchObject({
+      operation: "document.quarantine_instance",
+      resources: [{ resource_id: document_id, resource_type: "document", zone: "DELIVERABLES", expected_version: expected_version_id }]
+    });
+    expect(normalized.resources[0].version).toMatch(new RegExp(`^${expected_version_id}:5:${"b".repeat(64)}:[a-f0-9]{64}$`));
+    expect(() => parseManagedDocumentRequest({ ...request, observed_provider: { ...request.observed_provider, path: "/PROJECT/WORKING/strategies/current.md" } })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, archive_path: "ARCHIVES/chosen.md" })).toThrow();
+    expect(() => parseManagedDocumentRequest({ ...request, observed_provider: { ...request.observed_provider, provider_hash: "not-a-hash" } })).toThrow();
+  });
+
   it("binds a safe archive grouping to the request without accepting an arbitrary destination", async () => {
     const request = {
       operation: "document.archive", request_id: "DOCREQ-ARCHIVE-GROUP-0001", project_id,

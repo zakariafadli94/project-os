@@ -121,6 +121,18 @@ export async function normalizeDocumentAdmission(
     }];
     return { ...await normalized(request.project_id, request.operation, resources, request), dependency_classification: "resource_bound", dependency_resources: resources };
   }
+  if (request.operation === "document.quarantine_instance") {
+    const providerBinding = await sha256Canonical(request.observed_provider);
+    const resources = [{
+      resource_id: request.document_id,
+      resource_type: "document",
+      zone: "DELIVERABLES",
+      version: `${request.version_id}:${request.expected_source_generation}:${request.content_sha256}:${providerBinding}`,
+      expected_version: request.version_id,
+      relative_path: request.logical_path
+    }];
+    return { ...await normalized(request.project_id, request.operation, resources, request), dependency_classification: "resource_bound", dependency_resources: resources };
+  }
   if (request.operation === "package.replace") {
     const resources = [{ resource_id: request.candidate.package_id, resource_type: "package", zone: request.zone, version: packageResourceVersion(request.candidate) }];
     return { ...await normalized(request.project_id, request.operation, resources, request), dependency_classification: "resource_bound", dependency_resources: resources };

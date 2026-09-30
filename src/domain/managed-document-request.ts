@@ -137,6 +137,36 @@ const instanceRepairSchema = z.strictObject({
   }
 });
 
+const quarantineInstanceProvider = z.strictObject({
+  object_id: z.string().regex(/^id:[A-Za-z0-9_-]+$/),
+  revision_token: z.string().min(1).max(256),
+  path: z.string().min(1),
+  size: z.number().int().nonnegative().safe(),
+  provider_hash: hash
+}).superRefine((value, ctx) => {
+  if (!value.path.startsWith("/") || !value.path.includes("/DELIVERABLES/") || value.path.includes("..")) {
+    ctx.addIssue({ code: "custom", path: ["path"], message: "quarantine provider path must be a safe DELIVERABLES path" });
+  }
+});
+
+const quarantineInstanceSchema = z.strictObject({
+  operation: z.literal("document.quarantine_instance"),
+  request_id: requestId,
+  project_id: projectId,
+  document_id: documentId,
+  version_id: versionId,
+  logical_path: logicalPath,
+  expected_project_revision: z.number().int().nonnegative().safe(),
+  expected_source_generation: z.number().int().nonnegative().safe(),
+  observed_provider: quarantineInstanceProvider,
+  content_sha256: hash,
+  created_at: createdAt
+}).superRefine((value, ctx) => {
+  if (!value.observed_provider.path.endsWith(`/DELIVERABLES/${value.logical_path}`)) {
+    ctx.addIssue({ code: "custom", path: ["observed_provider", "path"], message: "quarantine provider path must match the DELIVERABLES logical path" });
+  }
+});
+
 export const managedDocumentRequestSchema = z.discriminatedUnion("operation", [
   navigationReconcileSchema,
   z.strictObject({ operation: z.literal("package.replace"), request_id: requestId, project_id: projectId, candidate: packageRefSchema, zone: packageZoneSchema, expected_navigation_generation: z.number().int().nonnegative().safe(), expected_project_revision: z.number().int().nonnegative().safe(), created_at: createdAt }),
@@ -149,7 +179,8 @@ export const managedDocumentRequestSchema = z.discriminatedUnion("operation", [
   reopenSchema,
   referenceClassifySchema,
   documentArchiveSchema,
-  instanceRepairSchema
+  instanceRepairSchema,
+  quarantineInstanceSchema
 ]);
 
 export type ManagedDocumentRequest = z.infer<typeof managedDocumentRequestSchema>;

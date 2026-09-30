@@ -57,6 +57,7 @@ import { workspaceProjectRoot } from "../persistence/layout";
 
 const DROPBOX_PROVIDER_ID = "dropbox";
 const DROPBOX_CONTENT_HASH_ALGORITHM = "dropbox-content-hash";
+const headMutationLocks = new WeakMap<object, Map<string, { reservation: string | null; active: boolean }>>();
 
 async function sha256Bytes(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
@@ -289,7 +290,25 @@ export class DocumentLedgerRepository {
     }
   }
 
-  async writeHead(head: ManagedDocumentHeadWriteInput): Promise<void> {
+  async withHeadReservation<T>(projectId: string, documentId: string, ownerHash: string, work: () => Promise<T>): Promise<T> {
+    const locks = this.headLocks();
+    const key = `${projectId}/${documentId}`;
+    const existing = locks.get(key);
+    if (existing?.active || existing?.reservation) throw new Error("DOCUMENT_HEAD_RESERVATION_CONFLICT");
+    const reservation = { reservation: ownerHash, active: false };
+    locks.set(key, reservation);
+    try { return await work(); }
+    finally { if (locks.get(key) === reservation) locks.delete(key); }
+  }
+
+  async writeHead(head: ManagedDocumentHeadWriteInput, expectedRevisionToken?: string, reservationOwnerHash?: string): Promise<void> {
+    const lock = this.headLocks().get(`${head.project_id}/${head.document_id}`);
+    if (lock?.reservation && lock.reservation !== reservationOwnerHash) throw new Error("DOCUMENT_HEAD_RESERVED");
+    if (lock?.active) throw new Error("DOCUMENT_HEAD_WRITE_CONFLICT");
+    const held = lock ?? { reservation: null, active: false };
+    held.active = true;
+    this.headLocks().set(`${head.project_id}/${head.document_id}`, held);
+    try {
     const serialized = encodeManagedDocumentHead(head, this.schemaWriterStage);
     const validated = readManagedDocumentHead(serialized).head;
     const pointers: Array<[keyof ManagedDocumentHead, string | undefined]> = [
@@ -319,13 +338,39 @@ export class DocumentLedgerRepository {
     const exactContent = pretty(serialized);
     const writeHash = await sha256Text(exactContent);
     const tickets = recoveryZones.length
-      ? await sources.beginHeadWrites(validated.project_id, affectedZones, `head:${validated.document_id}`, undefined, recoveryZones, writeHash)
+      ? await sources.beginHeadWrites(validated.project_id, affectedZones, `head:${validated.document_id}`, undefined, recoveryZones, writeHash, false, reservationOwnerHash)
       : [];
-    await this.runtime.objects.upsertText(path, exactContent);
+    try {
+      if (expectedRevisionToken !== undefined) await this.runtime.conditionalWrite.writeTextConditional(path, exactContent, expectedRevisionToken);
+      else await this.runtime.objects.upsertText(path, exactContent);
+    } catch (error) {
+      if (tickets.length) {
+        try { await sources.completeHeadWrites(tickets); } catch { /* A stale head hash discards the reservation without writing a marker. */ }
+      }
+      throw error;
+    }
     if (tickets.length) {
       if (await this.runtime.objects.readText(path) !== exactContent) throw new Error("navigation_source_head_write_unverified");
       await sources.completeHeadWrites(tickets);
     }
+    } finally {
+      held.active = false;
+      if (held.reservation === null && this.headLocks().get(`${head.project_id}/${head.document_id}`) === held) {
+        this.headLocks().delete(`${head.project_id}/${head.document_id}`);
+      }
+    }
+  }
+
+  async headWriteHash(head: ManagedDocumentHeadWriteInput): Promise<string> {
+    const serialized = encodeManagedDocumentHead(head, this.schemaWriterStage);
+    readManagedDocumentHead(serialized);
+    return sha256Text(pretty(serialized));
+  }
+
+  private headLocks(): Map<string, { reservation: string | null; active: boolean }> {
+    let locks = headMutationLocks.get(this.runtime);
+    if (!locks) { locks = new Map(); headMutationLocks.set(this.runtime, locks); }
+    return locks;
   }
 
   async readProviderFileBinding(projectId: string, providerFileId: string): Promise<ProviderFileBindingRecord | null> {

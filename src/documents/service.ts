@@ -10,6 +10,7 @@ import { samePayload } from "../artifacts/staged-publication";
 import { assertManagedRelativePath, assertReferenceCollectionPath, documentIdFor } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
 import {
+  matchesDropboxV1Evidence,
   requireDropboxV1Evidence,
   toManagedProviderObservation
 } from "../persistence/compatibility/dropbox-v1-evidence";
@@ -17,7 +18,7 @@ import {
   asProjectOsPersistence,
   type PersistenceInput
 } from "../persistence/compatibility/legacy-dropbox-runtime";
-import { machineDocumentProviderPayloadPath, workspaceManagedDocumentPath, workspaceProjectRoot } from "../persistence/layout";
+import { machineDocumentProviderPayloadPath, workspaceManagedDocumentPath } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import {
@@ -28,11 +29,12 @@ import { sha256Text } from "./hash";
 import { enforceManagedMarkdownIdentity } from "./identity-frontmatter";
 import { DocumentLedgerRepository } from "./repository";
 import { ManagedDocumentPromotionJournal } from "./promotion-journal";
+import { ZoneNavigationSources } from "./zone-navigation-sources";
 import { DocumentPackageReplacement, type PackageReplaceRequest, type PackageExecutionOptions } from "./package-replacement";
 import type { ExecutionAdmission } from "../execution/contract";
 import type { ManagedDocumentRequest } from "../domain/managed-document-request";
 import { readDocumentVersionRecord, readManagedDocumentHead } from "../schema/managed-document";
-import { machineDocumentHeadPath, machineDocumentInstanceRepairPath, machineDocumentVersionPath } from "../persistence/layout";
+import { machineDocumentHeadPath, machineDocumentInstanceRepairPath, machineDocumentRoot, machineDocumentVersionPath, workspaceProjectRoot } from "../persistence/layout";
 import { canonicalJson } from "../rules/contract";
 import { sha256Canonical } from "../materialization/hash";
 
@@ -92,11 +94,13 @@ export interface ManagedDocumentReceipt {
   status: "committed";
   provider_rev?: string;
   candidate_request_id?: string;
-  accepted?: true;
+  accepted?: true | false;
   published?: true;
   archived_stage?: "working" | "review" | "published";
   archive_path?: string;
-  operation?: "document.instance.repair";
+  payload_ref?: string;
+  operation?: "document.instance.repair" | "document.quarantine_instance";
+  content_sha256?: string;
   request_sha256?: string;
   request_payload_sha256?: string;
   admission_request_sha256?: string;
@@ -262,6 +266,316 @@ export class ManagedDocumentService {
     return this.instanceRepairReceipt(request, actor, proofRef, await sha256Text(proofText), requestSha256, requestPayloadSha256);
   }
 
+  async quarantinePublishedInstance(
+    request: Extract<ManagedDocumentRequest, { operation: "document.quarantine_instance" }>,
+    state: ProjectState,
+    actor: { actor_id: string; authority: string }
+  ): Promise<ManagedDocumentReceipt> {
+    if (actor.actor_id !== "control_tower" || actor.authority !== "control_tower_operator") throw new Error("document_quarantine_authority_required");
+    const requestSha256 = await sha256Canonical(request);
+    const requestPayloadSha256 = await sha256Text(JSON.stringify(request));
+    const operationRoot = `${machineDocumentRoot(request.project_id)}/quarantines/${request.request_id}`;
+    const intentPath = `${operationRoot}/intent.json`;
+    const copyProofPath = `${operationRoot}/copy-verified.json`;
+    const payloadPath = `${operationRoot}/payload.bin`;
+    const payloadProofPath = `${operationRoot}/payload-verified.json`;
+    const completionPath = `${operationRoot}/receipt.json`;
+    const archivePath = `${workspaceProjectRoot(state.project_id, state.slug)}/ARCHIVES/QUARANTINED-PUBLISHED/${request.document_id}/${request.version_id}/${request.request_id}/${request.logical_path}`;
+    const intent = {
+      schema_version: "1.0", operation: request.operation, request_id: request.request_id,
+      request_sha256: requestSha256, request_payload_sha256: requestPayloadSha256,
+      project_id: request.project_id, document_id: request.document_id, version_id: request.version_id,
+      logical_path: request.logical_path, expected_project_revision: request.expected_project_revision,
+      expected_source_generation: request.expected_source_generation, observed_provider: request.observed_provider,
+      content_sha256: request.content_sha256, archive_path: archivePath, payload_path: payloadPath, actor
+    };
+    const intentText = canonicalJson(intent);
+    const priorIntent = await this.runtime.objects.readText(intentPath);
+    if (priorIntent !== null && priorIntent !== intentText) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_INTENT_CONFLICT", "A different quarantine intent already exists for this request", request.document_id);
+    if (priorIntent === null) {
+      try { await this.runtime.objects.createText(intentPath, intentText); }
+      catch (error) {
+        if (!(error instanceof ProviderConflictError) || await this.runtime.objects.readText(intentPath) !== intentText) throw error;
+      }
+    }
+    const completed = await this.runtime.objects.readText(completionPath);
+    if (completed !== null) {
+      const record = JSON.parse(completed) as Record<string, unknown>;
+      if (record.request_sha256 !== requestSha256 || record.request_payload_sha256 !== requestPayloadSha256
+        || record.archive_path !== archivePath || record.content_sha256 !== request.content_sha256
+        || record.payload_ref !== payloadPath
+        || canonicalJson(record.actor) !== canonicalJson(actor)) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_RECEIPT_CONFLICT", "A different quarantine receipt already exists", request.document_id);
+      const [payloadProof, payloadBefore] = await Promise.all([
+        this.runtime.objects.readText(payloadProofPath), this.runtime.objects.getMetadata(payloadPath)
+      ]);
+      const payloadBytes = await this.runtime.objects.readBytes?.(payloadPath, MAX_PUBLISHED_ARCHIVE_BYTES);
+      const payloadAfter = await this.runtime.objects.getMetadata(payloadPath);
+      let payloadEvidence;
+      try { payloadEvidence = payloadAfter ? requireDropboxV1Evidence(payloadAfter) : null; }
+      catch { payloadEvidence = null; }
+      let payloadRecord: Record<string, unknown> | null = null;
+      try { payloadRecord = payloadProof === null ? null : JSON.parse(payloadProof) as Record<string, unknown>; }
+      catch { payloadRecord = null; }
+      if (!payloadProof || !payloadBefore || !payloadAfter || !payloadBytes || !payloadEvidence
+        || record.payload_proof_sha256 !== await sha256Text(payloadProof)
+        || payloadBefore.objectId !== payloadAfter.objectId || payloadBefore.revisionToken !== payloadAfter.revisionToken
+        || payloadAfter.path !== payloadPath || payloadAfter.size !== request.observed_provider.size
+        || payloadBytes.byteLength !== request.observed_provider.size || await sha256Bytes(payloadBytes) !== request.content_sha256
+        || payloadRecord?.request_sha256 !== requestSha256 || payloadRecord.payload_path !== payloadPath
+        || payloadRecord.content_sha256 !== request.content_sha256 || payloadRecord.bytes_accepted !== false
+        || canonicalJson(payloadRecord.actor) !== canonicalJson(actor)
+        || payloadEvidence.content_hash !== request.observed_provider.provider_hash) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PAYLOAD_CONFLICT", "Committed machine quarantine payload failed replay verification", request.document_id);
+      }
+      return this.quarantineReceipt(request, actor, archivePath, payloadPath, completionPath, await sha256Text(completed), requestSha256, requestPayloadSha256);
+    }
+    return this.ledger.withHeadReservation(request.project_id, request.document_id, requestSha256, async () => {
+    if (request.project_id !== state.project_id || request.expected_project_revision !== state.revision) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PROJECT_REVISION_CONFLICT", "Project revision changed", request.document_id);
+    const sources = new ZoneNavigationSources(this.runtime);
+
+    const headPath = machineDocumentHeadPath(request.project_id, request.document_id);
+    const versionPath = machineDocumentVersionPath(request.project_id, request.document_id, request.version_id);
+    const headRaw = await this.readStableText(headPath);
+    const versionRaw = await this.readStableText(versionPath);
+    if (!headRaw || !versionRaw) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_EVIDENCE_UNAVAILABLE", "Current head or immutable version record is unavailable", request.document_id);
+    const head = readManagedDocumentHead(JSON.parse(headRaw.text)).head;
+    const version = readDocumentVersionRecord(JSON.parse(versionRaw.text)).record;
+    if (head.project_id !== request.project_id || head.document_id !== request.document_id || head.kind !== "work_product"
+      || head.logical_path !== request.logical_path || head.reconciliation_status !== "clean"
+      || version.project_id !== request.project_id || version.document_id !== request.document_id || version.version_id !== request.version_id
+      || version.kind !== "work_product" || version.stage !== "published" || version.logical_path !== request.logical_path) {
+      throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_BINDING_CONFLICT", "Published document head or immutable version does not match the request", request.document_id);
+    }
+    const wasPublished = head.published_version_id === request.version_id;
+    const alreadyRetired = head.published_version_id === undefined && head.provider?.published === undefined;
+    if (!wasPublished && !alreadyRetired) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_BINDING_CONFLICT", "Published head has moved to another version", request.document_id);
+    if (!version.content_sha256) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_IMMUTABLE_HASH_MISSING", "Immutable published version has no canonical SHA-256", request.document_id);
+    const sourcePath = workspaceManagedDocumentPath(request.project_id, state.slug, "deliverables", request.logical_path);
+    if (!this.runtime.objects.readBytes) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_IMMUTABLE_EVIDENCE_UNAVAILABLE", "Provider cannot read the immutable published version bytes", request.document_id);
+    const immutableBefore = await this.runtime.objects.getMetadata(version.immutable_payload_path);
+    const immutableBytes = await this.runtime.objects.readBytes(version.immutable_payload_path, MAX_PUBLISHED_ARCHIVE_BYTES);
+    const immutableAfter = await this.runtime.objects.getMetadata(version.immutable_payload_path);
+    if (!immutableBefore || !immutableAfter || !immutableBytes || immutableBytes.byteLength !== immutableBefore.size
+      || immutableBefore.objectId !== immutableAfter.objectId || immutableBefore.revisionToken !== immutableAfter.revisionToken
+      || immutableBefore.size !== immutableAfter.size || await sha256Bytes(immutableBytes) !== version.content_sha256) {
+      throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_IMMUTABLE_EVIDENCE_UNAVAILABLE", "Immutable published version bytes failed stable verification", request.document_id);
+    }
+    const source = await this.runtime.objects.getMetadata(sourcePath);
+    let sourceBytes: Uint8Array | null = null;
+    if (source) {
+      let evidence;
+      try { evidence = requireDropboxV1Evidence(source); }
+      catch { throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PROVIDER_EVIDENCE_UNAVAILABLE", "Provider cannot prove the current published object identity and hash", request.document_id); }
+      if (source.path !== request.observed_provider.path || sourcePath !== request.observed_provider.path
+        || evidence.file_id !== request.observed_provider.object_id || evidence.rev !== request.observed_provider.revision_token
+        || evidence.content_hash !== request.observed_provider.provider_hash || evidence.size !== request.observed_provider.size) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PROVIDER_CONFLICT", "Published provider object changed from the observed identity", request.document_id);
+      }
+      if (!this.runtime.objects.readBytes || !this.runtime.serverSideCopy?.copyObjectVersion || !this.runtime.objects.deleteIfUnchanged) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_CAPABILITY_UNAVAILABLE", "Provider cannot copy exact bytes and conditionally remove the observed object", request.document_id);
+      }
+      sourceBytes = await this.runtime.objects.readBytes(sourcePath, MAX_PUBLISHED_ARCHIVE_BYTES);
+      if (!sourceBytes || sourceBytes.byteLength !== source.size || await sha256Bytes(sourceBytes) !== request.content_sha256) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_CONTENT_CONFLICT", "Current published bytes do not match the supplied SHA-256 and provider size", request.document_id);
+      }
+      if (sameBytes(sourceBytes, immutableBytes)) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_NO_DRIFT", "Current published bytes match the immutable published version", request.document_id);
+      const rechecked = await this.runtime.objects.getMetadata(sourcePath);
+      if (!rechecked || !matchesDropboxV1Evidence(rechecked, evidence)) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PROVIDER_CONFLICT", "Published provider object changed while reading its bytes", request.document_id);
+    }
+    if (!source && (!(await this.runtime.objects.getMetadata(payloadPath)) || await this.runtime.objects.readText(payloadProofPath) === null)) {
+      throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_COPY_PROOF_MISSING", "A verified machine quarantine payload is required before recovering a missing source", request.document_id);
+    }
+
+    const retiredHead: ManagedDocumentHead = { ...head, published_version_id: undefined,
+      provider: compactProviderState({ ...head.provider, published: undefined }), reconciliation_status: "clean" };
+    const targetHeadHash = await this.ledger.headWriteHash(retiredHead);
+    let ownedTicket: import("./zone-navigation-sources").ZoneNavigationHeadWriteTicket | null = null;
+    let sourceRemovalMayHaveOccurred = wasPublished && !source;
+    try {
+    let sourceState = await sources.readState(request.project_id, "DELIVERABLES");
+    ownedTicket = await sources.readOwnedHeadWrite(request.project_id, "DELIVERABLES", `head:${request.document_id}`, requestSha256);
+    if (ownedTicket) {
+      if (ownedTicket.write_hash !== targetHeadHash || sourceState.generation !== ownedTicket.generation
+        || !sourceState.in_flight_resource_ids.includes(`head:${request.document_id}`)) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_SOURCE_GENERATION_CONFLICT", "Owned DELIVERABLES fence changed", request.document_id);
+      }
+    } else if (wasPublished) {
+      if (sourceState.generation !== request.expected_source_generation || sourceState.in_flight_resource_ids.includes(`head:${request.document_id}`)) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_SOURCE_GENERATION_CONFLICT", "DELIVERABLES source generation changed", request.document_id);
+      }
+      ownedTicket = await sources.beginHeadWrite(request.project_id, "DELIVERABLES", `head:${request.document_id}`, undefined, targetHeadHash, true, requestSha256);
+      if (!ownedTicket) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_SOURCE_GENERATION_CONFLICT", "Could not reserve the DELIVERABLES source", request.document_id);
+      sourceState = await sources.readState(request.project_id, "DELIVERABLES");
+      if (sourceState.generation !== ownedTicket.generation || !sourceState.in_flight_resource_ids.includes(`head:${request.document_id}`)) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_SOURCE_GENERATION_CONFLICT", "DELIVERABLES reservation could not be verified", request.document_id);
+      }
+    } else if (sourceState.generation < request.expected_source_generation + 1
+      || sourceState.in_flight_resource_ids.includes(`head:${request.document_id}`)) {
+      throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_SOURCE_GENERATION_CONFLICT", "Retired head does not match the quarantine source generation", request.document_id);
+    }
+
+    let payloadMeta = await this.runtime.objects.getMetadata(payloadPath);
+    let payloadCopy: { source: { objectId: string; revisionToken: string; contentSha256: string }; destination: ProviderObjectMetadata } | undefined;
+    if (!payloadMeta) {
+      if (!source || !sourceBytes) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_COPY_PROOF_MISSING", "A verified machine quarantine payload is required before recovering a missing source", request.document_id);
+      await this.runtime.directoryProvisioning?.ensureDirectory(operationRoot);
+      try {
+        payloadCopy = await this.runtime.serverSideCopy.copyObjectVersion!(sourcePath, payloadPath, {
+          objectId: request.observed_provider.object_id,
+          revisionToken: request.observed_provider.revision_token,
+          contentSha256: request.content_sha256
+        });
+      } catch (error) {
+        if (!(error instanceof ProviderConflictError) && !(await this.runtime.objects.getMetadata(payloadPath))) throw error;
+      }
+      payloadMeta = await this.runtime.objects.getMetadata(payloadPath);
+    }
+    const payloadBefore = payloadMeta;
+    const payloadBytes = await this.runtime.objects.readBytes?.(payloadPath, MAX_PUBLISHED_ARCHIVE_BYTES);
+    const payloadAfter = await this.runtime.objects.getMetadata(payloadPath);
+    let payloadEvidence;
+    try { payloadEvidence = payloadAfter ? requireDropboxV1Evidence(payloadAfter) : null; }
+    catch { payloadEvidence = null; }
+    if (!payloadBefore || !payloadAfter || !payloadBytes || payloadBytes.byteLength !== request.observed_provider.size
+      || payloadBefore.objectId !== payloadAfter.objectId || payloadBefore.revisionToken !== payloadAfter.revisionToken
+      || payloadBefore.size !== payloadAfter.size || payloadAfter.path !== payloadPath
+      || await sha256Bytes(payloadBytes) !== request.content_sha256
+      || !payloadEvidence || payloadEvidence.size !== request.observed_provider.size
+      || payloadEvidence.content_hash !== request.observed_provider.provider_hash
+      || (payloadCopy && (payloadCopy.source.objectId !== request.observed_provider.object_id
+        || payloadCopy.source.revisionToken !== request.observed_provider.revision_token
+        || payloadCopy.source.contentSha256 !== request.content_sha256 || payloadCopy.destination.path !== payloadPath))) {
+      throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PAYLOAD_CONFLICT", "Machine-managed quarantine payload failed exact verification", request.document_id);
+    }
+    const payloadProofText = canonicalJson({
+      schema_version: "1.0", operation: request.operation, request_id: request.request_id,
+      request_sha256: requestSha256, project_id: request.project_id, document_id: request.document_id,
+      version_id: request.version_id, source_provider: request.observed_provider, payload_path: payloadPath,
+      payload_provider: { object_id: payloadEvidence.file_id, revision_token: payloadEvidence.rev,
+        path: payloadAfter.path, size: payloadEvidence.size, provider_hash: payloadEvidence.content_hash },
+      content_sha256: request.content_sha256, bytes_accepted: false, actor
+    });
+    const priorPayloadProof = await this.runtime.objects.readText(payloadProofPath);
+    if (priorPayloadProof !== null && priorPayloadProof !== payloadProofText) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PAYLOAD_PROOF_CONFLICT", "Machine quarantine payload proof differs from the exact observed bytes", request.document_id);
+    if (priorPayloadProof === null) {
+      if (!source) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_COPY_PROOF_MISSING", "A machine quarantine payload proof is required before recovering a missing source", request.document_id);
+      try { await this.runtime.objects.createText(payloadProofPath, payloadProofText); }
+      catch (error) {
+        if (!(error instanceof ProviderConflictError) || await this.runtime.objects.readText(payloadProofPath) !== payloadProofText) throw error;
+      }
+    }
+
+    const archivedAtEntry = await this.runtime.objects.getMetadata(archivePath);
+    if (archivedAtEntry) {
+      if (!sourceBytes && source) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_CONTENT_CONFLICT", "Published source bytes are unavailable", request.document_id);
+      const existingCopyProof = await this.runtime.objects.readText(copyProofPath);
+      if (!source && existingCopyProof === null) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_COPY_PROOF_MISSING", "A verified operation copy proof is required before recovering a missing source", request.document_id);
+      const archiveBytes = await this.runtime.objects.readBytes?.(archivePath, MAX_PUBLISHED_ARCHIVE_BYTES);
+      let archiveEvidence;
+      try { archiveEvidence = requireDropboxV1Evidence(archivedAtEntry); }
+      catch { throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_ARCHIVE_CONFLICT", "Quarantine archive lacks provider hash evidence", request.document_id); }
+      if (!archiveBytes || archiveBytes.byteLength !== request.observed_provider.size || await sha256Bytes(archiveBytes) !== request.content_sha256
+        || archiveEvidence.size !== request.observed_provider.size || archiveEvidence.content_hash !== request.observed_provider.provider_hash) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_ARCHIVE_CONFLICT", "Quarantine archive exists with different bytes or provider hash", request.document_id);
+      }
+      if (!sourceBytes && sameBytes(archiveBytes, immutableBytes)) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_NO_DRIFT", "Verified quarantine bytes match the immutable published version", request.document_id);
+      if (sourceBytes && !sameBytes(archiveBytes, sourceBytes)) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_ARCHIVE_CONFLICT", "Quarantine archive does not preserve the exact observed bytes", request.document_id);
+      await this.persistQuarantineCopyProof(copyProofPath, request, requestSha256, archivePath, archivedAtEntry, actor, existingCopyProof);
+    } else {
+      if (!source || !sourceBytes) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_SOURCE_MISSING", "Observed published source is missing before a verified quarantine copy exists", request.document_id);
+      await this.runtime.directoryProvisioning?.ensureDirectory(archivePath.slice(0, archivePath.lastIndexOf("/")));
+      const copyObjectVersion = this.runtime.serverSideCopy?.copyObjectVersion;
+      if (!copyObjectVersion) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_CAPABILITY_UNAVAILABLE", "Provider cannot copy an exact object revision", request.document_id);
+      try {
+        const copied = await copyObjectVersion(sourcePath, archivePath, {
+          objectId: request.observed_provider.object_id,
+          revisionToken: request.observed_provider.revision_token,
+          contentSha256: request.content_sha256
+        });
+        if (copied.source.objectId !== request.observed_provider.object_id || copied.source.revisionToken !== request.observed_provider.revision_token
+          || copied.source.contentSha256 !== request.content_sha256 || copied.destination.path !== archivePath) {
+          throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_COPY_CONFLICT", "Provider did not confirm the exact observed revision copy", request.document_id);
+        }
+      } catch (error) {
+        if (!(error instanceof ProviderConflictError)) throw error;
+      }
+      const archiveMeta = await this.runtime.objects.getMetadata(archivePath);
+      const archiveBytes = await this.runtime.objects.readBytes!(archivePath, MAX_PUBLISHED_ARCHIVE_BYTES);
+      let archiveEvidence;
+      try { archiveEvidence = archiveMeta ? requireDropboxV1Evidence(archiveMeta) : null; }
+      catch { archiveEvidence = null; }
+      if (!archiveMeta || archiveMeta.path !== archivePath || archiveMeta.size !== request.observed_provider.size
+        || !archiveEvidence || archiveEvidence.content_hash !== request.observed_provider.provider_hash || !archiveBytes
+        || archiveBytes.byteLength !== sourceBytes.byteLength || !sameBytes(archiveBytes, sourceBytes)
+        || await sha256Bytes(archiveBytes) !== request.content_sha256) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_ARCHIVE_CONFLICT", "Copied quarantine bytes failed exact verification", request.document_id);
+      }
+      await this.persistQuarantineCopyProof(copyProofPath, request, requestSha256, archivePath, archiveMeta, actor);
+    }
+    const payloadBeforeDelete = await this.runtime.objects.getMetadata(payloadPath);
+    const payloadBeforeDeleteBytes = await this.runtime.objects.readBytes?.(payloadPath, MAX_PUBLISHED_ARCHIVE_BYTES);
+    const payloadAfterDeleteRead = await this.runtime.objects.getMetadata(payloadPath);
+    if (!payloadBeforeDelete || !payloadAfterDeleteRead || !payloadBeforeDeleteBytes
+      || payloadBeforeDelete.objectId !== payloadAfterDeleteRead.objectId || payloadBeforeDelete.revisionToken !== payloadAfterDeleteRead.revisionToken
+      || payloadBeforeDelete.objectId !== payloadAfter.objectId || payloadBeforeDelete.revisionToken !== payloadAfter.revisionToken
+      || payloadBeforeDeleteBytes.byteLength !== request.observed_provider.size
+      || await sha256Bytes(payloadBeforeDeleteBytes) !== request.content_sha256) {
+      throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PAYLOAD_CONFLICT", "Machine quarantine payload changed before source removal", request.document_id);
+    }
+    const assertOwnedSourceFence = async () => {
+      const [currentState, currentTicket] = await Promise.all([
+        sources.readState(request.project_id, "DELIVERABLES"),
+        sources.readOwnedHeadWrite(request.project_id, "DELIVERABLES", `head:${request.document_id}`, requestSha256)
+      ]);
+      if (!ownedTicket || !currentTicket || currentTicket.generation !== ownedTicket.generation
+        || currentTicket.write_hash !== targetHeadHash || currentState.generation !== ownedTicket.generation
+        || !currentState.in_flight_resource_ids.includes(`head:${request.document_id}`)) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_SOURCE_GENERATION_CONFLICT", "Owned DELIVERABLES fence changed before retirement", request.document_id);
+      }
+    };
+    if (wasPublished) await assertOwnedSourceFence();
+    const latestSource = await this.runtime.objects.getMetadata(sourcePath);
+    if (latestSource) {
+      sourceRemovalMayHaveOccurred = true;
+      const deleted = await this.runtime.objects.deleteIfUnchanged!(sourcePath, { objectId: request.observed_provider.object_id, revisionToken: request.observed_provider.revision_token });
+      if (deleted === "changed") {
+        sourceRemovalMayHaveOccurred = false;
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_PROVIDER_CONFLICT", "Published provider object changed before conditional removal", request.document_id);
+      }
+    } else {
+      // A previous attempt may have removed the source and lost its response.
+      sourceRemovalMayHaveOccurred = true;
+    }
+    if (wasPublished) {
+      await assertOwnedSourceFence();
+      const finalHead = await this.readStableText(headPath);
+      if (!finalHead || finalHead.text !== headRaw.text || await this.runtime.objects.getMetadata(sourcePath) !== null) {
+        throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_HEAD_CONFLICT", "Published head or provider source changed before retirement", request.document_id);
+      }
+      await this.ledger.writeHead(retiredHead, headRaw.metadata.revisionToken, requestSha256);
+    }
+    const record = {
+      schema_version: "1.0", operation: request.operation, request_id: request.request_id,
+      request_sha256: requestSha256, request_payload_sha256: requestPayloadSha256,
+      project_id: request.project_id, document_id: request.document_id, version_id: request.version_id,
+      logical_path: request.logical_path, archive_path: archivePath, payload_ref: payloadPath,
+      payload_proof_sha256: await sha256Text(payloadProofText),
+      provider: request.observed_provider, content_sha256: request.content_sha256,
+      bytes_accepted: false, actor
+    };
+    const receiptText = canonicalJson(record);
+    try { await this.runtime.objects.createText(completionPath, receiptText); }
+    catch (error) {
+      if (!(error instanceof ProviderConflictError) || await this.runtime.objects.readText(completionPath) !== receiptText) throw error;
+    }
+    return this.quarantineReceipt(request, actor, archivePath, payloadPath, completionPath, await sha256Text(receiptText), requestSha256, requestPayloadSha256);
+    } catch (error) {
+      if (ownedTicket && !sourceRemovalMayHaveOccurred) await sources.abandonHeadWrite(ownedTicket);
+      throw error;
+    }
+    });
+  }
+
   private instanceRepairReceipt(
     request: Extract<ManagedDocumentRequest, { operation: "document.instance.repair" }>,
     actor: { actor_id: string; authority: string }, proofRef: string, proofSha256: string, requestSha256: string, requestPayloadSha256: string
@@ -282,6 +596,52 @@ export class ManagedDocumentService {
       proof_sha256: proofSha256,
       actor
     };
+  }
+
+  private quarantineReceipt(
+    request: Extract<ManagedDocumentRequest, { operation: "document.quarantine_instance" }>,
+    actor: { actor_id: string; authority: string }, archivePath: string, payloadPath: string, proofRef: string,
+    proofSha256: string, requestSha256: string, requestPayloadSha256: string
+  ): ManagedDocumentReceipt {
+    return {
+      operation: "document.quarantine_instance", request_id: request.request_id,
+      project_id: request.project_id, document_id: request.document_id, version_id: request.version_id,
+      stage: "published", logical_path: request.logical_path, status: "committed",
+      provider_rev: request.observed_provider.revision_token, archive_path: archivePath, payload_ref: payloadPath,
+      accepted: false, content_sha256: request.content_sha256,
+      admission_request_sha256: requestSha256, request_payload_sha256: requestPayloadSha256,
+      proof_ref: proofRef, proof_sha256: proofSha256, actor
+    };
+  }
+
+  private async persistQuarantineCopyProof(
+    proofPath: string,
+    request: Extract<ManagedDocumentRequest, { operation: "document.quarantine_instance" }>,
+    requestSha256: string,
+    archivePath: string,
+    archiveMetadata: ProviderObjectMetadata,
+    actor: { actor_id: string; authority: string },
+    existingProof?: string | null
+  ): Promise<void> {
+    const archiveEvidence = requireDropboxV1Evidence(archiveMetadata);
+    const proofText = canonicalJson({
+      schema_version: "1.0", operation: request.operation, request_id: request.request_id,
+      request_sha256: requestSha256, project_id: request.project_id, document_id: request.document_id,
+      version_id: request.version_id, source_provider: request.observed_provider,
+      archive_path: archivePath, payload_path: `${machineDocumentRoot(request.project_id)}/quarantines/${request.request_id}/payload.bin`,
+      archive_provider: { object_id: archiveEvidence.file_id, revision_token: archiveEvidence.rev,
+        path: archiveMetadata.path, size: archiveEvidence.size, provider_hash: archiveEvidence.content_hash },
+      content_sha256: request.content_sha256, bytes_accepted: false, actor
+    });
+    const prior = existingProof === undefined ? await this.runtime.objects.readText(proofPath) : existingProof;
+    if (prior !== null) {
+      if (prior !== proofText) throw new ManagedDocumentConflictError("DOCUMENT_QUARANTINE_COPY_PROOF_CONFLICT", "Quarantine copy proof differs from the exact observed archive", request.document_id);
+      return;
+    }
+    try { await this.runtime.objects.createText(proofPath, proofText); }
+    catch (error) {
+      if (!(error instanceof ProviderConflictError) || await this.runtime.objects.readText(proofPath) !== proofText) throw error;
+    }
   }
 
   private async readStableText(path: string): Promise<{ text: string; metadata: ProviderObjectMetadata } | null> {
@@ -1178,7 +1538,11 @@ export class ManagedDocumentService {
       metadata.path !== path
       || !expectedRev
       || evidence.rev !== expectedRev
-      || (version.provider_file_id !== undefined && evidence.file_id !== version.provider_file_id)
+      // A promoted immutable version can retain the provider identity of its
+      // earlier stage. Once the managed head records the current stage's
+      // observation, compare identity to that observation and still require
+      // the immutable version's content hash and size below.
+      || (observation === undefined && version.provider_file_id !== undefined && evidence.file_id !== version.provider_file_id)
       || (observation === undefined && version.provider_rev !== undefined && evidence.rev !== version.provider_rev)
       || (observation !== undefined && (
         evidence.file_id !== observation.file_id

@@ -827,12 +827,13 @@ export class ZoneNavigationSources {
       const current = state.zones[zone] ?? DEFAULT_ZONE_STATE;
       if (current.catalog_rebuild_request_id) throw new Error("navigation_catalog_rebuild_writer_fenced");
     }
-    if (ownerHash !== undefined) {
-      for (const zone of new Set([...affectedZones, ...recoveryZones])) {
-        const foreignFlight = (state.zones[zone] ?? DEFAULT_ZONE_STATE).in_flight_writes
-          .some((write) => write.resource_id === resourceId && write.owner_hash !== ownerHash);
-        if (foreignFlight) throw new Error("navigation_source_owner_conflict");
-      }
+    for (const zone of new Set([...affectedZones, ...recoveryZones])) {
+      const resourceFlights = (state.zones[zone] ?? DEFAULT_ZONE_STATE).in_flight_writes
+        .filter((write) => write.resource_id === resourceId);
+      const foreignFlight = ownerHash === undefined
+        ? resourceFlights.some((write) => write.owner_hash !== undefined)
+        : resourceFlights.some((write) => write.owner_hash !== ownerHash);
+      if (foreignFlight) throw new Error("navigation_source_owner_conflict");
     }
     let cleanedSupersededTicket = false;
     if (writeHash !== null && resourceId.startsWith("head:DOC-")) {
@@ -887,6 +888,19 @@ export class ZoneNavigationSources {
     const item = state.zones[zone] ?? DEFAULT_ZONE_STATE;
     const write = item.in_flight_writes.find((candidate) => candidate.resource_id === resourceId && candidate.owner_hash === ownerHash);
     return write ? { project_id: projectId, zone, resource_id: resourceId, generation: write.generation, write_hash: write.write_hash ?? null, owner_hash: ownerHash } : null;
+  }
+
+  /** Release an owned source fence only when the caller proves its source mutation has not begun. */
+  async abandonHeadWrite(ticket: ZoneNavigationHeadWriteTicket): Promise<void> {
+    await this.withMutationLock(ticket.project_id, ticket.resource_id, async () => {
+      const current = await this.readProjectState(ticket.project_id);
+      const write = (current.zones[ticket.zone] ?? DEFAULT_ZONE_STATE).in_flight_writes
+        .find((candidate) => candidate.resource_id === ticket.resource_id
+          && candidate.generation === ticket.generation
+          && (candidate.write_hash ?? null) === ticket.write_hash
+          && candidate.owner_hash === ticket.owner_hash);
+      if (write) await this.discardHeadWrite(ticket);
+    });
   }
 
   async completeHeadWrite(ticket: ZoneNavigationHeadWriteTicket | null, observedEntry: NavigationInventoryEntry | null, budget?: SliceBudget): Promise<void> {

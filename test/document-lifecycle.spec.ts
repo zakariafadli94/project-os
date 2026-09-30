@@ -12,6 +12,11 @@ import {
 } from "../src/documents/service";
 import { sha256Text } from "../src/documents/hash";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
+import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath } from "../src/persistence/layout";
+import { DocumentLedgerRepository } from "../src/documents/repository";
+import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
+import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
+import type { SliceBudget } from "../src/convergence/contract";
 
 class FakeTransport implements DropboxTransport {
   files = new Map<string, { content: string; metadata: DropboxFileMetadata }>();
@@ -23,6 +28,7 @@ class FakeTransport implements DropboxTransport {
   failCopyAfterWrite = false;
   failConditionalDelete: "before" | "after" | null = null;
   failHeadWriteOnce = false;
+  beforeConditionalDelete?: () => Promise<void>;
   private revision = 0;
 
   async upload(path: string, content: string, mode: "add" | "overwrite"): Promise<void> {
@@ -81,6 +87,9 @@ class FakeTransport implements DropboxTransport {
   async delete(path: string): Promise<void> { this.files.delete(path); }
 
   async deleteIfRevision(path: string, revision: string): Promise<boolean> {
+    const beforeDelete = this.beforeConditionalDelete;
+    this.beforeConditionalDelete = undefined;
+    if (beforeDelete) await beforeDelete();
     const current = this.files.get(path);
     if (!current || current.metadata.rev !== revision) return false;
     const fail = this.failConditionalDelete;
@@ -147,6 +156,296 @@ function runtimeWithConditionalDelete(transport: FakeTransport) {
     return await transport.deleteIfRevision(path, expected.revisionToken) ? "deleted" : "changed";
   };
   return runtime;
+}
+
+describe("managed document quarantine", () => {
+  it("fails closed when the immutable published version has no content hash", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-QUARANTINE-NOHASH-1", "accepted publication");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-QUARANTINE-NOHASH-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id, created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-QUARANTINE-NOHASH-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id, created_at: "2026-09-30T10:01:00Z" }, state());
+    const versionPath = machineDocumentVersionPath("PRJ-0002", working.document_id, published.version_id);
+    const versionRecord = JSON.parse((await runtime.objects.readText(versionPath))!);
+    delete versionRecord.content_sha256;
+    await runtime.objects.upsertText(versionPath, JSON.stringify(versionRecord));
+    const driftedBytes = "externally edited, not accepted";
+    await transport.upload(publishedPath, driftedBytes, "overwrite");
+    const metadata = await runtime.objects.getMetadata(publishedPath);
+    const request = {
+      operation: "document.quarantine_instance" as const, request_id: "DOCREQ-QUARANTINE-NOHASH-0001",
+      project_id: "PRJ-0002", document_id: working.document_id, version_id: published.version_id,
+      logical_path: logicalPath, expected_project_revision: 0, expected_source_generation: 0,
+      observed_provider: { object_id: metadata!.objectId!, revision_token: metadata!.revisionToken!, path: publishedPath, size: metadata!.size, provider_hash: metadata!.integrityHash!.value },
+      content_sha256: await sha256Text(driftedBytes), created_at: "2026-09-30T10:02:00Z"
+    };
+
+    await expect(service.quarantinePublishedInstance(request, state(), { actor_id: "control_tower", authority: "control_tower_operator" }))
+      .rejects.toMatchObject({ code: "DOCUMENT_QUARANTINE_IMMUTABLE_HASH_MISSING" });
+    expect(transport.files.has(publishedPath)).toBe(true);
+  });
+
+  it("rejects quarantine when current published bytes still match the immutable version", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-QUARANTINE-NODRIFT-1", "accepted publication");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-QUARANTINE-NODRIFT-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id, created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-QUARANTINE-NODRIFT-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id, created_at: "2026-09-30T10:01:00Z" }, state());
+    const metadata = await runtime.objects.getMetadata(publishedPath);
+    const request = {
+      operation: "document.quarantine_instance" as const,
+      request_id: "DOCREQ-QUARANTINE-NODRIFT-0001",
+      project_id: "PRJ-0002", document_id: working.document_id, version_id: published.version_id,
+      logical_path: logicalPath, expected_project_revision: 0, expected_source_generation: 0,
+      observed_provider: { object_id: metadata!.objectId!, revision_token: metadata!.revisionToken!, path: publishedPath, size: metadata!.size, provider_hash: metadata!.integrityHash!.value },
+      content_sha256: await sha256Text((await runtime.objects.readText(publishedPath))!), created_at: "2026-09-30T10:02:00Z"
+    };
+
+    await expect(service.quarantinePublishedInstance(request, state(), { actor_id: "control_tower", authority: "control_tower_operator" }))
+      .rejects.toMatchObject({ code: "DOCUMENT_QUARANTINE_NO_DRIFT" });
+    expect(transport.files.has(publishedPath)).toBe(true);
+  });
+
+  it("blocks a competing head mutation until the copy and CAS retirement finish", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-QUARANTINE-RACE-1", "accepted publication");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-QUARANTINE-RACE-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id, created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-QUARANTINE-RACE-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id, created_at: "2026-09-30T10:01:00Z" }, state());
+    const driftedBytes = "externally edited, not accepted";
+    await transport.upload(publishedPath, driftedBytes, "overwrite");
+    const metadata = await runtime.objects.getMetadata(publishedPath);
+    const request = {
+      operation: "document.quarantine_instance" as const,
+      request_id: "DOCREQ-QUARANTINE-RACE-0001",
+      project_id: "PRJ-0002", document_id: working.document_id, version_id: published.version_id,
+      logical_path: logicalPath, expected_project_revision: 0, expected_source_generation: 0,
+      observed_provider: { object_id: metadata!.objectId!, revision_token: metadata!.revisionToken!, path: publishedPath, size: metadata!.size, provider_hash: metadata!.integrityHash!.value },
+      content_sha256: await sha256Text(driftedBytes), created_at: "2026-09-30T10:02:00Z"
+    };
+    const repository = new DocumentLedgerRepository(runtime);
+    const head = await repository.readHead("PRJ-0002", working.document_id);
+    const copyObjectVersion = runtime.serverSideCopy.copyObjectVersion!;
+    let competingMutation: "blocked" | "committed" | null = null;
+    runtime.serverSideCopy.copyObjectVersion = async (...args) => {
+      try {
+        await repository.writeHead({ ...head!, reconciliation_status: "conflict" });
+        competingMutation = "committed";
+      } catch {
+        competingMutation = "blocked";
+      }
+      return copyObjectVersion(...args);
+    };
+
+    const receipt = await service.quarantinePublishedInstance(request, state(), { actor_id: "control_tower", authority: "control_tower_operator" });
+
+    expect(competingMutation).toBe("blocked");
+    expect(receipt).toMatchObject({ status: "committed", accepted: false });
+    expect((await service.status("PRJ-0002", working.document_id))?.published_version_id).toBeUndefined();
+    expect(await new ZoneNavigationSources(runtime).readState("PRJ-0002", "DELIVERABLES")).toMatchObject({ in_flight_resource_ids: [] });
+  });
+
+  it("clears the navigation in-flight marker when a head CAS loses to a competing revision", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-QUARANTINE-CAS-CLEANUP-1", "published candidate");
+    const sources = new ZoneNavigationSources(runtime);
+    await sources.beginAdoption("PRJ-0002", "DELIVERABLES", "NAV-QUARANTINE-CAS-CLEANUP-1", 0);
+    const repository = new DocumentLedgerRepository(runtime);
+    const head = await repository.readHead("PRJ-0002", working.document_id);
+    const headPath = machineDocumentHeadPath("PRJ-0002", working.document_id);
+    const headText = await runtime.objects.readText(headPath);
+    const metadata = await runtime.objects.getMetadata(headPath);
+    expect(head).not.toBeNull();
+    expect(headText).not.toBeNull();
+    expect(metadata).not.toBeNull();
+    transport.raceBeforeConditional = {
+      path: headPath,
+      content: JSON.stringify({ ...JSON.parse(headText!), reconciliation_status: "conflict" })
+    };
+
+    await expect(repository.writeHead({ ...head!, logical_path: "competing-target.md" }, "stale-head-revision"))
+      .rejects.toThrow();
+
+    expect(await sources.readState("PRJ-0002", "DELIVERABLES")).toMatchObject({ in_flight_resource_ids: [] });
+    expect(await repository.readHead("PRJ-0002", working.document_id)).toMatchObject({ reconciliation_status: "conflict" });
+  });
+
+  it("fails closed when the source is missing and no quarantine copy proof exists", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-QUARANTINE-NOPROOF-1", "accepted publication");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-QUARANTINE-NOPROOF-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id, created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-QUARANTINE-NOPROOF-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id, created_at: "2026-09-30T10:01:00Z" }, state());
+    const driftedBytes = "externally edited, not accepted";
+    await transport.upload(publishedPath, driftedBytes, "overwrite");
+    const metadata = await runtime.objects.getMetadata(publishedPath);
+    const request = {
+      operation: "document.quarantine_instance" as const,
+      request_id: "DOCREQ-QUARANTINE-NOPROOF-0001",
+      project_id: "PRJ-0002", document_id: working.document_id, version_id: published.version_id,
+      logical_path: logicalPath, expected_project_revision: 0, expected_source_generation: 0,
+      observed_provider: { object_id: metadata!.objectId!, revision_token: metadata!.revisionToken!, path: publishedPath, size: metadata!.size, provider_hash: metadata!.integrityHash!.value },
+      content_sha256: await sha256Text(driftedBytes), created_at: "2026-09-30T10:02:00Z"
+    };
+    const actor = { actor_id: "control_tower", authority: "control_tower_operator" };
+    const archivePath = `/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARCHIVES/QUARANTINED-PUBLISHED/${working.document_id}/${published.version_id}/${request.request_id}/${logicalPath}`;
+    await transport.upload(archivePath, driftedBytes, "add");
+    await transport.delete(publishedPath);
+
+    await expect(service.quarantinePublishedInstance(request, state(), actor)).rejects.toMatchObject({ code: "DOCUMENT_QUARANTINE_COPY_PROOF_MISSING" });
+    expect((await service.status("PRJ-0002", working.document_id))?.published_version_id).toBe(published.version_id);
+    expect(await new ZoneNavigationSources(runtime).readState("PRJ-0002", "DELIVERABLES")).toMatchObject({ in_flight_resource_ids: [] });
+  });
+
+  it("abandons its durable source fence on a pre-delete archive collision and can retry at the refreshed generation", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-QUARANTINE-ABANDON-1", "accepted publication");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-QUARANTINE-ABANDON-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id, created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-QUARANTINE-ABANDON-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id, created_at: "2026-09-30T10:01:00Z" }, state());
+    const driftedBytes = "externally edited, not accepted";
+    await transport.upload(publishedPath, driftedBytes, "overwrite");
+    const metadata = await runtime.objects.getMetadata(publishedPath);
+    const request = {
+      operation: "document.quarantine_instance" as const, request_id: "DOCREQ-QUARANTINE-ABANDON-0001",
+      project_id: "PRJ-0002", document_id: working.document_id, version_id: published.version_id,
+      logical_path: logicalPath, expected_project_revision: 0, expected_source_generation: 0,
+      observed_provider: { object_id: metadata!.objectId!, revision_token: metadata!.revisionToken!, path: publishedPath, size: metadata!.size, provider_hash: metadata!.integrityHash!.value },
+      content_sha256: await sha256Text(driftedBytes), created_at: "2026-09-30T10:02:00Z"
+    };
+    const archivePath = `/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARCHIVES/QUARANTINED-PUBLISHED/${working.document_id}/${published.version_id}/${request.request_id}/${logicalPath}`;
+    await transport.upload(archivePath, "unrelated archive collision", "add");
+    const actor = { actor_id: "control_tower", authority: "control_tower_operator" };
+
+    await expect(service.quarantinePublishedInstance(request, state(), actor)).rejects.toMatchObject({ code: "DOCUMENT_QUARANTINE_ARCHIVE_CONFLICT" });
+    expect(transport.files.has(publishedPath)).toBe(true);
+    expect(await new ZoneNavigationSources(runtime).readState("PRJ-0002", "DELIVERABLES")).toMatchObject({ in_flight_resource_ids: [] });
+
+    const refreshed = await new ZoneNavigationSources(runtime).readState("PRJ-0002", "DELIVERABLES");
+    const retry = { ...request, request_id: "DOCREQ-QUARANTINE-ABANDON-RETRY-0001", expected_source_generation: refreshed.generation };
+    const receipt = await service.quarantinePublishedInstance(retry, state(), actor);
+    expect(receipt).toMatchObject({ status: "committed", accepted: false });
+    expect(transport.files.has(publishedPath)).toBe(false);
+    expect(await new ZoneNavigationSources(runtime).readState("PRJ-0002", "DELIVERABLES")).toMatchObject({ in_flight_resource_ids: [] });
+  });
+
+  it("preserves externally drifted published bytes as unaccepted evidence and retires only the active pointer", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-QUARANTINE-1", "accepted publication");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-QUARANTINE-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id, created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-QUARANTINE-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id, created_at: "2026-09-30T10:01:00Z" }, state());
+    const driftedBytes = "externally edited, not accepted";
+    await transport.upload(publishedPath, driftedBytes, "overwrite");
+    const metadata = await runtime.objects.getMetadata(publishedPath);
+    const request = {
+      operation: "document.quarantine_instance" as const,
+      request_id: "DOCREQ-QUARANTINE-INSTANCE-0001",
+      project_id: "PRJ-0002",
+      document_id: working.document_id,
+      version_id: published.version_id,
+      logical_path: logicalPath,
+      expected_project_revision: 0,
+      expected_source_generation: 0,
+      observed_provider: {
+        object_id: metadata!.objectId!, revision_token: metadata!.revisionToken!,
+        path: publishedPath, size: metadata!.size, provider_hash: metadata!.integrityHash!.value
+      },
+      content_sha256: await sha256Text(driftedBytes),
+      created_at: "2026-09-30T10:02:00Z"
+    };
+    const actor = { actor_id: "control_tower", authority: "control_tower_operator" };
+
+    transport.failConditionalDelete = "after";
+    await expect(service.quarantinePublishedInstance(request, state(), actor)).rejects.toThrow("injected lost conditional review-delete response");
+    expect(transport.files.has(publishedPath)).toBe(false);
+    const restartedService = new ManagedDocumentService(runtimeWithConditionalDelete(transport));
+    const receipt = await restartedService.quarantinePublishedInstance(request, state(), actor);
+
+    expect(receipt).toMatchObject({ operation: "document.quarantine_instance", status: "committed", accepted: false, archive_path: expect.stringContaining("/ARCHIVES/QUARANTINED-PUBLISHED/"), actor });
+    expect(transport.files.get(receipt.archive_path!)?.content).toBe(driftedBytes);
+    expect(receipt.payload_ref).toContain(`/quarantines/${request.request_id}/payload.bin`);
+    const preservedPayload = await runtime.objects.readBytes!(receipt.payload_ref!, 1024);
+    expect(preservedPayload).not.toBeNull();
+    expect(new TextDecoder().decode(preservedPayload!)).toBe(driftedBytes);
+    expect(transport.files.has(publishedPath)).toBe(false);
+    expect((await service.status("PRJ-0002", working.document_id))?.published_version_id).toBeUndefined();
+    expect(await runtime.objects.readText(`${machineDocumentRoot("PRJ-0002")}/quarantines/${request.request_id}/receipt.json`)).toContain('"bytes_accepted":false');
+    expect(await new ZoneNavigationSources(runtime).readState("PRJ-0002", "DELIVERABLES")).toMatchObject({ in_flight_resource_ids: [] });
+    await expect(service.quarantinePublishedInstance(request, state(), actor)).resolves.toEqual(receipt);
+  });
+
+  it("blocks a catalog snapshot across source deletion and preserves bytes if the visible archive is edited", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-QUARANTINE-SNAPSHOT-RACE-1", "accepted publication");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-QUARANTINE-SNAPSHOT-RACE-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id, created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-QUARANTINE-SNAPSHOT-RACE-1", project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id, created_at: "2026-09-30T10:01:00Z" }, state());
+    const driftedBytes = "externally edited, not accepted";
+    await transport.upload(publishedPath, driftedBytes, "overwrite");
+    const metadata = await runtime.objects.getMetadata(publishedPath);
+    const request = {
+      operation: "document.quarantine_instance" as const, request_id: "DOCREQ-QUARANTINE-SNAPSHOT-RACE-0001",
+      project_id: "PRJ-0002", document_id: working.document_id, version_id: published.version_id,
+      logical_path: logicalPath, expected_project_revision: 0, expected_source_generation: 0,
+      observed_provider: { object_id: metadata!.objectId!, revision_token: metadata!.revisionToken!, path: publishedPath, size: metadata!.size, provider_hash: metadata!.integrityHash!.value },
+      content_sha256: await sha256Text(driftedBytes), created_at: "2026-09-30T10:02:00Z"
+    };
+    const archivePath = `/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARCHIVES/QUARANTINED-PUBLISHED/${working.document_id}/${published.version_id}/${request.request_id}/${logicalPath}`;
+    let payloadReadyBeforeDelete = false;
+    transport.beforeConditionalDelete = async () => {
+      const payload = await runtime.objects.readBytes!(`${machineDocumentRoot("PRJ-0002")}/quarantines/${request.request_id}/payload.bin`, 1024);
+      payloadReadyBeforeDelete = !!payload && await sha256Text(new TextDecoder().decode(payload)) === request.content_sha256;
+      await transport.upload(archivePath, "external archive edit", "overwrite");
+    };
+    const headPath = machineDocumentHeadPath("PRJ-0002", working.document_id);
+    const originalConditionalWrite = runtime.conditionalWrite.writeTextConditional.bind(runtime.conditionalWrite);
+    let snapshotWasBlocked: boolean | undefined;
+    let competingWriterWasBlocked: boolean | undefined;
+    runtime.conditionalWrite.writeTextConditional = async (path, content, expectedRevisionToken) => {
+      if (path === headPath) {
+        const page = await new ZoneNavigationInventory(runtime, new ZoneNavigationSources(runtime)).listPage({
+          project_id: "PRJ-0002", zone: "DELIVERABLES", cursor: null, limit: 10, budget: navigationBudget()
+        });
+        snapshotWasBlocked = page.gaps.some((gap) => gap.code === "canonical_source_write_in_progress");
+        const competingRuntime = runtimeWithConditionalDelete(transport);
+        const competingRepository = new DocumentLedgerRepository(competingRuntime);
+        const currentHead = await competingRepository.readHead("PRJ-0002", working.document_id);
+        try { await competingRepository.writeHead({ ...currentHead!, logical_path: "competing-target.md" }); }
+        catch (error) { competingWriterWasBlocked = error instanceof Error && error.message === "navigation_source_owner_conflict"; }
+      }
+      return originalConditionalWrite(path, content, expectedRevisionToken);
+    };
+    const receipt = await service.quarantinePublishedInstance(request, state(), { actor_id: "control_tower", authority: "control_tower_operator" });
+
+    expect(snapshotWasBlocked).toBe(true);
+    expect(competingWriterWasBlocked).toBe(true);
+    expect(payloadReadyBeforeDelete).toBe(true);
+    expect(transport.files.get(archivePath)?.content).toBe("external archive edit");
+    expect(receipt.payload_ref).toContain(`/quarantines/${request.request_id}/payload.bin`);
+    const preservedPayload = await runtime.objects.readBytes!(receipt.payload_ref!, 1024);
+    expect(preservedPayload).not.toBeNull();
+    expect(new TextDecoder().decode(preservedPayload!)).toBe(driftedBytes);
+    expect(transport.files.has(publishedPath)).toBe(false);
+    expect(await new ZoneNavigationSources(runtime).readState("PRJ-0002", "DELIVERABLES")).toMatchObject({ in_flight_resource_ids: [] });
+  });
+});
+
+function navigationBudget(): SliceBudget {
+  return {
+    deadline_ms: 25_000, calls_left: 32, now: () => Date.now(), signal: new AbortController().signal,
+    beforeHttp() { this.calls_left -= 1; if (this.calls_left < 0) throw new Error("slice_budget_exhausted"); },
+    canStartEffect(requiredCalls) { return this.calls_left >= requiredCalls + 4; }
+  };
 }
 
 function state() {
@@ -489,6 +788,42 @@ describe("ManagedDocumentService work-product lifecycle", () => {
       .rejects.toMatchObject({ code: "DOCUMENT_REQUEST_REPLAY_CONFLICT" });
     expect(transport.copies).toHaveLength(copyCount);
     expect(transport.uploads.filter((entry) => entry.path === publishedPath)).toHaveLength(publishedUpdateCount);
+  });
+
+  it("publishes over a prior version whose current head tracks an identical provider copy", async () => {
+    const transport = new FakeTransport();
+    const prepared = await prepareReplacement(transport, "HEAD-TRACKED-COPY");
+    const previous = transport.files.get(publishedPath)!;
+    await transport.upload(publishedPath, previous.content, "overwrite");
+    const current = transport.files.get(publishedPath)!.metadata;
+    const headPath = machineDocumentHeadPath("PRJ-0002", prepared.firstWorking.document_id);
+    const head = JSON.parse(transport.files.get(headPath)!.content);
+    head.provider.published.file_id = current.id;
+    head.provider.published.rev = current.rev;
+    await transport.upload(headPath, JSON.stringify(head), "overwrite");
+
+    const receipt = await prepared.service.publish(prepared.request, state());
+    expect(receipt.status).toBe("committed");
+    expect(transport.files.get(prepared.archivePath)?.content).toBe(previous.content);
+    expect(transport.files.get(publishedPath)?.content).toContain("published v2");
+  });
+
+  it("still refuses a head-tracked published copy when its bytes differ from the immutable version", async () => {
+    const transport = new FakeTransport();
+    const prepared = await prepareReplacement(transport, "HEAD-TRACKED-DRIFT");
+    await transport.upload(publishedPath, "unaccepted changed publication", "overwrite");
+    const current = transport.files.get(publishedPath)!.metadata;
+    const headPath = machineDocumentHeadPath("PRJ-0002", prepared.firstWorking.document_id);
+    const head = JSON.parse(transport.files.get(headPath)!.content);
+    head.provider.published.file_id = current.id;
+    head.provider.published.rev = current.rev;
+    head.provider.published.content_hash = current.content_hash;
+    head.provider.published.size = current.size;
+    await transport.upload(headPath, JSON.stringify(head), "overwrite");
+
+    await expect(prepared.service.publish(prepared.request, state())).rejects.toMatchObject({ code: "PROVIDER_VERSION_CHANGED" });
+    expect(transport.files.has(prepared.archivePath)).toBe(false);
+    expect(transport.files.get(publishedPath)?.content).toBe("unaccepted changed publication");
   });
 
   it("resumes after CAS and REVIEW deletion without duplicating the publication", async () => {

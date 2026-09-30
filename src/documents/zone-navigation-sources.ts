@@ -323,7 +323,10 @@ export class ZoneNavigationSources {
     const currentIdentity = await this.compactCatalogManifestIdentity(input.project_id, input.zone, budget);
     if (!currentIdentity || canonicalJson(currentIdentity) !== canonicalJson(identity)) throw new Error("navigation_catalog_rebuild_manifest_conflict");
     const manifest = await this.readCompactManifest(input.project_id, input.zone, budget);
-    const readyManifest = manifest?.ready_generation === input.expected_generation && !manifest.rebuilding_request_id;
+    // A stale compact cache can be rebuilt from the newer, frozen source
+    // snapshot; requiring it to be current would strand legacy lost-dirty gaps.
+    const readyManifest = manifest?.ready_generation !== null && manifest?.ready_generation !== undefined
+      && manifest.ready_generation <= input.expected_generation && !manifest.rebuilding_request_id;
     const abandonedUnreadyManifest = manifest?.ready_generation === null && !manifest.rebuilding_request_id;
     if (!manifest || (!readyManifest && !abandonedUnreadyManifest)) throw new Error("navigation_catalog_rebuild_manifest_not_ready");
     const root = compactCatalogRebuildRoot(input.project_id, input.zone, requestId);

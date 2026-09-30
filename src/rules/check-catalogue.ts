@@ -9,6 +9,7 @@ export const normalizedMutationOperations: readonly string[] = [...operationValu
   "artifact.write", "document.publish", "document.reopen", "document.archive", "working.write", "working.supersede", "working.fork", "review.write", "review.promote",
   "input.intake", "input.recover", "project.materialize", "project.repair", "candidate.resolve", "navigation.reconcile"];
 const physical = ["package.replace", "package.drift.observe", "document.instance.repair", "artifact.write", "document.publish", "document.reopen", "document.archive", "working.write", "working.supersede", "working.fork", "review.write", "review.promote", "input.intake", "input.recover", "project.materialize", "project.repair"];
+const navigation = ["navigation.reconcile"];
 export interface CheckDefinition {
   check_id: string; operations: readonly string[]; parameters: z.ZodType;
   required_evidence: readonly string[]; stages: readonly CheckStage[];
@@ -26,7 +27,7 @@ const definitions = [
   definition("exact_approval", normalizedMutationOperations, empty, ["exact_server_approval"], both, ["EXACT_APPROVAL_REQUIRED", "EXACT_APPROVAL_VERIFIED"], "src/rules/evaluator.ts#exactApproval", "pure"),
   definition("current_uniqueness", physical, empty, ["current_head_inventory", "canonical_head_version"], both, ["RULE_CONTROL_UNAVAILABLE"], "src/documents/working-head-service.ts"),
   definition("verified_archive", physical, empty, ["source_metadata", "archive_metadata", "integrity_hash", "archive_provenance"], ["post_execution"], ["RULE_CONTROL_UNAVAILABLE"], "src/artifacts/staged-publication.ts#samePayload"),
-  definition("valid_links", physical, empty, ["declared_links", "resolved_target_versions"], ["post_execution"], ["RULE_CONTROL_UNAVAILABLE"], "docs/superpowers/specs/2026-09-12-sop-runtime-coverage-matrix.md#L5"),
+  definition("valid_links", [...physical, ...navigation], empty, ["declared_links", "resolved_target_versions"], ["post_execution"], ["RULE_CONTROL_UNAVAILABLE"], "src/documents/zone-navigation.ts#runValidLinksPostcheck"),
   definition("coherent_phase", ["plan.phase.complete"], empty, ["canonical_phase", "attached_task_statuses"], ["pre_admission"], ["RULE_EVIDENCE_UNAVAILABLE", "UNSUPPORTED_CHECK_ENFORCEMENT", "PHASE_COMPLETION_ALLOWED", "PHASE_NOT_FOUND", "PHASE_COMPLETED", "PHASE_NOT_CURRENT", "PHASE_STATE_INCONSISTENT", "PHASE_HAS_UNFINISHED_TASKS"], "src/domain/phase-completion-check.ts#checkPhaseCompletion", "pure"),
   definition("useful_resume", normalizedMutationOperations, empty, ["exact_server_approval_or_objective_resume_control"], both, ["RULE_CONTROL_UNAVAILABLE", "EXACT_APPROVAL_REQUIRED", "EXACT_APPROVAL_VERIFIED"], "docs/superpowers/specs/2026-09-12-sop-runtime-coverage-matrix.md#L4"),
   definition("terminal_staging", physical, empty, ["staging_inventory", "terminal_effect_receipts"], ["post_execution"], ["RULE_CONTROL_UNAVAILABLE"], "src/documents/input-intake-service.ts"),

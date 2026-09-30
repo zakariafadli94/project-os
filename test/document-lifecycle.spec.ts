@@ -186,6 +186,33 @@ async function prepareReplacement(transport: FakeTransport, suffix: string) {
 }
 
 describe("ManagedDocumentService work-product lifecycle", () => {
+  it("retires an exact REVIEW pointer already moved into ARCHIVES without restoring the old file", async () => {
+    const transport = new FakeTransport();
+    const service = new ManagedDocumentService(runtimeWithConditionalDelete(transport));
+    const working = await write(service, "DOCREQ-WORK-EXTERNAL-ARCHIVE-1", "historical review");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-EXTERNAL-ARCHIVE-1",
+      project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id,
+      created_at: "2026-09-29T15:00:00Z" }, state());
+    const archivedPath = "/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARCHIVES/A03/REVIEW-HISTORY/historical.md";
+    await transport.move(reviewPath, archivedPath);
+    const archived = transport.files.get(archivedPath)!.metadata;
+    const request = {
+      operation: "document.archive" as const, request_id: "DOCREQ-EXTERNAL-ARCHIVE-0001",
+      project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id,
+      stage: "review" as const, expected_project_revision: 0, observed_archive: { path: archivedPath, object_id: archived.id,
+        revision_token: archived.rev, content_hash: archived.content_hash, size: archived.size },
+      created_at: "2026-09-29T15:05:00Z"
+    };
+    const receipt = await service.archiveActiveDocument(request, state());
+    expect(receipt).toMatchObject({ status: "committed", archive_path: archivedPath, archived_stage: "review" });
+    expect((await service.status("PRJ-0002", working.document_id))?.review_version_id).toBeUndefined();
+    expect(transport.files.has(reviewPath)).toBe(false);
+    expect(transport.files.get(archivedPath)?.content).toContain("historical review");
+    expect(transport.copies).toHaveLength(0);
+    await transport.upload(archivedPath, transport.files.get(archivedPath)!.content, "overwrite");
+    await expect(service.archiveActiveDocument(request, state())).rejects.toMatchObject({ code: "DOCUMENT_ARCHIVE_EVIDENCE_CONFLICT" });
+  });
+
   it("archives a bound working version under its safe grouping and resumes after a lost source-delete response", async () => {
     const transport = new FakeTransport();
     const service = new ManagedDocumentService(runtimeWithConditionalDelete(transport));

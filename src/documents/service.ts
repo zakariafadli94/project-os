@@ -971,7 +971,7 @@ export class ManagedDocumentService {
     const head = await this.requireWorkProductHead(request.project_id, request.document_id);
     const target = archiveTarget(request.stage);
     const versionId = head[target.version_field];
-    const archivePath = managedArchivePath(
+    const archivePath = request.observed_archive?.path ?? managedArchivePath(
       state,
       request.document_id,
       request.expected_version_id,
@@ -980,9 +980,24 @@ export class ManagedDocumentService {
       head.logical_path,
       request.archive_group
     );
+    if (request.observed_archive && request.expected_project_revision !== state.revision) {
+      throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_PROJECT_REVISION_CONFLICT", "Project revision changed before external archive reconciliation", request.document_id);
+    }
     if (!versionId) {
       const archivedVersion = await this.requireVersion(request.project_id, request.document_id, request.expected_version_id);
       const archived = await this.runtime.objects.getMetadata(archivePath);
+      if (request.observed_archive) {
+        const archiveRoot = `${workspaceProjectRoot(state.project_id, state.slug)}/ARCHIVES/`;
+        const evidence = archived ? requireDropboxV1Evidence(archived) : null;
+        if (!archivePath.startsWith(archiveRoot) || archivePath.split("/").includes("..")
+          || await this.runtime.objects.getMetadata(workspaceManagedDocumentPath(state.project_id, state.slug, target.zone, head.logical_path)) !== null
+          || !evidence || evidence.file_id !== request.observed_archive.object_id
+          || evidence.rev !== request.observed_archive.revision_token
+          || evidence.content_hash !== request.observed_archive.content_hash
+          || evidence.size !== request.observed_archive.size) {
+          throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_EVIDENCE_CONFLICT", "Observed archive changed before replay", request.document_id);
+        }
+      }
       if (archived && archived.path === archivePath && providerContentMatches(archived, archivedVersion)) {
         return archiveReceipt(request, archivedVersion, archivePath);
       }
@@ -995,7 +1010,12 @@ export class ManagedDocumentService {
     this.assertExpectedVersion(request.expected_version_id, versionId, request.document_id);
     const version = await this.requireVersion(request.project_id, request.document_id, versionId);
     const visiblePath = workspaceManagedDocumentPath(state.project_id, state.slug, target.zone, head.logical_path);
-    await this.ensureActiveVersionArchived(visiblePath, archivePath, version, head.provider?.[target.provider_field], request.document_id);
+    if (request.observed_archive) {
+      await this.verifyExternallyArchivedActiveVersion(visiblePath, archivePath, version,
+        head.provider?.[target.provider_field], request.observed_archive, state, request.document_id);
+    } else {
+      await this.ensureActiveVersionArchived(visiblePath, archivePath, version, head.provider?.[target.provider_field], request.document_id);
+    }
 
     await this.ledger.writeHead({
       ...head,
@@ -1326,6 +1346,40 @@ export class ManagedDocumentService {
     }
     await this.ensurePublishedVersionArchived(visiblePath, archivePath, version, currentObservation, documentId);
     await this.deleteReviewConditionally(visiblePath, source, documentId, "archive");
+  }
+
+  private async verifyExternallyArchivedActiveVersion(
+    visiblePath: string,
+    archivePath: string,
+    version: DocumentVersionRecord,
+    observation: ManagedProviderObservation | undefined,
+    expected: { path: string; object_id: string; revision_token: string; content_hash: string; size: number },
+    state: ProjectState,
+    documentId: string
+  ): Promise<void> {
+    const archiveRoot = `${workspaceProjectRoot(state.project_id, state.slug)}/ARCHIVES/`;
+    if (!archivePath.startsWith(archiveRoot) || archivePath.split("/").includes("..") || expected.path !== archivePath) {
+      throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_PATH_INVALID", "Observed archive is outside this project's ARCHIVES", documentId);
+    }
+    if (!observation || observation.file_id !== expected.object_id || observation.content_hash !== expected.content_hash
+      || observation.size !== expected.size) {
+      throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_IDENTITY_CONFLICT", "Active head does not identify the observed archived file", documentId);
+    }
+    if (await this.runtime.objects.getMetadata(visiblePath) !== null) {
+      throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_SOURCE_PRESENT", "Active document still exists at its visible path", documentId);
+    }
+    const archived = await this.runtime.objects.getMetadata(archivePath);
+    if (!archived || archived.path !== archivePath || !providerContentMatches(archived, version)) {
+      throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_EVIDENCE_CONFLICT", "Archived document is missing or differs from its immutable version", documentId);
+    }
+    const evidence = requireDropboxV1Evidence(archived);
+    if (evidence.file_id !== expected.object_id || evidence.rev !== expected.revision_token
+      || evidence.content_hash !== expected.content_hash || evidence.size !== expected.size) {
+      throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_EVIDENCE_CONFLICT", "Archived provider identity changed", documentId);
+    }
+    if (await this.runtime.objects.getMetadata(visiblePath) !== null) {
+      throw new ManagedDocumentConflictError("DOCUMENT_ARCHIVE_SOURCE_PRESENT", "Active document reappeared during reconciliation", documentId);
+    }
   }
 
   private async writeTextAtStage(

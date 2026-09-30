@@ -82,7 +82,19 @@ const documentArchiveSchema = z.strictObject({
   stage: z.enum(["working", "review", "published"]),
   expected_version_id: versionId,
   archive_group: z.string().max(323).regex(/^[A-Z0-9][A-Z0-9_-]{0,79}(?:\/[A-Z0-9][A-Z0-9_-]{0,79}){0,3}$/).optional(),
+  expected_project_revision: z.number().int().nonnegative().safe().optional(),
+  observed_archive: z.strictObject({
+    path: z.string().min(1),
+    object_id: z.string().regex(/^id:[A-Za-z0-9_-]+$/),
+    revision_token: z.string().min(1).max(256),
+    content_hash: hash,
+    size: z.number().int().nonnegative().safe()
+  }).optional(),
   created_at: createdAt
+}).superRefine((value, ctx) => {
+  if (value.observed_archive && (value.expected_project_revision === undefined || value.archive_group !== undefined)) {
+    ctx.addIssue({ code: "custom", path: ["observed_archive"], message: "external archive reconciliation requires an exact project revision and no generated archive group" });
+  }
 });
 
 const instanceRepairProvider = z.strictObject({

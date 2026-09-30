@@ -363,6 +363,24 @@ describe("ZoneNavigationInventory", () => {
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
     h.put(receiptPath, JSON.stringify({ ...legacyReceipt, request_sha256: "0".repeat(64) }));
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
+
+    // Older promotions also omitted the optional expected_version_id. Their
+    // admission resource was bound to the request ID rather than the parent.
+    const olderRequest = { operation: "review.promote", request_id: requestId, project_id: projectId,
+      document_id: documentId, created_at: request.created_at };
+    const olderJson = JSON.stringify(olderRequest);
+    const olderDigest = await sha256Text(olderJson);
+    h.put(intentPath, JSON.stringify({ ...legacyIntent, request_sha256: olderDigest }));
+    h.put(receiptPath, JSON.stringify({ ...legacyReceipt, request_sha256: olderDigest }));
+    const journal = new ExecutionJournal(h.runtime, projectId, "document", requestId);
+    const olderAdmission = await journal.readAdmission();
+    expect(olderAdmission).not.toBeNull();
+    h.put(`${await journal.root()}/admission.json`, JSON.stringify({ ...olderAdmission,
+      admission: { ...olderAdmission!.admission, request_hash: await executionHash(olderRequest),
+        resources: [{ resource_id: documentId, resource_type: "document", zone: "DOCUMENTS", version: requestId }] } }));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+    h.put(receiptPath, JSON.stringify({ ...legacyReceipt, request_sha256: "0".repeat(64) }));
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
 
   it("accepts a DELIVERABLES head only when its exact committed publication proves the provider move", async () => {

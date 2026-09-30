@@ -842,20 +842,27 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       if (intent.schema_version !== "1.0" || intent.project_id !== projectId || intent.request_id !== version.request_id
         || typeof intent.request_sha256 !== "string") return false;
       // Legacy committed promotions stored only the raw request digest. The
-      // immutable version contains every field needed to reconstruct that
-      // minimal request; require its exact raw digest before trusting it.
+      // optional expected_version_id was absent in some of those requests;
+      // reconstruct only these two exact historical shapes and require the
+      // persisted digest to select one before consulting the receipt.
+      const legacyBase = {
+        operation: "review.promote", request_id: version.request_id, project_id: projectId,
+        document_id: documentId
+      };
+      const legacyRequests = [
+        JSON.stringify({ ...legacyBase, expected_version_id: version.parent_version_id, created_at: version.created_at }),
+        JSON.stringify({ ...legacyBase, created_at: version.created_at })
+      ];
       const requestJson = typeof intent.request_json === "string" ? intent.request_json
-        : intent.request_json === undefined ? JSON.stringify({
-          operation: "review.promote", request_id: version.request_id, project_id: projectId,
-          document_id: documentId, expected_version_id: version.parent_version_id,
-          created_at: version.created_at
-        }) : null;
+        : intent.request_json === undefined
+          ? (await Promise.all(legacyRequests.map(async (candidate) => ({ candidate, digest: await sha256Text(candidate) })))).find((item) => item.digest === intent.request_sha256)?.candidate ?? null
+          : null;
       if (!requestJson || await sha256Text(requestJson) !== intent.request_sha256) return false;
       request = parseManagedDocumentRequest(JSON.parse(requestJson)) as unknown as Record<string, unknown>;
     } catch { return false; }
     if (request.operation !== "review.promote" || request.request_id !== version.request_id
       || request.project_id !== projectId || request.document_id !== documentId
-      || request.expected_version_id !== version.parent_version_id) return false;
+      || (request.expected_version_id !== undefined && request.expected_version_id !== version.parent_version_id)) return false;
 
     const receiptPath = `${machineDocumentRoot(projectId)}/requests/${version.request_id}/receipt.json`;
     charge(budget);
@@ -882,7 +889,9 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       || admission.admission.request_hash !== await executionHash(request) || admission.admission.verdict !== "allow") return false;
     const matchingResources = admission.admission.resources.filter((resource) => resource.resource_id === documentId
       && resource.resource_type === "document" && resource.zone === "DOCUMENTS"
-      && resource.version === version.parent_version_id && resource.expected_version === version.parent_version_id);
+      && (request.expected_version_id === undefined
+        ? resource.version === version.request_id && resource.expected_version === undefined
+        : resource.version === version.parent_version_id && resource.expected_version === version.parent_version_id));
     return matchingResources.length === 1;
   }
 

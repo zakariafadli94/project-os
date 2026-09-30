@@ -485,6 +485,69 @@ async function prepareReplacement(transport: FakeTransport, suffix: string) {
 }
 
 describe("ManagedDocumentService work-product lifecycle", () => {
+  it("archives a published version whose historical WORKING evidence differs but whose current bytes equal its immutable payload", async () => {
+    const transport = new FakeTransport();
+    const service = new ManagedDocumentService(runtimeWithConditionalDelete(transport));
+    const working = await write(service, "DOCREQ-WORK-LEGACY-PUBLISHED-1", "published current body");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-LEGACY-PUBLISHED-1",
+      project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id,
+      created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-LEGACY-PUBLISHED-1",
+      project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id,
+      created_at: "2026-09-30T10:01:00Z" }, state());
+    const versionPath = machineDocumentVersionPath("PRJ-0002", working.document_id, published.version_id);
+    const version = JSON.parse(transport.files.get(versionPath)!.content);
+    version.provider_content_hash = contentHash("historical working body");
+    version.size = "historical working body".length;
+    await transport.upload(versionPath, JSON.stringify(version), "overwrite");
+    const request = { operation: "document.archive" as const, request_id: "DOCREQ-ARCHIVE-LEGACY-PUBLISHED-1",
+      project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: published.version_id,
+      stage: "published" as const, created_at: "2026-09-30T10:02:00Z" };
+    const receipt = await service.archiveActiveDocument(request, state());
+    expect(receipt).toMatchObject({ status: "committed", archived_stage: "published" });
+    expect(transport.files.has(publishedPath)).toBe(false);
+    expect(transport.files.get(receipt.archive_path!)?.content).toContain("published current body");
+    expect((await service.status("PRJ-0002", working.document_id))?.published_version_id).toBeUndefined();
+    expect(await service.archiveActiveDocument(request, state())).toEqual(receipt);
+  });
+
+  it("keeps a legacy published source when its verified archive is replaced before removal", async () => {
+    const transport = new FakeTransport();
+    const runtime = runtimeWithConditionalDelete(transport);
+    const service = new ManagedDocumentService(runtime);
+    const working = await write(service, "DOCREQ-WORK-LEGACY-ARCHIVE-RACE-1", "published current body");
+    const review = await service.promoteToReview({ request_id: "DOCREQ-REVIEW-LEGACY-ARCHIVE-RACE-1",
+      project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: working.version_id,
+      created_at: "2026-09-30T10:00:00Z" }, state());
+    const published = await service.publish({ request_id: "DOCREQ-PUBLISH-LEGACY-ARCHIVE-RACE-1",
+      project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: review.version_id,
+      created_at: "2026-09-30T10:01:00Z" }, state());
+    const versionPath = machineDocumentVersionPath("PRJ-0002", working.document_id, published.version_id);
+    const version = JSON.parse(transport.files.get(versionPath)!.content);
+    version.provider_content_hash = contentHash("historical working body");
+    version.size = "historical working body".length;
+    await transport.upload(versionPath, JSON.stringify(version), "overwrite");
+    const requestId = "DOCREQ-ARCHIVE-LEGACY-RACE-1";
+    const archivePath = `/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-0002-project-os/ARCHIVES/MANAGED-DOCUMENTS/${working.document_id}/${published.version_id}/published/${requestId}/${logicalPath}`;
+    const getMetadata = runtime.objects.getMetadata.bind(runtime.objects);
+    let changed = false;
+    runtime.objects.getMetadata = async (path) => {
+      const result = await getMetadata(path);
+      if (!changed && path === publishedPath && transport.files.has(archivePath)) {
+        changed = true;
+        await transport.upload(archivePath, "external archive replacement", "overwrite");
+      }
+      return result;
+    };
+    await expect(service.archiveActiveDocument({ operation: "document.archive", request_id: requestId,
+      project_id: "PRJ-0002", document_id: working.document_id, expected_version_id: published.version_id,
+      stage: "published", created_at: "2026-09-30T10:02:00Z" }, state()))
+      .rejects.toMatchObject({ code: "DOCUMENT_ARCHIVE_VERIFICATION_FAILED" });
+    expect(changed).toBe(true);
+    expect(transport.files.has(publishedPath)).toBe(true);
+    expect((await service.status("PRJ-0002", working.document_id))?.published_version_id).toBe(published.version_id);
+  });
+
   it("retires an exact REVIEW pointer already moved into ARCHIVES without restoring the old file", async () => {
     const transport = new FakeTransport();
     const service = new ManagedDocumentService(runtimeWithConditionalDelete(transport));

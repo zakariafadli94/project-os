@@ -10,7 +10,7 @@ import {
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
-import { executionHash, ExecutionJournal } from "../src/execution/journal";
+import { executionHash, ExecutionJournal, requiredRulePostchecks } from "../src/execution/journal";
 import type { ExecutionAdmission } from "../src/execution/contract";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
@@ -64,6 +64,29 @@ function admissionFor(input: NavigationReconcileRequest): Promise<ExecutionAdmis
     gaps: [],
     deferred_rules: []
   } as unknown as ExecutionAdmission));
+}
+
+function withDeferredValidLinks(admission: ExecutionAdmission): { admission: ExecutionAdmission; rule: import("../src/domain/rule-governance").RuleVersion } {
+  const reference = { rule_id: "RULE-NAV-LINKS-01", version: 1, scope: { kind: "global" as const } };
+  admission.deferred_rules = [reference];
+  admission.ruleset.rules = [reference];
+  const rule = {
+    ...reference,
+    source_refs: ["server:qualified"],
+    title: "Navigation links resolve to verified targets",
+    operations: ["navigation.reconcile"],
+    resource_scope: { resource_types: ["navigation"], zones: ["WORKING"] },
+    check_id: "valid_links",
+    parameters: {},
+    enforcement: "automatic",
+    check_stage: "post_execution",
+    exception_allowed: false,
+    status: "active",
+    activation_evidence: ["server:qualified"],
+    created_by: "test",
+    created_at: at
+  } as import("../src/domain/rule-governance").RuleVersion;
+  return { admission, rule };
 }
 
 function runtimeHarness() {
@@ -630,6 +653,198 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(attempts).toBe(2);
     expect(harness.files.get(indexPath)?.objectId).toBe(firstIndex?.objectId);
     expect(harness.files.get(indexPath)?.revisionToken).toBe(firstIndex?.revisionToken);
+  });
+
+  it("finalizes valid_links only with provider evidence for the published index and every target", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const { admission, rule } = withDeferredValidLinks(await admissionFor(input));
+
+    const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, inv.port, undefined, [rule]), input, project, admission);
+
+    expect(result.status).toBe("finalized");
+    const progressPath = [...harness.files.keys()].find((path) => path.endsWith("/navigation-progress.json"))!;
+    const progress = JSON.parse(harness.files.get(progressPath)!.content);
+    expect(progress.postchecks).toEqual([expect.objectContaining({
+      check_id: requiredRulePostchecks(admission)[0],
+      verdict: "allow",
+      evidence_refs: [expect.stringContaining("/observations/")]
+    })]);
+    const evidence = JSON.parse(harness.files.get(progress.postchecks[0].evidence_refs[0])!.content);
+    expect(evidence).toMatchObject({
+      check_id: "valid_links",
+      index: { object_id: expect.any(String), revision_token: expect.any(String), content_sha256: expect.any(String) },
+      target_evidence_refs: [expect.stringContaining("/observations/navigation-valid-links-target-")]
+    });
+    const targetEvidence = JSON.parse(harness.files.get(evidence.target_evidence_refs[0])!.content);
+    expect(targetEvidence.target).toMatchObject({ resource_id: inv.entry.resource_id, object_id: inv.entry.expected.object_id, revision_token: inv.entry.expected.revision_token, content_sha256: inv.entry.expected.content_sha256 });
+  });
+
+  it("does not finalize valid_links when a generated target is physically missing", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const { admission, rule } = withDeferredValidLinks(await admissionFor(input));
+    const createText = harness.runtime.objects.createText;
+    harness.runtime.objects.createText = async (path, content) => {
+      await createText(path, content);
+      if (path.endsWith("/WORKING/00-CURRENT.md")) harness.files.delete(inv.targetPath);
+    };
+
+    const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, inv.port, undefined, [rule]), input, project, admission);
+
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_postcheck_denied" });
+    expect(harness.files.has(`${machineDocumentRoot(project.project_id)}/navigation/WORKING/head.json`)).toBe(false);
+    const progressPath = [...harness.files.keys()].find((path) => path.endsWith("/navigation-progress.json"))!;
+    expect(JSON.parse(harness.files.get(progressPath)!.content).postchecks).toEqual([
+      expect.objectContaining({ check_id: requiredRulePostchecks(admission)[0], verdict: "deny" })
+    ]);
+  });
+
+  it("denies valid_links when a target identity changes after the index is published", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const { admission, rule } = withDeferredValidLinks(await admissionFor(input));
+    const createText = harness.runtime.objects.createText;
+    harness.runtime.objects.createText = async (path, content) => {
+      await createText(path, content);
+      if (path.endsWith("/WORKING/00-CURRENT.md")) harness.put(inv.targetPath, "Changed after publication\n", "id:target");
+    };
+
+    const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, inv.port, undefined, [rule]), input, project, admission);
+
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_postcheck_denied" });
+    expect(harness.files.has(`${machineDocumentRoot(project.project_id)}/navigation/WORKING/head.json`)).toBe(false);
+  });
+
+  it("leaves navigation unfinalized when a target provider read is unavailable", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const { admission, rule } = withDeferredValidLinks(await admissionFor(input));
+    const createText = harness.runtime.objects.createText;
+    const getMetadata = harness.runtime.objects.getMetadata;
+    let indexPublished = false;
+    harness.runtime.objects.createText = async (path, content) => {
+      await createText(path, content);
+      if (path.endsWith("/WORKING/00-CURRENT.md")) indexPublished = true;
+    };
+    harness.runtime.objects.getMetadata = async (path) => {
+      if (indexPublished && path === inv.targetPath) throw new Error("provider temporarily unavailable");
+      return getMetadata(path);
+    };
+
+    const result = await reconcileUntilTerminal(new ZoneNavigationEngine(harness.runtime, inv.port, undefined, [rule]), input, project, admission);
+
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_postcheck_unavailable" });
+    expect(harness.files.has(`${machineDocumentRoot(project.project_id)}/navigation/WORKING/head.json`)).toBe(false);
+  });
+
+  it("creates no navigation intent for an unsupported deferred check", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    const input = request();
+    const admission = await admissionFor(input);
+    admission.deferred_rules = [{ rule_id: "RULE-NAV-UNSUPPORTED-01", version: 1, scope: { kind: "global" } }];
+
+    const result = await new ZoneNavigationEngine(harness.runtime, inv.port).reconcile(input, project, admission, budget());
+
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_postchecks_unavailable" });
+    expect([...harness.files.keys()].some((path) => path.endsWith("/navigation-intention.json"))).toBe(false);
+    expect([...harness.files.keys()].some((path) => path.endsWith("/admission.json"))).toBe(false);
+  });
+
+  it("allows preparation to defer the qualified navigation postcheck until ProjectGuard publication", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const { admission } = withDeferredValidLinks(await admissionFor(input));
+
+    const result = await new ZoneNavigationEngine(harness.runtime, inv.port)
+      .reconcile(input, project, admission, budget(128), { deferPublication: true });
+
+    expect(result).toMatchObject({ status: "prepared", source_snapshot_id: "snapshot-1" });
+    const progress = [...harness.files.entries()].find(([path]) => path.endsWith("/navigation-progress.json"))?.[1].content;
+    expect(JSON.parse(progress!).postchecks).toEqual([]);
+  });
+
+  it("resumes multi-slice target verification from stable evidence without rereading completed targets", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const contents = Array.from({ length: 7 }, (_, index) => `Target ${index}\n`);
+    const entries: NavigationInventoryEntry[] = await Promise.all(contents.map(async (content, index) => ({
+      project_id: project.project_id,
+      zone: "WORKING",
+      resource_id: `DOC-${String(index).padStart(24, "0")}`,
+      version: `VER-${String(index).padStart(24, "0")}`,
+      logical_path: `plans/target-${index}.md`,
+      path: `${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/plans/target-${index}.md`,
+      expected: { object_id: `id:target-${index}`, revision_token: `rev-target-${index}`, content_sha256: await sha256Text(content), size: new TextEncoder().encode(content).byteLength }
+    })));
+    const inv = await inventoryHarness(project, "WORKING", { pages: [entries] });
+    inv.port.listPage = async ({ budget: slice }) => { slice.beforeHttp(); return { entries, gaps: [], snapshot_id: "snapshot-1", next_cursor: null }; };
+    inv.port.verifyEntry = async (_entry, slice) => { slice.beforeHttp(); return true; };
+    for (const [index, entry] of entries.entries()) {
+      const identity = harness.put(entry.path, contents[index], entry.expected.object_id);
+      entry.expected.object_id = identity.objectId!;
+      entry.expected.revision_token = identity.revisionToken!;
+    }
+    const { admission, rule } = withDeferredValidLinks(await admissionFor(input));
+    const metadata = harness.runtime.objects.getMetadata;
+    const readBytes = harness.runtime.objects.readBytes!;
+    const originalCreate = harness.runtime.objects.createText;
+    const originalConditionalWrite = harness.runtime.conditionalWrite.writeTextConditional;
+    let indexPublished = false;
+    let interrupted = false;
+    const postcheckMetadataReads = new Map<string, number>();
+    const postcheckByteReads = new Map<string, number>();
+    harness.runtime.objects.createText = async (path, content) => {
+      await originalCreate(path, content);
+      if (path.endsWith("/WORKING/00-CURRENT.md")) indexPublished = true;
+    };
+    harness.runtime.objects.getMetadata = async (path) => {
+      if (indexPublished && entries.some((entry) => entry.path === path)) postcheckMetadataReads.set(path, (postcheckMetadataReads.get(path) ?? 0) + 1);
+      return metadata(path);
+    };
+    harness.runtime.objects.readBytes = async (path, maxBytes) => {
+      if (indexPublished && entries.some((entry) => entry.path === path)) postcheckByteReads.set(path, (postcheckByteReads.get(path) ?? 0) + 1);
+      return readBytes(path, maxBytes);
+    };
+    harness.runtime.conditionalWrite.writeTextConditional = async (path, content, expectedToken) => {
+      if (!interrupted && path.endsWith("/navigation-progress.json")
+        && JSON.parse(content).valid_links_work?.verified_count === 1) {
+        interrupted = true;
+        throw new Error("slice_budget_exhausted");
+      }
+      return originalConditionalWrite(path, content, expectedToken);
+    };
+
+    const engine = new ZoneNavigationEngine(harness.runtime, inv.port, undefined, [rule]);
+    let result = await engine.reconcile(input, project, admission, budget(32));
+    for (let attempt = 0; result.status === "pending" && !interrupted && attempt < 12; attempt++) {
+      result = await engine.reconcile(input, project, admission, budget(32));
+    }
+    expect(interrupted).toBe(true);
+    expect(result.status).toBe("pending");
+    result = await reconcileUntilTerminal(engine, input, project, admission, 32);
+
+    expect(result.status, JSON.stringify({ result, postcheckMetadataReads: [...postcheckMetadataReads], postcheckByteReads: [...postcheckByteReads] })).toBe("finalized");
+    expect([...postcheckMetadataReads.values()]).toEqual(Array(7).fill(2));
+    expect([...postcheckByteReads.values()]).toEqual(Array(7).fill(1));
   });
 
   it("rejects an overlapping inventory page instead of duplicating a source", async () => {

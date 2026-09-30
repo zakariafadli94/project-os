@@ -26,6 +26,7 @@ import { machineDocumentRoot, workspaceProjectRoot } from "../persistence/layout
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { ProviderConflictError, ProviderPreconditionFailedError } from "../persistence/provider/errors";
+import type { RuleVersion } from "../domain/rule-governance";
 
 const PAGE_LIMIT = 8;
 const navigationProgressSchema = z.strictObject({
@@ -51,6 +52,16 @@ const navigationProgressSchema = z.strictObject({
   rendered_links: z.array(z.string()),
   generated_sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
   legacy_archive_ref: z.string().nullable(),
+  valid_links_work: z.strictObject({
+    check_id: z.string(),
+    rule_ref: z.string(),
+    snapshot_id: z.string(),
+    index: navigationIndexIdentitySchema,
+    next_page: z.number().int().nonnegative().safe(),
+    next_entry: z.number().int().nonnegative().safe(),
+    verified_count: z.number().int().nonnegative().safe(),
+    target_evidence_refs: z.array(z.string().min(1))
+  }).nullable().optional().default(null),
   status: z.enum(["adopting", "publishing", "finalized", "conflict"]),
   receipt: z.unknown().nullable(),
   postchecks: z.array(z.object({ check_id: z.string(), verdict: z.enum(["allow", "deny", "unavailable"]), evidence_refs: z.array(z.string()) }).strict())
@@ -76,7 +87,8 @@ export class ZoneNavigationEngine {
   constructor(
     private readonly runtime: ProjectOsPersistenceRuntime,
     private readonly inventory: NavigationInventoryPort,
-    private readonly postchecks?: NavigationPostcheckPort
+    private readonly postchecks?: NavigationPostcheckPort,
+    private readonly postcheckRules: readonly RuleVersion[] = []
   ) {}
 
   async reconcile(
@@ -99,7 +111,7 @@ export class ZoneNavigationEngine {
     const headPath = zoneNavigationHeadPath(request.project_id, request.zone);
 
     try {
-      this.assertAdmission(request, state, admission, requestHash, indexPath);
+      this.assertAdmission(request, state, admission, requestHash, indexPath, !options.deferPublication);
       const intent = await this.prepare(request, state, requestHash, indexPath, headPath, intentPath, progressPath, budget);
       if (intent.status === "conflict") return intent;
       let progress = intent.progress;
@@ -152,8 +164,8 @@ export class ZoneNavigationEngine {
       const index = write.identity;
       progress.published_index = index;
       progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
-      const checks = await this.runPostchecks(request, admission, progress, progressPath, budget);
-      if (checks.status === "conflict") return checks;
+      const checks = await this.runPostchecks(request, state, admission, progress, progressPath, pagesRoot, budget);
+      if (checks.status !== "ok") return checks;
 
       const certificate = {
         schema_version: "1.0",
@@ -281,8 +293,8 @@ export class ZoneNavigationEngine {
         progress.published_index = index;
         progress = await this.saveProgress(path, progress, await this.token(path, budget), budget);
       }
-      const checks = await this.runPostchecks(request, admission, progress, path, budget);
-      if (checks.status === "conflict") return checks;
+      const checks = await this.runPostchecks(request, state, admission, progress, path, `${root}/navigation/snapshot`, budget);
+      if (checks.status !== "ok") return checks;
 
       const certificate = {
         schema_version: "1.0",
@@ -387,6 +399,7 @@ export class ZoneNavigationEngine {
       rendered_links: [],
       generated_sha256: null,
       legacy_archive_ref: null,
+      valid_links_work: null,
       status: "adopting",
       receipt: null,
       postchecks: []
@@ -596,7 +609,7 @@ export class ZoneNavigationEngine {
     return { status: "ok" };
   }
 
-  private async verifyPhysicalEntry(entry: NavigationInventoryEntry, budget: SliceBudget): Promise<void> {
+  private async verifyPhysicalEntry(entry: NavigationInventoryEntry, budget: SliceBudget): Promise<{ object_id: string; revision_token: string; content_sha256: string; size: number }> {
     const before = await this.metadata(entry.path, budget);
     if (!matchesEntryMetadata(before, entry) || before?.size !== entry.expected.size) throw new NavigationConflict("navigation_target_missing_or_changed");
     let bytes: Uint8Array | null = null;
@@ -609,7 +622,9 @@ export class ZoneNavigationEngine {
       bytes = content === null ? null : new TextEncoder().encode(content);
     }
     const after = await this.metadata(entry.path, budget);
-    if (bytes === null || bytes.byteLength !== entry.expected.size || !matchesEntryMetadata(after, entry) || after?.size !== entry.expected.size || before!.objectId !== after!.objectId || before!.revisionToken !== after!.revisionToken || await sha256Bytes(bytes) !== entry.expected.content_sha256) throw new NavigationConflict("navigation_target_missing_or_changed");
+    const contentSha256 = bytes === null ? null : await sha256Bytes(bytes);
+    if (bytes === null || bytes.byteLength !== entry.expected.size || !matchesEntryMetadata(after, entry) || after?.size !== entry.expected.size || before!.objectId !== after!.objectId || before!.revisionToken !== after!.revisionToken || contentSha256 !== entry.expected.content_sha256) throw new NavigationConflict("navigation_target_missing_or_changed");
+    return { object_id: after!.objectId!, revision_token: after!.revisionToken!, content_sha256: contentSha256!, size: after!.size };
   }
 
   private async observeIndex(path: string, budget: SliceBudget): Promise<{ identity: NavigationIndexIdentity; content: string; bytes: Uint8Array; exact_bytes: boolean } | null> {
@@ -730,7 +745,7 @@ export class ZoneNavigationEngine {
     if (entry.project_id !== state.project_id || entry.zone !== zone || entry.path !== expectedPath || entry.path === this.indexPath(state, zone, "00-CURRENT.md") || entry.path === this.indexPath(state, zone, "00-CURRENT-INDEX.md")) throw new NavigationConflict("navigation_entry_out_of_scope");
   }
 
-  private assertAdmission(request: NavigationReconcileRequest, state: ProjectState, admission: ExecutionAdmission, requestHash: string, indexPath: string): void {
+  private assertAdmission(request: NavigationReconcileRequest, state: ProjectState, admission: ExecutionAdmission, requestHash: string, indexPath: string, requirePostcheckAdapter = true): void {
     const resourceId = `navigation:${request.zone}`;
     const resource = admission.resources?.filter((candidate) => candidate.resource_id === resourceId && candidate.resource_type === "navigation" && candidate.zone === request.zone && candidate.version === String(request.expected_generation));
     const scope = admission.resource_effect_scopes?.find((candidate) => candidate.resource_id === resourceId && candidate.resource_version === String(request.expected_generation) && candidate.provider_id === this.runtime.providerId);
@@ -744,16 +759,21 @@ export class ZoneNavigationEngine {
     const archive = scope?.preservation_copies?.find((candidate) => candidate.path === archivePath
       && candidate.logical_path === `ARCHIVES/NAVIGATION/${request.zone}/${request.expected_generation + 1}-${request.expected_index?.content_sha256}.md`);
     if (state.project_id !== request.project_id || state.revision !== request.expected_project_revision || admission.project_id !== request.project_id || admission.request_id !== request.request_id || admission.kind !== "document" || admission.operation !== "navigation.reconcile" || admission.request_hash !== requestHash || admission.verdict !== "allow" || admission.project_revision !== request.expected_project_revision || resource?.length !== 1 || !scope || !address || scope.destinations.length !== 1 || scope.sources.length !== (sourcePath ? 1 : 0) || (sourcePath && !source) || scope.preservation_copies.length !== (archivePath ? 1 : 0) || (archivePath && !archive)) throw new NavigationConflict("navigation_admission_binding_mismatch");
-    if (admission.deferred_rules?.length && !this.postchecks) throw new NavigationConflict("navigation_postchecks_unavailable");
+    if (requirePostcheckAdapter && admission.deferred_rules?.length && !this.postchecks && admission.deferred_rules.some((reference) => {
+      const checkId = `rule:${canonicalJson(reference)}`;
+      return !this.validLinksRule(admission, checkId);
+    })) throw new NavigationConflict("navigation_postchecks_unavailable");
   }
 
   private async runPostchecks(
     request: NavigationReconcileRequest,
+    state: ProjectState,
     admission: ExecutionAdmission,
     progress: NavigationProgress,
     progressPath: string,
+    pagesRoot: string,
     budget: SliceBudget
-  ): Promise<{ status: "ok"; records: unknown[] } | { status: "conflict"; code: string }> {
+  ): Promise<{ status: "ok"; records: unknown[] } | { status: "pending"; cursor: string | null } | { status: "conflict"; code: string }> {
     const records: NavigationProgress["postchecks"] = [...progress.postchecks];
     for (const checkId of requiredRulePostchecks(admission)) {
       const prior = records.find((record) => record.check_id === checkId);
@@ -763,8 +783,13 @@ export class ZoneNavigationEngine {
         progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
         return { status: "conflict", code: "navigation_postcheck_denied" };
       }
-      if (!this.postchecks) return { status: "conflict", code: "navigation_postchecks_unavailable" };
-      const result = await this.postchecks.run({ request, admission, check_id: checkId, budget });
+      const rule = this.validLinksRule(admission, checkId);
+      const result = rule
+        ? await this.runValidLinksPostcheck(request, state, progress, pagesRoot, rule, progressPath, budget)
+        : this.postchecks
+          ? await this.postchecks.run({ request, admission, check_id: checkId, budget })
+          : { verdict: "unavailable" as const, evidence_refs: [] };
+      if (result.verdict === "pending") return { status: "pending", cursor: result.cursor };
       const verdict = result.verdict === "allow" && result.evidence_refs.length && result.evidence_refs.every((ref) => typeof ref === "string" && !!ref)
         ? "allow"
         : result.verdict === "deny" ? "deny" : "unavailable";
@@ -779,6 +804,139 @@ export class ZoneNavigationEngine {
       if (verdict === "unavailable") return { status: "conflict", code: "navigation_postcheck_unavailable" };
     }
     return { status: "ok", records };
+  }
+
+  private validLinksRule(admission: ExecutionAdmission, checkId: string): RuleVersion | null {
+    const reference = admission.deferred_rules?.find((candidate) => `rule:${canonicalJson(candidate)}` === checkId);
+    if (!reference) return null;
+    const rule = this.postcheckRules.find((candidate) => canonicalJson({ rule_id: candidate.rule_id, version: candidate.version, scope: candidate.scope }) === canonicalJson(reference));
+    if (!rule || rule.check_id !== "valid_links" || rule.check_stage !== "post_execution" || rule.enforcement !== "automatic"
+      || !rule.operations.includes("navigation.reconcile") || !["active", "superseded", "retired"].includes(rule.status)) return null;
+    return rule;
+  }
+
+  private async runValidLinksPostcheck(
+    request: NavigationReconcileRequest,
+    state: ProjectState,
+    progress: NavigationProgress,
+    pagesRoot: string,
+    rule: RuleVersion,
+    progressPath: string,
+    budget: SliceBudget
+  ): Promise<{ verdict: "allow" | "deny" | "unavailable"; evidence_refs: string[] } | { verdict: "pending"; evidence_refs: []; cursor: string | null }> {
+    try {
+      if (!progress.published_index || !progress.generated_sha256 || !progress.snapshot_id || progress.coverage_gaps.length) {
+        return { verdict: "deny", evidence_refs: [] };
+      }
+      if (progress.source_ids.length !== progress.source_count || progress.rendered_links.length !== progress.source_count) return { verdict: "deny", evidence_refs: [] };
+      if (!await this.inventory.verifySnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id, budget })) return { verdict: "deny", evidence_refs: [] };
+      const indexPath = this.indexPath(state, request.zone, progress.index_basename);
+      const observedIndex = await this.observeIndex(indexPath, budget);
+      if (!observedIndex || !sameIndexIdentity(observedIndex.identity, progress.published_index)
+        || observedIndex.identity.content_sha256 !== progress.generated_sha256
+        || observedIndex.content !== this.render(request.zone, progress.rendered_links, progress.coverage_gaps)) {
+        return { verdict: "deny", evidence_refs: [] };
+      }
+      const actualLinks = observedIndex.content.split("\n").filter((line) => line.startsWith("- ["));
+      if (canonicalJson(actualLinks) !== canonicalJson(progress.rendered_links)) return { verdict: "deny", evidence_refs: [] };
+
+      const ruleRef = { rule_id: rule.rule_id, version: rule.version, scope: rule.scope };
+      const ruleBinding = canonicalJson(ruleRef);
+      let work = progress.valid_links_work;
+      if (work && (work.check_id !== "valid_links" || work.rule_ref !== ruleBinding || work.snapshot_id !== progress.snapshot_id
+        || !sameIndexIdentity(work.index, progress.published_index))) return { verdict: "deny", evidence_refs: [] };
+      if (!work) {
+        work = {
+          check_id: "valid_links", rule_ref: ruleBinding, snapshot_id: progress.snapshot_id,
+          index: progress.published_index, next_page: 0, next_entry: 0, verified_count: 0, target_evidence_refs: []
+        };
+        progress.valid_links_work = work;
+        if (!budget.canStartEffect(2)) return { verdict: "pending", evidence_refs: [], cursor: null };
+        progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+      }
+      let cachedPageNumber = -1;
+      let cachedPage: SnapshotPage | null = null;
+      while (work.next_page < progress.page_count) {
+        if (!budget.canStartEffect(8)) {
+          if (budget.canStartEffect(2)) progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+          return { verdict: "pending", evidence_refs: [], cursor: `${work.next_page}:${work.next_entry}` };
+        }
+        if (cachedPageNumber !== work.next_page) {
+          const path = `${pagesRoot}/${work.next_page.toString().padStart(8, "0")}.json`;
+          const raw = await this.readText(path, budget);
+          if (raw === null) return { verdict: "unavailable", evidence_refs: [] };
+          let page: SnapshotPage;
+          try { page = JSON.parse(raw) as SnapshotPage; } catch { return { verdict: "deny", evidence_refs: [] }; }
+          if (canonicalJson(page) !== raw || page.schema_version !== "1.0" || page.page !== work.next_page
+            || page.project_id !== request.project_id || page.request_id !== request.request_id || page.snapshot_id !== progress.snapshot_id
+            || !Array.isArray(page.entries) || !Array.isArray(page.gaps) || page.gaps.length) return { verdict: "deny", evidence_refs: [] };
+          cachedPage = page;
+          cachedPageNumber = work.next_page;
+        }
+        const page = cachedPage!;
+        if (work.next_entry >= page.entries.length) {
+          work.next_page += 1;
+          work.next_entry = 0;
+          progress.valid_links_work = work;
+          if (!budget.canStartEffect(2)) return { verdict: "pending", evidence_refs: [], cursor: `${work.next_page}:0` };
+          progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+          continue;
+        }
+        const parsed = navigationInventoryEntrySchema.safeParse(page.entries[work.next_entry]);
+        if (!parsed.success) return { verdict: "deny", evidence_refs: [] };
+        const entry = parsed.data;
+        this.assertEntry(entry, state, request.zone);
+        const offset = work.verified_count;
+        if (offset >= progress.source_count || entry.resource_id !== progress.source_ids[offset]
+          || renderLink(entry) !== progress.rendered_links[offset]) return { verdict: "deny", evidence_refs: [] };
+        const targetEvidence = {
+          schema_version: "1.0", check_id: "valid_links_target", project_id: request.project_id,
+          request_id: request.request_id, request_hash: progress.request_hash, snapshot_id: progress.snapshot_id,
+          rule: ruleRef, index: observedIndex.identity, offset,
+          target: {
+            resource_id: entry.resource_id, path: entry.path,
+            object_id: entry.expected.object_id, revision_token: entry.expected.revision_token,
+            content_sha256: entry.expected.content_sha256, size: entry.expected.size
+          }
+        };
+        const targetRef = `${await new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id).root()}/observations/navigation-valid-links-target-${offset}-${await executionHash(targetEvidence)}.json`;
+        const persistedTargetEvidence = await this.readText(targetRef, budget);
+        if (persistedTargetEvidence !== null) {
+          if (persistedTargetEvidence !== canonicalJson(targetEvidence)) return { verdict: "deny", evidence_refs: [] };
+        } else {
+          const target = await this.verifyPhysicalEntry(entry, budget);
+          if (target.object_id !== entry.expected.object_id || target.revision_token !== entry.expected.revision_token
+            || target.content_sha256 !== entry.expected.content_sha256 || target.size !== entry.expected.size) return { verdict: "deny", evidence_refs: [] };
+          await this.immutable(targetRef, targetEvidence, budget);
+        }
+        work.target_evidence_refs.push(targetRef);
+        work.verified_count += 1;
+        work.next_entry += 1;
+        progress.valid_links_work = work;
+        if (!budget.canStartEffect(2)) return { verdict: "pending", evidence_refs: [], cursor: `${work.next_page}:${work.next_entry}` };
+        progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+      }
+      if (work.verified_count !== progress.source_count || work.target_evidence_refs.length !== progress.source_count) return { verdict: "deny", evidence_refs: [] };
+      const evidence = {
+        schema_version: "1.0",
+        check_id: "valid_links",
+        project_id: request.project_id,
+        request_id: request.request_id,
+        request_hash: progress.request_hash,
+        snapshot_id: progress.snapshot_id,
+        rule: ruleRef,
+        index: { path: indexPath, ...observedIndex.identity, size: observedIndex.bytes.byteLength },
+        links: actualLinks,
+        target_evidence_refs: work.target_evidence_refs
+      };
+      const ref = `${await new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id).root()}/observations/navigation-valid-links-${await executionHash(evidence)}.json`;
+      await this.immutable(ref, evidence, budget);
+      return { verdict: "allow", evidence_refs: [ref] };
+    } catch (error) {
+      if (isBudgetExhausted(error)) throw error;
+      if (error instanceof NavigationConflict && error.code === "navigation_target_missing_or_changed") return { verdict: "deny", evidence_refs: [] };
+      return { verdict: "unavailable", evidence_refs: [] };
+    }
   }
 
   private render(zone: NavigationZone, links: string[], gaps: { resource_id: string; code: string }[]): string {

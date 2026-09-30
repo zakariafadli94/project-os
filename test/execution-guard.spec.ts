@@ -22,12 +22,13 @@ import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/ca
 import { encodeAdmission } from "../src/admission/transport";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
-import { ExecutionJournal } from "../src/execution/journal";
+import { executionHash, ExecutionJournal } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
 import { ProviderConflictError, ProviderOperationError } from "../src/persistence/provider/errors";
+import { ruleFixture } from "./helpers/rule-fixtures";
 
 const testEnv = env as unknown as Env;
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -2129,6 +2130,237 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(executionProgressPath).toBeDefined();
     expect(JSON.parse(mock.files.get(executionProgressPath!)!)).toMatchObject({ status: "finalized", terminal: true });
     expect([...mock.files.keys()].some((path) => path.includes("/WORKING/00-CURRENT.md"))).toBe(true);
+  });
+
+  it("publishes legacy navigation admissions without consulting RegistryGuard", async () => {
+    const projectId = "PRJ-8410";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-LEGACY-8410",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn(instance as any, "readGlobalGovernance").mockRejectedValue(new Error("RegistryGuard unavailable"));
+    });
+    let publish: Response | undefined;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      publish = await guard.fetch("https://project-guard.internal/navigation-publish", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.ref)
+      });
+      const result = await publish.clone().json() as { status?: string };
+      if (result.status !== "pending") break;
+    }
+
+    expect(publish?.status).toBe(200);
+    expect(await publish?.json()).toMatchObject({ status: "committed" });
+  });
+
+  it("fails closed when a globally deferred navigation rule cannot be read from RegistryGuard", async () => {
+    const projectId = "PRJ-8411";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-GLOBAL-8411",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+
+    const reference = { rule_id: "RULE-NAV-GLOBAL-8411", version: 1, scope: { kind: "global" as const } };
+    const originalReadAdmission = ExecutionJournal.prototype.readAdmission;
+    vi.spyOn(ExecutionJournal.prototype, "readAdmission").mockImplementation(async function (this: ExecutionJournal) {
+      const existing = await originalReadAdmission.call(this);
+      if (this.projectId !== projectId || this.requestId !== request.request_id || !existing) return existing;
+      return {
+        ...existing,
+        admission: {
+          ...existing.admission,
+          deferred_rules: [reference],
+          ruleset: { ...existing.admission.ruleset, rules: [reference] }
+        }
+      };
+    });
+    let governanceReads = 0;
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn(instance as any, "readGlobalGovernance").mockImplementation(async () => {
+        governanceReads += 1;
+        throw new Error("RegistryGuard unavailable");
+      });
+    });
+
+    await expect(guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.ref)
+    })).rejects.toThrow("RegistryGuard unavailable");
+
+    expect(governanceReads).toBe(1);
+    expect([...mock.files.keys()].some((path) => path.endsWith("/navigation/WORKING/head.json"))).toBe(false);
+  });
+
+  it("publishes local-only navigation postchecks without consulting RegistryGuard", async () => {
+    const projectId = "PRJ-8412";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-LOCAL-8412",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+
+    const reference = { rule_id: "RULE-NAV-LOCAL-8412", version: 1, scope: { kind: "project" as const, project_id: projectId } };
+    const rule = ruleFixture(projectId, {
+      rule_id: reference.rule_id,
+      status: "active",
+      operations: ["navigation.reconcile"],
+      resource_scope: { resource_types: ["navigation"], zones: ["WORKING"] },
+      check_id: "valid_links",
+      parameters: {},
+      check_stage: "post_execution",
+      activation_evidence: ["server:qualified"]
+    });
+    const originalReadAdmission = ExecutionJournal.prototype.readAdmission;
+    vi.spyOn(ExecutionJournal.prototype, "readAdmission").mockImplementation(async function (this: ExecutionJournal) {
+      const existing = await originalReadAdmission.call(this);
+      if (this.projectId !== projectId || this.requestId !== request.request_id || !existing) return existing;
+      return {
+        ...existing,
+        admission: {
+          ...existing.admission,
+          deferred_rules: [reference],
+          ruleset: { ...existing.admission.ruleset, rules: [reference] }
+        }
+      };
+    });
+    const governanceReads = vi.fn();
+    const originalFrozenState = (ProjectGuard.prototype as any).readFrozenNavigationState;
+    await runInDurableObject(guard, (instance) => {
+      vi.spyOn(instance as any, "readGlobalGovernance").mockImplementation(async () => {
+        governanceReads();
+        throw new Error("RegistryGuard unavailable");
+      });
+      vi.spyOn(instance as any, "readFrozenNavigationState").mockImplementation(async (...args: any[]) => ({
+        ...(await originalFrozenState.apply(instance, args)),
+        local_rules: { [`${reference.rule_id}@${reference.version}`]: rule }
+      }));
+    });
+
+    let publish: Response | undefined;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      publish = await guard.fetch("https://project-guard.internal/navigation-publish", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.ref)
+      });
+      const result = await publish.clone().json() as { status?: string };
+      if (result.status !== "pending") break;
+    }
+
+    expect(governanceReads).not.toHaveBeenCalled();
+    expect(publish?.status).toBe(200);
+    expect(await publish?.json()).toMatchObject({ status: "committed" });
+  });
+
+  it("resolves a global navigation postcheck from the exact historical version in Governance", async () => {
+    const projectId = "PRJ-8413";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-HISTORY-8413",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard } = await setup(projectId);
+    const reference = { rule_id: "RULE-NAV-HISTORY-8413", version: 1, scope: { kind: "global" as const } };
+    const historicalRule = ruleFixture("GLOBAL", {
+      rule_id: reference.rule_id,
+      version: reference.version,
+      status: "superseded",
+      operations: ["navigation.reconcile"],
+      resource_scope: { resource_types: ["navigation"], zones: ["WORKING"] },
+      check_id: "valid_links",
+      parameters: {},
+      check_stage: "post_execution",
+      activation_evidence: ["server:qualified"]
+    });
+    const currentRule = { ...historicalRule, version: 2, status: "active" };
+    const proof = {
+      project_id: projectId,
+      operation: request.operation,
+      request_hash: await executionHash(request),
+      resources: [{ resource_id: "navigation:WORKING", resource_type: "navigation", zone: "WORKING", version: "0" }],
+      global_revision: 5,
+      project_revision: request.expected_project_revision,
+      ruleset: { global_revision: 5, project_revision: request.expected_project_revision, rules: [reference] },
+      deferred_rules: [reference]
+    };
+    const state = commitFixture(projectId, 1)[0]!.state;
+
+    const resolved = await runInDurableObject(guard, (instance) =>
+      (instance as any).resolveAdmittedNavigationPostcheckRules(request, state, proof, {
+        revision: 6,
+        rules: {
+          [`${reference.rule_id}@1`]: historicalRule,
+          [`${reference.rule_id}@2`]: currentRule
+        },
+        exceptions: {}
+      })
+    );
+
+    expect(resolved).toEqual([historicalRule]);
   });
 
   it("fences a prepared navigation after a source-generation interleave and replays duplicate workrefs safely", async () => {

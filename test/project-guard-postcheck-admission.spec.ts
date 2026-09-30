@@ -64,8 +64,18 @@ it("admits only the exact automatic package check/stage tuples with a deferred p
   expect(result.proof).toMatchObject({ verdict: "allow", deferred_rules: [{ rule_id: "RULE-POSTCHECK-9861", version: 1 }] });
 });
 
-it("refuses navigation valid-links admission before permit while no physical postcheck is qualified", async () => {
+it("admits the exact automatic navigation valid-links tuple with deferred proof", async () => {
   const result = await checkAdmission("valid_links", "post_execution", "automatic", "navigation.reconcile");
+  expect(result.error).toBeUndefined();
+  expect(result.permit).toHaveBeenCalledTimes(1);
+  expect(result.proof).toMatchObject({
+    verdict: "allow",
+    deferred_rules: [{ rule_id: "RULE-POSTCHECK-9861", version: 1, scope: { kind: "global" } }]
+  });
+});
+
+it("refuses unsupported navigation postcheck tuples before requesting a permit", async () => {
+  const result = await checkAdmission("verified_presence", "post_execution", "automatic", "navigation.reconcile");
   expect(result.error).toMatchObject({ message: "UNSUPPORTED_CHECK_OPERATION" });
   expect(result.permit).not.toHaveBeenCalled();
   expect(result.proof).toBeUndefined();

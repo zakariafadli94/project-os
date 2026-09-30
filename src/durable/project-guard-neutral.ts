@@ -1493,6 +1493,11 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", code: "navigation_workref_binding_mismatch" }, { status: 409 });
     }
     const frozenState = await this.readFrozenNavigationState(nav, ref.request_hash, budget, true);
+    const hasGlobalPostcheck = admitted.admission.deferred_rules.some(reference => reference.scope.kind === "global");
+    const global = hasGlobalPostcheck
+      ? await this.readGlobalGovernance()
+      : { revision: 0, rules: {}, exceptions: {} };
+    const postcheckRules = await this.resolveAdmittedNavigationPostcheckRules(nav, frozenState, admitted.admission, global);
     const sources = new ZoneNavigationSources(this.persistence);
     const sourceState = await sources.readState(nav.project_id, nav.zone, budget);
     const sourceGeneration = Number(ref.source_snapshot_id.slice("source:".length));
@@ -1508,7 +1513,7 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json(receipt, { status: 409 });
     }
     const inventory = new ZoneNavigationInventory(this.persistence, sources);
-    const result = await new ZoneNavigationEngine(this.persistence, inventory).publishPrepared(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
+    const result = await new ZoneNavigationEngine(this.persistence, inventory, undefined, postcheckRules).publishPrepared(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
     if (result.status === "pending") {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
       return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "pending", code: "NAVIGATION_PUBLICATION_PENDING", cursor: result.cursor }, { status: 503 });
@@ -2851,6 +2856,46 @@ export class ProjectGuard extends DurableObject<Env> {
     return result;
   }
 
+  private async resolveAdmittedNavigationPostcheckRules(
+    operation: NavigationReconcileRequest,
+    state: ProjectState,
+    proof: AdmissionProof,
+    currentGlobal: GlobalGovernanceState
+  ): Promise<RuleVersion[]> {
+    if (proof.operation !== operation.operation || proof.project_id !== operation.project_id
+      || proof.request_hash !== await sha256Canonical(operation)
+      || proof.ruleset.global_revision !== proof.global_revision
+      || proof.ruleset.project_revision !== proof.project_revision
+      || proof.project_revision !== operation.expected_project_revision) {
+      throw new Error("navigation_admission_binding");
+    }
+    const result: RuleVersion[] = [];
+    for (const reference of proof.deferred_rules) {
+      if (!proof.ruleset.rules.some(rule => canonicalJson(rule) === canonicalJson(reference))) {
+        throw new Error("navigation_admission_binding");
+      }
+      const key = ruleVersionKey(reference.rule_id, reference.version);
+      const source = reference.scope.kind === "global"
+        ? currentGlobal.rules[key]
+        : state.local_rules?.[key];
+      const parsed = ruleVersionSchema.safeParse(source);
+      if (!parsed.success) throw new Error("navigation_rule_history_unavailable");
+      const rule = parsed.data;
+      if (key !== ruleVersionKey(rule.rule_id, rule.version)
+        || canonicalJson(rule.scope) !== canonicalJson(reference.scope)
+        || !["active", "superseded", "retired"].includes(rule.status)
+        || rule.check_id !== "valid_links"
+        || rule.check_stage !== "post_execution"
+        || rule.enforcement !== "automatic"
+        || !rule.operations.includes("navigation.reconcile")
+        || !proof.resources.some(resource => matchesResource(rule, resource))) {
+        throw new Error("navigation_rule_history_unavailable");
+      }
+      result.push(rule);
+    }
+    return result;
+  }
+
   private async resumeManagedDocument(requestId: string): Promise<void> {
     const projectId = this.ctx.id.name;
     if (!projectId) {
@@ -3671,18 +3716,23 @@ export class ProjectGuard extends DurableObject<Env> {
     };
     const first = await evaluate(global);
     if (first.verdict !== "allow") throw new RuleAdmissionRejection(first);
-    const equippedPackageCheckStages: Readonly<Record<string, string>> = {
+    const equippedPostcheckStages: Readonly<Record<string, string>> = {
       verified_presence: "post_execution",
       valid_links: "post_execution",
       current_uniqueness: "both",
       verified_archive: "post_execution"
     };
+    const equippedChecksForOperation = normalized.operation === "package.replace"
+      ? equippedPostcheckStages
+      : normalized.operation === "navigation.reconcile"
+        ? { valid_links: "post_execution" }
+        : {};
     const unsupportedDeferred = (evaluation: EvaluationResult) => evaluation.deferred_rules.find(reference => {
       const rule = [...Object.values(global.rules), ...Object.values(state.local_rules ?? {})].find(candidate =>
         candidate.rule_id === reference.rule_id && candidate.version === reference.version
         && canonicalJson(candidate.scope) === canonicalJson(reference.scope) && candidate.status === "active");
-      return normalized.operation !== "package.replace" || !rule || rule.enforcement !== "automatic"
-        || equippedPackageCheckStages[rule.check_id] !== rule.check_stage;
+      return !rule || rule.enforcement !== "automatic"
+        || equippedChecksForOperation[rule.check_id] !== rule.check_stage;
     });
     const firstUnsupported = unsupportedDeferred(first);
     if (firstUnsupported) throw new RuleAdmissionRejection({

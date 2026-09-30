@@ -264,6 +264,32 @@ describe("ZoneNavigationSources", () => {
     await sources.releaseCompactCatalogRebuildFence("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-0001", b);
   });
 
+  it("starts a full rebuild when the verified source is newer than compact readiness", async () => {
+    const { sources, files } = harness();
+    const b = budget(3000);
+    const initial = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-STALE-ADOPT01", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-STALE-ADOPT01", 0, b);
+    await sources.recordVerifiedCatalogEntry(initial, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const ticket = await sources.beginHeadWrite("PRJ-0002", "WORKING", initial.resource_id, b);
+    await sources.completeHeadWrite(ticket, null, b);
+    // A legacy writer consumed the dirty marker without a compact readiness proof.
+    for (const path of files.keys()) if (path.startsWith(`${zoneNavigationDirtyRoot("PRJ-0002", "WORKING")}/`)) files.delete(path);
+    const identity = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", b);
+    expect((await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))?.ready_generation).toBe(0);
+    expect((await sources.readState("PRJ-0002", "WORKING", b)).generation).toBe(1);
+    const request = { project_id: "PRJ-0002", zone: "WORKING" as const,
+      request_id: "DOCREQ-CATALOG-STALE-REBUILD01", expected_generation: 1, expected_manifest: identity! };
+    const started = await sources.beginCompactCatalogRebuild(request, b);
+    expect(started).toEqual({ snapshot_id: "source:1" });
+    const invalidated = await sources.invalidateCompactCatalogRebuild(request, b);
+    const published = await sources.publishCompactCatalogRebuildManifest({ ...request, snapshot_id: started.snapshot_id,
+      shards: [], invalidated_manifest: invalidated, chunk_evidence: [] }, b);
+    expect(published.ready_generation).toBe(1);
+    expect((await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))?.shards).toEqual([]);
+  });
+
   it("replaces a stale existing shard only while the manifest is invalidated and CAS publishes readiness last", async () => {
     const { sources, files } = harness();
     const b = budget();

@@ -8,6 +8,7 @@ import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { ExecutionJournal, executionHash } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentTextPayloadPath, machineDocumentVersionPath, machineStatePath, workspaceProjectRoot } from "../src/persistence/layout";
+import { documentIdFor } from "../src/domain/managed-document";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { ProviderObjectMetadata } from "../src/persistence/provider/contract";
 import { ProviderOperationError } from "../src/persistence/provider/errors";
@@ -114,6 +115,12 @@ function harness() {
       providerCalls += 1;
       pageLimits.push(limit);
       pagePaths.push(path);
+      if (path === `${machineDocumentRoot(projectId)}/quarantines`) {
+        const names = [...new Set([...files.keys()].filter((key) => key.startsWith(`${path}/`)).map((key) => key.slice(path.length + 1).split("/")[0]))].sort();
+        const start = cursor ? Math.max(0, names.findIndex((name) => name > cursor)) : 0;
+        const page = names.slice(start, start + limit);
+        return { entries: page.map((name) => ({ kind: "folder" as const, name, path: `${path}/${name}` })), cursor: start + page.length < names.length ? page.at(-1) ?? null : null };
+      }
       const matching = [...files.keys()].filter((key) => key.startsWith(`${path}/`) && !key.slice(path.length + 1).includes("/")).sort();
       const start = cursor ? Math.max(0, matching.findIndex((key) => key > cursor)) : 0;
       const page = matching.slice(start, start + limit);
@@ -1107,6 +1114,51 @@ describe("ZoneNavigationInventory", () => {
     expect(entries[0]).toMatchObject({ resource_id: `artifact:${await sha256Text(destination)}`, version: `ART-NAVIGATION-001:${await sha256Text("approved artifact")}`, logical_path: "report.md", path: destination });
     expect(proofs).toEqual([{ resource_id: entries[0].resource_id, entry_hash: await sha256Text(canonicalJson(entries[0])), persisted: false }]);
     expect(await h.inventory.verifyEntry(entries[0], budget())).toBe(true);
+  });
+
+  it("omits a removed artifact only when its exact governed quarantine is committed", async () => {
+    const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/DELIVERABLES/report.md`;
+    await seedCommittedArtifact(h, "ART-NAVIGATION-001", destination, "old report");
+    h.files.delete(destination);
+    const docId = await documentIdFor(projectId, "report.md");
+    const quarantineId = "DOCREQ-NAVIGATION-QUARANTINE-001";
+    const root = `${machineDocumentRoot(projectId)}/quarantines/${quarantineId}`;
+    const archivePath = `${workspaceProjectRoot(projectId, slug)}/ARCHIVES/QUARANTINED-PUBLISHED/${docId}/VER-REQ-0123456789ABCDEF01234567/${quarantineId}/report.md`;
+    h.put(machineDocumentHeadPath(projectId, docId), JSON.stringify({ schema_version: "2.0", project_id: projectId, document_id: docId, kind: "work_product", logical_path: "report.md", provider: {}, reconciliation_status: "clean" }));
+    h.put(archivePath, "old report");
+    const proof = { schema_version: "1.0", operation: "document.quarantine_instance", request_id: quarantineId, project_id: projectId, document_id: docId, version_id: "VER-REQ-0123456789ABCDEF01234567", logical_path: "report.md", archive_path: archivePath, provider: { path: destination, object_id: "id:artifact", revision_token: "rev:original", size: 10 }, content_sha256: await sha256Text("old report") };
+    const proofText = canonicalJson(proof);
+    h.put(`${root}/receipt.json`, proofText);
+    const quarantineRequest = canonicalJson({ operation: "document.quarantine_instance", request_id: quarantineId, project_id: projectId, document_id: docId, created_at: "2026-09-30T00:00:00Z", expected_project_revision: 1, observed_provider: proof.provider });
+    const quarantineRequestHash = await sha256Text(quarantineRequest);
+    h.put(`${machineDocumentRoot(projectId)}/requests/${quarantineId}/receipt.json`, canonicalJson({ schema_version: "1.0", project_id: projectId, request_id: quarantineId, request_sha256: quarantineRequestHash, request_json: quarantineRequest, receipt_json: canonicalJson({ status: "committed", operation: "document.quarantine_instance", request_id: quarantineId, project_id: projectId, document_id: docId, archive_path: archivePath, proof_ref: `${root}/receipt.json`, proof_sha256: await sha256Text(proofText), content_sha256: proof.content_sha256, provider_rev: "rev:original", request_payload_sha256: quarantineRequestHash }) }));
+    const pages = [];
+    let cursor: string | null = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, mode: "canonical_catalog_rebuild", budget: budget() });
+      pages.push(page); cursor = page.next_cursor;
+    } while (cursor !== null);
+    expect(pages.flatMap((page) => page.gaps)).toEqual([]);
+    expect(pages.flatMap((page) => page.entries)).toEqual([]);
+    h.files.delete(`${root}/receipt.json`);
+    const unproved = [];
+    cursor = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, mode: "canonical_catalog_rebuild", budget: budget() });
+      unproved.push(page); cursor = page.next_cursor;
+    } while (cursor !== null);
+    expect(unproved.flatMap((page) => page.gaps)).toContainEqual({ resource_id: `artifact:${await sha256Text(destination)}`, code: "committed_artifact_source_out_of_bounds" });
+    h.put(`${root}/receipt.json`, proofText);
+    await seedCommittedArtifact(h, "ART-NAVIGATION-NEW-001", destination, "new report", "2026-10-01T00:00:00Z");
+    h.files.delete(destination);
+    const newer = [];
+    cursor = null;
+    do {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "DELIVERABLES", cursor, limit: 8, mode: "canonical_catalog_rebuild", budget: budget() });
+      newer.push(page); cursor = page.next_cursor;
+    } while (cursor !== null);
+    expect(newer.flatMap((page) => page.gaps)).toContainEqual({ resource_id: `artifact:${await sha256Text(destination)}`, code: "committed_artifact_source_out_of_bounds" });
   });
 
   it("ignores a committed artifact in the same project's ARTIFACTS folder when rebuilding REVIEW", async () => {

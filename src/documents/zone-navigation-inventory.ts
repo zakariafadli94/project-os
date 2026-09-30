@@ -947,9 +947,19 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     try {
       intent = JSON.parse(intentRaw) as Record<string, unknown>;
       if (intent.schema_version !== "1.0" || intent.project_id !== projectId || intent.request_id !== version.request_id
-        || typeof intent.request_json !== "string" || typeof intent.request_sha256 !== "string"
-        || await sha256Text(intent.request_json) !== intent.request_sha256) return false;
-      request = parseManagedDocumentRequest(JSON.parse(intent.request_json)) as unknown as Record<string, unknown>;
+        || typeof intent.request_sha256 !== "string") return false;
+      // Historical committed publications stored the request digest without
+      // its JSON envelope. Reconstruct only the exact request represented by
+      // this immutable version, and trust it only when the digest matches.
+      const legacyRequestJson = JSON.stringify({
+        operation: "publish", request_id: version.request_id, project_id: projectId,
+        document_id: documentId, expected_version_id: version.parent_version_id,
+        created_at: version.created_at
+      });
+      const requestJson = typeof intent.request_json === "string" ? intent.request_json
+        : intent.request_json === undefined ? legacyRequestJson : null;
+      if (!requestJson || await sha256Text(requestJson) !== intent.request_sha256) return false;
+      request = parseManagedDocumentRequest(JSON.parse(requestJson)) as unknown as Record<string, unknown>;
     } catch { return false; }
     if (request.operation !== "publish" || request.request_id !== version.request_id
       || request.project_id !== projectId || request.document_id !== documentId

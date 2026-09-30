@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { emptyProjectState } from "../src/domain/transitions";
 import {
+  navigationCatalogRebuildProgressSchema,
   navigationReconcileSchema,
   type NavigationReconcileRequest,
   type NavigationInventoryEntry,
@@ -20,6 +21,7 @@ import { sha256Text } from "../src/documents/hash";
 import type { SliceBudget } from "../src/convergence/contract";
 import { mutationIntentIdFor } from "../src/domain/mutation-gate";
 import { MutationGateRepository } from "../src/mutation-gate/repository";
+import { canonicalJson } from "../src/rules/contract";
 
 const state = () => emptyProjectState("PRJ-0002", "Project OS", "project-os", "Managed docs");
 const at = "2026-09-25T09:00:00.000Z";
@@ -283,6 +285,28 @@ async function reconcileUntilTerminal(engine: ZoneNavigationEngine, input: Navig
 }
 
 describe("zone navigation identity and resumable reconciliation", () => {
+  it("keeps legacy reconcile requests compatible and binds catalog rebuild purpose to the exact manifest", () => {
+    const normal = request();
+    expect(normal.purpose).toBeUndefined();
+    const rebuildBase = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAV-CATALOG-REBUILD-0001",
+      project_id: "PRJ-0002",
+      zone: "REVIEW" as const,
+      expected_project_revision: 42,
+      expected_generation: 2,
+      expected_index: null,
+      purpose: "compact_catalog_rebuild" as const,
+      expected_source_generation: 27,
+      expected_catalog_manifest: { object_id: "manifest-object", revision_token: "manifest-rev", content_sha256: "a".repeat(64) },
+      created_at: at
+    };
+    expect(navigationReconcileSchema.parse(rebuildBase)).toMatchObject({ purpose: "compact_catalog_rebuild", expected_generation: 2, expected_source_generation: 27 });
+    expect(() => navigationReconcileSchema.parse({ ...rebuildBase, expected_catalog_manifest: undefined })).toThrow();
+    expect(() => navigationReconcileSchema.parse({ ...rebuildBase, expected_index: { basename: "00-CURRENT.md", object_id: "index-object", revision_token: "index-rev", content_sha256: "b".repeat(64) } })).toThrow();
+    expect(() => navigationReconcileSchema.parse({ ...rebuildBase, untrusted_chunks: [] })).toThrow();
+  });
+
   it("removes stale gap duplicates only after a resumed head is physically verified", async () => {
     const harness = runtimeHarness();
     const project = state();
@@ -543,6 +567,46 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(currentHead).toMatchObject({ generation: 2, source_request_id: secondInput.request_id });
     await harness.runtime.objects.delete(`${await firstJournal.root()}/progress.json`);
     await expect(firstJournal.commit(firstAdmission, null)).rejects.toThrow("execution_progress_unavailable");
+  });
+
+  it("does not certify a catalog rebuild from a receipt and certificate alone", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = navigationReconcileSchema.parse({
+      ...request("REVIEW"), purpose: "compact_catalog_rebuild",
+      expected_source_generation: 0,
+      expected_catalog_manifest: { object_id: "id:old", revision_token: "rev-old", content_sha256: "a".repeat(64) }
+    });
+    const journal = new ExecutionJournal(harness.runtime, project.project_id, "document", input.request_id);
+    const admission = await admissionFor(input);
+    await journal.commit(admission, null);
+    const receiptRef = `${machineDocumentRoot(project.project_id)}/requests/${input.request_id}/receipt.json`;
+    await journal.recordReceipt("committed", receiptRef);
+    const certificateRef = `${await journal.root()}/navigation/catalog-rebuild/finalizations/${admission.request_hash}.json`;
+    const certificate = {
+      schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: project.project_id,
+      request_id: input.request_id, request_hash: admission.request_hash, zone: "REVIEW",
+      source_generation: 0, source_snapshot_id: "source:0", source_count: 0,
+      shards: [], expected_manifest: input.expected_catalog_manifest,
+      published_manifest: { object_id: "id:new", revision_token: "rev-new", content_sha256: "b".repeat(64) },
+      chunk_evidence: [], coverage_gaps: []
+    };
+    harness.put(certificateRef, canonicalJson(certificate));
+
+    await expect(journal.finalizeVerifiedCatalogRebuild({ receipt_ref: receiptRef, certificate_ref: certificateRef }))
+      .rejects.toThrow("execution_catalog_rebuild_progress_unavailable");
+    expect((await journal.status())?.terminal).toBe(false);
+
+    const engineProgress = {
+      schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: project.project_id,
+      request_id: input.request_id, request_hash: admission.request_hash, zone: "REVIEW",
+      source_generation: 0, source_snapshot_id: "source:0", cursor: null, page_count: 0,
+      source_count: 0, shard_cursor: 0, shard_count: 0, status: "finalized",
+      finalization_ref: certificateRef, coverage_gaps: []
+    };
+    harness.put(`${await journal.root()}/navigation-catalog-rebuild-progress.json`, canonicalJson(navigationCatalogRebuildProgressSchema.parse(engineProgress)));
+    const finalized = await journal.finalizeVerifiedCatalogRebuild({ receipt_ref: receiptRef, certificate_ref: certificateRef });
+    expect(finalized).toMatchObject({ status: "finalized", terminal: true });
   });
 
   it("rejects unknown public fields and non-exact index identities", () => {

@@ -399,6 +399,51 @@ describe("MaterializationGuard isolation boundary", () => {
     });
   });
 
+  it("routes a catalog rebuild to its bounded worker without adopting or publishing an index", async () => {
+    const projectId = "PRJ-3929";
+    const requestId = "DOCREQ-CATALOG-REBUILD-3929001";
+    const ref = navigationWorkRefSchema.parse({
+      project_id: projectId, request_id: requestId, zone: "REVIEW", expected_generation: 4,
+      source_snapshot_id: "source:4", authority_ref: `authority:${requestId}`, request_hash: "a".repeat(64)
+    });
+    const state = commitFixture(projectId, 1)[0]!.state;
+    const request = {
+      operation: "navigation.reconcile", project_id: projectId, request_id: requestId, zone: "REVIEW",
+      expected_project_revision: 1, expected_generation: 4, expected_source_generation: 4, expected_index: null,
+      purpose: "compact_catalog_rebuild",
+      expected_catalog_manifest: { object_id: "id:manifest", revision_token: "rev:manifest", content_sha256: "b".repeat(64) },
+      created_at: at
+    };
+    const stored = new Map<string, string>([
+      [`navigation-work:${requestId}`, canonicalJson(ref)],
+      [`navigation-context:${requestId}`, canonicalJson({
+        schema_version: "1.0", ref, request, admission: {}, state,
+        state_hash: await sha256Canonical(state)
+      })]
+    ]);
+    const storage = {
+      get: async <T>(key: string) => stored.get(key) as T | undefined,
+      put: async (key: string, value: string) => { stored.set(key, value); },
+      list: async ({ prefix, limit, startAfter }: { prefix: string; limit?: number; startAfter?: string }) =>
+        new Map([...stored.entries()].filter(([key]) => key.startsWith(prefix) && (!startAfter || key > startAfter)).slice(0, limit))
+    };
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId, env: testEnv, queue: Promise.resolve(), queueDepth: 0,
+      ctx: { id: { name: projectId }, storage }
+    }) as MaterializationGuard;
+    vi.spyOn(ZoneNavigationSources.prototype, "readState").mockResolvedValue({ generation: 4, adopted: true, in_flight_resource_ids: [] } as never);
+    const adoption = vi.spyOn(ZoneNavigationSources.prototype, "beginAdoption");
+    const ordinary = vi.spyOn(ZoneNavigationEngine.prototype, "reconcile");
+    const rebuild = vi.spyOn(ZoneNavigationEngine.prototype as any, "prepareCompactCatalogRebuild")
+      .mockResolvedValue({ status: "pending", cursor: "catalog:1" });
+
+    const result = await (guard as unknown as { runNavigationWorkSlice(): Promise<unknown> }).runNavigationWorkSlice();
+    expect(result).toMatchObject({ ref, publish: false });
+    expect(rebuild).toHaveBeenCalledOnce();
+    expect(adoption).not.toHaveBeenCalled();
+    expect(ordinary).not.toHaveBeenCalled();
+  });
+
   it("rotates actual navigation slices across nonterminal jobs and skips a backed-off head", async () => {
     const projectId = "PRJ-3928";
     const now = Date.now();

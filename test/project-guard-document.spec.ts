@@ -18,7 +18,7 @@ import { ruleFixture } from "./helpers/rule-fixtures";
 import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineStatePath } from "../src/persistence/layout";
 import { toManagedProviderObservation } from "../src/persistence/compatibility/dropbox-v1-evidence";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
-import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
+import { ZoneNavigationSources, zoneNavigationCompactCatalogRoot } from "../src/documents/zone-navigation-sources";
 import { createSliceBudget } from "../src/convergence/budget";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { navigationReconcileSchema } from "../src/domain/zone-navigation";
@@ -58,6 +58,59 @@ describe("ProjectGuard managed documents", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("admits and finalizes a governed catalog rebuild without publishing an index or a business revision", async () => {
+    const created = await createProject("TXN-CATALOG-REBUILD-GUARD-9097");
+    const projectId = created.project_id;
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    const runtime = createProductionPersistence(testEnv, projectId);
+    const sources = new ZoneNavigationSources(runtime);
+    const sourceBudget = createSliceBudget(() => Date.now(), new AbortController().signal);
+    expect(await sources.beginAdoption(projectId, "REVIEW", "DOCREQ-CATALOG-REBUILD-SETUP", 0, sourceBudget)).toBe(true);
+    expect(await sources.finishAdoption(projectId, "REVIEW", "DOCREQ-CATALOG-REBUILD-SETUP", 0, sourceBudget)).toBe(true);
+    const manifestPath = `${zoneNavigationCompactCatalogRoot(projectId, "REVIEW")}/ready.json`;
+    const manifest = JSON.stringify({ schema_version: "1.0", project_id: projectId, zone: "REVIEW",
+      ready_generation: 0, shards: [], completed_generations: [], coalesced_dirty: [] });
+    await runtime.objects.createText(manifestPath, manifest);
+    const metadata = await runtime.objects.getMetadata(manifestPath);
+    expect(metadata).not.toBeNull();
+    const token = "catalog-rebuild-operator-test";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+      MUTATION_CONTEXT_SIGNING_KEY: governanceSigningKey,
+      RULE_ADMISSION_SIGNING_KEY: governanceSigningKey,
+      INGRESS_TOKEN: token,
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" })
+    }));
+    const contextResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${token}` } });
+    const { context }: any = await contextResponse.json();
+    const request = navigationReconcileSchema.parse({
+      operation: "navigation.reconcile", request_id: "DOCREQ-CATALOG-REBUILD-GUARD-0001", project_id: projectId,
+      zone: "REVIEW", expected_project_revision: created.new_revision, expected_generation: 0,
+      expected_source_generation: 0, expected_index: null, purpose: "compact_catalog_rebuild",
+      expected_catalog_manifest: { object_id: metadata!.objectId, revision_token: metadata!.revisionToken,
+        content_sha256: await sha256Text(manifest) }, created_at: at
+    });
+    const response = await guard.fetch("https://internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(await response.json()).toMatchObject({ request_id: request.request_id, status: "pending" });
+
+    let receipt: { receipt_json: string } | null = null;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await runDurableObjectAlarm(materialization);
+      receipt = await new ManagedDocumentRequestLedger(runtime.objects).readReceipt(projectId, request.request_id);
+      if (receipt) break;
+    }
+    expect(receipt).not.toBeNull();
+    expect(JSON.parse(receipt!.receipt_json)).toMatchObject({
+      status: "committed", operation: "navigation.reconcile", execution_status: "pending",
+      catalog_rebuild_certificate_ref: expect.stringContaining("/navigation/catalog-rebuild/finalizations/")
+    });
+    expect(await new ExecutionJournal(runtime, projectId, "document", request.request_id).status())
+      .toMatchObject({ status: "finalized", terminal: true });
+    expect(await runtime.objects.readText(`${machineDocumentRoot(projectId)}/navigation/REVIEW/head.json`)).toBeNull();
   });
 
   it("rejects instance repair from a fresh signed generic ingress actor", async () => {

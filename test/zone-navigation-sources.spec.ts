@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { ZoneNavigationSources, zoneNavigationCatalogRoot, zoneNavigationDirtyRoot } from "../src/documents/zone-navigation-sources";
+import { describe, expect, it, vi } from "vitest";
+import { ZoneNavigationSources, zoneNavigationCatalogRoot, zoneNavigationDirtyRoot, zoneNavigationCatalogShardForResource } from "../src/documents/zone-navigation-sources";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
 import type { NavigationInventoryEntry } from "../src/domain/zone-navigation";
 
@@ -77,6 +77,13 @@ function entry(): NavigationInventoryEntry {
 }
 
 describe("ZoneNavigationSources", () => {
+  it("treats a paginated dirty-marker tail as an incomplete snapshot", async () => {
+    const { runtime, sources } = harness();
+    vi.spyOn(runtime.pagedListing!, "listPage").mockResolvedValue({ entries: [], cursor: "dirty-tail" });
+
+    await expect(sources.verifySnapshot("PRJ-0002", "WORKING", "source:0", budget())).resolves.toBe(false);
+  });
+
   it("releases only the exact failed adoption owner for a safe new request", async () => {
     const { sources } = harness();
     const b = budget();
@@ -101,7 +108,7 @@ describe("ZoneNavigationSources", () => {
   });
 
   it("does not rewrite shared source state when the exact adoption owner resumes", async () => {
-    const { sources, files } = harness();
+    const { sources, files, runtime } = harness();
     const b = budget();
     const requestId = "DOCREQ-NAVIGATION-WORKING-0001";
     await expect(sources.beginAdoption("PRJ-0002", "WORKING", requestId, 0, b)).resolves.toBe(true);
@@ -128,6 +135,341 @@ describe("ZoneNavigationSources", () => {
     await sources.recordVerifiedCatalogTombstone("PRJ-0002", "WORKING", e.resource_id, "source:0", b);
     expect(JSON.parse(files.get(manifestPath)!).shards).toContain(shard);
     await expect(sources.readCompactCatalogShard("PRJ-0002", "WORKING", shard, 0, b)).rejects.toThrow("navigation_compact_catalog_missing");
+  });
+
+  it("rebuilds a missing compact shard from a frozen verified snapshot and publishes the manifest last", async () => {
+    const { sources, files, runtime } = harness();
+    const b = budget(3000);
+    const e = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT01", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT01", 0, b);
+    await sources.recordVerifiedCatalogEntry(e, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const identity = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", b);
+    expect(identity).not.toBeNull();
+    const shard = (await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))!.shards[0];
+    const manifestPath = `${zoneNavigationCatalogRoot("PRJ-0002", "WORKING")}/compact/ready.json`;
+    const chunkPath = `${zoneNavigationCatalogRoot("PRJ-0002", "WORKING")}/compact/${shard.toString(16).padStart(2, "0")}.json`;
+    const manifestRevisionBefore = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", b);
+    files.delete(chunkPath);
+
+    const started = await sources.beginCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!
+    }, b);
+    const invalidated = await sources.invalidateCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!
+    }, b);
+    expect((await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))?.ready_generation).toBeNull();
+    await sources.stageCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      snapshot_id: started.snapshot_id, shard, entries: [e]
+    }, b);
+    await expect(sources.readCompactCatalogShard("PRJ-0002", "WORKING", shard, 0, b)).rejects.toThrow("navigation_compact_catalog_missing");
+
+    const evidence = await sources.publishCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, shard
+    }, b);
+    await sources.verifyCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, shard, evidence
+    }, b);
+    const published = await sources.publishCompactCatalogRebuildManifest({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, chunk_evidence: [evidence]
+    }, b);
+
+    expect(published.ready_generation).toBe(0);
+    expect(await sources.readCompactCatalogShard("PRJ-0002", "WORKING", shard, 0, b)).toEqual([e]);
+    expect(published.identity.revision_token).not.toBe(manifestRevisionBefore!.revision_token);
+    expect(JSON.parse(files.get(manifestPath)!).shards).toEqual([shard]);
+    await expect(sources.recordVerifiedCatalogEntry({ ...e, version: "VER-REBUILD-FENCED-WRITE" }, "source:0", b)).rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+    await expect(sources.verifyPublishedCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id,
+      shards: [shard], invalidated_manifest: invalidated, shard, evidence
+    }, b)).resolves.toBeUndefined();
+    const publishedChunk = files.get(chunkPath)!;
+    files.set(chunkPath, "{}");
+    await expect(sources.verifyPublishedCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id,
+      shards: [shard], invalidated_manifest: invalidated, shard, evidence
+    }, b)).rejects.toThrow("navigation_catalog_rebuild_chunk_postcheck_failed");
+    files.set(chunkPath, publishedChunk);
+    // Simulates restart after the final manifest CAS but before the immutable
+    // certificate/progress write: the exact verified publication is replayable.
+    await expect(sources.publishCompactCatalogRebuildManifest({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, chunk_evidence: [evidence]
+    }, b)).resolves.toMatchObject({ ready_generation: 0, identity: published.identity });
+    await expect(sources.recordVerifiedCatalogEntry({ ...e, version: "VER-REBUILD-FENCED-REPLAY" }, "source:0", b)).rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+
+    files.set(chunkPath, "{}");
+    await expect(sources.verifyPublishedCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id,
+      shards: [shard], invalidated_manifest: invalidated, shard, evidence
+    }, b)).rejects.toThrow("navigation_catalog_rebuild_chunk_postcheck_failed");
+    vi.spyOn(runtime.conditionalWrite!, "writeTextConditional").mockRejectedValueOnce(new Error("simulated manifest CAS failure"));
+    await expect(sources.invalidateFailedPublishedCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_final_manifest: published.identity
+    }, b)).resolves.toEqual({ status: "pending" });
+    expect((await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))?.ready_generation).toBe(0);
+    await expect(sources.beginHeadWrite("PRJ-0002", "WORKING", e.resource_id, b)).rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+    const failureInvalidation = await sources.invalidateFailedPublishedCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_final_manifest: published.identity
+    }, b);
+    expect(failureInvalidation).toMatchObject({ status: "invalidated", identity: expect.any(Object) });
+    if (failureInvalidation.status !== "invalidated") throw new Error("expected rebuild failure invalidation");
+    expect(await sources.compactCatalogManifest("PRJ-0002", "WORKING", b)).toMatchObject({
+      ready_generation: null, rebuilding_request_id: "DOCREQ-CATALOG-REBUILD-0001", shards: [shard]
+    });
+    await expect(sources.beginHeadWrite("PRJ-0002", "WORKING", e.resource_id, b)).rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+    vi.spyOn(runtime.conditionalWrite!, "writeTextConditional").mockRejectedValueOnce(new Error("simulated abandon CAS failure"));
+    await expect(sources.abandonFailedCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_unready_manifest: failureInvalidation.identity
+    }, b)).resolves.toEqual({ status: "pending" });
+    await expect(sources.beginHeadWrite("PRJ-0002", "WORKING", e.resource_id, b)).rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+    const abandoned = await sources.abandonFailedCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_unready_manifest: failureInvalidation.identity
+    }, b);
+    expect(abandoned).toMatchObject({ status: "abandoned", identity: expect.any(Object) });
+    if (abandoned.status !== "abandoned") throw new Error("expected rebuild abandonment");
+    expect(await sources.compactCatalogManifest("PRJ-0002", "WORKING", b)).toMatchObject({
+      ready_generation: null, rebuilding_request_id: null, rebuild_repair_required: true, shards: [shard]
+    });
+    await expect(sources.markCatalogReady("PRJ-0002", "WORKING", 0, b)).resolves.toBe(false);
+    await expect(sources.abandonFailedCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0001",
+      expected_unready_manifest: failureInvalidation.identity
+    }, b)).resolves.toEqual(abandoned);
+    const nextRequest = {
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0002",
+      expected_generation: 0, expected_manifest: abandoned.identity
+    } as const;
+    await expect(sources.beginCompactCatalogRebuild(nextRequest, b)).resolves.toEqual({ snapshot_id: "source:0" });
+    const nextInvalidation = await sources.invalidateCompactCatalogRebuild(nextRequest, b);
+    expect(nextInvalidation.revision_token).not.toBe(abandoned.identity.revision_token);
+    expect(await sources.compactCatalogManifest("PRJ-0002", "WORKING", b)).toMatchObject({
+      ready_generation: null, rebuilding_request_id: nextRequest.request_id, rebuild_repair_required: true
+    });
+    await sources.releaseCompactCatalogRebuildFence("PRJ-0002", "WORKING", nextRequest.request_id, b);
+    await sources.releaseCompactCatalogRebuildFence("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-0001", b);
+  });
+
+  it("replaces a stale existing shard only while the manifest is invalidated and CAS publishes readiness last", async () => {
+    const { sources, files } = harness();
+    const b = budget();
+    const e = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT02", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT02", 0, b);
+    const stale = { ...e, expected: { ...e.expected, revision_token: "stale-revision", content_sha256: "b".repeat(64) } };
+    await sources.recordVerifiedCatalogEntry(stale, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const identity = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", b);
+    const shard = (await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))!.shards[0];
+    const chunkPath = `${zoneNavigationCatalogRoot("PRJ-0002", "WORKING")}/compact/${shard.toString(16).padStart(2, "0")}.json`;
+    const started = await sources.beginCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0003",
+      expected_generation: 0, expected_manifest: identity!
+    }, b);
+    await sources.stageCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0003",
+      snapshot_id: started.snapshot_id, shard, entries: [e]
+    }, b);
+    const invalidated = await sources.invalidateCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0003",
+      expected_generation: 0, expected_manifest: identity!
+    }, b);
+    const evidence = await sources.publishCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0003",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, shard
+    }, b);
+    await sources.verifyCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0003",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, shard, evidence
+    }, b);
+    expect((await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))?.ready_generation).toBeNull();
+    expect(JSON.parse(files.get(chunkPath)!).entries[0].entry.expected).toEqual(e.expected);
+    await sources.publishCompactCatalogRebuildManifest({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0003",
+      expected_generation: 0, expected_manifest: identity!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, chunk_evidence: [evidence]
+    }, b);
+    expect((await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))?.ready_generation).toBe(0);
+  });
+
+  it("replays a post-CAS publication with more than eight shards within a bounded slice", async () => {
+    const { sources, files } = harness();
+    const wide = budget(10000);
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT03", 0, wide);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT03", 0, wide);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, wide);
+    const byShard = new Map<number, NavigationInventoryEntry>();
+    for (let i = 0; byShard.size < 9 && i < 10000; i++) {
+      const candidate = entry();
+      candidate.resource_id = `head:rebuild-fixture-${i}`;
+      candidate.version = `VER-rebuild-fixture-${i}`;
+      const shard = zoneNavigationCatalogShardForResource(candidate.resource_id);
+      if (!byShard.has(shard)) byShard.set(shard, candidate);
+    }
+    expect(byShard.size).toBe(9);
+    for (const item of byShard.values()) await sources.recordVerifiedCatalogEntry(item, "source:0", wide);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, wide);
+    const expectedManifest = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", wide);
+    const shards = [...byShard.keys()].sort((a, b) => a - b);
+    const requestId = "DOCREQ-CATALOG-REBUILD-WIDE01";
+    const started = await sources.beginCompactCatalogRebuild({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expectedManifest! }, wide);
+    for (const [shard, item] of byShard) await sources.stageCompactCatalogRebuildShard({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, snapshot_id: started.snapshot_id, shard, entries: [item] }, wide);
+    const invalidated = await sources.invalidateCompactCatalogRebuild({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expectedManifest! }, wide);
+    const evidence = [];
+    for (const shard of shards) {
+      const itemEvidence = await sources.publishCompactCatalogRebuildShard({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expectedManifest!, snapshot_id: started.snapshot_id, shards, invalidated_manifest: invalidated, shard }, wide);
+      await sources.verifyCompactCatalogRebuildShard({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expectedManifest!, snapshot_id: started.snapshot_id, shards, invalidated_manifest: invalidated, shard, evidence: itemEvidence }, wide);
+      evidence.push(itemEvidence);
+    }
+    const published = await sources.publishCompactCatalogRebuildManifest({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_manifest: expectedManifest!, expected_generation: 0, snapshot_id: started.snapshot_id, shards, invalidated_manifest: invalidated, chunk_evidence: evidence }, wide);
+
+    // Crash after manifest CAS but before certificate/progress. A changed live
+    // chunk must be caught by the engine's durable per-shard replay cursor.
+    const changedShard = shards[0]!;
+    const changedPath = `${zoneNavigationCatalogRoot("PRJ-0002", "WORKING")}/compact/${changedShard.toString(16).padStart(2, "0")}.json`;
+    const unchangedChunk = (files.get(changedPath))!;
+    files.set(changedPath, "{}");
+    await expect(sources.verifyPublishedCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0,
+      expected_manifest: expectedManifest!, snapshot_id: started.snapshot_id, shards,
+      invalidated_manifest: invalidated, shard: changedShard,
+      evidence: evidence.find((item) => item.shard === changedShard)!
+    }, wide)).rejects.toThrow("navigation_catalog_rebuild_chunk_postcheck_failed");
+    files.set(changedPath, unchangedChunk);
+    for (const itemEvidence of evidence) {
+      await sources.verifyPublishedCompactCatalogRebuildShard({
+        project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0,
+        expected_manifest: expectedManifest!, snapshot_id: started.snapshot_id, shards,
+        invalidated_manifest: invalidated, shard: itemEvidence.shard, evidence: itemEvidence
+      }, wide);
+    }
+
+    await expect(sources.publishCompactCatalogRebuildManifest({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0,
+      expected_manifest: expectedManifest!, snapshot_id: started.snapshot_id, shards, invalidated_manifest: invalidated, chunk_evidence: evidence
+    }, budget(32))).resolves.toMatchObject({ ready_generation: 0, shards, identity: published.identity });
+    await expect(sources.recordVerifiedCatalogEntry({ ...byShard.values().next().value!, version: "VER-REBUILD-FENCED-WRITE" }, "source:0", wide))
+      .rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+    await sources.releaseCompactCatalogRebuildFence("PRJ-0002", "WORKING", requestId, wide);
+  });
+
+  it("does not let a rebuild steal another request's source-writer fence", async () => {
+    const { sources } = harness();
+    const b = budget();
+    const e = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT-FENCE", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT-FENCE", 0, b);
+    await sources.recordVerifiedCatalogEntry(e, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const expected = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", b);
+    await sources.beginCompactCatalogRebuild({ project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-OWNER01", expected_generation: 0, expected_manifest: expected! }, b);
+    await sources.invalidateCompactCatalogRebuild({ project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-OWNER01", expected_generation: 0, expected_manifest: expected! }, b);
+    await expect(sources.acquireCompactCatalogRebuildFence({ project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-OWNER02", expected_generation: 0, expected_manifest: expected! }, b)).resolves.toBe(false);
+    await expect(sources.recordVerifiedCatalogEntry(e, "source:0", b)).rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+  });
+
+  it("fences source and compact-cache writers between final evidence verification and manifest CAS", async () => {
+    const { sources, pauseNextCatalogWrite } = harness();
+    const b = budget(2000);
+    const requestId = "DOCREQ-CATALOG-REBUILD-FENCE01";
+    const writeResource = "head:DOC-0123456789ABCDEF01234567";
+    const e = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT04", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT04", 0, b);
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-FENCEADOPT", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-FENCEADOPT", 0, b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    await sources.recordVerifiedCatalogEntry(e, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const expected = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", b);
+    const shard = zoneNavigationCatalogShardForResource(e.resource_id);
+    const started = await sources.beginCompactCatalogRebuild({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expected! }, b);
+    await sources.stageCompactCatalogRebuildShard({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, snapshot_id: started.snapshot_id, shard, entries: [e] }, b);
+    const invalidated = await sources.invalidateCompactCatalogRebuild({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expected! }, b);
+    const evidence = await sources.publishCompactCatalogRebuildShard({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expected!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, shard }, b);
+    await sources.verifyCompactCatalogRebuildShard({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expected!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, shard, evidence }, b);
+
+    const pause = pauseNextCatalogWrite();
+    const publishing = sources.publishCompactCatalogRebuildManifest({ project_id: "PRJ-0002", zone: "WORKING", request_id: requestId, expected_generation: 0, expected_manifest: expected!, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, chunk_evidence: [evidence] }, b);
+    await pause.entered;
+    await expect(sources.beginHeadWrite("PRJ-0002", "WORKING", writeResource, b)).rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+    await expect(sources.recordVerifiedCatalogEntry(e, "source:0", b)).rejects.toThrow("navigation_catalog_rebuild_writer_fenced");
+    expect((await sources.listDirtyPage("PRJ-0002", "WORKING", null, 1, b)).resource_ids).toEqual([]);
+    pause.release();
+    await expect(publishing).resolves.toMatchObject({ ready_generation: 0, shards: [shard] });
+    await sources.releaseCompactCatalogRebuildFence("PRJ-0002", "WORKING", requestId, b);
+
+    const ticket = await sources.beginHeadWrite("PRJ-0002", "WORKING", writeResource, b);
+    expect(ticket?.generation).toBe(1);
+    await sources.completeHeadWrite(ticket, e, b);
+    expect((await sources.listDirtyPage("PRJ-0002", "WORKING", null, 1, b)).resource_ids).toContain(writeResource);
+  });
+
+  it("forces a pre-fence compact writer token stale before final rebuild publication", async () => {
+    const { sources, pauseNextCatalogWrite } = harness();
+    const b = budget(2000);
+    const e = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT-PERMIT", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT-PERMIT", 0, b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    await sources.recordVerifiedCatalogEntry(e, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const expected = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", b);
+    const requestId = "DOCREQ-CATALOG-REBUILD-PERMIT1";
+    const request = { project_id: "PRJ-0002", zone: "WORKING" as const, request_id: requestId, expected_generation: 0, expected_manifest: expected! };
+    const started = await sources.beginCompactCatalogRebuild(request, b);
+    const shard = zoneNavigationCatalogShardForResource(e.resource_id);
+    await sources.stageCompactCatalogRebuildShard({ ...request, snapshot_id: started.snapshot_id, shard, entries: [e] }, b);
+    const changed = { ...e, version: "VER-CATALOG-WRITER-CHANGED", expected: { ...e.expected, revision_token: "rev-new", content_sha256: "b".repeat(64) } };
+    const gate = pauseNextCatalogWrite();
+    const writing = sources.recordVerifiedCatalogEntry(changed, "source:0", b);
+    await gate.entered;
+    const invalidated = await sources.invalidateCompactCatalogRebuild(request, b);
+    const evidence = await sources.publishCompactCatalogRebuildShard({ ...request, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, shard }, b);
+    await sources.verifyCompactCatalogRebuildShard({ ...request, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, shard, evidence }, b);
+    gate.release();
+    await expect(writing).rejects.toThrow("precondition_failed");
+    await expect(sources.publishCompactCatalogRebuildManifest({ ...request, snapshot_id: started.snapshot_id, shards: [shard], invalidated_manifest: invalidated, chunk_evidence: [evidence] }, b))
+      .resolves.toMatchObject({ ready_generation: 0, shards: [shard] });
+  });
+
+  it("refuses compact catalog publication when the source generation changed after staging", async () => {
+    const { sources } = harness();
+    const b = budget();
+    const e = entry();
+    await sources.beginAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT1", 0, b);
+    await sources.finishAdoption("PRJ-0002", "WORKING", "DOCREQ-CATALOG-REBUILD-ADOPT1", 0, b);
+    await sources.recordVerifiedCatalogEntry(e, "source:0", b);
+    await sources.markCatalogReady("PRJ-0002", "WORKING", 0, b);
+    const identity = await sources.compactCatalogManifestIdentity("PRJ-0002", "WORKING", b);
+    const shard = (await sources.compactCatalogManifest("PRJ-0002", "WORKING", b))!.shards[0];
+    const started = await sources.beginCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0002",
+      expected_generation: 0, expected_manifest: identity!
+    }, b);
+    await sources.stageCompactCatalogRebuildShard({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0002",
+      snapshot_id: started.snapshot_id, shard, entries: [e]
+    }, b);
+    await sources.beginHeadWrite("PRJ-0002", "WORKING", e.resource_id, b);
+
+    await expect(sources.invalidateCompactCatalogRebuild({
+      project_id: "PRJ-0002", zone: "WORKING", request_id: "DOCREQ-CATALOG-REBUILD-0002",
+      expected_generation: 0, expected_manifest: identity!
+    }, b)).rejects.toThrow("navigation_catalog_rebuild_snapshot_stale");
   });
 
   it("does not add a compact shard for a tombstone with no compact entry", async () => {

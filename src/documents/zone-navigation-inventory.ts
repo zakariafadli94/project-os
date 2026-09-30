@@ -24,6 +24,7 @@ import { ExecutionJournal, executionHash } from "../execution/journal";
 import { sha256Canonical } from "../materialization/hash";
 import { parseManagedDocumentRequest } from "../domain/managed-document-request";
 import { readProjectState } from "../schema/project-state";
+import { enforceManagedMarkdownIdentity } from "./identity-frontmatter";
 
 type PagePhase = "initial" | "packages" | "artifacts" | "artifact-bindings" | "artifact-finalize" | "dirty" | "dirty-package" | "dirty-artifacts" | "dirty-finish" | "catalog" | "catalog-compact";
 interface PageCursor { phase: PagePhase; cursor: string | null }
@@ -40,7 +41,7 @@ const MAX_INITIAL_HEADS_PER_PAGE = 512;
 // Keep an additional checkpoint window after that bounded per-head proof so a
 // saved provider page can advance under the shared 32-call slice.
 const MAX_INITIAL_HEAD_PROVIDER_CALLS = 10;
-const MAX_INITIAL_MISMATCHED_HEAD_PROVIDER_CALLS = 19;
+const MAX_INITIAL_MISMATCHED_HEAD_PROVIDER_CALLS = 20;
 const MIN_INACTIVE_HEAD_PROVIDER_CALLS = 2;
 
 interface InitialHeadPageCursor {
@@ -790,13 +791,28 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const reviewPromotionProven = providerMismatch && zone === "REVIEW"
       ? await this.hasCommittedReviewPromotion(projectId, documentId, head.logical_path, pointer.versionId, observation, version, budget)
       : false;
+    const reviewWriteProven = providerMismatch && zone === "REVIEW" && !reviewPromotionProven
+      ? await this.hasCommittedReviewWrite(projectId, documentId, head.logical_path, pointer.versionId, observation, version, budget)
+      : false;
     const publishedMoveProven = providerMismatch && zone === "DELIVERABLES" && !legacyExternalPublishedContentProof
       ? await this.hasCommittedPublishedMove(projectId, documentId, head.logical_path, pointer.versionId, observation, version, budget)
       : false;
-    if (providerMismatch && !repairProof && !reviewPromotionProven && !publishedMoveProven && !legacyExternalPublishedContentProof) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
+    if (providerMismatch && !repairProof && !reviewPromotionProven && !reviewWriteProven && !publishedMoveProven && !legacyExternalPublishedContentProof) return { entry: null, gap: { resource_id: resourceId, code: "active_version_provider_mismatch" } };
     const verified = await this.readVisible(observation.path, observation, version, budget);
     if (!verified) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_content_unverified" } };
     if (repairProof && verified.sha256 !== repairProof.content_sha256) return { entry: null, gap: { resource_id: resourceId, code: "active_instance_repair_content_mismatch" } };
+    if ((publishedMoveProven || reviewWriteProven) && version.provider_evidence?.size !== observation.size) {
+      // Historical WORKING evidence may describe older bytes. An exact
+      // publication or REVIEW write receipt proves the operation, but only
+      // immutable payload bytes can justify the changed destination size.
+      charge(budget);
+      const immutable = this.runtime.objects.readBytes
+        ? await this.runtime.objects.readBytes(version.immutable_payload_path, Math.max(1, observation.size))
+        : await this.runtime.objects.readText(version.immutable_payload_path).then((text) => text === null ? null : new TextEncoder().encode(text));
+      if (!immutable || immutable.byteLength !== verified.size || await sha256Bytes(immutable) !== verified.sha256) {
+        return { entry: null, gap: { resource_id: resourceId, code: "active_immutable_payload_mismatch" } };
+      }
+    }
     return {
       entry: navigationInventoryEntrySchema.parse({
         project_id: projectId,
@@ -813,6 +829,89 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         }
       })
     };
+  }
+
+  private async hasCommittedReviewWrite(
+    projectId: string, documentId: string, logicalPath: string, versionId: string,
+    current: { path: string; object_id: string; revision_token: string; size: number },
+    version: CurrentDocumentVersionRecord, budget: SliceBudget
+  ): Promise<boolean> {
+    const historical = version.provider_evidence;
+    if (version.source !== "project_os" || !historical || !version.parent_version_id || !version.request_id
+      || !/^DOCREQ-[A-Z0-9-]{8,}$/.test(version.request_id)
+      || historical.provider_id !== this.runtime.providerId || historical.object_id !== current.object_id) return false;
+    const expectedVersionId = `VER-REQ-${(await sha256Text(`${version.request_id}\nreview`)).slice(0, 24).toUpperCase()}`;
+    if (version.version_id !== versionId || versionId !== expectedVersionId || !version.content_sha256
+      || version.immutable_payload_path !== machineDocumentTextPayloadPath(projectId, version.content_sha256)) return false;
+    charge(budget);
+    const stateRaw = await this.runtime.objects.readText(machineStatePath(projectId));
+    if (!stateRaw) return false;
+    let canonicalRoot: string;
+    try {
+      const state = readProjectState(JSON.parse(stateRaw)).state;
+      if (state.project_id !== projectId) return false;
+      canonicalRoot = workspaceProjectRoot(projectId, state.slug);
+    } catch { return false; }
+    if (historical.path !== `${canonicalRoot}/WORKING/${logicalPath}`
+      || current.path !== `${canonicalRoot}/REVIEW/${logicalPath}`) return false;
+
+    charge(budget);
+    const parentRaw = await this.runtime.objects.readText(machineDocumentVersionPath(projectId, documentId, version.parent_version_id));
+    if (!parentRaw) return false;
+    let parent: CurrentDocumentVersionRecord;
+    try { parent = readDocumentVersionRecord(JSON.parse(parentRaw)).record; }
+    catch { return false; }
+    const previous = parent.provider_evidence;
+    if (parent.project_id !== projectId || parent.document_id !== documentId || parent.version_id !== version.parent_version_id
+      || parent.kind !== version.kind || parent.stage !== "review" || parent.logical_path !== logicalPath
+      || !previous || previous.provider_id !== historical.provider_id || previous.object_id !== historical.object_id
+      || previous.revision_token !== historical.revision_token || previous.path !== historical.path
+      || previous.size !== historical.size || previous.integrity_hash.algorithm !== historical.integrity_hash.algorithm
+      || previous.integrity_hash.value !== historical.integrity_hash.value) return false;
+
+    charge(budget);
+    const intentRaw = await this.runtime.objects.readText(`${machineDocumentRoot(projectId)}/requests/${version.request_id}/intent.json`);
+    if (!intentRaw) return false;
+    let intent: Record<string, unknown>;
+    let request: Record<string, unknown>;
+    try {
+      intent = JSON.parse(intentRaw) as Record<string, unknown>;
+      if (intent.schema_version !== "1.0" || intent.project_id !== projectId || intent.request_id !== version.request_id
+        || typeof intent.request_sha256 !== "string" || typeof intent.request_json !== "string"
+        || await sha256Text(intent.request_json) !== intent.request_sha256) return false;
+      request = parseManagedDocumentRequest(JSON.parse(intent.request_json)) as unknown as Record<string, unknown>;
+    } catch { return false; }
+    if (request.operation !== "review.write" || request.project_id !== projectId || request.document_id !== documentId
+      || request.request_id !== version.request_id || request.expected_version_id !== version.parent_version_id
+      || request.created_at !== version.created_at || typeof request.content !== "string"
+      || await sha256Text(request.content) !== request.content_sha256
+      || await sha256Text(enforceManagedMarkdownIdentity(request.content, { projectId, documentId, logicalPath })) !== version.content_sha256) return false;
+
+    charge(budget);
+    const receiptRaw = await this.runtime.objects.readText(`${machineDocumentRoot(projectId)}/requests/${version.request_id}/receipt.json`);
+    if (!receiptRaw) return false;
+    let wrapper: Record<string, unknown>;
+    let receipt: Record<string, unknown>;
+    try {
+      wrapper = JSON.parse(receiptRaw) as Record<string, unknown>;
+      if (wrapper.schema_version !== "1.0" || wrapper.project_id !== projectId || wrapper.request_id !== version.request_id
+        || wrapper.request_sha256 !== intent.request_sha256 || wrapper.request_json !== intent.request_json
+        || typeof wrapper.receipt_json !== "string") return false;
+      receipt = JSON.parse(wrapper.receipt_json) as Record<string, unknown>;
+    } catch { return false; }
+    if (receipt.status !== "committed" || receipt.request_id !== version.request_id || receipt.project_id !== projectId
+      || receipt.document_id !== documentId || receipt.version_id !== versionId || receipt.stage !== "review"
+      || receipt.logical_path !== logicalPath || receipt.provider_rev !== current.revision_token) return false;
+
+    charge(budget);
+    let admission: Awaited<ReturnType<ExecutionJournal["readAdmission"]>>;
+    try { admission = await new ExecutionJournal(this.runtime, projectId, "document", version.request_id).readAdmission(); }
+    catch { return false; }
+    if (!admission || admission.admission.operation !== "review.write"
+      || admission.admission.request_hash !== await executionHash(request) || admission.admission.verdict !== "allow") return false;
+    return admission.admission.resources.filter((resource) => resource.resource_id === documentId
+      && resource.resource_type === "document" && resource.zone === "DOCUMENTS"
+      && resource.version === version.parent_version_id && resource.expected_version === version.parent_version_id).length === 1;
   }
 
   private async hasCommittedReviewPromotion(
@@ -910,7 +1009,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       if (state.project_id !== projectId) return false;
       canonicalRoot = workspaceProjectRoot(projectId, state.slug);
     } catch { return false; }
-    if (!historical || historical.object_id !== current.object_id || historical.size !== current.size
+    if (!historical || historical.object_id !== current.object_id
       || historical.provider_id !== this.runtime.providerId || historical.path !== `${canonicalRoot}/WORKING/${logicalPath}`
       || current.path !== `${canonicalRoot}/DELIVERABLES/${logicalPath}`
       || !historical.path.endsWith(`/${logicalPath}`)

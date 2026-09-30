@@ -150,7 +150,7 @@ it.each(["API", "Control Tower", "ProjectGuard"] as const)(
         actor_id: entry === "Control Tower" ? "control_tower" : "ingress",
         rule_id: "RULE-SOP-DOC-ENTRY01", rule_version: 1, rule_scope: { kind: "global" },
         resource_id: working.document_id, resource_type: "document", resource_zone: "DOCUMENTS",
-        resource_version: resourceVersion, operation, expires_at: "2026-09-30T12:00:00.000Z"
+        resource_version: resourceVersion, operation, expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString()
       }, mutationContext.canonical_revision, f.projectId);
       const response = await f.guard.fetch("https://project-guard.internal/transaction", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(tx, mutationContext))

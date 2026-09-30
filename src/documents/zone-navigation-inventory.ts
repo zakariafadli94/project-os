@@ -433,7 +433,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       state = JSON.parse(cursor ?? "") as ArtifactBindingCursor;
       if (!state || typeof state.request_id !== "string" || typeof state.destination_path !== "string" || !Array.isArray(state.eligible_request_ids) || !Array.isArray(state.gaps)
         || (state.next_intent_cursor !== null && typeof state.next_intent_cursor !== "string") || (state.binding_cursor !== null && typeof state.binding_cursor !== "string")
-        || (state.quarantine_cursor !== undefined && state.quarantine_cursor !== null && typeof state.quarantine_cursor !== "string")) throw new Error("invalid");
+        || (state.quarantine_cursor !== undefined && state.quarantine_cursor !== null && typeof state.quarantine_cursor !== "string")
+        || (state.committed_unverified !== undefined && typeof state.committed_unverified !== "boolean")) throw new Error("invalid");
     } catch { throw new Error("navigation_inventory_cursor_invalid"); }
     return this.scanArtifactBindings(projectId, zone, state, snapshotId, budget);
   }
@@ -478,7 +479,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
           if (metadata.size > MAX_VISIBLE_SOURCE_BYTES) throw new Error("artifact_visible_out_of_bounds");
           // A committed predecessor can remain in the binding history after
           // a visible replacement. Only absence needs quarantine proof.
-          if (status.verification_state !== "canonical_verified") continue;
+          if (status.verification_state !== "canonical_verified") {
+            state.committed_unverified = true;
+            continue;
+          }
           // Finalization below rechecks this status and resolves the visible
           // bytes once. Avoid doing the same physical source verification here
           // and then again in the engine after the final entry is returned.
@@ -569,6 +573,12 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const resourceId = `artifact:${await sha256Text(state.destination_path)}`;
     const distinct = [...new Set(state.eligible_request_ids)];
     let winningRequestId = distinct.length === 1 ? distinct[0] : null;
+    if (distinct.length === 0 && state.committed_unverified) {
+      const target = artifactNavigationTarget(projectId, state.destination_path);
+      const covered = target.kind === "zone" && target.zone === zone
+        && await this.managedHeadCoversVisibleArtifact(projectId, state.destination_path, target.logical_path, budget);
+      if (!covered) state.gaps.push({ resource_id: resourceId, code: "committed_artifact_source_unverified" });
+    }
     if (distinct.length > 1) {
       // Several committed replacements can prove the *same visible bytes*.
       // An index needs one receipt witness, not a claim about which identical
@@ -610,6 +620,24 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       return { entries: [], gaps: [], snapshot_id: snapshotId, next_cursor: encodeCursor("dirty-finish", JSON.stringify({ resource_id: resourceId, dirty_cursor: state.dirty.dirty_cursor, entry: null })) };
     }
     return { entries: [], gaps: state.gaps, snapshot_id: snapshotId, next_cursor: state.next_intent_cursor === null ? null : encodeCursor("artifacts", state.next_intent_cursor) };
+  }
+
+  private async managedHeadCoversVisibleArtifact(projectId: string, destinationPath: string, logicalPath: string, budget: SliceBudget): Promise<boolean> {
+    const documentId = await documentIdFor(projectId, logicalPath);
+    const raw = await budgetedRuntime(this.runtime, budget).objects.readText(machineDocumentHeadPath(projectId, documentId));
+    if (!raw) return false;
+    let head: CurrentManagedDocumentHead;
+    try {
+      const read = readManagedDocumentHead(JSON.parse(raw));
+      if (!("head" in read)) return false;
+      head = read.head;
+    } catch { return false; }
+    const published = head.provider?.published;
+    if (head.project_id !== projectId || head.document_id !== documentId || head.logical_path !== logicalPath
+      || head.reconciliation_status !== "clean" || !head.published_version_id || published?.path !== destinationPath) return false;
+    const visible = await budgetedRuntime(this.runtime, budget).objects.getMetadata(destinationPath);
+    try { return metadataMatches(visible, normalizeObservation(published)); }
+    catch { return false; }
   }
 
   private async dirtyAndCatalogPage(
@@ -1439,6 +1467,7 @@ interface ArtifactBindingCursor {
   eligible_request_ids: string[];
   gaps: NavigationCoverageGap[];
   quarantine_cursor?: string | null;
+  committed_unverified?: boolean;
   dirty?: { resource_id: string; dirty_cursor: string | null };
 }
 

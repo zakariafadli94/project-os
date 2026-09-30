@@ -86,6 +86,16 @@ interface SnapshotPage {
   gaps: { resource_id: string; code: string }[];
 }
 
+function catalogRebuildShardMatchesSourceIds(sourceIds: readonly string[], shard: number, entries: readonly NavigationInventoryEntry[]): boolean {
+  const expectedIds = sourceIds.filter((resourceId) => zoneNavigationCatalogShardForResource(resourceId) === shard);
+  const actualIds = entries.map((entry) => entry.resource_id);
+  const actualIdSet = new Set(actualIds);
+  return new Set(expectedIds).size === expectedIds.length
+    && actualIdSet.size === actualIds.length
+    && expectedIds.length === actualIds.length
+    && expectedIds.every((resourceId) => actualIdSet.has(resourceId));
+}
+
 export function zoneNavigationHeadPath(projectId: string, zone: NavigationZone): string {
   return `${machineDocumentRoot(projectId)}/navigation/${zone}/head.json`;
 }
@@ -132,7 +142,8 @@ export class ZoneNavigationEngine {
           request_hash: requestHash, zone: request.zone, source_generation: sourceGeneration,
           source_snapshot_id: snapshot.snapshot_id, cursor: null, page_count: 0, source_count: 0,
           shard_cursor: 0, shard_count: 0, verify_page: 0, verify_entry: 0, verify_cursor: null,
-          stage_page: 0, staging_entries: [], staged_shards: [], invalidated_manifest: null, chunk_evidence: [],
+          stage_page: 0, staging_entries: [], staging_index_page: 0, staging_page_index: [], staging_index_complete: false,
+          staged_shards: [], invalidated_manifest: null, chunk_evidence: [],
           status: "scanning", finalization_ref: null, coverage_gaps: []
         });
         await this.saveCatalogRebuildProgress(progressPath, current, null, budget);
@@ -205,7 +216,12 @@ export class ZoneNavigationEngine {
 
       const shards = [...new Set((current.source_ids ?? []).map(zoneNavigationCatalogShardForResource))].sort((left, right) => left - right);
       current.shard_count = shards.length;
-      while (current.status === "staging" && current.shard_cursor < shards.length) {
+      // Older progress files have no staging index. If one was partway through
+      // a shard, finish that exact legacy cursor first; its accumulated entries
+      // and page cursor remain authoritative until the shard is written.
+      if (!current.staging_index_complete && current.staging_index_page === null
+        && (current.stage_page > 0 || current.staging_entries.length > 0)
+        && current.shard_cursor < shards.length) {
         const shard = shards[current.shard_cursor];
         while (current.stage_page < current.page_count) {
           if (!budget.canStartEffect(3)) return { status: "pending", cursor: `stage:${current.shard_cursor}:${current.stage_page}` };
@@ -215,6 +231,62 @@ export class ZoneNavigationEngine {
           if (current.staging_entries.length > 256) return await this.catalogRebuildConflict(progressPath, current, "navigation_compact_catalog_chunk_full", budget);
           current.stage_page += 1;
           current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+        }
+        if (!catalogRebuildShardMatchesSourceIds(current.source_ids ?? [], shard, current.staging_entries)) {
+          return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_staging_source_set_mismatch", budget);
+        }
+        if (current.staging_entries.length) await sources.stageCompactCatalogRebuildShard({ project_id: request.project_id, zone: request.zone, request_id: request.request_id, snapshot_id: current.source_snapshot_id!, shard, entries: current.staging_entries }, budget);
+        current.staged_shards.push(shard);
+        current.shard_cursor += 1;
+        current.stage_page = 0;
+        current.staging_entries = [];
+        current.staging_index_page = 0;
+        current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+      }
+
+      if (!current.staging_index_complete) {
+        let indexPage = current.staging_index_page ?? 0;
+        current.staging_index_page = indexPage;
+        while (indexPage < current.page_count) {
+          if (!budget.canStartEffect(3)) return { status: "pending", cursor: `stage-index:${indexPage}` };
+          const pageNumber = indexPage;
+          const page = await this.readJson(`${pagesRoot}/${pageNumber.toString().padStart(8, "0")}.json`, budget) as SnapshotPage | null;
+          if (!page || page.snapshot_id !== current.source_snapshot_id) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_page_invalid", budget);
+          const pageShards = [...new Set(page.entries.map((entry) => zoneNavigationCatalogShardForResource(entry.resource_id)))].sort((left, right) => left - right);
+          for (const shard of pageShards) {
+            let indexed = current.staging_page_index.find((item) => item.shard === shard);
+            if (!indexed) {
+              indexed = { shard, pages: [] };
+              current.staging_page_index.push(indexed);
+              current.staging_page_index.sort((left, right) => left.shard - right.shard);
+            }
+            indexed.pages.push(pageNumber);
+          }
+          indexPage = pageNumber + 1;
+          current.staging_index_page = indexPage;
+          current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+        }
+        current.staging_index_page = null;
+        current.staging_index_complete = true;
+        current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+      }
+
+      while (current.status === "staging" && current.shard_cursor < shards.length) {
+        const shard = shards[current.shard_cursor];
+        const indexedPages = current.staging_page_index.find((item) => item.shard === shard)?.pages;
+        if (!indexedPages?.length) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_staging_index_invalid", budget);
+        while (current.stage_page < indexedPages.length) {
+          if (!budget.canStartEffect(3)) return { status: "pending", cursor: `stage:${current.shard_cursor}:${current.stage_page}` };
+          const pageNumber = indexedPages[current.stage_page];
+          const page = await this.readJson(`${pagesRoot}/${pageNumber.toString().padStart(8, "0")}.json`, budget) as SnapshotPage | null;
+          if (!page || page.snapshot_id !== current.source_snapshot_id) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_page_invalid", budget);
+          current.staging_entries.push(...page.entries.filter((entry) => zoneNavigationCatalogShardForResource(entry.resource_id) === shard));
+          if (current.staging_entries.length > 256) return await this.catalogRebuildConflict(progressPath, current, "navigation_compact_catalog_chunk_full", budget);
+          current.stage_page += 1;
+          current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+        }
+        if (!catalogRebuildShardMatchesSourceIds(current.source_ids ?? [], shard, current.staging_entries)) {
+          return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_staging_source_set_mismatch", budget);
         }
         if (current.staging_entries.length) await sources.stageCompactCatalogRebuildShard({ project_id: request.project_id, zone: request.zone, request_id: request.request_id, snapshot_id: current.source_snapshot_id!, shard, entries: current.staging_entries }, budget);
         current.staged_shards.push(shard);

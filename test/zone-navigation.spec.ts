@@ -3,6 +3,7 @@ import { emptyProjectState } from "../src/domain/transitions";
 import {
   navigationCatalogRebuildProgressSchema,
   navigationReconcileSchema,
+  type NavigationCatalogRebuildRequest,
   type NavigationReconcileRequest,
   type NavigationInventoryEntry,
   type NavigationInventoryPort,
@@ -10,7 +11,7 @@ import {
 } from "../src/domain/zone-navigation";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
-import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
+import { ZoneNavigationSources, zoneNavigationCatalogShardForResource } from "../src/documents/zone-navigation-sources";
 import { executionHash, ExecutionJournal, requiredRulePostchecks } from "../src/execution/journal";
 import type { ExecutionAdmission } from "../src/execution/contract";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
@@ -96,6 +97,7 @@ function runtimeHarness() {
   const binaryFiles = new Map<string, { bytes: Uint8Array; objectId: string; revisionToken: string }>();
   let sequence = 0;
   const listingCalls: Array<{ path: string; cursor: string | null; limit: number }> = [];
+  const readPaths: string[] = [];
   let failCreatePathOnce: ((path: string) => boolean) | null = null;
   const metadata = (path: string): ProviderObjectMetadata | null => {
     const file = files.get(path);
@@ -116,7 +118,7 @@ function runtimeHarness() {
   const runtime: ProjectOsPersistenceRuntime = {
     providerId: "test-provider",
     objects: {
-      readText: async (path) => files.get(path)?.content ?? null,
+      readText: async (path) => { readPaths.push(path); return files.get(path)?.content ?? null; },
       readBytes: async (path, maxBytes) => {
         const binary = binaryFiles.get(path);
         const bytes = binary?.bytes ?? (files.has(path) ? new TextEncoder().encode(files.get(path)!.content) : null);
@@ -170,7 +172,7 @@ function runtimeHarness() {
     binaryFiles.set(path, { bytes: bytes.slice(), objectId: objectId ?? `id:${sequence}`, revisionToken: `rev-${sequence}` });
     return metadata(path)!;
   };
-  return { runtime, files, binaryFiles, listingCalls, put, putBytes, failNextCreate: (match: (path: string) => boolean) => { failCreatePathOnce = match; } };
+  return { runtime, files, binaryFiles, listingCalls, readPaths, put, putBytes, failNextCreate: (match: (path: string) => boolean) => { failCreatePathOnce = match; } };
 }
 
 async function inventoryHarness(inputState = state(), zone: "WORKING" | "REVIEW" | "DELIVERABLES" = "WORKING", options: { missing?: boolean; snapshotChanged?: boolean; pages?: NavigationInventoryEntry[][] } = {}) {
@@ -282,6 +284,88 @@ async function reconcileUntilTerminal(engine: ZoneNavigationEngine, input: Navig
   let result = await engine.reconcile(input, project, admission, budget(firstBudget));
   for (let attempt = 0; result.status === "pending" && attempt < 12; attempt++) result = await engine.reconcile(input, project, admission, budget());
   return result;
+}
+
+async function runSparseCatalogRebuildWithLegacyProgress(includeOmittedSourceId = false) {
+  const harness = runtimeHarness();
+  const project = state();
+  const manifest = { object_id: "manifest-object", revision_token: "manifest-rev", content_sha256: "a".repeat(64) };
+  const input = navigationReconcileSchema.parse({
+    ...request("REVIEW"), request_id: includeOmittedSourceId ? "DOCREQ-NAV-CATALOG-REBUILD-0003" : "DOCREQ-NAV-CATALOG-REBUILD-0002",
+    purpose: "compact_catalog_rebuild", expected_source_generation: 0, expected_catalog_manifest: manifest
+  }) as NavigationCatalogRebuildRequest;
+  const requestHash = await executionHash(input);
+  const journal = new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id);
+  const root = await journal.root();
+  const manifestPath = `${machineDocumentRoot(input.project_id)}/navigation-sources/${input.zone}/catalog/compact/ready.json`;
+  const scope = {
+    resource_id: `navigation:${input.zone}`, resource_version: String(input.expected_generation), provider_id: "test-provider",
+    sources: [{ path: manifestPath, logical_path: manifestPath }], destinations: [{ path: manifestPath, logical_path: manifestPath }], preservation_copies: []
+  };
+  const admission = {
+    ...(await admissionFor(input)),
+    resources: [{ resource_id: `navigation:${input.zone}`, resource_type: "navigation", zone: input.zone, version: String(input.expected_generation) }],
+    resource_effect_scopes: [scope]
+  } as unknown as ExecutionAdmission;
+
+  const inv = await inventoryHarness(project, "REVIEW");
+  const entries: NavigationInventoryEntry[] = [];
+  const byShard = new Map<number, NavigationInventoryEntry>();
+  for (let candidate = 1; byShard.size < 2 && candidate < 1000; candidate++) {
+    const resource_id = `DOC-${candidate.toString(16).toUpperCase().padStart(24, "0")}`;
+    const shard = zoneNavigationCatalogShardForResource(resource_id);
+    if (byShard.has(shard)) continue;
+    const entry = { ...inv.entry, resource_id, logical_path: `plans/${resource_id}.md`, path: `${workspaceProjectRoot(project.project_id, project.slug)}/REVIEW/plans/${resource_id}.md` };
+    byShard.set(shard, entry);
+    entries.push(entry);
+  }
+  const orderedShards = [...byShard.keys()].sort((left, right) => left - right);
+  const sourceIds = entries.map((entry) => entry.resource_id);
+  if (includeOmittedSourceId) {
+    for (let candidate = 1000; candidate < 2000; candidate++) {
+      const resource_id = `DOC-${candidate.toString(16).toUpperCase().padStart(24, "0")}`;
+      if (zoneNavigationCatalogShardForResource(resource_id) === orderedShards[0]) {
+        sourceIds.push(resource_id);
+        break;
+      }
+    }
+  }
+  expect(sourceIds.length).toBe(includeOmittedSourceId ? 3 : 2);
+
+  for (let page = 0; page < 4; page++) {
+    const entry = page === 0 ? byShard.get(orderedShards[0]) : page === 3 ? byShard.get(orderedShards[1]) : undefined;
+    harness.put(`${root}/navigation/catalog-rebuild/snapshot/${page.toString().padStart(8, "0")}.json`, JSON.stringify({
+      schema_version: "1.0", page, project_id: input.project_id, request_id: input.request_id, snapshot_id: "source:0",
+      entries: entry ? [entry] : [], gaps: []
+    }));
+  }
+  // This is the persisted pre-index shape: the schema supplies the new index
+  // defaults when the execution resumes.
+  harness.put(`${root}/navigation-catalog-rebuild-progress.json`, JSON.stringify({
+    schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: input.project_id,
+    request_id: input.request_id, request_hash: requestHash, zone: input.zone, source_generation: 0,
+    source_snapshot_id: "source:0", cursor: null, page_count: 4, source_count: sourceIds.length,
+    source_ids: sourceIds, shard_cursor: 0, shard_count: 2,
+    stage_page: 0, staging_entries: [], staged_shards: [], invalidated_manifest: null, chunk_evidence: [],
+    status: "staging", finalization_ref: null, coverage_gaps: []
+  }));
+  const stageSpy = vi.spyOn(ZoneNavigationSources.prototype, "stageCompactCatalogRebuildShard").mockResolvedValue(undefined);
+  const manifestSpy = vi.spyOn(ZoneNavigationSources.prototype, "compactCatalogManifestIdentity").mockResolvedValue(manifest);
+  const inventoryPort: NavigationInventoryPort = {
+    ...inv.port,
+    verifySnapshot: async ({ budget: slice }) => { slice.beforeHttp(); return true; }
+  };
+  const engine = new ZoneNavigationEngine(harness.runtime, inventoryPort);
+  const initial = await engine.prepareCompactCatalogRebuild(input, project, admission, budget(4));
+  const checkpoint = JSON.parse(harness.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content);
+  const result = initial.status === "pending"
+    ? await engine.prepareCompactCatalogRebuild(input, project, admission, budget(512))
+    : initial;
+  const snapshotReads = harness.readPaths.filter((path) => path.includes("/navigation/catalog-rebuild/snapshot/"));
+  const stagedShards = stageSpy.mock.calls.map(([call]) => call.shard);
+  stageSpy.mockRestore();
+  manifestSpy.mockRestore();
+  return { result, initial, checkpoint, root, snapshotReads, stagedShards };
 }
 
 describe("zone navigation identity and resumable reconciliation", () => {
@@ -607,6 +691,42 @@ describe("zone navigation identity and resumable reconciliation", () => {
     harness.put(`${await journal.root()}/navigation-catalog-rebuild-progress.json`, canonicalJson(navigationCatalogRebuildProgressSchema.parse(engineProgress)));
     const finalized = await journal.finalizeVerifiedCatalogRebuild({ receipt_ref: receiptRef, certificate_ref: certificateRef });
     expect(finalized).toMatchObject({ status: "finalized", terminal: true });
+  });
+
+  it("keeps legacy rebuild progress resumable while validating the sparse staging page index", () => {
+    const legacy = {
+      schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: "PRJ-0002",
+      request_id: "DOCREQ-NAV-CATALOG-REBUILD-0001", request_hash: "a".repeat(64), zone: "REVIEW",
+      source_generation: 0, source_snapshot_id: "source:0", cursor: null, page_count: 3,
+      source_count: 1, source_ids: ["DOC-0123456789ABCDEF01234567"], shard_cursor: 0, shard_count: 1,
+      stage_page: 1, staging_entries: [], staged_shards: [], status: "staging", finalization_ref: null, coverage_gaps: []
+    };
+
+    const parsedLegacy = navigationCatalogRebuildProgressSchema.parse(legacy);
+    expect(parsedLegacy).toMatchObject({ staging_index_page: null, staging_page_index: [], staging_index_complete: false });
+    expect(navigationCatalogRebuildProgressSchema.safeParse({
+      ...legacy, staging_index_page: null, staging_page_index: [{ shard: 8, pages: [0, 2] }], staging_index_complete: true
+    }).success).toBe(true);
+    expect(navigationCatalogRebuildProgressSchema.safeParse({
+      ...legacy, staging_index_page: null, staging_page_index: [{ shard: 8, pages: [2, 0] }], staging_index_complete: true
+    }).success).toBe(false);
+  });
+
+  it("builds and resumes the sparse staging index from legacy progress before staging shards", async () => {
+    const { result, initial, checkpoint, snapshotReads, stagedShards } = await runSparseCatalogRebuildWithLegacyProgress();
+
+    expect(initial).toMatchObject({ status: "pending", cursor: "stage-index:1" });
+    expect(checkpoint).toMatchObject({ staging_index_page: 1, staging_index_complete: false, staging_page_index: [{ shard: expect.any(Number), pages: [0] }] });
+    expect(result).toMatchObject({ status: "prepared", source_count: 2, shard_count: 2 });
+    expect(stagedShards).toHaveLength(2);
+    expect(snapshotReads).toHaveLength(6);
+  });
+
+  it("rejects a sparse index that omits a source ID before writing its shard", async () => {
+    const { result, stagedShards } = await runSparseCatalogRebuildWithLegacyProgress(true);
+
+    expect(result).toMatchObject({ status: "conflict", code: "navigation_catalog_rebuild_staging_source_set_mismatch" });
+    expect(stagedShards).toEqual([]);
   });
 
   it("rejects unknown public fields and non-exact index identities", () => {

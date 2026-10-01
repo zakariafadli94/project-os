@@ -45,6 +45,19 @@ export const packageNavigationSchema = z.strictObject({
   schema_version: z.literal("1.0"), project_id: projectId, zone: packageZoneSchema,
   generation: z.number().int().positive().safe(), source_request_id: z.string().min(1),
   packages: z.array(z.strictObject({ ref: packageRefSchema, root: z.string().min(1) }))
+}).superRefine((head, ctx) => {
+  const packageIds = new Set<string>();
+  const roots = new Set<string>();
+  for (const [index, entry] of head.packages.entries()) {
+    if (packageIds.has(entry.ref.package_id)) {
+      ctx.addIssue({ code: "custom", path: ["packages", index, "ref", "package_id"], message: "package_navigation_duplicate_package" });
+    }
+    if (roots.has(entry.root)) {
+      ctx.addIssue({ code: "custom", path: ["packages", index, "root"], message: "package_navigation_duplicate_root" });
+    }
+    packageIds.add(entry.ref.package_id);
+    roots.add(entry.root);
+  }
 });
 export type PackageNavigationHead = z.infer<typeof packageNavigationSchema>;
 export type PackageNavigation = Partial<Record<PackageZone, PackageNavigationHead>>;

@@ -112,6 +112,9 @@ describe("ZoneNavigationSources", () => {
     const b = budget();
     const requestId = "DOCREQ-NAVIGATION-WORKING-0001";
     await expect(sources.beginAdoption("PRJ-0002", "WORKING", requestId, 0, b)).resolves.toBe(true);
+    expect(await sources.readState("PRJ-0002", "WORKING", b)).toMatchObject({
+      generation: 0, adoption_request_id: requestId, adoption_generation: 0, adopted: false
+    });
     const statePath = [...files.keys()].find((path) => path.endsWith("/navigation-sources/state.json"))!;
     const before = JSON.parse(files.get(statePath)!);
     await expect(sources.beginAdoption("PRJ-0002", "WORKING", requestId, 0, b)).resolves.toBe(true);

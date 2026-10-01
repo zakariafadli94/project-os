@@ -68,6 +68,7 @@ export interface ZoneNavigationSourceState {
   generation: number;
   adopted: boolean;
   adoption_request_id: string | null;
+  adoption_generation: number | null;
   in_flight_resource_ids: string[];
 }
 
@@ -149,7 +150,7 @@ export class ZoneNavigationSources {
   async readState(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<ZoneNavigationSourceState> {
     const state = await this.readProjectState(projectId, budget);
     const item = state.zones[zone] ?? DEFAULT_ZONE_STATE;
-    return { schema_version: "1.0", project_id: projectId, zone, generation: item.generation, adopted: item.adopted, adoption_request_id: item.adoption_request_id, in_flight_resource_ids: item.in_flight_writes.map((write) => write.resource_id) };
+    return { schema_version: "1.0", project_id: projectId, zone, generation: item.generation, adopted: item.adopted, adoption_request_id: item.adoption_request_id, adoption_generation: item.adoption_generation, in_flight_resource_ids: item.in_flight_writes.map((write) => write.resource_id) };
   }
 
   async beginAdoption(projectId: string, zone: NavigationZone, requestId: string, expectedGeneration: number, budget?: SliceBudget): Promise<boolean> {

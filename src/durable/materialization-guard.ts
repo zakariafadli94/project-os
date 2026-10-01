@@ -477,7 +477,13 @@ export class MaterializationGuard extends DurableObject<Env> {
       // Retrying it as an internal failure strands the admitted request.
       return { ref, publish: true };
     }
-    if (!sourceState.adopted && !await sources.beginAdoption(this.projectId, ref.zone, ref.request_id, sourceState.generation, budget)) {
+    const alreadyOwnedAdoption = sourceState.adoption_request_id === ref.request_id
+      && sourceState.adoption_generation === sourceState.generation;
+    // The fresh source-state read already proves this exact adoption owner.
+    // Avoid rereading the same two provider records on every inventory slice;
+    // inventory and each catalog CAS still recheck generation before effects.
+    if (!sourceState.adopted && !alreadyOwnedAdoption
+      && !await sources.beginAdoption(this.projectId, ref.zone, ref.request_id, sourceState.generation, budget)) {
       return { ref, publish: false };
     }
     const inventory = new ZoneNavigationInventory(runtime, sources);

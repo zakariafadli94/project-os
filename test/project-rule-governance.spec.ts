@@ -4,15 +4,27 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { encodeAdmission } from "../src/admission/transport";
 import { ExecutionJournal } from "../src/execution/journal";
-import { machineTransactionRequestIntentPath } from "../src/persistence/layout";
+import { machineTransactionRequestIntentPath, workspaceManagedDocumentPath } from "../src/persistence/layout";
 import { sha256Text } from "../src/documents/hash";
 import { qualificationEntries, type RuleQualificationEvidenceResolver } from "../src/rules/qualification";
 import { governanceTx, exceptionFixture, ruleAt, ruleFixture } from "./helpers/rule-fixtures";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 const testEnv = env as unknown as Env;
 let mock: ReturnType<typeof installDropboxMock>;
+let resetGlobalGovernanceAfterTest = false;
 beforeEach(() => { mock = installDropboxMock(); });
-afterEach(() => vi.restoreAllMocks());
+afterEach(async () => {
+  vi.restoreAllMocks();
+  if (!resetGlobalGovernanceAfterTest) return;
+  resetGlobalGovernanceAfterTest = false;
+  await runInDurableObject(testEnv.REGISTRY_GUARD.getByName("global"), (instance, ctx) => {
+    ctx.storage.sql.exec("DELETE FROM meta WHERE key = 'rule_governance'");
+    ctx.storage.sql.exec("DELETE FROM requests WHERE project_id = 'GLOBAL'");
+    ctx.storage.sql.exec("DELETE FROM governance_events");
+    Object.assign((instance as any).env, { RULE_GOVERNANCE_TOKEN: undefined, RULE_ADMISSION_SIGNING_KEY: undefined });
+  });
+});
 it("serializes project governance through ordinary committed event/receipt persistence", async () => {
   const projectId = "PRJ-7101";
   const governanceToken = "project-rule-governance-dedicated-test-token";
@@ -106,6 +118,121 @@ it("rejects an ingress-signed local rule proposal before persisting its transact
   });
   expect(sharedTokenResponse.status).toBe(403);
   expect(mock.files.has(machineTransactionRequestIntentPath(projectId, tx.transaction_id))).toBe(false);
+});
+
+it("persists an accepted-unenforced rule gap at ProjectGuard while an independent working write commits", async () => {
+  const suffix = String(Date.now());
+  const projectId = `PRJ-${suffix}`;
+  const slug = `g14-visible-${suffix.slice(-8)}`;
+  const governanceToken = "project-rule-governance-g14-token";
+  const ingressToken = "project-rule-governance-g14-ingress";
+  const signingKey = "project-rule-governance-g14-signing-key";
+  const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+    RULE_GOVERNANCE_TOKEN: governanceToken,
+    MUTATION_CONTEXT_SIGNING_KEY: signingKey
+  }));
+
+  const created = await guard.fetch("https://project-guard.internal/transaction", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ schema_version: "1.0", transaction_id: `TXN-G14-CREATE-${suffix}`,
+      project_id: projectId, base_revision: 0, operation: "project.create", created_at: ruleAt,
+      payload: { name: "Visible unequipped rule", slug, aliases: [], objective: "Persist a server-resolved rule gap" } })
+  });
+  expect(created.status).toBe(200);
+  expect(await created.json()).toMatchObject({ status: "committed", new_revision: 1 });
+
+  const submitGovernance = async (operation: "rule.propose" | "rule.accept", payload: unknown, baseRevision: number) => {
+    const tx = { ...governanceTx(operation, payload, baseRevision, projectId), created_at: ruleAt };
+    const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context", {
+      headers: { authorization: `Bearer ${governanceToken}` }
+    });
+    expect(contextResponse.status).toBe(200);
+    const { context } = await contextResponse.json<{ context: Parameters<typeof encodeAdmission>[1] }>();
+    const response = await guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(encodeAdmission(tx, context))
+    });
+    expect(response.status).toBe(200);
+    return response.json<{ status: string; new_revision: number }>();
+  };
+  const rule = ruleFixture(projectId, {
+    rule_id: "RULE-G14-UNAVAILABLE-CONTROL",
+    operations: ["working.write"],
+    resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] },
+    check_id: "future_unavailable_control",
+    parameters: {}
+  });
+  expect(await submitGovernance("rule.propose", { rule }, 1)).toMatchObject({ status: "committed", new_revision: 2 });
+  expect(await submitGovernance("rule.accept", { rule_id: rule.rule_id, version: 1 }, 2))
+    .toMatchObject({ status: "committed", new_revision: 3 });
+
+  const acceptedStateResponse = await guard.fetch("https://project-guard.internal/mutation-context", {
+    headers: { authorization: `Bearer ${governanceToken}` }
+  });
+  expect(acceptedStateResponse.status).toBe(200);
+  const acceptedState = await acceptedStateResponse.json<{ canonical_state: { local_rules: Record<string, { status: string; activation_evidence: string[] }> } }>();
+  expect(acceptedState.canonical_state.local_rules[`${rule.rule_id}@1`]).toMatchObject({
+    status: "accepted_unenforced", activation_evidence: []
+  });
+
+  await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, {
+    INGRESS_TOKEN: ingressToken,
+    RULE_ADMISSION_SIGNING_KEY: signingKey,
+    PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" })
+  }));
+  resetGlobalGovernanceAfterTest = true;
+  await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectId);
+  const mutationContextResponse = await guard.fetch("https://project-guard.internal/mutation-context", {
+    headers: { authorization: `Bearer ${ingressToken}` }
+  });
+  expect(mutationContextResponse.status).toBe(200);
+  const { context } = await mutationContextResponse.json<{ context: Parameters<typeof encodeAdmission>[1] }>();
+
+  const requestId = `DOCREQ-G14-WORK-${suffix}`;
+  const logicalPath = "visible-unenforced-rule.md";
+  const content = "# Independent working write\n\nThis remains committed while the unequipped rule is visible.\n";
+  const request = {
+    operation: "working.write" as const,
+    request_id: requestId,
+    project_id: projectId,
+    logical_path: logicalPath,
+    content,
+    content_sha256: await sha256Text(content),
+    created_at: ruleAt
+  };
+  const response = await guard.fetch("https://project-guard.internal/document", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(encodeAdmission(request, context))
+  });
+  expect(response.status).toBe(200);
+  const receipt = await response.json<Record<string, unknown>>();
+  expect(receipt).toMatchObject({ request_id: requestId, project_id: projectId, status: "committed", logical_path: logicalPath });
+  expect(mock.files.get(workspaceManagedDocumentPath(projectId, slug, "working", logicalPath))).toContain(content);
+
+  const stored = await runInDurableObject(guard, async (instance) => {
+    const journal = new ExecutionJournal((instance as any).persistence, projectId, "document", requestId);
+    return journal.readAdmission();
+  });
+  expect(stored?.admission).toMatchObject({
+    project_id: projectId,
+    request_id: requestId,
+    operation: "working.write",
+    verdict: "allow",
+    ruleset: { rules: [], global_revision: 1, project_revision: 3 },
+    results: [],
+    gaps: [{
+      rule: { rule_id: rule.rule_id, version: 1, scope: { kind: "project", project_id: projectId } },
+      code: "ACCEPTED_UNENFORCED",
+      check_id: "future_unavailable_control"
+    }]
+  });
+
+  const receiptResponse = await guard.fetch(`https://project-guard.internal/receipt?kind=document&request_id=${requestId}`);
+  expect(receiptResponse.status).toBe(200);
+  const durableReceipt = await receiptResponse.json<Record<string, unknown>>();
+  expect(durableReceipt).toMatchObject({ request_id: requestId, project_id: projectId, status: "committed", logical_path: logicalPath });
+  expect(durableReceipt).not.toHaveProperty("gaps");
 });
 
 it("applies only a live canonical exact exception at the ProjectGuard document boundary", async () => {

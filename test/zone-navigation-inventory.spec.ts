@@ -836,6 +836,25 @@ describe("ZoneNavigationInventory", () => {
     expect(second.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
   });
 
+  it("pipelines a saved provider suffix with the guard's remaining 28-call budget", async () => {
+    const h = harness();
+    const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222"];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`);
+    }
+    const deferred = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(8) });
+    expect(deferred.entries).toEqual([]);
+    const originalList = h.runtime.pagedListing!.listPage;
+    h.runtime.pagedListing!.listPage = async (input) => {
+      if (input.path === `${machineDocumentRoot(projectId)}/heads`) throw new Error("saved_page_relisted");
+      return originalList(input);
+    };
+    const slice = budget(28);
+    const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: deferred.next_cursor, limit: 8, budget: slice });
+    expect(resumed.entries.map((entry) => entry.resource_id)).toEqual(ids.map((id) => `head:${id}`));
+    expect(slice.calls_left).toBeGreaterThanOrEqual(4);
+  });
+
   it("keeps the first unfinished head in the cursor after a transient second-sidecar failure", async () => {
     const h = harness();
     const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222"];

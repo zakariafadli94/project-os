@@ -397,12 +397,23 @@ describe("zone navigation identity and resumable reconciliation", () => {
       sources: [{ path: manifestPath, logical_path: manifestPath }], destinations: [{ path: manifestPath, logical_path: manifestPath }], preservation_copies: []
     }] } as ExecutionAdmission;
     const seen: number[] = [];
+    let activeVerifications = 0;
+    let peakVerifications = 0;
+    let interruptSecondVerification = phase === "verify";
     const charge = (slice: SliceBudget | undefined) => { for (let index = 0; index < 9; index += 1) slice!.beforeHttp(); };
     const publish = vi.spyOn(ZoneNavigationSources.prototype, "publishCompactCatalogRebuildShard").mockImplementation(async (call, slice) => {
       seen.push(call.shard); charge(slice); return evidence.find((item) => item.shard === call.shard)!;
     });
     const verify = vi.spyOn(ZoneNavigationSources.prototype, "verifyCompactCatalogRebuildShard").mockImplementation(async (call, slice) => {
       seen.push(call.shard); charge(slice);
+      activeVerifications += 1;
+      peakVerifications = Math.max(peakVerifications, activeVerifications);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      activeVerifications -= 1;
+      if (call.shard === 2 && interruptSecondVerification) {
+        interruptSecondVerification = false;
+        throw new Error("slice_budget_exhausted");
+      }
     });
     const manifest = vi.spyOn(ZoneNavigationSources.prototype, "publishCompactCatalogRebuildManifest").mockImplementation(async (call) => ({
       ready_generation: 0, shards: call.shards, identity, chunk_evidence: call.chunk_evidence
@@ -412,11 +423,18 @@ describe("zone navigation identity and resumable reconciliation", () => {
     });
     const release = vi.spyOn(ZoneNavigationSources.prototype, "releaseCompactCatalogRebuildFence").mockResolvedValue(true);
     try {
-      await new ZoneNavigationEngine(h.runtime, { listPage: async () => { throw new Error("unused"); }, verifyEntry: async () => true, verifySnapshot: async () => true })
-        .publishPreparedCompactCatalogRebuild(input, project, admission, "source:0", budget(32));
+      const engine = new ZoneNavigationEngine(h.runtime, { listPage: async () => { throw new Error("unused"); }, verifyEntry: async () => true, verifySnapshot: async () => true });
+      if (phase === "verify") {
+        expect((await engine.publishPreparedCompactCatalogRebuild(input, project, admission, "source:0", budget(32))).status).toBe("pending");
+        expect(JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content).verify_shard_cursor).toBe(0);
+        seen.length = 0;
+        peakVerifications = 0;
+      }
+      await engine.publishPreparedCompactCatalogRebuild(input, project, admission, "source:0", budget(32));
       const progress = JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content);
       expect(seen).toEqual([1, 2]);
       expect(progress[phase === "publish" ? "publish_cursor" : phase === "verify" ? "verify_shard_cursor" : "post_publish_verify_cursor"]).toBe(2);
+      if (phase === "verify") expect(peakVerifications).toBe(2);
     } finally {
       publish.mockRestore(); verify.mockRestore(); manifest.mockRestore(); post.mockRestore(); release.mockRestore();
     }

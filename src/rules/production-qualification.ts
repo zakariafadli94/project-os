@@ -10,7 +10,7 @@ import { AdmissionError, parseMutationContextOrNull, verifyMutationContext } fro
 import { readProjectState } from "../schema/project-state";
 import { admissionModeForProject } from "../convergence/rollout";
 import { archiveProjectRoot, machineCommitRecordPath, machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPath, machineRegistryJsonPath, workspaceProjectRoot } from "../persistence/layout";
-import { parseDocumentVersionRecord, parseManagedDocumentHead } from "../domain/managed-document";
+import { documentIdFor, parseDocumentVersionRecord, parseManagedDocumentHead } from "../domain/managed-document";
 import { approvalRecordSchema } from "../domain/approval";
 import { DocumentLedgerRepository } from "../documents/repository";
 import { parseManagedDocumentRequest } from "../domain/managed-document-request";
@@ -23,11 +23,11 @@ import { checkCatalogue, normalizedMutationOperations, validateCheck } from "./c
 import { evaluateRules } from "./evaluator";
 import { QualificationResolutionFailure, qualificationEntries, type ControlProbe, type QualificationAudit, type QualificationEvidence, type RuleQualificationEvidenceResolver } from "./qualification";
 
-/** Build-owned coverage of the shared artifact admission boundary. This is not Markdown/client evidence.
- * Artifact current_version and approval readers are not supplied by production admission yet, so those checks
- * deliberately have no qualification coverage. A new allowed_destination rule needs no code change. */
+/** Build-owned coverage of production admission boundaries. This is not Markdown/client evidence.
+ * Coverage is intentionally limited to exact operation/resource tuples whose server normalizer and evidence
+ * reader are deployed. A new allowed_destination rule needs no code change. */
 export const deployedQualificationCoverage = Object.freeze({
-  version: "artifact-admission-v3",
+  version: "artifact-admission-v4",
   checks: Object.freeze({ allowed_destination: Object.freeze({
     operations: Object.freeze(normalizedMutationOperations.filter(operation => operation === "artifact.write" && checkCatalogue.allowed_destination.operations.includes(operation))),
     entries: Object.freeze([...qualificationEntries]),
@@ -83,6 +83,29 @@ export const deployedQualificationCoverage = Object.freeze({
       AD: "src/durable/project-guard-neutral.ts#request-status",
       RP: "src/mutation-gate/classifier.ts#candidate-resolution"
     })
+  }),
+  expected_version: Object.freeze({
+    operations: Object.freeze(["working.write"]),
+    entries: Object.freeze(["API", "CT", "GI"]),
+    not_applicable_entries: Object.freeze(["FB", "IN", "CF", "AD", "RP"]),
+    resource_types: Object.freeze(["document"]), zones: Object.freeze(["DOCUMENTS"]),
+    enforcement: "automatic", check_stage: "pre_admission", parameters: Object.freeze({ required: true }),
+    normalizer: "src/admission/operation-context.ts#normalizeDocumentAdmission",
+    boundary: "src/durable/project-guard-neutral.ts#resolveServerObservations;src/durable/project-guard-neutral.ts#handleManagedDocument",
+    positive_route: "src/index-neutral.ts#/v1/documents;src/control-tower/mcp.ts#project_os_write_working_document;src/durable/project-guard-neutral.ts#/document",
+    negative_route: "src/fallback/contract.ts#transaction-only;src/inbox/runtime.ts#typed-transaction-or-artifact;src/index-neutral.ts#scheduled-reconcile;src/durable/project-guard-neutral.ts#request-status;src/mutation-gate/classifier.ts#candidate-resolution",
+    positive_test_ref: "test/project-guard-document.spec.ts#rejects-a-head-changed-during-observation-and-re-reads-independent-durable-head-version-evidence",
+    negative_test_ref: "test/rule-evaluator.spec.ts#returns-actionable-rule-version-evidence-on-refusal",
+    entry_evidence: Object.freeze({
+      API: "src/index-neutral.ts#/v1/documents",
+      CT: "src/control-tower/mcp.ts#project_os_write_working_document",
+      GI: "test/project-guard-document.spec.ts#rejects-a-head-changed-during-observation-and-re-reads-independent-durable-head-version-evidence",
+      FB: "src/fallback/contract.ts#transaction-only",
+      IN: "src/inbox/runtime.ts#typed-transaction-or-artifact",
+      CF: "src/index-neutral.ts#scheduled-reconcile",
+      AD: "src/durable/project-guard-neutral.ts#request-status",
+      RP: "src/mutation-gate/classifier.ts#candidate-resolution"
+    })
   }) })
 });
 const registrySchema = z.object({ schema_version: z.literal("1.0"), projects: z.array(z.object({ project_id: z.string().regex(/^PRJ-[0-9]{4,}$/), slug: z.string().min(1), status: z.enum(["active", "paused", "completed", "archived"]) })) });
@@ -109,7 +132,7 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
       || canonicalJson(rule.parameters) !== canonicalJson(coverage.parameters)
       || !exactList(rule.resource_scope.resource_types, coverage.resource_types)
       || !exactList(rule.resource_scope.zones, coverage.zones)
-      || (rule.check_id === "coherent_phase" && !exactList(rule.operations, coverage.operations))) {
+      || ((rule.check_id === "coherent_phase" || rule.check_id === "expected_version") && !exactList(rule.operations, coverage.operations))) {
       fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "No deployed coverage for this exact pre-admission check/resource tuple");
     }
     const observed = new Map<string, ProviderObjectMetadata>();
@@ -236,15 +259,16 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     const applicable = states.filter(state => rule.scope.kind === "global" || rule.scope.project_id === state.project_id);
     if (!applicable.length || applicable.some(state => admissionModeForProject(env.PROJECT_OS_ADMISSION_PROJECT_MODES, state.project_id) !== "strict")) fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "Every governed project must have strict production admission configured");
     if (!isArtifactCoverage) {
-      const control = coverage as typeof deployedQualificationCoverage.checks.coherent_phase | typeof deployedQualificationCoverage.checks.exact_approval;
+      const control = coverage as typeof deployedQualificationCoverage.checks.coherent_phase | typeof deployedQualificationCoverage.checks.exact_approval | typeof deployedQualificationCoverage.checks.expected_version;
       const positive: string[] = [], negative: string[] = [];
+      const currentVersionEvidence: string[] = [];
       const controlProbes: ControlProbe[] = [];
       const probeRule: RuleVersion = { ...rule, scope: { kind: "global" }, status: "active" };
       const probeGovernance = { revision: governance!.state.revision, rules: { [ruleVersionKey(probeRule.rule_id, probeRule.version)]: probeRule }, exceptions: {} };
-      const probeResult = async (state: ProjectState, operation: string, resources: any[], approvals: unknown[] = []) => {
+      const probeResult = async (state: ProjectState, operation: string, resources: any[], approvals: unknown[] = [], observations: any[] = []) => {
         const evaluation = await evaluateRules({ actor: { actor_id: "qualification-probe", authority: "server" }, project_id: state.project_id,
           operation, expected_project_revision: state.revision, stage: "pre_admission", now, state: { ...state, local_rules: {} },
-          global_governance: probeGovernance, resources, observations: [], approvals });
+          global_governance: probeGovernance, resources, observations, approvals });
         const result = evaluation.results.find(item => item.rule?.rule_id === rule.rule_id && item.rule.version === rule.version);
         if (!result) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", "Read-only production evaluator did not return the exact candidate check");
         return result!;
@@ -268,14 +292,14 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
         ["expired", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }],
         ["revoked", { code: "EXACT_APPROVAL_REQUIRED", verdict: "approval_required" }]
       ]);
-      const documents = new Map<string, Array<{ document_id: string; working?: string; review?: string }>>();
-      if (rule.check_id === "exact_approval") {
+      const documents = new Map<string, Array<{ document_id: string; logical_path: string; working?: string; review?: string }>>();
+      if (rule.check_id === "exact_approval" || rule.check_id === "expected_version") {
         const ledger = new DocumentLedgerRepository(runtime);
         for (const state of applicable) {
           const headsPath = `${machineDocumentRoot(state.project_id)}/heads`;
           const headEntries = await list(headsPath);
           if (headEntries.length > 256) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Managed document head inventory exceeds the synchronous qualification bound");
-          const heads: Array<{ document_id: string; working?: string; review?: string }> = [];
+          const heads: Array<{ document_id: string; logical_path: string; working?: string; review?: string }> = [];
           const headIds = await ledger.listHeadIds(state.project_id);
           const listedIds = headEntries.filter(entry => entry.kind === "file").map(entry => /^((?:DOC-)[A-F0-9]{24})\.json$/.exec(entry.name)?.[1] ?? null).filter((id): id is string => id !== null).sort();
           if (canonicalJson(headIds) !== canonicalJson(listedIds)) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Managed document head inventory changed during qualification");
@@ -284,7 +308,8 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
             const rawHead = await read(headPath, "QUALIFICATION_INVENTORY_UNAVAILABLE");
             const head = parseManagedDocumentHead(JSON.parse(rawHead));
             if (head.project_id !== state.project_id || head.document_id !== documentId || head.kind !== "work_product") fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Managed document head identity is malformed");
-            const bound: { document_id: string; working?: string; review?: string } = { document_id: documentId };
+            if (await documentIdFor(state.project_id, head.logical_path) !== documentId) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Managed document head path does not bind its document identity");
+            const bound: { document_id: string; logical_path: string; working?: string; review?: string } = { document_id: documentId, logical_path: head.logical_path };
             for (const versionId of [head.working_version_id, head.review_version_id, head.published_version_id].filter((id): id is string => Boolean(id))) {
               const versionPath = machineDocumentVersionPath(state.project_id, documentId, versionId);
               const record = parseDocumentVersionRecord(JSON.parse(await read(versionPath, "QUALIFICATION_INVENTORY_UNAVAILABLE")));
@@ -333,7 +358,7 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
               current_phase_id: positiveCase ? realPhase : state.current_phase_id, attached_task_count: positiveCase ? Object.values(positiveState.tasks).filter(task => task.phase_id === realPhase).length : 0,
               attached_task_statuses_sha256: taskDigest, probe_source: "ephemeral_evaluator_vector" });
           }
-        } else {
+        } else if (rule.check_id === "exact_approval") {
           for (const operation of rule.operations) {
             const op = operation as "document.publish" | "review.promote";
             const versionField = op === "document.publish" ? "review" : "working";
@@ -374,6 +399,34 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
                 probe_source: "ephemeral_evaluator_vector" } as ControlProbe);
             }
           }
+        } else {
+          const operation = "working.write";
+          const actual = (documents.get(state.project_id) ?? []).find(head => head.working);
+          const canonicalWorking = actual?.working
+            ? { document_id: actual.document_id, logical_path: actual.logical_path, version: actual.working }
+            : fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", "No canonical working head is available for the deployed current-version reader");
+          const expectedVersion = canonicalWorking.version;
+          currentVersionEvidence.push(machineDocumentVersionPath(state.project_id, canonicalWorking.document_id, expectedVersion));
+          const staleVersion = `VER-REQ-${(await sha256Text(`${state.project_id}:${expectedVersion}:stale`)).slice(0, 24).toUpperCase()}`;
+          const content = "# Expected-version qualification vector\n";
+          for (const entry of control.entries) for (const [probeCase, submittedVersion, expected] of [
+            ["exact", expectedVersion, { verdict: "allow", code: "EXPECTED_VERSION_MATCH" }],
+            ["stale", staleVersion, { verdict: "deny", code: "STALE_DOCUMENT_VERSION" }]
+          ] as const) {
+            const request = parseManagedDocumentRequest({ operation, request_id: `DOCREQ-QUALIFICATION-${probeCase.toUpperCase()}01`,
+              project_id: state.project_id, logical_path: canonicalWorking.logical_path, content,
+              content_sha256: await sha256Text(content), expected_version_id: submittedVersion, created_at: now });
+            const normalized = await normalizeDocumentAdmission(request);
+            const observation = { project_id: state.project_id, resource_id: normalized.resources[0].resource_id,
+              resource_version: normalized.resources[0].version, observed_at: new Date(Date.parse(now) - 1_000).toISOString(),
+              expires_at: new Date(Date.parse(now) + 60_000).toISOString(),
+              evidence_refs: [machineDocumentHeadPath(state.project_id, canonicalWorking.document_id), machineDocumentVersionPath(state.project_id, canonicalWorking.document_id, expectedVersion)],
+              current_version: expectedVersion };
+            const outcome = await probeResult(state, operation, normalized.resources, [], [observation]);
+            if (outcome.verdict !== expected.verdict || outcome.code !== expected.code) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", `Shared expected-version evaluator failed the ${probeCase} vector`);
+            const ref = await probeRef(state, { operation, entry, probeCase, resources: normalized.resources, observation });
+            (probeCase === "exact" ? positive : negative).push(ref);
+          }
         }
       }
       if (!positive.length || !negative.length) fail("QUALIFICATION_TEST_EVIDENCE_UNAVAILABLE", "Read-only control evaluator probes lack positive or negative outcomes");
@@ -387,7 +440,9 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
       const evidence: QualificationEvidence = {
         rule_id: rule.rule_id, rule_version: rule.version, rule_scope: rule.scope, evidence_refs: request.requested_evidence_refs,
         accepted_source_refs: rule.source_refs, deployed_check_id: rule.check_id, deployment_ref: build,
-        check_evidence: Object.fromEntries(checkCatalogue[rule.check_id].required_evidence.map((key, index) => [key, { status: "verified", evidence_ref: stateEvidence[0] ?? `${machineRegistryJsonPath()}#inventory=${snapshot}`, verification_ref: index === 0 ? positive[0] : negative[0] }])),
+        check_evidence: Object.fromEntries(checkCatalogue[rule.check_id].required_evidence.map((key, index) => [key, { status: "verified",
+          evidence_ref: key === "current_version" && currentVersionEvidence[0] ? currentVersionEvidence[0] : stateEvidence[0] ?? `${machineRegistryJsonPath()}#inventory=${snapshot}`,
+          verification_ref: index === 0 ? positive[0] : negative[0] }])),
         entry_coverage: entryCoverage.map(row => ({ ...row, evidence_refs: [...row.evidence_refs, ...positiveRouteRefs, ...nonApplicableRouteRefs, ...negativeRouteRefs] })),
         positive_test_refs: [...new Set([...positiveRouteRefs, ...positive])], negative_test_refs: [...new Set([...negativeRouteRefs, ...negative])],
         contradiction_scan_ref: `${globalGovernancePath}#inventory=${snapshot}`, historical_drift_ref: `${machineRegistryJsonPath()}#inventory=${snapshot}`,

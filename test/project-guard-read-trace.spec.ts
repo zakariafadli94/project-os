@@ -136,6 +136,74 @@ it.each(["project_queue", "search_queue"] as const)(
   }
 );
 
+it("starts independent canonical execution and receipt reads together for finalized status", async () => {
+  const projectId = "PRJ-8490";
+  const requestId = "TXN-PRJ8490-PARALLEL-STATUS";
+  const { receipt } = await seedFinalizedTransactionStatus(projectId, requestId, 5);
+  const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(guard, async instance => {
+    const subject = instance as unknown as {
+      handleRequestStatus(url: URL, correlationId: string, runtime: unknown, repository: unknown, requireFinalizationProof: boolean): Promise<Response>;
+      readRequestStatusReceipt(...args: unknown[]): Promise<unknown>;
+      hasValidFinalizationEvidence(...args: unknown[]): Promise<boolean>;
+      persistence: unknown;
+      repository: unknown;
+    };
+    const canonicalExecution = await new ExecutionJournal(
+      createProductionPersistence(env as unknown as Env, projectId), projectId, "transaction", requestId
+    ).status();
+    let release!: (value: typeof canonicalExecution) => void;
+    const blockedExecution = new Promise<typeof canonicalExecution>(resolve => { release = resolve; });
+    vi.spyOn(ExecutionJournal.prototype, "status").mockReturnValue(blockedExecution);
+    const receiptRead = vi.spyOn(subject, "readRequestStatusReceipt").mockResolvedValue(receipt);
+    vi.spyOn(subject, "hasValidFinalizationEvidence").mockResolvedValue(true);
+    const pending = subject.handleRequestStatus(
+      new URL(`https://guard.internal/request-status?kind=transaction&request_id=${requestId}`),
+      "corr-parallel-status", subject.persistence, subject.repository, true
+    );
+    await Promise.resolve();
+    const beganWhileExecutionPending = receiptRead.mock.calls.length === 1;
+    release(canonicalExecution);
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(beganWhileExecutionPending).toBe(true);
+  });
+});
+
+it.each(["published", "still_missing"] as const)(
+  "does not report finalized from crossed execution and %s receipt snapshots",
+  async receiptState => {
+    const projectId = receiptState === "published" ? "PRJ-8491" : "PRJ-8492";
+    const requestId = `TXN-${projectId}-CROSSED-STATUS`;
+    const { receipt } = await seedFinalizedTransactionStatus(projectId, requestId, 5);
+    const guard = (env as unknown as Env).PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(guard, async instance => {
+      const subject = instance as unknown as {
+        handleRequestStatus(url: URL, correlationId: string, runtime: unknown, repository: unknown, requireFinalizationProof: boolean): Promise<Response>;
+        readRequestStatusReceipt(...args: unknown[]): Promise<unknown>;
+        persistence: unknown;
+        repository: unknown;
+      };
+      const receiptRead = vi.spyOn(subject, "readRequestStatusReceipt")
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(receiptState === "published" ? receipt : null);
+      const response = await subject.handleRequestStatus(
+        new URL(`https://guard.internal/request-status?kind=transaction&request_id=${requestId}`),
+        "corr-crossed-status", subject.persistence, subject.repository, false
+      );
+      const body = await response.json<Record<string, any>>();
+      expect(receiptRead).toHaveBeenCalledTimes(2);
+      if (receiptState === "published") {
+        expect(response.status).toBe(200);
+        expect(body).toMatchObject({ status: "finalized", receipt: { status: "committed" } });
+      } else {
+        expect(response.status).toBe(503);
+        expect(body).toMatchObject({ status: "unknown" });
+      }
+    });
+  }
+);
+
 it.each(["project_queue", "search_queue"] as const)(
   "returns receipt absence only after full bound status proof during an unrelated %s operation",
   async (queue) => {

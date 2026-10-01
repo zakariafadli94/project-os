@@ -4000,6 +4000,7 @@ export class ProjectGuard extends DurableObject<Env> {
           required_action: "Refresh the canonical document head and submit the exact reviewed version"
         };
       }
+      const observations = await this.resolveServerObservations(state, normalized);
       return evaluateRules({
       actor,
       project_id: normalized.project_id,
@@ -4010,7 +4011,7 @@ export class ProjectGuard extends DurableObject<Env> {
       state,
       global_governance,
       resources: normalized.resources,
-      observations: await this.resolveServerObservations(state, normalized),
+      observations,
       approvals: Object.values(state.approvals ?? {})
       });
     };
@@ -4796,8 +4797,20 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ error: "request_identity_required" }, { status: 400 });
     }
     try {
-      const execution = await new ExecutionJournal(runtime, projectId, kind, requestId).status();
-      const receipt = await this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository);
+      const [execution, parallelReceipt] = await Promise.all([
+        new ExecutionJournal(runtime, projectId, kind, requestId).status(),
+        this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository)
+      ]);
+      let receipt = parallelReceipt;
+      // A receipt read can race ahead of an execution that becomes finalized.
+      // Re-read after observing that terminal state before reporting success.
+      if (execution?.status === "finalized" && (!receipt || typeof receipt !== "object"
+        || !("status" in receipt) || receipt.status !== "committed")) {
+        receipt = await this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository);
+        if (!receipt || typeof receipt !== "object" || !("status" in receipt) || receipt.status !== "committed") {
+          return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "request_status_unavailable");
+        }
+      }
       const canonicalCommitVerified = requireFinalizationProof && kind === "transaction"
         ? await this.hasVerifiedCanonicalTransactionCommit(projectId, requestId, receipt, execution, runtime, repository)
         : false;

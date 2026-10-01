@@ -799,8 +799,10 @@ export class ProjectGuard extends DurableObject<Env> {
       // Capacity refusal is pre-admission and leaves no transaction intent.
       // Existing non-repair projects retain their prior admission sequence.
       if (!capacityReservationRequired) await this.enqueueRequestRecovery("transaction", tx.transaction_id, stagedRequest);
+      let freshIntent = false;
       try {
-        await this.transactionRequests.ensureTransactionRequest(tx.project_id, tx, proof?.actor);
+        const ensured = await this.transactionRequests.ensureTransactionRequest(tx.project_id, tx, proof?.actor);
+        freshIntent = ensured.created;
       } catch (error) {
         if (error instanceof Error && error.message === "idempotency_payload_mismatch") {
           const released = !capacityReservationRequired || await this.releaseCapacityReservation(normalized, tx.transaction_id);
@@ -809,7 +811,14 @@ export class ProjectGuard extends DurableObject<Env> {
         }
         throw error;
       }
-      const admitted = proof ? await this.persistAdmissionProof("transaction", tx.transaction_id, proof) : null;
+      const admitted = proof
+        ? await this.persistAdmissionProof("transaction", tx.transaction_id, proof)
+        : freshIntent ? null
+          : (await new ExecutionJournal(this.persistence, tx.project_id, "transaction", tx.transaction_id).readAdmission())?.admission ?? null;
+      if (admitted && (admitted.project_id !== tx.project_id || admitted.request_id !== tx.transaction_id
+        || admitted.operation !== normalized.operation || admitted.request_hash !== normalized.request_hash)) {
+        throw new AdmissionError("idempotency_payload_mismatch", 409);
+      }
 
       // A refused strict admission must not reserve an idempotency key.  Only
       // bind this intent after the verified permit and second rules evaluation.

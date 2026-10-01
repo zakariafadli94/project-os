@@ -9,6 +9,7 @@ import type { Env } from "../src/env";
 import { ExecutionJournal } from "../src/execution/journal";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { readReceipt } from "../src/schema/receipt";
+import { TransactionRequestLedger } from "../src/transactions/request-ledger";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 
@@ -143,6 +144,49 @@ describe("external admission gap receipts", () => {
     const status = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${transaction.transaction_id}`);
     expect(await status.json()).toMatchObject({ status: "committed", receipt: { gaps: [gap] } });
     await runInDurableObject(guard, instance => { (instance as any).queueDepth = 0; });
+  });
+
+  it("retains a committed admission gap when recovery no longer requires a new rule evaluation", async () => {
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey);
+    const created = await createProject("TXN-GAP-RECOVERY-TRANS-9001");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await installGapAdmission(created.project_id);
+    const { context } = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    const transaction = {
+      schema_version: "1.0" as const,
+      transaction_id: "TXN-GAP-RECOVERY-TRANS-9002",
+      project_id: created.project_id,
+      base_revision: created.new_revision,
+      operation: "task.create" as const,
+      created_at: createdAt,
+      payload: { task_id: "TASK-GAPRECOVERY0001", title: "Keep historical gap" }
+    };
+    const normalized = await normalizeTransactionAdmission(transaction);
+    const persistence = createProductionPersistence(testEnv);
+    await new TransactionRequestLedger(persistence.objects).ensureTransactionRequest(created.project_id, transaction);
+    await new ExecutionJournal(persistence, created.project_id, "transaction", transaction.transaction_id).commit({
+      project_id: created.project_id,
+      request_id: transaction.transaction_id,
+      kind: "transaction",
+      operation: normalized.operation,
+      request_hash: normalized.request_hash,
+      actor: (context as any).actor,
+      resources: normalized.resources,
+      global_revision: 1,
+      project_revision: created.new_revision,
+      ruleset: { digest: "a".repeat(64), rules: [], global_revision: 1, project_revision: created.new_revision },
+      verdict: "allow",
+      results: [], gaps: [gap], deferred_rules: []
+    }, null);
+    await runInDurableObject(guard, instance => {
+      vi.spyOn(instance as any, "ruleAdmissionRequired").mockResolvedValue(false);
+    });
+
+    const response = await guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(encodeAdmission(transaction, context))
+    });
+    expect(await response.json()).toMatchObject({ status: "committed", gaps: [gap] });
   });
 
   it("returns the immutable admission gaps on a committed document receipt", async () => {

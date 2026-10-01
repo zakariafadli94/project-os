@@ -18,7 +18,7 @@ export interface TransactionRequestIntent {
 export class TransactionRequestLedger {
   constructor(private readonly objects: ObjectPersistence) {}
 
-  async ensureTransactionRequest(projectId: string, tx: Transaction, actor?: { actor_id: string; authority: string }): Promise<TransactionRequestIntent> {
+  async ensureTransactionRequest(projectId: string, tx: Transaction, actor?: { actor_id: string; authority: string }): Promise<TransactionRequestIntent & { created: boolean }> {
     if (tx.project_id !== projectId) throw new Error("transaction_intent_project_mismatch");
     const requestJson = canonicalJson(tx);
     const record: TransactionRequestIntent = {
@@ -29,7 +29,7 @@ export class TransactionRequestLedger {
     const path = machineTransactionRequestIntentPath(projectId, tx.transaction_id);
     try {
       await this.objects.createText(path, JSON.stringify(record));
-      return record;
+      return { ...record, created: true };
     } catch (error) {
       if (!(error instanceof ProviderConflictError)) throw error;
       const existing = await this.readIntent(projectId, tx.transaction_id);
@@ -37,7 +37,7 @@ export class TransactionRequestLedger {
         || (actor && (existing.actor?.actor_id !== actor.actor_id || existing.actor.authority !== actor.authority))) {
         throw new Error("idempotency_payload_mismatch");
       }
-      return existing;
+      return { ...existing, created: false };
     }
   }
 

@@ -22,10 +22,10 @@ const testEnv = env as unknown as Env;
 let projectNumber = 9600;
 afterEach(() => vi.restoreAllMocks());
 
-async function fixture(overrides: Record<string, unknown> = {}, realContentHash = false, faults: DropboxMockFault[] = []) {
+async function fixture(overrides: Record<string, unknown> = {}, realContentHash = false, faults: DropboxMockFault[] = [], seedWorkingDocument = false) {
   const mock = installDropboxMock({ realContentHash, faults });
   const registry = testEnv.REGISTRY_GUARD.getByName("global");
-  const environment = { ...testEnv, RULE_GOVERNANCE_TOKEN: "qualification-production-authority", RULE_ADMISSION_SIGNING_KEY: "qualification-production-signing", CF_VERSION_METADATA: { id: "production-wiring-test-version", tag: `git-${"a".repeat(40)}` }, PROJECT_OS_LAYOUT_MODE: "v2" } as Env;
+  const environment = { ...testEnv, RULE_GOVERNANCE_TOKEN: "qualification-production-authority", RULE_ADMISSION_SIGNING_KEY: "qualification-production-signing", MUTATION_CONTEXT_SIGNING_KEY: "qualification-production-signing", CF_VERSION_METADATA: { id: "production-wiring-test-version", tag: `git-${"a".repeat(40)}` }, PROJECT_OS_LAYOUT_MODE: "v2" } as Env;
   // Configure bindings only: the production constructor owns the resolver. No protected resolver replacement.
   await runInDurableObject(registry, (instance, state) => {
     Object.assign((instance as any).env, environment);
@@ -41,6 +41,16 @@ async function fixture(overrides: Record<string, unknown> = {}, realContentHash 
   expect(accepted.status).toBe("committed");
   const route = governanceTx("artifact.route.configure", { route_id: "ROUTE-QUALIFICATION01", source_prefix: "LOGICAL", target_prefix: "WORKING/attachments", exclusive: true, decision_ids: ["DEC-QUALIFICATION01"] }, 2, project);
   expect(await (await guard.fetch("https://internal/transaction", { method: "POST", body: JSON.stringify(route) })).json()).toMatchObject({ status: "committed" });
+  let seededWorking: any;
+  if (seedWorkingDocument) {
+    const { context }: any = await (await guard.fetch("https://internal/mutation-context")).json();
+    const content = "# Qualification baseline\n";
+    seededWorking = await (await guard.fetch("https://internal/document", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission({
+      operation: "working.write", request_id: "DOCREQ-QUALIFICATION-SEED01", project_id: project,
+      logical_path: "qualification/expected-version.md", content, content_sha256: await sha256Text(content), created_at: decision.created_at
+    }, context)) })).json();
+    expect(seededWorking).toMatchObject({ status: "committed", version_id: expect.stringMatching(/^VER-/) });
+  }
   environment.PROJECT_OS_ADMISSION_PROJECT_MODES = JSON.stringify({ [project]: "strict" });
   await runInDurableObject(registry, instance => Object.assign((instance as any).env, environment));
   await runInDurableObject(guard, instance => Object.assign((instance as any).env, environment));
@@ -50,7 +60,7 @@ async function fixture(overrides: Record<string, unknown> = {}, realContentHash 
   const acceptance = governanceTx("rule.accept", { rule_id: rule.rule_id, version: 1 }, 1, "GLOBAL");
   expect(await (await submit(acceptance)).json()).toMatchObject({ status: "committed" });
   const activate = (refs = [`${globalGovernancePath}#transaction=${acceptance.transaction_id}`]) => submit(governanceTx("rule.activate", { rule_id: rule.rule_id, version: 1, activation_evidence: refs }, 2, "GLOBAL"));
-  return { mock, project, guard, registry, environment, rule, activate, submit };
+  return { mock, project, guard, registry, environment, rule, activate, submit, seededWorking };
 }
 
 async function qualifyViaCommitInventory(f: Awaited<ReturnType<typeof fixture>>) {
@@ -81,6 +91,61 @@ it.each([
   expect(governance.rules["RULE-PRODUCTION01@1"].status).toBe("active");
   const projectCommit = JSON.parse(f.mock.files.get(machineCommitRecordPath(f.project, 3))!);
   expect(projectCommit.state.approvals).toEqual({});
+});
+
+it("qualifies expected_version only for the exact deployed working-write tuple", async () => {
+  const f = await fixture({
+    check_id: "expected_version", parameters: { required: true }, operations: ["working.write"],
+    resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] },
+    enforcement: "automatic", check_stage: "pre_admission"
+  }, false, [], true);
+  const directQualification = await qualifyViaCommitInventory(f);
+  expect(directQualification, JSON.stringify(directQualification)).toMatchObject({ verdict: "allow" });
+  const response = await f.activate();
+  const receipt: any = await response.json();
+  expect(response.status, JSON.stringify(receipt)).toBe(200);
+  expect(receipt).toMatchObject({ status: "committed" });
+  const governance = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+  const activation: any = governance.journal[receipt.transaction_id];
+  expect(activation.qualification.proof.evidence).toMatchObject({
+    deployed_check_id: "expected_version",
+    entry_coverage: [expect.objectContaining({ operation: "working.write", entries: ["API", "CT", "GI"] })],
+    check_evidence: { current_version: { status: "verified" } }
+  });
+  expect(activation.qualification.proof.evidence.deployment_ref).toContain("production-wiring-test-version");
+  expect(activation.qualification.proof.evidence.deployment_ref).toContain("a".repeat(40));
+  expect(activation.qualification.proof.evidence.positive_test_refs.some((ref: string) => ref.includes("#control-probe="))).toBe(true);
+  expect(activation.qualification.proof.evidence.negative_test_refs.some((ref: string) => ref.includes("#control-probe="))).toBe(true);
+  expect(governance.rules["RULE-PRODUCTION01@1"].status).toBe("active");
+  const exactContext: any = await (await f.guard.fetch("https://internal/mutation-context")).json();
+  const nextContent = "# Qualification exact write\n";
+  const exactRequest = { operation: "working.write", request_id: "DOCREQ-QUALIFICATION-EXACT01", project_id: f.project,
+    logical_path: "qualification/expected-version.md", content: nextContent, content_sha256: await sha256Text(nextContent),
+    expected_version_id: f.seededWorking.version_id, created_at: new Date().toISOString() };
+  const RealDate = Date;
+  const clockStart = RealDate.now();
+  let clockTick = 0;
+  class AdvancingDate extends RealDate {
+    constructor(value?: string | number | Date) { super(value === undefined ? clockStart + clockTick++ : value instanceof RealDate ? value.getTime() : value); }
+    static now() { return clockStart + clockTick++; }
+  }
+  vi.stubGlobal("Date", AdvancingDate);
+  let exactResponse: Response;
+  try {
+    exactResponse = await f.guard.fetch("https://internal/document", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(exactRequest, exactContext.context)) });
+  } finally {
+    vi.stubGlobal("Date", RealDate);
+  }
+  const exactBody: any = await exactResponse!.json();
+  expect(exactResponse!.status, JSON.stringify(exactBody)).toBe(200);
+  expect(exactBody).toMatchObject({ status: "committed" });
+  const staleContext: any = await (await f.guard.fetch("https://internal/mutation-context")).json();
+  const stale = await f.guard.fetch("https://internal/document", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission({ ...exactRequest,
+    request_id: "DOCREQ-QUALIFICATION-STALE01", content: "# Qualification stale write\n", content_sha256: await sha256Text("# Qualification stale write\n")
+  }, staleContext.context)) });
+  const staleBody: any = await stale.json();
+  expect(stale.status, JSON.stringify(staleBody)).toBe(409);
+  expect(staleBody).toMatchObject({ error: "STALE_DOCUMENT_VERSION" });
 });
 
 async function reviewInventoryFixture(filesPerProject: number, faults: DropboxMockFault[] = []) {
@@ -495,6 +560,9 @@ it.each([
   { change: { parameters: { allowed_zones: [] } }, code: "INVALID_CHECK_PARAMETERS" },
   { change: { check_id: "unknown" }, code: "UNKNOWN_ACTIVE_CHECK" },
   { change: { check_id: "expected_version", parameters: { required: true } }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
+  { change: { check_id: "expected_version", parameters: { required: true }, operations: ["working.write"], resource_scope: { resource_types: ["document"], zones: ["WORKING"] }, enforcement: "automatic", check_stage: "pre_admission" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
+  { change: { check_id: "expected_version", parameters: { required: true }, operations: ["review.promote"], resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] }, enforcement: "automatic", check_stage: "pre_admission" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
+  { change: { check_id: "expected_version", parameters: { required: true }, operations: ["working.write"], resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] }, enforcement: "automatic", check_stage: "post_execution" }, code: "UNSUPPORTED_CHECK_STAGE" },
   { change: { check_id: "exact_approval", parameters: {}, operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, enforcement: "explicit_approval", check_stage: "pre_admission" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
   { change: { check_id: "exact_approval", parameters: {}, operations: ["document.publish"], resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] }, enforcement: "explicit_approval", check_stage: "both" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
   { change: { operations: ["project.materialize"] }, code: "UNSUPPORTED_CHECK_OPERATION" },

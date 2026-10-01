@@ -4000,6 +4000,7 @@ export class ProjectGuard extends DurableObject<Env> {
           required_action: "Refresh the canonical document head and submit the exact reviewed version"
         };
       }
+      const observations = await this.resolveServerObservations(state, normalized);
       return evaluateRules({
       actor,
       project_id: normalized.project_id,
@@ -4010,7 +4011,7 @@ export class ProjectGuard extends DurableObject<Env> {
       state,
       global_governance,
       resources: normalized.resources,
-      observations: await this.resolveServerObservations(state, normalized),
+      observations,
       approvals: Object.values(state.approvals ?? {})
       });
     };

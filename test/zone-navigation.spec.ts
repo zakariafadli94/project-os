@@ -369,6 +369,58 @@ async function runSparseCatalogRebuildWithLegacyProgress(includeOmittedSourceId 
 }
 
 describe("zone navigation identity and resumable reconciliation", () => {
+  it.each(["publish", "verify", "post-publish"] as const)("advances two independent catalog shards in one bounded %s slice", async (phase) => {
+    const h = runtimeHarness();
+    const project = state();
+    const input = navigationReconcileSchema.parse({
+      ...request("REVIEW"), request_id: `DOCREQ-NAV-BATCH-${phase.toUpperCase()}-0001`,
+      purpose: "compact_catalog_rebuild", expected_source_generation: 0,
+      expected_catalog_manifest: { object_id: "manifest-object", revision_token: "manifest-rev", content_sha256: "a".repeat(64) }
+    }) as NavigationCatalogRebuildRequest;
+    const root = await new ExecutionJournal(h.runtime, input.project_id, "document", input.request_id).root();
+    const identity = { object_id: "unready-object", revision_token: "unready-rev", content_sha256: "c".repeat(64) };
+    const evidence = [1, 2].map((shard) => ({ shard, object_id: `chunk-${shard}`, revision_token: `chunk-rev-${shard}`, content_sha256: "b".repeat(64) }));
+    h.put(`${root}/navigation-catalog-rebuild-progress.json`, JSON.stringify({
+      schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: input.project_id, request_id: input.request_id,
+      request_hash: await executionHash(input), zone: input.zone, source_generation: 0, source_snapshot_id: "source:0",
+      cursor: null, page_count: 2, source_count: 2, source_ids: ["head:one", "head:two"],
+      shard_cursor: 2, shard_count: 2, staged_shards: [1, 2], invalidated_manifest: identity,
+      chunk_evidence: phase === "publish" ? [] : evidence,
+      publish_cursor: phase === "publish" ? 0 : 2,
+      verify_shard_cursor: phase === "post-publish" ? 2 : 0,
+      post_publish_verify_cursor: 0,
+      status: "publishing", finalization_ref: null, coverage_gaps: []
+    }));
+    const manifestPath = `${machineDocumentRoot(input.project_id)}/navigation-sources/REVIEW/catalog/compact/ready.json`;
+    const admission = { ...(await admissionFor(input)), resource_effect_scopes: [{
+      resource_id: "navigation:REVIEW", resource_version: "0", provider_id: "test-provider",
+      sources: [{ path: manifestPath, logical_path: manifestPath }], destinations: [{ path: manifestPath, logical_path: manifestPath }], preservation_copies: []
+    }] } as ExecutionAdmission;
+    const seen: number[] = [];
+    const charge = (slice: SliceBudget | undefined) => { for (let index = 0; index < 9; index += 1) slice!.beforeHttp(); };
+    const publish = vi.spyOn(ZoneNavigationSources.prototype, "publishCompactCatalogRebuildShard").mockImplementation(async (call, slice) => {
+      seen.push(call.shard); charge(slice); return evidence.find((item) => item.shard === call.shard)!;
+    });
+    const verify = vi.spyOn(ZoneNavigationSources.prototype, "verifyCompactCatalogRebuildShard").mockImplementation(async (call, slice) => {
+      seen.push(call.shard); charge(slice);
+    });
+    const manifest = vi.spyOn(ZoneNavigationSources.prototype, "publishCompactCatalogRebuildManifest").mockImplementation(async (call) => ({
+      ready_generation: 0, shards: call.shards, identity, chunk_evidence: call.chunk_evidence
+    }));
+    const post = vi.spyOn(ZoneNavigationSources.prototype, "verifyPublishedCompactCatalogRebuildShard").mockImplementation(async (call, slice) => {
+      seen.push(call.shard); charge(slice);
+    });
+    const release = vi.spyOn(ZoneNavigationSources.prototype, "releaseCompactCatalogRebuildFence").mockResolvedValue(true);
+    try {
+      await new ZoneNavigationEngine(h.runtime, { listPage: async () => { throw new Error("unused"); }, verifyEntry: async () => true, verifySnapshot: async () => true })
+        .publishPreparedCompactCatalogRebuild(input, project, admission, "source:0", budget(32));
+      const progress = JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content);
+      expect(seen).toEqual([1, 2]);
+      expect(progress[phase === "publish" ? "publish_cursor" : phase === "verify" ? "verify_shard_cursor" : "post_publish_verify_cursor"]).toBe(2);
+    } finally {
+      publish.mockRestore(); verify.mockRestore(); manifest.mockRestore(); post.mockRestore(); release.mockRestore();
+    }
+  });
   it("verifies independent catalog rebuild pages concurrently before advancing their cursor", async () => {
     const h = runtimeHarness();
     const project = state();

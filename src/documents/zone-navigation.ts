@@ -481,6 +481,22 @@ export class ZoneNavigationEngine {
         progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
       }
       while (progress.verify_shard_cursor < shards.length) {
+        // Two shards have independent, read-only physical proofs. Verify them
+        // together, then checkpoint the pair; an interrupted pair is safe to
+        // reread because neither verification publishes an effect.
+        if (progress.verify_shard_cursor + 1 < shards.length && budget.canStartEffect(18)) {
+          const pair = shards.slice(progress.verify_shard_cursor, progress.verify_shard_cursor + 2);
+          const evidence = pair.map((shard) => progress.chunk_evidence.find((item) => item.shard === shard));
+          if (evidence.some((item) => !item)) return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_chunk_evidence_missing", budget);
+          const verified = await Promise.allSettled(pair.map((shard, index) => sources.verifyCompactCatalogRebuildShard({
+            ...publication, invalidated_manifest: invalidatedManifest, shard, evidence: evidence[index]!
+          }, budget)));
+          const failed = verified.find((item) => item.status === "rejected");
+          if (failed?.status === "rejected") throw failed.reason;
+          progress.verify_shard_cursor += 2;
+          progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+          continue;
+        }
         if (!budget.canStartEffect(12)) return { status: "pending", cursor: `verify-shard:${progress.verify_shard_cursor}` };
         const shard = shards[progress.verify_shard_cursor];
         const evidence = progress.chunk_evidence.find((item) => item.shard === shard);

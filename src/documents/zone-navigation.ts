@@ -1045,8 +1045,18 @@ export class ZoneNavigationEngine {
         progress.coverage_gaps = progress.coverage_gaps.filter((gap) => gap.resource_id !== entry.resource_id);
         progress.verify_entry += 1;
         progress.verify_cursor = null;
+        // The last entry and the page transition form one durable checkpoint.
+        // Both its catalog proof and immutable evidence are already written;
+        // a crash before this save safely replays the same entry.
+        const completedPage = progress.verify_entry === page.entries.length;
+        if (completedPage) {
+          progress.verify_page += 1;
+          progress.verify_entry = 0;
+        }
         progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        if (completedPage) break;
       }
+      if (progress.verify_page > page.page) continue;
       progress.verify_page += 1;
       progress.verify_entry = 0;
       progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);

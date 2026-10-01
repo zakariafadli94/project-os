@@ -809,7 +809,7 @@ export class ProjectGuard extends DurableObject<Env> {
         }
         throw error;
       }
-      if (proof) await this.persistAdmissionProof("transaction", tx.transaction_id, proof);
+      const admitted = proof ? await this.persistAdmissionProof("transaction", tx.transaction_id, proof) : null;
 
       // A refused strict admission must not reserve an idempotency key.  Only
       // bind this intent after the verified permit and second rules evaluation.
@@ -830,11 +830,9 @@ export class ProjectGuard extends DurableObject<Env> {
       const result = applyTransaction(state, tx, { localRuleActivation, approvalTransition, localGovernanceAuthority });
 
       if (result.kind === "rejected" || result.kind === "conflict") {
-        const receipt = await this.withJournalGaps(
-          tx.project_id,
-          "transaction",
-          tx.transaction_id,
-          this.terminalReceipt(tx, result.kind, result.code, result.message, state?.revision ?? 0)
+        const receipt = this.receiptWithAdmissionGaps(
+          this.terminalReceipt(tx, result.kind, result.code, result.message, state?.revision ?? 0),
+          admitted?.gaps ?? []
         );
         await this.repository.writeTerminalTransaction(tx, receipt);
         this.persistReceipt(receipt);
@@ -844,7 +842,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
 
       const previousRevision = state?.revision ?? 0;
-      const receipt: CanonicalCommitRecord["receipt"] = await this.withJournalGaps(tx.project_id, "transaction", tx.transaction_id, {
+      const receipt: CanonicalCommitRecord["receipt"] = this.receiptWithAdmissionGaps({
         schema_version: "1.0",
         transaction_id: tx.transaction_id,
         status: "committed",
@@ -853,7 +851,7 @@ export class ProjectGuard extends DurableObject<Env> {
         new_revision: result.state.revision,
         event_id: result.event.event_id,
         committed_at: tx.created_at
-      });
+      }, admitted?.gaps ?? []);
       if (this.layoutMode === "v2") {
         const record: CanonicalCommitRecord = {
           schema_version: "1.0",
@@ -4087,22 +4085,25 @@ export class ProjectGuard extends DurableObject<Env> {
     return observations;
   }
 
-  protected async persistAdmissionProof(kind: string, requestId: string, proof: AdmissionProof): Promise<void> {
+  protected async persistAdmissionProof(kind: string, requestId: string, proof: AdmissionProof): Promise<ExecutionAdmission> {
     const admission: ExecutionAdmission = { ...proof, kind, request_id: requestId };
     if (kind === "transaction") await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
     // The canonical journal is authority. SQL is only a cache; awaiting this
     // boundary is mandatory before every admitted family starts an effect.
+    let admitted: ExecutionAdmission;
     try {
-      await new ExecutionJournal(this.persistence, proof.project_id, kind, requestId).commit(admission, await this.executionPlanResolver(admission));
+      admitted = await new ExecutionJournal(this.persistence, proof.project_id, kind, requestId).commit(admission, await this.executionPlanResolver(admission));
     } catch (error) {
       if (error instanceof Error && (error.message.startsWith("execution_") || error.message === "repair_diagnosed_drift_required")) throw error;
       throw new Error("execution_evidence_unavailable");
     }
+    const { kind: _kind, request_id: _requestId, ...persistedProof } = admitted;
     this.ctx.storage.sql.exec(
       `INSERT INTO admission_proofs (kind, request_id, proof_json) VALUES (?, ?, ?)
        ON CONFLICT(kind, request_id) DO UPDATE SET proof_json = excluded.proof_json`,
-      kind, requestId, JSON.stringify(proof)
+      kind, requestId, JSON.stringify(persistedProof)
     );
+    return admitted;
   }
 
   private async readGlobalGovernance(): Promise<GlobalGovernanceState> {

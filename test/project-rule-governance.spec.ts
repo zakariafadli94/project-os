@@ -232,7 +232,7 @@ it("persists an accepted-unenforced rule gap at ProjectGuard while an independen
   expect(receiptResponse.status).toBe(200);
   const durableReceipt = await receiptResponse.json<Record<string, unknown>>();
   expect(durableReceipt).toMatchObject({ request_id: requestId, project_id: projectId, status: "committed", logical_path: logicalPath });
-  expect(durableReceipt).not.toHaveProperty("gaps");
+  expect(durableReceipt).toMatchObject({ gaps: stored?.admission.gaps });
 });
 
 it("applies only a live canonical exact exception at the ProjectGuard document boundary", async () => {

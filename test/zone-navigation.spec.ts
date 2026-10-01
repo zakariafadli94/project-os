@@ -421,6 +421,9 @@ describe("zone navigation identity and resumable reconciliation", () => {
     const post = vi.spyOn(ZoneNavigationSources.prototype, "verifyPublishedCompactCatalogRebuildShard").mockImplementation(async (call, slice) => {
       seen.push(call.shard); charge(slice);
     });
+    const identityRead = phase === "post-publish"
+      ? vi.spyOn(ZoneNavigationSources.prototype, "compactCatalogManifestIdentity").mockResolvedValue(identity)
+      : null;
     const release = vi.spyOn(ZoneNavigationSources.prototype, "releaseCompactCatalogRebuildFence").mockResolvedValue(true);
     try {
       const engine = new ZoneNavigationEngine(h.runtime, { listPage: async () => { throw new Error("unused"); }, verifyEntry: async () => true, verifySnapshot: async () => true });
@@ -430,13 +433,24 @@ describe("zone navigation identity and resumable reconciliation", () => {
         seen.length = 0;
         peakVerifications = 0;
       }
-      await engine.publishPreparedCompactCatalogRebuild(input, project, admission, "source:0", budget(32));
+      if (phase === "post-publish") {
+        expect((await engine.publishPreparedCompactCatalogRebuild(input, project, admission, "source:0", budget(13))).status).toBe("pending");
+        expect(JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content).published_manifest).toEqual(identity);
+      }
+      let result = await engine.publishPreparedCompactCatalogRebuild(input, project, admission, "source:0", budget(32));
+      if (phase === "post-publish" && result.status === "pending") {
+        result = await engine.publishPreparedCompactCatalogRebuild(input, project, admission, "source:0", budget(32));
+      }
       const progress = JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content);
       expect(seen).toEqual([1, 2]);
       expect(progress[phase === "publish" ? "publish_cursor" : phase === "verify" ? "verify_shard_cursor" : "post_publish_verify_cursor"]).toBe(2);
       if (phase === "verify") expect(peakVerifications).toBe(2);
+      if (phase === "post-publish") {
+        expect(manifest).toHaveBeenCalledTimes(1);
+        expect(result.status).toBe("finalized");
+      }
     } finally {
-      publish.mockRestore(); verify.mockRestore(); manifest.mockRestore(); post.mockRestore(); release.mockRestore();
+      publish.mockRestore(); verify.mockRestore(); manifest.mockRestore(); post.mockRestore(); identityRead?.mockRestore(); release.mockRestore();
     }
   });
   it("verifies independent catalog rebuild pages concurrently before advancing their cursor", async () => {

@@ -119,6 +119,7 @@ export const navigationCatalogRebuildProgressSchema = z.strictObject({
   staging_index_complete: z.boolean().default(false),
   staged_shards: z.array(z.number().int().nonnegative().max(63)).max(64).default([]),
   invalidated_manifest: navigationCatalogManifestIdentitySchema.nullable().default(null),
+  published_manifest: navigationCatalogManifestIdentitySchema.nullable().default(null),
   chunk_evidence: z.array(navigationCatalogChunkEvidenceSchema).max(64).default([]),
   status: z.enum(["scanning", "verifying", "staging", "prepared", "publishing", "finalized", "conflict"]),
   finalization_ref: z.string().min(1).nullable(),

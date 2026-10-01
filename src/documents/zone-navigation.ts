@@ -440,6 +440,7 @@ export class ZoneNavigationEngine {
         progress.publish_cursor = 0;
         progress.verify_shard_cursor = 0;
         progress.post_publish_verify_cursor = 0;
+        progress.published_manifest = null;
         progress.chunk_evidence = [];
         progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
         return { status: "pending", cursor: "publish:0" };
@@ -466,6 +467,7 @@ export class ZoneNavigationEngine {
           progress.publish_cursor = 0;
           progress.verify_shard_cursor = 0;
           progress.post_publish_verify_cursor = 0;
+          progress.published_manifest = null;
           progress.chunk_evidence = [];
           progress.post_publish_failure_count += 1;
           progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
@@ -508,7 +510,16 @@ export class ZoneNavigationEngine {
       if (progress.chunk_evidence.length !== shards.length || progress.coverage_gaps.length) {
         return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_chunk_evidence_incomplete", budget);
       }
-      const published = await sources.publishCompactCatalogRebuildManifest({ ...publication, invalidated_manifest: invalidatedManifest, chunk_evidence: progress.chunk_evidence }, budget);
+      // Persist the identity immediately after manifest CAS. A later slice
+      // must not spend its entire budget re-running the publication checks
+      // before it can verify any shard under the published manifest.
+      if (!progress.published_manifest) {
+        const published = await sources.publishCompactCatalogRebuildManifest({ ...publication, invalidated_manifest: invalidatedManifest, chunk_evidence: progress.chunk_evidence }, budget);
+        progress.published_manifest = published.identity;
+        progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+      }
+      const publishedManifest = progress.published_manifest;
+      if (!publishedManifest) return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_manifest_postcheck_failed", budget);
       while (progress.post_publish_verify_cursor < shards.length) {
         if (!budget.canStartEffect(14)) return { status: "pending", cursor: `post-publish-verify:${progress.post_publish_verify_cursor}` };
         const shard = shards[progress.post_publish_verify_cursor];
@@ -520,13 +531,14 @@ export class ZoneNavigationEngine {
           if (isBudgetExhausted(error)) throw error;
           const withdrawn = await sources.invalidateFailedPublishedCompactCatalogRebuild({
             project_id: request.project_id, zone: request.zone, request_id: request.request_id,
-            expected_final_manifest: published.identity
+            expected_final_manifest: publishedManifest
           }, budget);
           if (withdrawn.status === "pending") return { status: "pending", cursor: "withdraw-published-manifest" };
           progress.invalidated_manifest = withdrawn.identity;
           progress.publish_cursor = 0;
           progress.verify_shard_cursor = 0;
           progress.post_publish_verify_cursor = 0;
+          progress.published_manifest = null;
           progress.chunk_evidence = [];
           progress.post_publish_failure_count += 1;
           progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
@@ -544,12 +556,16 @@ export class ZoneNavigationEngine {
         progress.post_publish_verify_cursor += 1;
         progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
       }
+      const finalManifest = await sources.compactCatalogManifestIdentity(request.project_id, request.zone, budget);
+      if (!finalManifest || canonicalJson(finalManifest) !== canonicalJson(publishedManifest)) {
+        return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_manifest_postcheck_failed", budget);
+      }
       const certificate = navigationCatalogRebuildCertificateSchema.parse({
         schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: request.project_id,
         request_id: request.request_id, request_hash: requestHash, zone: request.zone,
         source_generation: request.expected_source_generation, source_snapshot_id: snapshotId,
         source_count: progress.source_count, shards, expected_manifest: request.expected_catalog_manifest,
-        published_manifest: published.identity, chunk_evidence: published.chunk_evidence, coverage_gaps: []
+        published_manifest: finalManifest, chunk_evidence: progress.chunk_evidence, coverage_gaps: []
       });
       await this.immutable(certificatePath, certificate, budget);
       progress.status = "finalized";

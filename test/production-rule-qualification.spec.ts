@@ -93,6 +93,37 @@ it.each([
   expect(projectCommit.state.approvals).toEqual({});
 });
 
+it("qualifies verified_presence from the build-bound post-execution plan and provider readers", async () => {
+  const f = await fixture({
+    check_id: "verified_presence", parameters: {}, operations: ["package.replace"],
+    resource_scope: { resource_types: ["package"], zones: ["WORKING"] },
+    enforcement: "automatic", check_stage: "post_execution"
+  });
+  const response = await f.activate();
+  const receipt: any = await response.json();
+  expect(response.status, JSON.stringify(receipt)).toBe(200);
+  const governance = JSON.parse(f.mock.files.get(globalGovernancePath)!);
+  const activation: any = governance.journal[receipt.transaction_id];
+  expect(activation.qualification.proof.evidence).toMatchObject({
+    deployed_check_id: "verified_presence",
+    check_evidence: {
+      expected_object_version: { status: "verified", evidence_ref: "src/execution/effects.ts#inspectStepObservation",
+        verification_ref: "test/document-package-replacement.spec.ts#canonical-exact-deferred-RuleVersion-resolves-to-verified-package-postchecks" },
+      verified_provider_metadata: { status: "verified", evidence_ref: "src/documents/package-replacement.ts#DocumentPackageReplacement.observe",
+        verification_ref: "test/document-package-replacement.spec.ts#canonical-exact-deferred-RuleVersion-denies-when-a-visible-member-vanishes-after-effects" }
+    },
+    entry_coverage: [expect.objectContaining({ operation: "package.replace", entries: ["API", "CT", "GI"] })],
+    server_control: expect.objectContaining({
+      check_id: "verified_presence", operation: "package.replace", zone: "WORKING", stage: "post_execution",
+      deployment_ref: expect.stringContaining("production-wiring-test-version")
+    })
+  });
+  const control = activation.qualification.proof.evidence.server_control;
+  expect(activation.qualification.proof.evidence.positive_test_refs).toContain(control.allow_probe_ref);
+  expect(activation.qualification.proof.evidence.negative_test_refs).toContain(control.deny_probe_ref);
+  expect(governance.rules["RULE-PRODUCTION01@1"].status).toBe("active");
+});
+
 it("qualifies expected_version only for the exact deployed working-write tuple", async () => {
   const f = await fixture({
     check_id: "expected_version", parameters: { required: true }, operations: ["working.write"],
@@ -560,6 +591,9 @@ it.each([
   { change: { parameters: { allowed_zones: [] } }, code: "INVALID_CHECK_PARAMETERS" },
   { change: { check_id: "unknown" }, code: "UNKNOWN_ACTIVE_CHECK" },
   { change: { check_id: "expected_version", parameters: { required: true } }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
+  { change: { check_id: "verified_presence", parameters: {}, operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["REVIEW"] }, enforcement: "automatic", check_stage: "post_execution" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
+  { change: { check_id: "verified_presence", parameters: {}, operations: ["artifact.write"], resource_scope: { resource_types: ["artifact"], zones: ["WORKING"] }, enforcement: "automatic", check_stage: "post_execution" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
+  { change: { check_id: "verified_presence", parameters: {}, operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, enforcement: "automatic", check_stage: "both" }, code: "UNSUPPORTED_CHECK_STAGE" },
   { change: { check_id: "expected_version", parameters: { required: true }, operations: ["working.write"], resource_scope: { resource_types: ["document"], zones: ["WORKING"] }, enforcement: "automatic", check_stage: "pre_admission" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
   { change: { check_id: "expected_version", parameters: { required: true }, operations: ["review.promote"], resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] }, enforcement: "automatic", check_stage: "pre_admission" }, code: "QUALIFICATION_COVERAGE_UNAVAILABLE" },
   { change: { check_id: "expected_version", parameters: { required: true }, operations: ["working.write"], resource_scope: { resource_types: ["document"], zones: ["DOCUMENTS"] }, enforcement: "automatic", check_stage: "post_execution" }, code: "UNSUPPORTED_CHECK_STAGE" },

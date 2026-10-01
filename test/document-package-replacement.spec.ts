@@ -292,6 +292,24 @@ describe("package replacement through frozen L4 effects", () => {
     expect(result.status).toBe("finalized");
     expect(result.postchecks).toContainEqual({ check_id: `rule:${canonicalJson(ref)}`, verdict: "allow", evidence_refs: expect.arrayContaining([expect.stringContaining("/observations/")]) });
   });
+  it("canonical exact deferred RuleVersion denies when a visible member vanishes after effects", async () => {
+    const f = await fixture();
+    const rule: any = ruleFixture(f.state.project_id, { operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, check_id: "verified_presence", parameters: {}, check_stage: "post_execution", status: "active", activation_evidence: ["server:qualified"] });
+    const proof: any = await f.admission(f.request);
+    const ref = { rule_id: rule.rule_id, version: rule.version, scope: rule.scope };
+    proof.deferred_rules = [ref]; proof.ruleset.rules = [ref];
+    const create = f.runtime.objects.createText;
+    f.runtime.objects.createText = async (path, content) => {
+      await create(path, content);
+      if (path.endsWith("/HANDOFF.md")) {
+        f.files.delete(`/PROJECT_OS/WORKSPACE/PROJECTS/PRJ-9300-packages/WORKING/PACKAGES/${f.request.candidate.package_id}/1/a.md`);
+      }
+    };
+    const result = await f.service.replacePackage(f.request, f.state, proof, { postcheckRules: [rule] });
+    expect(result).toMatchObject({ status: "conflict", terminal: true, code: "EXECUTION_POSTCHECK_DENIED" });
+    expect(result.postchecks).toContainEqual({ check_id: `rule:${canonicalJson(ref)}`, verdict: "deny", evidence_refs: [] });
+    expect(result.finalization_ref).toBeNull();
+  });
   it("never lets a physical package check stand in for explicit human approval", async () => {
     const f = await fixture();
     const rule: any = ruleFixture(f.state.project_id, { operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, check_id: "verified_archive", parameters: {}, check_stage: "post_execution", enforcement: "explicit_approval", status: "active", activation_evidence: ["server:qualified"] });

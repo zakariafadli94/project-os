@@ -621,6 +621,64 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(harness.files.has(`${seeded.root}/navigation/generated-index.md`)).toBe(false);
   });
 
+  it("checkpoints a verified singleton page only once when advancing to the next page", async () => {
+    const h = runtimeHarness();
+    const project = state();
+    const input = request();
+    const inv = await inventoryHarness(project);
+    seedTarget(h, inv);
+    const seeded = await seedAdoptingProgress(h, input, 1, "next", inv.entry);
+    const progressPath = `${seeded.root}/navigation-progress.json`;
+    const progress = JSON.parse(h.files.get(progressPath)!.content);
+    progress.inventory_complete = true;
+    progress.cursor = null;
+    h.put(progressPath, JSON.stringify(progress));
+    const pagePath = `${seeded.root}/navigation/snapshot/00000000.json`;
+    const page = JSON.parse(h.files.get(pagePath)!.content);
+    page.verified_entries = [{ resource_id: inv.entry.resource_id, entry_hash: await executionHash(inv.entry), persisted: true }];
+    h.put(pagePath, JSON.stringify(page));
+    const port: NavigationInventoryPort = { ...inv.port, verificationIncludesPhysicalIntegrity: true };
+    let progressWrites = 0;
+    const originalWrite = h.runtime.conditionalWrite.writeTextConditional.bind(h.runtime.conditionalWrite);
+    h.runtime.conditionalWrite.writeTextConditional = async (path, content, token) => {
+      if (path === progressPath && JSON.parse(content).status === "adopting") progressWrites += 1;
+      return originalWrite(path, content, token);
+    };
+    await new ZoneNavigationEngine(h.runtime, port).reconcile(input, project, await admissionFor(input), budget(20));
+    const saved = JSON.parse(h.files.get(progressPath)!.content);
+    expect(saved).toMatchObject({ verify_page: 1, verify_entry: 0 });
+    expect(progressWrites).toBe(1);
+  });
+
+  it("verifies two proven singleton pages within a realistic compact-catalog slice", async () => {
+    const h = runtimeHarness();
+    const project = state();
+    const input = request();
+    const inv = await inventoryHarness(project);
+    const second = { ...inv.entry, resource_id: "head:DOC-222222222222222222222222" };
+    const seeded = await seedAdoptingProgress(h, input, 2, "next", inv.entry);
+    const progressPath = `${seeded.root}/navigation-progress.json`;
+    const progress = JSON.parse(h.files.get(progressPath)!.content);
+    progress.inventory_complete = true;
+    progress.cursor = null;
+    progress.source_count = 2;
+    progress.source_ids = [inv.entry.resource_id, second.resource_id];
+    h.put(progressPath, JSON.stringify(progress));
+    for (const [index, entry] of [inv.entry, second].entries()) {
+      const pagePath = `${seeded.root}/navigation/snapshot/${index.toString().padStart(8, "0")}.json`;
+      const page = JSON.parse(h.files.get(pagePath)!.content);
+      page.entries = [entry];
+      page.verified_entries = [{ resource_id: entry.resource_id, entry_hash: await executionHash(entry), persisted: false }];
+      h.put(pagePath, JSON.stringify(page));
+    }
+    const port: NavigationInventoryPort = { ...inv.port, verificationIncludesPhysicalIntegrity: true };
+    port.recordVerifiedEntry = async (_entry, _snapshot, slice) => {
+      for (let call = 0; call < 8; call++) slice.beforeHttp();
+    };
+    await new ZoneNavigationEngine(h.runtime, port).reconcile(input, project, await admissionFor(input), budget(28));
+    expect(JSON.parse(h.files.get(progressPath)!.content)).toMatchObject({ verify_page: 2, verify_entry: 0 });
+  });
+
   it("advances a persisted legacy artifact cursor across several provider entries in one engine slice", async () => {
     const harness = runtimeHarness();
     const project = state();

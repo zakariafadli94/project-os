@@ -445,6 +445,7 @@ export class ZoneNavigationEngine {
         return { status: "pending", cursor: "publish:0" };
       }
       if (!progress.invalidated_manifest) return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_manifest_invalidation_missing", budget);
+      const invalidatedManifest = progress.invalidated_manifest;
       if (progress.post_publish_failure_count >= 6) {
         const abandoned = await sources.abandonFailedCompactCatalogRebuild({
           project_id: request.project_id, zone: request.zone, request_id: request.request_id,
@@ -471,36 +472,34 @@ export class ZoneNavigationEngine {
           return { status: "pending", cursor: "republish:0" };
         }
       }
-      if (progress.publish_cursor < shards.length) {
+      while (progress.publish_cursor < shards.length) {
         if (!budget.canStartEffect(14)) return { status: "pending", cursor: `publish:${progress.publish_cursor}` };
         const shard = shards[progress.publish_cursor];
-        const evidence = await sources.publishCompactCatalogRebuildShard({ ...publication, invalidated_manifest: progress.invalidated_manifest, shard }, budget);
+        const evidence = await sources.publishCompactCatalogRebuildShard({ ...publication, invalidated_manifest: invalidatedManifest, shard }, budget);
         progress.chunk_evidence = [...progress.chunk_evidence.filter((item) => item.shard !== shard), evidence].sort((a, b) => a.shard - b.shard);
         progress.publish_cursor += 1;
         progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
-        return { status: "pending", cursor: `publish:${progress.publish_cursor}` };
       }
-      if (progress.verify_shard_cursor < shards.length) {
+      while (progress.verify_shard_cursor < shards.length) {
         if (!budget.canStartEffect(12)) return { status: "pending", cursor: `verify-shard:${progress.verify_shard_cursor}` };
         const shard = shards[progress.verify_shard_cursor];
         const evidence = progress.chunk_evidence.find((item) => item.shard === shard);
         if (!evidence) return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_chunk_evidence_missing", budget);
-        await sources.verifyCompactCatalogRebuildShard({ ...publication, invalidated_manifest: progress.invalidated_manifest, shard, evidence }, budget);
+        await sources.verifyCompactCatalogRebuildShard({ ...publication, invalidated_manifest: invalidatedManifest, shard, evidence }, budget);
         progress.verify_shard_cursor += 1;
         progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
-        return { status: "pending", cursor: `verify-shard:${progress.verify_shard_cursor}` };
       }
       if (progress.chunk_evidence.length !== shards.length || progress.coverage_gaps.length) {
         return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_chunk_evidence_incomplete", budget);
       }
-      const published = await sources.publishCompactCatalogRebuildManifest({ ...publication, invalidated_manifest: progress.invalidated_manifest, chunk_evidence: progress.chunk_evidence }, budget);
-      if (progress.post_publish_verify_cursor < shards.length) {
+      const published = await sources.publishCompactCatalogRebuildManifest({ ...publication, invalidated_manifest: invalidatedManifest, chunk_evidence: progress.chunk_evidence }, budget);
+      while (progress.post_publish_verify_cursor < shards.length) {
         if (!budget.canStartEffect(14)) return { status: "pending", cursor: `post-publish-verify:${progress.post_publish_verify_cursor}` };
         const shard = shards[progress.post_publish_verify_cursor];
         const evidence = progress.chunk_evidence.find((item) => item.shard === shard);
         if (!evidence) return await this.catalogRebuildConflict(progressPath, progress, "navigation_catalog_rebuild_chunk_evidence_missing", budget);
         try {
-          await sources.verifyPublishedCompactCatalogRebuildShard({ ...publication, invalidated_manifest: progress.invalidated_manifest, shard, evidence }, budget);
+          await sources.verifyPublishedCompactCatalogRebuildShard({ ...publication, invalidated_manifest: invalidatedManifest, shard, evidence }, budget);
         } catch (error) {
           if (isBudgetExhausted(error)) throw error;
           const withdrawn = await sources.invalidateFailedPublishedCompactCatalogRebuild({
@@ -528,7 +527,6 @@ export class ZoneNavigationEngine {
         }
         progress.post_publish_verify_cursor += 1;
         progress = await this.saveCatalogRebuildProgress(progressPath, progress, await this.token(progressPath, budget), budget);
-        return { status: "pending", cursor: `post-publish-verify:${progress.post_publish_verify_cursor}` };
       }
       const certificate = navigationCatalogRebuildCertificateSchema.parse({
         schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: request.project_id,

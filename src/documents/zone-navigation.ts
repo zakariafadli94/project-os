@@ -982,7 +982,36 @@ export class ZoneNavigationEngine {
     while (progress.verify_page < progress.page_count) {
       const pagePath = `${pagesRoot}/${progress.verify_page.toString().padStart(8, "0")}.json`;
       const page = await this.readJson(pagePath, budget) as SnapshotPage | null;
-      if (!page || page.snapshot_id !== progress.snapshot_id) return { status: "conflict", code: "navigation_snapshot_page_invalid" };
+      if (!page || page.schema_version !== "1.0" || page.page !== progress.verify_page || page.project_id !== request.project_id ||
+          page.request_id !== request.request_id || page.snapshot_id !== progress.snapshot_id ||
+          !Array.isArray(page.entries) || !Array.isArray(page.gaps)) return { status: "conflict", code: "navigation_snapshot_page_invalid" };
+      if (progress.verify_entry === 0 && page.entries.length === 0 && page.gaps.length === 0) {
+        // Empty inventory pages have no resource effect. Read a bounded prefix
+        // concurrently and checkpoint it once; an interrupted batch can be
+        // reread without losing evidence or skipping a populated page.
+        const remaining = progress.page_count - progress.verify_page - 1;
+        const lookahead = Math.min(15, remaining, Math.max(0, budget.calls_left - 3));
+        let emptyCount = 1;
+        if (lookahead > 0) {
+          const candidates = await Promise.allSettled(Array.from({ length: lookahead }, (_, offset) =>
+            this.readJson(`${pagesRoot}/${(progress.verify_page + offset + 1).toString().padStart(8, "0")}.json`, budget)
+          ));
+          for (let offset = 0; offset < candidates.length; offset += 1) {
+            const result = candidates[offset];
+            if (result.status === "rejected") throw result.reason;
+            const candidate = result.value as SnapshotPage | null;
+            if (!candidate || candidate.schema_version !== "1.0" || candidate.page !== progress.verify_page + offset + 1 ||
+                candidate.project_id !== request.project_id || candidate.request_id !== request.request_id ||
+                candidate.snapshot_id !== progress.snapshot_id || !Array.isArray(candidate.entries) ||
+                !Array.isArray(candidate.gaps)) return { status: "conflict", code: "navigation_snapshot_page_invalid" };
+            if (candidate.entries.length || candidate.gaps.length) break;
+            emptyCount += 1;
+          }
+        }
+        progress.verify_page += emptyCount;
+        progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        continue;
+      }
       while (progress.verify_entry < page.entries.length) {
         if (!budget.canStartEffect(9)) return { status: "pending", cursor: progress.cursor };
         const entry = page.entries[progress.verify_entry];

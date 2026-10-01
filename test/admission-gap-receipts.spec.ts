@@ -122,7 +122,27 @@ describe("external admission gap receipts", () => {
       body: JSON.stringify(encodeAdmission(transaction, context))
     });
 
-    expect(await response.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    const committed = await response.json<Record<string, unknown>>();
+    expect(committed).toMatchObject({ status: "committed", gaps: [gap] });
+    const legacy = { ...committed };
+    delete legacy.gaps;
+    await runInDurableObject(guard, instance => {
+      (instance as any).ctx.storage.sql.exec(
+        "UPDATE transactions SET receipt_json = ? WHERE transaction_id = ?",
+        JSON.stringify(legacy), transaction.transaction_id
+      );
+    });
+    const replay = await guard.fetch("https://project-guard.internal/transaction", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(encodeAdmission(transaction, context))
+    });
+    expect(await replay.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    const read = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await read.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    await runInDurableObject(guard, instance => { (instance as any).queueDepth = 1; });
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await status.json()).toMatchObject({ status: "committed", receipt: { gaps: [gap] } });
+    await runInDurableObject(guard, instance => { (instance as any).queueDepth = 0; });
   });
 
   it("returns the immutable admission gaps on a committed document receipt", async () => {
@@ -133,20 +153,39 @@ describe("external admission gap receipts", () => {
     const { context } = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
     const content = "# Visible admission gap";
 
+    const request = {
+      operation: "working.write" as const,
+      request_id: "DOCREQ-GAP-RECEIPT-0001",
+      project_id: created.project_id,
+      logical_path: "gap.md",
+      content,
+      content_sha256: await sha256Text(content),
+      created_at: createdAt
+    };
+    const envelope = JSON.stringify(encodeAdmission(request, context));
     const response = await guard.fetch("https://project-guard.internal/document", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(encodeAdmission({
-        operation: "working.write",
-        request_id: "DOCREQ-GAP-RECEIPT-0001",
-        project_id: created.project_id,
-        logical_path: "gap.md",
-        content,
-        content_sha256: await sha256Text(content),
-        created_at: createdAt
-      }, context))
+      body: envelope
     });
 
-    expect(await response.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    const committed = await response.json<Record<string, unknown>>();
+    expect(committed).toMatchObject({ status: "committed", gaps: [gap] });
+    const legacy = { ...committed };
+    delete legacy.gaps;
+    await runInDurableObject(guard, instance => {
+      (instance as any).ctx.storage.sql.exec(
+        "UPDATE document_requests SET receipt_json = ? WHERE request_id = ?",
+        JSON.stringify(legacy), request.request_id
+      );
+    });
+    const replay = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: envelope
+    });
+    expect(await replay.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    const read = await guard.fetch(`https://project-guard.internal/receipt?kind=document&request_id=${request.request_id}`);
+    expect(await read.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    const status = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(await status.json()).toMatchObject({ receipt: { status: "committed", gaps: [gap] } });
   });
 });

@@ -604,7 +604,12 @@ export class ProjectGuard extends DurableObject<Env> {
       if (observed) {
         const body = await observed.clone().json() as Record<string, unknown>;
         if (body.receipt && ["committed", "rejected", "conflict"].includes(String((body.receipt as Record<string, unknown>).status))) {
-          return Response.json(body.receipt);
+          return Response.json(await this.withExternalReceiptGaps(
+            projectId,
+            kind as RequestKind,
+            requestId,
+            body.receipt as Record<string, unknown>
+          ));
         }
       }
       if (this.queueDepth > 0) {
@@ -667,7 +672,11 @@ export class ProjectGuard extends DurableObject<Env> {
       const existing = this.findReceipt(tx.transaction_id);
       if (existing) {
         await this.verifyCommittedReplayPayload(tx, existing);
-        return this.replayCommittedTransactionResponse(tx, existing, prefersAsync);
+        return this.replayCommittedTransactionResponse(
+          tx,
+          await this.withJournalGaps(tx.project_id, "transaction", tx.transaction_id, existing),
+          prefersAsync
+        );
       }
 
       if (tx.project_id === AUTO_PROJECT_ID) {
@@ -690,7 +699,11 @@ export class ProjectGuard extends DurableObject<Env> {
         const reconciled = this.findReceipt(tx.transaction_id);
         if (reconciled) {
           await this.verifyCommittedReplayPayload(tx, reconciled);
-          return this.replayCommittedTransactionResponse(tx, reconciled, prefersAsync);
+          return this.replayCommittedTransactionResponse(
+            tx,
+            await this.withJournalGaps(tx.project_id, "transaction", tx.transaction_id, reconciled),
+            prefersAsync
+          );
         }
       }
 
@@ -701,7 +714,11 @@ export class ProjectGuard extends DurableObject<Env> {
         }
         await this.verifyCommittedReplayPayload(tx, canonicalReceipt);
         this.persistReceipt(canonicalReceipt);
-        return this.replayCommittedTransactionResponse(tx, canonicalReceipt, prefersAsync);
+        return this.replayCommittedTransactionResponse(
+          tx,
+          await this.withJournalGaps(tx.project_id, "transaction", tx.transaction_id, canonicalReceipt),
+          prefersAsync
+        );
       }
 
       const admissionState = reconciledState ?? await this.loadOrRecoverState();
@@ -1097,7 +1114,7 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.settleDocumentReceipt(operation, cached);
         await this.ensureDocumentCapacityReleased(operation, cached);
       }
-      return Response.json(cached);
+      return Response.json(await this.withDocumentJournalGaps(operation, cached));
     }
 
     if (this.ctx.id.name && this.ctx.id.name !== operation.project_id) {
@@ -1204,7 +1221,7 @@ export class ProjectGuard extends DurableObject<Env> {
         const receipt = JSON.parse(durable.receipt_json) as ManagedDocumentOperationReceipt;
         await this.settleDocumentReceipt(operation, receipt);
         await this.ensureDocumentCapacityReleased(operation, receipt);
-        return Response.json(receipt);
+        return Response.json(await this.withDocumentJournalGaps(operation, receipt));
       }
       try {
         return Response.json(await this.resumePackageManagedDocument(operation));
@@ -1268,7 +1285,7 @@ export class ProjectGuard extends DurableObject<Env> {
       const receipt = JSON.parse(durableReceipt.receipt_json) as ManagedDocumentOperationReceipt;
       await this.settleDocumentReceipt(operation, receipt);
       await this.ensureDocumentCapacityReleased(operation, receipt);
-      return Response.json(receipt);
+      return Response.json(await this.withDocumentJournalGaps(operation, receipt));
     }
 
     // This is written after admission and before the provider effect. It is
@@ -2091,14 +2108,59 @@ export class ProjectGuard extends DurableObject<Env> {
     projectId: string,
     kind: string,
     requestId: string,
-    receipt: T
+    receipt: T,
+    runtime: ProjectOsPersistenceRuntime = this.persistence
   ): Promise<T & { gaps?: ExecutionAdmission["gaps"] }> {
-    const admission = await new ExecutionJournal(this.persistence, projectId, kind, requestId).readAdmission();
+    const admission = await new ExecutionJournal(runtime, projectId, kind, requestId).readAdmission();
     if (!admission) return receipt;
+    return this.receiptWithAdmissionGaps(receipt, admission.admission.gaps);
+  }
+
+  private receiptWithAdmissionGaps<T extends object>(
+    receipt: T,
+    gaps: ExecutionAdmission["gaps"]
+  ): T & { gaps?: ExecutionAdmission["gaps"] } {
     const { gaps: _cachedGaps, ...canonicalReceipt } = receipt as T & { gaps?: ExecutionAdmission["gaps"] };
-    return (admission.admission.gaps.length
-      ? { ...canonicalReceipt, gaps: structuredClone(admission.admission.gaps) }
+    return (gaps.length
+      ? { ...canonicalReceipt, gaps: structuredClone(gaps) }
       : canonicalReceipt) as T & { gaps?: ExecutionAdmission["gaps"] };
+  }
+
+  private withDocumentJournalGaps<T extends object>(request: ManagedDocumentRequest, receipt: T): Promise<T & { gaps?: ExecutionAdmission["gaps"] }> {
+    return this.withJournalGaps(
+      request.project_id,
+      request.operation === "package.replace" ? "package-admission" : "document",
+      request.request_id,
+      receipt
+    );
+  }
+
+  private async withExternalReceiptGaps<T extends object>(
+    projectId: string,
+    kind: RequestKind,
+    requestId: string,
+    receipt: T,
+    requestJson?: string,
+    runtime: ProjectOsPersistenceRuntime = this.persistence
+  ): Promise<T & { gaps?: ExecutionAdmission["gaps"] }> {
+    if (!runtime?.objects) return receipt;
+    if (kind !== "document") return this.withJournalGaps(projectId, kind, requestId, receipt, runtime);
+    let journalKind: "document" | "package-admission" | null = null;
+    if (requestJson) {
+      try {
+        const request = parseManagedDocumentRequest(JSON.parse(requestJson));
+        journalKind = request.operation === "package.replace" ? "package-admission" : "document";
+      } catch {
+        // Legacy hash-only or pre-parser intents are still bound by the ledger.
+        // Resolve their family from the immutable admission paths below.
+      }
+    }
+    const kinds = journalKind ? [journalKind] : ["package-admission", "document"] as const;
+    for (const candidate of kinds) {
+      const admission = await new ExecutionJournal(runtime, projectId, candidate, requestId).readAdmission();
+      if (admission) return this.receiptWithAdmissionGaps(receipt, admission.admission.gaps);
+    }
+    return receipt;
   }
 
   private async ensureDocumentCapacityReleased(request: ManagedDocumentRequest, receipt: ManagedDocumentOperationReceipt): Promise<void> {
@@ -2965,7 +3027,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       this.persistDocumentRequest(operation, receipt);
       this.clearRequestRecovery("document", operation.request_id);
-      return receipt;
+      return this.withDocumentJournalGaps(operation, receipt);
     }
     const state = await this.loadOrRecoverState();
     if (!state || state.project_id !== operation.project_id) throw new Error("package_project_not_initialized");
@@ -4327,7 +4389,8 @@ export class ProjectGuard extends DurableObject<Env> {
   protected async handleReceiptRead(url: URL): Promise<Response> {
     const requestId = url.searchParams.get("request_id");
     const kind = url.searchParams.get("kind");
-    if (!requestId || !["transaction", "document", "artifact"].includes(kind ?? "")) {
+    const projectId = this.ctx.id.name;
+    if (!projectId || !requestId || !["transaction", "document", "artifact"].includes(kind ?? "")) {
       return Response.json({ error: "invalid_receipt_query" }, { status: 400 });
     }
     if (url.searchParams.has("project_id") && url.searchParams.get("project_id") !== this.ctx.id.name) {
@@ -4338,7 +4401,7 @@ export class ProjectGuard extends DurableObject<Env> {
       : kind === "document"
         ? this.findDocumentRequest(requestId)
         : this.findArtifact(requestId);
-    const receipt = row && typeof row === "object" && "receipt_json" in row
+    let receipt = row && typeof row === "object" && "receipt_json" in row
       ? JSON.parse(row.receipt_json)
       : row;
     const identityKey = kind === "transaction" ? "transaction_id" : "request_id";
@@ -4350,6 +4413,18 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     if (receipt && typeof receipt === "object" && receipt.project_id !== this.ctx.id.name) {
       return Response.json({ error: "receipt_not_found" }, { status: 404 });
+    }
+    if (receipt && typeof receipt === "object") {
+      const requestJson = row && typeof row === "object" && "request_json" in row
+        ? row.request_json
+        : undefined;
+      receipt = await this.withExternalReceiptGaps(
+        projectId,
+        kind as RequestKind,
+        requestId,
+        receipt,
+        requestJson
+      );
     }
     return receipt ? Response.json(receipt) : Response.json({ error: "receipt_not_found" }, { status: 404 });
   }
@@ -4884,7 +4959,7 @@ export class ProjectGuard extends DurableObject<Env> {
         if (typeof receipt.project_id !== "string") throw new Error("receipt_project_binding_missing");
         if (receipt.project_id !== projectId) return null;
         if (receipt.transaction_id !== requestId) throw new Error("receipt_identity_conflict");
-        return receipt;
+        return this.withExternalReceiptGaps(projectId, "transaction", requestId, receipt, undefined, runtime);
       }
       const admitted = await new ExecutionJournal(runtime, projectId, "transaction", requestId).readAdmission();
       if (!admitted) {
@@ -4901,7 +4976,7 @@ export class ProjectGuard extends DurableObject<Env> {
         || await sha256Canonical(record.transaction) !== admitted.admission.request_hash) {
         throw new Error("receipt_commit_binding_conflict");
       }
-      return record.receipt;
+      return this.withExternalReceiptGaps(projectId, "transaction", requestId, record.receipt, undefined, runtime);
     }
     if (kind === "document") {
       const durable = await new ManagedDocumentRequestLedger(runtime.objects).readReceipt(projectId, requestId);
@@ -4913,7 +4988,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       const receipt = JSON.parse(durable.receipt_json) as { request_id?: unknown; project_id?: unknown };
       if (receipt.request_id !== requestId || receipt.project_id !== projectId) throw new Error("receipt_identity_conflict");
-      return receipt;
+      return this.withExternalReceiptGaps(projectId, "document", requestId, receipt, durable.request_json, runtime);
     }
     const raw = await runtime.objects.readText(machineArtifactReceiptPath(requestId));
     if (raw === null) {
@@ -4930,7 +5005,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     if (receipt.project_id !== projectId) return null;
     if (receipt.request_id !== requestId) throw new Error("artifact_receipt_identity_conflict");
-    return receipt;
+    return this.withExternalReceiptGaps(projectId, "artifact", requestId, receipt, undefined, runtime);
   }
 
   private async hasValidFinalizationEvidence(
@@ -5043,9 +5118,11 @@ export class ProjectGuard extends DurableObject<Env> {
           || (execution.status === "admitted" ? execution.receipt_ref !== null
             : execution.receipt_ref !== `${machineCommitRecordPath(projectId, receipt.new_revision)}#receipt`)))) return false;
       const record = await repository.readCommitRecord(projectId, receipt.new_revision);
+      const { gaps: _projectedGaps, ...receiptIdentity } = receipt;
+      const { gaps: _canonicalGaps, ...recordIdentity } = record?.receipt ?? {};
       if (!record || record.project_id !== projectId || record.new_revision !== receipt.new_revision || record.transaction.transaction_id !== requestId
         || record.receipt.transaction_id !== requestId || record.receipt.event_id !== receipt.event_id
-        || canonicalJson(record.receipt) !== canonicalJson(receipt)) return false;
+        || canonicalJson(recordIdentity) !== canonicalJson(receiptIdentity)) return false;
       if (!execution) return true;
       const journal = new ExecutionJournal(runtime, projectId, "transaction", requestId);
       const admissionRecord = await journal.readAdmission();
@@ -5053,6 +5130,7 @@ export class ProjectGuard extends DurableObject<Env> {
       const admission = admissionRecord.admission;
       if (admission.project_id !== projectId || admission.kind !== "transaction" || admission.request_id !== requestId
         || admission.project_revision !== record.previous_revision || admission.request_hash !== execution.request_hash
+        || canonicalJson(this.receiptWithAdmissionGaps(record.receipt, admission.gaps)) !== canonicalJson(receipt)
         || execution.admission_ref !== `${await journal.root()}/admission.json`
         || await sha256Canonical(record.transaction) !== admission.request_hash) return false;
       return true;

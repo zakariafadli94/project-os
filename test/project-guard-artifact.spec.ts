@@ -105,6 +105,8 @@ describe("ProjectGuard artifact writes", () => {
         body.request_id
       );
     });
+    const legacyRead = await project.fetch(`https://project-guard.internal/receipt?kind=artifact&request_id=${body.request_id}`);
+    expect(await legacyRead.json()).toEqual(expect.objectContaining({ status: "committed", gaps: [admissionGap] }));
 
     const second = await project.fetch("https://project-guard.internal/artifact", {
       method: "POST", headers: { "content-type": "application/json" }, body: envelope

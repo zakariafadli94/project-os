@@ -728,6 +728,17 @@ describe("ProjectGuard managed documents", () => {
     expect(result).toMatchObject({ status: "committed", execution_status: "finalized", gaps: [admissionGap] });
     expect((await repository.readPackageNavigation(created.project_id)).WORKING?.packages[0].ref).toEqual(frozen.candidate);
     expect(await submit(request)).toEqual(result);
+    const legacyResult = { ...result };
+    delete legacyResult.gaps;
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE document_requests SET receipt_json = ? WHERE request_id = ?",
+        JSON.stringify(legacyResult), request.request_id
+      );
+    });
+    expect(await submit(request)).toMatchObject({ status: "committed", gaps: [admissionGap] });
+    const packageRead = await guard.fetch(`https://project-guard.internal/receipt?kind=document&request_id=${request.request_id}`);
+    await expect(packageRead.json()).resolves.toMatchObject({ status: "committed", gaps: [admissionGap] });
 
     const terminalRequest = { ...request, request_id: "DOCREQ-PACKAGE-CONFLICT-0092", expected_navigation_generation: 1 };
     await runInDurableObject(guard, (instance) => {

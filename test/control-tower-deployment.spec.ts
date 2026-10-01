@@ -35,6 +35,8 @@ describe("Control Tower deployment policy", () => {
     expect(checker).toMatch(/unauthenticated/i);
     expect(checker).toMatch(/tools\/list/);
     expect(checker).toMatch(/authorization/i);
+    expect(checker).toContain("requireLiveQualificationToken(requireLive, token)");
+    expect(checker).toContain("requireGovernedNavigationTool(discovery.tools)");
   });
 
   it("documents a route-only rollback that preserves the canonical guard and inbox", async () => {

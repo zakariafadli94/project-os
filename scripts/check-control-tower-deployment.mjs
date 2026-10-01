@@ -1,8 +1,9 @@
-import { successfulMcpResult } from "./control-tower-qualification.mjs";
+import { requireGovernedNavigationTool, requireLiveQualificationToken, successfulMcpResult } from "./control-tower-qualification.mjs";
 
 const baseUrl = (process.env.CONTROL_TOWER_URL ?? "https://project-os-control-tower.zakaria-fadli-94.workers.dev").replace(/\/$/, "");
 const token = process.env.CONTROL_TOWER_BEARER_TOKEN;
 const requireLive = process.env.CONTROL_TOWER_REQUIRE_LIVE === "true";
+requireLiveQualificationToken(requireLive, token);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -47,6 +48,7 @@ const initialized = await jsonRequest("/mcp", {
 assert(initialized.response.ok, "authenticated MCP tools/list failed");
 const discovery = successfulMcpResult(initialized.body, 2);
 assert(Array.isArray(discovery.tools) && discovery.tools.some(tool => tool.name === "project_os_get_context"), "authenticated tools/list omitted Project OS tools");
+requireGovernedNavigationTool(discovery.tools);
 
 const context = await jsonRequest("/mcp", {
   method: "POST",

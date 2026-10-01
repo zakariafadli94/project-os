@@ -517,12 +517,26 @@ describe("durable managed-document change jobs", () => {
     const first = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
     expect(first.status).toBe(200);
     expect(await first.json()).toMatchObject({ scheduled_due: true, last_scheduled_verified_at: null });
+    let intermediateCursor: string | null = null;
+    await runInDurableObject(guard, async (_instance, state) => {
+      intermediateCursor = state.storage.sql.exec<{ cursor: string | null }>(
+        "SELECT cursor FROM managed_document_change_control WHERE singleton = 1"
+      ).one().cursor;
+    });
+    expect(intermediateCursor).toBe("daily-page-1");
 
     const second = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
     expect(second.status).toBe(200);
     const result = await second.json<{ scheduled_due: boolean; last_scheduled_verified_at: string | null }>();
     expect(result.scheduled_due).toBe(true);
     expect(result.last_scheduled_verified_at).not.toBeNull();
+    let finalCursor: string | null = null;
+    await runInDurableObject(guard, async (_instance, state) => {
+      finalCursor = state.storage.sql.exec<{ cursor: string | null }>(
+        "SELECT cursor FROM managed_document_change_control WHERE singleton = 1"
+      ).one().cursor;
+    });
+    expect(finalCursor).toBe("daily-page-2");
     const third = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
     expect(await third.json()).toMatchObject({ scheduled_due: false });
   });

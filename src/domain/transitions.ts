@@ -165,6 +165,12 @@ export function applyTransaction(state: ProjectState | null, tx: Transaction, op
       if (next.status !== "active" && next.status !== "paused") {
         return rejected("INVALID_PROJECT_TRANSITION", "Only active or paused projects can be completed");
       }
+      if (Object.values(next.tasks).some((task) => task.status !== "completed")) {
+        return rejected("PROJECT_HAS_UNFINISHED_TASKS", "Complete all open tasks before completing the project");
+      }
+      if (Object.values(next.plan_phases).some((phase) => phase.status !== "completed")) {
+        return rejected("PROJECT_HAS_OPEN_PHASES", "Complete all plan phases before completing the project");
+      }
       next.status = "completed";
       return commit(next, tx);
 

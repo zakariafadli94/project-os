@@ -320,6 +320,29 @@ describe("package replacement through frozen L4 effects", () => {
     expect(result.status).not.toBe("finalized");
     expect(result.postchecks).toContainEqual({ check_id: "rule:" + canonicalJson(ref), verdict: "unavailable", evidence_refs: [] });
   });
+  it("never finalizes through a historical automatic verified-archive rule without a qualified adapter", async () => {
+    const f = await fixture();
+    const rule: any = ruleFixture(f.state.project_id, { operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, check_id: "verified_archive", parameters: {}, check_stage: "post_execution", enforcement: "automatic", status: "active", activation_evidence: ["server:historical"] });
+    const proof: any = await f.admission(f.request);
+    const ref = { rule_id: rule.rule_id, version: rule.version, scope: rule.scope };
+    proof.deferred_rules = [ref]; proof.ruleset.rules = [ref];
+    const result = await f.service.replacePackage(f.request, f.state, proof, { postcheckRules: [rule] });
+    expect(result.status).not.toBe("finalized");
+    expect(result.postchecks).toContainEqual({ check_id: "rule:" + canonicalJson(ref), verdict: "unavailable", evidence_refs: [] });
+  });
+  it.each([
+    ["valid_links", "post_execution"],
+    ["current_uniqueness", "both"]
+  ] as const)("never finalizes through a historical automatic unequipped package rule: %s", async (checkId, stage) => {
+    const f = await fixture();
+    const rule: any = ruleFixture(f.state.project_id, { operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, check_id: checkId, parameters: {}, check_stage: stage, enforcement: "automatic", status: "active", activation_evidence: ["server:historical"] });
+    const proof: any = await f.admission(f.request);
+    const ref = { rule_id: rule.rule_id, version: rule.version, scope: rule.scope };
+    proof.deferred_rules = [ref]; proof.ruleset.rules = [ref];
+    const result = await f.service.replacePackage(f.request, f.state, proof, { postcheckRules: [rule] });
+    expect(result.status).not.toBe("finalized");
+    expect(result.postchecks).toContainEqual({ check_id: "rule:" + canonicalJson(ref), verdict: "unavailable", evidence_refs: [] });
+  });
   it("canonical package projections retain their DOC/VER membership instead of becoming independent working heads", async () => {
     const f = await fixture();
     await f.service.replacePackage(f.request, f.state, await f.admission(f.request));

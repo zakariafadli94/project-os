@@ -6,6 +6,40 @@ const createControlTowerServer = (env: Parameters<typeof createScopedControlTowe
   createScopedControlTowerServer(env, { read: true, mutate: true });
 
 describe("Control Tower typed tool contracts", () => {
+  it("preserves validated admission gaps on a sanitized business refusal without leaking other fields", async () => {
+    const admissionGap = {
+      rule: { rule_id: "RULE-GAP-RECEIPT-0001", version: 1, scope: { kind: "global" } },
+      code: "ACCEPTED_UNENFORCED",
+      check_id: "expected_version"
+    };
+    const owner = { getByName: () => ({ fetch: async (url: string) => {
+      if (new URL(url).pathname === "/mutation-context") return Response.json({ context: {
+        actor: { actor_id: "control_tower", authority: "control_tower_operator" },
+        project_id: "PRJ-0007", canonical_revision: 1, state_hash: "a".repeat(64),
+        observed_at: "2026-09-29T10:00:00.000Z", expiry: "2026-09-29T10:05:00.000Z", token: "synthetic.test"
+      } });
+      return Response.json({
+        schema_version: "1.0", transaction_id: "TXN-GAP-REFUSAL-0001", project_id: "PRJ-0007",
+        status: "conflict", previous_revision: 1, new_revision: 1, code: "TASK_EXISTS",
+        gaps: [admissionGap], private_provider_body: "must-not-escape"
+      });
+    } }) } as unknown as DurableObjectNamespace;
+    const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }) as any;
+
+    const result = await server._registeredTools.project_os_submit_transaction.handler({
+      project_id: "PRJ-0007", request: {
+        schema_version: "1.0", transaction_id: "TXN-GAP-REFUSAL-0001", project_id: "PRJ-0007",
+        base_revision: 1, operation: "task.create", created_at: "2026-09-29T10:01:00.000Z",
+        payload: { task_id: "TASK-GAPREFUSAL1", title: "Expose immutable admission gap" }
+      }
+    });
+
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({ status: "conflict", code: "TASK_EXISTS", gaps: [admissionGap] });
+    expect(JSON.stringify(body)).not.toContain("must-not-escape");
+  });
+
   it("reports an unavailable rule adapter as a precise refusal, not an ambiguous submission", async () => {
     const owner = { getByName: () => ({ fetch: async (url: string) => {
       if (new URL(url).pathname === "/mutation-context") return Response.json({ context: {

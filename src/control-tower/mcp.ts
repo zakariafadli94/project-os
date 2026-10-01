@@ -377,5 +377,38 @@ function sanitizeSubmissionReceipt(payload: Record<string, unknown>): Record<str
     const value = payload[key];
     if (typeof value === "string" || typeof value === "number") result[key] = value;
   }
+  const gaps = sanitizeAdmissionGaps(payload.gaps);
+  if (gaps) result.gaps = gaps;
   return result;
+}
+
+function sanitizeAdmissionGaps(value: unknown): Record<string, unknown>[] | null {
+  if (!Array.isArray(value)) return null;
+  const gaps: Record<string, unknown>[] = [];
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+    const gap = candidate as Record<string, unknown>;
+    const rule = gap.rule;
+    if (!rule || typeof rule !== "object" || Array.isArray(rule)
+      || typeof gap.code !== "string" || !gap.code.length
+      || typeof gap.check_id !== "string" || !gap.check_id.length) return null;
+    const reference = rule as Record<string, unknown>;
+    const scope = reference.scope;
+    if (typeof reference.rule_id !== "string" || !reference.rule_id.length
+      || !Number.isSafeInteger(reference.version) || Number(reference.version) < 1
+      || !scope || typeof scope !== "object" || Array.isArray(scope)) return null;
+    const rawScope = scope as Record<string, unknown>;
+    const sanitizedScope = rawScope.kind === "global"
+      ? { kind: "global" }
+      : rawScope.kind === "project" && typeof rawScope.project_id === "string" && /^PRJ-[0-9]{4,}$/.test(rawScope.project_id)
+        ? { kind: "project", project_id: rawScope.project_id }
+        : null;
+    if (!sanitizedScope) return null;
+    gaps.push({
+      rule: { rule_id: reference.rule_id, version: reference.version, scope: sanitizedScope },
+      code: gap.code,
+      check_id: gap.check_id
+    });
+  }
+  return gaps;
 }

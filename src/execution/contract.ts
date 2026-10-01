@@ -1,6 +1,8 @@
 import type { EvaluationResult, RuleResource } from "../rules/contract";
 import type { ApprovalChange } from "../domain/approval";
 
+export type AdmissionGaps = EvaluationResult["gaps"];
+
 /** Server-created admission only. Never decode this interface from a public payload. */
 export interface ExecutionAdmission {
   project_id: string;

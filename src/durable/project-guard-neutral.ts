@@ -163,6 +163,7 @@ interface ManagedDocumentTerminalReceipt {
   code: string;
   message: string;
   document_id?: string;
+  gaps?: ExecutionAdmission["gaps"];
 }
 
 interface PackageDocumentReceipt {
@@ -810,7 +811,12 @@ export class ProjectGuard extends DurableObject<Env> {
       const result = applyTransaction(state, tx, { localRuleActivation, approvalTransition, localGovernanceAuthority });
 
       if (result.kind === "rejected" || result.kind === "conflict") {
-        const receipt = this.terminalReceipt(tx, result.kind, result.code, result.message, state?.revision ?? 0);
+        const receipt = await this.withJournalGaps(
+          tx.project_id,
+          "transaction",
+          tx.transaction_id,
+          this.terminalReceipt(tx, result.kind, result.code, result.message, state?.revision ?? 0)
+        );
         await this.repository.writeTerminalTransaction(tx, receipt);
         this.persistReceipt(receipt);
         const released = !capacityReservationRequired || await this.releaseCapacityReservation(normalized, tx.transaction_id);
@@ -819,7 +825,7 @@ export class ProjectGuard extends DurableObject<Env> {
       }
 
       const previousRevision = state?.revision ?? 0;
-      const receipt: CanonicalCommitRecord["receipt"] = {
+      const receipt: CanonicalCommitRecord["receipt"] = await this.withJournalGaps(tx.project_id, "transaction", tx.transaction_id, {
         schema_version: "1.0",
         transaction_id: tx.transaction_id,
         status: "committed",
@@ -828,7 +834,7 @@ export class ProjectGuard extends DurableObject<Env> {
         new_revision: result.state.revision,
         event_id: result.event.event_id,
         committed_at: tx.created_at
-      };
+      });
       if (this.layoutMode === "v2") {
         const record: CanonicalCommitRecord = {
           schema_version: "1.0",
@@ -2024,6 +2030,7 @@ export class ProjectGuard extends DurableObject<Env> {
     request: ManagedDocumentRequest,
     receipt: ManagedDocumentOperationReceipt
   ): Promise<Response> {
+    receipt = await this.withJournalGaps(request.project_id, "document", request.request_id, receipt);
     const requestJson = JSON.stringify(request);
     const receiptJson = JSON.stringify(receipt);
     await this.managedDocumentRequests.writeReceipt(
@@ -2048,6 +2055,18 @@ export class ProjectGuard extends DurableObject<Env> {
     await this.settleDocumentReceipt(request, receipt);
     await this.ensureDocumentCapacityReleased(request, receipt);
     return Response.json(receipt);
+  }
+
+  private async withJournalGaps<T extends object>(
+    projectId: string,
+    kind: string,
+    requestId: string,
+    receipt: T
+  ): Promise<T & { gaps?: ExecutionAdmission["gaps"] }> {
+    const admission = await new ExecutionJournal(this.persistence, projectId, kind, requestId).readAdmission();
+    return admission?.admission.gaps.length
+      ? { ...receipt, gaps: structuredClone(admission.admission.gaps) }
+      : receipt;
   }
 
   private async ensureDocumentCapacityReleased(request: ManagedDocumentRequest, receipt: ManagedDocumentOperationReceipt): Promise<void> {

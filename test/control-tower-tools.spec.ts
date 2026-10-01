@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createMcpHandler } from "agents/mcp/server";
-import { successfulMcpResult } from "../scripts/control-tower-qualification.mjs";
+import { requireGovernedNavigationTool, successfulMcpResult } from "../scripts/control-tower-qualification.mjs";
 import { createControlTowerServer as createScopedControlTowerServer } from "../src/control-tower/mcp";
 const createControlTowerServer = (env: Parameters<typeof createScopedControlTowerServer>[0]) =>
   createScopedControlTowerServer(env, { read: true, mutate: true });
@@ -92,6 +92,12 @@ describe("Control Tower typed tool contracts", () => {
     expect(wire).toContain("decision.accept");
     expect(wire).toContain("project_os_write_working_document");
     expect(wire).toContain("working.write");
+    const discovery = successfulMcpResult(wire, 1) as { tools: Array<{ name: string; inputSchema: unknown }> };
+    const documentSchema = JSON.stringify(discovery.tools.find(tool => tool.name === "project_os_write_working_document")?.inputSchema);
+    expect(documentSchema).toContain("navigation.reconcile");
+    expect(documentSchema).toContain("expected_generation");
+    expect(documentSchema).toContain("expected_index");
+    expect(() => requireGovernedNavigationTool(discovery.tools)).not.toThrow();
   });
 
   it("submits project.create through RegistryGuard without reading a non-existent PRJ-AUTO guard", async () => {

@@ -15,3 +15,31 @@ export function successfulMcpResult(payload, expectedId) {
   }
   return matches[0].result;
 }
+
+export function requireLiveQualificationToken(requireLive, token) {
+  if (requireLive && !token) throw new Error("Control Tower live qualification token is unavailable");
+}
+
+/** Require callable schema fields, not words embedded in a tool description. */
+export function requireGovernedNavigationTool(tools) {
+  const documentTool = Array.isArray(tools)
+    ? tools.find(tool => tool?.name === "project_os_write_working_document") : null;
+  let qualified = false;
+  const visit = node => {
+    if (!node || typeof node !== "object" || qualified) return;
+    const operation = node.properties?.operation;
+    const isNavigation = operation?.const === "navigation.reconcile"
+      || (Array.isArray(operation?.enum) && operation.enum.length === 1 && operation.enum[0] === "navigation.reconcile");
+    if (isNavigation && node.properties?.expected_generation && node.properties?.expected_index
+      && Array.isArray(node.required) && ["operation", "expected_generation", "expected_index"].every(field => node.required.includes(field))) {
+      qualified = true;
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object") visit(value);
+    }
+  };
+  visit(documentTool?.inputSchema?.properties?.request);
+  if (!qualified) throw new Error("authenticated tools/list omitted governed navigation.reconcile inputs");
+}

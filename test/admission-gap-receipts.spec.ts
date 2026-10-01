@@ -21,6 +21,7 @@ const gap = {
   code: "ACCEPTED_UNENFORCED",
   check_id: "expected_version"
 };
+let dropbox: ReturnType<typeof installDropboxMock>;
 
 async function createProject(transactionId: string): Promise<Receipt> {
   const response = await testEnv.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/create", {
@@ -68,7 +69,7 @@ async function installGapAdmission(projectId: string, evaluatedGap = gap): Promi
 }
 
 describe("external admission gap receipts", () => {
-  beforeEach(() => installDropboxMock());
+  beforeEach(() => { dropbox = installDropboxMock(); });
   afterEach(() => vi.restoreAllMocks());
 
   it("keeps legacy receipts without a gaps field valid", () => {
@@ -187,6 +188,21 @@ describe("external admission gap receipts", () => {
       body: JSON.stringify(encodeAdmission(transaction, context))
     });
     expect(await response.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    const admissionPath = `${await new ExecutionJournal(persistence, created.project_id, "transaction", transaction.transaction_id).root()}/admission.json`;
+    dropbox.downloadCalls.length = 0;
+    const readOnce = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await readOnce.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    const readTwice = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await readTwice.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    expect(dropbox.downloadCalls.filter(path => path === admissionPath)).toHaveLength(1);
+    await runInDurableObject(guard, async (_instance, ctx) => {
+      const key = `admission-gaps:v1:transaction:${transaction.transaction_id}`;
+      const cached = await ctx.storage.get<Record<string, unknown>>(key);
+      await ctx.storage.put(key, { ...cached, gaps: "invalid-cache-entry" });
+    });
+    const afterCorruption = await guard.fetch(`https://project-guard.internal/receipt?kind=transaction&request_id=${transaction.transaction_id}`);
+    expect(await afterCorruption.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    expect(dropbox.downloadCalls.filter(path => path === admissionPath)).toHaveLength(2);
   });
 
   it("returns the immutable admission gaps on a committed document receipt", async () => {
@@ -215,6 +231,11 @@ describe("external admission gap receipts", () => {
 
     const committed = await response.json<Record<string, unknown>>();
     expect(committed).toMatchObject({ status: "committed", gaps: [gap] });
+    const admissionPath = `${await new ExecutionJournal(createProductionPersistence(testEnv), created.project_id, "document", request.request_id).root()}/admission.json`;
+    dropbox.downloadCalls.length = 0;
+    const freshRead = await guard.fetch(`https://project-guard.internal/receipt?kind=document&request_id=${request.request_id}`);
+    expect(await freshRead.json()).toMatchObject({ status: "committed", gaps: [gap] });
+    expect(dropbox.downloadCalls).not.toContain(admissionPath);
     const legacy = { ...committed };
     delete legacy.gaps;
     await runInDurableObject(guard, instance => {

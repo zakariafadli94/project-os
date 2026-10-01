@@ -1473,6 +1473,10 @@ export class ZoneNavigationEngine {
       let work = progress.valid_links_work;
       if (work && (work.check_id !== "valid_links" || work.rule_ref !== ruleBinding || work.snapshot_id !== progress.snapshot_id
         || !sameIndexIdentity(work.index, progress.published_index))) return { verdict: "deny", evidence_refs: [] };
+      // A target proof persisted by an earlier slice is no longer a fresh
+      // physical observation. Without an atomic provider snapshot/fence, it
+      // cannot be reused to authorize finalization.
+      if (work?.target_evidence_refs.length) return { verdict: "unavailable", evidence_refs: [] };
       if (!work) {
         work = {
           check_id: "valid_links", rule_ref: ruleBinding, snapshot_id: progress.snapshot_id,
@@ -1530,7 +1534,9 @@ export class ZoneNavigationEngine {
         const targetRef = `${await new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id).root()}/observations/navigation-valid-links-target-${offset}-${await executionHash(targetEvidence)}.json`;
         const persistedTargetEvidence = await this.readText(targetRef, budget);
         if (persistedTargetEvidence !== null) {
-          if (persistedTargetEvidence !== canonicalJson(targetEvidence)) return { verdict: "deny", evidence_refs: [] };
+          // The immutable proof may have been written by an earlier slice whose
+          // progress checkpoint failed. It is not a fresh physical observation.
+          return { verdict: "unavailable", evidence_refs: [] };
         } else {
           const target = await this.verifyPhysicalEntry(entry, budget);
           if (target.object_id !== entry.expected.object_id || target.revision_token !== entry.expected.revision_token
@@ -1545,6 +1551,30 @@ export class ZoneNavigationEngine {
         progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
       }
       if (work.verified_count !== progress.source_count || work.target_evidence_refs.length !== progress.source_count) return { verdict: "deny", evidence_refs: [] };
+      for (const [offset, targetRef] of work.target_evidence_refs.entries()) {
+        const raw = await this.readText(targetRef, budget);
+        if (raw === null) return { verdict: "unavailable", evidence_refs: [] };
+        let persisted: {
+          schema_version: string; check_id: string; project_id: string; request_id: string; request_hash: string;
+          snapshot_id: string; rule: unknown; index: unknown; offset: number;
+          target: { resource_id: string; path: string; object_id: string; revision_token: string; content_sha256: string; size: number };
+        };
+        try { persisted = JSON.parse(raw); } catch { return { verdict: "deny", evidence_refs: [] }; }
+        if (canonicalJson(persisted) !== raw || persisted.schema_version !== "1.0" || persisted.check_id !== "valid_links_target"
+          || persisted.project_id !== request.project_id || persisted.request_id !== request.request_id || persisted.request_hash !== progress.request_hash
+          || persisted.snapshot_id !== progress.snapshot_id || canonicalJson(persisted.rule) !== canonicalJson(ruleRef)
+          || !sameIndexIdentity(persisted.index as NavigationIndexIdentity, progress.published_index) || persisted.offset !== offset
+          || typeof persisted.target?.path !== "string" || typeof persisted.target.object_id !== "string"
+          || typeof persisted.target.revision_token !== "string" || typeof persisted.target.content_sha256 !== "string"
+          || !Number.isSafeInteger(persisted.target.size) || persisted.target.size < 0
+          || targetRef !== `${await new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id).root()}/observations/navigation-valid-links-target-${offset}-${await executionHash(persisted)}.json`) {
+          return { verdict: "deny", evidence_refs: [] };
+        }
+        const current = await this.metadata(persisted.target.path, budget);
+        if (!current || current.objectId !== persisted.target.object_id || current.revisionToken !== persisted.target.revision_token || current.size !== persisted.target.size) {
+          return { verdict: "deny", evidence_refs: [] };
+        }
+      }
       const evidence = {
         schema_version: "1.0",
         check_id: "valid_links",

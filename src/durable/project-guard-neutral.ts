@@ -3126,10 +3126,7 @@ export class ProjectGuard extends DurableObject<Env> {
       throw new Error("package_admission_binding");
     }
     const supportedPackageChecks: Readonly<Record<string, string>> = {
-      verified_presence: "post_execution",
-      valid_links: "post_execution",
-      current_uniqueness: "both",
-      verified_archive: "post_execution"
+      verified_presence: "post_execution"
     };
     const result: RuleVersion[] = [];
     for (const reference of proof.deferred_rules) {
@@ -4018,10 +4015,7 @@ export class ProjectGuard extends DurableObject<Env> {
     const first = await evaluate(global);
     if (first.verdict !== "allow") throw new RuleAdmissionRejection(first);
     const equippedPostcheckStages: Readonly<Record<string, string>> = {
-      verified_presence: "post_execution",
-      valid_links: "post_execution",
-      current_uniqueness: "both",
-      verified_archive: "post_execution"
+      verified_presence: "post_execution"
     };
     const equippedChecksForOperation = normalized.operation === "package.replace"
       ? equippedPostcheckStages

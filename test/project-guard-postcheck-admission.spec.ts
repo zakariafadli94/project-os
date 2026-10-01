@@ -50,6 +50,13 @@ it("refuses package approval rules before requesting a permit when a physical ch
   expect(result.proof).toBeUndefined();
 });
 
+it("refuses an automatic verified-archive package rule before requesting a permit", async () => {
+  const result = await checkAdmission("verified_archive", "post_execution", "automatic");
+  expect(result.error).toMatchObject({ message: "RULE_POSTCHECK_ADAPTER_UNAVAILABLE" });
+  expect(result.permit).not.toHaveBeenCalled();
+  expect(result.proof).toBeUndefined();
+});
+
 it("rejects an artifact postcheck at ProjectGuard admission before permit or any later intent boundary", async () => {
   const result = await checkAdmission("verified_presence", "post_execution", "automatic", "artifact.write");
   expect(result.error).toMatchObject({ message: "RULE_POSTCHECK_ADAPTER_UNAVAILABLE" });
@@ -57,11 +64,15 @@ it("rejects an artifact postcheck at ProjectGuard admission before permit or any
   expect(result.proof).toBeUndefined();
 });
 
-it("admits only the exact automatic package check/stage tuples with a deferred proof", async () => {
-  const result = await checkAdmission("valid_links", "post_execution", "automatic");
-  expect(result.error).toBeUndefined();
-  expect(result.permit).toHaveBeenCalledTimes(1);
-  expect(result.proof).toMatchObject({ verdict: "allow", deferred_rules: [{ rule_id: "RULE-POSTCHECK-9861", version: 1 }] });
+it.each([
+  ["valid_links", "post_execution", "RULE_POSTCHECK_ADAPTER_UNAVAILABLE"],
+  ["current_uniqueness", "post_execution", "RULE_POSTCHECK_ADAPTER_UNAVAILABLE"],
+  ["current_uniqueness", "both", "RULE_CONTROL_UNAVAILABLE"]
+] as const)("refuses an unequipped automatic package check before requesting a permit: %s", async (checkId, stage, code) => {
+  const result = await checkAdmission(checkId, stage, "automatic");
+  expect(result.error).toMatchObject({ message: code });
+  expect(result.permit).not.toHaveBeenCalled();
+  expect(result.proof).toBeUndefined();
 });
 
 it("admits the exact automatic navigation valid-links tuple with deferred proof", async () => {

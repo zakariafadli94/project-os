@@ -1115,11 +1115,14 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(JSON.parse(progress!).postchecks).toEqual([]);
   });
 
-  it("resumes multi-slice target verification from stable evidence without rereading completed targets", async () => {
+  it.each([
+    { mutate: false },
+    { mutate: true }
+  ])("never reuses a target proof persisted by an earlier valid_links slice: mutate=$mutate", async ({ mutate }) => {
     const harness = runtimeHarness();
     const project = state();
     const input = request();
-    const contents = Array.from({ length: 7 }, (_, index) => `Target ${index}\n`);
+    const contents = ["Target 0\n"];
     const entries: NavigationInventoryEntry[] = await Promise.all(contents.map(async (content, index) => ({
       project_id: project.project_id,
       zone: "WORKING",
@@ -1174,11 +1177,12 @@ describe("zone navigation identity and resumable reconciliation", () => {
     }
     expect(interrupted).toBe(true);
     expect(result.status).toBe("pending");
+    if (mutate) harness.put(entries[0].path, "Changed after the persisted target proof\n", entries[0].expected.object_id);
     result = await reconcileUntilTerminal(engine, input, project, admission, 32);
 
-    expect(result.status, JSON.stringify({ result, postcheckMetadataReads: [...postcheckMetadataReads], postcheckByteReads: [...postcheckByteReads] })).toBe("finalized");
-    expect([...postcheckMetadataReads.values()]).toEqual(Array(7).fill(2));
-    expect([...postcheckByteReads.values()]).toEqual(Array(7).fill(1));
+    expect(result, JSON.stringify({ result, postcheckMetadataReads: [...postcheckMetadataReads], postcheckByteReads: [...postcheckByteReads] }))
+      .toMatchObject({ status: "conflict", code: "navigation_postcheck_unavailable" });
+    expect(harness.files.has(`${machineDocumentRoot(project.project_id)}/navigation/WORKING/head.json`)).toBe(false);
   });
 
   it("rejects an overlapping inventory page instead of duplicating a source", async () => {

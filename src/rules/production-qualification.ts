@@ -27,7 +27,7 @@ import { QualificationResolutionFailure, qualificationEntries, type ControlProbe
  * Coverage is intentionally limited to exact operation/resource tuples whose server normalizer and evidence
  * reader are deployed. A new allowed_destination rule needs no code change. */
 export const deployedQualificationCoverage = Object.freeze({
-  version: "artifact-admission-v4",
+  version: "artifact-admission-v5",
   checks: Object.freeze({ allowed_destination: Object.freeze({
     operations: Object.freeze(normalizedMutationOperations.filter(operation => operation === "artifact.write" && checkCatalogue.allowed_destination.operations.includes(operation))),
     entries: Object.freeze([...qualificationEntries]),
@@ -106,6 +106,29 @@ export const deployedQualificationCoverage = Object.freeze({
       AD: "src/durable/project-guard-neutral.ts#request-status",
       RP: "src/mutation-gate/classifier.ts#candidate-resolution"
     })
+  }),
+  verified_presence: Object.freeze({
+    operations: Object.freeze(["package.replace"]),
+    entries: Object.freeze(["API", "CT", "GI"]),
+    not_applicable_entries: Object.freeze(["FB", "IN", "CF", "AD", "RP"]),
+    resource_types: Object.freeze(["package"]), zones: Object.freeze(["WORKING"]),
+    enforcement: "automatic", check_stage: "post_execution", parameters: Object.freeze({}),
+    normalizer: "src/admission/operation-context.ts#normalizeDocumentAdmission",
+    boundary: "src/documents/package-replacement.ts#DocumentPackageReplacement.resume",
+    positive_route: "src/index-neutral.ts#/v1/documents;src/control-tower/mcp.ts#project_os_write_working_document;src/durable/project-guard-neutral.ts#/document",
+    negative_route: "src/fallback/contract.ts#transaction-only;src/inbox/runtime.ts#typed-transaction-or-artifact;src/index-neutral.ts#scheduled-reconcile;src/durable/project-guard-neutral.ts#request-status;src/mutation-gate/classifier.ts#candidate-resolution",
+    positive_test_ref: "test/document-package-replacement.spec.ts#canonical-exact-deferred-RuleVersion-resolves-to-verified-package-postchecks",
+    negative_test_ref: "test/document-package-replacement.spec.ts#canonical-exact-deferred-RuleVersion-denies-when-a-visible-member-vanishes-after-effects",
+    entry_evidence: Object.freeze({
+      API: "src/index-neutral.ts#/v1/documents",
+      CT: "src/control-tower/mcp.ts#project_os_write_working_document",
+      GI: "test/document-package-replacement.spec.ts#canonical-exact-deferred-RuleVersion-resolves-to-verified-package-postchecks",
+      FB: "src/fallback/contract.ts#transaction-only",
+      IN: "src/inbox/runtime.ts#typed-transaction-or-artifact",
+      CF: "src/index-neutral.ts#scheduled-reconcile",
+      AD: "src/durable/project-guard-neutral.ts#request-status",
+      RP: "src/mutation-gate/classifier.ts#candidate-resolution"
+    })
   }) })
 });
 const registrySchema = z.object({ schema_version: z.literal("1.0"), projects: z.array(z.object({ project_id: z.string().regex(/^PRJ-[0-9]{4,}$/), slug: z.string().min(1), status: z.enum(["active", "paused", "completed", "archived"]) })) });
@@ -132,7 +155,7 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
       || canonicalJson(rule.parameters) !== canonicalJson(coverage.parameters)
       || !exactList(rule.resource_scope.resource_types, coverage.resource_types)
       || !exactList(rule.resource_scope.zones, coverage.zones)
-      || ((rule.check_id === "coherent_phase" || rule.check_id === "expected_version") && !exactList(rule.operations, coverage.operations))) {
+      || ((rule.check_id === "coherent_phase" || rule.check_id === "expected_version" || rule.check_id === "verified_presence") && !exactList(rule.operations, coverage.operations))) {
       fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "No deployed coverage for this exact pre-admission check/resource tuple");
     }
     const observed = new Map<string, ProviderObjectMetadata>();
@@ -259,7 +282,7 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
     const applicable = states.filter(state => rule.scope.kind === "global" || rule.scope.project_id === state.project_id);
     if (!applicable.length || applicable.some(state => admissionModeForProject(env.PROJECT_OS_ADMISSION_PROJECT_MODES, state.project_id) !== "strict")) fail("QUALIFICATION_COVERAGE_UNAVAILABLE", "Every governed project must have strict production admission configured");
     if (!isArtifactCoverage) {
-      const control = coverage as typeof deployedQualificationCoverage.checks.coherent_phase | typeof deployedQualificationCoverage.checks.exact_approval | typeof deployedQualificationCoverage.checks.expected_version;
+      const control = coverage as typeof deployedQualificationCoverage.checks.coherent_phase | typeof deployedQualificationCoverage.checks.exact_approval | typeof deployedQualificationCoverage.checks.expected_version | typeof deployedQualificationCoverage.checks.verified_presence;
       const positive: string[] = [], negative: string[] = [];
       const currentVersionEvidence: string[] = [];
       const controlProbes: ControlProbe[] = [];
@@ -329,7 +352,12 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
 
       for (const state of applicable) {
         const stateRef = stateReferences.get(state.project_id) ?? machineCommitRecordPath(state.project_id, state.revision);
-        if (rule.check_id === "coherent_phase") {
+        if (rule.check_id === "verified_presence") {
+          for (const entry of control.entries) {
+            positive.push(`${control.positive_test_ref}#entry=${entry}`);
+            negative.push(`${control.negative_test_ref}#entry=${entry}`);
+          }
+        } else if (rule.check_id === "coherent_phase") {
           if (!state.last_event_id) fail("QUALIFICATION_INVENTORY_UNAVAILABLE", "Canonical phase state has no event provenance");
           const taskDigest = await sha256Text(canonicalJson(Object.values(state.tasks).map(task => ({ task_id: task.task_id, phase_id: task.phase_id, status: task.status })).sort((a, b) => compareCodePoints(a.task_id, b.task_id))));
           const realPhase = state.current_phase_id && state.plan_phases[state.current_phase_id] ? state.current_phase_id : `PHASE-${(await sha256Text(state.project_id)).slice(0, 24).toUpperCase()}`;
@@ -440,11 +468,22 @@ export function createProductionRuleQualificationResolver(runtime: ProjectOsPers
       const evidence: QualificationEvidence = {
         rule_id: rule.rule_id, rule_version: rule.version, rule_scope: rule.scope, evidence_refs: request.requested_evidence_refs,
         accepted_source_refs: rule.source_refs, deployed_check_id: rule.check_id, deployment_ref: build,
-        check_evidence: Object.fromEntries(checkCatalogue[rule.check_id].required_evidence.map((key, index) => [key, { status: "verified",
-          evidence_ref: key === "current_version" && currentVersionEvidence[0] ? currentVersionEvidence[0] : stateEvidence[0] ?? `${machineRegistryJsonPath()}#inventory=${snapshot}`,
-          verification_ref: index === 0 ? positive[0] : negative[0] }])),
+        check_evidence: rule.check_id === "verified_presence"
+          ? {
+              expected_object_version: { status: "verified", evidence_ref: "src/execution/effects.ts#inspectStepObservation", verification_ref: control.positive_test_ref },
+              verified_provider_metadata: { status: "verified", evidence_ref: "src/documents/package-replacement.ts#DocumentPackageReplacement.observe", verification_ref: control.negative_test_ref }
+            }
+          : Object.fromEntries(checkCatalogue[rule.check_id].required_evidence.map((key, index) => [key, { status: "verified",
+            evidence_ref: key === "current_version" && currentVersionEvidence[0] ? currentVersionEvidence[0] : stateEvidence[0] ?? `${machineRegistryJsonPath()}#inventory=${snapshot}`,
+            verification_ref: index === 0 ? positive[0] : negative[0] }])),
         entry_coverage: entryCoverage.map(row => ({ ...row, evidence_refs: [...row.evidence_refs, ...positiveRouteRefs, ...nonApplicableRouteRefs, ...negativeRouteRefs] })),
         positive_test_refs: [...new Set([...positiveRouteRefs, ...positive])], negative_test_refs: [...new Set([...negativeRouteRefs, ...negative])],
+        ...(rule.check_id === "verified_presence" ? { server_control: {
+          check_id: "verified_presence" as const, operation: "package.replace" as const, resource_type: "package" as const, zone: "WORKING" as const,
+          enforcement: "automatic" as const, stage: "post_execution" as const,
+          adapter_ref: "src/documents/package-replacement.ts#DocumentPackageReplacement.resume" as const,
+          deployment_ref: build, allow_probe_ref: control.positive_test_ref, deny_probe_ref: control.negative_test_ref
+        } } : {}),
         contradiction_scan_ref: `${globalGovernancePath}#inventory=${snapshot}`, historical_drift_ref: `${machineRegistryJsonPath()}#inventory=${snapshot}`,
         qualified_at: now, expires_at: new Date(Date.parse(now) + 60_000).toISOString()
       };

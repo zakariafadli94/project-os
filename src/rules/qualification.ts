@@ -20,6 +20,13 @@ export const qualificationEvidenceSchema = z.strictObject({
   check_evidence: z.record(text, qualifiedCheckEvidenceSchema),
   entry_coverage: z.array(z.strictObject({ operation: text, entries: z.array(z.enum(qualificationEntries)).min(1), not_applicable_entries: z.array(z.enum(qualificationEntries)).optional(), evidence_refs: refs })).min(1),
   positive_test_refs: refs, negative_test_refs: refs, contradiction_scan_ref: text, historical_drift_ref: text,
+  server_control: z.strictObject({
+    check_id: z.literal("verified_presence"), operation: z.literal("package.replace"),
+    resource_type: z.literal("package"), zone: z.literal("WORKING"),
+    enforcement: z.literal("automatic"), stage: z.literal("post_execution"),
+    adapter_ref: z.literal("src/documents/package-replacement.ts#DocumentPackageReplacement.resume"),
+    deployment_ref: text, allow_probe_ref: text, deny_probe_ref: text
+  }).optional(),
   qualified_at: z.string().datetime({ offset: true }), expires_at: z.string().datetime({ offset: true })
 });
 export type QualificationEvidence = z.infer<typeof qualificationEvidenceSchema>;
@@ -155,7 +162,20 @@ export function qualifyRuleActivation(input: QualificationRequest & { evidence: 
   }
   const conflict = findRuleConflict([...active, rule]);
   if (conflict) return conflictVerdict(conflict);
-  if (checkCatalogue[rule.check_id].adapter === "requires_server_control" && rule.enforcement === "automatic") return verdict("unavailable", "RULE_CONTROL_UNAVAILABLE", rule, "Deployed executable server control adapter", "Catalogue records requirements only", "Equip the deterministic control and qualify it before automatic activation");
+  if (checkCatalogue[rule.check_id].adapter === "requires_server_control" && rule.enforcement === "automatic") {
+    const control = proof.server_control;
+    const equipped = rule.check_id === "verified_presence"
+      && rule.operations.length === 1 && rule.operations[0] === "package.replace"
+      && rule.resource_scope.resource_types.length === 1 && rule.resource_scope.resource_types[0] === "package"
+      && rule.resource_scope.zones.length === 1 && rule.resource_scope.zones[0] === "WORKING"
+      && rule.check_stage === "post_execution"
+      && control?.check_id === rule.check_id && control.operation === rule.operations[0]
+      && control.resource_type === rule.resource_scope.resource_types[0] && control.zone === rule.resource_scope.zones[0]
+      && control.enforcement === rule.enforcement && control.stage === rule.check_stage
+      && control.deployment_ref === proof.deployment_ref
+      && proof.positive_test_refs.includes(control.allow_probe_ref) && proof.negative_test_refs.includes(control.deny_probe_ref);
+    if (!equipped) return verdict("unavailable", "RULE_CONTROL_UNAVAILABLE", rule, "Exact build-bound deployed server control adapter with allow/deny probes", "No exact server-control attestation for this tuple", "Keep accepted_unenforced until the deterministic adapter and its probes are qualified");
+  }
   return { ...verdict("allow", "RULE_QUALIFIED", rule, "Complete activation qualification", "Server proof verified for the exact rule version", "None"), evidence_refs: proof.evidence_refs };
 }
 

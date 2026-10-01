@@ -37,6 +37,24 @@ function controlProof(changes: Record<string, unknown> = {}) {
     ...changes
   });
 }
+function presenceCandidate(changes: Record<string, unknown> = {}) {
+  return candidate({ check_id: "verified_presence", operations: ["package.replace"], resource_scope: { resource_types: ["package"], zones: ["WORKING"] }, parameters: {}, enforcement: "automatic", check_stage: "post_execution", ...changes });
+}
+function presenceProof(changes: Record<string, unknown> = {}): any {
+  const binding = { status: "verified", evidence_ref: "object:package", verification_ref: "probe:allow" };
+  return proof({
+    deployed_check_id: "verified_presence",
+    check_evidence: { expected_object_version: binding, verified_provider_metadata: binding },
+    entry_coverage: [{ operation: "package.replace", entries: ["API", "CT", "GI"], not_applicable_entries: ["FB", "IN", "CF", "AD", "RP"], evidence_refs: ["coverage:package-presence"] }],
+    positive_test_refs: ["probe:allow"], negative_test_refs: ["probe:deny"],
+    server_control: {
+      check_id: "verified_presence", operation: "package.replace", resource_type: "package", zone: "WORKING",
+      enforcement: "automatic", stage: "post_execution", adapter_ref: "src/documents/package-replacement.ts#DocumentPackageReplacement.resume",
+      deployment_ref: "build:qualified", allow_probe_ref: "probe:allow", deny_probe_ref: "probe:deny"
+    },
+    ...changes
+  });
+}
 describe("activation qualification", () => {
   it("preserves the historical artifact proof schema when its optional audit is absent", async () => {
     const historicalProof = proof({ deployed_check_id: "allowed_destination" });
@@ -79,6 +97,26 @@ describe("activation qualification", () => {
   });
   it("accepts the exact code-owned exercised/non-route partition for a control operation", async () => {
     expect(await qualify(controlCandidate(), controlProof())).toMatchObject({ verdict: "allow", code: "RULE_QUALIFIED" });
+  });
+  it("accepts only the exact build-bound verified-presence package postcheck adapter", async () => {
+    expect(await qualify(presenceCandidate(), presenceProof())).toMatchObject({ verdict: "allow", code: "RULE_QUALIFIED" });
+  });
+  it.each([
+    { server_control: undefined },
+    { server_control: { ...presenceProof().server_control, deployment_ref: "build:other" } },
+    { server_control: { ...presenceProof().server_control, allow_probe_ref: "probe:unbound" } },
+    { negative_test_refs: ["other:deny"] }
+  ])("keeps the server control unavailable when its exact attestation is absent or unbound %j", async changes => {
+    expect(await qualify(presenceCandidate(), presenceProof(changes))).toMatchObject({ verdict: "unavailable", code: "RULE_CONTROL_UNAVAILABLE" });
+  });
+  it("does not let the verified-presence attestation equip another server control", async () => {
+    const rule = presenceCandidate({ check_id: "verified_archive" });
+    expect(await qualify(rule, presenceProof({ deployed_check_id: "verified_archive", check_evidence: {
+      source_metadata: { status: "verified", evidence_ref: "e", verification_ref: "v" },
+      archive_metadata: { status: "verified", evidence_ref: "e", verification_ref: "v" },
+      integrity_hash: { status: "verified", evidence_ref: "e", verification_ref: "v" },
+      archive_provenance: { status: "verified", evidence_ref: "e", verification_ref: "v" }
+    } }))).toMatchObject({ verdict: "unavailable", code: "RULE_CONTROL_UNAVAILABLE" });
   });
   it.each([
     { entries: ["API", "CT", "FB", "IN"], not_applicable_entries: ["CF", "AD", "RP"] },

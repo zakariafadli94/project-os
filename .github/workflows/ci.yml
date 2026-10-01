@@ -30,5 +30,6 @@ jobs:
         run: npm run test:recover-inputs-api
       - name: Test recovery workflow specification
         run: npm run test:recover-inputs-workflow-spec
+      - run: npm test
       - run: npm run check
       - run: npx wrangler deploy --dry-run

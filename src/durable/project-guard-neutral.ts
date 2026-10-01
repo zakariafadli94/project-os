@@ -4797,8 +4797,20 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json({ error: "request_identity_required" }, { status: 400 });
     }
     try {
-      const execution = await new ExecutionJournal(runtime, projectId, kind, requestId).status();
-      const receipt = await this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository);
+      const [execution, parallelReceipt] = await Promise.all([
+        new ExecutionJournal(runtime, projectId, kind, requestId).status(),
+        this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository)
+      ]);
+      let receipt = parallelReceipt;
+      // A receipt read can race ahead of an execution that becomes finalized.
+      // Re-read after observing that terminal state before reporting success.
+      if (execution?.status === "finalized" && (!receipt || typeof receipt !== "object"
+        || !("status" in receipt) || receipt.status !== "committed")) {
+        receipt = await this.readRequestStatusReceipt(projectId, kind as RequestKind, requestId, runtime, repository);
+        if (!receipt || typeof receipt !== "object" || !("status" in receipt) || receipt.status !== "committed") {
+          return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "request_status_unavailable");
+        }
+      }
       const canonicalCommitVerified = requireFinalizationProof && kind === "transaction"
         ? await this.hasVerifiedCanonicalTransactionCommit(projectId, requestId, receipt, execution, runtime, repository)
         : false;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DocumentLedgerRepository } from "../src/documents/repository";
 import { sha256Text } from "../src/documents/hash";
+import { packageNavigationSchema } from "../src/domain/document-package";
 import { packageRuntime } from "./helpers/package-runtime";
 
 export async function packageFixture() {
@@ -22,6 +23,20 @@ export async function packageFixture() {
 }
 
 describe("frozen document package", () => {
+  it.each([
+    ["package_id", "package_navigation_duplicate_package"],
+    ["root", "package_navigation_duplicate_root"]
+  ] as const)("rejects a duplicate package navigation %s", (field, code) => {
+    const ref = { project_id: "PRJ-9300", package_id: `PKG-${"A".repeat(64)}`, version: 1, manifest_sha256: "b".repeat(64) };
+    const first = { ref, root: "WORKING/PACKAGES/first/1" };
+    const second = field === "package_id"
+      ? { ref: { ...ref, version: 2 }, root: "WORKING/PACKAGES/second/2" }
+      : { ref: { ...ref, package_id: `PKG-${"C".repeat(64)}` }, root: first.root };
+    expect(() => packageNavigationSchema.parse({
+      schema_version: "1.0", project_id: "PRJ-9300", zone: "WORKING",
+      generation: 1, source_request_id: "DOCREQ-NAVIGATION-0001", packages: [first, second]
+    })).toThrow(code);
+  });
   it("rejects a member colliding with the reserved generated index", async () => {
     const { repository, manifest } = await packageFixture();
     await expect(repository.freezePackage({ ...manifest, members: [{ ...manifest.members[0], relative_path: "index.md" }], links: [] })).rejects.toThrow("package_reserved_member");

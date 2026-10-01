@@ -174,6 +174,7 @@ interface PackageDocumentReceipt {
   execution_status?: "finalized";
   finalization_ref?: string | null;
   code?: string;
+  gaps?: ExecutionAdmission["gaps"];
 }
 
 interface NavigationDocumentReceipt {
@@ -186,6 +187,7 @@ interface NavigationDocumentReceipt {
   catalog_rebuild_certificate_ref?: string;
   code?: string;
   finalization_ref?: string | null;
+  gaps?: ExecutionAdmission["gaps"];
 }
 
 type ManagedDocumentOperationReceipt = ManagedDocumentReceipt | ManagedDocumentTerminalReceipt | NavigationDocumentReceipt;
@@ -1088,8 +1090,8 @@ export class ProjectGuard extends DurableObject<Env> {
       }
       const cached = JSON.parse(existing.receipt_json) as ManagedDocumentOperationReceipt;
       if (operation.operation === "navigation.reconcile") {
-        await this.settleNavigationReceipt(operation, cached as NavigationDocumentReceipt);
-        return Response.json(await this.currentNavigationReceipt(operation, cached as NavigationDocumentReceipt));
+        const settled = await this.settleNavigationReceipt(operation, cached as NavigationDocumentReceipt);
+        return Response.json(await this.currentNavigationReceipt(operation, settled));
       }
       if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, operation.project_id) === "repair") {
         await this.settleDocumentReceipt(operation, cached);
@@ -1406,8 +1408,8 @@ export class ProjectGuard extends DurableObject<Env> {
     const durable = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
     if (durable) {
       const receipt = JSON.parse(durable.receipt_json) as NavigationDocumentReceipt;
-      await this.settleNavigationReceipt(request, receipt);
-      return Response.json(await this.currentNavigationReceipt(request, receipt));
+      const settled = await this.settleNavigationReceipt(request, receipt);
+      return Response.json(await this.currentNavigationReceipt(request, settled));
     }
     // This also runs on replay of an already persisted, exact admission so an
     // interruption after admission cannot strand the governed successor.
@@ -1601,9 +1603,7 @@ export class ProjectGuard extends DurableObject<Env> {
         && sourceState.adoption_request_id === nav.request_id) {
         await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceGeneration, budget);
       }
-      const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: "navigation_snapshot_changed" };
-      await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
-      await this.settleNavigationReceipt(nav, receipt);
+      const receipt = await this.settleNavigationReceipt(nav, { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: "navigation_snapshot_changed" });
       return Response.json(receipt, { status: 409 });
     }
     const inventory = new ZoneNavigationInventory(this.persistence, sources);
@@ -1616,10 +1616,8 @@ export class ProjectGuard extends DurableObject<Env> {
           status: "pending", code: "NAVIGATION_CATALOG_REBUILD_PENDING", cursor: result.cursor }, { status: 503 });
       }
       if (result.status === "conflict") {
-        const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id,
-          project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: result.code };
-        await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
-        await this.settleNavigationReceipt(nav, receipt);
+        const receipt = await this.settleNavigationReceipt(nav, { operation: nav.operation, request_id: nav.request_id,
+          project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: result.code });
         return Response.json(receipt, { status: 409 });
       }
       const certificate = navigationCatalogRebuildCertificateSchema.parse(result.certificate);
@@ -1628,11 +1626,9 @@ export class ProjectGuard extends DurableObject<Env> {
         throw new Error("navigation_catalog_rebuild_certificate_binding_invalid");
       }
       const certificateRef = `${await journal.root()}/navigation/catalog-rebuild/finalizations/${requestHash}.json`;
-      const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id,
+      const receipt = await this.settleNavigationReceipt(nav, { operation: nav.operation, request_id: nav.request_id,
         project_id: nav.project_id, status: "committed", execution_status: "pending",
-        catalog_rebuild_certificate_ref: certificateRef };
-      await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
-      await this.settleNavigationReceipt(nav, receipt);
+        catalog_rebuild_certificate_ref: certificateRef });
       return Response.json(await this.currentNavigationReceipt(nav, receipt));
     }
     const result = await new ZoneNavigationEngine(this.persistence, inventory, undefined, postcheckRules).publishPrepared(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
@@ -1649,9 +1645,7 @@ export class ProjectGuard extends DurableObject<Env> {
         && sourceState.adoption_request_id === nav.request_id) {
         await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceGeneration, budget);
       }
-      const receipt: NavigationDocumentReceipt = { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: result.code };
-      await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
-      await this.settleNavigationReceipt(nav, receipt);
+      const receipt = await this.settleNavigationReceipt(nav, { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: result.code });
       return Response.json(receipt, { status: 409 });
     }
     if (!sourceState.adopted) {
@@ -1660,12 +1654,10 @@ export class ProjectGuard extends DurableObject<Env> {
         return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
       }
     }
-    const receipt: NavigationDocumentReceipt = {
+    const receipt = await this.settleNavigationReceipt(nav, {
       operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id,
       status: "committed", execution_status: "pending", navigation_receipt: result.receipt
-    };
-    await this.managedDocumentRequests.writeReceipt(nav.project_id, nav.request_id, JSON.stringify(nav), JSON.stringify(receipt));
-    await this.settleNavigationReceipt(nav, receipt);
+    });
     return Response.json(await this.currentNavigationReceipt(nav, receipt));
   }
 
@@ -1749,32 +1741,43 @@ export class ProjectGuard extends DurableObject<Env> {
     throw new Error("navigation_admitted_state_unavailable");
   }
 
-  private async settleNavigationReceipt(request: NavigationReconcileRequest, receipt: NavigationDocumentReceipt): Promise<void> {
-    this.persistDocumentRequest(request, receipt);
+  private async settleNavigationReceipt(request: NavigationReconcileRequest, receipt: NavigationDocumentReceipt): Promise<NavigationDocumentReceipt> {
+    const projected = await this.withJournalGaps(request.project_id, "document", request.request_id, receipt);
+    const existing = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
+    const canonical = existing
+      ? JSON.parse(existing.receipt_json) as NavigationDocumentReceipt
+      : projected;
+    const durableReceipt = existing ?? await this.managedDocumentRequests.writeReceipt(
+      request.project_id,
+      request.request_id,
+      JSON.stringify(request),
+      JSON.stringify(canonical)
+    );
+    this.persistDocumentRequest(request, projected);
     const receiptPath = `${machineDocumentRoot(request.project_id)}/requests/${request.request_id}/receipt.json`;
     const intent = await this.managedDocumentRequests.readRecoverableIntent(request.project_id, request.request_id);
-    const durableReceipt = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
     if (intent && durableReceipt && durableReceipt.request_sha256 === intent.request_sha256
-      && canonicalJson(JSON.parse(durableReceipt.receipt_json)) === canonicalJson(receipt)) {
+      && canonicalJson(JSON.parse(durableReceipt.receipt_json)) === canonicalJson(canonical)) {
       await this.storeCanonicalTerminalObservation(
-        request.project_id, "document", request.request_id, receipt, receiptPath, durableReceipt, intent.request_sha256
+        request.project_id, "document", request.request_id, canonical, receiptPath, durableReceipt, intent.request_sha256
       );
     }
     const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
-    await journal.recordReceipt(receipt.status, receiptPath);
-    if (receipt.status === "conflict") {
+    await journal.recordReceipt(canonical.status, receiptPath);
+    if (canonical.status === "conflict") {
       this.clearRequestRecovery("document", request.request_id);
-      return;
+      return projected;
     }
     if (request.purpose === "compact_catalog_rebuild") {
-      if (!receipt.catalog_rebuild_certificate_ref) throw new Error("navigation_catalog_rebuild_certificate_unavailable");
-      await journal.finalizeVerifiedCatalogRebuild({ receipt_ref: receiptPath, certificate_ref: receipt.catalog_rebuild_certificate_ref });
+      if (!canonical.catalog_rebuild_certificate_ref) throw new Error("navigation_catalog_rebuild_certificate_unavailable");
+      await journal.finalizeVerifiedCatalogRebuild({ receipt_ref: receiptPath, certificate_ref: canonical.catalog_rebuild_certificate_ref });
       if ((await journal.status())?.terminal) this.clearRequestRecovery("document", request.request_id);
-      return;
+      return projected;
     }
-    const navigationReceipt = zoneNavigationReceiptSchema.parse(receipt.navigation_receipt);
+    const navigationReceipt = zoneNavigationReceiptSchema.parse(canonical.navigation_receipt);
     await journal.finalizeVerifiedNavigation({ receipt_ref: receiptPath, receipt: navigationReceipt });
     if ((await journal.status())?.terminal) this.clearRequestRecovery("document", request.request_id);
+    return projected;
   }
 
   private async currentNavigationReceipt(request: NavigationReconcileRequest, receipt: NavigationDocumentReceipt): Promise<NavigationDocumentReceipt> {
@@ -1929,22 +1932,49 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async finalizeArtifact(request: ArtifactWriteRequest, receipt: ArtifactWriteReceipt): Promise<Response> {
+    const projected = await this.withJournalGaps(request.project_id, "artifact", request.request_id, receipt);
+    const existingCanonical = await this.persistence.objects.readText(machineArtifactReceiptPath(request.request_id));
+    const canonical = existingCanonical === null
+      ? projected
+      : JSON.parse(existingCanonical) as ArtifactWriteReceipt;
+    const { gaps: _projectedGaps, ...projectedIdentity } = projected;
+    const { gaps: _canonicalGaps, ...canonicalIdentity } = canonical;
+    const canonicalCompatible = canonicalJson(projectedIdentity) === canonicalJson(canonicalIdentity);
+    if (!canonicalCompatible) {
+      if (projected.status !== "committed") throw new Error("Conflicting immutable artifact receipt");
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({
+        request_id: request.request_id,
+        project_id: request.project_id,
+        status: "pending",
+        code: "ARTIFACT_FINALIZATION_SCHEDULED"
+      }, { status: 503 });
+    }
     await this.completeArtifactNavigationSource(request);
-    if (isReviewCandidate(request)) await this.repository.reviewJournal.recordTerminal(request, receipt);
+    if (isReviewCandidate(request)) {
+      const reviewTerminal = await this.repository.reviewJournal.terminal(request);
+      if (!reviewTerminal) await this.repository.reviewJournal.recordTerminal(request, projected);
+      else {
+        const { gaps: _reviewGaps, ...reviewIdentity } = reviewTerminal;
+        if (canonicalJson(projectedIdentity) !== canonicalJson(reviewIdentity)) {
+          throw new Error("Conflicting immutable review evidence");
+        }
+      }
+    }
     // Store the frozen family record and its wake signal *before* the
     // canonical receipt. If a provider acknowledgement is interrupted after
     // the physical artifact exists, the alarm can safely write the same
     // immutable receipt and certify it without replaying the artifact effect.
-    this.persistArtifact(request, receipt);
-    if (receipt.status === "committed") {
+    this.persistArtifact(request, projected);
+    if (projected.status === "committed") {
       await this.enqueueRequestRecovery("artifact", request.request_id);
     }
     try {
-      await this.repository.writeArtifactReceipt(receipt);
+      if (existingCanonical === null) await this.repository.writeArtifactReceipt(canonical);
       const canonicalReceipt = await this.persistence.objects.readText(machineArtifactReceiptPath(request.request_id));
       if (canonicalReceipt !== null) {
         const verified = JSON.parse(canonicalReceipt) as ArtifactWriteReceipt;
-        if (canonicalJson(verified) === canonicalJson(receipt)) {
+        if (canonicalJson(verified) === canonicalJson(canonical)) {
           const intent = await new MutationGateRepository(this.persistence).readArtifactIntent(request.project_id, request.request_id);
           if (intent) await this.storeCanonicalTerminalObservation(
             request.project_id, "artifact", request.request_id, verified, machineArtifactReceiptPath(request.request_id),
@@ -1952,12 +1982,12 @@ export class ProjectGuard extends DurableObject<Env> {
           );
         }
       }
-      await this.settleArtifactReceipt(request, receipt);
-      if (receipt.status === "committed") await this.repository.cleanupStagedArtifact(request);
-      await this.ensureArtifactCapacityReleased(request, receipt);
-      return Response.json(receipt);
+      await this.settleArtifactReceipt(request, canonical);
+      if (canonical.status === "committed") await this.repository.cleanupStagedArtifact(request);
+      await this.ensureArtifactCapacityReleased(request, canonical);
+      return Response.json(projected);
     } catch (error) {
-      if (receipt.status !== "committed") throw error;
+      if (projected.status !== "committed") throw error;
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
       return Response.json({
         request_id: request.request_id,
@@ -2064,9 +2094,11 @@ export class ProjectGuard extends DurableObject<Env> {
     receipt: T
   ): Promise<T & { gaps?: ExecutionAdmission["gaps"] }> {
     const admission = await new ExecutionJournal(this.persistence, projectId, kind, requestId).readAdmission();
-    return admission?.admission.gaps.length
-      ? { ...receipt, gaps: structuredClone(admission.admission.gaps) }
-      : receipt;
+    if (!admission) return receipt;
+    const { gaps: _cachedGaps, ...canonicalReceipt } = receipt as T & { gaps?: ExecutionAdmission["gaps"] };
+    return (admission.admission.gaps.length
+      ? { ...canonicalReceipt, gaps: structuredClone(admission.admission.gaps) }
+      : canonicalReceipt) as T & { gaps?: ExecutionAdmission["gaps"] };
   }
 
   private async ensureDocumentCapacityReleased(request: ManagedDocumentRequest, receipt: ManagedDocumentOperationReceipt): Promise<void> {
@@ -2899,6 +2931,12 @@ export class ProjectGuard extends DurableObject<Env> {
     operation: Extract<ManagedDocumentRequest, { operation: "package.freeze" | "package.replace" }>,
     receipt: PackageDocumentReceipt
   ): Promise<PackageDocumentReceipt> {
+    receipt = await this.withJournalGaps(
+      operation.project_id,
+      operation.operation === "package.freeze" ? "document" : "package-admission",
+      operation.request_id,
+      receipt
+    );
     const serialized = JSON.stringify(operation);
     await this.managedDocumentRequests.writeReceipt(
       operation.project_id,
@@ -3231,9 +3269,8 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     const request = parseArtifactWriteRequest(JSON.parse(row.request_json));
     const receipt = JSON.parse(row.receipt_json) as ArtifactWriteReceipt;
-    await this.repository.writeArtifactReceipt(receipt);
-    await this.settleArtifactReceipt(request, receipt);
-    await this.ensureArtifactCapacityReleased(request, receipt);
+    const response = await this.finalizeArtifact(request, receipt);
+    if (!response.ok) throw new Error("artifact_capacity_or_recovery_pending");
   }
 
   private loadState(): ProjectState | null {

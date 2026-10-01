@@ -1,11 +1,15 @@
 import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import { encodeAdmission } from "../src/admission/transport";
+import { machineArtifactReceiptPath } from "../src/persistence/layout";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-23T00:30:00.000Z";
+const admissionGap = { rule: { rule_id: "RULE-ARTIFACT-GAP-0001", version: 1, scope: { kind: "global" } }, code: "ACCEPTED_UNENFORCED", check_id: "expected_version" };
 
 async function sha256(value: string): Promise<string> {
   const bytes = new TextEncoder().encode(value);
@@ -53,21 +57,74 @@ describe("ProjectGuard artifact writes", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("commits an artifact and returns the same receipt on exact replay", async () => {
+    const signingKey = "artifact-gap-receipt";
     const created = await createProject("TXN-ARTIFACT-PROJECT-0001");
     const project = testEnv.PROJECT_GUARD.getByName(created.project_id);
     const content = "# Acquisition";
     const body = artifactBody(created.project_id, "ART-GROWTH-000001", content, await sha256(content));
 
-    const first = await project.fetch("https://project-guard.internal/artifact", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body)
+    await runInDurableObject(project, instance => {
+      Object.assign((instance as unknown as { env: Env }).env, {
+        MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+        RULE_ADMISSION_SIGNING_KEY: signingKey,
+        PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" })
+      });
+      const target = instance as any;
+      vi.spyOn(target, "ruleAdmissionRequired").mockResolvedValue(true);
+      vi.spyOn(target, "admitRules").mockImplementation(async (state: any, normalized: any, actor: any) => ({
+        project_id: created.project_id,
+        operation: normalized.operation,
+        resources: normalized.resources,
+        request_hash: normalized.request_hash,
+        actor,
+        global_revision: 0,
+        project_revision: state.revision,
+        ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: state.revision },
+        verdict: "allow",
+        results: [],
+        gaps: [admissionGap],
+        deferred_rules: []
+      }));
     });
-    const firstReceipt = await first.json<{ status: string }>();
+    const { context }: any = await (await project.fetch("https://project-guard.internal/mutation-context")).json();
+    const envelope = JSON.stringify(encodeAdmission(body, context));
+    const first = await project.fetch("https://project-guard.internal/artifact", {
+      method: "POST", headers: { "content-type": "application/json" }, body: envelope
+    });
+    const firstReceipt = await first.json<{ status: string; gaps?: unknown[] }>();
     expect(firstReceipt.status).toBe("committed");
+    expect(firstReceipt.gaps).toEqual([admissionGap]);
+
+    const legacyReceipt = { ...firstReceipt } as Record<string, unknown>;
+    delete legacyReceipt.gaps;
+    dropbox.files.set(machineArtifactReceiptPath(body.request_id), `${JSON.stringify(legacyReceipt, null, 2)}\n`);
+    await runInDurableObject(project, instance => {
+      (instance as any).ctx.storage.sql.exec(
+        "UPDATE artifact_requests SET receipt_json = ? WHERE request_id = ?",
+        JSON.stringify(legacyReceipt),
+        body.request_id
+      );
+    });
 
     const second = await project.fetch("https://project-guard.internal/artifact", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body)
+      method: "POST", headers: { "content-type": "application/json" }, body: envelope
     });
-    expect(await second.json()).toEqual(expect.objectContaining({ status: "committed", request_id: body.request_id }));
+    expect(await second.json()).toEqual(expect.objectContaining({ status: "committed", request_id: body.request_id, gaps: [admissionGap] }));
+
+    const incompatibleReceipt = { ...legacyReceipt, content_sha256: "f".repeat(64) };
+    dropbox.files.set(machineArtifactReceiptPath(body.request_id), `${JSON.stringify(incompatibleReceipt, null, 2)}\n`);
+    const collision = await project.fetch("https://project-guard.internal/artifact", {
+      method: "POST", headers: { "content-type": "application/json" }, body: envelope
+    });
+    expect(collision.status).toBe(503);
+    expect(await collision.json()).toMatchObject({ status: "pending", code: "ARTIFACT_FINALIZATION_SCHEDULED" });
+    expect(JSON.parse(dropbox.files.get(machineArtifactReceiptPath(body.request_id)) ?? "null")).toEqual(incompatibleReceipt);
+
+    dropbox.files.delete(machineArtifactReceiptPath(body.request_id));
+    await runInDurableObject(project, instance => (instance as any).resumeArtifactFinalization(body.request_id));
+    expect(JSON.parse(dropbox.files.get(machineArtifactReceiptPath(body.request_id)) ?? "null")).toEqual(
+      expect.objectContaining({ status: "committed", gaps: [admissionGap] })
+    );
 
     const artifactPath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-artifact-0001/ARTIFACTS/playbooks/acquisition.md`;
     expect(dropbox.files.get(artifactPath)).toBe(content);

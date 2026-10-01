@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { AdmissionGaps } from "../execution/contract";
 
 const requestId = z.string().regex(/^ART-[A-Z0-9-]{10,}$/);
 const projectId = z.string().regex(/^PRJ-[0-9]{4,}$/);
@@ -86,6 +87,7 @@ export interface ArtifactWriteReceipt {
   status: "committed" | "conflict" | "rejected";
   code?: string;
   message?: string;
+  gaps?: AdmissionGaps;
 }
 
 export function parseArtifactWriteRequest(input: unknown): ArtifactWriteRequest {

@@ -30,6 +30,7 @@ import { ManagedDocumentChangeJobStore } from "../src/documents/change-job-store
 const testEnv = env as unknown as Env;
 const at = "2026-08-24T19:35:00+01:00";
 const governanceSigningKey = "project-document-governance";
+const admissionGap = { rule: { rule_id: "RULE-DOCUMENT-GAP-0001", version: 1, scope: { kind: "global" } }, code: "ACCEPTED_UNENFORCED", check_id: "expected_version" };
 
 async function createProject(transactionId: string): Promise<Receipt> {
   const suffix = transactionId.slice(-4).toLowerCase();
@@ -86,6 +87,11 @@ describe("ProjectGuard managed documents", () => {
     }));
     const contextResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${token}` } });
     const { context }: any = await contextResponse.json();
+    await runInDurableObject(guard, instance => {
+      const target = instance as any;
+      const admit = target.admitRules.bind(target);
+      vi.spyOn(target, "admitRules").mockImplementation(async (...args: any[]) => ({ ...await admit(...args), gaps: [admissionGap] }));
+    });
     const request = navigationReconcileSchema.parse({
       operation: "navigation.reconcile", request_id: "DOCREQ-CATALOG-REBUILD-GUARD-0001", project_id: projectId,
       zone: "REVIEW", expected_project_revision: created.new_revision, expected_generation: 0,
@@ -107,6 +113,7 @@ describe("ProjectGuard managed documents", () => {
     expect(receipt).not.toBeNull();
     expect(JSON.parse(receipt!.receipt_json)).toMatchObject({
       status: "committed", operation: "navigation.reconcile", execution_status: "pending",
+      gaps: [admissionGap],
       catalog_rebuild_certificate_ref: expect.stringContaining("/navigation/catalog-rebuild/finalizations/")
     });
     expect(await new ExecutionJournal(runtime, projectId, "document", request.request_id).status())
@@ -143,6 +150,11 @@ describe("ProjectGuard managed documents", () => {
     }));
     const contextResponse = await guard.fetch("https://internal/mutation-context", { headers: { authorization: `Bearer ${token}` } });
     const { context }: any = await contextResponse.json();
+    await runInDurableObject(guard, instance => {
+      const target = instance as any;
+      const admit = target.admitRules.bind(target);
+      vi.spyOn(target, "admitRules").mockImplementation(async (...args: any[]) => ({ ...await admit(...args), gaps: [admissionGap] }));
+    });
     const request = navigationReconcileSchema.parse({
       operation: "navigation.reconcile", request_id: "DOCREQ-CATALOG-GAP-0001", project_id: projectId,
       zone: "REVIEW", expected_project_revision: created.new_revision, expected_generation: 0,
@@ -157,7 +169,7 @@ describe("ProjectGuard managed documents", () => {
     for (let attempt = 0; attempt < 6; attempt += 1) await runDurableObjectAlarm(materialization);
     const receipt = await new ManagedDocumentRequestLedger(runtime.objects).readReceipt(projectId, request.request_id);
     expect(receipt).not.toBeNull();
-    expect(JSON.parse(receipt!.receipt_json)).toMatchObject({ status: "conflict", code: "active_version_provider_mismatch" });
+    expect(JSON.parse(receipt!.receipt_json)).toMatchObject({ status: "conflict", code: "active_version_provider_mismatch", gaps: [admissionGap] });
     expect(await new ExecutionJournal(runtime, projectId, "document", request.request_id).status())
       .toMatchObject({ status: "conflict", terminal: true });
   });
@@ -653,6 +665,11 @@ describe("ProjectGuard managed documents", () => {
     const key = governanceSigningKey;
     await runInDurableObject(guard, (instance) => Object.assign((instance as any).env, { MUTATION_CONTEXT_SIGNING_KEY: key, RULE_ADMISSION_SIGNING_KEY: key, PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" }) }));
     const { context }: any = await (await guard.fetch("https://internal/mutation-context")).json();
+    await runInDurableObject(guard, instance => {
+      const target = instance as any;
+      const admit = target.admitRules.bind(target);
+      vi.spyOn(target, "admitRules").mockImplementation(async (...args: any[]) => ({ ...await admit(...args), gaps: [admissionGap] }));
+    });
     const submit = async (request: unknown) => (await guard.fetch("https://internal/document", { method: "POST", body: JSON.stringify(encodeAdmission(request, context)) })).json<any>();
     const freezeRequest = { operation: "package.freeze" as const, request_id: "DOCREQ-PACKAGE-FREEZE-0092", project_id: created.project_id, document_id: descriptor.document_id, expected_version_id: descriptor.version_id, content_sha256: await sha256Text(content), expected_project_revision: 1, created_at: at };
     let restoreFreeze!: () => void;
@@ -671,7 +688,7 @@ describe("ProjectGuard managed documents", () => {
     restoreFreeze();
     expect(await runDurableObjectAlarm(guard)).toBe(true);
     const frozen = await submit(freezeRequest);
-    expect(frozen).toMatchObject({ status: "committed", candidate: { version: 1 } });
+    expect(frozen).toMatchObject({ status: "committed", candidate: { version: 1 }, gaps: [admissionGap] });
     const freezeAdmission = await new ExecutionJournal(createProductionPersistence(testEnv), created.project_id, "document", freezeRequest.request_id).readAdmission();
     expect(freezeAdmission?.admission).toMatchObject({ operation: "package.freeze", request_id: freezeRequest.request_id, verdict: "allow" });
     const freezeJournal = new ExecutionJournal(createProductionPersistence(testEnv), created.project_id, "document", freezeRequest.request_id);
@@ -708,7 +725,7 @@ describe("ProjectGuard managed documents", () => {
     expect(await runDurableObjectAlarm(guard)).toBe(true);
     let result = await submit(request);
     for (let count = 0; count < 5 && result.status === "finalizing"; count++) result = await submit(request);
-    expect(result).toMatchObject({ status: "committed", execution_status: "finalized" });
+    expect(result).toMatchObject({ status: "committed", execution_status: "finalized", gaps: [admissionGap] });
     expect((await repository.readPackageNavigation(created.project_id)).WORKING?.packages[0].ref).toEqual(frozen.candidate);
     expect(await submit(request)).toEqual(result);
 
@@ -719,7 +736,7 @@ describe("ProjectGuard managed documents", () => {
       });
     });
     const terminal = await submit(terminalRequest);
-    expect(terminal).toMatchObject({ status: "conflict", code: "EXECUTION_RESOURCE_CHANGED" });
+    expect(terminal).toMatchObject({ status: "conflict", code: "EXECUTION_RESOURCE_CHANGED", gaps: [admissionGap] });
     const terminalStatus = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${terminalRequest.request_id}`);
     await expect(terminalStatus.json()).resolves.toMatchObject({ status: "conflict" });
   });

@@ -2118,9 +2118,45 @@ export class ProjectGuard extends DurableObject<Env> {
     receipt: T,
     runtime: ProjectOsPersistenceRuntime = this.persistence
   ): Promise<T & { gaps?: ExecutionAdmission["gaps"] }> {
-    const admission = await new ExecutionJournal(runtime, projectId, kind, requestId).readAdmission();
-    if (!admission) return receipt;
-    return this.receiptWithAdmissionGaps(receipt, admission.admission.gaps);
+    const gaps = await this.readAdmissionGapsCached(projectId, kind, requestId, runtime);
+    return gaps === null ? receipt : this.receiptWithAdmissionGaps(receipt, gaps);
+  }
+
+  private admissionGapCacheKey(kind: string, requestId: string): string {
+    return `admission-gaps:v1:${kind}:${requestId}`;
+  }
+
+  private async rememberAdmissionGaps(admission: ExecutionAdmission): Promise<void> {
+    await this.ctx.storage.put(this.admissionGapCacheKey(admission.kind, admission.request_id), {
+      project_id: admission.project_id,
+      kind: admission.kind,
+      request_id: admission.request_id,
+      request_hash: admission.request_hash,
+      gaps: admission.gaps,
+      verified_at: Date.now()
+    });
+  }
+
+  private async readAdmissionGapsCached(
+    projectId: string,
+    kind: string,
+    requestId: string,
+    runtime: ProjectOsPersistenceRuntime
+  ): Promise<ExecutionAdmission["gaps"] | null> {
+    const cached = await this.ctx.storage.get<{
+      project_id: string; kind: string; request_id: string; request_hash: string;
+      gaps: ExecutionAdmission["gaps"]; verified_at: number;
+    }>(this.admissionGapCacheKey(kind, requestId));
+    if (cached?.project_id === projectId && cached.kind === kind && cached.request_id === requestId
+      && /^[a-f0-9]{64}$/.test(cached.request_hash) && Array.isArray(cached.gaps)
+      && Number.isSafeInteger(cached.verified_at) && Date.now() >= cached.verified_at
+      && Date.now() - cached.verified_at < 30_000) {
+      return structuredClone(cached.gaps);
+    }
+    const record = await new ExecutionJournal(runtime, projectId, kind, requestId).readAdmission();
+    if (!record) return null;
+    await this.rememberAdmissionGaps(record.admission);
+    return structuredClone(record.admission.gaps);
   }
 
   private receiptWithAdmissionGaps<T extends object>(
@@ -2164,8 +2200,8 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     const kinds = journalKind ? [journalKind] : ["package-admission", "document"] as const;
     for (const candidate of kinds) {
-      const admission = await new ExecutionJournal(runtime, projectId, candidate, requestId).readAdmission();
-      if (admission) return this.receiptWithAdmissionGaps(receipt, admission.admission.gaps);
+      const gaps = await this.readAdmissionGapsCached(projectId, candidate, requestId, runtime);
+      if (gaps !== null) return this.receiptWithAdmissionGaps(receipt, gaps);
     }
     return receipt;
   }
@@ -4112,6 +4148,9 @@ export class ProjectGuard extends DurableObject<Env> {
        ON CONFLICT(kind, request_id) DO UPDATE SET proof_json = excluded.proof_json`,
       kind, requestId, JSON.stringify(persistedProof)
     );
+    if (["transaction", "document", "package-admission", "artifact"].includes(kind)) {
+      await this.rememberAdmissionGaps(admitted);
+    }
     return admitted;
   }
 

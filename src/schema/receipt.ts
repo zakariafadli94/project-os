@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Receipt } from "../domain/receipt";
+import { ruleScopeSchema } from "../domain/rule-governance";
 import { unsupportedSchemaVersion } from "./version";
 
 const receiptSchema = z.strictObject({
@@ -12,7 +13,16 @@ const receiptSchema = z.strictObject({
   event_id: z.string().regex(/^EVT-[0-9]{6,}$/).optional(),
   code: z.string().min(1).optional(),
   message: z.string().min(1).optional(),
-  committed_at: z.string().datetime({ offset: true }).optional()
+  committed_at: z.string().datetime({ offset: true }).optional(),
+  gaps: z.array(z.strictObject({
+    rule: z.strictObject({
+      rule_id: z.string().trim().min(1),
+      version: z.number().int().positive(),
+      scope: ruleScopeSchema
+    }),
+    code: z.string().trim().min(1),
+    check_id: z.string().trim().min(1)
+  })).optional()
 });
 
 function requireRecord(input: unknown): Record<string, unknown> {

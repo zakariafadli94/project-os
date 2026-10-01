@@ -9,6 +9,7 @@ import { ReviewCandidateEvidenceChangedError, ReviewCandidateJournal } from "../
 import { samePayload } from "../artifacts/staged-publication";
 import { assertManagedRelativePath, assertReferenceCollectionPath, documentIdFor } from "../domain/managed-document";
 import type { ProjectState } from "../domain/project-state";
+import type { AdmissionGaps } from "../execution/contract";
 import {
   matchesDropboxV1Evidence,
   requireDropboxV1Evidence,
@@ -106,6 +107,8 @@ export interface ManagedDocumentReceipt {
   admission_request_sha256?: string;
   proof_ref?: string;
   proof_sha256?: string;
+  /** Exact accepted-but-unenforced gaps frozen by the canonical admission. */
+  gaps?: AdmissionGaps;
   actor?: { actor_id: string; authority: string };
 }
 

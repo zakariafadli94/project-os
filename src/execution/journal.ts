@@ -39,7 +39,7 @@ export class ExecutionJournal {
     return `${machineConvergenceRoot(this.projectId)}/executions/${await executionHash({ kind: this.kind, request_id: this.requestId })}`;
   }
 
-  async commit(admission: ExecutionAdmission, plan: ExecutionPlan | null): Promise<void> {
+  async commit(admission: ExecutionAdmission, plan: ExecutionPlan | null): Promise<ExecutionAdmission> {
     this.assertAdmission(admission);
     if (!plan && requiredRulePostchecks(admission).length > 0) {
       throw new Error("execution_required_postcheck_adapter_missing");
@@ -77,10 +77,11 @@ export class ExecutionJournal {
         // record is recoverable only at this exact pre-effect boundary.
         await this.immutable(`${root}/progress.json`, this.initialProgress(admission, path, existing.effect_plan_hash));
       }
-      return;
+      return existing.admission;
     }
     await this.immutable(path, record);
     await this.immutable(`${root}/progress.json`, this.initialProgress(admission, path, record.effect_plan_hash));
+    return admission;
   }
 
   private initialProgress(admission: ExecutionAdmission, admissionRef: string, effectPlanHash: string): ExecutionProgress {

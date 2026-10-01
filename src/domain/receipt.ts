@@ -1,3 +1,5 @@
+import type { AdmissionGaps } from "../execution/contract";
+
 export type ReceiptStatus = "committed" | "rejected" | "conflict";
 
 export interface Receipt {
@@ -11,4 +13,6 @@ export interface Receipt {
   code?: string;
   message?: string;
   committed_at?: string;
+  /** Exact accepted-but-unenforced gaps frozen by the canonical admission. */
+  gaps?: AdmissionGaps;
 }

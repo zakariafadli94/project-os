@@ -5,7 +5,9 @@ import worker from "../src/index";
 import type { MutationContextResponse } from "../src/admission/mutation-context";
 import { encodeAdmission } from "../src/admission/transport";
 import type { Env } from "../src/env";
-import { machineCommitRecordPath, machineReceiptPath, machineStatePath } from "../src/dropbox/layout";
+import { machineCommitRecordPath, machineDocumentRoot, machineReceiptPath, machineStatePath, workspaceManagedDocumentPath } from "../src/dropbox/layout";
+import { ExecutionJournal } from "../src/execution/journal";
+import { sha256Text } from "../src/documents/hash";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
@@ -365,5 +367,139 @@ describe("canonical mutation-context admission", () => {
     expect(accepted.status).toBe(200);
     await expect(accepted.json()).resolves.toMatchObject({ status: "committed", previous_revision: 2, new_revision: 3 });
     expect(mock.files.has(machineCommitRecordPath(projectId, 3))).toBe(true);
+  });
+
+  it("rejects project A's signed context at project B's document boundary without reserving work, then admits B's own context", async () => {
+    const projectA = "PRJ-9988";
+    const projectB = "PRJ-9989";
+    const mock = installDropboxMock();
+    seed(mock, projectA, 1);
+    const recordsB = seed(mock, projectB, 1);
+    const testEnv = strictEnv(projectA);
+    testEnv.PROJECT_OS_ADMISSION_PROJECT_MODES = JSON.stringify({ [projectA]: "strict", [projectB]: "strict" });
+    const headers = { authorization: `Bearer ${testEnv.INGRESS_TOKEN}`, "content-type": "application/json" };
+    for (const projectId of [projectA, projectB]) {
+      await runInDurableObject(testEnv.PROJECT_GUARD.getByName(projectId), (instance) => {
+        Object.assign((instance as unknown as { env: Env }).env, {
+          PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [projectId]: "strict" }),
+          MUTATION_CONTEXT_SIGNING_KEY: signingKey,
+          RULE_ADMISSION_SIGNING_KEY: signingKey
+        });
+      });
+    }
+
+    const [contextAResponse, contextBResponse] = await Promise.all([
+      readContext(projectA, testEnv),
+      readContext(projectB, testEnv)
+    ]);
+    expect(contextAResponse.status).toBe(200);
+    expect(contextBResponse.status).toBe(200);
+    const { context: contextA } = await contextAResponse.json<MutationContextResponse>();
+    const { context: contextB } = await contextBResponse.json<MutationContextResponse>();
+    expect(contextA.project_id).toBe(projectA);
+    expect(contextB.project_id).toBe(projectB);
+    await bootstrapRuleAdmissionGovernance(testEnv, signingKey, projectB);
+
+    const crossProjectRequest = {
+      operation: "working.write" as const,
+      request_id: "DOCREQ-CROSS-PROJECT-9988-0001",
+      project_id: projectB,
+      logical_path: "context/cross-project.md",
+      content: "A's signed context must not authorize B.",
+      content_sha256: await sha256Text("A's signed context must not authorize B."),
+      created_at: "2026-09-09T10:00:00.000Z"
+    };
+    const uploadsBeforeRefusal = [...mock.uploadCalls];
+    const refused = await worker.fetch(new Request("https://example.com/v1/documents", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(encodeAdmission(crossProjectRequest, contextA))
+    }), testEnv, createExecutionContext());
+    expect(refused.status).toBe(409);
+    await expect(refused.json()).resolves.toEqual({ error: "mutation_context_stale" });
+    expect(mock.uploadCalls).toEqual(uploadsBeforeRefusal);
+    expect(mock.files.has(`${machineDocumentRoot(projectB)}/requests/${crossProjectRequest.request_id}/intent.json`)).toBe(false);
+    expect(mock.files.has(`${machineDocumentRoot(projectB)}/requests/${crossProjectRequest.request_id}/receipt.json`)).toBe(false);
+
+    const guardB = testEnv.PROJECT_GUARD.getByName(projectB);
+    const assertNoDurableWork = async (requestId: string) => {
+      expect(mock.files.has(`${machineDocumentRoot(projectB)}/requests/${requestId}/intent.json`)).toBe(false);
+      expect(mock.files.has(`${machineDocumentRoot(projectB)}/requests/${requestId}/receipt.json`)).toBe(false);
+      expect(mock.uploadCalls).toEqual(uploadsBeforeRefusal);
+      const durableState = await runInDurableObject(guardB, async (instance, ctx) => {
+        const runtime = (instance as unknown as { persistence: ConstructorParameters<typeof ExecutionJournal>[0] }).persistence;
+        return {
+          admission: await new ExecutionJournal(runtime, projectB, "document", requestId).readAdmission(),
+          documentRequest: ctx.storage.sql.exec("SELECT request_id FROM document_requests WHERE request_id = ?", requestId).toArray(),
+          admissionProof: ctx.storage.sql.exec("SELECT request_id FROM admission_proofs WHERE kind = ? AND request_id = ?", "document", requestId).toArray()
+        };
+      });
+      expect(durableState).toEqual({ admission: null, documentRequest: [], admissionProof: [] });
+    };
+    await assertNoDurableWork(crossProjectRequest.request_id);
+
+    const forgedContextRequest = { ...crossProjectRequest, request_id: "DOCREQ-FORGED-CONTEXT-9988-0001" };
+    const forgedContextEnvelope = {
+      ...encodeAdmission(forgedContextRequest, contextA),
+      mutation_context: { ...contextA, project_id: projectB }
+    };
+    const forgedContextResponse = await worker.fetch(new Request("https://example.com/v1/documents", {
+      method: "POST", headers, body: JSON.stringify(forgedContextEnvelope)
+    }), testEnv, createExecutionContext());
+    expect(forgedContextResponse.status).toBe(428);
+    await expect(forgedContextResponse.json()).resolves.toEqual({ error: "mutation_context_invalid" });
+    await assertNoDurableWork(forgedContextRequest.request_id);
+
+    const clientRulesetRequest = { ...crossProjectRequest, request_id: "DOCREQ-CLIENT-RULESET-9988-0001" };
+    const clientRulesetEnvelope = {
+      ...encodeAdmission(clientRulesetRequest, contextA),
+      ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 1 }
+    };
+    const clientRulesetResponse = await worker.fetch(new Request("https://example.com/v1/documents", {
+      method: "POST", headers, body: JSON.stringify(clientRulesetEnvelope)
+    }), testEnv, createExecutionContext());
+    expect(clientRulesetResponse.status).toBe(428);
+    await expect(clientRulesetResponse.json()).resolves.toEqual({ error: "mutation_context_invalid" });
+    await assertNoDurableWork(clientRulesetRequest.request_id);
+
+    const clientPermitRequest = { ...crossProjectRequest, request_id: "DOCREQ-CLIENT-PERMIT-9988-0001" };
+    const clientPermitEnvelope = {
+      ...encodeAdmission(clientPermitRequest, contextA),
+      permit: { project_id: projectB, ruleset: { digest: "b".repeat(64), rules: [] }, token: "client-selected" }
+    };
+    const clientPermitResponse = await worker.fetch(new Request("https://example.com/v1/documents", {
+      method: "POST", headers, body: JSON.stringify(clientPermitEnvelope)
+    }), testEnv, createExecutionContext());
+    expect(clientPermitResponse.status).toBe(428);
+    await expect(clientPermitResponse.json()).resolves.toEqual({ error: "mutation_context_invalid" });
+    await assertNoDurableWork(clientPermitRequest.request_id);
+
+    const acceptedRequest = { ...crossProjectRequest, request_id: "DOCREQ-CANONICAL-PROJECT-B-0001", logical_path: "context/canonical-project-b.md" };
+    const accepted = await worker.fetch(new Request("https://example.com/v1/documents", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(encodeAdmission(acceptedRequest, contextB))
+    }), testEnv, createExecutionContext());
+    expect(accepted.status).toBe(200);
+    const acceptedReceipt = await accepted.json<Record<string, unknown>>();
+    expect(acceptedReceipt).toMatchObject({
+      request_id: acceptedRequest.request_id,
+      project_id: projectB,
+      status: "committed"
+    });
+    const success = await runInDurableObject(guardB, async (instance, ctx) => {
+      const runtime = (instance as unknown as { persistence: ConstructorParameters<typeof ExecutionJournal>[0] }).persistence;
+      return {
+        admission: await new ExecutionJournal(runtime, projectB, "document", acceptedRequest.request_id).readAdmission(),
+        documentRequest: ctx.storage.sql.exec("SELECT request_id FROM document_requests WHERE request_id = ?", acceptedRequest.request_id).toArray()
+      };
+    });
+    expect(success.admission?.admission).toMatchObject({ project_id: projectB, request_id: acceptedRequest.request_id, operation: "working.write" });
+    expect(success.documentRequest).toHaveLength(1);
+    const receiptPath = `${machineDocumentRoot(projectB)}/requests/${acceptedRequest.request_id}/receipt.json`;
+    const durableReceipt = JSON.parse(mock.files.get(receiptPath)!) as { receipt_json: string };
+    expect(JSON.parse(durableReceipt.receipt_json)).toEqual(acceptedReceipt);
+    expect(mock.files.get(workspaceManagedDocumentPath(projectB, recordsB[0]!.state.slug, "working", acceptedRequest.logical_path)))
+      .toBe(`---\nproject_id: ${projectB}\ndocument_id: ${String(acceptedReceipt.document_id)}\n---\n${acceptedRequest.content}`);
   });
 });

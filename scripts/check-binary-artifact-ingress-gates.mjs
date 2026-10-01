@@ -38,7 +38,7 @@ const reviewJournal = await readFile(new URL("../src/artifacts/review-journal.ts
 requireMatch(config, /"PROJECT_OS_REVIEW_CANDIDATE_INGRESS_MODE"\s*:\s*"off"/, "review candidate ingress must default off");
 requireMatch(config, /"PROJECT_OS_REVIEW_CANDIDATE_CAPABILITY"\s*:\s*""/, "repository must not activate a review capability");
 requireBefore(reviewGuard, "reviewJournal.terminal(artifact)", "binaryArtifactPolicyViolation(this.env, artifact)", "review exact terminal recovery must precede authorization for new effects");
-requireBefore(reviewGuard, "reviewJournal.recordTerminal(request, receipt)", "this.repository.writeArtifactReceipt(receipt)", "review terminal journal must precede receipt and local state");
+requireBefore(reviewGuard, "reviewJournal.recordTerminal(request, projected)", "this.repository.writeArtifactReceipt(canonical)", "review terminal journal must precede receipt and local state");
 requireMatch(reviewGuard, /PROJECT_OS_MUTATION_GATE_MODE !== "enforce"/, "review requires enforced MutationGate");
 requireMatch(reviewJournal, /reviewReceiptMatchesObservation/, "review observation must retain the exact frozen provider identity");
 

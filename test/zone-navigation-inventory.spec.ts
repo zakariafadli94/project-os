@@ -793,6 +793,166 @@ describe("ZoneNavigationInventory", () => {
     expect(await h.inventory.verifyEntry(resumed.entries[0], budget(12))).toBe(true);
   });
 
+  it("adopts two independent ordinary active heads in one bounded slice", async () => {
+    const h = harness();
+    const originalMetadata = h.runtime.objects.getMetadata.bind(h.runtime.objects);
+    let active = 0;
+    let peak = 0;
+    h.runtime.objects.getMetadata = async (path) => {
+      if (!path.includes("/WORKING/")) return originalMetadata(path);
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      try { return await originalMetadata(path); }
+      finally { active -= 1; }
+    };
+    const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222"];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`);
+    }
+    const slice = budget(32);
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: slice });
+    expect(page.entries.map((entry) => entry.resource_id)).toEqual(ids.map((id) => `head:${id}`));
+    expect(page.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
+    expect(peak).toBe(2);
+    expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+  });
+
+  it("resumes the saved active-head suffix without listing the provider page again", async () => {
+    const h = harness();
+    const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222", "DOC-333333333333333333333333"];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`);
+    }
+    const first = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(32) });
+    expect(first.entries.map((entry) => entry.resource_id)).toEqual(ids.slice(0, 2).map((id) => `head:${id}`));
+    const originalList = h.runtime.pagedListing!.listPage;
+    h.runtime.pagedListing!.listPage = async (input) => {
+      if (input.path === `${machineDocumentRoot(projectId)}/heads`) throw new Error("saved_page_relisted");
+      return originalList(input);
+    };
+    const second = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: first.next_cursor, limit: 8, budget: budget(32) });
+    expect(second.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[2]}`]);
+    expect(second.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
+  });
+
+  it("keeps the first unfinished head in the cursor after a transient second-sidecar failure", async () => {
+    const h = harness();
+    const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222"];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`);
+    }
+    const secondSidecar = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/${await sha256Text(`head:${ids[1]}`)}.json`;
+    const originalWrite = h.runtime.objects.createText.bind(h.runtime.objects);
+    let injected = false;
+    h.runtime.objects.createText = async (path, content) => {
+      if (path === secondSidecar && !injected) {
+        injected = true;
+        throw new ProviderOperationError("temporary Dropbox failure", true);
+      }
+      return originalWrite(path, content);
+    };
+    const first = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(32) });
+    expect(injected).toBe(true);
+    expect(first.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[0]}`]);
+    const second = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: first.next_cursor, limit: 8, budget: budget(32) });
+    expect(second.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[1]}`]);
+  });
+
+  it("preserves checkpoint budget after a late nonretryable second-sidecar conflict", async () => {
+    const h = harness();
+    const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222"];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`);
+    }
+    const secondSidecar = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/${await sha256Text(`head:${ids[1]}`)}.json`;
+    const originalCreate = h.runtime.objects.createText.bind(h.runtime.objects);
+    let injected = false;
+    h.runtime.objects.createText = async (path, content) => {
+      if (path === secondSidecar && !injected) {
+        injected = true;
+        throw new ProviderOperationError("sidecar conflict", false);
+      }
+      return originalCreate(path, content);
+    };
+    const short = budget(29);
+    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: short }))
+      .rejects.toThrow("sidecar conflict");
+    expect(injected).toBe(true);
+    expect(short.calls_left).toBeGreaterThanOrEqual(4);
+    const retry = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(32) });
+    expect(retry.entries.map((entry) => entry.resource_id)).toEqual(ids.map((id) => `head:${id}`));
+  });
+
+  it("classifies a malformed first observation without stalling its following head", async () => {
+    const h = harness();
+    const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222"];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`);
+    }
+    const headPath = machineDocumentHeadPath(projectId, ids[0]);
+    const head = JSON.parse(h.files.get(headPath)!.content);
+    delete head.provider.working.rev;
+    h.put(headPath, JSON.stringify(head));
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(32) });
+    expect(page.gaps.some((gap) => gap.resource_id === `head:${ids[0]}`)).toBe(true);
+    expect(page.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[1]}`]);
+  });
+
+  it("does not create a new tombstone for an unverified visible file", async () => {
+    const h = harness();
+    const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222"];
+    const paths = [];
+    for (const [index, id] of ids.entries()) {
+      paths.push(await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`));
+    }
+    h.put(paths[0], "wrong bytes", "id:visible");
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(32) });
+    const sidecar = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/${await sha256Text(`head:${ids[0]}`)}.json`;
+    expect(page.gaps).toContainEqual({ resource_id: `head:${ids[0]}`, code: "active_provider_content_unverified" });
+    expect(h.files.has(sidecar)).toBe(false);
+    expect(page.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[1]}`]);
+  });
+
+  it("keeps legacy immutable-payload proofs on the sequential path", async () => {
+    const h = harness();
+    const ids = ["DOC-111111111111111111111111", "DOC-222222222222222222222222"];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`);
+    }
+    const versionPath = machineDocumentVersionPath(projectId, ids[0], `VER-REQ-${ids[0].slice(4)}`);
+    const version = JSON.parse(h.files.get(versionPath)!.content);
+    version.schema_version = "2.0";
+    delete version.content_sha256;
+    delete version.provider_file_id;
+    delete version.provider_rev;
+    delete version.provider_path;
+    delete version.size;
+    version.provider_evidence = {
+      provider_id: "test", object_id: "id:visible", revision_token: "rev-0",
+      path: `${workspaceProjectRoot(projectId, slug)}/WORKING/draft-0.md`,
+      integrity_hash: { algorithm: "dropbox-content-hash", value: "d".repeat(64) }, size: 6
+    };
+    h.put(version.immutable_payload_path, "body 0");
+    h.put(versionPath, JSON.stringify(version));
+    const originalMetadata = h.runtime.objects.getMetadata.bind(h.runtime.objects);
+    let active = 0;
+    let peak = 0;
+    h.runtime.objects.getMetadata = async (path) => {
+      if (!path.includes("/WORKING/")) return originalMetadata(path);
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      try { return await originalMetadata(path); }
+      finally { active -= 1; }
+    };
+    const slice = budget(50);
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: slice });
+    expect(page.entries).toHaveLength(2);
+    expect(peak).toBe(1);
+    expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+  });
+
   it("avoids a null catalog write for a clean inactive head but clears a stale catalog row", async () => {
     const h = harness();
     const visiblePath = await addWorkingHead(h, "current body");

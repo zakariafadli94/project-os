@@ -52,6 +52,7 @@ interface InitialHeadPageCursor {
   provider_cursor: string | null;
   listing_limit: number;
 }
+interface InitialHeadReadCache { head?: string | null; version?: { id: string; raw: string | null } }
 
 /** Canonical, bounded source adapter used by ZoneNavigationEngine. */
 export class ZoneNavigationInventory implements NavigationInventoryPort {
@@ -231,8 +232,39 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     }
     const entries: NavigationInventoryEntry[] = [];
     const gaps: NavigationCoverageGap[] = [];
+    const headCache = new Map<string, InitialHeadReadCache>();
     let offset = 0;
-    for (const item of listedEntries) {
+    while (offset < listedEntries.length) {
+      const item = listedEntries[offset];
+      // Only ordinary, identity-matching active heads can share a slice. The
+      // preflight spends four calls and the two unchanged proof/CAS chains
+      // need at most eighteen more, including a conditional stale tombstone;
+      // canStartEffect preserves the checkpoint
+      // reserve before either chain begins. Mismatches retain the solo path.
+      if (persistCatalog && offset + 1 < listedEntries.length && budget.canStartEffect(22)) {
+        const pair = await this.ordinaryInitialPair(projectId, zone, listedEntries.slice(offset, offset + 2), snapshotId, budget, headCache);
+        if (pair) {
+          let failed = false;
+          for (const result of pair) {
+            if (result.status === "rejected") {
+              if (isBudgetError(result.reason) || isRetryableProviderError(result.reason)) { failed = true; break; }
+              // A late CAS rejection can leave too little budget for both a
+              // compensating tombstone and the engine checkpoint. Preserve
+              // the prior cursor and surface the original conflict instead.
+              if (!budget.canStartEffect(5)) throw result.reason;
+              const id = listedEntries[offset].name.slice(0, -5);
+              const resourceId = `head:${id}`;
+              await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+              gaps.push({ resource_id: resourceId, code: classifyGap(result.reason) });
+            } else if (result.value.entry) {
+              entries.push(result.value.entry);
+            } else if (result.value.gap) gaps.push(result.value.gap);
+            offset += 1;
+          }
+          if (failed) break;
+          continue;
+        }
+      }
       if (item.kind !== "file" || !item.path) {
         if (!persistCatalog) gaps.push({ resource_id: item.name || "head-listing-entry", code: "head_listing_entry_invalid" });
         offset += 1;
@@ -258,7 +290,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
         break;
       }
       try {
-        const resolved = await this.resolveHead(projectId, zone, resourceId, budget, true);
+        const resolved = await this.resolveHead(projectId, zone, resourceId, budget, true, headCache.get(match[1]));
         if (resolved.gap) gaps.push(resolved.gap);
         if (resolved.entry) {
           if (persistCatalog) await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
@@ -273,7 +305,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
           }
         }
       } catch (error) {
-        if (isBudgetError(error)) {
+        if (isBudgetError(error) || isRetryableProviderError(error)) {
           if (offset === 0 && reusingSavedListing) throw error;
           break;
         }
@@ -295,6 +327,80 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       snapshot_id: snapshotId,
       next_cursor: nextCursor
     };
+  }
+
+  private async ordinaryInitialPair(
+    projectId: string, zone: NavigationZone, items: ProviderEntry[], snapshotId: string, budget: SliceBudget,
+    headCache: Map<string, InitialHeadReadCache>
+  ): Promise<PromiseSettledResult<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap }> [] | null> {
+    const ids = items.map((item) => /^(DOC-[A-F0-9]{24})\.json$/.exec(item.name)?.[1]);
+    if (ids.some((id, index) => !id || items[index].kind !== "file" || items[index].path !== machineDocumentHeadPath(projectId, id))) return null;
+    const readHead = async (id: string) => {
+      const cached = headCache.get(id);
+      if (cached && "head" in cached) return cached.head!;
+      charge(budget);
+      const raw = await this.runtime.objects.readText(machineDocumentHeadPath(projectId, id));
+      headCache.set(id, { ...cached, head: raw });
+      return raw;
+    };
+    let rawHeads: (string | null)[];
+    try { rawHeads = await Promise.all(ids.map((id) => readHead(id!))); }
+    catch { return null; }
+    if (rawHeads.some((raw) => raw === null)) return null;
+    let heads: CurrentManagedDocumentHead[];
+    try { heads = rawHeads.map((raw) => readManagedDocumentHead(JSON.parse(raw!)).head); }
+    catch { return null; }
+    const pointers = heads.map((head) => activePointer(head, zone));
+    if (heads.some((head, index) => head.project_id !== projectId || head.document_id !== ids[index] || head.reconciliation_status !== "clean"
+      || !pointers[index].versionId || !pointers[index].observation)) return null;
+    const readVersion = async (id: string, versionId: string) => {
+      const cached = headCache.get(id);
+      if (cached?.version?.id === versionId) return cached.version.raw;
+      charge(budget);
+      const raw = await this.runtime.objects.readText(machineDocumentVersionPath(projectId, id, versionId));
+      headCache.set(id, { ...cached, version: { id: versionId, raw } });
+      return raw;
+    };
+    let rawVersions: (string | null)[];
+    try { rawVersions = await Promise.all(ids.map((id, index) => readVersion(id!, pointers[index].versionId!))); }
+    catch { return null; }
+    if (rawVersions.some((raw) => raw === null)) return null;
+    let versions: CurrentDocumentVersionRecord[];
+    try { versions = rawVersions.map((raw) => readDocumentVersionRecord(JSON.parse(raw!)).record); }
+    catch { return null; }
+    let observations: ReturnType<typeof normalizeObservation>[];
+    try { observations = pointers.map((pointer) => normalizeObservation(pointer.observation!)); }
+    catch { return null; }
+    if (versions.some((version, index) => {
+      const head = heads[index];
+      const pointer = pointers[index];
+      const observation = observations[index];
+      return version.project_id !== projectId || version.document_id !== ids[index] || version.version_id !== pointer.versionId
+        || version.kind !== head.kind || version.stage !== pointer.stage || version.logical_path !== head.logical_path
+        || version.provider_file_id !== observation.object_id || version.provider_rev !== observation.revision_token
+        || version.provider_path !== observation.path || version.size !== observation.size
+        || !observation.path.endsWith(`/${zone}/${version.logical_path}`)
+        || !(version.content_sha256 || version.provider_evidence?.integrity_hash.algorithm === "sha256");
+    })) return null;
+    requireBudget(budget, 18);
+    return Promise.allSettled(ids.map(async (id, index) => {
+      const observation = observations[index];
+      const version = versions[index];
+      const resourceId = `head:${id}`;
+      const verified = await this.readVisible(observation.path, observation, version, budget);
+      if (!verified) {
+        const prior = await this.sources.readCatalogEntry(projectId, zone, resourceId, budget);
+        if (prior) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        return { entry: null, gap: { resource_id: resourceId, code: "active_provider_content_unverified" } };
+      }
+      const entry = navigationInventoryEntrySchema.parse({
+        project_id: projectId, zone, resource_id: resourceId, version: pointers[index].versionId,
+        logical_path: version.logical_path, path: observation.path,
+        expected: { object_id: observation.object_id, revision_token: observation.revision_token, content_sha256: verified.sha256, size: verified.size }
+      });
+      await this.sources.writeCatalogEntry(entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+      return { entry };
+    }));
   }
 
   private async packagePage(projectId: string, zone: NavigationZone, cursor: string | null, snapshotId: string, budget: SliceBudget, persistCatalog = true) {
@@ -880,12 +986,12 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     };
   }
 
-  private async resolveHead(projectId: string, zone: NavigationZone, resourceId: string, budget: SliceBudget, reserveActiveProof = false): Promise<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap }> {
+  private async resolveHead(projectId: string, zone: NavigationZone, resourceId: string, budget: SliceBudget, reserveActiveProof = false, cached?: InitialHeadReadCache): Promise<{ entry: NavigationInventoryEntry | null; gap?: NavigationCoverageGap }> {
     const match = /^head:(DOC-[A-F0-9]{24})$/.exec(resourceId);
     if (!match) return { entry: null, gap: { resource_id: resourceId, code: "invalid_head_resource_id" } };
     const documentId = match[1];
-    charge(budget);
-    const rawHead = await this.runtime.objects.readText(machineDocumentHeadPath(projectId, documentId));
+    if (!cached || !("head" in cached)) charge(budget);
+    const rawHead = cached && "head" in cached ? cached.head! : await this.runtime.objects.readText(machineDocumentHeadPath(projectId, documentId));
     if (rawHead === null) return { entry: null };
     const head = readManagedDocumentHead(JSON.parse(rawHead)).head;
     if (head.project_id !== projectId || head.document_id !== documentId) throw new Error("head_binding_mismatch");
@@ -895,8 +1001,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     if (!pointer.versionId || !pointer.observation) return { entry: null, gap: { resource_id: resourceId, code: "active_provider_binding_missing" } };
     if (reserveActiveProof) requireBudget(budget, MAX_INITIAL_HEAD_PROVIDER_CALLS - 1);
     const observation = normalizeObservation(pointer.observation);
-    charge(budget);
-    const rawVersion = await this.runtime.objects.readText(machineDocumentVersionPath(projectId, documentId, pointer.versionId));
+    if (cached?.version?.id !== pointer.versionId) charge(budget);
+    const rawVersion = cached?.version?.id === pointer.versionId ? cached.version.raw : await this.runtime.objects.readText(machineDocumentVersionPath(projectId, documentId, pointer.versionId));
     if (rawVersion === null) return { entry: null, gap: { resource_id: resourceId, code: "active_version_missing" } };
     const version = readDocumentVersionRecord(JSON.parse(rawVersion)).record;
     if (version.project_id !== projectId || version.document_id !== documentId || version.version_id !== pointer.versionId || version.kind !== head.kind || version.stage !== pointer.stage || version.logical_path !== head.logical_path) {

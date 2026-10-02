@@ -10,13 +10,13 @@ import {
 } from "../domain/materialization";
 import type { ProjectState } from "../domain/project-state";
 import { archiveProjectRoot, machineMaterializationRecordPath, workspaceProjectRoot } from "../persistence/layout";
-import { projectionIndexRootHash } from "./hash";
+import { projectionIndexRootHash, sha256Canonical } from "./hash";
 import {
   planProjection,
   type ProjectionBaseline as PlannerBaseline,
   type ProjectionPlan
 } from "./planner";
-import type { FinalVerificationItem, MaterializationLedgerStatus, MaterializationRepairScanCheckpoint, MaterializationTarget } from "./ledger";
+import type { FinalVerificationItem, MaterializationLedgerStatus, MaterializationRepairScanCheckpoint, MaterializationTarget, MaterializationWorkPlanCheckpoint } from "./ledger";
 import { MaterializationOutputConflictError, type ProjectionWriteOutcome } from "./writer";
 import type { SliceBudget } from "../convergence/contract";
 import type { PackageNavigation } from "../domain/document-package";
@@ -53,6 +53,7 @@ export interface MaterializationLedgerPort {
   requestTarget(target: { revision: number; projection_version: number }): void;
   beginNextTarget(): MaterializationTarget | null;
   recordVerifiedOutput(key: string, evidence: ProjectionOutputEvidence): void;
+  checkpointActiveWorkPlan?(plan: MaterializationWorkPlanCheckpoint): void;
   attemptOutputs(): Map<string, ProjectionOutputEvidence>;
   finalVerificationActive(): boolean;
   beginFinalVerification(items: readonly FinalVerificationItem[]): void;
@@ -384,6 +385,23 @@ export class MaterializationCoordinator {
         ? { projection_version: baseline.head.projection_version, outputs: baseline.outputs }
         : null;
       plan = await planProjection(record, plannerBaseline, target.projection_version, await this.repository.readPackageNavigation?.(this.projectId) ?? {});
+      const currentPlan = plan;
+      if (!currentPlan) throw new Error("Materialization plan is unavailable");
+      await this.ledger.checkpointActiveWorkPlan?.({
+        target_revision: target.revision,
+        projection_version: target.projection_version,
+        writes: [...currentPlan.changed_outputs.values()].map((output) => ({
+          key: output.key,
+          input_hash: output.input_hash,
+          content_hash: output.content_hash,
+          source_revision: output.source_revision
+        })).sort((left, right) => left.key.localeCompare(right.key)),
+        removals: await Promise.all([...currentPlan.removed_outputs].sort().map(async (key) => {
+          const evidence = currentPlan.removed_output_evidence?.get(key);
+          if (!evidence) throw new Error(`Materialization removal lacks exact baseline evidence: ${key}`);
+          return { key, fingerprint: await sha256Canonical(evidence) };
+        }))
+      });
       const attempts = this.ledger.attemptOutputs();
       const archived = record.state.status === "archived";
       const activeRoot = this.workspaceRootFor(record.state);

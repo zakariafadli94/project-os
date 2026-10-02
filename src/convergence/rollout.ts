@@ -16,6 +16,8 @@ export interface RolloutEvidence {
 
 export interface CapacityObservation {
   queued_outputs: number;
+  /** Bounded admitted canonical target slots not yet replaced by an exact plan; not a physical-output estimate. */
+  pending_uncompiled_targets?: number;
   oldest_pending_seconds: number;
   continuation_available: boolean;
   within_qualified_envelope: boolean;

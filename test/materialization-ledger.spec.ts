@@ -99,6 +99,79 @@ describe("MaterializationLedger", () => {
     });
   });
 
+  it("counts only exact active-plan writes still unverified and final checks still pending", async () => {
+    await withLedger("PRJ-3421", (ledger) => {
+      ledger.requestTarget({ revision: 4, projection_version: 2 });
+      ledger.beginNextTarget();
+      const plan = {
+        target_revision: 4,
+        projection_version: 2,
+        writes: [
+          { key: "global:STATE", input_hash: "a".repeat(64), content_hash: "a".repeat(64), source_revision: 4 },
+          { key: "global:HANDOFF", input_hash: "f".repeat(64), content_hash: "f".repeat(64), source_revision: 4 }
+        ],
+        removals: [{ key: "deliverable:DEL-OLD3421", fingerprint: "e".repeat(64) }]
+      };
+      ledger.checkpointActiveWorkPlan(plan);
+      ledger.recordVerifiedOutput("global:STATE", evidence("STATE.md", "a", 4));
+      ledger.recordVerifiedOutput("global:HANDOFF", evidence("HANDOFF.md", "e", 4));
+
+      expect(ledger.status()).toMatchObject({ active_work_plan_state: "ready",
+        active_work: { phase: "writing", remaining_write_count: 1, remaining_removal_count: 1,
+          final_verification_pending_count: 0, remaining_action_count: 2 } });
+
+      ledger.recordVerifiedOutput("global:HANDOFF", evidence("HANDOFF.md", "f", 4));
+      ledger.beginFinalVerification([
+        { key: "global:STATE", expected: "present", evidence: evidence("STATE.md", "a", 4) },
+        { key: "deliverable:DEL-OLD3421", expected: "absent", evidence: evidence("DELIVERABLES/OLD.md", "e", 3) }
+      ]);
+      ledger.completeFinalVerification(["global:STATE"]);
+      expect(ledger.status().active_work).toMatchObject({ phase: "final_verification",
+        remaining_write_count: 0, remaining_removal_count: 0,
+        final_verification_pending_count: 1, remaining_action_count: 2 });
+      ledger.completeFinalVerification(["deliverable:DEL-OLD3421"]);
+      expect(ledger.status().active_work).toMatchObject({ final_verification_pending_count: 0, remaining_action_count: 1 });
+
+      ledger.failActive("retry under a fresh epoch");
+      ledger.beginNextTarget();
+      expect(ledger.status()).toMatchObject({ active_work_plan_state: "missing", active_work: null, attempt_output_count: 0 });
+    });
+  });
+
+  it("invalidates work-plan evidence when its target binding differs", async () => {
+    await withLedger("PRJ-3422", (ledger) => {
+      ledger.requestTarget({ revision: 4, projection_version: 2 });
+      ledger.beginNextTarget();
+      expect(() => ledger.checkpointActiveWorkPlan({ target_revision: 5, projection_version: 2, writes: [], removals: [] }))
+        .toThrow("Materialization work plan target mismatch");
+      expect(ledger.status()).toMatchObject({ active_work_plan_state: "invalid", active_work: null });
+    });
+  });
+
+  it("accepts an exact writing-phase replan without reusing mismatched attempt evidence", async () => {
+    await withLedger("PRJ-3423", (ledger) => {
+      ledger.requestTarget({ revision: 4, projection_version: 2 });
+      ledger.beginNextTarget();
+      ledger.checkpointActiveWorkPlan({ target_revision: 4, projection_version: 2, writes: [
+        { key: "global:STATE", input_hash: "a".repeat(64), content_hash: "a".repeat(64), source_revision: 4 }
+      ], removals: [] });
+      ledger.recordVerifiedOutput("global:STATE", evidence("STATE.md", "a", 4));
+
+      ledger.checkpointActiveWorkPlan({ target_revision: 4, projection_version: 2, writes: [
+        { key: "global:STATE", input_hash: "c".repeat(64), content_hash: "c".repeat(64), source_revision: 4 }
+      ], removals: [] });
+      expect(ledger.status()).toMatchObject({ active_work_plan_state: "ready",
+        active_work: { remaining_write_count: 1, remaining_action_count: 1 } });
+
+      ledger.beginFinalVerification([
+        { key: "global:STATE", expected: "present", evidence: evidence("STATE.md", "c", 4) }
+      ]);
+      expect(() => ledger.checkpointActiveWorkPlan({ target_revision: 4, projection_version: 2, writes: [], removals: [] }))
+        .toThrow("Materialization work plan changed during final verification");
+      expect(ledger.status()).toMatchObject({ active_work_plan_state: "invalid", active_work: null });
+    });
+  });
+
   it("persists managed-zone bootstrap within an active target without carrying it into the next target", async () => {
     await withLedger("PRJ-3412", (ledger) => {
       ledger.requestTarget({ revision: 1, projection_version: 3 });

@@ -9,6 +9,7 @@ import { sha256Text } from "../src/documents/hash";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
 import { MaterializationLedger } from "../src/materialization/ledger";
+import { CURRENT_PROJECTION_VERSION } from "../src/domain/materialization";
 import { commitFixture } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
 import {
@@ -98,7 +99,7 @@ describe("convergence rollout gates", () => {
     const progress = initialProgress(projectId, pendingAt, "capacity-floor");
     progress.obligations["b".repeat(64)] = {
       id: "b".repeat(64), layer: "human_handoff", from_revision: 0,
-      target: { revision: 1, projection_version: 3 }, incident: 1,
+      target: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION }, incident: 1,
       state: "retry_wait", first_pending_at: pendingAt,
       next_attempt_at: new Date(Date.now() + 300_000).toISOString(), failure_count: 1,
       last_attempt_number: 1, last_closed_attempt_number: 1, last_verified_at: null,

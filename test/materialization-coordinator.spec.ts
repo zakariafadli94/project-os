@@ -179,6 +179,7 @@ class FakeLedger implements MaterializationLedgerPort {
   lastError: string | null = null;
   nextCoalesced: number[] = [];
   repairScan: MaterializationRepairScanCheckpoint | null = null;
+  workPlan: unknown = null;
 
   immutableDerivativesThrough() { return 0; }
   markImmutableDerivativesThrough(_revision: number) {}
@@ -196,6 +197,7 @@ class FakeLedger implements MaterializationLedgerPort {
     return this.active;
   }
   recordVerifiedOutput(key: string, evidence: ProjectionOutputEvidence) { this.attempts.set(key, evidence); }
+  checkpointActiveWorkPlan(plan: unknown) { this.workPlan = structuredClone(plan); }
   attemptOutputs() { return new Map(this.attempts); }
   finalVerificationActive() { return this.pendingFinalVerification !== null; }
   beginFinalVerification(items: readonly FinalVerificationItem[]) {
@@ -262,12 +264,14 @@ class FakeWriter implements ProjectionWriterPort {
   verifiedOutputKeys: string[][] = [];
   failVerificationOnCall: number | null = null;
   onVerifyOutputs: (() => void) | null = null;
+  onMaterialize: (() => void) | null = null;
 
   async materialize(plan: ProjectionPlan, options: {
     workspaceRoot: string;
     alreadyVerified?: ReadonlyMap<string, ProjectionOutputEvidence>;
     onOutputVerified?: (key: string, evidence: ProjectionOutputEvidence) => void | Promise<void>;
   }) {
+    this.onMaterialize?.();
     this.calls += 1;
     this.plans.push(plan);
     const keys: string[] = [];
@@ -366,6 +370,27 @@ function coordinator(
 }
 
 describe("MaterializationCoordinator", () => {
+  it("checkpoints only compact target-bound plan evidence before output effects", async () => {
+    const record = createFixture();
+    const repo = new FakeRepository();
+    repo.commits.set(record.new_revision, record);
+    const { value, ledger, writer } = coordinator(repo);
+    writer.onMaterialize = () => {
+      expect(ledger.workPlan).toMatchObject({ target_revision: record.new_revision, projection_version: CURRENT_PROJECTION_VERSION });
+    };
+
+    value.requestTarget(record.new_revision);
+    await value.runNext();
+
+    const plan = writer.plans[0]!;
+    const checkpoint = ledger.workPlan as { writes: Array<Record<string, unknown>>; removals: Array<Record<string, unknown>> };
+    expect(checkpoint.writes).toEqual([...plan.changed_outputs.values()].map((output) => ({
+      key: output.key, input_hash: output.input_hash, content_hash: output.content_hash, source_revision: output.source_revision
+    })).sort((left, right) => left.key.localeCompare(right.key)));
+    expect(checkpoint.removals).toEqual([]);
+    expect(checkpoint.writes.every((item) => !Object.hasOwn(item, "content"))).toBe(true);
+  });
+
   it("sizes final verification independently from the following publication slice", () => {
     const budget = createSliceBudget(() => 0, new AbortController().signal);
     expect(selectFinalVerificationBatchSize(budget, 6)).toBe(6);

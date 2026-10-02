@@ -7,7 +7,7 @@ import {
 } from "../convergence/budget";
 import { ConvergenceEngine } from "../convergence/engine";
 import { unknownHealth } from "../convergence/health";
-import type { ConvergenceHealth } from "../convergence/contract";
+import type { ConvergenceHealth, Progress } from "../convergence/contract";
 import { ConvergenceJournal } from "../convergence/journal";
 import { convergenceModeForProject, type CapacityObservation } from "../convergence/rollout";
 import { deploymentIdentity } from "../deployment/identity";
@@ -69,6 +69,10 @@ interface CapacityReservationRequest {
   operation: string;
   resources: RuleResource[];
   dependency_classification: "resource_bound" | "unknown";
+}
+
+interface UncompiledTargetProof {
+  first_pending_at: string;
 }
 
 interface NavigationWorkSlice {
@@ -866,6 +870,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       if (snapshot.reservations.length > 0 && !replay) return null;
       return {
         queued_outputs: replay ? snapshot.reservations[0]!.output_cost : 0,
+        pending_uncompiled_targets: 0,
         oldest_pending_seconds: 0,
         continuation_available: continuationAvailable,
         within_qualified_envelope: true,
@@ -876,13 +881,29 @@ export class MaterializationGuard extends DurableObject<Env> {
       };
     }
     const status = snapshot.status;
+    if (status.active !== null && (status.active_work_plan_state !== "ready" || !status.active_work)) return null;
+    const requestedCoveredByActive = status.requested !== null && (
+      status.active !== null
+      && status.active.projection_version === status.requested.projection_version
+      && status.active.revision >= status.requested.revision
+    );
+    const requestedCoveredByHead = status.requested !== null && status.head !== null
+      && status.head.projection_version === status.requested.projection_version
+      && status.head.revision >= status.requested.revision;
+    const uncompiledTargetProof = status.requested !== null && !requestedCoveredByActive && !requestedCoveredByHead
+      ? proveUncompiledTarget(status.requested, progress, snapshot.reservations)
+      : null;
+    if (status.requested !== null && !requestedCoveredByActive && !requestedCoveredByHead && !uncompiledTargetProof) return null;
+    const pendingUncompiledTargets = uncompiledTargetProof ? 1 : 0;
     const obligations = Object.values(progress.obligations).filter((obligation) => obligation.state !== "verified");
     const work = classifyCapacityWork(obligations, Date.now());
     const knownRevision = Math.max(progress.canonical_observed_revision, status.head?.revision ?? 0,
       status.active?.revision ?? 0, status.requested?.revision ?? 0,
       ...snapshot.reservations.filter((reservation) => reservation.state !== "reserved" && reservation.target_revision !== null)
         .map((reservation) => reservation.target_revision as number));
-    if (expectedCanonicalRevision !== undefined && expectedCanonicalRevision !== knownRevision) return null;
+    if (expectedCanonicalRevision !== undefined && expectedCanonicalRevision !== knownRevision) {
+      return null;
+    }
     if (progress.canonical_observed_revision < (status.head?.revision ?? 0)) return null;
     const representedRevision = Math.max(progress.canonical_observed_revision, status.head?.revision ?? 0,
       status.active?.revision ?? 0, status.requested?.revision ?? 0);
@@ -891,16 +912,19 @@ export class MaterializationGuard extends DurableObject<Env> {
       && reservation.target_revision > representedRevision);
     const inFlightEffects = snapshot.reservations.filter((reservation) => reservation.reservation_kind !== "transaction");
     const queuedOutputs = Math.max(work.executable.length,
-      status.active === null ? 0 : status.attempt_output_count,
-      status.requested === null ? 0 : Math.max(1, status.output_count)) + unrepresented.length
+      (status.active_work?.remaining_action_count ?? 0) + pendingUncompiledTargets) + unrepresented.length
         + inFlightEffects.reduce((total, reservation) => total + reservation.output_cost, 0);
-    const oldestPendingSeconds = Math.max(work.oldest_pending_seconds, ...[...unrepresented, ...inFlightEffects].map((reservation) =>
-      Math.max(0, (Date.now() - Date.parse(reservation.created_at)) / 1_000)));
+    const uncompiledPendingSeconds = uncompiledTargetProof?.first_pending_at
+      ? Math.max(0, (Date.now() - Date.parse(uncompiledTargetProof.first_pending_at)) / 1_000) : 0;
+    const oldestPendingSeconds = Math.max(work.oldest_pending_seconds, uncompiledPendingSeconds,
+      ...[...unrepresented, ...inFlightEffects].map((reservation) =>
+        Math.max(0, (Date.now() - Date.parse(reservation.created_at)) / 1_000)));
     const continuationRequired = status.active !== null || status.requested !== null
-      || work.executable.length > 0 || unrepresented.length > 0 || inFlightEffects.length > 0;
+      || pendingUncompiledTargets > 0 || work.executable.length > 0 || unrepresented.length > 0 || inFlightEffects.length > 0;
     const blocking = work.terminal[0] ?? work.executable[0] ?? obligations[0] ?? null;
     return {
-      queued_outputs: queuedOutputs, oldest_pending_seconds: oldestPendingSeconds,
+      queued_outputs: queuedOutputs, pending_uncompiled_targets: pendingUncompiledTargets,
+      oldest_pending_seconds: oldestPendingSeconds,
       continuation_available: !continuationRequired || continuationAvailable,
       within_qualified_envelope: queuedOutputs <= 200 && oldestPendingSeconds <= 600,
       reason: continuationRequired && !continuationAvailable ? "continuation_unavailable"
@@ -1789,6 +1813,49 @@ function isMaterializationTargetRequestBody(value: unknown): value is Materializ
     && (candidate.revision as number) >= 0
     && Number.isSafeInteger(candidate.projection_version)
     && (candidate.projection_version as number) >= 1;
+}
+
+function proveUncompiledTarget(
+  target: { revision: number; projection_version: number },
+  progress: Progress,
+  reservations: readonly CapacityReservation[]
+): UncompiledTargetProof | null {
+  if (!Number.isSafeInteger(target.revision) || target.revision < 1
+    || target.projection_version !== CURRENT_PROJECTION_VERSION
+    || !Number.isSafeInteger(progress.canonical_observed_revision) || progress.canonical_observed_revision < 0) return null;
+  const handedOffFor = (revision: number): CapacityReservation[] => reservations.filter((reservation) =>
+    reservation.reservation_kind === "transaction"
+    && reservation.state === "handed_off"
+    && reservation.target_revision === revision
+    && reservation.canonical_revision === revision - 1
+  );
+  const obligation = Object.values(progress.obligations).find((item) => item.layer === "human_handoff"
+    && item.target.revision === target.revision
+    && item.target.projection_version === target.projection_version
+    && (item.state === "pending" || item.state === "running" || item.state === "retry_wait"));
+  if (obligation && Number.isFinite(Date.parse(obligation.first_pending_at))) {
+    return { first_pending_at: obligation.first_pending_at };
+  }
+  if (target.revision <= progress.canonical_observed_revision) {
+    const exactReservations = handedOffFor(target.revision);
+    if (exactReservations.length === 1 && Number.isFinite(Date.parse(exactReservations[0]!.created_at))) {
+      return { first_pending_at: exactReservations[0]!.created_at };
+    }
+    if (exactReservations.length > 1) return null;
+    return null;
+  }
+
+  const gap = target.revision - progress.canonical_observed_revision;
+  if (!Number.isSafeInteger(gap) || gap < 1 || gap > 200) return null;
+  const chain: CapacityReservation[] = [];
+  for (let revision = progress.canonical_observed_revision + 1; revision <= target.revision; revision += 1) {
+    const exact = handedOffFor(revision);
+    if (exact.length !== 1 || !Number.isFinite(Date.parse(exact[0]!.created_at))) return null;
+    chain.push(exact[0]!);
+  }
+  const oldest = chain.reduce((value, reservation) =>
+    Date.parse(reservation.created_at) < Date.parse(value) ? reservation.created_at : value, chain[0]!.created_at);
+  return { first_pending_at: oldest };
 }
 
 function parseCapacityReservationRequest(value: Record<string, unknown> | null, projectId: string): CapacityReservationRequest | null {

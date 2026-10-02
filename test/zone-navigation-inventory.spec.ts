@@ -174,7 +174,7 @@ async function addWorkingHead(h: ReturnType<typeof harness>, content: string, re
 
 async function seedHistoricalPublishedHead(
   h: ReturnType<typeof harness>,
-  options: { currentObjectId?: string; receiptRevision?: string; providerSlug?: string } = {}
+  options: { currentObjectId?: string; receiptRevision?: string; providerSlug?: string; legacyEnvelope?: boolean } = {}
 ) {
   const requestId = "DOCREQ-NAV-AUTO-PUBLISH-S27-R439-G1";
   const parentVersionId = "VER-REQ-1123456789ABCDEF01234567";
@@ -229,11 +229,11 @@ async function seedHistoricalPublishedHead(
   } as unknown as ExecutionAdmission, null);
   h.put(`${machineDocumentRoot(projectId)}/requests/${requestId}/intent.json`, JSON.stringify({
     schema_version: "1.0", project_id: projectId, request_id: requestId,
-    request_sha256: await sha256Text(requestJson), request_json: requestJson
+    request_sha256: await sha256Text(requestJson), ...(!options.legacyEnvelope ? { request_json: requestJson } : {})
   }));
   h.put(`${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`, JSON.stringify({
     schema_version: "1.0", project_id: projectId, request_id: requestId,
-    request_sha256: await sha256Text(requestJson), request_json: requestJson,
+    request_sha256: await sha256Text(requestJson), ...(!options.legacyEnvelope ? { request_json: requestJson } : {}),
     receipt_json: JSON.stringify({
       request_id: requestId, project_id: projectId, document_id: documentId, version_id: publishedVersionId,
       stage: "published", logical_path: "draft.md", status: "committed", provider_rev: options.receiptRevision ?? "rev-published"
@@ -569,9 +569,16 @@ describe("ZoneNavigationInventory", () => {
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
 
-  it("rejects an otherwise valid publication proof when the current provider object is unrelated", async () => {
+  it("accepts a governed replacement publication with a new destination object and the exact receipt revision", async () => {
     const h = harness();
-    const { entry } = await seedHistoricalPublishedHead(h, { currentObjectId: "id:unrelated-object" });
+    const { entry } = await seedHistoricalPublishedHead(h, { currentObjectId: "id:replacement-destination", legacyEnvelope: true });
+
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+  });
+
+  it("rejects a replacement publication when its receipt does not bind the destination revision", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h, { currentObjectId: "id:replacement-destination", receiptRevision: "rev-unrelated" });
 
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
@@ -776,6 +783,91 @@ describe("ZoneNavigationInventory", () => {
     expect(page.gaps).toEqual([]);
     expect(page.next_cursor).toBe("packages:%7B%22package_index%22%3A0%2C%22member_index%22%3A0%7D");
     expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+  });
+
+  it("consumes a bounded batch of irrelevant heads before checkpointing the initial inventory", async () => {
+    const h = harness();
+    const originalRead = h.runtime.objects.readText.bind(h.runtime.objects);
+    let concurrentHeadReads = 0;
+    let peakHeadReads = 0;
+    h.runtime.objects.readText = async (path) => {
+      if (!path.includes("/documents/heads/")) return originalRead(path);
+      concurrentHeadReads += 1;
+      peakHeadReads = Math.max(peakHeadReads, concurrentHeadReads);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      try { return await originalRead(path); }
+      finally { concurrentHeadReads -= 1; }
+    };
+    for (let index = 0; index < 24; index++) {
+      const id = `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`;
+      h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+        schema_version: "1.0", project_id: projectId, document_id: id,
+        kind: "work_product", logical_path: `other-zone-${index}.md`, reconciliation_status: "clean"
+      }));
+    }
+    const slice = budget(32);
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "REVIEW", cursor: null, limit: 8, budget: slice });
+    expect(page.entries).toEqual([]);
+    expect(page.gaps).toEqual([]);
+    expect(page.next_cursor?.startsWith("initial:")).toBe(true);
+    const pending = JSON.parse(decodeURIComponent(page.next_cursor!.slice("initial:".length))) as { entries: unknown[] };
+    expect(pending.entries.length).toBeLessThanOrEqual(12);
+    expect(peakHeadReads).toBeGreaterThanOrEqual(4);
+    expect(slice.calls_left).toBeGreaterThanOrEqual(0);
+  });
+
+  it("does not skip an active head mixed into a batch of irrelevant heads", async () => {
+    const h = harness();
+    const activeId = "DOC-000000000000000000000005";
+    for (let index = 0; index < 12; index++) {
+      const id = `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`;
+      if (id === activeId) {
+        await addWorkingHead(h, "active body", "rev-active", id, `VER-REQ-${id.slice(4)}`, "active.md");
+      } else {
+        h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+          schema_version: "1.0", project_id: projectId, document_id: id,
+          kind: "work_product", logical_path: `inactive-${index}.md`, reconciliation_status: "clean"
+        }));
+      }
+    }
+    let cursor: string | null = null;
+    const found: string[] = [];
+    for (let slice = 0; slice < 8; slice++) {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget(32) });
+      found.push(...page.entries.map((entry) => entry.resource_id));
+      expect(page.gaps).toEqual([]);
+      cursor = page.next_cursor;
+      if (cursor?.startsWith("packages:")) break;
+    }
+    expect(cursor?.startsWith("packages:")).toBe(true);
+    expect(found).toEqual([`head:${activeId}`]);
+  });
+
+  it("keeps the initial cursor at a failed batch and resumes without losing the active head", async () => {
+    const h = harness();
+    const activeId = "DOC-000000000000000000000005";
+    for (let index = 0; index < 12; index++) {
+      const id = `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`;
+      if (id === activeId) await addWorkingHead(h, "active body", "rev-active", id, `VER-REQ-${id.slice(4)}`, "active.md");
+      else h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+        schema_version: "1.0", project_id: projectId, document_id: id,
+        kind: "work_product", logical_path: `inactive-${index}.md`, reconciliation_status: "clean"
+      }));
+    }
+    const failedPath = machineDocumentHeadPath(projectId, "DOC-000000000000000000000004");
+    h.readErrors.set(failedPath, new Error("temporary provider read failure"));
+    const first = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(32) });
+    expect(first.next_cursor?.startsWith("initial:")).toBe(true);
+    h.readErrors.delete(failedPath);
+    let cursor = first.next_cursor;
+    const found = [...first.entries.map((entry) => entry.resource_id)];
+    for (let slice = 0; slice < 8 && cursor?.startsWith("initial:"); slice++) {
+      const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget(32) });
+      found.push(...page.entries.map((entry) => entry.resource_id));
+      cursor = page.next_cursor;
+    }
+    expect(cursor?.startsWith("packages:")).toBe(true);
+    expect(found).toEqual([`head:${activeId}`]);
   });
 
   it("defers an active head when its proof budget is short, then resumes the exact source", async () => {
@@ -992,6 +1084,13 @@ describe("ZoneNavigationInventory", () => {
     delete activeHead.working_version_id;
     delete activeHead.provider.working;
     h.put(headPath, JSON.stringify(activeHead), "id:head");
+    for (let index = 0; index < 6; index++) {
+      const id = `DOC-${(index + 1).toString(16).toUpperCase().padStart(24, "0")}`;
+      h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+        schema_version: "1.0", project_id: projectId, document_id: id,
+        kind: "work_product", logical_path: `unrelated-${index}.md`, reconciliation_status: "clean"
+      }));
+    }
     await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget() });
     expect(JSON.parse(h.files.get(catalogPath)!.content).entry).toBeNull();
     expect(stale).toBe(visiblePath);

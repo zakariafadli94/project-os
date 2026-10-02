@@ -1279,8 +1279,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       if (state.project_id !== projectId) return false;
       canonicalRoot = workspaceProjectRoot(projectId, state.slug);
     } catch { return false; }
-    if (!historical || historical.object_id !== current.object_id
-      || historical.provider_id !== this.runtime.providerId || historical.path !== `${canonicalRoot}/WORKING/${logicalPath}`
+    // A replacement publication can write a new DELIVERABLES object instead
+    // of moving the WORKING object. Its identity is established below by the
+    // exact committed publish receipt revision and verified immutable bytes.
+    if (!historical || historical.provider_id !== this.runtime.providerId || historical.path !== `${canonicalRoot}/WORKING/${logicalPath}`
       || current.path !== `${canonicalRoot}/DELIVERABLES/${logicalPath}`
       || !historical.path.endsWith(`/${logicalPath}`)
       || !version.parent_version_id || !version.request_id

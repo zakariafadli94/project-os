@@ -174,7 +174,7 @@ async function addWorkingHead(h: ReturnType<typeof harness>, content: string, re
 
 async function seedHistoricalPublishedHead(
   h: ReturnType<typeof harness>,
-  options: { currentObjectId?: string; receiptRevision?: string; providerSlug?: string } = {}
+  options: { currentObjectId?: string; receiptRevision?: string; providerSlug?: string; legacyEnvelope?: boolean } = {}
 ) {
   const requestId = "DOCREQ-NAV-AUTO-PUBLISH-S27-R439-G1";
   const parentVersionId = "VER-REQ-1123456789ABCDEF01234567";
@@ -229,11 +229,11 @@ async function seedHistoricalPublishedHead(
   } as unknown as ExecutionAdmission, null);
   h.put(`${machineDocumentRoot(projectId)}/requests/${requestId}/intent.json`, JSON.stringify({
     schema_version: "1.0", project_id: projectId, request_id: requestId,
-    request_sha256: await sha256Text(requestJson), request_json: requestJson
+    request_sha256: await sha256Text(requestJson), ...(!options.legacyEnvelope ? { request_json: requestJson } : {})
   }));
   h.put(`${machineDocumentRoot(projectId)}/requests/${requestId}/receipt.json`, JSON.stringify({
     schema_version: "1.0", project_id: projectId, request_id: requestId,
-    request_sha256: await sha256Text(requestJson), request_json: requestJson,
+    request_sha256: await sha256Text(requestJson), ...(!options.legacyEnvelope ? { request_json: requestJson } : {}),
     receipt_json: JSON.stringify({
       request_id: requestId, project_id: projectId, document_id: documentId, version_id: publishedVersionId,
       stage: "published", logical_path: "draft.md", status: "committed", provider_rev: options.receiptRevision ?? "rev-published"
@@ -569,9 +569,16 @@ describe("ZoneNavigationInventory", () => {
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });
 
-  it("rejects an otherwise valid publication proof when the current provider object is unrelated", async () => {
+  it("accepts a governed replacement publication with a new destination object and the exact receipt revision", async () => {
     const h = harness();
-    const { entry } = await seedHistoricalPublishedHead(h, { currentObjectId: "id:unrelated-object" });
+    const { entry } = await seedHistoricalPublishedHead(h, { currentObjectId: "id:replacement-destination", legacyEnvelope: true });
+
+    await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(true);
+  });
+
+  it("rejects a replacement publication when its receipt does not bind the destination revision", async () => {
+    const h = harness();
+    const { entry } = await seedHistoricalPublishedHead(h, { currentObjectId: "id:replacement-destination", receiptRevision: "rev-unrelated" });
 
     await expect(h.inventory.verifyEntry(entry, budget())).resolves.toBe(false);
   });

@@ -223,6 +223,23 @@ describe("ProjectGuard managed documents", () => {
       "INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message) VALUES (?, ?, ?, ?, ?, ?)",
       "document", request.request_id, "old-failure", 6, 1, JSON.stringify({ code: "identical_internal_failure_limit" })
     ));
+    const navigationWorker = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    await runInDurableObject(navigationWorker, async (_instance, state) => {
+      await state.storage.put(`navigation-work:${request.request_id}`, "queued");
+      await state.storage.put(`navigation-retry:${request.request_id}`, JSON.stringify({ stopped: true, next_attempt_at: null }));
+    });
+    const status = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(await status.json()).toMatchObject({ navigation_worker: { queued: true, stopped: true, next_attempt_at: null } });
+    let originalMaterializationGuard!: DurableObjectNamespace;
+    await runInDurableObject(guard, (instance) => {
+      originalMaterializationGuard = (instance as any).env.MATERIALIZATION_GUARD;
+      (instance as any).env.MATERIALIZATION_GUARD = { getByName: () => ({ fetch: () => new Promise(() => {}) }) };
+    });
+    const started = Date.now();
+    const statusWithSlowDiagnostic = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(await statusWithSlowDiagnostic.json()).toMatchObject({ status: "recovery_blocked" });
+    await runInDurableObject(guard, (instance) => { (instance as any).env.MATERIALIZATION_GUARD = originalMaterializationGuard; });
     const replay = await guard.fetch("https://internal/document", { method: "POST", body: envelope });
     expect(await replay.json()).toMatchObject({ status: "conflict", code: "active_version_provider_mismatch" });
     const receipt = await new ManagedDocumentRequestLedger(runtime.objects).readReceipt(projectId, request.request_id);

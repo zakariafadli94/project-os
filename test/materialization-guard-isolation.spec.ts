@@ -66,6 +66,24 @@ async function createProject(projectId: string, slug: string, transactionId: str
 describe("MaterializationGuard isolation boundary", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("reports a navigation worker's durable retry state without starting work", async () => {
+    const projectId = "PRJ-3991";
+    const requestId = "DOCREQ-NAVIGATION-STATUS-3991001";
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.put(`navigation-work:${requestId}`, "queued");
+      await state.storage.put(`navigation-retry:${requestId}`, JSON.stringify({ stopped: true, next_attempt_at: null }));
+    });
+    const response = await guard.fetch(new Request(`https://materialization-guard.internal/navigation-work-status?request_id=${requestId}`));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      project_id: projectId, request_id: requestId, queued: true, stopped: true, next_attempt_at: null
+    });
+    await runInDurableObject(guard, async (_instance, state) => {
+      expect(await state.storage.get(`navigation-work:${requestId}`)).toBe("queued");
+    });
+  });
+
   it("does not queue capacity or diagnostics reads behind maintenance I/O", async () => {
     installDropboxMock();
     const projectId = "PRJ-3913";

@@ -4940,11 +4940,51 @@ export class ProjectGuard extends DurableObject<Env> {
           ? failureDiagnostic?.code ?? (failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit")
           : materializationFailure?.code ?? null)
       });
+      let navigationWorker: { queued: boolean; stopped: boolean; next_attempt_at: string | null } | null = null;
+      if (kind === "document" && intent && typeof intent.request_json === "string" && recoverableIntent) {
+        try {
+          const documentRequest = parseManagedDocumentRequest(JSON.parse(intent.request_json));
+          if (documentRequest.operation === "navigation.reconcile") {
+            const controller = new AbortController();
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            let response: Response | null;
+            try {
+              response = await Promise.race([
+                this.env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
+                  `https://materialization-guard.internal/navigation-work-status?request_id=${encodeURIComponent(requestId)}`,
+                  { signal: controller.signal }
+                ),
+                new Promise<null>((resolve) => {
+                  timeout = setTimeout(() => { controller.abort(); resolve(null); }, 250);
+                })
+              ]);
+            } finally {
+              if (timeout !== undefined) clearTimeout(timeout);
+            }
+            if (response?.ok) {
+              const worker = await response.json<Record<string, unknown>>();
+              if (worker.project_id === projectId && worker.request_id === requestId
+                && typeof worker.queued === "boolean" && typeof worker.stopped === "boolean"
+                && (worker.next_attempt_at === null || typeof worker.next_attempt_at === "string")) {
+                navigationWorker = {
+                  queued: worker.queued,
+                  stopped: worker.stopped,
+                  next_attempt_at: worker.next_attempt_at as string | null
+                };
+              }
+            }
+          }
+        } catch {
+          // Worker diagnostics are supplementary; unavailable diagnostics must
+          // never change the governed request's receipt or recovery verdict.
+        }
+      }
       return Response.json({
         project_id: projectId,
         kind,
         request_id: requestId,
         status,
+        ...(navigationWorker ? { navigation_worker: navigationWorker } : {}),
         ...(canonicalCommitVerified ? { canonical_commit_verified: true } : {}),
         observation,
         ...(receipt ? { receipt } : {}),

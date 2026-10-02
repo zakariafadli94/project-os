@@ -1434,21 +1434,24 @@ describe("canonical execution boundary in ProjectGuard", () => {
         : null;
     });
 
-    const response = await runInDurableObject(guard, (instance) =>
-      (instance as unknown as { finalizeCurrentMaterialization(request: Request, armInitialWake?: boolean): Promise<Response> })
-        .finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-        }), false)
-    );
-
-    expect(response.status).toBe(202);
-    expect(readCommit).toHaveBeenCalledWith(projectId, 9302);
-    expect(readCommit).toHaveBeenCalledWith(projectId, 9304);
-    await runInDurableObject(guard, async (_instance, state) => {
+    await runInDurableObject(guard, (instance, state) => (instance as any).serialize(async () => {
+      // Hold the DO serialization lock across finalization and its checkpoint
+      // assertion. The finalizer arms a continuation alarm even when the
+      // initial wake is disabled; a separate callback could let it consume
+      // the cursor before this test inspects it.
+      await state.storage.setAlarm(Date.now() + 60_000);
+      const response = await (instance as unknown as {
+        finalizeCurrentMaterialization(request: Request, armInitialWake?: boolean): Promise<Response>
+      }).finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+      }), false);
+      expect(response.status).toBe(202);
+      expect(readCommit).toHaveBeenCalledWith(projectId, 9302);
+      expect(readCommit).toHaveBeenCalledWith(projectId, 9304);
       const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
       expect(work?.candidates.map(({ revision }) => revision)).toEqual([9305]);
-    });
+    }));
   });
 
   it("finalizes a committed transaction from the ProjectGuard alarm without a status read", async () => {

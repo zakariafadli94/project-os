@@ -4957,6 +4957,17 @@ export class ProjectGuard extends DurableObject<Env> {
               : intent || artifactIntent || staged || queued
                 ? "recovery_unavailable"
               : "not_received";
+      let navigationWorker: { queued: boolean; stopped: boolean; next_attempt_at: string | null } | null = null;
+      if (kind === "document" && intent && typeof intent.request_json === "string" && recoverableIntent) {
+        try {
+          const documentRequest = parseManagedDocumentRequest(JSON.parse(intent.request_json));
+          if (documentRequest.operation === "navigation.reconcile") {
+            navigationWorker = await this.readNavigationWorkerDiagnostic(projectId, requestId);
+          }
+        } catch {
+          // An unavailable diagnostic is not evidence of a scheduled wake.
+        }
+      }
       const observedAt = new Date().toISOString();
       const lease = execution?.lease && typeof execution.lease === "object"
         ? execution.lease as { owner?: unknown; until?: unknown }
@@ -4965,12 +4976,14 @@ export class ProjectGuard extends DurableObject<Env> {
       const running = typeof lease?.owner === "string" && lease.owner.length > 0
         && Number.isFinite(leaseUntil) && leaseUntil > Date.now();
       const requestFailureWakeScheduled = queued && !failure?.stopped && wakeScheduled && alarmAt !== null;
-      const observationWakeScheduled = requestFailureWakeScheduled || Boolean(materializationFailure?.wake_scheduled);
+      const navigationWakeScheduled = Boolean(navigationWorker?.queued && !navigationWorker.stopped
+        && navigationWorker.next_attempt_at && Number.isFinite(Date.parse(navigationWorker.next_attempt_at)));
+      const observationWakeScheduled = requestFailureWakeScheduled || Boolean(materializationFailure?.wake_scheduled) || navigationWakeScheduled;
       const observationNextAttempt = materializationFailure?.wake_scheduled
         ? materializationFailure.next_attempt_at
         : requestFailureWakeScheduled
           ? failureDiagnostic?.next_attempt_at ?? new Date(alarmAt!).toISOString()
-          : null;
+          : navigationWakeScheduled ? navigationWorker!.next_attempt_at : null;
       const observation = persistenceObservation({
         project_id: projectId,
         kind: kind as RequestKind,
@@ -4994,18 +5007,6 @@ export class ProjectGuard extends DurableObject<Env> {
           ? failureDiagnostic?.code ?? (failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit")
           : materializationFailure?.code ?? null)
       });
-      let navigationWorker: { queued: boolean; stopped: boolean; next_attempt_at: string | null } | null = null;
-      if (kind === "document" && intent && typeof intent.request_json === "string" && recoverableIntent) {
-        try {
-          const documentRequest = parseManagedDocumentRequest(JSON.parse(intent.request_json));
-          if (documentRequest.operation === "navigation.reconcile") {
-            navigationWorker = await this.readNavigationWorkerDiagnostic(projectId, requestId);
-          }
-        } catch {
-          // Worker diagnostics are supplementary; unavailable diagnostics must
-          // never change the governed request's receipt or recovery verdict.
-        }
-      }
       return Response.json({
         project_id: projectId,
         kind,
@@ -5020,7 +5021,7 @@ export class ProjectGuard extends DurableObject<Env> {
           recovery: {
             durable_intent: Boolean(intent || artifactIntent || materializationFailure),
             recoverable: recoverableIntent,
-            scheduled: requestFailureWakeScheduled || Boolean(materializationFailure?.wake_scheduled),
+            scheduled: observationWakeScheduled,
             ...(materializationFailure ? {
               finalization: {
                 target_revision: materializationFailure.target_revision,

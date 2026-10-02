@@ -23,6 +23,7 @@ import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { sha256Canonical } from "../src/materialization/hash";
 import { MaterializationLedger } from "../src/materialization/ledger";
 import { canonicalJson } from "../src/rules/contract";
+import { ProviderOperationError } from "../src/persistence/provider/errors";
 
 const testEnv = env as unknown as Env;
 const at = "2026-09-02T07:20:00+01:00";
@@ -65,6 +66,31 @@ async function createProject(projectId: string, slug: string, transactionId: str
 
 describe("MaterializationGuard isolation boundary", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it.each([true, false])("attributes a provider failure to its navigation request (retryable=%s)", async (retryable) => {
+    const requestId = `DOCREQ-NAV-PROVIDER-${retryable ? "RETRY" : "BLOCK"}-3992`;
+    const ref = { project_id: "PRJ-3992", request_id: requestId };
+    const report = vi.fn(async () => undefined);
+    let slices = 0;
+    const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+      projectId: "PRJ-3992", layoutMode: "v2", env: testEnv,
+      ledger: { capacitySnapshot: () => ({}) },
+      ctx: { storage: {
+        list: async () => new Map([[`navigation-work:${requestId}`, "queued"]]),
+        getAlarm: async () => Date.now() + 1_000,
+        setAlarm: async () => undefined
+      } },
+      capacityHasPendingWork: () => false,
+      serialize: async (operation: () => Promise<unknown>) => (++slices === 1 ? operation() : false),
+      runNavigationWorkSlice: async function (this: { selectedNavigationWorkRef?: unknown }) {
+        this.selectedNavigationWorkRef = ref;
+        throw new ProviderOperationError("provider failed", retryable, { providerId: "dropbox", status: retryable ? 503 : 403 });
+      },
+      reportNavigationWorkFailure: report
+    }) as MaterializationGuard;
+    await guard.alarm();
+    expect(report).toHaveBeenCalledWith(ref, retryable ? "navigation_provider_temporary" : "navigation_provider_blocked");
+  });
 
   it("reports a navigation worker's durable retry state without starting work", async () => {
     const projectId = "PRJ-3991";

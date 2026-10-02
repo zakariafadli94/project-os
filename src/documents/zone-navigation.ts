@@ -109,6 +109,89 @@ export class ZoneNavigationEngine {
     private readonly postcheckRules: readonly RuleVersion[] = []
   ) {}
 
+  /** Read-only recovery proof: a later source mutation does not undo a
+   * publication already committed for this exact request. This is not a
+   * declaration that the newer source generation is current. */
+  async readVerifiedPublication(
+    rawRequest: NavigationReconcileRequest, state: ProjectState,
+    admission: ExecutionAdmission, budget: SliceBudget, expectedSnapshotId: string
+  ): Promise<ZoneNavigationReceipt | null> {
+    const request = navigationReconcileSchema.parse(rawRequest);
+    const requestHash = await executionHash(request);
+    const root = await new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id).root();
+    const indexPath = this.indexPath(state, request.zone, request.expected_index?.basename ?? "00-CURRENT.md");
+    this.assertAdmission(request, state, admission, requestHash, indexPath);
+    const progressPath = `${root}/navigation-progress.json`;
+    const progressProof = await this.readBoundedPublicationProof(progressPath, 2_000_000, budget);
+    const raw = progressProof.text;
+    const parsed = navigationProgressSchema.safeParse(JSON.parse(raw));
+    if (!parsed.success) throw new NavigationConflict("navigation_publication_proof_unavailable");
+    const progress = parsed.data;
+    if (canonicalJson(progress) !== raw || progress.status !== "finalized"
+      || progress.project_id !== request.project_id || progress.request_id !== request.request_id
+      || progress.request_hash !== requestHash || progress.snapshot_id !== expectedSnapshotId
+      || !progress.inventory_complete || progress.verify_page < progress.page_count
+      || progress.target_generation !== request.expected_generation + 1) return null;
+    const receiptResult = zoneNavigationReceiptSchema.safeParse(progress.receipt);
+    if (!receiptResult.success) return null;
+    const receipt = receiptResult.data;
+    const headPath = zoneNavigationHeadPath(request.project_id, request.zone);
+    if (receipt.project_id !== request.project_id || receipt.request_id !== request.request_id
+      || receipt.zone !== request.zone || receipt.generation !== progress.target_generation
+      || receipt.source_snapshot_id !== expectedSnapshotId || receipt.head_ref !== headPath
+      || receipt.source_count !== progress.source_count || canonicalJson(receipt.coverage_gaps) !== canonicalJson(progress.coverage_gaps)
+      || receipt.index.content_sha256 !== progress.generated_sha256) return null;
+    if (!receipt.finalization_ref.startsWith(`${root}/navigation/finalizations/`)
+      || !/\/[a-f0-9]{64}\.json$/.test(receipt.finalization_ref)) return null;
+    const certificateProof = await this.readBoundedPublicationProof(receipt.finalization_ref, 128_000, budget);
+    const certificateRaw = certificateProof.text;
+    const certificate = JSON.parse(certificateRaw);
+    if (canonicalJson(certificate) !== certificateRaw
+      || receipt.finalization_ref !== `${root}/navigation/finalizations/${await executionHash(certificate)}.json`
+      || certificate.schema_version !== "1.0" || certificate.project_id !== request.project_id
+      || certificate.request_id !== request.request_id || certificate.request_hash !== requestHash
+      || certificate.zone !== request.zone || certificate.generation !== receipt.generation
+      || certificate.source_snapshot_id !== expectedSnapshotId || certificate.source_count !== receipt.source_count
+      || canonicalJson(certificate.index) !== canonicalJson(receipt.index)
+      || canonicalJson(certificate.coverage_gaps) !== canonicalJson(receipt.coverage_gaps)
+      || certificate.generated_content_sha256 !== progress.generated_sha256) return null;
+    if (!Array.isArray(certificate.postchecks)
+      || requiredRulePostchecks(admission).some(checkId => !certificate.postchecks.some(
+        (check: { check_id?: string; verdict?: string; evidence_refs?: unknown[] }) => check?.check_id === checkId
+          && check.verdict === "allow" && Array.isArray(check.evidence_refs) && check.evidence_refs.length > 0
+          && check.evidence_refs.every(ref => typeof ref === "string" && ref.length > 0)))) return null;
+    const headProof = await this.readBoundedPublicationProof(headPath, 128_000, budget);
+    const current = zoneNavigationHeadSchema.safeParse(JSON.parse(headProof.text));
+    if (!current.success || canonicalJson(current.data) !== headProof.text
+      || current.data.project_id !== request.project_id || current.data.zone !== request.zone
+      || current.data.source_request_id !== request.request_id
+      || current.data.generation !== receipt.generation || current.data.finalization_ref !== receipt.finalization_ref
+      || current.data.source_snapshot_id !== expectedSnapshotId
+      || current.data.source_count !== receipt.source_count
+      || canonicalJson(current.data.coverage_gaps) !== canonicalJson(receipt.coverage_gaps)
+      || !sameIndexIdentity(current.data.index, receipt.index)) return null;
+    const observed = await this.readBoundedPublicationProof(indexPath, 2_000_000, budget);
+    if (observed.metadata.objectId !== receipt.index.object_id
+      || observed.metadata.revisionToken !== receipt.index.revision_token
+      || await sha256Text(observed.text) !== receipt.index.content_sha256) return null;
+    return receipt;
+  }
+
+  private async readBoundedPublicationProof(path: string, limit: number, budget: SliceBudget): Promise<{ text: string; metadata: ProviderObjectMetadata }> {
+    const before = await this.metadata(path, budget);
+    if (!before?.objectId || !before.revisionToken || before.size > limit || !this.runtime.objects.readBytes) {
+      throw new NavigationConflict("navigation_publication_proof_unavailable");
+    }
+    budget.beforeHttp();
+    const bytes = await this.runtime.objects.readBytes(path, limit);
+    const after = await this.metadata(path, budget);
+    if (!bytes || bytes.byteLength !== before.size || after?.objectId !== before.objectId
+      || after?.revisionToken !== before.revisionToken) throw new NavigationConflict("navigation_publication_proof_unavailable");
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    if (!sameBytes(new TextEncoder().encode(text), bytes)) throw new NavigationConflict("navigation_publication_proof_unavailable");
+    return { text, metadata: before };
+  }
+
   async prepareCompactCatalogRebuild(
     rawRequest: NavigationCatalogRebuildRequest,
     state: ProjectState,

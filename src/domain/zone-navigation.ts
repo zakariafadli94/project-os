@@ -215,7 +215,7 @@ export interface NavigationInventoryPort {
   /** Persist a verified exact source entry for bounded reuse in later reconciliations. */
   recordVerifiedEntry?(entry: NavigationInventoryEntry, snapshot_id: string, budget: import("../convergence/contract").SliceBudget): Promise<void>;
   /** Persist a compact catalog completion marker only after every snapshot entry was verified. */
-  completeSnapshot?(input: { project_id: string; zone: NavigationZone; snapshot_id: string; budget: import("../convergence/contract").SliceBudget }): Promise<boolean | "pending" | { status: "conflict"; code: string }>;
+  completeSnapshot?(input: { project_id: string; zone: NavigationZone; snapshot_id: string; cursor?: string | null; budget: import("../convergence/contract").SliceBudget }): Promise<boolean | "pending" | { status: "pending"; cursor: string | null } | { status: "conflict"; code: string }>;
 }
 
 export interface NavigationPostcheckPort {

@@ -256,9 +256,30 @@ describe("ZoneNavigationInventory", () => {
 
     const result = await h.inventory.completeSnapshot({ project_id: projectId, zone: "REVIEW", snapshot_id: "source:0", budget: budget() });
 
-    expect(result).toBe("pending");
+    expect(result).toMatchObject({ status: "pending", cursor: "dirty:opaque-next" });
     expect(listDirtyPage).toHaveBeenCalledTimes(1);
     expect(markReady).not.toHaveBeenCalled();
+  });
+
+  it("resolves an adopted dirty artifact across persisted completion cursors", async () => {
+    const h = harness();
+    const destination = `${workspaceProjectRoot(projectId, slug)}/REVIEW/report.md`;
+    const intent = await seedCommittedArtifact(h, "ART-NAVIGATION-DIRTY-001", destination, "adopted artifact");
+    const resourceId = `artifact:${await sha256Text(destination)}`;
+    const ticket = await h.sources.beginHeadWrite(projectId, "REVIEW", resourceId, budget(), null, true);
+    await h.sources.completeHeadWrite(ticket, null, budget());
+
+    let cursor: string | null = null;
+    let result: Awaited<ReturnType<typeof h.inventory.completeSnapshot>> = "pending";
+    for (let attempt = 0; attempt < 20 && result !== true && (result === "pending" || (typeof result === "object" && result !== null && result.status === "pending")); attempt += 1) {
+      result = await h.inventory.completeSnapshot({ project_id: projectId, zone: "REVIEW", snapshot_id: "source:1", cursor, budget: budget() });
+      if (typeof result === "object" && result.status === "pending") cursor = result.cursor;
+      else if (result === "pending") cursor = null;
+    }
+
+    expect(intent.expected_content_sha256).toBe(await sha256Text("adopted artifact"));
+    expect(result).toBe(true);
+    expect(await h.sources.listDirtyPage(projectId, "REVIEW", null, 1, budget())).toMatchObject({ resource_ids: [], next_cursor: null });
   });
 
   it("enumerates only current canonical zone heads from a bounded provider page", async () => {
@@ -1166,7 +1187,7 @@ describe("ZoneNavigationInventory", () => {
     const request = { operation: "package.replace" as const, request_id: "DOCREQ-REPLACE-0001", project_id: state.project_id, candidate: ref, zone: "WORKING" as const, expected_navigation_generation: 0, expected_project_revision: 0, created_at: "2026-09-12T12:00:00Z" };
     const admission = { project_id: state.project_id, operation: "package.replace", kind: "document", request_id: request.request_id, request_hash: await sha256Text(canonicalJson(request)), actor: { actor_id: "operator", authority: "ingress" }, resources: [{ resource_id: ref.package_id, resource_type: "package", zone: "WORKING", version: `${ref.version}:${ref.manifest_sha256}` }], global_revision: 0, project_revision: 0, ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 }, verdict: "allow", results: [], gaps: [], deferred_rules: [] };
     const result = await new ManagedDocumentService(runtime).replacePackage(request, state, admission as never);
-    expect(result.status).toBe("finalized");
+    expect(result.status, JSON.stringify(result)).toBe("finalized");
     runtime.pagedListing = { listPage: async ({ path, cursor, limit }) => {
       const matching = [...store.files.keys()].filter((key) => key.startsWith(`${path}/`) && !key.slice(path.length + 1).includes("/" )).sort();
       const start = cursor ? Math.max(0, matching.findIndex((key) => key > cursor)) : 0;
@@ -1290,14 +1311,42 @@ describe("ZoneNavigationInventory", () => {
     const indexPath = `${workspaceProjectRoot(state.project_id, state.slug)}/WORKING/00-CURRENT.md`;
     const resourceId = "navigation:WORKING";
     const admission = { project_id: state.project_id, request_id: request.request_id, kind: "document", operation: "navigation.reconcile", request_hash: requestHash, actor: { actor_id: "operator:test", authority: "project_guard" }, resources: [{ resource_id: resourceId, resource_type: "navigation", zone: "WORKING", version: "0" }], resource_effect_scopes: [{ resource_id: resourceId, resource_version: "0", provider_id: runtime.providerId, sources: [], destinations: [{ path: indexPath, logical_path: "WORKING/00-CURRENT.md" }], preservation_copies: [] }], global_revision: 0, project_revision: 0, ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: 0 }, verdict: "allow", results: [], gaps: [], deferred_rules: [] };
+    const completionCursors: Array<string | null> = [];
+    let holdCompletionOnce = true;
+    const navigationProgressPath = `${await new ExecutionJournal(runtime, state.project_id, "document", request.request_id).root()}/navigation-progress.json`;
     const legacyPort: NavigationInventoryPort = {
       listPage: async (input) => { const page = await inventory.listPage(input); const { verified_entries: _proof, ...withoutProof } = page; return withoutProof; },
       verifySnapshot: inventory.verifySnapshot.bind(inventory), verifyEntry: inventory.verifyEntry.bind(inventory), verifyEntryPage: inventory.verifyEntryPage.bind(inventory),
-      verificationIncludesPhysicalIntegrity: true, recordVerifiedEntry: inventory.recordVerifiedEntry.bind(inventory), completeSnapshot: inventory.completeSnapshot.bind(inventory)
+      verificationIncludesPhysicalIntegrity: true, recordVerifiedEntry: inventory.recordVerifiedEntry.bind(inventory),
+      completeSnapshot: async (input) => {
+        completionCursors.push(input.cursor ?? null);
+        if (completionCursors.length > 1) {
+          const saved = store.files.get(navigationProgressPath)?.content;
+          expect(saved && (JSON.parse(saved) as { completion_cursor?: string | null }).completion_cursor).toBe(input.cursor ?? null);
+        }
+        if (holdCompletionOnce) {
+          holdCompletionOnce = false;
+          return { status: "pending", cursor: "catalog:" };
+        }
+        return inventory.completeSnapshot(input);
+      }
     };
     let result = await new ZoneNavigationEngine(runtime, legacyPort).reconcile(request, state, admission as never, budget(32));
-    for (let attempt = 0; result.status === "pending" && attempt < 160; attempt += 1) result = await new ZoneNavigationEngine(runtime, legacyPort).reconcile(request, state, admission as never, budget(32));
-    expect(result.status).toBe("finalized");
+    const savedCompletionCursors: Array<string | null> = [];
+    const saveCursor = () => {
+      const raw = store.files.get(navigationProgressPath)?.content;
+      if (raw) savedCompletionCursors.push((JSON.parse(raw) as { completion_cursor?: string | null }).completion_cursor ?? null);
+    };
+    saveCursor();
+    for (let attempt = 0; result.status === "pending" && attempt < 160; attempt += 1) {
+      result = await new ZoneNavigationEngine(runtime, legacyPort).reconcile(request, state, admission as never, budget(32));
+      saveCursor();
+    }
+    expect(result.status, JSON.stringify(result)).toBe("finalized");
+    expect(completionCursors[0]).toBeNull();
+    expect(completionCursors.slice(0, 2)).toEqual([null, "catalog:"]);
+    expect(savedCompletionCursors).toContain(completionCursors[1]);
+    expect(await sources.listDirtyPage(state.project_id, "WORKING", null, 1, budget(32))).toMatchObject({ resource_ids: [], next_cursor: null });
   });
 
   it("clears a pre-existing dirty REVIEW head only after the census proves its zone tombstone", async () => {
@@ -1396,6 +1445,10 @@ describe("ZoneNavigationInventory", () => {
     expect(sliceCalls.length).toBeLessThanOrEqual(24);
     expect(sliceCalls.every((count) => count <= 32)).toBe(true);
     const preparationSlices = sliceCalls.length;
+    const legacyProgressFile = h.files.get(progressPath)!;
+    const legacyProgress = JSON.parse(legacyProgressFile.content) as Record<string, unknown>;
+    delete legacyProgress.completion_cursor;
+    h.files.set(progressPath, { ...legacyProgressFile, content: canonicalJson(legacyProgress) });
     const publicationCalls: number[] = [];
     for (let attempt = 0; result.status !== "finalized" && attempt < 24; attempt += 1) {
       sliceBudget = budget(32);

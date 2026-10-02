@@ -45,6 +45,7 @@ const MAX_INITIAL_HEADS_PER_PAGE = 512;
 const MAX_INITIAL_HEAD_PROVIDER_CALLS = 10;
 const MAX_INITIAL_MISMATCHED_HEAD_PROVIDER_CALLS = 20;
 const MIN_INACTIVE_HEAD_PROVIDER_CALLS = 2;
+const INITIAL_PAGE_CHECKPOINT_CALLS = 4;
 
 interface InitialHeadPageCursor {
   kind: "zone-navigation-head-batch-v1";
@@ -253,6 +254,15 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       listedEntries = page.entries;
       providerCursor = page.cursor;
     }
+    // Initial adoption may update a ready compact cache while walking the
+    // provider page. Keep a small independent window for the engine's durable
+    // page/progress checkpoint so a costly shard repair cannot repeat the same
+    // saved cursor indefinitely.
+    const compactManifest = persistCatalog
+      ? await this.sources.compactCatalogManifest(projectId, zone, budget)
+      : null;
+    const protectCheckpoint = compactManifest?.ready_generation !== null && compactManifest?.ready_generation !== undefined;
+    const pageBudget = protectCheckpoint ? withCheckpointReserve(budget, INITIAL_PAGE_CHECKPOINT_CALLS) : budget;
     const entries: NavigationInventoryEntry[] = [];
     const gaps: NavigationCoverageGap[] = [];
     const headCache = new Map<string, InitialHeadReadCache>();
@@ -269,9 +279,9 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // A slow/non-ordinary second head can consume the shared deadline even
       // though the first head is independently verifiable; retrying the same
       // saved cursor would otherwise repeat that preflight forever.
-      if (persistCatalog && !(offset === 0 && reusingSavedListing)
-        && offset + 1 < listedEntries.length && budget.canStartEffect(22)) {
-        const pair = await this.ordinaryInitialPair(projectId, zone, listedEntries.slice(offset, offset + 2), snapshotId, budget, headCache);
+      if (persistCatalog && !protectCheckpoint && !(offset === 0 && reusingSavedListing)
+        && offset + 1 < listedEntries.length && pageBudget.canStartEffect(22)) {
+        const pair = await this.ordinaryInitialPair(projectId, zone, listedEntries.slice(offset, offset + 2), snapshotId, pageBudget, headCache);
         if (pair) {
           let failed = false;
           for (const result of pair) {
@@ -280,10 +290,11 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
               // A late CAS rejection can leave too little budget for both a
               // compensating tombstone and the engine checkpoint. Preserve
               // the prior cursor and surface the original conflict instead.
-              if (!budget.canStartEffect(5)) throw result.reason;
+              if (!pageBudget.canStartEffect(5)) throw result.reason;
               const id = listedEntries[offset].name.slice(0, -5);
               const resourceId = `head:${id}`;
-              await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+              await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, pageBudget,
+                generationFromSnapshot(snapshotId));
               gaps.push({ resource_id: resourceId, code: classifyGap(result.reason) });
             } else if (result.value.entry) {
               entries.push(result.value.entry);
@@ -297,8 +308,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // The active-head pair keeps its original reservation. Batch only the
       // proven inactive prefix; an active/stale/error entry stays at the next
       // cursor, rather than serializing every irrelevant head before it.
-      if (persistCatalog && offset + 6 <= listedEntries.length && budget.canStartEffect(13)) {
-        const inactiveCount = await this.inactiveInitialBatch(projectId, zone, listedEntries.slice(offset, offset + 6), budget, headCache);
+      if (persistCatalog && offset + 6 <= listedEntries.length && pageBudget.canStartEffect(13)) {
+        const inactiveCount = await this.inactiveInitialBatch(projectId, zone, listedEntries.slice(offset, offset + 6), pageBudget, headCache);
         if (inactiveCount > 0) {
           offset += inactiveCount;
           continue;
@@ -324,23 +335,25 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // Inactive heads only need a head read and catalog check. Reserve the
       // larger proof budget after inspecting an active pointer, so historical
       // inactive heads do not consume a whole recovery slice apiece.
-      if (!budget.canStartEffect(MIN_INACTIVE_HEAD_PROVIDER_CALLS)) {
+      if (!pageBudget.canStartEffect(MIN_INACTIVE_HEAD_PROVIDER_CALLS)) {
         if (offset === 0 && reusingSavedListing) throw new Error("slice_budget_exhausted");
         break;
       }
       try {
-        const resolved = await this.resolveHead(projectId, zone, resourceId, budget, true, headCache.get(match[1]));
+        const resolved = await this.resolveHead(projectId, zone, resourceId, pageBudget, true, headCache.get(match[1]));
         if (resolved.gap) gaps.push(resolved.gap);
         if (resolved.entry) {
-          if (persistCatalog) await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+          if (persistCatalog) await this.sources.writeCatalogEntry(resolved.entry, projectId, zone, resourceId,
+            pageBudget, generationFromSnapshot(snapshotId));
           entries.push(resolved.entry);
         } else {
           // Clean inactive heads need no catalog tombstone unless a prior
           // partial adoption left an active row behind. Gaps are retained
           // independently below, and stale rows are still cleared exactly.
           if (persistCatalog) {
-            const prior = await this.sources.readCatalogEntry(projectId, zone, resourceId, budget);
-            if (prior) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+            const prior = await this.sources.readCatalogEntry(projectId, zone, resourceId, pageBudget);
+            if (prior) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId,
+              pageBudget, generationFromSnapshot(snapshotId));
           }
         }
       } catch (error) {
@@ -348,7 +361,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
           if (offset === 0 && reusingSavedListing) throw error;
           break;
         }
-        if (persistCatalog) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId, budget, generationFromSnapshot(snapshotId));
+        if (persistCatalog) await this.sources.writeCatalogEntry(null, projectId, zone, resourceId,
+          pageBudget, generationFromSnapshot(snapshotId));
         gaps.push({ resource_id: resourceId, code: classifyGap(error) });
       }
       offset += 1;
@@ -1574,6 +1588,20 @@ function metadataMatches(metadata: ProviderObjectMetadata | null, identity: { ob
 
 function requireBudget(budget: SliceBudget, calls: number): void {
   if (!budget.canStartEffect(calls)) throw new Error("slice_budget_exhausted");
+}
+
+function withCheckpointReserve(budget: SliceBudget, reservedCalls: number): SliceBudget {
+  return {
+    get deadline_ms() { return budget.deadline_ms; },
+    get calls_left() { return budget.calls_left; },
+    now: () => budget.now(),
+    signal: budget.signal,
+    beforeHttp() {
+      if (budget.calls_left <= reservedCalls) throw new Error("slice_budget_exhausted");
+      budget.beforeHttp();
+    },
+    canStartEffect(requiredCalls) { return budget.canStartEffect(requiredCalls); }
+  };
 }
 
 function generationFromSnapshot(snapshotId: string): number {

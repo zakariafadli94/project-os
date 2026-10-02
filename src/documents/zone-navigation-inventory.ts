@@ -265,6 +265,15 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
           continue;
         }
       }
+      // The active-head pair keeps its original reservation. Only when that
+      // preflight found no eligible pair may we batch clean, irrelevant heads:
+      // its first two head reads are already cached, while the next four can
+      // overlap. No listing cursor advances until every catalog row is absent.
+      if (persistCatalog && offset + 6 <= listedEntries.length && budget.canStartEffect(13)
+        && await this.inactiveInitialBatch(projectId, zone, listedEntries.slice(offset, offset + 6), budget, headCache)) {
+        offset += 6;
+        continue;
+      }
       if (item.kind !== "file" || !item.path) {
         if (!persistCatalog) gaps.push({ resource_id: item.name || "head-listing-entry", code: "head_listing_entry_invalid" });
         offset += 1;
@@ -327,6 +336,33 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       snapshot_id: snapshotId,
       next_cursor: nextCursor
     };
+  }
+
+  private async inactiveInitialBatch(
+    projectId: string, zone: NavigationZone, items: ProviderEntry[], budget: SliceBudget,
+    headCache: Map<string, InitialHeadReadCache>
+  ): Promise<boolean> {
+    const ids = items.map((item) => /^(DOC-[A-F0-9]{24})\.json$/.exec(item.name)?.[1]);
+    if (ids.some((id, index) => !id || items[index].kind !== "file" || items[index].path !== machineDocumentHeadPath(projectId, id))) return false;
+    const heads = await Promise.allSettled(ids.map(async (id) => {
+      const cached = headCache.get(id!);
+      if (cached && "head" in cached) return cached.head!;
+      charge(budget);
+      const raw = await this.runtime.objects.readText(machineDocumentHeadPath(projectId, id!));
+      headCache.set(id!, { head: raw });
+      return raw;
+    }));
+    if (heads.some((result) => result.status !== "fulfilled" || result.value === null)) return false;
+    try {
+      if (heads.some((result, index) => {
+        const head = readManagedDocumentHead(JSON.parse((result as PromiseFulfilledResult<string>).value)).head;
+        const pointer = activePointer(head, zone);
+        return head.project_id !== projectId || head.document_id !== ids[index] || head.reconciliation_status !== "clean"
+          || pointer.versionId != null || pointer.observation != null;
+      })) return false;
+    } catch { return false; }
+    const catalog = await Promise.allSettled(ids.map((id) => this.sources.readCatalogEntry(projectId, zone, `head:${id}`, budget)));
+    return catalog.every((result) => result.status === "fulfilled" && result.value === null);
   }
 
   private async ordinaryInitialPair(

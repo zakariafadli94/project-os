@@ -7,9 +7,10 @@ import { parseMutationContextOrNull } from "../admission/mutation-context";
 import { DETAIL_FIELDS } from "./context";
 import type { ControlTowerAccess } from "./auth";
 import { persistenceCapabilities } from "../persistence/capabilities";
-import type { VersionMetadataLike } from "../deployment/identity";
+import { deploymentIdentity, type VersionMetadataLike } from "../deployment/identity";
 import { checkCatalogue } from "../rules/check-catalogue";
 import { persistenceObservation, type RequestKind } from "../persistence/observation";
+import { ruleExceptionSchema, ruleVersionSchema } from "../domain/rule-governance";
 
 const localRecoveryDiagnosticSchema = z.object({
   scope: z.literal("local_only"),
@@ -34,6 +35,13 @@ export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectName
     description: "Read deployed persistence capabilities and token permissions; client tool availability is unknown to the server",
     inputSchema: {}, annotations: { readOnlyHint: true }
   }, async () => ({ content: [{ type: "text" as const, text: JSON.stringify(persistenceCapabilities(env, access)) }] }));
+  server.registerTool("project_os_get_rule_authority", {
+    description: "Read the current validated global rule authority references",
+    inputSchema: {}, annotations: { readOnlyHint: true }
+  }, async () => {
+    if (!access.read) return scopeDenied("project.read");
+    return readGlobalRuleAuthority(env.REGISTRY_GUARD, deploymentIdentity(env).git_sha);
+  });
   server.registerTool("project_os_get_context", { description: "Read canonical Project OS context", inputSchema: { project_id: projectIdSchema, cursor: z.string().max(1_024).optional() } }, async ({ project_id, cursor }) => {
     if (!access.read) return scopeDenied("project.read");
     const query = new URLSearchParams();
@@ -120,6 +128,90 @@ function readCreateStatus(namespace: DurableObjectNamespace, transactionId: stri
 }
 
 type ReadToolResult = { isError?: boolean; content: Array<{ type: "text"; text: string }> };
+
+const globalGovernanceReadSchema = z.strictObject({
+  revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  rules: z.record(z.string(), ruleVersionSchema),
+  exceptions: z.record(z.string(), ruleExceptionSchema)
+});
+
+async function readGlobalRuleAuthority(namespace: DurableObjectNamespace, deployedSha: string | null): Promise<ReadToolResult> {
+  const unavailable = (code: string): ReadToolResult => ({ isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code }) }] });
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let finished = false;
+  const work = async (): Promise<ReadToolResult> => {
+    const response = await namespace.getByName("global").fetch("https://registry-guard.internal/governance", { method: "GET", signal: controller.signal });
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => {});
+      return unavailable("GLOBAL_RULE_AUTHORITY_UNAVAILABLE");
+    }
+    const declaredSize = Number(response.headers.get("Content-Length"));
+    if (Number.isFinite(declaredSize) && declaredSize > 256 * 1024) {
+      void response.body?.cancel().catch(() => {});
+      return unavailable("GLOBAL_RULE_AUTHORITY_RESPONSE_INVALID");
+    }
+    if (!response.body) return unavailable("GLOBAL_RULE_AUTHORITY_RESPONSE_INVALID");
+    reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 256 * 1024) {
+        void reader.cancel().catch(() => {});
+        return unavailable("GLOBAL_RULE_AUTHORITY_RESPONSE_INVALID");
+      }
+      chunks.push(value);
+    }
+    reader.releaseLock();
+    reader = undefined;
+    let body: unknown;
+    try {
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      body = JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      return unavailable("GLOBAL_RULE_AUTHORITY_RESPONSE_INVALID");
+    }
+    const parsed = globalGovernanceReadSchema.safeParse(body);
+    if (!parsed.success) return unavailable("GLOBAL_RULE_AUTHORITY_RESPONSE_INVALID");
+    const active = [];
+    for (const [key, rule] of Object.entries(parsed.data.rules)) {
+      if (key !== `${rule.rule_id}@${rule.version}` || rule.scope.kind !== "global") {
+        return unavailable("GLOBAL_RULE_AUTHORITY_RESPONSE_INVALID");
+      }
+      if (rule.status === "active") active.push({ rule_id: rule.rule_id, version: rule.version, scope: rule.scope, check_id: rule.check_id });
+    }
+    for (const [key, exception] of Object.entries(parsed.data.exceptions)) {
+      if (key !== exception.exception_id) return unavailable("GLOBAL_RULE_AUTHORITY_RESPONSE_INVALID");
+    }
+    active.sort((left, right) => left.rule_id.localeCompare(right.rule_id) || left.version - right.version);
+    return { content: [{ type: "text", text: JSON.stringify({ status: "verified", activation_attestation_verified: true,
+      current_runtime_qualification: "not_probed", revision: parsed.data.revision, rules: active, deployed_sha: deployedSha }) }] };
+  };
+  try {
+    const result = await Promise.race([
+      work(),
+      new Promise<ReadToolResult>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("deadline")), 10_000);
+      })
+    ]);
+    finished = true;
+    return result;
+  } catch {
+    return unavailable("GLOBAL_RULE_AUTHORITY_UNAVAILABLE");
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (!finished) {
+      controller.abort();
+      if (reader) void reader.cancel().catch(() => {});
+    }
+  }
+}
 
 function isContextReadPage(value: unknown, projectId: string): value is Record<string, any> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;

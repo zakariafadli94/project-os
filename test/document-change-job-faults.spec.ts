@@ -11,6 +11,9 @@ import {
   type ManagedDocumentChangeQuarantine
 } from "../src/documents/change-job-store";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
+import { ManagedDocumentChangeCoordinator } from "../src/documents/change-coordinator";
+import { emptyProjectState } from "../src/domain/transitions";
+import { packageRuntime } from "./helpers/package-runtime";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-31T14:20:00+01:00";
@@ -61,6 +64,81 @@ describe("durable managed-document change jobs", () => {
       jobs_completed: 1,
       jobs_pending: 5
     });
+  });
+
+  it("resumes a frozen CURRENT-index resource fanout across bounded scheduled slices", async () => {
+    const projectId = "PRJ-9327";
+    const state = emptyProjectState(projectId, "Fanout", "package-fanout");
+    const runtime = packageRuntime().runtime;
+    const path = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-package-fanout/WORKING/CURRENT.md`;
+    await runtime.objects.createText(path, "externally changed index");
+    runtime.objects.listChildren = async (parent) => parent === path.slice(0, path.lastIndexOf("/"))
+      ? [{ kind: "file", name: "CURRENT.md", path }]
+      : [];
+    runtime.changeFeed = { listChanges: async () => ({ entries: [], cursor: "fanout-pending" }) };
+    const resources = Array.from({ length: 10 }, (_, index) => ({
+      resource_id: `PKG-${index.toString(16).toUpperCase().padStart(64, "0")}`,
+      resource_type: "package",
+      zone: "WORKING",
+      version: `1:${index.toString(16).padStart(64, "0")}`
+    }));
+    const callbackResources: string[] = [];
+    const callbackSnapshotIds: (string | undefined)[] = [];
+    let normalReconcileCalls = 0;
+    let snapshotUnavailable = false;
+    let snapshotRestored = false;
+    const guard = testEnv.PROJECT_GUARD.getByName(projectId);
+
+    const results = await runInDurableObject(guard, async (_instance, durableState) => {
+      const store = new ManagedDocumentChangeJobStore(durableState.storage);
+      store.registerPage({ expected_cursor: null, next_cursor: "fanout-seed", jobs: [] });
+      const job: ManagedDocumentChangeJobInput = {
+        job_id: `CHGJOB-${"A".repeat(24)}`,
+        change: { kind: "file", name: "CURRENT.md", path },
+        detection_source: "incremental",
+        priority: 10
+      };
+      store.registerPage({ expected_cursor: "fanout-seed", next_cursor: "fanout-pending", jobs: [job] });
+      const coordinator = new ManagedDocumentChangeCoordinator(runtime, durableState.storage, "observe",
+        async (_state, operation) => { callbackResources.push(operation.resources[0].resource_id); },
+        async () => undefined);
+      (coordinator as any).mutationGate.processChanges = async () => ({ candidates: 0, policy_violations: 0 });
+      (coordinator as any).stableWorkProducts.reconcile = async () => ({ handled: false, captured: 0, restored: 0, conflicts: 0 });
+      (coordinator as any).reconciler.reconcileChanges = async () => { normalReconcileCalls += 1; return ({ scanned: 0, ignored: 0, captured: 0, ingested: 0, duplicates: 0, restored: 0, conflicts: 0, intake_completed: 0, duplicate_cleaned: 0, withdrawn: 0, intake_resumed: 0, changed_document_ids: [] }); };
+      (coordinator as any).packageDrift = {
+        observe: async (_state: unknown, _change: unknown, snapshotRequestId?: string) => {
+          callbackSnapshotIds.push(snapshotRequestId);
+          if (snapshotRestored) return { handled: true, status: "expected_reconciled", code: "PACKAGE_EXPECTED_WRITE", request_id: "DOCREQ-SNAPSHOT-PROOF-0001", resource: resources[0] };
+          if (snapshotUnavailable) return { handled: true, status: "unexpected_conflict", code: "PACKAGE_NAVIGATION_UNAVAILABLE", snapshot_request_id: snapshotRequestId };
+          return { handled: true, status: "unexpected_conflict", code: "PACKAGE_UNEXPECTED_MUTATION", resources, snapshot_request_id: "DOCREQ-SNAPSHOT-PROOF-0001" };
+        }
+      };
+      const first = await coordinator.reconcile(state);
+      const firstFindings = store.driftFindingsForJob(job.job_id);
+      snapshotRestored = true;
+      const restored = await coordinator.reconcile(state);
+      const restoredFindings = store.driftFindingsForJob(job.job_id);
+      snapshotRestored = false;
+      snapshotUnavailable = true;
+      const unavailable = await coordinator.reconcile(state);
+      const unavailableFindings = store.driftFindingsForJob(job.job_id);
+      snapshotUnavailable = false;
+      const second = await coordinator.reconcile(state);
+      return { first, second, restored, unavailable, firstFindings, restoredFindings, unavailableFindings, findings: store.driftFindingsForJob(job.job_id) };
+    });
+
+    expect(results.first).toMatchObject({ jobs_completed: 0, jobs_pending: 1, job_failures: 0, restored: 0 });
+    expect(results.firstFindings).toHaveLength(9); // frozen-snapshot sentinel plus eight resources
+    expect(results.restored).toMatchObject({ jobs_completed: 0, jobs_pending: 1, job_failures: 0 });
+    expect(results.restoredFindings).toHaveLength(9);
+    expect(results.unavailable).toMatchObject({ jobs_completed: 0, jobs_pending: 1, job_failures: 0 });
+    expect(results.unavailableFindings).toHaveLength(9);
+    expect(results.second).toMatchObject({ jobs_completed: 1, jobs_pending: 0, job_failures: 0, restored: 0 });
+    expect(results.findings).toHaveLength(11);
+    expect(callbackResources).toHaveLength(10);
+    expect(new Set(callbackResources).size).toBe(10);
+    expect(callbackSnapshotIds).toEqual([undefined, "DOCREQ-SNAPSHOT-PROOF-0001", "DOCREQ-SNAPSHOT-PROOF-0001", "DOCREQ-SNAPSHOT-PROOF-0001"]);
+    expect(normalReconcileCalls).toBe(0);
   });
 
   it("advances the provider cursor after durable registration while isolating a failed job from a healthy sibling", async () => {

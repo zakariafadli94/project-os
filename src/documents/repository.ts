@@ -55,6 +55,7 @@ import { ExecutionJournal, executionHash } from "../execution/journal";
 import type { ProjectState } from "../domain/project-state";
 import { workspaceProjectRoot } from "../persistence/layout";
 
+const MAX_AUDIT_PACKAGE_NAVIGATION_BYTES = 128_000;
 const DROPBOX_PROVIDER_ID = "dropbox";
 const DROPBOX_CONTENT_HASH_ALGORITHM = "dropbox-content-hash";
 const headMutationLocks = new WeakMap<object, Map<string, { reservation: string | null; active: boolean }>>();
@@ -125,15 +126,80 @@ export class DocumentLedgerRepository {
     return this.readNavigation(projectId, true);
   }
 
-  /** Drift/audit expectations ONLY. Proves canonical ledger/finalization,
-   * deliberately does not attest current visible targets. Never render from it. */
+  /** Drift/audit expectations ONLY. Proves the finalized canonical ledger refs
+   * and their journal binding, not fresh package-manifest or visible-target
+   * validity. Never render from it. */
   async readCanonicalPackageNavigationForAudit(projectId: string): Promise<PackageNavigation> {
     return this.readNavigation(projectId, false);
   }
 
+  async readPackageNavigationSnapshotForAudit(projectId: string, requestId?: string): Promise<{ request_id: string; navigation: PackageNavigation }> {
+    let snapshotRequestId = requestId;
+    if (!snapshotRequestId) {
+      const currentText = await this.readBoundedAuditText(packageNavigationPath(projectId));
+      if (currentText === null) throw new Error("package_navigation_ledger_missing");
+      snapshotRequestId = packageNavigationLedgerSchema.parse(JSON.parse(currentText)).source_request_id;
+    }
+    const { admitted, progress } = await this.readPackageExecutionEvidence(projectId, "document", snapshotRequestId);
+    const ledgerPath = packageNavigationPath(projectId);
+    const step = admitted.plan!.steps.find((candidate) => candidate.action.kind === "write_if_unchanged"
+      && candidate.action.destination.path === ledgerPath
+      && candidate.action.destination.logical_path === "documents/packages/navigation.json");
+    if (!step || step.action.kind !== "write_if_unchanged"
+      || !progress.completed_steps.some((completed) => completed.step_id === step.step_id && completed.evidence_refs.length)) {
+      throw new Error("package_navigation_snapshot_unproven");
+    }
+    const journal = new ExecutionJournal(this.runtime, projectId, "document", snapshotRequestId);
+    const effectReceipt = await this.runtime.objects.readText(`${await journal.root()}/effects/${await executionHash(step)}.json`);
+    let destination: { path?: string; logical_path?: string; state?: string; identity?: { content_sha256?: string } } | null;
+    try {
+      const receipt = effectReceipt ? JSON.parse(effectReceipt) as { step_hash?: string; destination_identity?: string } : null;
+      destination = receipt?.destination_identity ? JSON.parse(receipt.destination_identity) as { path?: string; logical_path?: string; state?: string; identity?: { content_sha256?: string } } : null;
+      if (receipt?.step_hash !== await executionHash(step)) throw new Error("receipt_step_binding");
+    } catch {
+      throw new Error("package_navigation_snapshot_effect_unproven");
+    }
+    if (!destination || destination.path !== ledgerPath || destination.logical_path !== "documents/packages/navigation.json"
+      || destination.state !== "present" || destination.identity?.content_sha256 !== step.action.desired.content_sha256) {
+      throw new Error("package_navigation_snapshot_effect_unproven");
+    }
+    const payloadPath = machineDocumentTextPayloadPath(projectId, step.action.desired.content_sha256);
+    const payload = await this.readBoundedAuditText(payloadPath);
+    if (payload === null || await sha256Text(payload) !== step.action.desired.content_sha256) {
+      throw new Error("package_navigation_snapshot_unavailable");
+    }
+    const ledger = packageNavigationLedgerSchema.parse(JSON.parse(payload));
+    if (ledger.project_id !== projectId || ledger.source_request_id !== snapshotRequestId
+      || canonicalJson(ledger) !== payload) throw new Error("package_navigation_snapshot_binding");
+    if (!requestId) {
+      const current = await this.readBoundedAuditText(ledgerPath);
+      if (current !== payload) throw new Error("package_navigation_snapshot_changed");
+    }
+    return { request_id: snapshotRequestId, navigation: ledger.heads };
+  }
+
+  private async readBoundedAuditText(path: string): Promise<string | null> {
+    const before = await this.runtime.objects.getMetadata(path);
+    if (!before) return null;
+    if (before.size > MAX_AUDIT_PACKAGE_NAVIGATION_BYTES || !this.runtime.objects.readBytes) {
+      throw new Error("package_navigation_ledger_oversize_or_unreadable");
+    }
+    const bytes = await this.runtime.objects.readBytes(path, MAX_AUDIT_PACKAGE_NAVIGATION_BYTES);
+    const after = await this.runtime.objects.getMetadata(path);
+    if (!bytes || bytes.byteLength !== before.size || after?.objectId !== before.objectId || after?.revisionToken !== before.revisionToken) {
+      throw new Error("package_navigation_ledger_unstable");
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  }
+
   private async readNavigation(projectId: string, verifyVisibility: boolean): Promise<PackageNavigation> {
     const path = packageNavigationPath(projectId);
-    const raw = await this.runtime.objects.readText(path);
+    let raw: string | null;
+    if (verifyVisibility) {
+      raw = await this.runtime.objects.readText(path);
+    } else {
+      raw = await this.readBoundedAuditText(path);
+    }
     if (raw === null) return {};
     const ledger = packageNavigationLedgerSchema.parse(JSON.parse(raw));
     if (ledger.project_id !== projectId) throw new Error("package_navigation_binding");
@@ -159,9 +225,14 @@ export class DocumentLedgerRepository {
       if (!head) continue;
       if (head.project_id !== projectId || head.zone !== zone || new Set(head.packages.map((p) => p.ref.package_id)).size !== head.packages.length || head.packages.some((p) => p.ref.project_id !== projectId || p.root !== `${zone}/PACKAGES/${p.ref.package_id}/${p.ref.version}`)) throw new Error("package_navigation_binding");
       if (verifyVisibility) await verifyVisible(`${base}/${zone}/CURRENT.md`, await sha256Text(renderPackageIndex(head)));
+      if (!verifyVisibility) {
+        // Audit expectations come from the exact finalized ledger output; do
+        // not traverse each referenced manifest or imply it is still visible.
+        navigation[zone] = head;
+        continue;
+      }
       for (const entry of head.packages) {
         const manifest = await this.readPackage(entry.ref);
-        if (!verifyVisibility) continue;
         const index = `# ${entry.ref.package_id} v${entry.ref.version}\n\n${manifest.members.map((m) => `- [[${entry.root}/${m.relative_path}]]`).join("\n")}\n`;
         await verifyVisible(`${base}/${entry.root}/INDEX.md`, await sha256Text(index));
         for (const member of manifest.members) {

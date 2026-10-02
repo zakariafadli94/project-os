@@ -40,6 +40,8 @@ import { zoneNavigationHeadSchema } from "../domain/zone-navigation";
 
 const LEGACY_CURSOR_KEY = "managed-document-change-cursor-v1";
 export const SCHEDULED_DOCUMENT_JOB_LIMIT = 1;
+const PACKAGE_INDEX_FANOUT_LIMIT = 8;
+const PACKAGE_INDEX_SNAPSHOT_CODE = "PACKAGE_CURRENT_INDEX_SNAPSHOT";
 
 class MissingChangeTargetError extends Error {
   constructor(path: string) {
@@ -106,6 +108,11 @@ interface BootstrapBaselineResult {
   changed_document_ids: string[];
 }
 
+interface DrainPendingResult {
+  attempted: number;
+  deferred: boolean;
+}
+
 export class ManagedDocumentChangeCoordinator {
   private readonly runtime: ProjectOsPersistenceRuntime;
   private readonly reconciler: ManagedDocumentReconciler;
@@ -162,7 +169,7 @@ export class ManagedDocumentChangeCoordinator {
     // Retry durable work first. A failed job remains pending, but never prevents
     // healthy siblings or later provider pages from being durably registered.
     const jobLimit = options.scheduled ? SCHEDULED_DOCUMENT_JOB_LIMIT : 256;
-    await this.drainPending(state, summary, jobLimit);
+    const firstDrain = await this.drainPending(state, summary, jobLimit);
 
     const root = workspaceProjectRoot(state.project_id, state.slug);
     let existingCursor = this.jobs.cursor();
@@ -201,7 +208,7 @@ export class ManagedDocumentChangeCoordinator {
 
     // The cursor now represents only work that has already been journaled in
     // the ProjectGuard SQLite store. Execution may fail safely after this point.
-    const remainingJobBudget = Math.max(0, jobLimit - summary.jobs_completed - summary.job_failures);
+    const remainingJobBudget = firstDrain.deferred ? 0 : Math.max(0, jobLimit - firstDrain.attempted);
     if (remainingJobBudget > 0) await this.drainPending(state, summary, remainingJobBudget);
     summary.jobs_pending = this.jobs.pendingCount();
     if (options.scheduled && !page.has_more && summary.jobs_pending === 0 && summary.job_failures === 0) {
@@ -298,11 +305,14 @@ export class ManagedDocumentChangeCoordinator {
     state: ProjectState,
     summary: ManagedDocumentChangeSummary,
     limit = 256
-  ): Promise<void> {
+  ): Promise<DrainPendingResult> {
     const jobs = this.jobs;
-    if (!jobs) return;
+    if (!jobs) return { attempted: 0, deferred: false };
     const pending = jobs.pending(limit);
+    let attempted = 0;
+    let deferred = false;
     for (const job of pending) {
+      attempted += 1;
       try {
         const actualKind = await this.actualChangeKind(job.change);
         if (actualKind === "folder") {
@@ -315,7 +325,11 @@ export class ManagedDocumentChangeCoordinator {
           }
           continue;
         }
-        await this.processJob(state, job, summary);
+        const completed = await this.processJob(state, job, summary);
+        if (!completed) {
+          deferred = true;
+          continue;
+        }
         jobs.markCompleted(job.job_id);
         summary.jobs_completed += 1;
       } catch (error) {
@@ -358,6 +372,7 @@ export class ManagedDocumentChangeCoordinator {
         });
       }
     }
+    return { attempted, deferred };
   }
 
   private async actualChangeKind(change: ProviderChangeEntry): Promise<ProviderChangeEntry["kind"]> {
@@ -374,21 +389,23 @@ export class ManagedDocumentChangeCoordinator {
     state: ProjectState,
     job: ManagedDocumentChangeJob,
     summary: ManagedDocumentChangeSummary
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (job.change.kind === "deleted") await this.recordArtifactDeletion(state, job.change.path);
-    if (await this.observeNavigationIndexDrift(state, job.change, summary, job.job_id)) return;
+    if (await this.observeNavigationIndexDrift(state, job.change, summary, job.job_id)) return true;
 
     // MutationGate remains the first semantic observer for every non-navigation change.
     const gate = await this.mutationGate.processChanges(state, [job.change], job.detection_source);
     await this.recordArtifactDestinationMutations(state, gate.artifact_destination_paths ?? []);
     accumulateGate(summary, gate);
 
-    if (await this.observePackageDrift(state, job.change, summary, job.job_id)) return;
+    const packageDrift = await this.observePackageDrift(state, job.change, summary, job.job_id);
+    if (packageDrift === "deferred") return false;
+    if (packageDrift === "handled") return true;
 
     const stable = await this.stableWorkProducts.reconcile(state, job.change);
     if (stable.handled) {
       accumulateStable(summary, stable);
-      return;
+      return true;
     }
 
     if (job.detection_source !== "incremental") {
@@ -399,6 +416,7 @@ export class ManagedDocumentChangeCoordinator {
 
     const reconciled = await this.reconciler.reconcileChanges(state, [job.change]);
     accumulateReconcile(summary, reconciled);
+    return true;
   }
 
   private async reconcileStableChanges(
@@ -409,7 +427,7 @@ export class ManagedDocumentChangeCoordinator {
     const unhandled: ProviderChangeEntry[] = [];
     for (const change of changes) {
       if (await this.observeNavigationIndexDrift(state, change, summary)) continue;
-      if (await this.observePackageDrift(state, change, summary)) continue;
+      if ((await this.observePackageDrift(state, change, summary)) !== "unhandled") continue;
       const stable = await this.stableWorkProducts.reconcile(state, change);
       if (stable.handled) accumulateStable(summary, stable);
       else unhandled.push(change);
@@ -422,9 +440,69 @@ export class ManagedDocumentChangeCoordinator {
     change: ProviderChangeEntry,
     summary: ManagedDocumentChangeSummary,
     jobId?: string
-  ): Promise<boolean> {
-    const drift = await this.packageDrift.observe(state, change);
-    if (!drift.handled) return false;
+  ): Promise<"unhandled" | "handled" | "deferred"> {
+    const existingFindings = this.jobs && jobId ? this.jobs.driftFindingsForJob(jobId) : [];
+    const priorSnapshot = existingFindings.find((finding) => finding.code === PACKAGE_INDEX_SNAPSHOT_CODE);
+    const drift = await this.packageDrift.observe(state, change, priorSnapshot?.request_id ?? undefined);
+    if (!drift.handled) return "unhandled";
+    if (priorSnapshot && !drift.resources) return "deferred";
+    if (drift.resources && drift.snapshot_request_id && this.jobs && jobId) {
+      const snapshotId = await this.packageIndexSnapshotFindingId(jobId, change.path);
+      if (!existingFindings.some((finding) => finding.finding_id === snapshotId)) {
+        this.jobs.recordDriftFinding({
+          finding_id: snapshotId,
+          job_id: jobId,
+          path: change.path,
+          change_kind: change.kind,
+          status: "unexpected_conflict",
+          code: PACKAGE_INDEX_SNAPSHOT_CODE,
+          request_id: drift.snapshot_request_id,
+          observed_at: new Date().toISOString()
+        });
+        summary.drift_findings += 1;
+        if (drift.status === "unexpected_conflict") summary.conflicts += 1;
+      }
+      const doneIds = new Set(existingFindings.map((finding) => finding.finding_id));
+      let processed = 0;
+      for (const resource of drift.resources) {
+        const findingId = await this.packageIndexResourceFindingId(jobId, change.path, drift.snapshot_request_id, resource);
+        if (doneIds.has(findingId)) continue;
+        if (processed >= PACKAGE_INDEX_FANOUT_LIMIT) return "deferred";
+        await this.recordObservedNavigationSourceMutation?.(state.project_id, resource.zone as "WORKING" | "REVIEW" | "DELIVERABLES", `package:${resource.resource_id}`);
+        if (this.admitObservedPackageDrift) {
+          await this.admitObservedPackageDrift(state, {
+            project_id: state.project_id,
+            operation: "package.drift.observe",
+            resources: [resource],
+            request_hash: await sha256Canonical({
+              project_id: state.project_id,
+              finding_id: findingId,
+              change,
+              resource,
+              expected_request_id: drift.snapshot_request_id
+            })
+          }, findingId);
+        }
+        this.jobs.recordDriftFinding({
+          finding_id: findingId,
+          job_id: jobId,
+          path: change.path,
+          change_kind: change.kind,
+          status: drift.status ?? "unexpected_conflict",
+          code: drift.code ?? "PACKAGE_UNEXPECTED_MUTATION",
+          request_id: drift.snapshot_request_id,
+          resource,
+          observed_at: new Date().toISOString()
+        });
+        doneIds.add(findingId);
+        processed += 1;
+        summary.drift_findings += 1;
+        if (drift.status === "unexpected_conflict") summary.conflicts += 1;
+        else if (drift.status === "expected_reconciled") summary.expected_changes += 1;
+        else summary.ignored += 1;
+      }
+      return "handled";
+    }
     if (drift.resource) {
       await this.recordObservedNavigationSourceMutation?.(
         state.project_id,
@@ -472,7 +550,15 @@ export class ManagedDocumentChangeCoordinator {
         }, findingId);
       }
     }
-    return true;
+    return "handled";
+  }
+
+  private async packageIndexSnapshotFindingId(jobId: string, path: string): Promise<string> {
+    return `DRIFT-${(await sha256Text(JSON.stringify({ jobId, path, code: PACKAGE_INDEX_SNAPSHOT_CODE }))).slice(0, 24).toUpperCase()}`;
+  }
+
+  private async packageIndexResourceFindingId(jobId: string, path: string, snapshotRequestId: string, resource: import("../rules/contract").RuleResource): Promise<string> {
+    return `DRIFT-${(await sha256Text(JSON.stringify({ jobId, path, snapshotRequestId, resource }))).slice(0, 24).toUpperCase()}`;
   }
 
   private async recordArtifactDestinationMutations(state: ProjectState, paths: string[]): Promise<void> {

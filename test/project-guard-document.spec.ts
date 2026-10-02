@@ -251,7 +251,7 @@ describe("ProjectGuard managed documents", () => {
     const started = Date.now();
     const statusWithSlowDiagnostic = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
     expect(Date.now() - started).toBeLessThan(1_000);
-    expect(await statusWithSlowDiagnostic.json()).toMatchObject({ status: "recovery_blocked" });
+    expect(await statusWithSlowDiagnostic.json()).toMatchObject({ status: "recovery_blocked", observation: { recovery: { state: "blocked" } } });
     await runInDurableObject(guard, (instance) => { (instance as any).env.MATERIALIZATION_GUARD = originalMaterializationGuard; });
     const replay = await guard.fetch("https://internal/document", { method: "POST", body: envelope });
     expect(await replay.json()).toMatchObject({ status: "conflict", code: "active_version_provider_mismatch" });

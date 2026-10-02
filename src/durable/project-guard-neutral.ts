@@ -1567,18 +1567,23 @@ export class ProjectGuard extends DurableObject<Env> {
         status: "pending", code: diagnostic?.code ?? "EXECUTION_RECOVERY_STOPPED" }, { status: 503 });
     }
     let response: Response;
+    let acknowledgement: Record<string, unknown> | null = null;
     try {
       response = await this.env.MATERIALIZATION_GUARD.getByName(request.project_id).fetch("https://materialization-guard.internal/navigation-work", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(ref)
       });
-      await response.text();
+      acknowledgement = await response.json<Record<string, unknown>>();
     } catch {
       response = new Response(null, { status: 503 });
     }
-    if (!response.ok) {
+    if (!response.ok || acknowledgement?.project_id !== request.project_id
+      || acknowledgement.request_id !== request.request_id || acknowledgement.status !== "scheduled") {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
       return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_RECOVERY_SCHEDULED" }, { status: 503 });
     }
+    // MG acknowledged its durable workref and alarm. Retain the exact intent,
+    // staged payload and failures, but stop PG's duplicate preparation loop.
+    this.ctx.storage.sql.exec("DELETE FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id);
     return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "pending", code: "NAVIGATION_PREPARATION_SCHEDULED" }, { status: 202 });
   }
 
@@ -4943,7 +4948,7 @@ export class ProjectGuard extends DurableObject<Env> {
           ? "committed"
           : receiptStatus === "rejected" || receiptStatus === "conflict"
             ? receiptStatus
-            : queued && failure?.stopped
+            : failure?.stopped
               ? "recovery_blocked"
             : execution && (execution.status === "admitted" || (execution.status === "committed" && !execution.receipt_ref))
               ? "admitted_uncommitted"
@@ -4984,7 +4989,7 @@ export class ProjectGuard extends DurableObject<Env> {
         wake_scheduled: observationWakeScheduled,
         ...(observationWakeScheduled && observationNextAttempt ? { next_attempt_at: observationNextAttempt } : {}),
         running,
-        blocked: Boolean((queued && failure?.stopped) || materializationFailure?.blocked),
+        blocked: Boolean(failure?.stopped || materializationFailure?.blocked),
         code: recoveryCode ?? (failure?.stopped
           ? failureDiagnostic?.code ?? (failure.message === "document_intent_binding_mismatch" ? failure.message : "identical_internal_failure_limit")
           : materializationFailure?.code ?? null)

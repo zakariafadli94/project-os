@@ -2381,6 +2381,11 @@ describe("canonical execution boundary in ProjectGuard", () => {
       method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
     });
     expect(ingress.status).toBe(202);
+    const handoff = await runInDurableObject(guard, (_instance, state) => ({
+      queued: state.storage.sql.exec("SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id).toArray().length,
+      payloads: state.storage.sql.exec("SELECT request_id FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", request.request_id).toArray().length
+    }));
+    expect(handoff).toEqual({ queued: 0, payloads: 1 });
 
     const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
     const runPreparationSlice = () => runInDurableObject(materialization, (instance) =>
@@ -2405,6 +2410,41 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await publish.json()).toMatchObject({ status: "conflict", code: "navigation_snapshot_changed" });
     expect([...mock.files.keys()].some((path) => path.endsWith("/navigation/WORKING/head.json"))).toBe(false);
     expect([...mock.files.keys()].some((path) => path.endsWith("/WORKING/00-CURRENT.md"))).toBe(false);
+  });
+
+  it("keeps PG recovery when the navigation acknowledgement names another request", async () => {
+    const projectId = "PRJ-8406";
+    const request = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAV-HANDOFF-BINDING-8406",
+      project_id: projectId, zone: "WORKING" as const, expected_project_revision: 1,
+      expected_generation: 0, expected_index: null, created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    await runInDurableObject(guard, (instance) => {
+      const original = (instance as any).env.MATERIALIZATION_GUARD;
+      (instance as any).env.MATERIALIZATION_GUARD = { getByName: (id: string) => ({ fetch: (url: string, init?: RequestInit) =>
+        url.endsWith("/navigation-work")
+          ? Promise.resolve(Response.json({ project_id: projectId, request_id: "DOCREQ-OTHER-HANDOFF-8406", status: "scheduled" }, { status: 202 }))
+          : original.getByName(id).fetch(url, init)
+      }) };
+      (instance as any).__handoffOriginalBinding = original;
+    });
+    try {
+      const response = await guard.fetch("https://project-guard.internal/document", {
+        method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+      });
+      expect(response.status).toBe(503);
+      const queued = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec(
+        "SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id
+      ).toArray().length);
+      expect(queued).toBe(1);
+    } finally {
+      await runInDurableObject(guard, (instance) => {
+        (instance as any).env.MATERIALIZATION_GUARD = (instance as any).__handoffOriginalBinding;
+        delete (instance as any).__handoffOriginalBinding;
+      });
+    }
   });
 
   it("routes preparation conflicts through the alarm failure ledger and stops six no-progress repeats", async () => {

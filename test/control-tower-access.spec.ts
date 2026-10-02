@@ -90,9 +90,18 @@ describe("effective Control Tower token permissions", () => {
   });
 
   it("preserves a known busy status and retry delay without exposing Guard details", async () => {
+    const safeDiagnostic = {
+      scope: "local_only", payload_present: true, payload_hash_valid: true,
+      staged_marker_matches_payload: false, queue_present: false,
+      failure_stopped: null, failure_attempts: null, failure_code: null,
+      failure_next_attempt_at: null, alarm_readable: true, alarm_at: null,
+      local_receipt_present: false, local_observation_present: null
+    };
+    let diagnostic: unknown = { ...safeDiagnostic, raw_payload: "nested-provider-secret" };
     const owner = { getByName: () => ({ fetch: async () => Response.json({
       project_id: "PRJ-0003", kind: "transaction", request_id: "TXN-ORIGINAL",
-      status: "unknown", code: "PROJECT_OS_READ_BUSY", private_detail: "provider-secret"
+      status: "unknown", code: "PROJECT_OS_READ_BUSY", private_detail: "provider-secret",
+      local_recovery_diagnostic: diagnostic
     }, { status: 503, headers: { "Retry-After": "1" } }) }) } as unknown as DurableObjectNamespace;
     const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {
       _registeredTools: Record<string, { handler(input: unknown): Promise<{ content: Array<{ text: string }> }> }>
@@ -103,7 +112,14 @@ describe("effective Control Tower token permissions", () => {
     const body = JSON.parse(result.content[0]!.text);
     expect(body).toMatchObject({ status: "unavailable", code: "PROJECT_OS_READ_BUSY", retry_after_seconds: 1,
       request_id: "TXN-ORIGINAL", recovery: { action: "check_status", preserve_request_id: true } });
+    expect(body.local_recovery_diagnostic).toEqual(safeDiagnostic);
     expect(result.content[0]!.text).not.toContain("provider-secret");
+    diagnostic = { ...safeDiagnostic, payload_hash_valid: "invalid-provider-secret" };
+    const invalid = await server._registeredTools.project_os_get_request_status!.handler({
+      project_id: "PRJ-0003", request_id: "TXN-ORIGINAL", kind: "transaction"
+    });
+    expect(JSON.parse(invalid.content[0]!.text)).not.toHaveProperty("local_recovery_diagnostic");
+    expect(invalid.content[0]!.text).not.toContain("provider-secret");
   });
 
   it("distinguishes an exhausted status observation from a busy Guard", async () => {

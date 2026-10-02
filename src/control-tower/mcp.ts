@@ -11,6 +11,22 @@ import type { VersionMetadataLike } from "../deployment/identity";
 import { checkCatalogue } from "../rules/check-catalogue";
 import { persistenceObservation, type RequestKind } from "../persistence/observation";
 
+const localRecoveryDiagnosticSchema = z.object({
+  scope: z.literal("local_only"),
+  payload_present: z.boolean().nullable(),
+  payload_hash_valid: z.boolean().nullable(),
+  staged_marker_matches_payload: z.boolean().nullable(),
+  queue_present: z.boolean().nullable(),
+  failure_stopped: z.boolean().nullable(),
+  failure_attempts: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  failure_code: z.string().regex(/^[A-Za-z0-9._/-]{1,96}$/).nullable(),
+  failure_next_attempt_at: z.string().datetime().nullable(),
+  alarm_readable: z.boolean(),
+  alarm_at: z.string().datetime().nullable(),
+  local_receipt_present: z.boolean().nullable(),
+  local_observation_present: z.boolean().nullable()
+});
+
 export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string; CF_VERSION_METADATA?: VersionMetadataLike }, access: ControlTowerAccess = { read: false, mutate: false }) {
   const server = new McpServer({ name: "project-os-control-tower", version: "1.0.0" });
   const projectIdSchema = z.string().regex(/^PRJ-[0-9]{4}$/);
@@ -155,7 +171,7 @@ async function readGuard(
           // Only known, non-sensitive observation verdicts may cross this boundary.
           // Do not echo arbitrary 5xx payloads from a dependency to a client.
           if (["/request-status", "/receipt"].includes(diagnostic.route) && response.status === 503) {
-            const body = await response.clone().json().catch(() => null) as { code?: unknown; project_id?: unknown; kind?: unknown; request_id?: unknown } | null;
+            const body = await response.clone().json().catch(() => null) as { code?: unknown; project_id?: unknown; kind?: unknown; request_id?: unknown; local_recovery_diagnostic?: unknown } | null;
             const kind = query.get("kind");
             const identityMatches = body?.project_id === projectId && body.kind === kind && body.request_id === requestId;
             const knownObservationCode = diagnostic.route === "/request-status"
@@ -170,8 +186,13 @@ async function readGuard(
                 code: body.code as string });
               const status = diagnostic.route === "/request-status" && body.code === "PROJECT_OS_READ_BUSY"
                 ? "unavailable" : "unknown";
+              // Local evidence is diagnostic only. Strip unknown fields rather
+              // than forwarding dependency payloads or changing canonical state.
+              const localDiagnostic = diagnostic.route === "/request-status"
+                ? localRecoveryDiagnosticSchema.safeParse(body.local_recovery_diagnostic) : null;
               return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({
                 status, code: body.code, kind, ...diagnostic, observation,
+                ...(localDiagnostic?.success ? { local_recovery_diagnostic: localDiagnostic.data } : {}),
                 retry_after_seconds: retryAfterSeconds, recovery
               }) }] };
             }

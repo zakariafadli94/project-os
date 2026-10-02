@@ -165,14 +165,19 @@ interface LocalRecoveryDiagnostic {
   local_observation_present: boolean | null;
 }
 
-function isRecoverableStagedDocumentWrite(request: ManagedDocumentRequest): boolean {
+function isRecoverableStagedDocumentRequest(request: ManagedDocumentRequest): boolean {
   return request.operation === "working.write"
-    || (request.operation === "review.write" && request.expected_version_id !== undefined);
+    || ((request.operation === "review.write" || request.operation === "review.promote")
+      && request.expected_version_id !== undefined);
 }
 
-function isRecoverableDocumentWriteAdmission(admission: NormalizedAdmissionOperation): boolean {
-  if (admission.operation === "working.write") return true;
-  return admission.operation === "review.write"
+function isRecoverableStagedDocumentAdmission(
+  admission: NormalizedAdmissionOperation,
+  request: ManagedDocumentRequest
+): boolean {
+  if (request.operation === "working.write") return admission.operation === "working.write";
+  return (request.operation === "review.write" || request.operation === "review.promote")
+    && admission.operation === request.operation
     && admission.resources.length === 1
     && typeof admission.resources[0]?.expected_version === "string"
     && admission.resources[0].expected_version.length > 0;
@@ -1317,7 +1322,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
     if (rulesRequired) {
       const proof = await this.admitRules(state, normalized, mutationContext!.actor);
-      if (isRecoverableStagedDocumentWrite(operation)) {
+      if (isRecoverableStagedDocumentRequest(operation)) {
         try {
           // The staged-only row is intentionally discoverable before the
           // admission journal exists. Recovery validates the exact journal
@@ -1338,7 +1343,7 @@ export class ProjectGuard extends DurableObject<Env> {
       try {
         await this.persistAdmissionProof("document", operation.request_id, proof);
       } catch (error) {
-        if (isRecoverableStagedDocumentWrite(operation) && this.isDefinitelyPreJournalAdmissionFailure(error)) {
+        if (isRecoverableStagedDocumentRequest(operation) && this.isDefinitelyPreJournalAdmissionFailure(error)) {
           const digest = await sha256Text(serialized);
           this.ctx.storage.transactionSync(() => {
             this.ctx.storage.sql.exec(
@@ -1370,7 +1375,7 @@ export class ProjectGuard extends DurableObject<Env> {
       if (error instanceof ManagedDocumentRequestIntentConflictError) {
         return Response.json(this.documentTerminalReceipt(operation, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH", "The same request_id was reused with a different managed-document payload"));
       }
-      if (isRecoverableStagedDocumentWrite(operation) && error instanceof AdmissionError
+      if (isRecoverableStagedDocumentRequest(operation) && error instanceof AdmissionError
         && error.code === "convergence_capacity_exceeded" && error.detail?.reservation_outcome === "refused"
         && await this.documentWriteAdmissionStatus(operation.request_id, normalized) === "matching") {
         // The execution admission is already immutable, but no intent or
@@ -3176,7 +3181,7 @@ export class ProjectGuard extends DurableObject<Env> {
       await this.blockRequestRecovery("document", requestId, "document_staged_identity_invalid");
       return;
     }
-    if (!isRecoverableStagedDocumentWrite(operation)) {
+    if (!isRecoverableStagedDocumentRequest(operation)) {
       await this.blockRequestRecovery("document", requestId, "document_staged_operation_not_eligible");
       return;
     }
@@ -4330,7 +4335,19 @@ export class ProjectGuard extends DurableObject<Env> {
       let retainAdmittedDocumentWrite = false;
       let retainStagedOnlyDocumentWrite = false;
       let stageOnlyDocumentWrite = false;
-      if (definitiveCapacityRefusal && kind === "document" && isRecoverableDocumentWriteAdmission(admission)) {
+      let stagedOperation: ManagedDocumentRequest | null = null;
+      if (definitiveCapacityRefusal && kind === "document") {
+        try {
+          const parsed = parseManagedDocumentRequest(JSON.parse(serializedRequest));
+          if (parsed.project_id === admission.project_id && parsed.request_id === requestId
+            && await sha256Canonical(parsed) === admission.request_hash
+            && isRecoverableStagedDocumentRequest(parsed)) stagedOperation = parsed;
+        } catch {
+          // Unknown or malformed request bytes are never eligible for staged recovery.
+        }
+      }
+      if (definitiveCapacityRefusal && kind === "document" && stagedOperation
+        && isRecoverableStagedDocumentAdmission(admission, stagedOperation)) {
         const marker = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
           "SELECT request_sha256 FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?",
           requestId
@@ -4392,7 +4409,7 @@ export class ProjectGuard extends DurableObject<Env> {
     normalized: NormalizedAdmissionOperation
   ): Promise<"matching" | "absent" | "mismatch"> {
     const projectId = this.ctx.id.name;
-    if (!projectId || normalized.project_id !== projectId || !isRecoverableDocumentWriteAdmission(normalized)) return "mismatch";
+    if (!projectId || normalized.project_id !== projectId) return "mismatch";
     const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
       "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?",
       requestId
@@ -4404,8 +4421,9 @@ export class ProjectGuard extends DurableObject<Env> {
     } catch {
       return "mismatch";
     }
-    if (!isRecoverableStagedDocumentWrite(operation) || operation.request_id !== requestId
-      || operation.project_id !== projectId || await sha256Canonical(operation) !== normalized.request_hash) return "mismatch";
+    if (!isRecoverableStagedDocumentRequest(operation) || operation.request_id !== requestId
+      || operation.project_id !== projectId || await sha256Canonical(operation) !== normalized.request_hash
+      || !isRecoverableStagedDocumentAdmission(normalized, operation)) return "mismatch";
     const journal = new ExecutionJournal(this.persistence, projectId, "document", requestId);
     const record = await journal.readAdmission();
     if (!record) return "absent";
@@ -4430,7 +4448,7 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!staged || await sha256Text(staged.request_json) !== staged.request_sha256) return false;
     try {
       const operation = parseManagedDocumentRequest(JSON.parse(staged.request_json));
-      return isRecoverableStagedDocumentWrite(operation) && operation.request_id === requestId
+      return isRecoverableStagedDocumentRequest(operation) && operation.request_id === requestId
         && operation.project_id === this.ctx.id.name;
     } catch {
       return false;

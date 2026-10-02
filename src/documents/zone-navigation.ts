@@ -52,6 +52,7 @@ const navigationProgressSchema = z.strictObject({
   verify_page: z.number().int().nonnegative().safe(),
   verify_entry: z.number().int().nonnegative().safe(),
   verify_cursor: z.strictObject({ resource_id: z.string(), entry_hash: z.string().regex(/^[a-f0-9]{64}$/), cursor: z.string() }).nullable().optional(),
+  completion_cursor: z.string().nullable().optional(),
   source_count: z.number().int().nonnegative().safe(),
   source_ids: z.array(z.string()).default([]),
   published_index: navigationIndexIdentitySchema.nullable().default(null),
@@ -636,10 +637,20 @@ export class ZoneNavigationEngine {
       if (verified.status === "pending" || verified.status === "conflict") return verified;
       progress = verified.progress;
       if (this.inventory.completeSnapshot) {
-        const completion = await this.inventory.completeSnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id!, budget });
+        if (!budget.canStartEffect(2)) return { status: "pending", cursor: progress.cursor };
+        const completion = await this.inventory.completeSnapshot({ project_id: request.project_id, zone: request.zone, snapshot_id: progress.snapshot_id!, cursor: progress.completion_cursor ?? null, budget: withSliceBudgetReserve(budget, 2) });
         if (completion === "pending") return { status: "pending", cursor: progress.cursor };
+        if (typeof completion === "object" && completion.status === "pending") {
+          progress.completion_cursor = completion.cursor;
+          progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+          return { status: "pending", cursor: progress.cursor };
+        }
         if (typeof completion === "object") return completion;
         if (!completion) return { status: "conflict", code: "navigation_snapshot_changed" };
+        if (progress.completion_cursor !== null) {
+          progress.completion_cursor = null;
+          progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        }
       }
 
       const generated = this.render(request.zone, progress.rendered_links, progress.coverage_gaps);
@@ -894,6 +905,7 @@ export class ZoneNavigationEngine {
       verify_page: 0,
       verify_entry: 0,
       verify_cursor: null,
+      completion_cursor: null,
       source_count: 0,
       source_ids: [],
       published_index: null,
@@ -1652,6 +1664,20 @@ function matchesEntryMetadata(metadata: ProviderObjectMetadata | null, entry: Na
 
 function isBudgetExhausted(error: unknown): boolean {
   return error instanceof Error && error.message.includes("slice_budget_exhausted");
+}
+
+function withSliceBudgetReserve(budget: SliceBudget, reserveCalls: number): SliceBudget {
+  return {
+    get deadline_ms() { return budget.deadline_ms; },
+    get calls_left() { return budget.calls_left; },
+    now: () => budget.now(),
+    signal: budget.signal,
+    beforeHttp() {
+      if (!budget.canStartEffect(reserveCalls + 1)) throw new Error("slice_budget_exhausted");
+      budget.beforeHttp();
+    },
+    canStartEffect(requiredCalls) { return budget.canStartEffect(requiredCalls + reserveCalls); }
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

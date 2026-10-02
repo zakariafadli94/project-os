@@ -2514,6 +2514,8 @@ export class ProjectGuard extends DurableObject<Env> {
       if (row.zone !== "WORKING" && row.zone !== "REVIEW" && row.zone !== "DELIVERABLES") continue;
       const zone = row.zone as NavigationZone;
       try {
+        let validatedHead: ReturnType<typeof zoneNavigationHeadSchema.parse> | null = null;
+        let currentnessBudget: ReturnType<typeof createSliceBudget> | null = null;
         const sources = new ZoneNavigationSources(this.persistence);
         const source = await sources.readState(projectId, zone);
         const invalidatedAdoptionOwner = source.adoption_request_id !== null
@@ -2529,8 +2531,82 @@ export class ProjectGuard extends DurableObject<Env> {
             await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
             continue;
           }
-          this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);
-          continue;
+          const headPath = zoneNavigationHeadPath(projectId, zone);
+          currentnessBudget = createSliceBudget(() => Date.now(), new AbortController().signal);
+          currentnessBudget.beforeHttp();
+          const headMetadata = await this.persistence.objects.getMetadata(headPath);
+          if (headMetadata?.path !== headPath || !headMetadata.objectId || !headMetadata.revisionToken || !Number.isSafeInteger(headMetadata.size)
+            || headMetadata.size < 0 || headMetadata.size > 128_000 || !this.persistence.objects.readBytes) {
+            throw new Error("navigation_auto_refresh_head_unavailable");
+          }
+          currentnessBudget.beforeHttp();
+          const headBytes = await this.persistence.objects.readBytes(headPath, 128_000);
+          currentnessBudget.beforeHttp();
+          const headMetadataAfter = await this.persistence.objects.getMetadata(headPath);
+          if (!headBytes || headBytes.byteLength !== headMetadata.size
+            || headMetadataAfter?.path !== headPath || headMetadataAfter.objectId !== headMetadata.objectId
+            || headMetadataAfter.revisionToken !== headMetadata.revisionToken
+            || headMetadataAfter.size !== headMetadata.size) {
+            throw new Error("navigation_auto_refresh_head_unstable");
+          }
+          const headRaw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(headBytes);
+          const encodedHead = new TextEncoder().encode(headRaw);
+          if (encodedHead.byteLength !== headBytes.byteLength || encodedHead.some((byte, index) => byte !== headBytes[index])) {
+            throw new Error("navigation_auto_refresh_head_encoding");
+          }
+          const head = zoneNavigationHeadSchema.parse(JSON.parse(headRaw));
+          if (canonicalJson(head) !== headRaw || head.project_id !== projectId || head.zone !== zone) {
+            throw new Error("navigation_auto_refresh_head_binding");
+          }
+          validatedHead = head;
+          const publishedSourceGeneration = Number(head.source_snapshot_id.slice("source:".length));
+          if (!Number.isSafeInteger(publishedSourceGeneration) || publishedSourceGeneration < 0
+            || `source:${publishedSourceGeneration}` !== head.source_snapshot_id || publishedSourceGeneration > source.generation) {
+            throw new Error("navigation_auto_refresh_head_snapshot");
+          }
+          if (publishedSourceGeneration < source.generation) {
+            // Compact readiness and an empty dirty page do not prove that the
+            // published navigation head reflects the latest source. Let the
+            // existing governed AUTO reconcile path create a fresh identity.
+          } else {
+            // Only a publication whose immutable progress, certificate,
+            // current head, and physical index all verify can discharge an
+            // outbox row for the current source generation.
+            const budget = currentnessBudget;
+            if (!budget) throw new Error("navigation_auto_refresh_budget_unavailable");
+            budget.beforeHttp();
+            const intent = await this.managedDocumentRequests.readRecoverableIntent(projectId, head.source_request_id);
+            if (!intent) throw new Error("navigation_auto_refresh_publication_intent_unavailable");
+            const request = navigationReconcileSchema.parse(JSON.parse(intent.request_json));
+            const requestHash = await sha256Canonical(request);
+            const publicationJournal: ExecutionJournal = new ExecutionJournal(this.persistence, projectId, "document", request.request_id);
+            budget.beforeHttp();
+            const publicationAdmission: Awaited<ReturnType<ExecutionJournal["readAdmission"]>> = await publicationJournal.readAdmission();
+            if (intent.request_sha256 !== await sha256Text(intent.request_json)
+              || request.operation !== "navigation.reconcile" || request.project_id !== projectId
+              || request.zone !== zone || request.request_id !== head.source_request_id
+              || request.expected_generation + 1 !== head.generation
+              || !publicationAdmission || publicationAdmission.admission.operation !== request.operation
+              || publicationAdmission.admission.kind !== "document" || publicationAdmission.admission.project_id !== projectId
+              || publicationAdmission.admission.request_id !== request.request_id || publicationAdmission.admission.request_hash !== requestHash
+              || publicationAdmission.plan !== null || publicationAdmission.admission.resources.length !== 1
+              || publicationAdmission.admission.resources[0]?.resource_id !== `navigation:${zone}`
+              || publicationAdmission.admission.resources[0]?.resource_type !== "navigation"
+              || publicationAdmission.admission.resources[0]?.version !== String(request.expected_generation)) {
+              throw new Error("navigation_auto_refresh_publication_binding");
+            }
+            const frozenState = await this.readFrozenNavigationState(request, requestHash, budget, true);
+            const inventory = new ZoneNavigationInventory(this.persistence, sources);
+            const verified = await new ZoneNavigationEngine(this.persistence, inventory)
+              .readVerifiedPublication(request, frozenState, publicationAdmission.admission, budget, `source:${source.generation}`);
+            if (!verified || verified.request_id !== head.source_request_id
+              || verified.project_id !== projectId || verified.zone !== zone
+              || verified.source_snapshot_id !== `source:${source.generation}`) {
+              throw new Error("navigation_auto_refresh_publication_unverified");
+            }
+            this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);
+            continue;
+          }
         }
         // Unadopted sources need a new governed reconcile even when this one
         // dirty page is empty. The new admission performs full bounded
@@ -2544,9 +2620,12 @@ export class ProjectGuard extends DurableObject<Env> {
         const admitted = journal ? await journal.readAdmission() : null;
         const current = await this.readFreshCanonicalState(projectId);
         if (!current) throw new Error("navigation_auto_refresh_state_unavailable");
-        const headRaw = await this.persistence.objects.readText(zoneNavigationHeadPath(projectId, zone));
-        if (!headRaw) throw new Error("navigation_auto_refresh_head_unavailable");
-        const head = zoneNavigationHeadSchema.parse(JSON.parse(headRaw));
+        let head = validatedHead;
+        if (!head) {
+          const headRaw = await this.persistence.objects.readText(zoneNavigationHeadPath(projectId, zone));
+          if (!headRaw) throw new Error("navigation_auto_refresh_head_unavailable");
+          head = zoneNavigationHeadSchema.parse(JSON.parse(headRaw));
+        }
         if (head.project_id !== projectId || head.zone !== zone) throw new Error("navigation_auto_refresh_head_binding");
         if (source.generation > row.source_generation && !admitted) {
           this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);

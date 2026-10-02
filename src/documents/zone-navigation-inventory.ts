@@ -142,15 +142,10 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       } else if (!resourceId.startsWith("head:DOC-")) {
         return { status: "conflict", code: "navigation_dirty_resource_unresolved" };
       } else {
-        if (!input.budget.canStartEffect(16)) return "pending";
-        const resolved = await this.resolveHead(input.project_id, input.zone, resourceId, input.budget);
-        if (resolved.gap) return { status: "conflict", code: `navigation_dirty_${resolved.gap.code}` };
-        await this.sources.writeCatalogEntry(resolved.entry, input.project_id, input.zone, resourceId, input.budget, generation);
-        if (!resolved.entry) await this.sources.recordVerifiedCatalogTombstone(input.project_id, input.zone, resourceId, input.snapshot_id, input.budget);
-        if (!await this.sources.finishDirty(input.project_id, input.zone, resourceId, resolved.entry, input.budget)) {
-          return { status: "conflict", code: "navigation_dirty_identity_changed" };
-        }
-        return "pending";
+        // Resolve and clear this marker through the resumable page flow. In
+        // particular, head resolution may consume most of a provider slice;
+        // persist the phase before attempting the separate CAS clear.
+        return { status: "pending", cursor: encodeCursor("dirty", "") };
       }
     }
     const page = await this.listPage({ project_id: input.project_id, zone: input.zone, cursor, limit: 1, budget: input.budget });

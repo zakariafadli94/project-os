@@ -204,9 +204,12 @@ export class PackageExternalDriftObserver {
   private resourceForExactPackagePath(navigation: PackageNavigation, state: ProjectState, path: string): RuleResource | undefined {
     const parsed = this.packagePath(state, path);
     if (!parsed) return undefined;
-    const entry = navigation[parsed.zone]?.packages.find((value) =>
-      value.ref.package_id === parsed.package_id && value.ref.version === parsed.version
-    );
+    const matches = navigation[parsed.zone]?.packages.filter((value) =>
+      value.ref.package_id === parsed.package_id
+      && (parsed.version === undefined || value.ref.version === parsed.version)
+    ) ?? [];
+    if (matches.length !== 1) return undefined;
+    const entry = matches[0];
     return entry ? {
       resource_id: entry.ref.package_id,
       resource_type: "package",
@@ -215,18 +218,18 @@ export class PackageExternalDriftObserver {
     } : undefined;
   }
 
-  private packagePath(state: ProjectState, path: string): { zone: "WORKING" | "REVIEW" | "DELIVERABLES"; package_id: string; version: number } | null {
+  private packagePath(state: ProjectState, path: string): { zone: "WORKING" | "REVIEW" | "DELIVERABLES"; package_id: string; version?: number } | null {
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!path.startsWith(root)) return null;
     const relative = path.slice(root.length);
-    const visible = /^(WORKING|REVIEW|DELIVERABLES)\/PACKAGES\/(PKG-[A-F0-9]{64})\/([1-9][0-9]*)\//.exec(relative);
+    const visible = /^(WORKING|REVIEW|DELIVERABLES)\/PACKAGES\/(PKG-[A-F0-9]{64})(?:\/([1-9][0-9]*)(?:\/.*)?|$)/.exec(relative);
     const archive = /^ARCHIVES\/PACKAGES\/(PKG-[A-F0-9]{64})\/([1-9][0-9]*)\/(WORKING|REVIEW|DELIVERABLES)\//.exec(relative);
     const match = visible ?? archive;
     if (!match) return null;
     return {
       zone: (visible ? visible[1] : archive![3]) as "WORKING" | "REVIEW" | "DELIVERABLES",
       package_id: match[visible ? 2 : 1],
-      version: Number(match[visible ? 3 : 2])
+      ...(visible ? (visible[3] ? { version: Number(visible[3]) } : {}) : { version: Number(archive![2]) })
     };
   }
 
@@ -234,7 +237,7 @@ export class PackageExternalDriftObserver {
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!path.startsWith(root)) return false;
     const relative = path.slice(root.length);
-    return /^(?:WORKING|REVIEW|DELIVERABLES)\/(?:CURRENT\.md|PACKAGES\/PKG-[A-F0-9]{64}\/[1-9][0-9]*\/)|^ARCHIVES\/PACKAGES\/PKG-[A-F0-9]{64}\/[1-9][0-9]*\/(?:WORKING|REVIEW|DELIVERABLES)\//.test(relative);
+    return /^(?:WORKING|REVIEW|DELIVERABLES)\/(?:CURRENT\.md|PACKAGES\/PKG-[A-F0-9]{64}(?:\/[1-9][0-9]*(?:\/|$)|$))|^ARCHIVES\/PACKAGES\/PKG-[A-F0-9]{64}\/[1-9][0-9]*\/(?:WORKING|REVIEW|DELIVERABLES)\//.test(relative);
   }
 }
 

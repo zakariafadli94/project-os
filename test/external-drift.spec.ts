@@ -129,6 +129,35 @@ describe("package external drift", () => {
     expect(f.files.has(path)).toBe(false);
   });
 
+  it.each([
+    ["version directory", (f: Awaited<ReturnType<typeof fixture>>) => `${f.base}/WORKING/PACKAGES/${f.v2.package_id}/2`],
+    ["package-id directory", (f: Awaited<ReturnType<typeof fixture>>) => `${f.base}/WORKING/PACKAGES/${f.v2.package_id}`]
+  ])("attributes deletion of the current package %s without restoring removed bytes", async (_label, pathFor) => {
+    const f = await fixture();
+    const path = pathFor(f);
+    const memberPath = `${f.base}/WORKING/PACKAGES/${f.v2.package_id}/2/a.md`;
+    f.files.delete(memberPath);
+    const effects = f.effects.length;
+
+    const result = await new PackageExternalDriftObserver(f.runtime).observe(f.state, {
+      kind: "deleted", name: path.slice(path.lastIndexOf("/") + 1), path
+    });
+
+    expect(result).toMatchObject({
+      handled: true,
+      status: "unexpected_conflict",
+      code: "PACKAGE_UNEXPECTED_DISAPPEARANCE",
+      resource: {
+        resource_id: f.v2.package_id,
+        resource_type: "package",
+        zone: "WORKING",
+        version: `2:${f.v2.manifest_sha256}`
+      }
+    });
+    expect(f.effects).toHaveLength(effects);
+    expect(f.files.has(memberPath)).toBe(false);
+  });
+
   it("records package disappearance as reconciliation conflict instead of letting the legacy restorer ignore it", async () => {
     const f = await fixture();
     const path = `${f.base}/WORKING/PACKAGES/${f.v2.package_id}/2/a.md`;

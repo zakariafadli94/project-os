@@ -3,7 +3,7 @@ import type { SliceBudget } from "../src/convergence/contract";
 import type { ExecutionAdmission } from "../src/execution/contract";
 import { navigationReconcileSchema, type NavigationInventoryEntry, type NavigationInventoryPort } from "../src/domain/zone-navigation";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
-import { ZoneNavigationSources, zoneNavigationCatalogRoot } from "../src/documents/zone-navigation-sources";
+import { ZoneNavigationSources, zoneNavigationCatalogRoot, zoneNavigationCatalogShardForResource } from "../src/documents/zone-navigation-sources";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { ExecutionJournal, executionHash } from "../src/execution/journal";
 import { sha256Text } from "../src/documents/hash";
@@ -50,6 +50,140 @@ describe("compact catalog adoption gate", () => {
 });
 
 describe("saved initial listing deadline behavior", () => {
+  it("leaves checkpoint budget after compact-cache head updates on a saved active-head page", async () => {
+    const h = harness();
+    const ids = ["DOC-05620E091406A4614730CCDE", "DOC-BB8C797FFF67374EF24A4CF4"];
+    const entries: NavigationInventoryEntry[] = [];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `compact baseline head ${index}`, `rev-compact-${index}`, id,
+        `VER-REQ-${id.slice(4)}`, `compact-${index}.md`);
+    }
+    const initial = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(2000) });
+    entries.push(...initial.entries);
+    expect(entries.map((entry) => entry.resource_id)).toEqual(ids.map((id) => `head:${id}`));
+
+    const owner = "DOCREQ-NAV-COMPACT-BASELINE-OWNER-0001";
+    expect(await h.sources.beginAdoption(projectId, "WORKING", owner, 0, budget(2000))).toBe(true);
+    const firstTicket = await h.sources.beginHeadWrite(projectId, "WORKING", entries[0].resource_id, budget(2000), null, true);
+    await h.sources.completeHeadWrite(firstTicket, entries[0], budget(2000));
+    await h.sources.recordVerifiedCatalogEntry(entries[0], "source:1", budget(2000));
+    await h.sources.recordVerifiedCatalogEntry(entries[1], "source:1", budget(2000));
+    expect(await h.sources.finishDirty(projectId, "WORKING", entries[0].resource_id, entries[0], budget(2000))).toBe(true);
+    expect(await h.sources.markCatalogReady(projectId, "WORKING", 1, budget(2000))).toBe(true);
+
+    const secondTicket = await h.sources.beginHeadWrite(projectId, "WORKING", entries[1].resource_id, budget(2000), null, true);
+    await h.sources.completeHeadWrite(secondTicket, entries[1], budget(2000));
+    await h.sources.recordVerifiedCatalogEntry(entries[0], "source:2", budget(2000));
+    expect(await h.sources.readState(projectId, "WORKING", budget(2000))).toMatchObject({ generation: 2, adopted: false });
+    expect((await h.sources.compactCatalogManifest(projectId, "WORKING", budget(2000)))?.ready_generation).toBe(1);
+    for (const entry of entries) {
+      const shard = zoneNavigationCatalogShardForResource(entry.resource_id);
+      const savedChunk = await h.sources.readCompactCatalogShard(projectId, "WORKING", shard, 2, budget(2000));
+      const chunkPath = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/compact/${shard.toString(16).padStart(2, "0")}.json`;
+      expect(JSON.parse(h.files.get(chunkPath)!.content).entries.find((saved: { resource_id: string }) => saved.resource_id === entry.resource_id))
+        .toMatchObject({ resource_id: entry.resource_id, source_generation: entry === entries[0] ? 2 : 1, entry });
+      expect(savedChunk.map((saved) => saved.resource_id)).toContain(entry.resource_id);
+    }
+
+    const savedCursor = `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: ids.map((id) => ({ kind: "file" as const, name: `${id}.json`, path: machineDocumentHeadPath(projectId, id) })),
+      provider_cursor: null,
+      listing_limit: 512
+    }))}`;
+    const slice = budget(32);
+    // Four calls have already been spent on the engine's owner/context prefix;
+    // this listPage's state identity/read is the remaining two of that six-call prefix.
+    for (let index = 0; index < 4; index += 1) slice.beforeHttp();
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: savedCursor, limit: 8, budget: slice });
+
+    expect(page.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[0]}`]);
+    expect(page.next_cursor).not.toBe(savedCursor);
+    expect(page.next_cursor).toContain(ids[1]);
+    // The real engine's immutable-page/progress write is a bounded three-call checkpoint.
+    expect(slice.calls_left).toBeGreaterThanOrEqual(4);
+    for (let index = 0; index < 3; index += 1) slice.beforeHttp();
+    expect(slice.calls_left).toBeGreaterThanOrEqual(1);
+
+    const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: page.next_cursor, limit: 8, budget: budget(32) });
+    expect(resumed.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[1]}`]);
+    const refreshedChunk = await h.sources.readCompactCatalogShard(projectId, "WORKING",
+      zoneNavigationCatalogShardForResource(`head:${ids[1]}`), 2, budget(2000));
+    expect(refreshedChunk.find((entry) => entry.resource_id === `head:${ids[1]}`)?.version).toBe(entries[1].version);
+    const refreshedChunkPath = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/compact/${zoneNavigationCatalogShardForResource(`head:${ids[1]}`).toString(16).padStart(2, "0")}.json`;
+    expect(JSON.parse(h.files.get(refreshedChunkPath)!.content).entries.find((saved: { resource_id: string }) => saved.resource_id === `head:${ids[1]}`))
+      .toMatchObject({ source_generation: 2, entry: entries[1] });
+  });
+
+  it("checkpoints a completed prefix instead of repeatedly pairing heads against an older ready compact cache", async () => {
+    const h = harness();
+    const ids = ["DOC-05620E091406A4614730CCDE", "DOC-BB8C797FFF67374EF24A4CF4"];
+    const entries: NavigationInventoryEntry[] = [];
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `pair compact head ${index}`, `rev-pair-${index}`, id,
+        `VER-REQ-${id.slice(4)}`, `pair-compact-${index}.md`);
+    }
+    entries.push(...(await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(2000) })).entries);
+    expect(entries.map((entry) => entry.resource_id)).toEqual(ids.map((id) => `head:${id}`));
+
+    const owner = "DOCREQ-NAV-COMPACT-PAIR-OWNER-0001";
+    expect(await h.sources.beginAdoption(projectId, "WORKING", owner, 0, budget(2000))).toBe(true);
+    const firstTicket = await h.sources.beginHeadWrite(projectId, "WORKING", entries[0].resource_id, budget(2000), null, true);
+    await h.sources.completeHeadWrite(firstTicket, entries[0], budget(2000));
+    await h.sources.recordVerifiedCatalogEntry(entries[0], "source:1", budget(2000));
+    await h.sources.recordVerifiedCatalogEntry(entries[1], "source:1", budget(2000));
+    expect(await h.sources.finishDirty(projectId, "WORKING", entries[0].resource_id, entries[0], budget(2000))).toBe(true);
+    expect(await h.sources.markCatalogReady(projectId, "WORKING", 1, budget(2000))).toBe(true);
+    const secondTicket = await h.sources.beginHeadWrite(projectId, "WORKING", entries[1].resource_id, budget(2000), null, true);
+    await h.sources.completeHeadWrite(secondTicket, entries[1], budget(2000));
+    await h.sources.recordVerifiedCatalogEntry(entries[0], "source:2", budget(2000));
+
+    const firstSlice = budget(32);
+    const firstPage = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: firstSlice });
+    expect(firstPage.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[0]}`]);
+    expect(firstPage.next_cursor).not.toBeNull();
+    expect(firstPage.next_cursor).toContain(ids[1]);
+    expect(firstSlice.calls_left).toBeGreaterThanOrEqual(4);
+    for (let index = 0; index < 3; index += 1) firstSlice.beforeHttp();
+
+    const secondPage = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: firstPage.next_cursor, limit: 8, budget: budget(32) });
+    expect(secondPage.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[1]}`]);
+    expect(secondPage.next_cursor).not.toBe(firstPage.next_cursor);
+  });
+
+  it("keeps the checkpoint reserve while clearing an inactive head's prior catalog entry", async () => {
+    const h = harness();
+    await addWorkingHead(h, "inactive stale catalog body");
+    const first = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(2000) });
+    expect(first.entries).toHaveLength(1);
+    const owner = "DOCREQ-NAV-INACTIVE-CATALOG-OWNER-0001";
+    expect(await h.sources.beginAdoption(projectId, "WORKING", owner, 0, budget(2000))).toBe(true);
+    const ticket = await h.sources.beginHeadWrite(projectId, "WORKING", first.entries[0].resource_id, budget(2000), null, true);
+    await h.sources.completeHeadWrite(ticket, first.entries[0], budget(2000));
+    await h.sources.recordVerifiedCatalogEntry(first.entries[0], "source:1", budget(2000));
+    expect(await h.sources.finishDirty(projectId, "WORKING", first.entries[0].resource_id, first.entries[0], budget(2000))).toBe(true);
+    expect(await h.sources.markCatalogReady(projectId, "WORKING", 1, budget(2000))).toBe(true);
+
+    const headPath = machineDocumentHeadPath(projectId, documentId);
+    const head = JSON.parse(h.files.get(headPath)!.content);
+    delete head.working_version_id;
+    delete head.provider.working;
+    h.put(headPath, JSON.stringify(head), "id:inactive-head");
+    const catalogPath = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/${await sha256Text(`head:${documentId}`)}.json`;
+    const savedCursor = `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: [{ kind: "file" as const, name: `${documentId}.json`, path: headPath }],
+      provider_cursor: null,
+      listing_limit: 512
+    }))}`;
+    const slice = budget(32);
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: savedCursor, limit: 8, budget: slice });
+    expect(page.entries).toEqual([]);
+    expect(page.next_cursor).not.toBe(savedCursor);
+    expect(JSON.parse(h.files.get(catalogPath)!.content).entry).toBeNull();
+    expect(slice.calls_left).toBeGreaterThanOrEqual(4);
+  });
+
   it("advances a saved active head when its following head preflight reaches the deadline", async () => {
     const activeId = "DOC-000000000000000000000005";
     const inactiveId = "DOC-000000000000000000000006";
@@ -1131,23 +1265,40 @@ describe("ZoneNavigationInventory", () => {
     for (const [index, id] of ids.entries()) {
       await addWorkingHead(h, `body ${index}`, `rev-${index}`, id, `VER-REQ-${id.slice(4)}`, `draft-${index}.md`);
     }
+    const baseline = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(2000) });
+    expect(baseline.entries.map((entry) => entry.resource_id)).toEqual(ids.map((id) => `head:${id}`));
+    const owner = "DOCREQ-NAV-SIDECAR-CONFLICT-OWNER-0001";
+    expect(await h.sources.beginAdoption(projectId, "WORKING", owner, 0, budget(2000))).toBe(true);
+    const ticket = await h.sources.beginHeadWrite(projectId, "WORKING", baseline.entries[0].resource_id, budget(2000), null, true);
+    await h.sources.completeHeadWrite(ticket, baseline.entries[0], budget(2000));
+    for (const entry of baseline.entries) await h.sources.recordVerifiedCatalogEntry(entry, "source:1", budget(2000));
+    expect(await h.sources.finishDirty(projectId, "WORKING", baseline.entries[0].resource_id, baseline.entries[0], budget(2000))).toBe(true);
+    expect(await h.sources.markCatalogReady(projectId, "WORKING", 1, budget(2000))).toBe(true);
+
     const secondSidecar = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/${await sha256Text(`head:${ids[1]}`)}.json`;
-    const originalCreate = h.runtime.objects.createText.bind(h.runtime.objects);
-    let injected = false;
-    h.runtime.objects.createText = async (path, content) => {
-      if (path === secondSidecar && !injected) {
-        injected = true;
+    const short = budget(29);
+    const firstPage = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: short });
+    expect(firstPage.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[0]}`]);
+    expect(firstPage.next_cursor).toContain(ids[1]);
+    expect(short.calls_left).toBeGreaterThanOrEqual(4);
+
+    const originalConditionalWrite = h.runtime.conditionalWrite.writeTextConditional.bind(h.runtime.conditionalWrite);
+    let injected = 0;
+    h.runtime.conditionalWrite.writeTextConditional = async (path, content, revisionToken) => {
+      if (path === secondSidecar) {
+        injected += 1;
         throw new ProviderOperationError("sidecar conflict", false);
       }
-      return originalCreate(path, content);
+      return originalConditionalWrite(path, content, revisionToken);
     };
-    const short = budget(29);
-    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: short }))
+    const retry = budget(32);
+    await expect(h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: firstPage.next_cursor, limit: 8, budget: retry }))
       .rejects.toThrow("sidecar conflict");
-    expect(injected).toBe(true);
-    expect(short.calls_left).toBeGreaterThanOrEqual(4);
-    const retry = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(32) });
-    expect(retry.entries.map((entry) => entry.resource_id)).toEqual(ids.map((id) => `head:${id}`));
+    expect(injected).toBeGreaterThan(0);
+    expect(retry.calls_left).toBeGreaterThanOrEqual(4);
+    h.runtime.conditionalWrite.writeTextConditional = originalConditionalWrite;
+    const resumed = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: firstPage.next_cursor, limit: 8, budget: budget(32) });
+    expect(resumed.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[1]}`]);
   });
 
   it("classifies a malformed first observation without stalling its following head", async () => {
@@ -1969,7 +2120,7 @@ describe("ZoneNavigationInventory", () => {
     expect(fullEntries.map((entry) => entry.resource_id)).not.toContain(`head:${inactiveId}`);
     expect(fullGaps.some((gap) => gap.resource_id === "head:DOC-3123456789ABCDEF01234567")).toBe(true);
     expect(fullGaps.filter((gap) => gap.code === "artifact_destination_outside_navigation_zones")).toHaveLength(4);
-    expect({ calls: fullCallsUsed, tranches: fullPages.length }).toEqual({ calls: 36, tranches: 4 });
+    expect({ calls: fullCallsUsed, tranches: fullPages.length }).toEqual({ calls: 37, tranches: 4 });
   });
 
   it("measures the full initial traversal for mixed heads and outside-zone artifacts", async () => {
@@ -2006,7 +2157,7 @@ describe("ZoneNavigationInventory", () => {
     expect(entries.map((entry) => entry.resource_id)).not.toContain(`head:${inactiveId}`);
     expect(gaps.some((gap) => gap.resource_id === "head:DOC-3123456789ABCDEF01234567")).toBe(true);
     expect(gaps.filter((gap) => gap.code === "artifact_destination_outside_navigation_zones").map((gap) => gap.resource_id)).toEqual(expectedArtifacts);
-    expect({ calls, tranches: pages.length }).toEqual({ calls: 32, tranches: 3 });
+    expect({ calls, tranches: pages.length }).toEqual({ calls: 33, tranches: 3 });
   });
 
   it.each([

@@ -135,6 +135,24 @@ export class MaterializationGuard extends DurableObject<Env> {
       // alarm: ProjectGuard may be holding its own serializer while enqueueing.
       return this.enqueueNavigationWork(request);
     }
+    if (request.method === "GET" && url.pathname === "/navigation-work-status") {
+      const requestId = url.searchParams.get("request_id");
+      if (!requestId || !/^DOCREQ-[A-Z0-9-]{8,}$/.test(requestId)) {
+        return Response.json({ error: "request_identity_required" }, { status: 400 });
+      }
+      const [work, retryRaw] = await Promise.all([
+        this.ctx.storage.get<string>(this.navigationWorkKey(requestId)),
+        this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${requestId}`)
+      ]);
+      const retry = retryRaw ? JSON.parse(retryRaw) as { stopped?: unknown; next_attempt_at?: unknown } : null;
+      return Response.json({
+        project_id: this.projectId,
+        request_id: requestId,
+        queued: work !== undefined,
+        stopped: retry?.stopped === true,
+        next_attempt_at: typeof retry?.next_attempt_at === "string" ? retry.next_attempt_at : null
+      });
+    }
     if (request.method === "GET" && url.pathname === "/status") {
       if (this.queueDepth > 0) return this.busyReadResponse();
       return this.serialize(() => this.handleStatus());

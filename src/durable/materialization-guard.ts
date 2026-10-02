@@ -140,9 +140,10 @@ export class MaterializationGuard extends DurableObject<Env> {
       if (!requestId || !/^DOCREQ-[A-Z0-9-]{8,}$/.test(requestId)) {
         return Response.json({ error: "request_identity_required" }, { status: 400 });
       }
-      const [work, retryRaw] = await Promise.all([
+      const [work, retryRaw, alarmAt] = await Promise.all([
         this.ctx.storage.get<string>(this.navigationWorkKey(requestId)),
-        this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${requestId}`)
+        this.ctx.storage.get<string>(`${NAVIGATION_RETRY_PREFIX}${requestId}`),
+        this.ctx.storage.getAlarm()
       ]);
       const retry = retryRaw ? JSON.parse(retryRaw) as { stopped?: unknown; next_attempt_at?: unknown } : null;
       return Response.json({
@@ -150,7 +151,9 @@ export class MaterializationGuard extends DurableObject<Env> {
         request_id: requestId,
         queued: work !== undefined,
         stopped: retry?.stopped === true,
-        next_attempt_at: typeof retry?.next_attempt_at === "string" ? retry.next_attempt_at : null
+        next_attempt_at: work !== undefined && retry?.stopped !== true && alarmAt !== null
+          ? typeof retry?.next_attempt_at === "string" ? retry.next_attempt_at : new Date(alarmAt).toISOString()
+          : null
       });
     }
     if (request.method === "GET" && url.pathname === "/status") {

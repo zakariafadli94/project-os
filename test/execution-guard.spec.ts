@@ -2386,8 +2386,41 @@ describe("canonical execution boundary in ProjectGuard", () => {
       payloads: state.storage.sql.exec("SELECT request_id FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", request.request_id).toArray().length
     }));
     expect(handoff).toEqual({ queued: 0, payloads: 1 });
+    const handedOffStatus = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(await handedOffStatus.json()).toMatchObject({
+      observation: { recovery: { owner: "system", state: "scheduled", requires_new_approval: false } },
+      recovery: { scheduled: true }
+    });
 
     const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    const savedAlarm = await runInDurableObject(materialization, async (_instance, state) => {
+      const alarm = await state.storage.getAlarm();
+      await state.storage.deleteAlarm();
+      return alarm;
+    });
+    const noWake = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(await noWake.json()).toMatchObject({
+      observation: { recovery: { state: "none", next_attempt_at: null } }, recovery: { scheduled: false }
+    });
+    const retryAt = new Date(Date.now() + 60_000).toISOString();
+    await runInDurableObject(materialization, async (_instance, state) => {
+      await state.storage.setAlarm(savedAlarm!);
+      await state.storage.put(`navigation-retry:${request.request_id}`, JSON.stringify({ stopped: false, next_attempt_at: retryAt }));
+    });
+    const backedOff = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(await backedOff.json()).toMatchObject({ observation: { recovery: { owner: "system", next_attempt_at: retryAt } } });
+    await runInDurableObject(materialization, (_instance, state) => state.storage.deleteAlarm());
+    const orphanedRetry = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(await orphanedRetry.json()).toMatchObject({
+      observation: { recovery: { state: "none", next_attempt_at: null } }, recovery: { scheduled: false }
+    });
+    await runInDurableObject(materialization, async (_instance, state) => {
+      await state.storage.setAlarm(savedAlarm!);
+      await state.storage.put(`navigation-retry:${request.request_id}`, JSON.stringify({ stopped: true, next_attempt_at: retryAt }));
+    });
+    const stoppedRetry = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(await stoppedRetry.json()).toMatchObject({ recovery: { scheduled: false } });
+    await runInDurableObject(materialization, (_instance, state) => state.storage.delete(`navigation-retry:${request.request_id}`));
     const runPreparationSlice = () => runInDurableObject(materialization, (instance) =>
       (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
     );

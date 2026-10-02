@@ -290,10 +290,20 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
       if (timer !== undefined) clearTimeout(timer);
       timer = undefined;
     }
-    let submitted: { response: Response; payload: unknown; outcome: "business_refusal" | "http_rejection" | "committed" };
+    let submitted: { response: Response; payload: unknown; outcome: "business_refusal" | "http_rejection" | "committed" | "pending" };
     if (!response.ok) {
+      const pending = submissionPayload && typeof submissionPayload === "object" && !Array.isArray(submissionPayload)
+        ? submissionPayload as Record<string, unknown> : null;
+      const acknowledgedRecovery = kind === "document" && response.status === 503
+        && pending?.status === "pending" && pending.code === "DOCUMENT_RECOVERY_SCHEDULED"
+        && pending.project_id === projectId && pending.request_id === requestId;
       const refusal = knownBusinessRefusal(submissionPayload, response.status, requestId, projectId);
-      if (refusal) submitted = { response, payload: refusal, outcome: "business_refusal" };
+      if (acknowledgedRecovery) submitted = { response, outcome: "pending", payload: {
+        status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED", project_id: projectId, request_id: requestId,
+        recovery: { owner: "system", action: "check_status", preserve_request_id: true,
+          check_status_before_retry: true, requires_new_approval: false, next_attempt_at: null }
+      } };
+      else if (refusal) submitted = { response, payload: refusal, outcome: "business_refusal" };
       else if (response.status >= 500) throw new SubmissionFailure("submission");
       else submitted = { response, payload: { status: "rejected", code: "PROJECT_OS_SUBMISSION_REJECTED", request_id: requestId }, outcome: "http_rejection" };
     } else {
@@ -303,7 +313,7 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
     }
     console.log("project_os_submission_finished", { ...diagnostic, boundary: "submission", elapsed_ms: Date.now() - started, result: submitted.outcome });
     const payload = { content: [{ type: "text" as const, text: JSON.stringify(submitted.payload) }] };
-    return submitted.outcome === "committed" ? payload : { ...payload, isError: true as const };
+    return submitted.outcome === "committed" || submitted.outcome === "pending" ? payload : { ...payload, isError: true as const };
   } catch (error) {
     controller.abort();
     const failedBoundary = error instanceof SubmissionFailure ? error.boundary : boundary;

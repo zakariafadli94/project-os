@@ -122,7 +122,9 @@ export class ZoneNavigationEngine {
     const indexPath = this.indexPath(state, request.zone, request.expected_index?.basename ?? "00-CURRENT.md");
     this.assertAdmission(request, state, admission, requestHash, indexPath);
     const progressPath = `${root}/navigation-progress.json`;
-    const progressProof = await this.readBoundedPublicationProof(progressPath, 2_000_000, budget);
+    const headPath = zoneNavigationHeadPath(request.project_id, request.zone);
+    const progressProof = await this.readBoundedPublicationProof(progressPath, 2_000_000, budget, true);
+    if (!progressProof) return this.proveTargetWasNeverPublished(request, headPath, budget);
     const raw = progressProof.text;
     const parsed = navigationProgressSchema.safeParse(JSON.parse(raw));
     if (!parsed.success) throw new NavigationConflict("navigation_publication_proof_unavailable");
@@ -135,7 +137,6 @@ export class ZoneNavigationEngine {
     const receiptResult = zoneNavigationReceiptSchema.safeParse(progress.receipt);
     if (!receiptResult.success) return null;
     const receipt = receiptResult.data;
-    const headPath = zoneNavigationHeadPath(request.project_id, request.zone);
     if (receipt.project_id !== request.project_id || receipt.request_id !== request.request_id
       || receipt.zone !== request.zone || receipt.generation !== progress.target_generation
       || receipt.source_snapshot_id !== expectedSnapshotId || receipt.head_ref !== headPath
@@ -177,19 +178,42 @@ export class ZoneNavigationEngine {
     return receipt;
   }
 
-  private async readBoundedPublicationProof(path: string, limit: number, budget: SliceBudget): Promise<{ text: string; metadata: ProviderObjectMetadata }> {
+  private async readBoundedPublicationProof(path: string, limit: number, budget: SliceBudget): Promise<{ text: string; metadata: ProviderObjectMetadata }>;
+  private async readBoundedPublicationProof(path: string, limit: number, budget: SliceBudget, allowNotFound: true): Promise<{ text: string; metadata: ProviderObjectMetadata } | null>;
+  private async readBoundedPublicationProof(path: string, limit: number, budget: SliceBudget, allowNotFound = false): Promise<{ text: string; metadata: ProviderObjectMetadata } | null> {
     const before = await this.metadata(path, budget);
-    if (!before?.objectId || !before.revisionToken || before.size > limit || !this.runtime.objects.readBytes) {
+    if (before === null && allowNotFound) return null;
+    if (!before?.objectId || !before.revisionToken || before.path !== path || before.size > limit || !this.runtime.objects.readBytes) {
       throw new NavigationConflict("navigation_publication_proof_unavailable");
     }
     budget.beforeHttp();
     const bytes = await this.runtime.objects.readBytes(path, limit);
     const after = await this.metadata(path, budget);
     if (!bytes || bytes.byteLength !== before.size || after?.objectId !== before.objectId
-      || after?.revisionToken !== before.revisionToken) throw new NavigationConflict("navigation_publication_proof_unavailable");
+      || after.path !== path || after.revisionToken !== before.revisionToken || after.size !== before.size) {
+      throw new NavigationConflict("navigation_publication_proof_unavailable");
+    }
     const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
     if (!sameBytes(new TextEncoder().encode(text), bytes)) throw new NavigationConflict("navigation_publication_proof_unavailable");
     return { text, metadata: before };
+  }
+
+  private async proveTargetWasNeverPublished(
+    request: NavigationReconcileRequest,
+    headPath: string,
+    budget: SliceBudget
+  ): Promise<null> {
+    if (request.purpose === "compact_catalog_rebuild") throw new NavigationConflict("navigation_publication_proof_unavailable");
+    const headProof = await this.readBoundedPublicationProof(headPath, 128_000, budget);
+    const parsed = zoneNavigationHeadSchema.safeParse(JSON.parse(headProof.text));
+    if (!parsed.success || canonicalJson(parsed.data) !== headProof.text
+      || parsed.data.project_id !== request.project_id || parsed.data.zone !== request.zone
+      || parsed.data.generation !== request.expected_generation
+      || parsed.data.source_request_id === request.request_id
+      || !request.expected_index || !sameIndexIdentity(parsed.data.index, request.expected_index)) {
+      throw new NavigationConflict("navigation_publication_proof_unavailable");
+    }
+    return null;
   }
 
   async prepareCompactCatalogRebuild(

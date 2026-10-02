@@ -264,7 +264,13 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // need at most eighteen more, including a conditional stale tombstone;
       // canStartEffect preserves the checkpoint
       // reserve before either chain begins. Mismatches retain the solo path.
-      if (persistCatalog && offset + 1 < listedEntries.length && budget.canStartEffect(22)) {
+      // On the first item of a saved listing, let the solo path establish its
+      // active-head reservation before speculatively reading a second head.
+      // A slow/non-ordinary second head can consume the shared deadline even
+      // though the first head is independently verifiable; retrying the same
+      // saved cursor would otherwise repeat that preflight forever.
+      if (persistCatalog && !(offset === 0 && reusingSavedListing)
+        && offset + 1 < listedEntries.length && budget.canStartEffect(22)) {
         const pair = await this.ordinaryInitialPair(projectId, zone, listedEntries.slice(offset, offset + 2), snapshotId, budget, headCache);
         if (pair) {
           let failed = false;

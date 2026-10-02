@@ -3,13 +3,14 @@ import { emptyProjectState } from "../src/domain/transitions";
 import {
   navigationCatalogRebuildProgressSchema,
   navigationReconcileSchema,
+  zoneNavigationHeadSchema,
   type NavigationCatalogRebuildRequest,
   type NavigationReconcileRequest,
   type NavigationInventoryEntry,
   type NavigationInventoryPort,
   type NavigationIndexIdentity
 } from "../src/domain/zone-navigation";
-import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
+import { ZoneNavigationEngine, zoneNavigationHeadPath } from "../src/documents/zone-navigation";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ZoneNavigationSources, zoneNavigationCatalogShardForResource } from "../src/documents/zone-navigation-sources";
 import { executionHash, ExecutionJournal, requiredRulePostchecks } from "../src/execution/journal";
@@ -284,6 +285,30 @@ async function reconcileUntilTerminal(engine: ZoneNavigationEngine, input: Navig
   let result = await engine.reconcile(input, project, admission, budget(firstBudget));
   for (let attempt = 0; result.status === "pending" && attempt < 12; attempt++) result = await engine.reconcile(input, project, admission, budget());
   return result;
+}
+
+async function missingProgressPublicationFixture(requestId = "DOCREQ-NAVIGATION-WORKING-ABSENT-PROGRESS-0001") {
+  const harness = runtimeHarness();
+  const project = state();
+  const inv = await inventoryHarness(project);
+  const priorIndex = { basename: "00-CURRENT.md" as const, object_id: "id:prior-index", revision_token: "rev-prior-index", content_sha256: "a".repeat(64) };
+  const input = navigationReconcileSchema.parse({ ...request(), request_id: requestId, expected_generation: 1, expected_index: priorIndex });
+  const admission = await admissionFor(input);
+  await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).commit(admission, null);
+  const sources = new ZoneNavigationSources(harness.runtime);
+  expect(await sources.markCatalogReady(project.project_id, "WORKING", 0)).toBe(true);
+  const ticket = await sources.beginHeadWrite(project.project_id, "WORKING", "head:DOC-0123456789ABCDEF01234567", undefined, null, true);
+  expect(ticket?.generation).toBe(1);
+  await sources.completeHeadWrite(ticket!, null);
+  expect(await sources.readState(project.project_id, "WORKING")).toMatchObject({ generation: 1, in_flight_resource_ids: [] });
+  const headPath = zoneNavigationHeadPath(project.project_id, "WORKING");
+  const head = zoneNavigationHeadSchema.parse({
+    schema_version: "1.0", project_id: project.project_id, zone: "WORKING", generation: 1,
+    source_request_id: "DOCREQ-NAVIGATION-WORKING-PRIOR-0001", index: priorIndex,
+    finalization_ref: "prior:publication-certificate", source_snapshot_id: "source:0", source_count: 0, coverage_gaps: []
+  });
+  harness.put(headPath, canonicalJson(head));
+  return { harness, project, inv, input, admission, headPath, head };
 }
 
 async function runSparseCatalogRebuildWithLegacyProgress(includeOmittedSourceId = false) {
@@ -1657,6 +1682,49 @@ describe("zone navigation identity and resumable reconciliation", () => {
     harness.put(indexPath, `${index.content}\nexternal change`, index.objectId);
     expect(await engine.readVerifiedPublication(input, project, admission, budget(), published.receipt.source_snapshot_id)).toBeNull();
   });
+
+  it("returns no publication when progress is absent and a stable prior head proves the target generation was never published", async () => {
+    const { harness, project, inv, input, admission } = await missingProgressPublicationFixture();
+
+    const result = await new ZoneNavigationEngine(harness.runtime, inv.port)
+      .readVerifiedPublication(input, project, admission, budget(), "source:0");
+
+    expect(result).toBeNull();
+  });
+
+  it.each(["missing-head", "newer-head", "own-request-head", "malformed-head", "oversized-head", "unstable-head", "metadata-error"] as const)(
+    "keeps missing progress unavailable for %s instead of inferring conflict",
+    async (failure) => {
+      const { harness, project, inv, input, admission, headPath, head } = await missingProgressPublicationFixture(
+        `DOCREQ-NAVIGATION-WORKING-NO-PROOF-${failure.toUpperCase().replace(/[^A-Z0-9]/g, "-")}`
+      );
+      if (failure === "missing-head") harness.files.delete(headPath);
+      if (failure === "newer-head") harness.put(headPath, canonicalJson({ ...head, generation: 2 }));
+      if (failure === "own-request-head") harness.put(headPath, canonicalJson({ ...head, source_request_id: input.request_id }));
+      if (failure === "malformed-head") harness.put(headPath, "not-json");
+      if (failure === "oversized-head") harness.put(headPath, `${canonicalJson(head)}${" ".repeat(128_001)}`);
+      if (failure === "unstable-head") {
+        const originalMetadata = harness.runtime.objects.getMetadata.bind(harness.runtime.objects);
+        let reads = 0;
+        vi.spyOn(harness.runtime.objects, "getMetadata").mockImplementation(async (path) => {
+          const metadata = await originalMetadata(path);
+          return path === headPath && ++reads === 2 && metadata
+            ? { ...metadata, revisionToken: "head-changed-during-proof" } : metadata;
+        });
+      }
+      if (failure === "metadata-error") {
+        const originalMetadata = harness.runtime.objects.getMetadata.bind(harness.runtime.objects);
+        vi.spyOn(harness.runtime.objects, "getMetadata").mockImplementation(async (path) => {
+          if (path.endsWith("/navigation-progress.json")) throw new Error("provider unavailable");
+          return originalMetadata(path);
+        });
+      }
+
+      await expect(new ZoneNavigationEngine(harness.runtime, inv.port)
+        .readVerifiedPublication(input, project, admission, budget(), "source:0"))
+        .rejects.toThrow();
+    }
+  );
 
   it("returns an old finalized receipt without restoring its index over a newer generation", async () => {
     const harness = runtimeHarness();

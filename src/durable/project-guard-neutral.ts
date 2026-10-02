@@ -4764,7 +4764,7 @@ export class ProjectGuard extends DurableObject<Env> {
         || (body.status === "committed" && body.observation?.terminal !== true);
       if (!refreshable || body.observation?.freshness !== "stale") return stored;
       const current = await this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId);
-      if (!current.ok) return stored;
+      if (!current.ok) return this.withNavigationWorkerDiagnostic(stored, projectId, kind, requestId);
       const currentBody = await current.clone().json() as Record<string, any>;
       if (currentBody.project_id === projectId && currentBody.kind === kind && currentBody.request_id === requestId
         && currentBody.observation?.freshness === "verified") return current;
@@ -4772,7 +4772,50 @@ export class ProjectGuard extends DurableObject<Env> {
       // Keep the old observation explicitly stale when bounded revalidation
       // is unavailable; never turn that condition into absence.
     }
-    return stored;
+    return this.withNavigationWorkerDiagnostic(stored, projectId, kind, requestId);
+  }
+
+  private async readNavigationWorkerDiagnostic(projectId: string, requestId: string): Promise<{
+    queued: boolean; stopped: boolean; next_attempt_at: string | null
+  } | null> {
+    try {
+      const controller = new AbortController();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let response: Response | null;
+      try {
+        response = await Promise.race([
+          this.env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
+            `https://materialization-guard.internal/navigation-work-status?request_id=${encodeURIComponent(requestId)}`,
+            { signal: controller.signal }
+          ),
+          new Promise<null>((resolve) => {
+            timeout = setTimeout(() => { controller.abort(); resolve(null); }, 250);
+          })
+        ]);
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+      }
+      if (!response?.ok) return null;
+      const worker = await response.json<Record<string, unknown>>();
+      if (worker.project_id !== projectId || worker.request_id !== requestId
+        || typeof worker.queued !== "boolean" || typeof worker.stopped !== "boolean"
+        || (worker.next_attempt_at !== null && typeof worker.next_attempt_at !== "string")) return null;
+      return {
+        queued: worker.queued,
+        stopped: worker.stopped,
+        next_attempt_at: worker.next_attempt_at as string | null
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async withNavigationWorkerDiagnostic(response: Response, projectId: string, kind: RequestKind, requestId: string): Promise<Response> {
+    if (kind !== "document") return response;
+    const worker = await this.readNavigationWorkerDiagnostic(projectId, requestId);
+    if (!worker) return response;
+    const body = await response.json<Record<string, unknown>>();
+    return Response.json({ ...body, navigation_worker: worker }, { status: response.status });
   }
 
   /** A read-only recovery view. In particular, it must not certify an effect,
@@ -4945,34 +4988,7 @@ export class ProjectGuard extends DurableObject<Env> {
         try {
           const documentRequest = parseManagedDocumentRequest(JSON.parse(intent.request_json));
           if (documentRequest.operation === "navigation.reconcile") {
-            const controller = new AbortController();
-            let timeout: ReturnType<typeof setTimeout> | undefined;
-            let response: Response | null;
-            try {
-              response = await Promise.race([
-                this.env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
-                  `https://materialization-guard.internal/navigation-work-status?request_id=${encodeURIComponent(requestId)}`,
-                  { signal: controller.signal }
-                ),
-                new Promise<null>((resolve) => {
-                  timeout = setTimeout(() => { controller.abort(); resolve(null); }, 250);
-                })
-              ]);
-            } finally {
-              if (timeout !== undefined) clearTimeout(timeout);
-            }
-            if (response?.ok) {
-              const worker = await response.json<Record<string, unknown>>();
-              if (worker.project_id === projectId && worker.request_id === requestId
-                && typeof worker.queued === "boolean" && typeof worker.stopped === "boolean"
-                && (worker.next_attempt_at === null || typeof worker.next_attempt_at === "string")) {
-                navigationWorker = {
-                  queued: worker.queued,
-                  stopped: worker.stopped,
-                  next_attempt_at: worker.next_attempt_at as string | null
-                };
-              }
-            }
+            navigationWorker = await this.readNavigationWorkerDiagnostic(projectId, requestId);
           }
         } catch {
           // Worker diagnostics are supplementary; unavailable diagnostics must

@@ -46,6 +46,24 @@ export interface MaterializationLedgerStatus {
   last_error: string | null;
   output_count: number;
   attempt_output_count: number;
+  active_work_plan_state?: "none" | "missing" | "ready" | "invalid";
+  active_work?: {
+    target_revision: number;
+    projection_version: number;
+    verification_epoch: number;
+    phase: "writing" | "final_verification";
+    remaining_write_count: number;
+    remaining_removal_count: number;
+    final_verification_pending_count: number;
+    remaining_action_count: number;
+  } | null;
+}
+
+export interface MaterializationWorkPlanCheckpoint {
+  target_revision: number;
+  projection_version: number;
+  writes: Array<{ key: string; input_hash: string; content_hash: string; source_revision: number }>;
+  removals: Array<{ key: string; fingerprint: string }>;
 }
 
 interface ControlRow {
@@ -60,6 +78,7 @@ interface ControlRow {
   active_immutable_revision: number | null;
   active_verification_epoch: number;
   active_final_verification_json: string;
+  active_work_plan_json: string;
   repair_scan_json: string;
   active_managed_zones_ready: number;
   active_status: string | null;
@@ -121,6 +140,7 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
       active_immutable_revision INTEGER,
       active_verification_epoch INTEGER NOT NULL DEFAULT 0,
       active_final_verification_json TEXT NOT NULL DEFAULT '[]',
+      active_work_plan_json TEXT NOT NULL DEFAULT '',
       repair_scan_json TEXT NOT NULL DEFAULT '',
       active_managed_zones_ready INTEGER NOT NULL DEFAULT 0,
       active_status TEXT,
@@ -187,6 +207,11 @@ export function initializeMaterializationSchema(storage: DurableObjectStorage): 
   }
   try {
     storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_final_verification_json TEXT NOT NULL DEFAULT '[]'");
+  } catch (error) {
+    if (!String(error).includes("duplicate column name")) throw error;
+  }
+  try {
+    storage.sql.exec("ALTER TABLE materialization_control ADD COLUMN active_work_plan_json TEXT NOT NULL DEFAULT ''");
   } catch (error) {
     if (!String(error).includes("duplicate column name")) throw error;
   }
@@ -264,6 +289,7 @@ export class MaterializationLedger {
           `UPDATE materialization_control
            SET active_verification_epoch = active_verification_epoch + 1,
                active_final_verification_json = '[]',
+               active_work_plan_json = '',
                active_status = 'running', last_error = NULL
            WHERE singleton = 1`
         );
@@ -309,6 +335,7 @@ export class MaterializationLedger {
         `UPDATE materialization_control
          SET active_revision = ?, active_projection_version = ?, active_coalesced_json = ?, active_immutable_revision = NULL,
              active_verification_epoch = active_verification_epoch + 1, active_final_verification_json = '[]',
+             active_work_plan_json = '',
              active_managed_zones_ready = 0,
              active_status = 'running', last_error = NULL
          WHERE singleton = 1`,
@@ -351,6 +378,38 @@ export class MaterializationLedger {
       evidence.content_hash,
       evidence.source_revision,
       row.active_verification_epoch
+    );
+  }
+
+  checkpointActiveWorkPlan(plan: MaterializationWorkPlanCheckpoint): void {
+    const row = this.control();
+    if (row.active_revision === null || row.active_projection_version === null) {
+      throw new Error("Cannot checkpoint materialization work without an active target");
+    }
+    if (plan.target_revision !== row.active_revision || plan.projection_version !== row.active_projection_version) {
+      this.storage.sql.exec("UPDATE materialization_control SET active_work_plan_json = '!' WHERE singleton = 1");
+      throw new Error("Materialization work plan target mismatch");
+    }
+    let normalized: MaterializationWorkPlanCheckpoint;
+    try {
+      normalized = normalizeWorkPlan(plan);
+    } catch (error) {
+      this.storage.sql.exec("UPDATE materialization_control SET active_work_plan_json = '!' WHERE singleton = 1");
+      throw error;
+    }
+    const serialized = JSON.stringify({ ...normalized, verification_epoch: row.active_verification_epoch });
+    if (row.active_work_plan_json && row.active_work_plan_json !== serialized) {
+      if (row.active_status === "verifying") {
+        this.storage.sql.exec("UPDATE materialization_control SET active_work_plan_json = '!' WHERE singleton = 1");
+        throw new Error("Materialization work plan changed during final verification");
+      }
+      // Package navigation is live input and may legitimately change during a
+      // sliced write. Replace the exact plan, but old attempts only count if
+      // their key and all immutable evidence still match this new plan.
+    }
+    this.storage.sql.exec(
+      "UPDATE materialization_control SET active_work_plan_json = ? WHERE singleton = 1",
+      serialized
     );
   }
 
@@ -509,7 +568,7 @@ export class MaterializationLedger {
              requested_revision = CASE WHEN ? THEN NULL ELSE requested_revision END,
              requested_projection_version = CASE WHEN ? THEN NULL ELSE requested_projection_version END,
              active_revision = NULL, active_projection_version = NULL,
-             active_coalesced_json = '[]', active_immutable_revision = NULL, active_final_verification_json = '[]',
+             active_coalesced_json = '[]', active_immutable_revision = NULL, active_final_verification_json = '[]', active_work_plan_json = '',
              active_managed_zones_ready = 0,
              active_status = NULL, last_error = NULL
          WHERE singleton = 1`,
@@ -548,7 +607,7 @@ export class MaterializationLedger {
              requested_revision = CASE WHEN ? THEN NULL ELSE requested_revision END,
              requested_projection_version = CASE WHEN ? THEN NULL ELSE requested_projection_version END,
              active_revision = NULL, active_projection_version = NULL,
-             active_coalesced_json = '[]', active_immutable_revision = NULL, active_final_verification_json = '[]',
+             active_coalesced_json = '[]', active_immutable_revision = NULL, active_final_verification_json = '[]', active_work_plan_json = '',
              active_managed_zones_ready = 0,
              active_status = NULL, last_error = NULL
          WHERE singleton = 1`,
@@ -566,23 +625,66 @@ export class MaterializationLedger {
     const output_count = this.storage.sql.exec<CountRow>(
       "SELECT COUNT(*) AS count FROM materialization_outputs"
     ).one().count;
-    const attempt_output_count = this.storage.sql.exec<CountRow>(
-      "SELECT COUNT(*) AS count FROM materialization_attempt_outputs WHERE status = 'verified'"
+    const attempt_output_count = row.active_revision === null || row.active_projection_version === null ? 0 : this.storage.sql.exec<CountRow>(
+      `SELECT COUNT(*) AS count FROM materialization_attempt_outputs
+       WHERE revision = ? AND projection_version = ? AND verification_epoch = ? AND status = 'verified'`,
+      row.active_revision,
+      row.active_projection_version,
+      row.active_verification_epoch
     ).one().count;
+    const active = row.active_revision !== null && row.active_projection_version !== null
+      ? { revision: row.active_revision, projection_version: row.active_projection_version,
+          coalesced_revisions: parseRevisionList(row.active_coalesced_json) }
+      : null;
+    let active_work_plan_state: MaterializationLedgerStatus["active_work_plan_state"] = active
+      ? (row.active_work_plan_json ? "invalid" : "missing") : "none";
+    let active_work: MaterializationLedgerStatus["active_work"] = null;
+    if (active && row.active_work_plan_json) {
+      try {
+        const plan = parseStoredWorkPlan(row.active_work_plan_json);
+        if (plan.target_revision !== active.revision || plan.projection_version !== active.projection_version
+          || plan.verification_epoch !== row.active_verification_epoch) throw new Error("stale work plan");
+        const expectedWrites = new Map(plan.writes.map((item) => [item.key, item]));
+        const attempts = this.attemptOutputs();
+        let remainingWriteCount = plan.writes.length;
+        for (const [key, evidence] of attempts) {
+          const expected = expectedWrites.get(key);
+          if (!expected) continue;
+          if (evidence.input_hash !== expected.input_hash || evidence.content_hash !== expected.content_hash
+            || evidence.source_revision !== expected.source_revision) continue;
+          remainingWriteCount -= 1;
+        }
+        const finalVerificationPendingCount = row.active_status === "verifying"
+          ? parseFinalVerificationItems(row.active_final_verification_json).length : 0;
+        const phase = row.active_status === "verifying" ? "final_verification" : "writing";
+        const remainingRemovalCount = phase === "writing" ? plan.removals.length : 0;
+        active_work_plan_state = "ready";
+        active_work = {
+          target_revision: active.revision,
+          projection_version: active.projection_version,
+          verification_epoch: row.active_verification_epoch,
+          phase,
+          remaining_write_count: remainingWriteCount,
+          remaining_removal_count: remainingRemovalCount,
+          final_verification_pending_count: finalVerificationPendingCount,
+          remaining_action_count: phase === "final_verification"
+            ? finalVerificationPendingCount + 1
+            : Math.max(1, remainingWriteCount + remainingRemovalCount)
+        };
+      } catch {
+        active_work_plan_state = "invalid";
+      }
+    }
     return {
       head: pair(row.head_revision, row.head_projection_version),
       requested: pair(row.requested_revision, row.requested_projection_version),
-      active: row.active_revision !== null && row.active_projection_version !== null
-        ? {
-            revision: row.active_revision,
-            projection_version: row.active_projection_version,
-            coalesced_revisions: parseRevisionList(row.active_coalesced_json)
-          }
-        : null,
+      active,
       active_status: row.active_status,
       last_error: row.last_error,
       output_count,
-      attempt_output_count
+      attempt_output_count,
+      active_work_plan_state,
+      active_work
     };
   }
 
@@ -770,7 +872,7 @@ export class MaterializationLedger {
     return this.storage.sql.exec<ControlRow>(
       `SELECT head_revision, head_projection_version, requested_revision, requested_projection_version,
               active_revision, active_projection_version, active_coalesced_json, active_immutable_revision,
-              active_verification_epoch, active_final_verification_json, repair_scan_json, active_managed_zones_ready, active_status, last_error
+              active_verification_epoch, active_final_verification_json, active_work_plan_json, repair_scan_json, active_managed_zones_ready, active_status, last_error
        FROM materialization_control WHERE singleton = 1`
     ).one();
   }
@@ -886,6 +988,40 @@ function parseFinalVerificationItems(raw: string): FinalVerificationItem[] {
       }
     } as FinalVerificationItem;
   }));
+}
+
+type StoredMaterializationWorkPlan = MaterializationWorkPlanCheckpoint & { verification_epoch: number };
+
+function normalizeWorkPlan(plan: MaterializationWorkPlanCheckpoint): MaterializationWorkPlanCheckpoint {
+  validateTarget({ revision: plan.target_revision, projection_version: plan.projection_version });
+  const writes = plan.writes.map((item) => {
+    if (!item.key || !isHash(item.input_hash) || !isHash(item.content_hash)
+      || !Number.isSafeInteger(item.source_revision) || item.source_revision < 0) {
+      throw new Error("Invalid materialization work plan write");
+    }
+    return { key: item.key, input_hash: item.input_hash, content_hash: item.content_hash, source_revision: item.source_revision };
+  }).sort((left, right) => left.key.localeCompare(right.key));
+  const removals = plan.removals.map((item) => {
+    if (!item.key || !isHash(item.fingerprint)) throw new Error("Invalid materialization work plan removal");
+    return { key: item.key, fingerprint: item.fingerprint };
+  }).sort((left, right) => left.key.localeCompare(right.key));
+  const keys = [...writes.map((item) => item.key), ...removals.map((item) => item.key)];
+  if (new Set(keys).size !== keys.length) throw new Error("Duplicate materialization work plan key");
+  return { target_revision: plan.target_revision, projection_version: plan.projection_version, writes, removals };
+}
+
+function parseStoredWorkPlan(raw: string): StoredMaterializationWorkPlan {
+  const parsed = JSON.parse(raw) as Partial<StoredMaterializationWorkPlan>;
+  if (!parsed || typeof parsed !== "object" || !Number.isSafeInteger(parsed.verification_epoch)
+    || !Array.isArray(parsed.writes) || !Array.isArray(parsed.removals)) {
+    throw new Error("Invalid materialization work plan");
+  }
+  const normalized = normalizeWorkPlan(parsed as MaterializationWorkPlanCheckpoint);
+  return { ...normalized, verification_epoch: parsed.verification_epoch as number };
+}
+
+function isHash(value: string): boolean {
+  return /^[a-f0-9]{64}$/.test(value);
 }
 
 function integerRange(start: number, end: number): number[] {

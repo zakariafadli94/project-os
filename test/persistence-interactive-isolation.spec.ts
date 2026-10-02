@@ -18,6 +18,7 @@ import { createControlTowerServer } from "../src/control-tower/mcp";
 import { encodeAdmission } from "../src/admission/transport";
 import type { MutationContext } from "../src/admission/mutation-context";
 import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
+import { sha256Canonical } from "../src/materialization/hash";
 
 const testEnv = env as unknown as Env;
 const createdAt = "2026-09-26T09:00:00.000Z";
@@ -30,6 +31,17 @@ async function submit(projectId: string, transaction: unknown): Promise<Receipt>
   });
   expect(response.status).toBe(200);
   return response.json<Receipt>();
+}
+
+async function addPendingHumanHandoff(progress: ReturnType<typeof initialProgress>, revision: number): Promise<void> {
+  const id = await sha256Canonical({ project_id: progress.project_id, layer: "human_handoff", revision });
+  progress.obligations[id] = {
+    id, layer: "human_handoff", from_revision: Math.max(0, revision - 1),
+    target: { revision, projection_version: CURRENT_PROJECTION_VERSION }, incident: 1,
+    state: "pending", first_pending_at: new Date().toISOString(), next_attempt_at: null,
+    failure_count: 0, last_attempt_number: 0, last_closed_attempt_number: 0,
+    last_verified_at: null, code: "human_slice_pending", lease_until: null, continuation: null
+  };
 }
 
 describe("interactive persistence isolation", () => {
@@ -121,6 +133,7 @@ describe("interactive persistence isolation", () => {
       const modes = JSON.stringify({ [projectId]: "repair" });
       const checkpoint = initialProgress(projectId, createdAt, `capacity-recovery-proof-${projectId}`);
       checkpoint.canonical_observed_revision = 1;
+      await addPendingHumanHandoff(checkpoint, 1);
       await runInDurableObject(guard, (instance) => { (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = modes; });
       await runInDurableObject(materializer, async (instance, state) => {
         (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = modes;
@@ -213,8 +226,10 @@ describe("interactive persistence isolation", () => {
     await mock.writeExternal(reviewPath, "# Commercial strategy\n\nChanged after review.\n");
     const checkpoint = initialProgress(projectId, createdAt, "interactive-capacity-proof");
     checkpoint.canonical_observed_revision = 1;
+    await addPendingHumanHandoff(checkpoint, 1);
     const otherCheckpoint = initialProgress(otherProjectId, createdAt, "interactive-other-project-proof");
     otherCheckpoint.canonical_observed_revision = 1;
+    await addPendingHumanHandoff(otherCheckpoint, 1);
     await runInDurableObject(materializer, (_instance, state) => {
       new MaterializationLedger(state.storage, projectId).restoreConvergenceCheckpoint(checkpoint, "interactive-capacity-token");
     });
@@ -314,6 +329,7 @@ describe("interactive persistence isolation", () => {
     await new ProjectRepository(createProductionPersistence(testEnv, projectId), "v2").writeReceipt(created);
     const checkpoint = initialProgress(projectId, createdAt, "interactive-acquire-recovery-proof");
     checkpoint.canonical_observed_revision = 1;
+    await addPendingHumanHandoff(checkpoint, 1);
     const modes = JSON.stringify({ [projectId]: "repair" });
     await runInDurableObject(guard, (instance) => { (instance as unknown as { env: Env }).env.PROJECT_OS_CONVERGENCE_PROJECT_MODES = modes; });
     await runInDurableObject(materializer, (instance, state) => {

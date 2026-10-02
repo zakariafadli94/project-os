@@ -49,6 +49,93 @@ describe("compact catalog adoption gate", () => {
   });
 });
 
+describe("saved initial listing deadline behavior", () => {
+  it("advances a saved active head when its following head preflight reaches the deadline", async () => {
+    const activeId = "DOC-000000000000000000000005";
+    const inactiveId = "DOC-000000000000000000000006";
+    const tailIds = Array.from({ length: 4 }, (_, index) => `DOC-${(7 + index).toString(16).toUpperCase().padStart(24, "0")}`);
+    const activePath = machineDocumentHeadPath(projectId, activeId);
+    const inactivePath = machineDocumentHeadPath(projectId, inactiveId);
+    const makeCursor = (ids: string[]) => `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: ids.map((id) => ({ kind: "file" as const, name: `${id}.json`, path: machineDocumentHeadPath(projectId, id) })),
+      provider_cursor: null,
+      listing_limit: 512
+    }))}`;
+    const makeTimedBudget = (now: () => number): SliceBudget => {
+      const value: SliceBudget = {
+        deadline_ms: now() + 25_000,
+        calls_left: 32,
+        now,
+        signal: new AbortController().signal,
+        beforeHttp() {
+          if (this.now() >= this.deadline_ms || this.calls_left <= 0) throw new Error("slice_budget_exhausted");
+          this.calls_left -= 1;
+        },
+        canStartEffect(requiredCalls) {
+          return this.calls_left >= requiredCalls + 4 && this.now() < this.deadline_ms - 3_000;
+        }
+      };
+      return value;
+    };
+
+    const stalled = harness();
+    await addWorkingHead(stalled, "active body", "rev-active", activeId, `VER-REQ-${activeId.slice(4)}`, "active.md");
+    stalled.put(inactivePath, JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: inactiveId,
+      kind: "work_product", logical_path: "inactive.md", reconciliation_status: "clean"
+    }));
+    for (const id of tailIds) stalled.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: id,
+      kind: "work_product", logical_path: `${id}.md`, reconciliation_status: "clean"
+    }));
+    let stalledNow = 0;
+    let slowHeadReads = 0;
+    const stalledRead = stalled.runtime.objects.readText.bind(stalled.runtime.objects);
+    stalled.runtime.objects.readText = async (path) => {
+      if (path === activePath || path === inactivePath) {
+        slowHeadReads += 1;
+        const startedAt = stalledNow;
+        const raw = await stalledRead(path);
+        // ordinaryInitialPair starts these reads concurrently: model elapsed
+        // wall time as the slowest overlapping call, not their sum. The
+        // inactive second head reaches the provider deadline; the active first
+        // head itself is fast and remains available from the pair's cache.
+        stalledNow = Math.max(stalledNow, startedAt + (path === activePath ? 100 : 22_100));
+        if (path === inactivePath) throw new Error("simulated_provider_deadline");
+        return raw;
+      }
+      return stalledRead(path);
+    };
+    const savedPair = makeCursor([activeId, inactiveId, ...tailIds]);
+
+    const attempts: string[] = [];
+    for (let index = 0; index < 2; index += 1) {
+      try {
+        const page = await stalled.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: savedPair, limit: 8, budget: makeTimedBudget(() => stalledNow) });
+        attempts.push(page.next_cursor === savedPair ? "unchanged" : "advanced");
+      } catch (error) {
+        attempts.push(error instanceof Error ? error.message : "unknown");
+      }
+    }
+    expect(slowHeadReads).toBe(4);
+
+    const solo = harness();
+    await addWorkingHead(solo, "active body", "rev-active", activeId, `VER-REQ-${activeId.slice(4)}`, "active.md");
+    let soloNow = 0;
+    const soloRead = solo.runtime.objects.readText.bind(solo.runtime.objects);
+    solo.runtime.objects.readText = async (path) => {
+      if (path === activePath) soloNow += 100;
+      return soloRead(path);
+    };
+    const soloPage = await solo.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: makeCursor([activeId]), limit: 8, budget: makeTimedBudget(() => soloNow) });
+
+    expect(soloPage.entries.map((entry) => entry.resource_id)).toContain(`head:${activeId}`);
+    expect(soloPage.next_cursor).not.toBe(makeCursor([activeId]));
+    expect(attempts).toEqual(["advanced", "advanced"]);
+  });
+});
+
 function budget(calls = 32): SliceBudget {
   return {
     deadline_ms: 25_000,

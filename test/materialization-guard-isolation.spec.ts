@@ -190,6 +190,157 @@ describe("MaterializationGuard isolation boundary", () => {
     });
   });
 
+  it("counts finalization after 347 already verified plan outputs instead of treating them as queued", async () => {
+    const projectId = "PRJ-3940";
+    const guard = materializationNamespace().getByName(projectId);
+    const progress = initialProgress(projectId, at, "capacity-active-plan-verified");
+    await runInDurableObject(guard, (_instance, state) => {
+      const ledger = new MaterializationLedger(state.storage);
+      ledger.restoreConvergenceCheckpoint(progress, "capacity-token-active-plan");
+      ledger.requestTarget({ revision: 1, projection_version: CURRENT_PROJECTION_VERSION });
+      ledger.beginNextTarget();
+      const writes = Array.from({ length: 347 }, (_, index) => {
+        const key = `task:TSK-${index.toString().padStart(8, "0")}`;
+        const hash = index.toString(16).padStart(64, "0").slice(-64);
+        const evidence = { relative_path: `TASKS/${key}.md`, input_hash: hash, content_hash: hash, source_revision: 1 };
+        ledger.recordVerifiedOutput(key, evidence);
+        return { key, input_hash: hash, content_hash: hash, source_revision: 1 };
+      });
+      ledger.checkpointActiveWorkPlan({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION, writes, removals: [] });
+      const evidence = { relative_path: "STATE.md", input_hash: "a".repeat(64), content_hash: "a".repeat(64), source_revision: 1 };
+      ledger.beginFinalVerification([{ key: "global:STATE", expected: "present", evidence }]);
+      ledger.completeFinalVerification(["global:STATE"]);
+    });
+
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/capacity"));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ queued_outputs: 1, within_qualified_envelope: true });
+  });
+
+  it("rejects 201 unverified active writes and does not estimate an uncompiled request from baseline size", async () => {
+    const projectId = "PRJ-3941";
+    const guard = materializationNamespace().getByName(projectId);
+    const progress = initialProgress(projectId, at, "capacity-active-plan-pending");
+    progress.canonical_observed_revision = 1;
+    await runInDurableObject(guard, (_instance, state) => {
+      const ledger = new MaterializationLedger(state.storage);
+      ledger.restoreConvergenceCheckpoint(progress, "capacity-token-active-plan-pending");
+      ledger.restoreExternalBaseline({ revision: 1, projection_version: CURRENT_PROJECTION_VERSION },
+        new Map(Array.from({ length: 497 }, (_, index) => [`task:TSK-${index}`, {
+          relative_path: `TASKS/${index}.md`, input_hash: "a".repeat(64), content_hash: "a".repeat(64), source_revision: 1
+        }])));
+      ledger.requestTarget({ revision: 2, projection_version: CURRENT_PROJECTION_VERSION });
+      ledger.beginNextTarget();
+      const writes = Array.from({ length: 250 }, (_, index) => {
+        const key = `task:TSK-PENDING-${index}`;
+        const hash = index.toString(16).padStart(64, "0").slice(-64);
+        if (index < 49) ledger.recordVerifiedOutput(key, {
+          relative_path: `TASKS/${key}.md`, input_hash: hash, content_hash: hash, source_revision: 2
+        });
+        return { key, input_hash: hash, content_hash: hash, source_revision: 2 };
+      });
+      ledger.checkpointActiveWorkPlan({ target_revision: 2, projection_version: CURRENT_PROJECTION_VERSION, writes, removals: [] });
+      expect(ledger.status()).toMatchObject({ active_work_plan_state: "ready",
+        active_work: { remaining_write_count: 201, remaining_action_count: 201 } });
+    });
+
+    const makeReservation = (id: string) => new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, request_id: id, request_hash: "b".repeat(64),
+        canonical_revision: 2, operation: "task.create", dependency_classification: "resource_bound",
+        resources: [{ resource_id: id, resource_type: "task", zone: "PROJECT", version: "0" }] })
+    });
+    const overLimit = await guard.fetch(makeReservation("TXN-CAPACITY-REMAINING-0001"));
+    expect(overLimit.status).toBe(503);
+    await expect(overLimit.json()).resolves.toMatchObject({ error: "convergence_capacity_exceeded",
+      reason: "queued_outputs_exceeded", queued_outputs: 201 });
+
+    const requestedOnlyId = "PRJ-3942";
+    const requestedOnly = materializationNamespace().getByName(requestedOnlyId);
+    await runInDurableObject(requestedOnly, (_instance, state) => {
+      const ledger = new MaterializationLedger(state.storage);
+      ledger.restoreConvergenceCheckpoint(initialProgress(requestedOnlyId, at, "capacity-uncompiled-request"), "capacity-token-uncompiled-request");
+      ledger.restoreExternalBaseline({ revision: 1, projection_version: CURRENT_PROJECTION_VERSION },
+        new Map(Array.from({ length: 497 }, (_, index) => [`task:TSK-${index}`, {
+          relative_path: `TASKS/${index}.md`, input_hash: "a".repeat(64), content_hash: "a".repeat(64), source_revision: 1
+        }])));
+      ledger.requestTarget({ revision: 2, projection_version: CURRENT_PROJECTION_VERSION });
+    });
+    const unknownRequest = await requestedOnly.fetch(new Request("https://materialization-guard.internal/capacity"));
+    expect(unknownRequest.status).toBe(503);
+    await expect(unknownRequest.json()).resolves.toMatchObject({ error: "capacity_proof_unavailable" });
+  });
+
+  it("fails closed when an active legacy target has no exact durable plan", async () => {
+    const projectId = "PRJ-3943";
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (_instance, state) => {
+      const ledger = new MaterializationLedger(state.storage);
+      ledger.restoreConvergenceCheckpoint(initialProgress(projectId, at, "capacity-active-plan-missing"), "capacity-token-active-plan-missing");
+      ledger.requestTarget({ revision: 1, projection_version: CURRENT_PROJECTION_VERSION });
+      ledger.beginNextTarget();
+    });
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/capacity"));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ error: "capacity_proof_unavailable" });
+  });
+
+  it("accounts for an uncompiled requested target only through a contiguous handed-off admission chain", async () => {
+    const projectId = "PRJ-3945";
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (_instance, state) => {
+      const ledger = new MaterializationLedger(state.storage);
+      const progress = initialProgress(projectId, at, "capacity-uncompiled-chain");
+      progress.canonical_observed_revision = 1;
+      ledger.restoreConvergenceCheckpoint(progress, "capacity-token-uncompiled-chain");
+      ledger.restoreExternalBaseline({ revision: 1, projection_version: CURRENT_PROJECTION_VERSION }, new Map());
+      ledger.requestTarget({ revision: 3, projection_version: CURRENT_PROJECTION_VERSION });
+      for (const revision of [2, 3]) {
+        const requestId = `TXN-CAPACITY-CHAIN-${revision}`;
+        const requestHash = String(revision).repeat(64).slice(0, 64);
+        ledger.withCapacityReservation((snapshot) => ({ value: undefined, reservation: {
+          request_id: requestId, request_hash: requestHash, reservation_kind: "transaction", output_cost: 1,
+          canonical_revision: revision - 1, target_revision: revision, operation: "task.create", resources: [],
+          dependency_classification: "unknown", created_at: new Date().toISOString()
+        } }));
+        ledger.transitionCapacityReservation(requestId, requestHash, "reserved", "handed_off");
+      }
+    });
+
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/capacity"));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      pending_uncompiled_targets: 1, queued_outputs: 1, within_qualified_envelope: true
+    });
+  });
+
+  it("keeps final-verification backlog over 200 outside the qualified envelope", async () => {
+    const projectId = "PRJ-3944";
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, (_instance, state) => {
+      const ledger = new MaterializationLedger(state.storage);
+      ledger.restoreConvergenceCheckpoint(initialProgress(projectId, at, "capacity-final-verification"), "capacity-token-final-verification");
+      ledger.requestTarget({ revision: 1, projection_version: CURRENT_PROJECTION_VERSION });
+      ledger.beginNextTarget();
+      ledger.checkpointActiveWorkPlan({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION, writes: [], removals: [] });
+      const pending = Array.from({ length: 201 }, (_, index) => ({
+        key: `global:FINAL-${index}`, expected: "present" as const,
+        evidence: { relative_path: `FINAL-${index}.md`, input_hash: "a".repeat(64), content_hash: "b".repeat(64), source_revision: 1 }
+      }));
+      ledger.beginFinalVerification(pending);
+    });
+
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/capacity-reservation", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, request_id: "TXN-CAPACITY-FINAL-0001", request_hash: "c".repeat(64),
+        canonical_revision: 1, operation: "task.create", dependency_classification: "resource_bound",
+        resources: [{ resource_id: "TXN-CAPACITY-FINAL-0001", resource_type: "task", zone: "PROJECT", version: "0" }] })
+    }));
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ error: "convergence_capacity_exceeded",
+      reason: "queued_outputs_exceeded", queued_outputs: 202 });
+  });
+
   it("arms bounded reconstruction for an unknown reservation without admitting non-create work", async () => {
     installDropboxMock();
     const projectId = "PRJ-3917";

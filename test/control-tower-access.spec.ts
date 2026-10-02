@@ -90,9 +90,18 @@ describe("effective Control Tower token permissions", () => {
   });
 
   it("preserves a known busy status and retry delay without exposing Guard details", async () => {
+    const safeDiagnostic = {
+      scope: "local_only", payload_present: true, payload_hash_valid: true,
+      staged_marker_matches_payload: false, queue_present: false,
+      failure_stopped: null, failure_attempts: null, failure_code: null,
+      failure_next_attempt_at: null, alarm_readable: true, alarm_at: null,
+      local_receipt_present: false, local_observation_present: null
+    };
+    let diagnostic: unknown = { ...safeDiagnostic, raw_payload: "nested-provider-secret" };
     const owner = { getByName: () => ({ fetch: async () => Response.json({
       project_id: "PRJ-0003", kind: "transaction", request_id: "TXN-ORIGINAL",
-      status: "unknown", code: "PROJECT_OS_READ_BUSY", private_detail: "provider-secret"
+      status: "unknown", code: "PROJECT_OS_READ_BUSY", private_detail: "provider-secret",
+      local_recovery_diagnostic: diagnostic
     }, { status: 503, headers: { "Retry-After": "1" } }) }) } as unknown as DurableObjectNamespace;
     const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {
       _registeredTools: Record<string, { handler(input: unknown): Promise<{ content: Array<{ text: string }> }> }>
@@ -103,7 +112,14 @@ describe("effective Control Tower token permissions", () => {
     const body = JSON.parse(result.content[0]!.text);
     expect(body).toMatchObject({ status: "unavailable", code: "PROJECT_OS_READ_BUSY", retry_after_seconds: 1,
       request_id: "TXN-ORIGINAL", recovery: { action: "check_status", preserve_request_id: true } });
+    expect(body.local_recovery_diagnostic).toEqual(safeDiagnostic);
     expect(result.content[0]!.text).not.toContain("provider-secret");
+    diagnostic = { ...safeDiagnostic, payload_hash_valid: "invalid-provider-secret" };
+    const invalid = await server._registeredTools.project_os_get_request_status!.handler({
+      project_id: "PRJ-0003", request_id: "TXN-ORIGINAL", kind: "transaction"
+    });
+    expect(JSON.parse(invalid.content[0]!.text)).not.toHaveProperty("local_recovery_diagnostic");
+    expect(invalid.content[0]!.text).not.toContain("provider-secret");
   });
 
   it("distinguishes an exhausted status observation from a busy Guard", async () => {
@@ -144,6 +160,36 @@ describe("effective Control Tower token permissions", () => {
       expect(result.content[0]!.text).not.toContain("private-provider-detail");
     }
   );
+
+  it("preserves a bound document recovery acknowledgement without inventing a receipt", async () => {
+    let returnedId = "DOCREQ-PENDING-ORIGINAL";
+    const owner = { getByName: () => ({ fetch: async (url: string) => {
+      if (new URL(url).pathname === "/mutation-context") return Response.json({ context: {
+        actor: { actor_id: "tower-test", authority: "operator" }, project_id: "PRJ-0003", canonical_revision: 1,
+        state_hash: "a".repeat(64), observed_at: "2026-09-26T10:00:00.000Z",
+        expiry: "2026-09-26T10:05:00.000Z", token: "a.b"
+      } });
+      return Response.json({ project_id: "PRJ-0003", request_id: returnedId, status: "pending",
+        code: "DOCUMENT_RECOVERY_SCHEDULED", private_detail: "private-provider-detail" }, { status: 503 });
+    } }) } as unknown as DurableObjectNamespace;
+    const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {
+      _registeredTools: Record<string, { handler(input: unknown): Promise<{ content: Array<{ text: string }> }> }>
+    };
+    const input = { project_id: "PRJ-0003", request: { project_id: "PRJ-0003",
+      request_id: "DOCREQ-PENDING-ORIGINAL", operation: "working.write" } };
+    const result = await server._registeredTools.project_os_write_working_document!.handler(input);
+    const body = JSON.parse(result.content[0]!.text);
+    expect(body).toMatchObject({ status: "pending", code: "DOCUMENT_RECOVERY_SCHEDULED",
+      request_id: "DOCREQ-PENDING-ORIGINAL", recovery: { owner: "system", action: "check_status",
+        preserve_request_id: true, check_status_before_retry: true, requires_new_approval: false } });
+    expect(body).not.toHaveProperty("receipt");
+    expect(result).not.toHaveProperty("isError", true);
+    expect(result.content[0]!.text).not.toContain("private-provider-detail");
+    returnedId = "DOCREQ-DIFFERENT";
+    const mismatched = await server._registeredTools.project_os_write_working_document!.handler(input);
+    expect(JSON.parse(mismatched.content[0]!.text)).toMatchObject({ status: "unknown",
+      code: "PROJECT_OS_SUBMISSION_UNAVAILABLE", request_id: "DOCREQ-PENDING-ORIGINAL" });
+  });
 
   it("assigns a technical recovery action after an ambiguous submission", async () => {
     const owner = { getByName: () => ({ fetch: async () => { throw new Error("private-provider-detail"); } }) } as unknown as DurableObjectNamespace;

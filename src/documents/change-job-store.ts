@@ -333,6 +333,15 @@ export class ManagedDocumentChangeJobStore {
     ).toArray().map(parseDriftFinding);
   }
 
+  driftFindingsForJob(jobId: string): ManagedDocumentDriftFinding[] {
+    assertJobId(jobId);
+    return this.storage.sql.exec<DriftFindingRow>(
+      `SELECT finding_id, job_id, path, change_kind, status, code, request_id, resource_json, observed_at, opened_at
+       FROM managed_document_drift_findings WHERE job_id = ? ORDER BY opened_at, finding_id`,
+      jobId
+    ).toArray().map(parseDriftFinding);
+  }
+
   scheduledVerification(now: string): ScheduledDocumentVerification {
     const nowMs = dateMs(now);
     const current = this.scheduledControl();

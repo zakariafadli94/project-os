@@ -110,6 +110,8 @@ interface RecoveryRequestRow {
   [key: string]: SqlStorageValue;
   kind: string;
   request_id: string;
+  staged_only: number;
+  staged_phase: string | null;
   failure_message: string | null;
 }
 
@@ -134,6 +136,22 @@ interface RecoveryCursorRow {
   [key: string]: SqlStorageValue;
   kind: string;
   request_id: string;
+}
+
+interface LocalRecoveryDiagnostic {
+  scope: "local_only";
+  payload_present: boolean | null;
+  payload_hash_valid: boolean | null;
+  staged_marker_matches_payload: boolean | null;
+  queue_present: boolean | null;
+  failure_stopped: boolean | null;
+  failure_attempts: number | null;
+  failure_code: string | null;
+  failure_next_attempt_at: string | null;
+  alarm_readable: boolean;
+  alarm_at: string | null;
+  local_receipt_present: boolean | null;
+  local_observation_present: boolean | null;
 }
 
 interface StateRow {
@@ -377,6 +395,13 @@ export class ProjectGuard extends DurableObject<Env> {
         request_sha256 TEXT NOT NULL,
         PRIMARY KEY (kind, request_id)
       );
+      CREATE TABLE IF NOT EXISTS request_recovery_staged (
+        kind TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        phase TEXT NOT NULL DEFAULT 'preparing',
+        PRIMARY KEY (kind, request_id)
+      );
       CREATE TABLE IF NOT EXISTS request_recovery_failures (
         kind TEXT NOT NULL,
         request_id TEXT NOT NULL,
@@ -499,16 +524,21 @@ export class ProjectGuard extends DurableObject<Env> {
       const correlationId = this.observationCorrelationId(request, url);
       if (this.queueDepth > 0) {
         const observed = await this.readStoredOrRefreshRequestObservation(url, projectId, kind as RequestKind, requestId, correlationId);
-        if (observed) return observed;
-        return this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId);
+        if (observed) return this.withLocalRecoveryDiagnostic(observed, projectId, kind as RequestKind, requestId);
+        const busyResponse = await this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId)
+          .catch(() => this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY"));
+        return this.withLocalRecoveryDiagnostic(busyResponse, projectId, kind as RequestKind, requestId);
       }
       return this.readWhenIdle(async () => {
         const status = await this.readBoundedRequestStatus(url, correlationId);
         if (status.ok && this.hasPendingRequestIdentity(kind as RequestKind, requestId)
           && this.isVerifiedNotReceivedStatus(
             await status.clone().json() as Record<string, any>, projectId, kind, requestId, correlationId
-          )) return this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY");
-        return status;
+          )) return this.withLocalRecoveryDiagnostic(
+            this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY"),
+            projectId, kind as RequestKind, requestId
+          );
+        return this.withLocalRecoveryDiagnostic(status, projectId, kind as RequestKind, requestId);
       });
     }
 
@@ -1254,7 +1284,49 @@ export class ProjectGuard extends DurableObject<Env> {
         }, { status: 503 });
       }
     }
-    if (rulesRequired) await this.persistAdmissionProof("document", operation.request_id, await this.admitRules(state, normalized, mutationContext!.actor));
+    if (rulesRequired) {
+      const proof = await this.admitRules(state, normalized, mutationContext!.actor);
+      if (operation.operation === "working.write") {
+        try {
+          // The staged-only row is intentionally discoverable before the
+          // admission journal exists. Recovery validates the exact journal
+          // binding before it can become executable queue work.
+          await this.stageRequestRecoveryPayload("document", operation.request_id, serialized, true, true);
+        } catch (error) {
+          if (error instanceof ManagedDocumentRequestIntentConflictError) {
+            return Response.json(this.documentTerminalReceipt(operation, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH",
+              "The same request_id was reused with a different managed-document payload"));
+          }
+          throw error;
+        }
+        this.ctx.storage.transactionSync(() => this.ctx.storage.sql.exec(
+          "UPDATE request_recovery_staged SET phase = 'admission_write_attempted' WHERE kind = 'document' AND request_id = ?",
+          operation.request_id
+        ));
+      }
+      try {
+        await this.persistAdmissionProof("document", operation.request_id, proof);
+      } catch (error) {
+        if (operation.operation === "working.write" && this.isDefinitelyPreJournalAdmissionFailure(error)) {
+          const digest = await sha256Text(serialized);
+          this.ctx.storage.transactionSync(() => {
+            this.ctx.storage.sql.exec(
+              "DELETE FROM request_recovery_payload WHERE kind = 'document' AND request_id = ? AND request_sha256 = ?",
+              operation.request_id, digest
+            );
+            this.ctx.storage.sql.exec(
+              "DELETE FROM request_recovery_staged WHERE kind = 'document' AND request_id = ? AND request_sha256 = ?",
+              operation.request_id, digest
+            );
+            this.ctx.storage.sql.exec(
+              "DELETE FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?",
+              operation.request_id
+            );
+          });
+        }
+        throw error;
+      }
+    }
 
     try {
       if (convergenceModeForProject(this.env.PROJECT_OS_CONVERGENCE_PROJECT_MODES, operation.project_id) === "repair") {
@@ -1266,6 +1338,20 @@ export class ProjectGuard extends DurableObject<Env> {
     } catch (error) {
       if (error instanceof ManagedDocumentRequestIntentConflictError) {
         return Response.json(this.documentTerminalReceipt(operation, "rejected", "IDEMPOTENCY_PAYLOAD_MISMATCH", "The same request_id was reused with a different managed-document payload"));
+      }
+      if (operation.operation === "working.write" && error instanceof AdmissionError
+        && error.code === "convergence_capacity_exceeded" && error.detail?.reservation_outcome === "refused"
+        && await this.workingWriteAdmissionStatus(operation.request_id, normalized) === "matching") {
+        // The execution admission is already immutable, but no intent or
+        // provider effect has begun. Keep the exact queued request for the
+        // alarm-driven retry and report system recovery rather than rejection.
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        return Response.json({
+          request_id: operation.request_id,
+          project_id: operation.project_id,
+          status: "pending",
+          code: "DOCUMENT_RECOVERY_SCHEDULED"
+        }, { status: 503 });
       }
       throw error;
     }
@@ -2422,20 +2508,7 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async enqueueRequestRecovery(kind: "artifact" | "document" | "transaction", requestId: string, requestJson?: string): Promise<void> {
     if ((kind === "artifact" || kind === "document" || kind === "transaction") && requestJson) {
-      const digest = await sha256Text(requestJson);
-      const canonical = kind === "document" && this.ctx.id.name ? await this.managedDocumentRequests.readIntent(this.ctx.id.name, requestId) : null;
-      if (canonical && canonical.request_sha256 !== digest) throw new ManagedDocumentRequestIntentConflictError(requestId);
-      const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
-        "SELECT request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
-      ).toArray()[0];
-      if (staged && staged.request_sha256 !== digest) {
-        if (kind === "document") throw new ManagedDocumentRequestIntentConflictError(requestId);
-        throw new AdmissionError("idempotency_payload_mismatch", 409);
-      }
-      this.ctx.storage.sql.exec(
-        "INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES (?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING",
-        kind, requestId, requestJson, digest
-      );
+      await this.stageRequestRecoveryPayload(kind, requestId, requestJson);
     }
     if (kind === "transaction") await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
     this.ctx.storage.sql.exec(
@@ -2449,14 +2522,63 @@ export class ProjectGuard extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + 1_000);
   }
 
+  private async stageRequestRecoveryPayload(
+    kind: "artifact" | "document" | "transaction",
+    requestId: string,
+    requestJson: string,
+    discoverBeforeQueue = false,
+    prearmAlarm = false
+  ): Promise<void> {
+    const digest = await sha256Text(requestJson);
+    const canonical = kind === "document" && this.ctx.id.name ? await this.managedDocumentRequests.readIntent(this.ctx.id.name, requestId) : null;
+    if (canonical && canonical.request_sha256 !== digest) throw new ManagedDocumentRequestIntentConflictError(requestId);
+    const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
+      "SELECT request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
+    ).toArray()[0];
+    if (staged && staged.request_sha256 !== digest) {
+      if (kind === "document") throw new ManagedDocumentRequestIntentConflictError(requestId);
+      throw new AdmissionError("idempotency_payload_mismatch", 409);
+    }
+    if (prearmAlarm) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES (?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING",
+        kind, requestId, requestJson, digest
+      );
+      if (discoverBeforeQueue) this.ctx.storage.sql.exec(
+        `INSERT INTO request_recovery_staged (kind, request_id, request_sha256, phase) VALUES (?, ?, ?, 'preparing')
+         ON CONFLICT(kind, request_id) DO UPDATE SET request_sha256 = excluded.request_sha256,
+           phase = CASE WHEN request_recovery_staged.request_sha256 = excluded.request_sha256
+             AND request_recovery_staged.phase = 'admission_write_attempted'
+             THEN request_recovery_staged.phase ELSE 'preparing' END`,
+        kind, requestId, digest
+      );
+    });
+  }
+
+  private isDefinitelyPreJournalAdmissionFailure(error: unknown): boolean {
+    return error instanceof Error && [
+      "execution_identity_invalid",
+      "execution_plan_invalid",
+      "execution_required_postcheck_adapter_missing",
+      "execution_required_postcheck_missing",
+      "execution_resource_scope_conflict",
+      "execution_resource_scope_unavailable",
+      "repair_diagnosed_drift_required"
+    ].includes(error.message);
+  }
+
   private clearRequestRecovery(kind: "artifact" | "document" | "transaction", requestId: string): void {
-    this.ctx.storage.sql.exec(
-      "DELETE FROM request_recovery WHERE kind = ? AND request_id = ?",
-      kind,
-      requestId
-    );
-    this.ctx.storage.sql.exec("DELETE FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId);
-    this.ctx.storage.sql.exec("DELETE FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM request_recovery WHERE kind = ? AND request_id = ?",
+        kind,
+        requestId
+      );
+      this.ctx.storage.sql.exec("DELETE FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId);
+      this.ctx.storage.sql.exec("DELETE FROM request_recovery_staged WHERE kind = ? AND request_id = ?", kind, requestId);
+      this.ctx.storage.sql.exec("DELETE FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId);
+    });
   }
 
   private async clearTransactionRecovery(requestId: string): Promise<void> {
@@ -2583,18 +2705,20 @@ export class ProjectGuard extends DurableObject<Env> {
   ): Promise<RecoveryFailureResult> {
     const message = error instanceof Error ? error.message : "";
     const errorName = error instanceof Error ? error.name : "UnknownError";
+    const workingWriteCapacityWait = await this.isWorkingWriteCapacityRefusal(kind, requestId, error);
     const navigationFailureCode = kind === "document" && /^navigation_[A-Za-z0-9._-]{1,72}$/.test(message) ? message : null;
     const usefulContinuation = error instanceof Error
       && /(?:^|_)slice_budget_exhausted$/i.test(message);
     const networkTemporary = isTransientRecoveryFailure(error);
-    const providerTemporary = !usefulContinuation && ((error instanceof ProviderOperationError && error.retryable) || networkTemporary);
+    const providerTemporary = !usefulContinuation && (workingWriteCapacityWait
+      || (error instanceof ProviderOperationError && error.retryable) || networkTemporary);
     const providerBlocked = error instanceof ProviderOperationError && !error.retryable;
     const classification: RecoveryFailureClassification = usefulContinuation
       ? "continuation"
       : providerTemporary
       ? "provider_temporary"
       : providerBlocked ? "provider_blocked" : "internal";
-    const code = error instanceof ProviderOperationError
+    const code = workingWriteCapacityWait ? "convergence_capacity_exceeded" : error instanceof ProviderOperationError
       ? (error.diagnostics?.code && /^[A-Za-z0-9._/-]{1,96}$/.test(error.diagnostics.code)
         ? error.diagnostics.code
         : error instanceof ProviderConflictError
@@ -2681,9 +2805,19 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private async scheduleNextRequestRecoveryWake(excludeTransactions = false): Promise<void> {
     const rows = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; message: string | null }>(
-      `SELECT f.message FROM request_recovery r
+      `WITH pending AS (
+         SELECT kind, request_id FROM request_recovery
+         UNION
+         SELECT s.kind, s.request_id FROM request_recovery_staged s
+         WHERE s.kind = 'document' AND NOT EXISTS (
+           SELECT 1 FROM request_recovery r WHERE r.kind = s.kind AND r.request_id = s.request_id
+         )
+       )
+       SELECT f.message FROM pending r
        LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-       WHERE COALESCE(f.stopped, 0) = 0 ${excludeTransactions ? "AND r.kind <> 'transaction'" : ""}`
+       WHERE COALESCE(f.stopped, 0) = 0 ${excludeTransactions ? "AND r.kind <> 'transaction'" : ""}
+       ORDER BY r.kind, r.request_id LIMIT ?`,
+      REQUEST_RECOVERY_BATCH_SIZE
     ).toArray();
     if (!rows.length) return;
     const dueTimes = rows.map(({ message }) => {
@@ -2704,25 +2838,36 @@ export class ProjectGuard extends DurableObject<Env> {
     const cursor = this.ctx.storage.sql.exec<RecoveryCursorRow>(
       "SELECT kind, request_id FROM request_recovery_cursor WHERE singleton = 1"
     ).toArray()[0];
+    const pending = `WITH pending AS (
+      SELECT kind, request_id, 0 AS staged_only, NULL AS staged_phase FROM request_recovery WHERE kind <> 'transaction'
+      UNION ALL
+      SELECT s.kind, s.request_id, 1 AS staged_only, s.phase AS staged_phase FROM request_recovery_staged s
+      WHERE s.kind = 'document' AND NOT EXISTS (
+        SELECT 1 FROM request_recovery r WHERE r.kind = s.kind AND r.request_id = s.request_id
+      )
+    )`;
     const rows = cursor
       ? this.ctx.storage.sql.exec<RecoveryRequestRow>(
-          `SELECT r.kind, r.request_id FROM request_recovery r
+          `${pending}
+           SELECT r.kind, r.request_id, r.staged_only, r.staged_phase, f.message AS failure_message FROM pending r
            LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-           WHERE r.kind <> 'transaction' AND COALESCE(f.stopped, 0) = 0 AND (r.kind > ? OR (r.kind = ? AND r.request_id > ?))
+           WHERE COALESCE(f.stopped, 0) = 0 AND (r.kind > ? OR (r.kind = ? AND r.request_id > ?))
            ORDER BY r.kind, r.request_id LIMIT ?`,
           cursor.kind, cursor.kind, cursor.request_id, REQUEST_RECOVERY_BATCH_SIZE
         ).toArray()
       : this.ctx.storage.sql.exec<RecoveryRequestRow>(
-          `SELECT r.kind, r.request_id FROM request_recovery r
+          `${pending}
+           SELECT r.kind, r.request_id, r.staged_only, r.staged_phase, f.message AS failure_message FROM pending r
            LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-           WHERE r.kind <> 'transaction' AND COALESCE(f.stopped, 0) = 0 ORDER BY r.kind, r.request_id LIMIT ?`,
+           WHERE COALESCE(f.stopped, 0) = 0 ORDER BY r.kind, r.request_id LIMIT ?`,
           REQUEST_RECOVERY_BATCH_SIZE
         ).toArray();
     if (cursor && rows.length < REQUEST_RECOVERY_BATCH_SIZE) {
       rows.push(...this.ctx.storage.sql.exec<RecoveryRequestRow>(
-        `SELECT r.kind, r.request_id FROM request_recovery r
+        `${pending}
+         SELECT r.kind, r.request_id, r.staged_only, r.staged_phase, f.message AS failure_message FROM pending r
          LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
-         WHERE r.kind <> 'transaction' AND COALESCE(f.stopped, 0) = 0 AND (r.kind < ? OR (r.kind = ? AND r.request_id <= ?))
+         WHERE COALESCE(f.stopped, 0) = 0 AND (r.kind < ? OR (r.kind = ? AND r.request_id <= ?))
          ORDER BY r.kind, r.request_id LIMIT ?`,
         cursor.kind, cursor.kind, cursor.request_id, REQUEST_RECOVERY_BATCH_SIZE - rows.length
       ).toArray());
@@ -2745,7 +2890,15 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private hasPendingRequestRecovery(): boolean {
     return this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; pending: number }>(
-      `SELECT COUNT(*) AS pending FROM request_recovery r
+      `WITH pending AS (
+         SELECT kind, request_id FROM request_recovery
+         UNION
+         SELECT s.kind, s.request_id FROM request_recovery_staged s
+         WHERE s.kind = 'document' AND NOT EXISTS (
+           SELECT 1 FROM request_recovery r WHERE r.kind = s.kind AND r.request_id = s.request_id
+         )
+       )
+       SELECT COUNT(*) AS pending FROM pending r
        LEFT JOIN request_recovery_failures f ON f.kind = r.kind AND f.request_id = r.request_id
        WHERE COALESCE(f.stopped, 0) = 0`
     ).toArray()[0]?.pending > 0;
@@ -2761,7 +2914,8 @@ export class ProjectGuard extends DurableObject<Env> {
     for (const recovery of this.pendingRequestRecovery()) {
       await this.serialize(async () => {
         try {
-          if (recovery.kind === "document") await this.resumeManagedDocument(recovery.request_id);
+          if (recovery.kind === "document" && recovery.staged_only === 1) await this.resumeStagedDocumentRecovery(recovery.request_id, recovery.staged_phase);
+          else if (recovery.kind === "document") await this.resumeManagedDocument(recovery.request_id);
           else if (recovery.kind === "artifact") await this.resumeArtifactFinalization(recovery.request_id);
           else if (recovery.kind !== "transaction") this.clearRequestRecovery("document", recovery.request_id);
         } catch (error) {
@@ -2776,6 +2930,117 @@ export class ProjectGuard extends DurableObject<Env> {
     // not let their unfailed rows schedule an immediate wake before that
     // phase records its real retry deadline.
     await this.serialize(() => this.scheduleNextRequestRecoveryWake(true));
+  }
+
+  private async resumeStagedDocumentRecovery(requestId: string, _observedPhase: string | null): Promise<void> {
+    const projectId = this.ctx.id.name;
+    if (!projectId) return;
+    const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+      "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?",
+      requestId
+    ).toArray()[0];
+    const marker = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string; phase: string }>(
+      "SELECT request_sha256, phase FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?",
+      requestId
+    ).toArray()[0];
+    if (!marker) return;
+    if (!staged || marker.request_sha256 !== staged.request_sha256) {
+      await this.blockRequestRecovery("document", requestId, "document_staged_payload_binding_mismatch");
+      return;
+    }
+    if (await sha256Text(staged.request_json) !== staged.request_sha256) {
+      await this.blockRequestRecovery("document", requestId, "document_staged_payload_invalid");
+      return;
+    }
+    let operation: ManagedDocumentRequest;
+    try {
+      operation = parseManagedDocumentRequest(JSON.parse(staged.request_json));
+    } catch {
+      await this.blockRequestRecovery("document", requestId, "document_staged_payload_invalid");
+      return;
+    }
+    if (operation.project_id !== projectId || operation.request_id !== requestId) {
+      await this.blockRequestRecovery("document", requestId, "document_staged_identity_invalid");
+      return;
+    }
+    if (operation.operation !== "working.write") {
+      await this.blockRequestRecovery("document", requestId, "document_staged_operation_not_eligible");
+      return;
+    }
+
+    const journal = new ExecutionJournal(this.persistence, projectId, "document", requestId);
+    const admissionRecord = await journal.readAdmission();
+    if (!admissionRecord) {
+      if (marker.phase === "admission_write_attempted") {
+        // A prior immutable create may have timed out after the provider
+        // accepted it. An absent read is not proof of absence; retain and
+        // retry the observation instead of discarding the only exact payload.
+        throw new ProviderOperationError("document_admission_observation_pending", true, {
+          providerId: "persistence",
+          code: "document_admission_observation_pending"
+        });
+      }
+      if (marker.phase === "preparing") {
+        this.ctx.storage.transactionSync(() => {
+          this.ctx.storage.sql.exec(
+            "DELETE FROM request_recovery_payload WHERE kind = 'document' AND request_id = ? AND request_sha256 = ?",
+            requestId, staged.request_sha256
+          );
+          this.ctx.storage.sql.exec(
+            "DELETE FROM request_recovery_staged WHERE kind = 'document' AND request_id = ? AND request_sha256 = ?",
+            requestId, staged.request_sha256
+          );
+          this.ctx.storage.sql.exec(
+            "DELETE FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?",
+            requestId
+          );
+        });
+        return;
+      }
+      await this.blockRequestRecovery("document", requestId, "document_staged_phase_invalid");
+      return;
+    }
+    const admission = admissionRecord.admission;
+    const normalized = await normalizeDocumentAdmission(operation);
+    if (admission.kind !== "document" || admission.operation !== operation.operation
+      || admission.request_id !== requestId || admission.project_id !== projectId
+      || admission.request_hash !== await sha256Canonical(operation)
+      || admission.verdict !== "allow"
+      || canonicalJson(admission.resources) !== canonicalJson(normalized.resources)) {
+      await this.blockRequestRecovery("document", requestId, "document_staged_admission_binding_mismatch");
+      return;
+    }
+    let progress;
+    try {
+      progress = await journal.status();
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("execution_")) {
+        await this.blockRequestRecovery("document", requestId, error.message);
+        return;
+      }
+      throw error;
+    }
+    if (!progress || progress.project_id !== projectId || progress.request_id !== requestId || progress.kind !== "document"
+      || progress.request_hash !== admission.request_hash || progress.admission_ref !== `${await journal.root()}/admission.json`
+      || progress.effect_plan_hash !== admissionRecord.effect_plan_hash || progress.sequence !== 0
+      || progress.status !== "admitted" || progress.terminal || progress.code !== null
+      || progress.receipt_ref !== null || progress.lease !== null || progress.completed_steps.length !== 0
+      || progress.postchecks.length !== 0 || progress.failure_streak !== null || progress.next_attempt_at !== null
+      || progress.incident_ref !== null || progress.superseded_by !== null || progress.finalization_ref !== null) {
+      await this.blockRequestRecovery("document", requestId, "document_staged_progress_not_pristine");
+      return;
+    }
+
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO request_recovery (kind, request_id) VALUES ('document', ?) ON CONFLICT(kind, request_id) DO NOTHING",
+        requestId
+      );
+    });
+    // Keep the non-executable marker beside the queue until terminal cleanup.
+    // The pending query excludes staged-only rows when a queue exists, while
+    // the marker preserves proof-observation provenance if reservation fails.
+    await this.resumeManagedDocument(requestId);
   }
 
   private async armMaterializationFinalizationAlarm(): Promise<void> {
@@ -3847,12 +4112,114 @@ export class ProjectGuard extends DurableObject<Env> {
     try {
       await this.assertCommitCapacity(admission, requestId, canonicalRevision, kind, outputCost);
     } catch (error) {
-      const provenRefusal = error instanceof AdmissionError
-        && (error.code === "idempotency_payload_mismatch"
-          || (error.code === "convergence_capacity_exceeded" && error.detail?.reservation_outcome === "refused"));
-      if (provenRefusal) this.clearRequestRecovery(kind, requestId);
-      else await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      const definitiveCapacityRefusal = error instanceof AdmissionError
+        && error.code === "convergence_capacity_exceeded" && error.detail?.reservation_outcome === "refused";
+      let retainAdmittedWorkingWrite = false;
+      let retainStagedOnlyWorkingWrite = false;
+      let stageOnlyWorkingWrite = false;
+      if (definitiveCapacityRefusal && kind === "document" && admission.operation === "working.write") {
+        const marker = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
+          "SELECT request_sha256 FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?",
+          requestId
+        ).toArray()[0];
+        try {
+          const proofStatus = await this.workingWriteAdmissionStatus(requestId, admission);
+          retainAdmittedWorkingWrite = proofStatus === "matching";
+          stageOnlyWorkingWrite = proofStatus === "mismatch" || (proofStatus === "absent" && marker !== undefined);
+        } catch {
+          // The immutable create may have succeeded even if its observation
+          // is temporarily unavailable. Never interpret an unreadable proof
+          // as absence; demote the exact bytes back to non-executable staged
+          // recovery and retry that proof read later.
+          stageOnlyWorkingWrite = true;
+        }
+      }
+      if (definitiveCapacityRefusal && retainAdmittedWorkingWrite) {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      } else if (definitiveCapacityRefusal && stageOnlyWorkingWrite) {
+        // If the proof is mismatched, attempted-but-not-observed, or unreadable,
+        // never leave executable queue work behind. Keep the exact payload in
+        // a non-executable marker; recovery will require matching proof and
+        // pristine initial progress before promotion.
+        const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
+          "SELECT request_sha256 FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?",
+          requestId
+        ).toArray()[0];
+        if (staged) {
+          this.ctx.storage.transactionSync(() => {
+            this.ctx.storage.sql.exec(
+              "DELETE FROM request_recovery WHERE kind = 'document' AND request_id = ?", requestId
+            );
+            this.ctx.storage.sql.exec(
+              `INSERT INTO request_recovery_staged (kind, request_id, request_sha256, phase)
+               VALUES ('document', ?, ?, 'admission_write_attempted')
+               ON CONFLICT(kind, request_id) DO UPDATE SET request_sha256 = excluded.request_sha256,
+                 phase = 'admission_write_attempted'`, requestId, staged.request_sha256
+            );
+          });
+          retainStagedOnlyWorkingWrite = true;
+          await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        } else {
+          this.clearRequestRecovery(kind, requestId);
+        }
+      } else if (!definitiveCapacityRefusal && !(error instanceof AdmissionError && error.code === "idempotency_payload_mismatch")) {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      }
+      // A typed refusal for other operation families retains its historical
+      // cleanup behavior. Payload identity conflicts never erase the prior
+      // exact recovery body.
+      if (definitiveCapacityRefusal && !retainAdmittedWorkingWrite && !retainStagedOnlyWorkingWrite) this.clearRequestRecovery(kind, requestId);
       throw error;
+    }
+  }
+
+  private async workingWriteAdmissionStatus(
+    requestId: string,
+    normalized: NormalizedAdmissionOperation
+  ): Promise<"matching" | "absent" | "mismatch"> {
+    const projectId = this.ctx.id.name;
+    if (!projectId || normalized.project_id !== projectId || normalized.operation !== "working.write") return "mismatch";
+    const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+      "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?",
+      requestId
+    ).toArray()[0];
+    if (!staged || await sha256Text(staged.request_json) !== staged.request_sha256) return "mismatch";
+    let operation: ManagedDocumentRequest;
+    try {
+      operation = parseManagedDocumentRequest(JSON.parse(staged.request_json));
+    } catch {
+      return "mismatch";
+    }
+    if (operation.operation !== "working.write" || operation.request_id !== requestId
+      || operation.project_id !== projectId || await sha256Canonical(operation) !== normalized.request_hash) return "mismatch";
+    const journal = new ExecutionJournal(this.persistence, projectId, "document", requestId);
+    const record = await journal.readAdmission();
+    if (!record) return "absent";
+    const admission = record?.admission;
+    return Boolean(admission && admission.kind === "document" && admission.operation === "working.write"
+      && admission.project_id === projectId && admission.request_id === requestId
+      && admission.request_hash === normalized.request_hash && admission.verdict === "allow"
+      && canonicalJson(admission.resources) === canonicalJson(normalized.resources)) ? "matching" : "mismatch";
+  }
+
+  private async isWorkingWriteCapacityRefusal(
+    kind: "artifact" | "document" | "transaction" | "materialization",
+    requestId: string,
+    error: unknown
+  ): Promise<boolean> {
+    if (kind !== "document" || !(error instanceof AdmissionError)
+      || error.code !== "convergence_capacity_exceeded" || error.detail?.reservation_outcome !== "refused") return false;
+    const staged = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+      "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?",
+      requestId
+    ).toArray()[0];
+    if (!staged || await sha256Text(staged.request_json) !== staged.request_sha256) return false;
+    try {
+      const operation = parseManagedDocumentRequest(JSON.parse(staged.request_json));
+      return operation.operation === "working.write" && operation.request_id === requestId
+        && operation.project_id === this.ctx.id.name;
+    } catch {
+      return false;
     }
   }
 
@@ -4827,6 +5194,99 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!worker) return response;
     const body = await response.json<Record<string, unknown>>();
     return Response.json({ ...body, navigation_worker: worker }, { status: response.status });
+  }
+
+  private async readLocalRecoveryDiagnostic(projectId: string, kind: RequestKind, requestId: string): Promise<LocalRecoveryDiagnostic> {
+    const diagnostic: LocalRecoveryDiagnostic = {
+      scope: "local_only",
+      payload_present: null,
+      payload_hash_valid: null,
+      staged_marker_matches_payload: null,
+      queue_present: null,
+      failure_stopped: null,
+      failure_attempts: null,
+      failure_code: null,
+      failure_next_attempt_at: null,
+      alarm_readable: false,
+      alarm_at: null,
+      local_receipt_present: null,
+      local_observation_present: null
+    };
+    let payload: { request_json: string; request_sha256: string } | null | undefined;
+    if (kind === "document" || kind === "transaction") {
+      try {
+        payload = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_json: string; request_sha256: string }>(
+          "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = ? AND request_id = ?", kind, requestId
+        ).toArray()[0] ?? null;
+        diagnostic.payload_present = payload !== null;
+      } catch { payload = undefined; }
+      if (payload) {
+        try { diagnostic.payload_hash_valid = await sha256Text(payload.request_json) === payload.request_sha256; }
+        catch { diagnostic.payload_hash_valid = null; }
+      }
+    }
+    if (kind === "document") {
+      try {
+        const marker = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; request_sha256: string }>(
+          "SELECT request_sha256 FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?", requestId
+        ).toArray()[0] ?? null;
+        diagnostic.staged_marker_matches_payload = marker === null
+          ? false
+          : payload && payload !== null ? marker.request_sha256 === payload.request_sha256 : null;
+      } catch { diagnostic.staged_marker_matches_payload = null; }
+    }
+    try {
+      diagnostic.queue_present = this.ctx.storage.sql.exec(
+        "SELECT request_id FROM request_recovery WHERE kind = ? AND request_id = ?", kind, requestId
+      ).toArray().length > 0;
+    } catch { diagnostic.queue_present = null; }
+    try {
+      const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; stopped: number; count: number; message: string }>(
+        "SELECT stopped, count, message FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
+      ).toArray()[0] ?? null;
+      diagnostic.failure_stopped = failure ? failure.stopped !== 0 : false;
+      diagnostic.failure_attempts = failure?.count ?? 0;
+      const parsed = this.parseRecoveryFailureDiagnostic(failure?.message);
+      diagnostic.failure_code = parsed?.code ?? null;
+      diagnostic.failure_next_attempt_at = parsed?.next_attempt_at ?? null;
+    } catch {
+      diagnostic.failure_stopped = null;
+      diagnostic.failure_attempts = null;
+      diagnostic.failure_code = null;
+      diagnostic.failure_next_attempt_at = null;
+    }
+    try {
+      const alarm = await this.ctx.storage.getAlarm();
+      diagnostic.alarm_readable = true;
+      diagnostic.alarm_at = alarm === null ? null : new Date(alarm).toISOString();
+    } catch { diagnostic.alarm_readable = false; }
+    try {
+      const table = kind === "document" ? "document_requests" : kind === "artifact" ? "artifact_requests" : "transactions";
+      const identityColumn = kind === "transaction" ? "transaction_id" : "request_id";
+      diagnostic.local_receipt_present = this.ctx.storage.sql.exec(
+        `SELECT ${identityColumn} FROM ${table} WHERE ${identityColumn} = ?`, requestId
+      ).toArray().length > 0;
+    } catch { diagnostic.local_receipt_present = null; }
+    try {
+      const stored = await this.ctx.storage.get<StoredPersistenceObservation>(persistenceObservationStorageKey(kind, requestId));
+      diagnostic.local_observation_present = stored === undefined
+        ? false
+        : isStoredPersistenceObservation(stored, { project_id: projectId, kind, request_id: requestId }) ? true : null;
+    } catch { diagnostic.local_observation_present = null; }
+    return diagnostic;
+  }
+
+  private async withLocalRecoveryDiagnostic(response: Response, projectId: string, kind: RequestKind, requestId: string): Promise<Response> {
+    try {
+      const body = await response.clone().json() as Record<string, unknown>;
+      const status = typeof body.status === "string" ? body.status : "";
+      if (response.status < 500 && !["unknown", "recovery_unavailable", "recovery_blocked", "admitted_uncommitted"].includes(status)) return response;
+      if (body.local_recovery_diagnostic) return response;
+      return Response.json({ ...body, local_recovery_diagnostic: await this.readLocalRecoveryDiagnostic(projectId, kind, requestId) }, {
+        status: response.status,
+        headers: response.headers
+      });
+    } catch { return response; }
   }
 
   /** A read-only recovery view. In particular, it must not certify an effect,

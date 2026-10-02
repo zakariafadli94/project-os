@@ -16,7 +16,9 @@ export interface PackageDriftObservation {
   status?: PackageDriftStatus;
   code?: string;
   resource?: RuleResource;
+  resources?: RuleResource[];
   request_id?: string;
+  snapshot_request_id?: string;
 }
 
 interface ExecutionEvidence {
@@ -44,20 +46,54 @@ export class PackageExternalDriftObserver {
     this.repository = new DocumentLedgerRepository(runtime);
   }
 
-  async observe(state: ProjectState, change: ProviderChangeEntry): Promise<PackageDriftObservation> {
+  async observe(state: ProjectState, change: ProviderChangeEntry, frozenSnapshotRequestId?: string): Promise<PackageDriftObservation> {
     const packagePath = this.isPackagePath(state, change.path);
+    const indexZone = this.currentIndexZone(state, change.path);
     let navigation: PackageNavigation;
+    let snapshotRequestId: string | undefined;
     try {
-      navigation = await this.repository.readCanonicalPackageNavigationForAudit(state.project_id);
+      if (indexZone) {
+        const snapshot = await this.repository.readPackageNavigationSnapshotForAudit(state.project_id, frozenSnapshotRequestId);
+        navigation = snapshot.navigation;
+        snapshotRequestId = snapshot.request_id;
+      } else {
+        navigation = await this.repository.readCanonicalPackageNavigationForAudit(state.project_id);
+      }
     } catch {
-      if (!packagePath) return { handled: false };
+      if (!packagePath && !indexZone) return { handled: false };
       return {
         handled: true,
         status: "unexpected_conflict",
-        code: change.kind === "deleted" ? "PACKAGE_UNEXPECTED_DISAPPEARANCE" : "PACKAGE_NAVIGATION_UNAVAILABLE"
+        code: change.kind === "deleted" ? "PACKAGE_UNEXPECTED_DISAPPEARANCE" : "PACKAGE_NAVIGATION_UNAVAILABLE",
+        ...(frozenSnapshotRequestId ? { snapshot_request_id: frozenSnapshotRequestId } : {})
       };
     }
     const candidates = await this.candidates(state.project_id, navigation);
+    if (indexZone) {
+      // Once a conflicting event has pinned a snapshot, retries must finish
+      // that conflict's frozen resource set even if the visible bytes later
+      // match a finalized write. The change-feed event is not reclassified.
+      const expected = frozenSnapshotRequestId
+        ? null
+        : await this.completedCurrentIndexWrite(candidates, indexZone, change.path);
+      if (expected) {
+        return {
+          handled: true,
+          status: "expected_reconciled",
+          code: "PACKAGE_EXPECTED_WRITE",
+          resource: expected.resource,
+          request_id: expected.request_id
+        };
+      }
+      const resources = this.currentPackageResources(navigation, indexZone);
+      return {
+        handled: true,
+        status: "unexpected_conflict",
+        code: change.kind === "deleted" ? "PACKAGE_UNEXPECTED_DISAPPEARANCE" : "PACKAGE_UNEXPECTED_MUTATION",
+        resources,
+        ...(snapshotRequestId ? { snapshot_request_id: snapshotRequestId } : {})
+      };
+    }
     const matched = await Promise.all(candidates.map(async (candidate) => ({
       candidate,
       result: await this.matchFinalizedStep(candidate, change)
@@ -117,6 +153,49 @@ export class PackageExternalDriftObserver {
       return "expected";
     }
     return null;
+  }
+
+  private async completedCurrentIndexWrite(
+    candidates: PackageDriftCandidate[],
+    zone: "WORKING" | "REVIEW" | "DELIVERABLES",
+    path: string
+  ): Promise<PackageDriftCandidate | null> {
+    const actual = await this.runtime.objects.getMetadata(path);
+    if (!actual) return null;
+    for (const candidate of candidates) {
+      if (candidate.resource.zone !== zone) continue;
+      for (const step of candidate.finalized.admitted.plan.steps) {
+        const action = step.action;
+        if (action.kind !== "write_if_unchanged" || action.destination.path !== path
+          || action.destination.logical_path !== `${zone}/CURRENT.md`
+          || step.resource_id !== candidate.resource.resource_id
+          || step.expected_version !== candidate.resource.version) continue;
+        const completed = candidate.finalized.progress.completed_steps.find((entry) => entry.step_id === step.step_id);
+        if (completed && await this.matchesCompletedDestination(actual, completed.evidence_refs)) return candidate;
+      }
+    }
+    return null;
+  }
+
+  private currentIndexZone(state: ProjectState, path: string): "WORKING" | "REVIEW" | "DELIVERABLES" | null {
+    const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
+    if (!path.startsWith(root)) return null;
+    const match = /^(WORKING|REVIEW|DELIVERABLES)\/CURRENT\.md$/.exec(path.slice(root.length));
+    return (match?.[1] as "WORKING" | "REVIEW" | "DELIVERABLES" | undefined) ?? null;
+  }
+
+  private currentPackageResources(
+    navigation: PackageNavigation,
+    zone: "WORKING" | "REVIEW" | "DELIVERABLES"
+  ): RuleResource[] {
+    return [...(navigation[zone]?.packages ?? [])]
+      .sort((left, right) => left.ref.package_id < right.ref.package_id ? -1 : left.ref.package_id > right.ref.package_id ? 1 : 0)
+      .map((entry) => ({
+        resource_id: entry.ref.package_id,
+        resource_type: "package",
+        zone,
+        version: packageResourceVersion(entry.ref)
+      }));
   }
 
   private async hasFinalDeleteReceipt(candidate: PackageDriftCandidate, step: ExecutionStep): Promise<boolean> {
@@ -204,9 +283,12 @@ export class PackageExternalDriftObserver {
   private resourceForExactPackagePath(navigation: PackageNavigation, state: ProjectState, path: string): RuleResource | undefined {
     const parsed = this.packagePath(state, path);
     if (!parsed) return undefined;
-    const entry = navigation[parsed.zone]?.packages.find((value) =>
-      value.ref.package_id === parsed.package_id && value.ref.version === parsed.version
-    );
+    const matches = navigation[parsed.zone]?.packages.filter((value) =>
+      value.ref.package_id === parsed.package_id
+      && (parsed.version === undefined || value.ref.version === parsed.version)
+    ) ?? [];
+    if (matches.length !== 1) return undefined;
+    const entry = matches[0];
     return entry ? {
       resource_id: entry.ref.package_id,
       resource_type: "package",
@@ -215,18 +297,18 @@ export class PackageExternalDriftObserver {
     } : undefined;
   }
 
-  private packagePath(state: ProjectState, path: string): { zone: "WORKING" | "REVIEW" | "DELIVERABLES"; package_id: string; version: number } | null {
+  private packagePath(state: ProjectState, path: string): { zone: "WORKING" | "REVIEW" | "DELIVERABLES"; package_id: string; version?: number } | null {
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!path.startsWith(root)) return null;
     const relative = path.slice(root.length);
-    const visible = /^(WORKING|REVIEW|DELIVERABLES)\/PACKAGES\/(PKG-[A-F0-9]{64})\/([1-9][0-9]*)\//.exec(relative);
+    const visible = /^(WORKING|REVIEW|DELIVERABLES)\/PACKAGES\/(PKG-[A-F0-9]{64})(?:\/([1-9][0-9]*)(?:\/.*)?|$)/.exec(relative);
     const archive = /^ARCHIVES\/PACKAGES\/(PKG-[A-F0-9]{64})\/([1-9][0-9]*)\/(WORKING|REVIEW|DELIVERABLES)\//.exec(relative);
     const match = visible ?? archive;
     if (!match) return null;
     return {
       zone: (visible ? visible[1] : archive![3]) as "WORKING" | "REVIEW" | "DELIVERABLES",
       package_id: match[visible ? 2 : 1],
-      version: Number(match[visible ? 3 : 2])
+      ...(visible ? (visible[3] ? { version: Number(visible[3]) } : {}) : { version: Number(archive![2]) })
     };
   }
 
@@ -234,7 +316,7 @@ export class PackageExternalDriftObserver {
     const root = `${workspaceProjectRoot(state.project_id, state.slug)}/`;
     if (!path.startsWith(root)) return false;
     const relative = path.slice(root.length);
-    return /^(?:WORKING|REVIEW|DELIVERABLES)\/(?:CURRENT\.md|PACKAGES\/PKG-[A-F0-9]{64}\/[1-9][0-9]*\/)|^ARCHIVES\/PACKAGES\/PKG-[A-F0-9]{64}\/[1-9][0-9]*\/(?:WORKING|REVIEW|DELIVERABLES)\//.test(relative);
+    return /^(?:WORKING|REVIEW|DELIVERABLES)\/(?:CURRENT\.md|PACKAGES\/PKG-[A-F0-9]{64}(?:\/[1-9][0-9]*(?:\/|$)|$))|^ARCHIVES\/PACKAGES\/PKG-[A-F0-9]{64}\/[1-9][0-9]*\/(?:WORKING|REVIEW|DELIVERABLES)\//.test(relative);
   }
 }
 

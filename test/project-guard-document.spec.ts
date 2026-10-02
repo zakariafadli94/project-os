@@ -230,6 +230,19 @@ describe("ProjectGuard managed documents", () => {
     });
     const status = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
     expect(await status.json()).toMatchObject({ navigation_worker: { queued: true, stopped: true, next_attempt_at: null } });
+    let releaseBusy!: () => void;
+    const busy = new Promise<void>((resolve) => { releaseBusy = resolve; });
+    let held!: Promise<void>;
+    await runInDurableObject(guard, (instance) => {
+      held = (instance as any).serialize(async () => busy);
+    });
+    try {
+      const busyStatus = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
+      expect(await busyStatus.json()).toMatchObject({ navigation_worker: { queued: true, stopped: true } });
+    } finally {
+      releaseBusy();
+      await held;
+    }
     let originalMaterializationGuard!: DurableObjectNamespace;
     await runInDurableObject(guard, (instance) => {
       originalMaterializationGuard = (instance as any).env.MATERIALIZATION_GUARD;

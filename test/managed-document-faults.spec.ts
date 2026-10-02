@@ -6,6 +6,7 @@ import type { Receipt } from "../src/domain/receipt";
 import { encodeAdmission } from "../src/admission/transport";
 import { AdmissionError } from "../src/admission/mutation-context";
 import { sha256Text } from "../src/documents/hash";
+import { sha256Canonical } from "../src/materialization/hash";
 import { machineDocumentRoot, machineDocumentVersionPath, workspaceManagedDocumentPath } from "../src/persistence/layout";
 import { ExecutionJournal } from "../src/execution/journal";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
@@ -57,13 +58,14 @@ async function workingWrite(
   projectId: string,
   requestId: string,
   content: string,
-  expectedVersionId?: string
+  expectedVersionId?: string,
+  logicalPath = "strategy/commercial.md"
 ) {
   return jsonCall(guard, {
     operation: "working.write",
     request_id: requestId,
     project_id: projectId,
-    logical_path: "strategy/commercial.md",
+    logical_path: logicalPath,
     content,
     content_sha256: await sha256Text(content),
     ...(expectedVersionId ? { expected_version_id: expectedVersionId } : {}),
@@ -419,6 +421,225 @@ describe("managed document crash recovery", () => {
       ).toArray().length > 0
     }));
     expect(recovered).toEqual({ queued: false, payload: false, marker: false });
+  });
+
+  it("retains a pinned review promotion across post-admission capacity refusal and resumes it from the alarm", async () => {
+    const mock = installDropboxMock({ faults, immutableRevisions: true });
+    const created = await createProject("CAPACITY-REVIEW-PROMOTE");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const contextSecret = "managed-review-promote-capacity-context-secret";
+    const ruleSecret = "managed-review-promote-capacity-rule-secret";
+    await bootstrapRuleAdmissionGovernance(testEnv, ruleSecret, created.project_id);
+    const initial = await workingWrite(guard, created.project_id, "DOCREQ-REVIEW-PROMOTE-CAP-INITIAL-0001", "Pinned candidate awaiting review.");
+    const staleInitial = await workingWrite(guard, created.project_id, "DOCREQ-REVIEW-PROMOTE-CAP-STALE-INITIAL-0001", "A second candidate for stale-pin verification.", undefined, "strategy/stale-review.md");
+    await runInDurableObject(guard, (instance) => {
+      const instanceEnv = (instance as unknown as { env: Env }).env;
+      instanceEnv.PROJECT_OS_ADMISSION_PROJECT_MODES = JSON.stringify({ [created.project_id]: "strict" });
+      instanceEnv.PROJECT_OS_CONVERGENCE_PROJECT_MODES = JSON.stringify({ [created.project_id]: "repair" });
+      instanceEnv.MUTATION_CONTEXT_SIGNING_KEY = contextSecret;
+      instanceEnv.RULE_ADMISSION_SIGNING_KEY = ruleSecret;
+      vi.spyOn(instance as any, "assertCommitCapacity")
+        .mockRejectedValueOnce(new AdmissionError("convergence_capacity_exceeded", 503, { reservation_outcome: "refused" }))
+        .mockResolvedValue(undefined);
+      vi.spyOn(instance as any, "releaseManagedDocumentCapacity").mockResolvedValue(true);
+    });
+    const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context", {
+      headers: { authorization: `Bearer ${testEnv.INGRESS_TOKEN}` }
+    });
+    const { context: mutationContext } = await contextResponse.json<{ context: Parameters<typeof encodeAdmission>[1] }>();
+    if (mutationContext === null) throw new Error("expected signed mutation context for pinned review promotion test");
+    const request = {
+      operation: "review.promote" as const,
+      request_id: "DOCREQ-REVIEW-PROMOTE-CAP-0001",
+      project_id: created.project_id,
+      document_id: initial.document_id,
+      expected_version_id: initial.version_id,
+      created_at: at
+    };
+    const staleRequest = {
+      operation: "review.promote" as const,
+      request_id: "DOCREQ-REVIEW-PROMOTE-CAP-STALE-0001",
+      project_id: created.project_id,
+      document_id: staleInitial.document_id,
+      expected_version_id: staleInitial.version_id,
+      created_at: at
+    };
+    const exactJson = JSON.stringify(request);
+    const originalCommit = ExecutionJournal.prototype.commit;
+    const interruptedIds = new Set<string>();
+    vi.spyOn(ExecutionJournal.prototype, "commit").mockImplementation(async function (
+      this: ExecutionJournal,
+      admission: Parameters<ExecutionJournal["commit"]>[0],
+      plan: Parameters<ExecutionJournal["commit"]>[1]
+    ) {
+      const result = await originalCommit.call(this, admission, plan);
+      if ((this.requestId === request.request_id || this.requestId === staleRequest.request_id)
+        && !interruptedIds.has(this.requestId)) {
+        interruptedIds.add(this.requestId);
+        throw new Error("injected_after_pinned_review_promotion_admission");
+      }
+      return result;
+    });
+
+    const interruptedResponse = await documentCall(
+      guard,
+      encodeAdmission(request, mutationContext) as unknown as Record<string, unknown>
+    );
+    expect(interruptedResponse.status).toBe(503);
+    const afterAdmission = await runInDurableObject(guard, async (_instance, durableState) => ({
+      payload: durableState.storage.sql.exec<{ request_json: string; request_sha256: string }>(
+        "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?",
+        request.request_id
+      ).toArray()[0] ?? null,
+      marker: durableState.storage.sql.exec<{ request_sha256: string; phase: string }>(
+        "SELECT request_sha256, phase FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?",
+        request.request_id
+      ).toArray()[0] ?? null,
+      queued: durableState.storage.sql.exec(
+        "SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id
+      ).toArray().length > 0,
+      progress: await new ExecutionJournal(
+        (await import("../src/persistence/production-factory")).createProductionPersistence(testEnv, created.project_id),
+        created.project_id, "document", request.request_id
+      ).status(),
+      admission: await new ExecutionJournal(
+        (await import("../src/persistence/production-factory")).createProductionPersistence(testEnv, created.project_id),
+        created.project_id, "document", request.request_id
+      ).readAdmission(),
+      alarm: await durableState.storage.getAlarm()
+    }));
+    expect(afterAdmission.payload).toMatchObject({ request_json: exactJson, request_sha256: await sha256Text(exactJson) });
+    expect(afterAdmission.marker).toEqual({ request_sha256: await sha256Text(exactJson), phase: "admission_write_attempted" });
+    expect(afterAdmission.queued).toBe(false);
+    expect(afterAdmission.progress).toMatchObject({ status: "admitted", sequence: 0, terminal: false });
+    expect(afterAdmission.admission?.admission).toMatchObject({
+      operation: "review.promote", project_id: created.project_id, request_id: request.request_id,
+      request_hash: await sha256Canonical(request), verdict: "allow", actor: mutationContext.actor,
+      resources: [expect.objectContaining({ resource_id: initial.document_id, resource_type: "document",
+        zone: "DOCUMENTS", expected_version: initial.version_id })]
+    });
+    expect(afterAdmission.alarm).not.toBeNull();
+
+    await runInDurableObject(guard, async (_instance, durableState) => durableState.storage.setAlarm(Date.now() - 1));
+    await runDurableObjectAlarm(guard);
+    const afterCapacityRefusal = await runInDurableObject(guard, async (_instance, durableState) => ({
+      payload: durableState.storage.sql.exec<{ request_json: string; request_sha256: string }>(
+        "SELECT request_json, request_sha256 FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?",
+        request.request_id
+      ).toArray()[0] ?? null,
+      marker: durableState.storage.sql.exec<{ request_sha256: string; phase: string }>(
+        "SELECT request_sha256, phase FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?",
+        request.request_id
+      ).toArray()[0] ?? null,
+      queued: durableState.storage.sql.exec(
+        "SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id
+      ).toArray().length > 0,
+      alarm: await durableState.storage.getAlarm()
+    }));
+    expect(afterCapacityRefusal.payload).toEqual({ request_json: exactJson, request_sha256: await sha256Text(exactJson) });
+    expect(afterCapacityRefusal.marker).toEqual({ request_sha256: await sha256Text(exactJson), phase: "admission_write_attempted" });
+    expect(afterCapacityRefusal.queued).toBe(true);
+    expect(afterCapacityRefusal.alarm).not.toBeNull();
+    expect(mock.files.has(`${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/intent.json`)).toBe(false);
+    expect(mock.files.has(`${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/receipt.json`)).toBe(false);
+
+    await runInDurableObject(guard, async (_instance, durableState) => {
+      const failure = durableState.storage.sql.exec<{ message: string }>(
+        "SELECT message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?",
+        request.request_id
+      ).toArray()[0]!;
+      const diagnostic = JSON.parse(failure.message);
+      diagnostic.next_attempt_at = new Date(0).toISOString();
+      durableState.storage.sql.exec(
+        "UPDATE request_recovery_failures SET message = ? WHERE kind = 'document' AND request_id = ?",
+        JSON.stringify(diagnostic), request.request_id
+      );
+      await durableState.storage.setAlarm(Date.now() - 1);
+    });
+    await runDurableObjectAlarm(guard);
+    const afterRecovery = await runInDurableObject(guard, async (_instance, durableState) => ({
+      queue: durableState.storage.sql.exec("SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id).toArray(),
+      payload: durableState.storage.sql.exec("SELECT request_id FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", request.request_id).toArray(),
+      marker: durableState.storage.sql.exec("SELECT request_id, phase FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?", request.request_id).toArray(),
+      failure: durableState.storage.sql.exec("SELECT stopped, count, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id).toArray(),
+      alarm: await durableState.storage.getAlarm()
+    }));
+    expect(mock.files.has(`${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/intent.json`), JSON.stringify(afterRecovery)).toBe(true);
+    expect(mock.files.has(`${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/receipt.json`)).toBe(true);
+    const reviewPath = workspaceManagedDocumentPath(created.project_id, "managed-fault-capacityreviewpromote", "review", "strategy/commercial.md");
+    expect(mock.files.get(reviewPath)).toContain("Pinned candidate awaiting review.");
+    expect(mock.files.has(workspaceManagedDocumentPath(created.project_id, "managed-fault-capacityreviewpromote", "working", "strategy/commercial.md"))).toBe(false);
+    expect(await new ExecutionJournal(
+      (await import("../src/persistence/production-factory")).createProductionPersistence(testEnv, created.project_id),
+      created.project_id, "document", request.request_id
+    ).status()).toMatchObject({ status: "finalized", terminal: true });
+
+    const staleResponse = await documentCall(
+      guard,
+      encodeAdmission(staleRequest, mutationContext) as unknown as Record<string, unknown>
+    );
+    expect(staleResponse.status).toBe(503);
+    const newerVersionRequest = {
+      operation: "working.write" as const,
+      request_id: "DOCREQ-REVIEW-PROMOTE-CAP-STALE-WORK-0001",
+      project_id: created.project_id,
+      logical_path: "strategy/stale-review.md",
+      content: "The working head advanced after review promotion admission.",
+      content_sha256: await sha256Text("The working head advanced after review promotion admission."),
+      expected_version_id: staleInitial.version_id,
+      created_at: at
+    };
+    const advanced = await documentCall(
+      guard,
+      encodeAdmission(newerVersionRequest, mutationContext) as unknown as Record<string, unknown>
+    );
+    expect(advanced.status).toBe(200);
+    const advancedReceipt = await advanced.json<any>();
+    expect(advancedReceipt).toMatchObject({ status: "committed", version_id: expect.any(String) });
+    expect(advancedReceipt.version_id).not.toBe(staleInitial.version_id);
+
+    await runInDurableObject(guard, async (_instance, durableState) => durableState.storage.setAlarm(Date.now() - 1));
+    await runDurableObjectAlarm(guard);
+    const staleRecoveryState = await runInDurableObject(guard, async (_instance, durableState) => ({
+      queue: durableState.storage.sql.exec("SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", staleRequest.request_id).toArray(),
+      payload: durableState.storage.sql.exec("SELECT request_json FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", staleRequest.request_id).toArray(),
+      marker: durableState.storage.sql.exec("SELECT request_id, phase FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?", staleRequest.request_id).toArray(),
+      failure: durableState.storage.sql.exec("SELECT stopped, count, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", staleRequest.request_id).toArray(),
+      alarm: await durableState.storage.getAlarm()
+    }));
+    const stalePromotionEnvelope = JSON.parse(mock.files.get(
+      `${machineDocumentRoot(created.project_id)}/requests/${staleRequest.request_id}/receipt.json`
+    ) ?? "null");
+    const stalePromotionReceipt = JSON.parse(stalePromotionEnvelope?.receipt_json ?? "null");
+    expect(stalePromotionReceipt, JSON.stringify(staleRecoveryState)).toMatchObject({ status: "conflict", code: "STALE_DOCUMENT_VERSION" });
+    expect(mock.files.get(workspaceManagedDocumentPath(created.project_id, "managed-fault-capacityreviewpromote", "working", "strategy/stale-review.md")))
+      .toContain(newerVersionRequest.content);
+    expect(mock.files.has(workspaceManagedDocumentPath(created.project_id, "managed-fault-capacityreviewpromote", "review", "strategy/stale-review.md")))
+      .toBe(false);
+
+    const unpinnedRequest = {
+      operation: "review.promote" as const,
+      request_id: "DOCREQ-REVIEW-PROMOTE-CAP-UNPINNED-0001",
+      project_id: created.project_id,
+      document_id: staleInitial.document_id,
+      created_at: at
+    };
+    await runInDurableObject(guard, (instance) => {
+      (instance as any).assertCommitCapacity.mockRejectedValueOnce(
+        new AdmissionError("convergence_capacity_exceeded", 503, { reservation_outcome: "refused" })
+      );
+    });
+    const unpinnedResponse = await documentCall(
+      guard,
+      encodeAdmission(unpinnedRequest, mutationContext) as unknown as Record<string, unknown>
+    );
+    expect(unpinnedResponse.status).toBe(503);
+    const unpinnedRecovery = await runInDurableObject(guard, (_instance, durableState) => ({
+      payload: durableState.storage.sql.exec("SELECT request_id FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", unpinnedRequest.request_id).toArray(),
+      marker: durableState.storage.sql.exec("SELECT request_id FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?", unpinnedRequest.request_id).toArray(),
+      queue: durableState.storage.sql.exec("SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", unpinnedRequest.request_id).toArray()
+    }));
+    expect(unpinnedRecovery).toEqual({ payload: [], marker: [], queue: [] });
   });
 
   it("does not make an unpinned governed review write eligible for staged automatic recovery", async () => {

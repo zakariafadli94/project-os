@@ -345,14 +345,28 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
   ): Promise<number> {
     const ids = items.map((item) => /^(DOC-[A-F0-9]{24})\.json$/.exec(item.name)?.[1]);
     if (ids.some((id, index) => !id || items[index].kind !== "file" || items[index].path !== machineDocumentHeadPath(projectId, id))) return 0;
-    const heads = await Promise.allSettled(ids.map(async (id) => {
+    const readHead = async (id: string) => {
       const cached = headCache.get(id!);
       if (cached && "head" in cached) return cached.head!;
       charge(budget);
       const raw = await this.runtime.objects.readText(machineDocumentHeadPath(projectId, id!));
       headCache.set(id!, { head: raw });
       return raw;
-    }));
+    };
+    // An active first head cannot form an inactive prefix. Inspect it before
+    // spending five provider calls on the rest of a batch; the fallback active
+    // proof still needs this slice's remaining budget to advance its cursor.
+    let first: string | null;
+    try {
+      first = await readHead(ids[0]!);
+      if (first === null) return 0;
+      const head = readManagedDocumentHead(JSON.parse(first)).head;
+      const pointer = activePointer(head, zone);
+      if (head.project_id !== projectId || head.document_id !== ids[0] || head.reconciliation_status !== "clean"
+        || pointer.versionId != null || pointer.observation != null) return 0;
+    } catch { return 0; }
+    const heads = [{ status: "fulfilled", value: first } as PromiseFulfilledResult<string | null>,
+      ...await Promise.allSettled(ids.slice(1).map((id) => readHead(id!)))];
     let inactiveCount = 0;
     for (let index = 0; index < heads.length; index += 1) {
       const result = heads[index];

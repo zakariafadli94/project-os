@@ -1616,6 +1616,48 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(savedProgress.verify_cursor).toBeNull();
   });
 
+  it("verifies an already published generation without inventory and rejects a forged certificate", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const inv = await inventoryHarness(project);
+    seedTarget(harness, inv);
+    const input = request();
+    const admission = await admissionFor(input);
+    const engine = new ZoneNavigationEngine(harness.runtime, inv.port);
+    const published = await reconcileUntilTerminal(engine, input, project, admission);
+    expect(published.status).toBe("finalized");
+    if (published.status !== "finalized") throw new Error("expected publication");
+    inv.port.verifySnapshot = async () => { throw new Error("must not reevaluate a historical publication"); };
+    inv.port.listPage = async () => { throw new Error("must not rescan publication"); };
+    expect(await engine.readVerifiedPublication(input, project, admission, budget(), published.receipt.source_snapshot_id)).toEqual(published.receipt);
+    const progressPath = `${await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).root()}/navigation-progress.json`;
+    const progress = harness.files.get(progressPath)!;
+    const readBytes = vi.spyOn(harness.runtime.objects, "readBytes");
+    harness.put(progressPath, " ".repeat(2_000_001));
+    readBytes.mockClear();
+    await expect(engine.readVerifiedPublication(input, project, admission, budget(), published.receipt.source_snapshot_id)).rejects.toThrow("navigation_publication_proof_unavailable");
+    expect(readBytes).not.toHaveBeenCalled();
+    harness.put(progressPath, progress.content);
+    const originalMetadata = harness.runtime.objects.getMetadata.bind(harness.runtime.objects);
+    let proofMetadataReads = 0;
+    const metadataRace = vi.spyOn(harness.runtime.objects, "getMetadata").mockImplementation(async path => {
+      const metadata = await originalMetadata(path);
+      return path === progressPath && ++proofMetadataReads === 2 && metadata
+        ? { ...metadata, revisionToken: "concurrent-proof-write" } : metadata;
+    });
+    await expect(engine.readVerifiedPublication(input, project, admission, budget(), published.receipt.source_snapshot_id)).rejects.toThrow("navigation_publication_proof_unavailable");
+    metadataRace.mockRestore();
+    const certificate = harness.files.get(published.receipt.finalization_ref)!;
+    harness.put(published.receipt.finalization_ref, certificate.content.replace('"source_count":1', '"source_count":2'));
+    expect(await engine.readVerifiedPublication(input, project, admission, budget(), published.receipt.source_snapshot_id)).toBeNull();
+    harness.put(published.receipt.finalization_ref, certificate.content);
+    expect(await engine.readVerifiedPublication(input, project, admission, budget(), "source:999")).toBeNull();
+    const indexPath = `${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT.md`;
+    const index = harness.files.get(indexPath)!;
+    harness.put(indexPath, `${index.content}\nexternal change`, index.objectId);
+    expect(await engine.readVerifiedPublication(input, project, admission, budget(), published.receipt.source_snapshot_id)).toBeNull();
+  });
+
   it("returns an old finalized receipt without restoring its index over a newer generation", async () => {
     const harness = runtimeHarness();
     const project = state();

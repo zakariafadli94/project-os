@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { ZoneNavigationSources, zoneNavigationCatalogRoot, zoneNavigationDirtyRoot, zoneNavigationCatalogShardForResource } from "../src/documents/zone-navigation-sources";
 import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
-import type { NavigationInventoryEntry } from "../src/domain/zone-navigation";
+import type { NavigationInventoryEntry, ZoneNavigationReceipt } from "../src/domain/zone-navigation";
+import { machineDocumentRoot } from "../src/persistence/layout";
 
 function harness() {
   const files = new Map<string, string>();
@@ -12,6 +13,12 @@ function harness() {
     providerId: "test",
     objects: {
       readText: async (path) => files.get(path) ?? null,
+      readBytes: async (path, maxBytes) => {
+        const content = files.get(path);
+        if (content === undefined) return null;
+        const bytes = new TextEncoder().encode(content);
+        return bytes.byteLength <= maxBytes ? bytes : null;
+      },
       createText: async (path, content) => {
         if (files.has(path)) throw new Error("exists");
         files.set(path, content);
@@ -77,6 +84,158 @@ function entry(): NavigationInventoryEntry {
 }
 
 describe("ZoneNavigationSources", () => {
+  it("releases only the matching stale owner when navigation and source generations differ", async () => {
+    const { sources, files } = harness();
+    const projectId = "PRJ-0002";
+    const zone = "REVIEW" as const;
+    const requestId = "DOCREQ-NAVIGATION-REVIEW-PUBLISHED1";
+    const initialHead = "head:DOC-0123456789ABCDEF01234567";
+    const laterHead = "head:DOC-1123456789ABCDEF01234567";
+    for (let generation = 1; generation <= 7; generation++) {
+      const source = generation === 1 ? initialHead : `head:DOC-${generation}123456789ABCDEF01234567`;
+      const write = await sources.beginHeadWrite(projectId, zone, source, budget(), null, true);
+      expect(write).toMatchObject({ generation });
+      await sources.completeHeadWrite(write, null, budget());
+      expect(await sources.finishDirty(projectId, zone, source, null, budget())).toBe(true);
+    }
+    expect(await sources.beginAdoption(projectId, zone, requestId, 7, budget())).toBe(true);
+
+    const laterWrite = await sources.beginHeadWrite(projectId, zone, laterHead, budget());
+    expect(laterWrite).toMatchObject({ generation: 8 });
+    await sources.completeHeadWrite(laterWrite, null, budget());
+
+    files.set(`${zoneNavigationCatalogRoot(projectId, zone)}/compact/ready.json`, JSON.stringify({
+      schema_version: "1.0", project_id: projectId, zone, ready_generation: 7, shards: [0],
+      completed_generations: [], coalesced_dirty: []
+    }));
+
+    const index = { basename: "00-CURRENT.md" as const, object_id: "published-index", revision_token: "published-rev", content_sha256: "a".repeat(64) };
+    const headPath = `${machineDocumentRoot(projectId)}/navigation/${zone}/head.json`;
+    const receipt: ZoneNavigationReceipt = {
+      schema_version: "1.0", status: "committed", project_id: projectId, request_id: requestId, zone,
+      generation: 1, head_ref: headPath,
+      finalization_ref: `${machineDocumentRoot(projectId)}/navigation/${zone}/finalization.json`,
+      index, source_snapshot_id: "source:7", source_count: 0, coverage_gaps: []
+    };
+
+    await expect(sources.finishPublishedAdoption(projectId, zone, requestId, async () => ({
+      ...receipt, source_snapshot_id: "source:1"
+    }), budget())).resolves.toEqual({ status: "unchanged", reason: "owner_changed" });
+    let callbackCount = 0;
+    await expect(sources.finishPublishedAdoption(projectId, zone, requestId, async () => {
+      callbackCount++;
+      return null;
+    }, budget())).resolves.toEqual({
+      status: "unchanged", reason: "unverified_publication"
+    });
+    expect(callbackCount).toBe(1);
+    await expect(sources.readState(projectId, zone, budget())).resolves.toMatchObject({
+      generation: 8, adopted: false, adoption_request_id: requestId, adoption_generation: 7,
+      in_flight_resource_ids: []
+    });
+
+    await expect(sources.finishPublishedAdoption(projectId, zone, requestId, async () => {
+      callbackCount++;
+      return receipt;
+    }, budget())).resolves.toEqual({
+      status: "superseded", published_source_generation: 7, current_source_generation: 8, refresh_required: true
+    });
+    expect(callbackCount).toBe(2);
+    await expect(sources.readState(projectId, zone, budget())).resolves.toMatchObject({
+      generation: 8, adopted: true, adoption_request_id: null, adoption_generation: null,
+      in_flight_resource_ids: []
+    });
+    expect(await sources.verifySnapshot(projectId, zone, "source:8", budget())).toBe(false);
+    expect(await sources.hasDirtyMarker(projectId, zone, laterHead, budget())).toBe(true);
+    expect([...files.keys()].some((path) => path.includes("/dirty/"))).toBe(true);
+  });
+
+  it("marks only the exact published source generation adopted and remains idempotent", async () => {
+    const { sources } = harness();
+    const projectId = "PRJ-0002";
+    const zone = "REVIEW" as const;
+    const requestId = "DOCREQ-NAVIGATION-REVIEW-PUBLISHED2";
+    const initialHead = "head:DOC-3123456789ABCDEF01234567";
+    const firstWrite = await sources.beginHeadWrite(projectId, zone, initialHead, budget(), null, true);
+    await sources.completeHeadWrite(firstWrite, null, budget());
+    expect(await sources.finishDirty(projectId, zone, initialHead, null, budget())).toBe(true);
+    expect(await sources.beginAdoption(projectId, zone, requestId, 1, budget())).toBe(true);
+
+    const index = { basename: "00-CURRENT.md" as const, object_id: "published-index-2", revision_token: "published-rev-2", content_sha256: "c".repeat(64) };
+    const headPath = `${machineDocumentRoot(projectId)}/navigation/${zone}/head.json`;
+    const receipt: ZoneNavigationReceipt = {
+      schema_version: "1.0", status: "committed", project_id: projectId, request_id: requestId, zone,
+      generation: 1, head_ref: headPath,
+      finalization_ref: `${machineDocumentRoot(projectId)}/navigation/${zone}/finalization.json`,
+      index, source_snapshot_id: "source:1", source_count: 0, coverage_gaps: []
+    };
+
+    await expect(sources.finishPublishedAdoption(projectId, zone, requestId, async () => receipt, budget()))
+      .resolves.toEqual({ status: "adopted", source_generation: 1 });
+    await expect(sources.finishPublishedAdoption(projectId, zone, requestId, async () => receipt, budget()))
+      .resolves.toEqual({ status: "adopted", source_generation: 1 });
+    await expect(sources.readState(projectId, zone, budget())).resolves.toMatchObject({
+      generation: 1, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_resource_ids: []
+    });
+  });
+
+  it("keeps the full-inventory fallback when a superseded publication has no compact baseline", async () => {
+    const { sources, files } = harness();
+    const projectId = "PRJ-0002";
+    const zone = "REVIEW" as const;
+    const requestId = "DOCREQ-NAVIGATION-REVIEW-BASELINE1";
+    const source = "head:DOC-4123456789ABCDEF01234567";
+    expect(await sources.beginAdoption(projectId, zone, requestId, 0, budget())).toBe(true);
+
+    const write = await sources.beginHeadWrite(projectId, zone, source, budget());
+    expect(write).toMatchObject({ generation: 1 });
+    await sources.completeHeadWrite(write, null, budget());
+
+    const receipt: ZoneNavigationReceipt = {
+      schema_version: "1.0", status: "committed", project_id: projectId, request_id: requestId, zone,
+      generation: 1, head_ref: `${machineDocumentRoot(projectId)}/navigation/${zone}/head.json`,
+      finalization_ref: `${machineDocumentRoot(projectId)}/navigation/${zone}/finalization.json`,
+      index: { basename: "00-CURRENT.md", object_id: "published-index-baseline", revision_token: "published-rev-baseline", content_sha256: "a".repeat(64) },
+      source_snapshot_id: "source:0", source_count: 0, coverage_gaps: []
+    };
+    await expect(sources.finishPublishedAdoption(projectId, zone, requestId, async () => receipt, budget()))
+      .resolves.toEqual({ status: "superseded", published_source_generation: 0, current_source_generation: 1, refresh_required: true });
+
+    await expect(sources.readState(projectId, zone, budget())).resolves.toMatchObject({
+      generation: 1, adopted: false, adoption_request_id: null, adoption_generation: null,
+      in_flight_resource_ids: []
+    });
+    expect(await sources.verifySnapshot(projectId, zone, "source:1", budget())).toBe(false);
+    expect(await sources.hasDirtyMarker(projectId, zone, source, budget())).toBe(true);
+  });
+
+  it("does not retain a superseded baseline when the compact manifest needs repair", async () => {
+    const { sources, files } = harness();
+    const projectId = "PRJ-0002";
+    const zone = "REVIEW" as const;
+    const requestId = "DOCREQ-NAVIGATION-REVIEW-BASELINE2";
+    const source = "head:DOC-5123456789ABCDEF01234567";
+    expect(await sources.beginAdoption(projectId, zone, requestId, 0, budget())).toBe(true);
+    const readyPath = `${zoneNavigationCatalogRoot(projectId, zone)}/compact/ready.json`;
+    files.set(readyPath, JSON.stringify({
+      schema_version: "1.0", project_id: projectId, zone, ready_generation: 0, shards: [0],
+      completed_generations: [], coalesced_dirty: [], rebuild_repair_required: true
+    }));
+    const write = await sources.beginHeadWrite(projectId, zone, source, budget());
+    await sources.completeHeadWrite(write, null, budget());
+    const receipt: ZoneNavigationReceipt = {
+      schema_version: "1.0", status: "committed", project_id: projectId, request_id: requestId, zone,
+      generation: 1, head_ref: `${machineDocumentRoot(projectId)}/navigation/${zone}/head.json`,
+      finalization_ref: `${machineDocumentRoot(projectId)}/navigation/${zone}/finalization.json`,
+      index: { basename: "00-CURRENT.md", object_id: "published-index-repair", revision_token: "published-rev-repair", content_sha256: "b".repeat(64) },
+      source_snapshot_id: "source:0", source_count: 0, coverage_gaps: []
+    };
+    await expect(sources.finishPublishedAdoption(projectId, zone, requestId, async () => receipt, budget()))
+      .resolves.toMatchObject({ status: "superseded", current_source_generation: 1 });
+    await expect(sources.readState(projectId, zone, budget())).resolves.toMatchObject({ generation: 1, adopted: false });
+    expect(await sources.verifySnapshot(projectId, zone, "source:1", budget())).toBe(false);
+  });
+
   it("treats a paginated dirty-marker tail as an incomplete snapshot", async () => {
     const { runtime, sources } = harness();
     vi.spyOn(runtime.pagedListing!, "listPage").mockResolvedValue({ entries: [], cursor: "dirty-tail" });

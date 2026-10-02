@@ -23,6 +23,7 @@ import { encodeAdmission } from "../src/admission/transport";
 import { createProductionPersistence } from "../src/persistence/production-factory";
 import { ProjectRepository } from "../src/persistence/repository";
 import { executionHash, ExecutionJournal } from "../src/execution/journal";
+import { createSliceBudget } from "../src/convergence/budget";
 import { sha256Text } from "../src/documents/hash";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
@@ -1433,21 +1434,24 @@ describe("canonical execution boundary in ProjectGuard", () => {
         : null;
     });
 
-    const response = await runInDurableObject(guard, (instance) =>
-      (instance as unknown as { finalizeCurrentMaterialization(request: Request): Promise<Response> })
-        .finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-        }))
-    );
-
-    expect(response.status).toBe(202);
-    expect(readCommit).toHaveBeenCalledWith(projectId, 9302);
-    expect(readCommit).toHaveBeenCalledWith(projectId, 9304);
-    await runInDurableObject(guard, async (_instance, state) => {
+    await runInDurableObject(guard, (instance, state) => (instance as any).serialize(async () => {
+      // Hold the DO serialization lock across finalization and its checkpoint
+      // assertion. The finalizer arms a continuation alarm even when the
+      // initial wake is disabled; a separate callback could let it consume
+      // the cursor before this test inspects it.
+      await state.storage.setAlarm(Date.now() + 60_000);
+      const response = await (instance as unknown as {
+        finalizeCurrentMaterialization(request: Request, armInitialWake?: boolean): Promise<Response>
+      }).finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+      }), false);
+      expect(response.status).toBe(202);
+      expect(readCommit).toHaveBeenCalledWith(projectId, 9302);
+      expect(readCommit).toHaveBeenCalledWith(projectId, 9304);
       const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
       expect(work?.candidates.map(({ revision }) => revision)).toEqual([9305]);
-    });
+    }));
   });
 
   it("finalizes a committed transaction from the ProjectGuard alarm without a status read", async () => {
@@ -2443,6 +2447,335 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await publish.json()).toMatchObject({ status: "conflict", code: "navigation_snapshot_changed" });
     expect([...mock.files.keys()].some((path) => path.endsWith("/navigation/WORKING/head.json"))).toBe(false);
     expect([...mock.files.keys()].some((path) => path.endsWith("/WORKING/00-CURRENT.md"))).toBe(false);
+  });
+
+  it("recognizes a physically finalized navigation after source supersession and schedules a governed refresh", async () => {
+    const projectId = "PRJ-8417";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-SUPERSEDED-PUBLICATION-8417",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+
+    const runtime = createProductionPersistence(testEnv, projectId);
+    const state = commitFixture(projectId, 1)[0]!.state;
+    const journal = new ExecutionJournal(runtime, projectId, "document", request.request_id);
+    const admitted = await journal.readAdmission();
+    expect(admitted).not.toBeNull();
+    const sources = new ZoneNavigationSources(runtime);
+    const inventory = new ZoneNavigationInventory(runtime, sources);
+    const finalized = await new ZoneNavigationEngine(runtime, inventory).publishPrepared(
+      request, state, admitted!.admission, createSliceBudget(() => Date.now(), new AbortController().signal), prepared.ref.source_snapshot_id
+    );
+    expect(finalized.status).toBe("finalized");
+
+    const ticket = await sources.beginHeadWrite(projectId, "WORKING", "package:PKG-NAV-SUPERSESSION-8417");
+    expect(ticket).not.toBeNull();
+    await sources.completeHeadWrites([ticket!]);
+
+    const response = await guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.ref)
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "committed", navigation_receipt: { request_id: request.request_id } });
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, adopted: true });
+    expect(await sources.verifySnapshot(projectId, "WORKING", "source:1")).toBe(false);
+    expect((await sources.listDirtyPage(projectId, "WORKING", null, 1)).resource_ids)
+      .toContain("package:PKG-NAV-SUPERSESSION-8417");
+    await runInDurableObject(guard, (_instance, storage) => {
+      expect(storage.storage.sql.exec("SELECT zone, source_generation FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", "WORKING", 1).toArray()).toHaveLength(1);
+    });
+    await runInDurableObject(guard, (instance) => (instance as any).resumePendingNavigationRefreshes());
+    const refreshRequestId = "DOCREQ-NAV-AUTO-WORKING-S1-R1-G1";
+    const refreshIntent = mock.files.get(`${machineDocumentRoot(projectId)}/requests/${refreshRequestId}/intent.json`);
+    expect(refreshIntent).toBeDefined();
+    expect(JSON.parse(JSON.parse(refreshIntent!).request_json)).toMatchObject({
+      request_id: refreshRequestId, expected_generation: 1, expected_project_revision: 1
+    });
+    expect(refreshRequestId).not.toBe(request.request_id);
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, adopted: true });
+    expect(await sources.verifySnapshot(projectId, "WORKING", "source:1")).toBe(false);
+    expect((await sources.listDirtyPage(projectId, "WORKING", null, 1)).resource_ids).toContain("package:PKG-NAV-SUPERSESSION-8417");
+    expect([...mock.files.keys()].some((path) => path.endsWith("/WORKING/00-CURRENT.md"))).toBe(true);
+  });
+
+  it("recovers a source mutation racing the final publication callback within the normal slice budget", async () => {
+    const projectId = "PRJ-8422";
+    const request = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAVIGATION-ADOPTION-RACE-8422",
+      project_id: projectId, zone: "WORKING" as const, expected_project_revision: 1,
+      expected_generation: 0, expected_index: null, created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+
+    const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
+    const originalPublish = ZoneNavigationEngine.prototype.publishPrepared;
+    let mutationInjected = false;
+    vi.spyOn(ZoneNavigationEngine.prototype, "publishPrepared").mockImplementation(async function (
+      this: ZoneNavigationEngine,
+      ...args: Parameters<ZoneNavigationEngine["publishPrepared"]>
+    ) {
+      const result = await originalPublish.call(this, ...args);
+      if (!mutationInjected && args[0].request_id === request.request_id && result.status === "finalized") {
+        mutationInjected = true;
+        const ticket = await sources.beginHeadWrite(projectId, "WORKING", "package:PKG-NAV-ADOPTION-RACE-8422");
+        expect(ticket).not.toBeNull();
+        await sources.completeHeadWrites([ticket!]);
+      }
+      return result;
+    });
+
+    let publish: Response | undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      publish = await guard.fetch("https://project-guard.internal/navigation-publish", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.ref)
+      });
+      if ((await publish.clone().json() as { status?: string }).status !== "pending") break;
+    }
+
+    expect(mutationInjected).toBe(true);
+    expect(publish?.status).toBe(200);
+    expect(await publish?.json()).toMatchObject({ status: "committed", navigation_receipt: { request_id: request.request_id } });
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, adopted: true });
+    expect(await sources.verifySnapshot(projectId, "WORKING", "source:1")).toBe(false);
+    expect((await sources.listDirtyPage(projectId, "WORKING", null, 1)).resource_ids)
+      .toContain("package:PKG-NAV-ADOPTION-RACE-8422");
+    await runInDurableObject(guard, (_instance, storage) => {
+      expect(storage.storage.sql.exec("SELECT zone, source_generation FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", "WORKING", 1).toArray()).toHaveLength(1);
+    });
+    expect([...mock.files.keys()].some((path) => path.endsWith("/WORKING/00-CURRENT.md"))).toBe(true);
+  });
+
+  it("retains an unadopted refresh row when the canonical head cannot bind a governed successor", async () => {
+    const projectId = "PRJ-8418";
+    const { guard } = await setup(projectId);
+    await runInDurableObject(guard, (_instance, storage) => {
+      storage.storage.sql.exec(
+        "INSERT INTO navigation_refresh_outbox (zone, source_generation, request_json) VALUES (?, ?, NULL)",
+        "WORKING", 1
+      );
+    });
+
+    await runInDurableObject(guard, (instance) => (instance as any).resumePendingNavigationRefreshes());
+
+    await runInDurableObject(guard, async (_instance, storage) => {
+      expect(storage.storage.sql.exec(
+        "SELECT zone, source_generation FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?",
+        "WORKING", 1
+      ).toArray()).toHaveLength(1);
+      expect(await storage.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("starts a fresh governed navigation when an unadopted source has a known head but no dirty entries", async () => {
+    const projectId = "PRJ-8421";
+    const request = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAVIGATION-EMPTY-DIRTY-8421",
+      project_id: projectId, zone: "WORKING" as const, expected_project_revision: 1,
+      expected_generation: 0, expected_index: null, created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+
+    const runtime = createProductionPersistence(testEnv, projectId);
+    const sources = new ZoneNavigationSources(runtime);
+    const journal = new ExecutionJournal(runtime, projectId, "document", request.request_id);
+    const admitted = await journal.readAdmission();
+    expect(admitted).not.toBeNull();
+    const finalized = await new ZoneNavigationEngine(runtime, new ZoneNavigationInventory(runtime, sources)).publishPrepared(
+      request, commitFixture(projectId, 1)[0]!.state, admitted!.admission,
+      createSliceBudget(() => Date.now(), new AbortController().signal), prepared.ref.source_snapshot_id
+    );
+    expect(finalized.status).toBe("finalized");
+    expect(await sources.finishAdoption(projectId, "WORKING", request.request_id, 0)).toBe(true);
+
+    const sourceStatePath = `${machineDocumentRoot(projectId)}/navigation-sources/state.json`;
+    const persisted = JSON.parse(mock.files.get(sourceStatePath)!);
+    persisted.zones.WORKING = {
+      ...persisted.zones.WORKING, generation: 1, adopted: false,
+      adoption_request_id: null, adoption_generation: null, in_flight_writes: []
+    };
+    mock.files.set(sourceStatePath, JSON.stringify(persisted));
+    await runInDurableObject(guard, (_instance, storage) => {
+      storage.storage.sql.exec(
+        "INSERT INTO navigation_refresh_outbox (zone, source_generation, request_json) VALUES (?, ?, NULL)",
+        "WORKING", 1
+      );
+    });
+
+    await runInDurableObject(guard, (instance) => (instance as any).resumePendingNavigationRefreshes());
+
+    const refreshRequestId = "DOCREQ-NAV-AUTO-WORKING-S1-R1-G1";
+    const refreshIntent = mock.files.get(`${machineDocumentRoot(projectId)}/requests/${refreshRequestId}/intent.json`);
+    expect(refreshIntent).toBeDefined();
+    expect(JSON.parse(JSON.parse(refreshIntent!).request_json)).toMatchObject({
+      request_id: refreshRequestId, expected_generation: 1, expected_project_revision: 1
+    });
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ generation: 1, adopted: false });
+    expect((await sources.listDirtyPage(projectId, "WORKING", null, 1)).resource_ids).toEqual([]);
+  });
+
+  it("keeps a source-mismatched navigation pending when publication proof is unavailable", async () => {
+    const projectId = "PRJ-8419";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-UNKNOWN-PUBLICATION-8419",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+
+    await runInDurableObject(guard, (instance) => (instance as any).serialize(() =>
+      (instance as any).recordObservedNavigationSourceMutation(projectId, "WORKING", "package:PKG-NAV-UNKNOWN-8419")
+    ));
+    vi.spyOn(ZoneNavigationEngine.prototype, "readVerifiedPublication").mockRejectedValue(new Error("slice_budget_exhausted"));
+
+    const response = await guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.ref)
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ status: "pending", code: "NAVIGATION_PUBLICATION_VERIFICATION_PENDING" });
+    expect([...mock.files.keys()].some((path) => path.endsWith(`/requests/${request.request_id}/receipt.json`))).toBe(false);
+  });
+
+  it("preserves a terminal navigation conflict while allowing a later governed refresh past its invalidated owner", async () => {
+    const projectId = "PRJ-8420";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAVIGATION-HISTORICAL-PUBLICATION-8420",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+
+    const terminalConflict = {
+      operation: request.operation, request_id: request.request_id, project_id: projectId,
+      status: "conflict" as const, execution_status: "conflict" as const, code: "navigation_snapshot_changed"
+    };
+    await runInDurableObject(guard, (instance) => (instance as any).serialize(() =>
+      (instance as any).settleNavigationReceipt(request, terminalConflict)
+    ));
+    const receiptPath = `${machineDocumentRoot(projectId)}/requests/${request.request_id}/receipt.json`;
+    const historicalReceipt = mock.files.get(receiptPath);
+
+    const runtime = createProductionPersistence(testEnv, projectId);
+    const sources = new ZoneNavigationSources(runtime);
+    const journal = new ExecutionJournal(runtime, projectId, "document", request.request_id);
+    const admitted = await journal.readAdmission();
+    expect(admitted).not.toBeNull();
+    const finalized = await new ZoneNavigationEngine(runtime, new ZoneNavigationInventory(runtime, sources)).publishPrepared(
+      request, commitFixture(projectId, 1)[0]!.state, admitted!.admission,
+      createSliceBudget(() => Date.now(), new AbortController().signal), prepared.ref.source_snapshot_id
+    );
+    expect(finalized.status).toBe("finalized");
+    vi.spyOn(ZoneNavigationSources.prototype, "finishAdoption").mockResolvedValue(false);
+    const originalReadVerified = ZoneNavigationEngine.prototype.readVerifiedPublication;
+    vi.spyOn(ZoneNavigationEngine.prototype, "readVerifiedPublication").mockImplementation(async function (
+      this: ZoneNavigationEngine, ...args
+    ) {
+      const verified = await originalReadVerified.apply(this, args);
+      if (verified) {
+        const ticket = await sources.beginHeadWrite(projectId, "WORKING", "package:PKG-NAV-HISTORICAL-8420");
+        expect(ticket).not.toBeNull();
+        await sources.completeHeadWrites([ticket!]);
+      }
+      return verified;
+    });
+
+    const replay = await guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(prepared.ref)
+    });
+    expect(replay.status).toBe(409);
+    expect(await replay.json()).toMatchObject({ status: "conflict", code: "navigation_snapshot_changed" });
+    expect(mock.files.get(receiptPath)).toBe(historicalReceipt);
+
+    await runInDurableObject(guard, (instance) => (instance as any).resumePendingNavigationRefreshes());
+    await runInDurableObject(guard, (instance) => (instance as any).resumePendingNavigationRefreshes());
+    const successorId = "DOCREQ-NAV-AUTO-WORKING-S1-R1-G1";
+    expect(mock.files.has(`${machineDocumentRoot(projectId)}/requests/${successorId}/intent.json`)).toBe(true);
+    expect(mock.files.get(receiptPath)).toBe(historicalReceipt);
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({
+      generation: 1, adopted: false, adoption_request_id: request.request_id
+    });
   });
 
   it("keeps PG recovery when the navigation acknowledgement names another request", async () => {

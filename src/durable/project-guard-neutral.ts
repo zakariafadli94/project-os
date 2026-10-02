@@ -1711,9 +1711,23 @@ export class ProjectGuard extends DurableObject<Env> {
     const sources = new ZoneNavigationSources(this.persistence);
     const sourceState = await sources.readState(nav.project_id, nav.zone, budget);
     const sourceGeneration = Number(ref.source_snapshot_id.slice("source:".length));
-    if (`source:${sourceState.generation}` !== ref.source_snapshot_id
+    const sourceSnapshotChanged = `source:${sourceState.generation}` !== ref.source_snapshot_id;
+    const inventory = new ZoneNavigationInventory(this.persistence, sources);
+    if (sourceSnapshotChanged
       || (nav.purpose === "compact_catalog_rebuild" && sourceState.generation !== nav.expected_source_generation)
       || (nav.purpose !== "compact_catalog_rebuild" && !sourceState.adopted && sourceState.adoption_request_id !== nav.request_id)) {
+      if (sourceSnapshotChanged && nav.purpose !== "compact_catalog_rebuild") {
+        const engine = new ZoneNavigationEngine(this.persistence, inventory, undefined, postcheckRules);
+        let published: ZoneNavigationReceipt | null;
+        try {
+          published = await engine.readVerifiedPublication(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
+        } catch {
+          await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+          return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id,
+            status: "pending", code: "NAVIGATION_PUBLICATION_VERIFICATION_PENDING" }, { status: 503 });
+        }
+        if (published) return this.completeVerifiedNavigationPublication(nav, intent.request_sha256, published, sources, sourceState, budget);
+      }
       if (!sourceState.adopted && sourceState.generation === sourceGeneration
         && sourceState.adoption_request_id === nav.request_id) {
         await sources.abortAdoption(nav.project_id, nav.zone, nav.request_id, sourceGeneration, budget);
@@ -1721,7 +1735,6 @@ export class ProjectGuard extends DurableObject<Env> {
       const receipt = await this.settleNavigationReceipt(nav, { operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", execution_status: "conflict", code: "navigation_snapshot_changed" });
       return Response.json(receipt, { status: 409 });
     }
-    const inventory = new ZoneNavigationInventory(this.persistence, sources);
     if (nav.purpose === "compact_catalog_rebuild") {
       const result = await new ZoneNavigationEngine(this.persistence, inventory)
         .publishPreparedCompactCatalogRebuild(nav as NavigationCatalogRebuildRequest, frozenState, admitted.admission, ref.source_snapshot_id, budget);
@@ -1746,7 +1759,8 @@ export class ProjectGuard extends DurableObject<Env> {
         catalog_rebuild_certificate_ref: certificateRef });
       return Response.json(await this.currentNavigationReceipt(nav, receipt));
     }
-    const result = await new ZoneNavigationEngine(this.persistence, inventory, undefined, postcheckRules).publishPrepared(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
+    const engine = new ZoneNavigationEngine(this.persistence, inventory, undefined, postcheckRules);
+    const result = await engine.publishPrepared(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
     if (result.status === "pending") {
       await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
       return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "pending", code: "NAVIGATION_PUBLICATION_PENDING", cursor: result.cursor }, { status: 503 });
@@ -1764,7 +1778,27 @@ export class ProjectGuard extends DurableObject<Env> {
       return Response.json(receipt, { status: 409 });
     }
     if (!sourceState.adopted) {
-      if (budget.calls_left < 5 || !await sources.finishAdoption(nav.project_id, nav.zone, nav.request_id, sourceState.generation, budget)) {
+      let adopted = false;
+      try {
+        adopted = budget.calls_left >= 5
+          && await sources.finishAdoption(nav.project_id, nav.zone, nav.request_id, sourceState.generation, budget);
+      } catch {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+        return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id,
+          status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
+      }
+      if (!adopted) {
+        if (result.status === "finalized") {
+          let published: ZoneNavigationReceipt | null;
+          try {
+            published = await engine.readVerifiedPublication(nav, frozenState, admitted.admission, budget, ref.source_snapshot_id);
+          } catch {
+            await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+            return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id,
+              status: "pending", code: "NAVIGATION_PUBLICATION_VERIFICATION_PENDING" }, { status: 503 });
+          }
+          if (published) return this.completeVerifiedNavigationPublication(nav, intent.request_sha256, published, sources, sourceState, budget);
+        }
         await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
         return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
       }
@@ -1774,6 +1808,69 @@ export class ProjectGuard extends DurableObject<Env> {
       status: "committed", execution_status: "pending", navigation_receipt: result.receipt
     });
     return Response.json(await this.currentNavigationReceipt(nav, receipt));
+  }
+
+  private async completeVerifiedNavigationPublication(
+    request: NavigationReconcileRequest,
+    intentHash: string,
+    published: ZoneNavigationReceipt,
+    sources: ZoneNavigationSources,
+    observedSource: Awaited<ReturnType<ZoneNavigationSources["readState"]>>,
+    budget: ReturnType<typeof createSliceBudget>
+  ): Promise<Response> {
+    const publishedSourceGeneration = Number(published.source_snapshot_id.slice("source:".length));
+    const prior = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
+    if (prior) {
+      if (prior.request_sha256 !== intentHash) {
+        return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+          status: "conflict", code: "navigation_receipt_binding_mismatch" }, { status: 409 });
+      }
+      const receipt = JSON.parse(prior.receipt_json) as NavigationDocumentReceipt;
+      if (receipt.status === "conflict") {
+        // The source can advance after observedSource was read but during the
+        // awaited publication proof. A refresh wake is harmless when this
+        // snapshot is still current (the outbox rechecks canonical state), and
+        // closes that race without changing the historical receipt.
+        await this.armNavigationRefreshOutbox(request.zone, observedSource.generation);
+        return Response.json(receipt, { status: 409 });
+      }
+    }
+
+    // Write the durable refresh wake before releasing a superseded owner. If
+    // the following provider write is interrupted, the outbox observes the
+    // still-owned state and retries; it never promotes this old request.
+    if (observedSource.generation > publishedSourceGeneration || !observedSource.adopted) {
+      await this.armNavigationRefreshOutbox(request.zone, observedSource.generation);
+    }
+    let adoption: Awaited<ReturnType<ZoneNavigationSources["finishPublishedAdoption"]>>;
+    try {
+      adoption = await sources.finishPublishedAdoption(request.project_id, request.zone, request.request_id,
+        () => Promise.resolve(published), budget);
+    } catch {
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+        status: "pending", code: "NAVIGATION_ADOPTION_PENDING" }, { status: 503 });
+    }
+    if (adoption.status === "unchanged" && adoption.reason === "unverified_publication") {
+      await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+        status: "pending", code: "NAVIGATION_PUBLICATION_VERIFICATION_PENDING" }, { status: 503 });
+    }
+    if (adoption.status === "superseded") {
+      await this.armNavigationRefreshOutbox(request.zone, adoption.current_source_generation);
+    } else if (adoption.status === "unchanged") {
+      await this.armNavigationRefreshOutbox(request.zone, observedSource.generation);
+    }
+
+    if (prior) {
+      const receipt = JSON.parse(prior.receipt_json) as NavigationDocumentReceipt;
+      return Response.json(await this.currentNavigationReceipt(request, receipt));
+    }
+    const receipt = await this.settleNavigationReceipt(request, {
+      operation: request.operation, request_id: request.request_id, project_id: request.project_id,
+      status: "committed", execution_status: "pending", navigation_receipt: published
+    });
+    return Response.json(await this.currentNavigationReceipt(request, receipt));
   }
 
   private async handleNavigationWorkFailure(report: ReturnType<typeof navigationWorkFailureSchema.parse>): Promise<Response> {
@@ -2419,19 +2516,25 @@ export class ProjectGuard extends DurableObject<Env> {
       try {
         const sources = new ZoneNavigationSources(this.persistence);
         const source = await sources.readState(projectId, zone);
-        if (!source.adopted) {
-          this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);
-          continue;
-        }
-        if (source.in_flight_resource_ids.length) {
+        const invalidatedAdoptionOwner = source.adoption_request_id !== null
+          && source.adoption_generation !== null && source.generation > source.adoption_generation;
+        if ((!source.adopted && source.adoption_request_id !== null && !invalidatedAdoptionOwner)
+          || source.in_flight_resource_ids.length) {
           await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
           continue;
         }
         const dirty = await sources.listDirtyPage(projectId, zone, null, 1);
-        if (!dirty.resource_ids.length) {
+        if (source.adopted && !dirty.resource_ids.length) {
+          if (dirty.next_cursor !== null) {
+            await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+            continue;
+          }
           this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_outbox WHERE zone = ? AND source_generation = ?", zone, row.source_generation);
           continue;
         }
+        // Unadopted sources need a new governed reconcile even when this one
+        // dirty page is empty. The new admission performs full bounded
+        // inventory/physical verification; absence here is not a clean claim.
         let request: NavigationReconcileRequest | null = row.request_json
           ? navigationReconcileSchema.parse(JSON.parse(row.request_json))
           : null;

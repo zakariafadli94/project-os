@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { navigationCatalogManifestIdentitySchema, navigationInventoryEntrySchema, type NavigationCatalogManifestIdentity, type NavigationInventoryEntry, type NavigationZone } from "../domain/zone-navigation";
+import { navigationCatalogManifestIdentitySchema, navigationInventoryEntrySchema, zoneNavigationReceiptSchema, type NavigationCatalogManifestIdentity, type NavigationInventoryEntry, type NavigationZone, type ZoneNavigationReceipt } from "../domain/zone-navigation";
 import type { SliceBudget } from "../convergence/contract";
 import { machineDocumentHeadPath, machineDocumentRoot } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
@@ -80,6 +80,11 @@ export interface ZoneNavigationHeadWriteTicket {
   write_hash: string | null;
   owner_hash?: string;
 }
+
+export type PublishedAdoptionResult =
+  | { status: "adopted"; source_generation: number }
+  | { status: "superseded"; published_source_generation: number; current_source_generation: number; refresh_required: true }
+  | { status: "unchanged"; reason: "unverified_publication" | "owner_changed" | "source_changed" };
 
 export type CompactCatalogManifestIdentity = NavigationCatalogManifestIdentity;
 
@@ -182,6 +187,75 @@ export class ZoneNavigationSources {
     state.zones[zone] = current;
     await this.writeProjectState(projectId, state, budget);
     return true;
+  }
+
+  /**
+   * Finish an adoption only when an exact committed publication proves it.
+   * A newer source generation is not implied by the older publication: release
+   * only that publication's stale reservation and leave its newer dirty/flying
+   * work for the caller's existing refresh path. A verified compact catalog
+   * may remain adopted as baseline availability; current-generation validity
+   * is still independently fenced by generation, dirty markers, and in-flight writes.
+   */
+  async finishPublishedAdoption(
+    projectId: string,
+    zone: NavigationZone,
+    requestId: string,
+    readVerifiedPublication: () => Promise<ZoneNavigationReceipt | null>,
+    budget?: SliceBudget
+  ): Promise<PublishedAdoptionResult> {
+    // The callback must be the engine's readVerifiedPublication (or its exact
+    // memoized result), never a receipt supplied directly by an untrusted caller.
+    const rawReceipt = await readVerifiedPublication();
+    if (!rawReceipt) return { status: "unchanged", reason: "unverified_publication" };
+    const parsed = zoneNavigationReceiptSchema.safeParse(rawReceipt);
+    if (!parsed.success) return { status: "unchanged", reason: "unverified_publication" };
+    const receipt = parsed.data;
+    const sourceSnapshotMatch = /^source:(0|[1-9][0-9]*)$/.exec(receipt.source_snapshot_id);
+    if (receipt.project_id !== projectId || receipt.zone !== zone || receipt.request_id !== requestId
+      || receipt.status !== "committed" || !sourceSnapshotMatch) {
+      return { status: "unchanged", reason: "unverified_publication" };
+    }
+    const sourceGeneration = Number(sourceSnapshotMatch[1]);
+    if (!Number.isSafeInteger(sourceGeneration) || sourceGeneration < 0) {
+      return { status: "unchanged", reason: "unverified_publication" };
+    }
+    if (budget && !budget.canStartEffect(5)) throw new Error("slice_budget_exhausted");
+
+    const state = await this.readProjectState(projectId, budget);
+    const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
+    if (current.adopted) {
+      return current.generation === sourceGeneration
+        ? { status: "adopted", source_generation: sourceGeneration }
+        : { status: "unchanged", reason: "owner_changed" };
+    }
+    if (current.adoption_request_id !== requestId || current.adoption_generation !== sourceGeneration) {
+      return { status: "unchanged", reason: "owner_changed" };
+    }
+    if (current.generation > sourceGeneration) {
+      // Keep an already completed baseline available to incremental resolvers,
+      // but never infer that the newer source generation is current from this
+      // older publication. Missing/unavailable/stale manifests conservatively
+      // retain the full-inventory fallback.
+      if (current.catalog_rebuild_request_id === null && budget?.canStartEffect(6) !== false
+        && await this.hasExactReadyBaseline(projectId, zone, sourceGeneration, budget)) {
+        current.adopted = true;
+      }
+      current.adoption_request_id = null;
+      current.adoption_generation = null;
+      state.zones[zone] = current;
+      await this.writeProjectState(projectId, state, budget);
+      return { status: "superseded", published_source_generation: sourceGeneration, current_source_generation: current.generation, refresh_required: true };
+    }
+    if (current.generation !== sourceGeneration || current.in_flight_writes.length) return { status: "unchanged", reason: "source_changed" };
+    const dirty = await this.listDirtyPage(projectId, zone, null, 1, budget);
+    if (dirty.resource_ids.length || dirty.next_cursor !== null) return { status: "unchanged", reason: "source_changed" };
+    current.adopted = true;
+    current.adoption_request_id = null;
+    current.adoption_generation = null;
+    state.zones[zone] = current;
+    await this.writeProjectState(projectId, state, budget);
+    return { status: "adopted", source_generation: sourceGeneration };
   }
 
   async abortAdoption(projectId: string, zone: NavigationZone, requestId: string, generation: number, budget?: SliceBudget): Promise<boolean> {
@@ -1155,6 +1229,32 @@ export class ZoneNavigationSources {
     const ready = compactReadySchema.parse(JSON.parse(raw));
     if (ready.project_id !== projectId || ready.zone !== zone) throw new Error("navigation_compact_catalog_binding");
     return ready;
+  }
+
+  private async hasExactReadyBaseline(projectId: string, zone: NavigationZone, sourceGeneration: number, budget?: SliceBudget): Promise<boolean> {
+    const path = compactReadyPath(projectId, zone);
+    const readBytes = this.runtime.objects.readBytes;
+    if (!readBytes) return false;
+    try {
+      charge(budget);
+      const before = await this.runtime.objects.getMetadata(path);
+      if (!before?.objectId || !before.revisionToken || !Number.isSafeInteger(before.size)
+        || before.size < 0 || before.size > MAX_COMPACT_CHUNK_BYTES) return false;
+      charge(budget);
+      const bytes = await readBytes.call(this.runtime.objects, path, MAX_COMPACT_CHUNK_BYTES);
+      if (!bytes || bytes.byteLength !== before.size) return false;
+      charge(budget);
+      const after = await this.runtime.objects.getMetadata(path);
+      if (!after || before.objectId !== after.objectId || before.revisionToken !== after.revisionToken
+        || before.size !== after.size) return false;
+      const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      const manifest = compactReadySchema.parse(JSON.parse(raw));
+      return manifest.project_id === projectId && manifest.zone === zone
+        && manifest.ready_generation === sourceGeneration
+        && !manifest.rebuilding_request_id && !manifest.rebuild_repair_required;
+    } catch {
+      return false;
+    }
   }
 
   private async writeCatalogReadyGeneration(projectId: string, zone: NavigationZone, generation: number | null, budget?: SliceBudget, completedGenerations?: z.infer<typeof generationRangeSchema>[], coalescedDirty?: z.infer<typeof coalescedDirtySchema>[]): Promise<boolean> {

@@ -843,6 +843,27 @@ describe("ZoneNavigationInventory", () => {
     expect(found).toEqual([`head:${activeId}`]);
   });
 
+  it("does not exhaust a resumed slice by reading five irrelevant heads after an active first head", async () => {
+    const h = harness();
+    const ids = Array.from({ length: 6 }, (_, index) => `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`);
+    await addWorkingHead(h, "active body", "rev-active", ids[0], `VER-REQ-${ids[0].slice(4)}`, "active.md");
+    for (const id of ids.slice(1)) h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: id,
+      kind: "work_product", logical_path: `${id}.md`, reconciliation_status: "clean"
+    }));
+    const cursor = `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: ids.map((id) => ({ kind: "file", name: `${id}.json`, path: machineDocumentHeadPath(projectId, id) })),
+      provider_cursor: null,
+      listing_limit: 512
+    }))}`;
+
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 8, budget: budget(20) });
+
+    expect(page.entries.map((entry) => entry.resource_id)).toContain(`head:${ids[0]}`);
+    expect(page.next_cursor).not.toBe(cursor);
+  });
+
   it("checks the inactive prefix together even when the next head is active", async () => {
     const h = harness();
     const activeId = "DOC-000000000000000000000005";

@@ -265,14 +265,15 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
           continue;
         }
       }
-      // The active-head pair keeps its original reservation. Only when that
-      // preflight found no eligible pair may we batch clean, irrelevant heads:
-      // its first two head reads are already cached, while the next four can
-      // overlap. No listing cursor advances until every catalog row is absent.
-      if (persistCatalog && offset + 6 <= listedEntries.length && budget.canStartEffect(13)
-        && await this.inactiveInitialBatch(projectId, zone, listedEntries.slice(offset, offset + 6), budget, headCache)) {
-        offset += 6;
-        continue;
+      // The active-head pair keeps its original reservation. Batch only the
+      // proven inactive prefix; an active/stale/error entry stays at the next
+      // cursor, rather than serializing every irrelevant head before it.
+      if (persistCatalog && offset + 6 <= listedEntries.length && budget.canStartEffect(13)) {
+        const inactiveCount = await this.inactiveInitialBatch(projectId, zone, listedEntries.slice(offset, offset + 6), budget, headCache);
+        if (inactiveCount > 0) {
+          offset += inactiveCount;
+          continue;
+        }
       }
       if (item.kind !== "file" || !item.path) {
         if (!persistCatalog) gaps.push({ resource_id: item.name || "head-listing-entry", code: "head_listing_entry_invalid" });
@@ -341,9 +342,9 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
   private async inactiveInitialBatch(
     projectId: string, zone: NavigationZone, items: ProviderEntry[], budget: SliceBudget,
     headCache: Map<string, InitialHeadReadCache>
-  ): Promise<boolean> {
+  ): Promise<number> {
     const ids = items.map((item) => /^(DOC-[A-F0-9]{24})\.json$/.exec(item.name)?.[1]);
-    if (ids.some((id, index) => !id || items[index].kind !== "file" || items[index].path !== machineDocumentHeadPath(projectId, id))) return false;
+    if (ids.some((id, index) => !id || items[index].kind !== "file" || items[index].path !== machineDocumentHeadPath(projectId, id))) return 0;
     const heads = await Promise.allSettled(ids.map(async (id) => {
       const cached = headCache.get(id!);
       if (cached && "head" in cached) return cached.head!;
@@ -352,17 +353,26 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       headCache.set(id!, { head: raw });
       return raw;
     }));
-    if (heads.some((result) => result.status !== "fulfilled" || result.value === null)) return false;
-    try {
-      if (heads.some((result, index) => {
-        const head = readManagedDocumentHead(JSON.parse((result as PromiseFulfilledResult<string>).value)).head;
+    let inactiveCount = 0;
+    for (let index = 0; index < heads.length; index += 1) {
+      const result = heads[index];
+      if (result.status !== "fulfilled" || result.value === null) break;
+      try {
+        const head = readManagedDocumentHead(JSON.parse(result.value)).head;
         const pointer = activePointer(head, zone);
-        return head.project_id !== projectId || head.document_id !== ids[index] || head.reconciliation_status !== "clean"
-          || pointer.versionId != null || pointer.observation != null;
-      })) return false;
-    } catch { return false; }
-    const catalog = await Promise.allSettled(ids.map((id) => this.sources.readCatalogEntry(projectId, zone, `head:${id}`, budget)));
-    return catalog.every((result) => result.status === "fulfilled" && result.value === null);
+        if (head.project_id !== projectId || head.document_id !== ids[index] || head.reconciliation_status !== "clean"
+          || pointer.versionId != null || pointer.observation != null) break;
+      } catch { break; }
+      inactiveCount += 1;
+    }
+    if (inactiveCount === 0) return 0;
+    const catalog = await Promise.allSettled(ids.slice(0, inactiveCount).map((id) => this.sources.readCatalogEntry(projectId, zone, `head:${id}`, budget)));
+    let absentCount = 0;
+    for (const result of catalog) {
+      if (result.status !== "fulfilled" || result.value !== null) break;
+      absentCount += 1;
+    }
+    return absentCount;
   }
 
   private async ordinaryInitialPair(

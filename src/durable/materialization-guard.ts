@@ -210,11 +210,13 @@ export class MaterializationGuard extends DurableObject<Env> {
         navigation = await this.serialize(() => this.runNavigationWorkSlice());
         this.selectedNavigationWorkRef = undefined;
       } catch (error) {
-        if (error instanceof ProviderOperationError || (error instanceof Error && error.message.includes("slice_budget_exhausted"))) throw error;
+        if (error instanceof Error && error.message.includes("slice_budget_exhausted")) throw error;
         const ref = this.selectedNavigationWorkRef as NavigationWorkRef | undefined;
         this.selectedNavigationWorkRef = undefined;
         if (!ref) throw error;
-        await this.reportNavigationWorkFailure(ref, "navigation_work_internal_failure");
+        await this.reportNavigationWorkFailure(ref, error instanceof ProviderOperationError
+          ? error.retryable ? "navigation_provider_temporary" : "navigation_provider_blocked"
+          : "navigation_work_internal_failure");
       }
       if (navigation) {
         if (navigation.failure_code) {

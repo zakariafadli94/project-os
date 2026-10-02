@@ -2611,6 +2611,43 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(await replay.json()).toMatchObject({ status: "pending", code: "identical_internal_failure_limit" });
   });
 
+  it("backs off transient navigation provider failures and releases an adoption on a terminal provider failure", async () => {
+    const projectId = "PRJ-8345";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAV-PROVIDER-8345",
+      project_id: projectId,
+      zone: "WORKING" as const,
+      expected_project_revision: 1,
+      expected_generation: 0,
+      expected_index: null,
+      created_at: "2026-09-25T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    seedUnadoptedNavigationGeneration(mock, projectId, 1);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const sources = new ZoneNavigationSources(createProductionPersistence(testEnv, projectId));
+    expect(await sources.beginAdoption(projectId, "WORKING", request.request_id, 1)).toBe(true);
+    const work = await runInDurableObject(testEnv.MATERIALIZATION_GUARD.getByName(projectId), (_instance, state) =>
+      state.storage.list<string>({ prefix: "navigation-work" })
+    );
+    const ref = JSON.parse([...work.values()][0]!) as Record<string, unknown>;
+    const temporary = await guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...ref, failure_code: "navigation_provider_temporary" })
+    });
+    expect(await temporary.json()).toMatchObject({ status: "retry", failure_code: "navigation_provider_temporary" });
+    const terminal = await guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...ref, failure_code: "navigation_provider_blocked" })
+    });
+    expect(await terminal.json()).toMatchObject({ status: "stopped", failure_code: "navigation_provider_blocked" });
+    expect(await sources.readState(projectId, "WORKING")).toMatchObject({ adoption_request_id: null });
+  });
+
   it("releases the ProjectGuard queue between recovery jobs so an enqueued request runs before the next job", async () => {
     const { guard } = await setup("PRJ-8343");
     await runInDurableObject(guard, async (instance) => {

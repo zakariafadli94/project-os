@@ -1715,7 +1715,13 @@ export class ProjectGuard extends DurableObject<Env> {
       }));
     }
     const progress = await this.recoveryProgressFingerprint("document", ref.request_id);
-    const failure = await this.recordRecoveryFailure("document", ref.request_id, new Error(report.failure_code), progress);
+    const providerFailure = report.failure_code === "navigation_provider_temporary" || report.failure_code === "navigation_provider_blocked";
+    const error = providerFailure
+      ? new ProviderOperationError(report.failure_code, report.failure_code === "navigation_provider_temporary", {
+          providerId: "navigation", code: report.failure_code
+        })
+      : new Error(report.failure_code);
+    const failure = await this.recordRecoveryFailure("document", ref.request_id, error, progress);
     const sourceGeneration = Number(ref.source_snapshot_id.slice("source:".length));
     if (failure.stopped && !source.adopted && source.generation === sourceGeneration
       && source.adoption_request_id === ref.request_id) {

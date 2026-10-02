@@ -100,6 +100,17 @@ interface NavigationRefreshRow {
   request_json: string | null;
 }
 
+interface NavigationWorkerDiagnostic {
+  schema_version: "1.0";
+  project_id: string;
+  request_id: string;
+  selected_at: string;
+  stage: "selected" | "context" | "source" | "inventory" | "publication";
+  outcome: "running" | "pending" | "prepared" | "settled" | "failed" | "slice_exhausted";
+  elapsed_ms: number;
+  failure_code: string | null;
+}
+
 interface DocumentRequestRow {
   [key: string]: SqlStorageValue;
   request_json: string;
@@ -537,12 +548,18 @@ export class ProjectGuard extends DurableObject<Env> {
       const correlationId = this.observationCorrelationId(request, url);
       if (this.queueDepth > 0) {
         const observed = await this.readStoredOrRefreshRequestObservation(url, projectId, kind as RequestKind, requestId, correlationId);
-        if (observed) return this.withLocalRecoveryDiagnostic(observed, projectId, kind as RequestKind, requestId);
+        if (observed) return this.withNavigationWorkerDiagnostic(
+          await this.withLocalRecoveryDiagnostic(observed, projectId, kind as RequestKind, requestId),
+          projectId, kind as RequestKind, requestId
+        );
         const busyResponse = await this.readFinalizedRequestStatusWhileBusy(url, projectId, kind, requestId, correlationId)
           .catch(() => this.unknownObservationResponse(projectId, kind, requestId, correlationId, "PROJECT_OS_READ_BUSY"));
-        return this.withLocalRecoveryDiagnostic(busyResponse, projectId, kind as RequestKind, requestId);
+        return this.withNavigationWorkerDiagnostic(
+          await this.withLocalRecoveryDiagnostic(busyResponse, projectId, kind as RequestKind, requestId),
+          projectId, kind as RequestKind, requestId
+        );
       }
-      return this.readWhenIdle(async () => {
+      const idleResponse = await this.readWhenIdle(async () => {
         const status = await this.readBoundedRequestStatus(url, correlationId);
         if (status.ok && this.hasPendingRequestIdentity(kind as RequestKind, requestId)
           && this.isVerifiedNotReceivedStatus(
@@ -553,6 +570,7 @@ export class ProjectGuard extends DurableObject<Env> {
           );
         return this.withLocalRecoveryDiagnostic(status, projectId, kind as RequestKind, requestId);
       });
+      return this.withNavigationWorkerDiagnostic(idleResponse, projectId, kind as RequestKind, requestId);
     }
 
     if (request.method === "POST" && pathname === "/finalize-materialization") {
@@ -5350,42 +5368,118 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   private async readNavigationWorkerDiagnostic(projectId: string, requestId: string): Promise<{
-    queued: boolean; stopped: boolean; next_attempt_at: string | null
+    queued: boolean; stopped: boolean; next_attempt_at: string | null; diagnostic?: NavigationWorkerDiagnostic | null
   } | null> {
+    const maxResponseBytes = 4_096;
     try {
       const controller = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      let response: Response | null;
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      const readStatus = async (): Promise<{
+        queued: boolean; stopped: boolean; next_attempt_at: string | null; diagnostic?: NavigationWorkerDiagnostic | null
+      } | null> => {
+        const response = await this.env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
+          `https://materialization-guard.internal/navigation-work-status?request_id=${encodeURIComponent(requestId)}`,
+          { signal: controller.signal }
+        );
+        if (!response.ok || !response.body) return null;
+        const declaredLength = Number(response.headers.get("content-length"));
+        if (Number.isFinite(declaredLength) && declaredLength > maxResponseBytes) {
+          void response.body.cancel().catch(() => undefined);
+          return null;
+        }
+        reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let totalBytes = 0;
+        while (true) {
+          const part = await reader.read();
+          if (part.done) {
+            reader.releaseLock();
+            reader = undefined;
+            break;
+          }
+          if (part.value.byteLength > maxResponseBytes - totalBytes) {
+            void reader.cancel().catch(() => undefined);
+            reader = undefined;
+            return null;
+          }
+          chunks.push(part.value);
+          totalBytes += part.value.byteLength;
+        }
+        const bytes = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        const worker = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
+        if (worker.project_id !== projectId || worker.request_id !== requestId
+          || typeof worker.queued !== "boolean" || typeof worker.stopped !== "boolean"
+          || (worker.next_attempt_at !== null && typeof worker.next_attempt_at !== "string")) return null;
+        const diagnostic = this.parseNavigationWorkerDiagnostic(worker.diagnostic, projectId, requestId);
+        return {
+          queued: worker.queued,
+          stopped: worker.stopped,
+          next_attempt_at: worker.next_attempt_at as string | null,
+          ...(worker.diagnostic === undefined ? {} : { diagnostic })
+        };
+      };
       try {
-        response = await Promise.race([
-          this.env.MATERIALIZATION_GUARD.getByName(projectId).fetch(
-            `https://materialization-guard.internal/navigation-work-status?request_id=${encodeURIComponent(requestId)}`,
-            { signal: controller.signal }
-          ),
+        return await Promise.race([
+          readStatus(),
           new Promise<null>((resolve) => {
-            timeout = setTimeout(() => { controller.abort(); resolve(null); }, 250);
+            timeout = setTimeout(() => {
+              controller.abort();
+              if (reader) void reader.cancel().catch(() => undefined);
+              resolve(null);
+            }, 250);
           })
         ]);
+      } catch {
+        return null;
       } finally {
         if (timeout !== undefined) clearTimeout(timeout);
       }
-      if (!response?.ok) return null;
-      const worker = await response.json<Record<string, unknown>>();
-      if (worker.project_id !== projectId || worker.request_id !== requestId
-        || typeof worker.queued !== "boolean" || typeof worker.stopped !== "boolean"
-        || (worker.next_attempt_at !== null && typeof worker.next_attempt_at !== "string")) return null;
-      return {
-        queued: worker.queued,
-        stopped: worker.stopped,
-        next_attempt_at: worker.next_attempt_at as string | null
-      };
     } catch {
       return null;
     }
   }
 
+  private parseNavigationWorkerDiagnostic(raw: unknown, projectId: string, requestId: string): NavigationWorkerDiagnostic | null {
+    if (raw === null) return null;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+    const value = raw as Record<string, unknown>;
+    const stages = ["selected", "context", "source", "inventory", "publication"];
+    const outcomes = ["running", "pending", "prepared", "settled", "failed", "slice_exhausted"];
+    const validFailure = value.failure_code === null
+      || (typeof value.failure_code === "string" && (value.failure_code === "slice_budget_exhausted"
+        || value.failure_code === "publication_unacknowledged"
+        || /^navigation_[a-z0-9._-]{1,72}$/.test(value.failure_code)));
+    if (value.schema_version !== "1.0" || value.project_id !== projectId || value.request_id !== requestId
+      || typeof value.selected_at !== "string" || !Number.isFinite(Date.parse(value.selected_at))
+      || !stages.includes(value.stage as string) || !outcomes.includes(value.outcome as string)
+      || !Number.isSafeInteger(value.elapsed_ms) || (value.elapsed_ms as number) < 0 || !validFailure) return null;
+    const diagnostic: NavigationWorkerDiagnostic = {
+      schema_version: "1.0",
+      project_id: projectId,
+      request_id: requestId,
+      selected_at: value.selected_at,
+      stage: value.stage as NavigationWorkerDiagnostic["stage"],
+      outcome: value.outcome as NavigationWorkerDiagnostic["outcome"],
+      elapsed_ms: value.elapsed_ms as number,
+      failure_code: value.failure_code as string | null
+    };
+    return canonicalJson(diagnostic).length <= 1_024 ? diagnostic : null;
+  }
+
   private async withNavigationWorkerDiagnostic(response: Response, projectId: string, kind: RequestKind, requestId: string): Promise<Response> {
     if (kind !== "document") return response;
+    try {
+      const body = await response.clone().json() as Record<string, any>;
+      if (body.project_id === projectId && body.request_id === requestId && body.navigation_worker) return response;
+    } catch {
+      // A malformed status body remains unchanged; the optional diagnostic is omitted.
+    }
     const worker = await this.readNavigationWorkerDiagnostic(projectId, requestId);
     if (!worker) return response;
     const body = await response.json<Record<string, unknown>>();

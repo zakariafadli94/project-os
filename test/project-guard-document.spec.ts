@@ -224,12 +224,22 @@ describe("ProjectGuard managed documents", () => {
       "document", request.request_id, "old-failure", 6, 1, JSON.stringify({ code: "identical_internal_failure_limit" })
     ));
     const navigationWorker = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    const navigationDiagnostic = {
+      schema_version: "1.0", project_id: projectId, request_id: request.request_id,
+      selected_at: new Date().toISOString(), stage: "inventory", outcome: "pending",
+      elapsed_ms: 418, failure_code: "slice_budget_exhausted"
+    };
     await runInDurableObject(navigationWorker, async (_instance, state) => {
       await state.storage.put(`navigation-work:${request.request_id}`, "queued");
       await state.storage.put(`navigation-retry:${request.request_id}`, JSON.stringify({ stopped: true, next_attempt_at: null }));
+      await state.storage.put(`navigation-diagnostic:${request.request_id}`, canonicalJson(navigationDiagnostic));
     });
+    const workerStatus = await navigationWorker.fetch(new Request(`https://materialization-guard.internal/navigation-work-status?request_id=${request.request_id}`));
+    await expect(workerStatus.json()).resolves.toMatchObject({ diagnostic: navigationDiagnostic });
     const status = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
-    expect(await status.json()).toMatchObject({ navigation_worker: { queued: true, stopped: true, next_attempt_at: null } });
+    expect(await status.json()).toMatchObject({ navigation_worker: {
+      queued: true, stopped: true, next_attempt_at: null, diagnostic: navigationDiagnostic
+    } });
     let releaseBusy!: () => void;
     const busy = new Promise<void>((resolve) => { releaseBusy = resolve; });
     let held!: Promise<void>;
@@ -238,7 +248,9 @@ describe("ProjectGuard managed documents", () => {
     });
     try {
       const busyStatus = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
-      expect(await busyStatus.json()).toMatchObject({ navigation_worker: { queued: true, stopped: true } });
+      expect(await busyStatus.json()).toMatchObject({ navigation_worker: {
+        queued: true, stopped: true, diagnostic: navigationDiagnostic
+      } });
     } finally {
       releaseBusy();
       await held;
@@ -252,6 +264,39 @@ describe("ProjectGuard managed documents", () => {
     const statusWithSlowDiagnostic = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(await statusWithSlowDiagnostic.json()).toMatchObject({ status: "recovery_blocked", observation: { recovery: { state: "blocked" } } });
+    let bodyCancelled = false;
+    const stalledBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"project_id":"' + projectId + '"'));
+      },
+      cancel() { bodyCancelled = true; }
+    });
+    await runInDurableObject(guard, (instance) => {
+      (instance as any).env.MATERIALIZATION_GUARD = { getByName: () => ({
+        fetch: async () => new Response(stalledBody, { headers: { "content-type": "application/json" } })
+      }) };
+    });
+    const bodyReadStarted = Date.now();
+    const bodyRead = guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
+    const boundedBodyResult = await Promise.race([
+      bodyRead.then((response) => ({ response })),
+      new Promise<{ timeout: true }>((resolve) => setTimeout(() => resolve({ timeout: true }), 400))
+    ]);
+    expect(boundedBodyResult).not.toHaveProperty("timeout");
+    expect(Date.now() - bodyReadStarted).toBeLessThan(400);
+    expect(bodyCancelled).toBe(true);
+
+    const oversizedDiagnostic = { ...navigationDiagnostic, selected_at: new Date().toISOString() };
+    const oversizedStatusBody = JSON.stringify({ project_id: projectId, request_id: request.request_id,
+      queued: true, stopped: true, next_attempt_at: null, diagnostic: oversizedDiagnostic, padding: "x".repeat(5_000) });
+    await runInDurableObject(guard, (instance) => {
+      (instance as any).env.MATERIALIZATION_GUARD = { getByName: () => ({
+        fetch: async () => new Response(oversizedStatusBody, { headers: { "content-type": "application/json" } })
+      }) };
+    });
+    const oversizedResponse = await guard.fetch(`https://internal/request-status?kind=document&request_id=${request.request_id}`);
+    const oversizedResponseBody = await oversizedResponse.json() as any;
+    expect(oversizedResponseBody).not.toHaveProperty("navigation_worker");
     await runInDurableObject(guard, (instance) => { (instance as any).env.MATERIALIZATION_GUARD = originalMaterializationGuard; });
     const replay = await guard.fetch("https://internal/document", { method: "POST", body: envelope });
     expect(await replay.json()).toMatchObject({ status: "conflict", code: "active_version_provider_mismatch" });

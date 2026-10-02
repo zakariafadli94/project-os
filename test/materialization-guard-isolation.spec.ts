@@ -96,18 +96,114 @@ describe("MaterializationGuard isolation boundary", () => {
     const projectId = "PRJ-3991";
     const requestId = "DOCREQ-NAVIGATION-STATUS-3991001";
     const guard = materializationNamespace().getByName(projectId);
+    const diagnostic = {
+      schema_version: "1.0", project_id: projectId, request_id: requestId,
+      selected_at: new Date().toISOString(), stage: "inventory", outcome: "failed",
+      elapsed_ms: 27, failure_code: "navigation_provider_blocked"
+    };
     await runInDurableObject(guard, async (_instance, state) => {
       await state.storage.put(`navigation-work:${requestId}`, "queued");
       await state.storage.put(`navigation-retry:${requestId}`, JSON.stringify({ stopped: true, next_attempt_at: null }));
+      await state.storage.put(`navigation-diagnostic:${requestId}`, canonicalJson(diagnostic));
     });
     const response = await guard.fetch(new Request(`https://materialization-guard.internal/navigation-work-status?request_id=${requestId}`));
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
-      project_id: projectId, request_id: requestId, queued: true, stopped: true, next_attempt_at: null
+      project_id: projectId, request_id: requestId, queued: true, stopped: true, next_attempt_at: null, diagnostic
+    });
+    await runInDurableObject(guard, async (instance, state) => {
+      await expect((instance as unknown as { runNavigationWorkSlice(): Promise<unknown> }).runNavigationWorkSlice()).resolves.toBeNull();
+      expect(await state.storage.get(`navigation-diagnostic:${requestId}`)).toBeUndefined();
     });
     await runInDurableObject(guard, async (_instance, state) => {
-      expect(await state.storage.get(`navigation-work:${requestId}`)).toBe("queued");
+      expect(await state.storage.get(`navigation-work:${requestId}`)).toBeUndefined();
     });
+  });
+
+  it("distinguishes selected pending navigation from a queued-only request and continues after slice exhaustion", async () => {
+    const requestId = "DOCREQ-NAVIGATION-DIAGNOSTIC-3990001";
+    const projectId = "PRJ-3990";
+    const ref = { project_id: projectId, request_id: requestId, zone: "WORKING", expected_generation: 0,
+      source_snapshot_id: "source:0", authority_ref: "bounded-test-authority", request_hash: "a".repeat(64) };
+    const makeGuard = (runNavigationWorkSlice: () => Promise<unknown>, options: {
+      failDiagnosticRead?: boolean;
+      projectGuardFetch?: () => Promise<Response>;
+    } = {}) => {
+      const stored = new Map<string, string>([[`navigation-work:${requestId}`, "queued"]]);
+      let alarmAt: number | null = Date.now() + 1_000;
+      const storage = {
+        get: async <T>(key: string) => {
+          if (options.failDiagnosticRead && key.startsWith("navigation-diagnostic:")) throw new Error("diagnostic read unavailable");
+          return stored.get(key) as T | undefined;
+        },
+        put: async (key: string, value: string) => { stored.set(key, value); },
+        delete: async (key: string) => { stored.delete(key); },
+        list: async ({ prefix, limit }: { prefix: string; limit?: number }) => new Map(
+          [...stored.entries()].filter(([key]) => key.startsWith(prefix)).slice(0, limit)
+        ),
+        getAlarm: async () => alarmAt,
+        setAlarm: async (value: number) => { alarmAt = value; }
+      };
+      let canonicalSlices = 0;
+      const guard = Object.assign(Object.create(MaterializationGuard.prototype), {
+        projectId, layoutMode: "legacy", env: { PROJECT_OS_CONVERGENCE_PROJECT_MODES: "{}",
+          ...(options.projectGuardFetch ? { PROJECT_GUARD: { getByName: () => ({ fetch: options.projectGuardFetch }) } } : {}) },
+        ledger: { capacitySnapshot: () => ({}) }, ctx: { id: { name: projectId }, storage },
+        capacityHasPendingWork: () => true,
+        serialize: async (operation: () => Promise<unknown>) => operation(),
+        runNavigationWorkSlice: async function (this: { selectedNavigationWorkRef?: unknown }) {
+          this.selectedNavigationWorkRef = ref;
+          return runNavigationWorkSlice();
+        },
+        coordinatorForSlice: () => ({ coordinator: { runNext: async () => {
+          canonicalSlices += 1;
+          return { completed: false, more_work: true };
+        } } })
+      }) as MaterializationGuard;
+      return { guard, canonicalSlices: () => canonicalSlices, stored };
+    };
+
+    const queuedOnly = makeGuard(async () => null);
+    const queuedStatus = await queuedOnly.guard.fetch(new Request(
+      `https://materialization-guard.internal/navigation-work-status?request_id=${requestId}`
+    ));
+    await expect(queuedStatus.json()).resolves.toMatchObject({ queued: true, diagnostic: null });
+
+    const unavailable = makeGuard(async () => null, { failDiagnosticRead: true });
+    const unavailableStatus = await unavailable.guard.fetch(new Request(
+      `https://materialization-guard.internal/navigation-work-status?request_id=${requestId}`
+    ));
+    expect(unavailableStatus.status).toBe(200);
+    await expect(unavailableStatus.json()).resolves.toMatchObject({ queued: true, diagnostic: null });
+
+    const pending = makeGuard(async () => ({ ref, publish: false }));
+    await pending.guard.alarm();
+    const pendingStatus = await pending.guard.fetch(new Request(
+      `https://materialization-guard.internal/navigation-work-status?request_id=${requestId}`
+    ));
+    await expect(pendingStatus.json()).resolves.toMatchObject({ queued: true,
+      stopped: false, next_attempt_at: expect.any(String),
+      diagnostic: { stage: "selected", outcome: "pending", failure_code: null } });
+
+    const exhausted = makeGuard(async () => { throw new Error("slice_budget_exhausted"); });
+    await exhausted.guard.alarm();
+    expect(exhausted.canonicalSlices()).toBe(1);
+    const exhaustedStatus = await exhausted.guard.fetch(new Request(
+      `https://materialization-guard.internal/navigation-work-status?request_id=${requestId}`
+    ));
+    await expect(exhaustedStatus.json()).resolves.toMatchObject({ queued: true,
+      stopped: false, next_attempt_at: expect.any(String),
+      diagnostic: { stage: "selected", outcome: "slice_exhausted", failure_code: "slice_budget_exhausted" } });
+
+    const terminal = makeGuard(async () => ({ ref, publish: true }), {
+      projectGuardFetch: async () => Response.json({ project_id: projectId, request_id: requestId, status: "committed" })
+    });
+    terminal.stored.set(`navigation-diagnostic:${requestId}`, canonicalJson({
+      schema_version: "1.0", project_id: projectId, request_id: requestId, selected_at: new Date().toISOString(),
+      stage: "publication", outcome: "prepared", elapsed_ms: 31, failure_code: null
+    }));
+    await terminal.guard.alarm();
+    expect(terminal.stored.has(`navigation-diagnostic:${requestId}`)).toBe(false);
   });
 
   it("does not queue capacity or diagnostics reads behind maintenance I/O", async () => {

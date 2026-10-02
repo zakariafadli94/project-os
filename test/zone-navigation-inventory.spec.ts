@@ -843,6 +843,32 @@ describe("ZoneNavigationInventory", () => {
     expect(found).toEqual([`head:${activeId}`]);
   });
 
+  it("checks the inactive prefix together even when the next head is active", async () => {
+    const h = harness();
+    const activeId = "DOC-000000000000000000000005";
+    for (let index = 0; index < 12; index++) {
+      const id = `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`;
+      if (id === activeId) await addWorkingHead(h, "active body", "rev-active", id, `VER-REQ-${id.slice(4)}`, "active.md");
+      else h.put(machineDocumentHeadPath(projectId, id), JSON.stringify({
+        schema_version: "1.0", project_id: projectId, document_id: id,
+        kind: "work_product", logical_path: `inactive-${index}.md`, reconciliation_status: "clean"
+      }));
+    }
+    const originalRead = h.sources.readCatalogEntry.bind(h.sources);
+    let concurrentCatalogReads = 0;
+    let peakCatalogReads = 0;
+    vi.spyOn(h.sources, "readCatalogEntry").mockImplementation(async (...args) => {
+      concurrentCatalogReads += 1;
+      peakCatalogReads = Math.max(peakCatalogReads, concurrentCatalogReads);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      try { return await originalRead(...args); }
+      finally { concurrentCatalogReads -= 1; }
+    });
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: null, limit: 8, budget: budget(32) });
+    expect(page.gaps).toEqual([]);
+    expect(peakCatalogReads).toBeGreaterThanOrEqual(4);
+  });
+
   it("keeps the initial cursor at a failed batch and resumes without losing the active head", async () => {
     const h = harness();
     const activeId = "DOC-000000000000000000000005";

@@ -662,6 +662,81 @@ describe("MaterializationGuard isolation boundary", () => {
     expect(alarm).not.toBeNull();
   });
 
+  it("rejects a forged one-shot orphan recovery marker without clearing the stopped navigation record", async () => {
+    const projectId = "PRJ-3977";
+    const requestId = "DOCREQ-NAV-ORPHAN-3977001";
+    const guard = materializationNamespace().getByName(projectId);
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.put(`navigation-retry:${requestId}`, canonicalJson({ stopped: true, next_attempt_at: null }));
+    });
+    const ref = navigationWorkRefSchema.parse({
+      project_id: projectId, request_id: requestId, zone: "REVIEW", expected_generation: 2,
+      source_snapshot_id: "source:2", authority_ref: `authority:${requestId}`, request_hash: "a".repeat(64)
+    });
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/navigation-work-recovery", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        recovery_epoch: "navigation-orphan-cursor-v1",
+        marker_hash: "0".repeat(64),
+        workRef: ref,
+        material: {
+          epoch: "navigation-orphan-cursor-v1", request_id: requestId,
+          request_hash: ref.request_hash, source_snapshot_id: ref.source_snapshot_id,
+          checkpoint: { progress_sha256: "b".repeat(64), orphan_page_sha256: "c".repeat(64), page: 127,
+            cursor_before: "source:2", target_generation: 2 },
+          prior_failure: { fingerprint: "d".repeat(64), count: 6, message_sha256: "e".repeat(64) }
+        }
+      })
+    }));
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ error: "navigation_recovery_marker_invalid" });
+    await runInDurableObject(guard, async (_instance, state) => {
+      expect(await state.storage.get(`navigation-retry:${requestId}`)).toBe(canonicalJson({ stopped: true, next_attempt_at: null }));
+      expect(await state.storage.get(`navigation-work:${requestId}`)).toBeUndefined();
+    });
+  });
+
+  it("replays an acknowledged consumed orphan marker without rearming a second alarm", async () => {
+    const projectId = "PRJ-0007";
+    const requestId = "DOCREQ-PRJ0007-REVIEW-RECOVERY-20261002B1";
+    const guard = materializationNamespace().getByName(projectId);
+    const ref = navigationWorkRefSchema.parse({
+      project_id: projectId, request_id: requestId, zone: "REVIEW", expected_generation: 0,
+      source_snapshot_id: "source:2", authority_ref: `authority:${requestId}`, request_hash: "a".repeat(64)
+    });
+    const material = {
+      epoch: "navigation-orphan-cursor-v1", request_id: requestId,
+      request_hash: ref.request_hash, source_snapshot_id: ref.source_snapshot_id,
+      checkpoint: { progress_sha256: "b".repeat(64), orphan_page_sha256: "c".repeat(64),
+        page: 127, cursor_before: "legacy-before", target_generation: 2 },
+      prior_failure: { fingerprint: "d".repeat(64), count: 6, message_sha256: "e".repeat(64) }
+    };
+    const markerHash = await sha256Canonical(material);
+    const markerKey = `navigation-orphan-recovery:navigation-orphan-cursor-v1:${requestId}`;
+    const alarmAt = Date.now() + 20_000;
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.put(markerKey, canonicalJson({ schema_version: "1.0",
+        recovery_epoch: "navigation-orphan-cursor-v1", marker_hash: markerHash,
+        material, workRef: ref, prior_stop: canonicalJson({ stopped: true, next_attempt_at: null }),
+        status: "consumed" }));
+      await state.storage.put(`navigation-retry:${requestId}`, canonicalJson({ stopped: false,
+        next_attempt_at: null, recovery_epoch: "navigation-orphan-cursor-v1", marker_hash: markerHash }));
+      await state.storage.setAlarm(alarmAt);
+    });
+    const response = await guard.fetch(new Request("https://materialization-guard.internal/navigation-work-recovery", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ recovery_epoch: "navigation-orphan-cursor-v1", marker_hash: markerHash, workRef: ref, material })
+    }));
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({ status: "scheduled", replayed: true, consumed: true });
+    await runInDurableObject(guard, async (_instance, state) => {
+      expect(await state.storage.getAlarm()).toBe(alarmAt);
+      const markerRaw = await state.storage.get<string>(markerKey);
+      expect(JSON.parse(markerRaw!)).toMatchObject({ status: "consumed", marker_hash: markerHash });
+      expect(await state.storage.get(`navigation-work:${requestId}`)).toBeUndefined();
+    });
+  });
+
   it("retains the navigation wake when convergence becomes idle", async () => {
     const projectId = "PRJ-3926";
     const requestId = "DOCREQ-NAVIGATION-WORKING-3926001";

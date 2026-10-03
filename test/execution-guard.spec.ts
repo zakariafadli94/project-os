@@ -13,7 +13,8 @@ import {
   machineDocumentRoot,
   machineMaterializationRecordPath,
   machineStatePath,
-  machineTransactionRequestIntentPath
+  machineTransactionRequestIntentPath,
+  workspaceProjectRoot
 } from "../src/persistence/layout";
 import { commitFixture, seedCommits } from "./helpers/convergence-fixture";
 import { installDropboxMock } from "./helpers/mock-dropbox";
@@ -25,6 +26,8 @@ import { ProjectRepository } from "../src/persistence/repository";
 import { executionHash, ExecutionJournal } from "../src/execution/journal";
 import { createSliceBudget } from "../src/convergence/budget";
 import { sha256Text } from "../src/documents/hash";
+import { sha256Canonical } from "../src/materialization/hash";
+import { canonicalJson } from "../src/rules/contract";
 import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
@@ -44,6 +47,89 @@ async function setup(projectId: string) {
   }));
   await bootstrapRuleAdmissionGovernance(testEnv, "exec-guard-admission", projectId);
   return { mock, guard };
+}
+
+async function prepareLegacyNavigationOrphan(projectId: string) {
+  const { mock, guard } = await setup(projectId);
+  seedUnadoptedNavigationGeneration(mock, projectId, 2);
+  const state = commitFixture(projectId, 1)[0]!.state;
+  const request = {
+    operation: "navigation.reconcile" as const,
+    request_id: `DOCREQ-NAV-ORPHAN-${projectId.slice(4)}-0001`,
+    project_id: projectId,
+    zone: "REVIEW" as const,
+    expected_project_revision: 1,
+    expected_generation: 0,
+    expected_index: null,
+    created_at: "2026-10-03T06:00:00.000Z"
+  };
+  const mutationContext = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+  const admitted = await guard.fetch("https://project-guard.internal/document", {
+    method: "POST", body: JSON.stringify(encodeAdmission(request, mutationContext.context))
+  });
+  expect(admitted.status).toBe(202);
+
+  const runtime = createProductionPersistence(testEnv, projectId);
+  const journal = new ExecutionJournal(runtime, projectId, "document", request.request_id);
+  const root = await journal.root();
+  const entries = [];
+  for (let index = 0; index < 2; index += 1) {
+    const logicalPath = `orphan-${index + 1}.md`;
+    const content = `Review navigation orphan entry ${index + 1}\n`;
+    const path = `${workspaceProjectRoot(projectId, state.slug)}/REVIEW/${logicalPath}`;
+    mock.files.set(path, content);
+    const metadata = await runtime.objects.getMetadata(path);
+    entries.push({
+      project_id: projectId, zone: "REVIEW", resource_id: `DOC-1123456789ABCDEF0123456${index}`,
+      version: `VER-1123456789ABCDEF0123456${index}`, logical_path: logicalPath, path,
+      expected: { object_id: metadata!.objectId!, revision_token: metadata!.revisionToken!,
+        content_sha256: await sha256Text(content), size: new TextEncoder().encode(content).byteLength }
+    });
+  }
+  const requestHash = await executionHash(request);
+  const snapshotId = "source:2";
+  const progress = {
+    schema_version: "1.0", project_id: projectId, request_id: request.request_id,
+    request_hash: requestHash, target_generation: 1, index_basename: "00-CURRENT.md",
+    expected_index: null, head_revision_token: null, cursor: "source-cursor-before-orphan",
+    page_count: 127, inventory_complete: false, snapshot_id: snapshotId,
+    verify_page: 0, verify_entry: 0, source_count: 0, source_ids: [], published_index: null,
+    coverage_gaps: [], rendered_links: [], generated_sha256: null, legacy_archive_ref: null,
+    valid_links_work: null, status: "adopting", receipt: null, postchecks: []
+  };
+  const page = {
+    schema_version: "1.0", page: 127, project_id: projectId, request_id: request.request_id,
+    snapshot_id: snapshotId, entries,
+    verified_entries: await Promise.all(entries.map(async (entry) => ({
+      resource_id: entry.resource_id, entry_hash: await executionHash(entry), persisted: false
+    }))), gaps: []
+  };
+  mock.files.set(`${root}/navigation-progress.json`, canonicalJson(progress));
+  mock.files.set(`${root}/navigation/snapshot/00000127.json`, canonicalJson(page));
+
+  const progressHash = "f".repeat(64);
+  const errorHash = await sha256Text("Error:navigation_immutable_record_conflict");
+  const fingerprint = await sha256Text(JSON.stringify({ classification: "internal", error_name: "Error",
+    error_sha256: errorHash, progress_sha256: progressHash, external_progress_sha256: null }));
+  const failureMessage = canonicalJson({ code: "identical_internal_failure_limit", classification: "internal",
+    error_name: "Error", progress_sha256: progressHash, next_attempt_at: null });
+  const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+  await runInDurableObject(guard, (_instance, pgState) => {
+    pgState.storage.sql.exec(
+      `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
+       VALUES ('document', ?, ?, 6, 1, ?)`, request.request_id, fingerprint, failureMessage
+    );
+    expect(pgState.storage.sql.exec(
+      "SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id
+    ).toArray()).toHaveLength(0);
+  });
+  await runInDurableObject(materialization, async (_instance, mgState) => {
+    await mgState.storage.delete(`navigation-work:${request.request_id}`);
+    await mgState.storage.delete(`navigation-context:${request.request_id}`);
+    await mgState.storage.put(`navigation-retry:${request.request_id}`, canonicalJson({ stopped: true, next_attempt_at: null }));
+    await mgState.storage.deleteAlarm();
+  });
+  return { mock, guard, materialization, request, progressHash, fingerprint, failureMessage };
 }
 
 function seedUnadoptedNavigationGeneration(mock: ReturnType<typeof installDropboxMock>, projectId: string, generation: number): void {
@@ -2851,6 +2937,251 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(stopped).toMatchObject({ count: 6, stopped: 1 });
     expect(JSON.parse(stopped!.message)).toMatchObject({ code: "identical_internal_failure_limit" });
     expect([...mock.files.keys()].some((path) => path.endsWith(`/requests/${request.request_id}/receipt.json`))).toBe(false);
+  });
+
+  it("keeps the known immutable navigation conflict stopped after its one cursor re-arm", async () => {
+    const projectId = "PRJ-0007";
+    const requestId = "DOCREQ-PRJ0007-REVIEW-RECOVERY-20261002B1";
+    const { guard } = await setup(projectId);
+    const material = {
+      epoch: "navigation-orphan-cursor-v1",
+      request_id: requestId,
+      request_hash: "369cc88f5e015f973bd8c986ef01c9ddcd322118dad1c5fbdb79c471fa7290c0",
+      source_snapshot_id: "source:2",
+      checkpoint: {
+        progress_sha256: "a".repeat(64), orphan_page_sha256: "b".repeat(64),
+        page: 127, cursor_before: "legacy-cursor", target_generation: 2
+      },
+      prior_failure: { fingerprint: "c".repeat(64), count: 6, message_sha256: "d".repeat(64) }
+    };
+    await runInDurableObject(guard, async (instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
+         VALUES ('document', ?, ?, 6, 1, ?)`,
+        requestId, "e".repeat(64), JSON.stringify({ code: "identical_internal_failure_limit", classification: "internal",
+          error_name: "Error", progress_sha256: "f".repeat(64), next_attempt_at: null })
+      );
+      const marker = { schema_version: "1.0", recovery_epoch: "navigation-orphan-cursor-v1",
+        marker_hash: await sha256Canonical(material), material, workRef: {}, status: "acknowledged" };
+      await state.storage.put(`navigation-orphan-recovery:navigation-orphan-cursor-v1:${requestId}`, canonicalJson(marker));
+      const result = await (instance as any).recordRecoveryFailure(
+        "document", requestId, new Error("navigation_immutable_record_conflict"), "1".repeat(64)
+      );
+      expect(result).toMatchObject({ count: 7, stopped: true, code: "identical_internal_failure_limit" });
+      const row = state.storage.sql.exec<{ count: number; stopped: number }>(
+        "SELECT count, stopped FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", requestId
+      ).one();
+      expect(row).toEqual({ count: 7, stopped: 1 });
+    });
+  });
+
+  it("re-arms one admitted unowned legacy navigation orphan and preserves the PG stop row", async () => {
+    const { guard, materialization, request, fingerprint, failureMessage } = await prepareLegacyNavigationOrphan("PRJ-3978");
+    const before = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{
+      fingerprint: string; count: number; stopped: number; message: string;
+    }>("SELECT fingerprint, count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id).one());
+    expect(before).toEqual({ fingerprint, count: 6, stopped: 1, message: failureMessage });
+
+    const response = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
+    expect(response.status).toBe(200);
+    const marker = await runInDurableObject(guard, async (_instance, state) => {
+      const raw = await state.storage.get<string>(`navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`);
+      return raw ? JSON.parse(raw) : null;
+    });
+    expect(marker).toMatchObject({ recovery_epoch: "navigation-orphan-cursor-v1", status: "acknowledged",
+      material: { request_id: request.request_id, request_hash: await executionHash(request) } });
+    const workerState = await runInDurableObject(materialization, async (_instance, state) => ({
+      work: await state.storage.get<string>(`navigation-work:${request.request_id}`),
+      retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`),
+      alarm: await state.storage.getAlarm()
+    }));
+    expect(JSON.parse(workerState.work!)).toMatchObject({ request_id: request.request_id, source_snapshot_id: "source:2" });
+    expect(JSON.parse(workerState.retry!)).toMatchObject({ stopped: false, recovery_epoch: "navigation-orphan-cursor-v1", marker_hash: marker.marker_hash });
+    expect(workerState.alarm).not.toBeNull();
+    const after = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{
+      fingerprint: string; count: number; stopped: number; message: string;
+    }>("SELECT fingerprint, count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id).one());
+    expect(after).toEqual(before);
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" })).status).toBe(200);
+    const repeatedAlarm = await runInDurableObject(materialization, (_instance, state) => state.storage.getAlarm());
+    expect(repeatedAlarm).toBe(workerState.alarm);
+    const replayedRow = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{ count: number; stopped: number; message: string }>(
+      "SELECT count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+    ).one());
+    expect(replayedRow).toMatchObject({ count: 6, stopped: 1, message: failureMessage });
+  });
+
+  it("does not re-arm a known immutable-conflict fingerprint when the persisted failure names another error", async () => {
+    const { guard, materialization, request, mock } = await prepareLegacyNavigationOrphan("PRJ-3982");
+    const progressHash = "f".repeat(64);
+    const otherErrorHash = await sha256Text("Error:some_other_navigation_failure");
+    const otherFingerprint = await sha256Text(JSON.stringify({ classification: "internal", error_name: "Error",
+      error_sha256: otherErrorHash, progress_sha256: progressHash, external_progress_sha256: null }));
+    const otherMessage = canonicalJson({ code: "identical_internal_failure_limit", classification: "internal",
+      error_name: "Error", progress_sha256: progressHash, next_attempt_at: null });
+    await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec(
+      "UPDATE request_recovery_failures SET fingerprint = ?, message = ? WHERE kind = 'document' AND request_id = ?",
+      otherFingerprint, otherMessage, request.request_id
+    ));
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" })).status).toBe(200);
+    const marker = await runInDurableObject(guard, (_instance, state) => state.storage.get<string>(
+      `navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`
+    ));
+    const workerState = await runInDurableObject(materialization, async (_instance, state) => ({
+      work: await state.storage.get<string>(`navigation-work:${request.request_id}`),
+      retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`)
+    }));
+    expect(marker).toBeUndefined();
+    expect(workerState.work).toBeUndefined();
+    expect(JSON.parse(workerState.retry!).stopped).toBe(true);
+    expect(mock.files.has(`${machineDocumentRoot(request.project_id)}/navigation-sources/state.json`)).toBe(true);
+  });
+
+  it("does not re-arm when the canonical source is no longer an unowned current source", async () => {
+    const { guard, materialization, request, mock } = await prepareLegacyNavigationOrphan("PRJ-3983");
+    const sourcePath = `${machineDocumentRoot(request.project_id)}/navigation-sources/state.json`;
+    const raw = mock.files.get(sourcePath)!;
+    const sourceState = JSON.parse(raw) as { zones: Record<string, { generation: number; adopted: boolean }> };
+    sourceState.zones.REVIEW!.adopted = true;
+    mock.files.set(sourcePath, JSON.stringify(sourceState));
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" })).status).toBe(200);
+    const marker = await runInDurableObject(guard, (_instance, state) => state.storage.get<string>(
+      `navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`
+    ));
+    const workerState = await runInDurableObject(materialization, async (_instance, state) => ({
+      work: await state.storage.get<string>(`navigation-work:${request.request_id}`),
+      retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`)
+    }));
+    expect(marker).toBeUndefined();
+    expect(workerState.work).toBeUndefined();
+    expect(JSON.parse(workerState.retry!).stopped).toBe(true);
+  });
+
+  it("does not retarget a legacy orphan checkpoint to a newer source generation", async () => {
+    const { guard, materialization, request, mock } = await prepareLegacyNavigationOrphan("PRJ-3984");
+    const sourcePath = `${machineDocumentRoot(request.project_id)}/navigation-sources/state.json`;
+    const raw = mock.files.get(sourcePath)!;
+    const sourceState = JSON.parse(raw) as { zones: Record<string, { generation: number }> };
+    sourceState.zones.REVIEW!.generation = 3;
+    mock.files.set(sourcePath, JSON.stringify(sourceState));
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" })).status).toBe(200);
+    const marker = await runInDurableObject(guard, (_instance, state) => state.storage.get<string>(
+      `navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`
+    ));
+    const workerState = await runInDurableObject(materialization, async (_instance, state) => ({
+      work: await state.storage.get<string>(`navigation-work:${request.request_id}`),
+      retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`)
+    }));
+    expect(marker).toBeUndefined();
+    expect(workerState.work).toBeUndefined();
+    expect(JSON.parse(workerState.retry!).stopped).toBe(true);
+  });
+
+  it("retries the identical pending marker after MG accepted work but its acknowledgement was lost", async () => {
+    const { guard, materialization, request } = await prepareLegacyNavigationOrphan("PRJ-3979");
+    const originalBinding = testEnv.MATERIALIZATION_GUARD;
+    const markerBodies: string[] = [];
+    let loseFirstAck = true;
+    await runInDurableObject(guard, (instance) => {
+      (instance as any).env.MATERIALIZATION_GUARD = {
+        getByName(projectId: string) {
+          const stub = originalBinding.getByName(projectId);
+          return {
+            async fetch(url: string | Request, init?: RequestInit) {
+              const pathname = new URL(url instanceof Request ? url.url : url).pathname;
+              if (pathname !== "/navigation-work-recovery") return stub.fetch(url, init);
+              markerBodies.push(String(init?.body));
+              const accepted = await stub.fetch(url, init);
+              if (loseFirstAck) {
+                loseFirstAck = false;
+                return new Response("ack lost after durable accept", { status: 503 });
+              }
+              return accepted;
+            }
+          };
+        }
+      };
+    });
+    try {
+      expect((await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" })).status).toBe(200);
+      const pending = await runInDurableObject(guard, async (_instance, state) => {
+        const raw = await state.storage.get<string>(`navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`);
+        return raw ? JSON.parse(raw) : null;
+      });
+      expect(pending).toMatchObject({ status: "pending_ack" });
+      const alarmAfterFirstAccept = await runInDurableObject(materialization, (_instance, state) => state.storage.getAlarm());
+      expect(alarmAfterFirstAccept).not.toBeNull();
+
+      expect((await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" })).status).toBe(200);
+      expect(markerBodies).toHaveLength(2);
+      expect(markerBodies[1]).toBe(markerBodies[0]);
+      const acknowledged = await runInDurableObject(guard, async (_instance, state) => {
+        const raw = await state.storage.get<string>(`navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`);
+        return raw ? JSON.parse(raw) : null;
+      });
+      expect(acknowledged).toMatchObject({ status: "acknowledged", marker_hash: pending.marker_hash });
+      const after = await runInDurableObject(materialization, async (_instance, state) => ({
+        work: await state.storage.get<string>(`navigation-work:${request.request_id}`),
+        alarm: await state.storage.getAlarm()
+      }));
+      expect(JSON.parse(after.work!)).toEqual(acknowledged.workRef);
+      expect(after.alarm).toBe(alarmAfterFirstAccept);
+    } finally {
+      await runInDurableObject(guard, (instance) => { (instance as any).env.MATERIALIZATION_GUARD = originalBinding; });
+    }
+  });
+
+  it.each(["after_marker", "before_alarm"] as const)("finishes a pending recovery after a crash %s", async (crashPoint) => {
+    const projectId = crashPoint === "after_marker" ? "PRJ-3980" : "PRJ-3981";
+    const { guard, materialization, request } = await prepareLegacyNavigationOrphan(projectId);
+    let restoreFault: () => void = () => undefined;
+    await runInDurableObject(materialization, (_instance, state) => {
+      if (crashPoint === "after_marker") {
+        const originalPut = state.storage.put.bind(state.storage);
+        let injected = false;
+        const spy = vi.spyOn(state.storage, "put").mockImplementation(async (key, value) => {
+          await originalPut(key, value);
+          if (!injected && typeof key === "string" && key === `navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`) {
+            injected = true;
+            throw new Error("simulated crash after durable marker");
+          }
+        });
+        restoreFault = () => spy.mockRestore();
+      } else {
+        const spy = vi.spyOn(state.storage, "setAlarm").mockRejectedValue(new Error("simulated crash before alarm"));
+        restoreFault = () => spy.mockRestore();
+      }
+    });
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" })).status).toBe(200);
+    restoreFault();
+    const interrupted = await runInDurableObject(materialization, async (_instance, state) => ({
+      marker: await state.storage.get<string>(`navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`),
+      work: await state.storage.get<string>(`navigation-work:${request.request_id}`),
+      retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`),
+      alarm: await state.storage.getAlarm()
+    }));
+    expect(interrupted.marker).toBeDefined();
+    if (crashPoint === "after_marker") {
+      expect(interrupted.work).toBeUndefined();
+      expect(JSON.parse(interrupted.retry!)).toMatchObject({ stopped: true });
+      expect(interrupted.alarm).toBeNull();
+    } else {
+      expect(JSON.parse(interrupted.work!)).toMatchObject({ request_id: request.request_id });
+      expect(JSON.parse(interrupted.retry!)).toMatchObject({ stopped: false });
+      expect(interrupted.alarm).toBeNull();
+    }
+
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" })).status).toBe(200);
+    const recovered = await runInDurableObject(materialization, async (_instance, state) => ({
+      marker: await state.storage.get<string>(`navigation-orphan-recovery:navigation-orphan-cursor-v1:${request.request_id}`),
+      work: await state.storage.get<string>(`navigation-work:${request.request_id}`),
+      retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`),
+      alarm: await state.storage.getAlarm()
+    }));
+    expect(JSON.parse(recovered.marker!)).toMatchObject({ status: "acknowledged" });
+    expect(JSON.parse(recovered.work!)).toMatchObject({ request_id: request.request_id, source_snapshot_id: "source:2" });
+    expect(JSON.parse(recovered.retry!)).toMatchObject({ stopped: false, recovery_epoch: "navigation-orphan-cursor-v1" });
+    expect(recovered.alarm).not.toBeNull();
   });
 
   it("releases only the matching unadopted owner after terminal navigation conflict", async () => {

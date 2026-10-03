@@ -42,12 +42,13 @@ import { ProjectRepository } from "../persistence/repository";
 import { ExecutionJournal, executionHash } from "../execution/journal";
 import type { ExecutionAdmission } from "../execution/contract";
 import { ManagedDocumentRequestLedger } from "../documents/request-ledger";
-import { ZoneNavigationEngine } from "../documents/zone-navigation";
+import { ZoneNavigationEngine, type RecoverableOrphanCheckpoint } from "../documents/zone-navigation";
 import { ZoneNavigationInventory } from "../documents/zone-navigation-inventory";
 import { ZoneNavigationSources } from "../documents/zone-navigation-sources";
 import { machineDocumentRoot } from "../persistence/layout";
 import { normalizeProjectState } from "../domain/project-state-normalizer";
 import { sha256Canonical } from "../materialization/hash";
+import { sha256Text } from "../documents/hash";
 import { canonicalJson } from "../rules/contract";
 import type { RuleResource } from "../rules/contract";
 
@@ -60,6 +61,33 @@ const NAVIGATION_RETRY_PREFIX = "navigation-retry:";
 const NAVIGATION_DIAGNOSTIC_PREFIX = "navigation-diagnostic:";
 const NAVIGATION_WORK_CURSOR_KEY = "navigation-work-cursor";
 const NAVIGATION_WORK_SCAN_LIMIT = 16;
+const NAVIGATION_ORPHAN_MIN_FAILURE_COUNT = 6;
+const NAVIGATION_ORPHAN_RECOVERY_EPOCH = "navigation-orphan-cursor-v1";
+
+interface NavigationOrphanRecoveryMaterial {
+  epoch: typeof NAVIGATION_ORPHAN_RECOVERY_EPOCH;
+  request_id: string;
+  request_hash: string;
+  source_snapshot_id: string;
+  checkpoint: {
+    progress_sha256: string;
+    orphan_page_sha256: string;
+    page: number;
+    cursor_before: string | null;
+    target_generation: number;
+  };
+  prior_failure: { fingerprint: string; count: number; message_sha256: string };
+}
+
+interface StoredNavigationOrphanRecoveryMarker {
+  schema_version: "1.0";
+  recovery_epoch: typeof NAVIGATION_ORPHAN_RECOVERY_EPOCH;
+  marker_hash: string;
+  material: NavigationOrphanRecoveryMaterial;
+  workRef: NavigationWorkRef;
+  prior_stop: string;
+  status: "pending_ack" | "acknowledged" | "consumed";
+}
 
 type NavigationDiagnosticStage = "selected" | "context" | "source" | "inventory" | "publication";
 type NavigationDiagnosticOutcome = "running" | "pending" | "prepared" | "settled" | "failed" | "slice_exhausted";
@@ -153,6 +181,9 @@ export class MaterializationGuard extends DurableObject<Env> {
       // This acknowledgement must not queue behind the long materialization
       // alarm: ProjectGuard may be holding its own serializer while enqueueing.
       return this.enqueueNavigationWork(request);
+    }
+    if (request.method === "POST" && url.pathname === "/navigation-work-recovery") {
+      return this.recoverNavigationWork(request);
     }
     if (request.method === "GET" && url.pathname === "/navigation-work-status") {
       const requestId = url.searchParams.get("request_id");
@@ -499,6 +530,7 @@ export class MaterializationGuard extends DurableObject<Env> {
     }
     const requestId = candidate.requestId;
     const ref = navigationWorkRefSchema.parse(JSON.parse(candidate.value));
+    await this.markNavigationOrphanRecoveryConsumed(ref.request_id);
     this.selectedNavigationWorkRef = ref;
     await this.writeNavigationWorkDiagnostic(ref, "selected", "running", null);
     const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
@@ -1479,6 +1511,163 @@ export class MaterializationGuard extends DurableObject<Env> {
     return true;
   }
 
+  private navigationOrphanRecoveryKey(requestId: string): string {
+    return `navigation-orphan-recovery:${NAVIGATION_ORPHAN_RECOVERY_EPOCH}:${requestId}`;
+  }
+
+  private async recoverNavigationWork(request: Request): Promise<Response> {
+    let body: Record<string, unknown>;
+    try { body = await request.json() as Record<string, unknown>; }
+    catch { return Response.json({ error: "navigation_recovery_marker_invalid" }, { status: 409 }); }
+    let ref: NavigationWorkRef;
+    try { ref = navigationWorkRefSchema.parse(body.workRef); }
+    catch { return Response.json({ error: "navigation_recovery_marker_invalid" }, { status: 409 }); }
+    const material = body.material as NavigationOrphanRecoveryMaterial | undefined;
+    if (body.recovery_epoch !== NAVIGATION_ORPHAN_RECOVERY_EPOCH || !material
+      || material.epoch !== NAVIGATION_ORPHAN_RECOVERY_EPOCH
+      || body.marker_hash !== undefined && (typeof body.marker_hash !== "string" || !/^[a-f0-9]{64}$/.test(body.marker_hash))
+      || typeof material.request_id !== "string" || material.request_id !== ref.request_id
+      || material.request_hash !== ref.request_hash || material.source_snapshot_id !== ref.source_snapshot_id
+      || ref.project_id !== this.projectId || ref.zone !== "REVIEW" || ref.expected_generation < 0
+      || !material.checkpoint || !/^[a-f0-9]{64}$/.test(material.checkpoint.progress_sha256)
+      || !/^[a-f0-9]{64}$/.test(material.checkpoint.orphan_page_sha256)
+      || !Number.isSafeInteger(material.checkpoint.page) || material.checkpoint.page < 0
+      || (material.checkpoint.cursor_before !== null && typeof material.checkpoint.cursor_before !== "string")
+      || !Number.isSafeInteger(material.checkpoint.target_generation) || material.checkpoint.target_generation < 0
+      || !material.prior_failure || !/^[a-f0-9]{64}$/.test(material.prior_failure.fingerprint)
+      || !Number.isSafeInteger(material.prior_failure.count) || material.prior_failure.count < NAVIGATION_ORPHAN_MIN_FAILURE_COUNT
+      || !/^[a-f0-9]{64}$/.test(material.prior_failure.message_sha256)) {
+      return Response.json({ error: "navigation_recovery_marker_invalid" }, { status: 409 });
+    }
+    const markerHash = await sha256Canonical(material);
+    if (body.marker_hash !== markerHash) return Response.json({ error: "navigation_recovery_marker_invalid" }, { status: 409 });
+
+    const key = this.navigationOrphanRecoveryKey(ref.request_id);
+    const existingRaw = await this.ctx.storage.get<string>(key);
+    const replayed = existingRaw !== undefined;
+    let existing: StoredNavigationOrphanRecoveryMarker | null = null;
+    if (existingRaw !== undefined) {
+      try { existing = JSON.parse(existingRaw) as StoredNavigationOrphanRecoveryMarker; }
+      catch { return Response.json({ error: "navigation_recovery_marker_invalid" }, { status: 409 }); }
+      if (existing.schema_version !== "1.0" || existing.recovery_epoch !== NAVIGATION_ORPHAN_RECOVERY_EPOCH
+        || existing.marker_hash !== markerHash || canonicalJson(existing.material) !== canonicalJson(material)
+        || canonicalJson(existing.workRef) !== canonicalJson(ref)
+        || !["pending_ack", "acknowledged", "consumed"].includes(existing.status)) {
+        return Response.json({ error: "navigation_recovery_marker_conflict" }, { status: 409 });
+      }
+      if (existing.status === "consumed") {
+        return Response.json({ project_id: this.projectId, request_id: ref.request_id, status: "scheduled", marker_hash: markerHash, replayed: true, consumed: true }, { status: 202 });
+      }
+    }
+
+    try {
+      const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
+      const runtime = createProductionPersistence(this.env, this.projectId);
+      const intent = await new ManagedDocumentRequestLedger(runtime.objects).readRecoverableIntent(this.projectId, ref.request_id);
+      if (!intent || intent.project_id !== this.projectId || intent.request_id !== ref.request_id
+        || intent.request_sha256 !== await sha256Text(intent.request_json)) throw new Error("intent");
+      const navigationRequest = navigationReconcileSchema.parse(JSON.parse(intent.request_json));
+      const requestHash = await executionHash(navigationRequest);
+      const journal = new ExecutionJournal(runtime, this.projectId, "document", ref.request_id);
+      const admitted = await journal.readAdmission();
+      if (navigationRequest.project_id !== this.projectId || navigationRequest.request_id !== ref.request_id
+        || navigationRequest.zone !== ref.zone || navigationRequest.expected_generation !== ref.expected_generation
+        || requestHash !== material.request_hash || requestHash !== ref.request_hash
+        || !admitted || admitted.plan !== null || admitted.admission.kind !== "document"
+        || admitted.admission.operation !== "navigation.reconcile" || admitted.admission.verdict !== "allow"
+        || admitted.admission.project_id !== this.projectId || admitted.admission.request_id !== ref.request_id
+        || admitted.admission.request_hash !== requestHash
+        || admitted.admission.resources.length !== 1
+        || admitted.admission.resources[0]?.resource_id !== `navigation:${ref.zone}`
+        || admitted.admission.resources[0]?.resource_type !== "navigation"
+        || admitted.admission.resources[0]?.zone !== ref.zone
+        || admitted.admission.resources[0]?.version !== String(ref.expected_generation)
+        || ref.authority_ref !== `${await journal.root()}/admission.json`) throw new Error("admission");
+      const receipt = await new ManagedDocumentRequestLedger(runtime.objects).readReceipt(this.projectId, ref.request_id);
+      if (receipt) throw new Error("receipt");
+      budget.beforeHttp();
+      const frozenRaw = await runtime.objects.readText(`${machineDocumentRoot(this.projectId)}/requests/${ref.request_id}/navigation-admitted-state.json`);
+      if (frozenRaw === null) throw new Error("state");
+      const frozen = JSON.parse(frozenRaw) as Record<string, unknown>;
+      if (frozen.schema_version !== "1.0" || frozen.project_id !== this.projectId || frozen.request_id !== ref.request_id
+        || frozen.request_hash !== requestHash || frozen.project_revision !== navigationRequest.expected_project_revision
+        || await sha256Canonical(frozen.state) !== frozen.state_hash || canonicalJson(frozen) !== frozenRaw) throw new Error("state");
+      const frozenState = normalizeProjectState(frozen.state as ProjectState);
+      const sources = new ZoneNavigationSources(runtime);
+      const source = await sources.readState(this.projectId, ref.zone, budget);
+      if (source.adopted || source.in_flight_resource_ids.length > 0
+        || (source.adoption_request_id !== null && source.adoption_request_id !== ref.request_id)
+        || (source.adoption_request_id === null && source.adoption_generation !== null)
+        || (source.adoption_request_id === ref.request_id && source.adoption_generation !== source.generation)
+        || `source:${source.generation}` !== ref.source_snapshot_id) throw new Error("source");
+      const inventory = new ZoneNavigationInventory(runtime, sources);
+      const engine = new ZoneNavigationEngine(runtime, inventory);
+      const checkpoint = await engine.readRecoverableOrphanCheckpoint(
+        navigationRequest, frozenState, admitted.admission, budget
+      );
+      if (!checkpoint || !navigationOrphanCheckpointMatches(checkpoint, material, navigationRequest, source.generation)) {
+        throw new Error("checkpoint");
+      }
+      const progress = await journal.status();
+      if (!progress || progress.terminal || progress.status === "conflict") throw new Error("terminal");
+    } catch {
+      return Response.json({ error: "navigation_recovery_proof_unavailable" }, { status: 409 });
+    }
+
+    return this.withWakeScheduleLock(async () => {
+      const stopKey = `${NAVIGATION_RETRY_PREFIX}${ref.request_id}`;
+      const stopRaw = await this.ctx.storage.get<string>(stopKey);
+      let stop: { stopped?: unknown } | null = null;
+      try { stop = stopRaw === undefined ? null : JSON.parse(stopRaw) as { stopped?: unknown }; }
+      catch { return Response.json({ error: "navigation_recovery_stop_invalid" }, { status: 409 }); }
+      const matchingRecoveryState = stop?.stopped === false
+        && stopRaw !== undefined
+        && (() => {
+          try {
+            const value = JSON.parse(stopRaw) as Record<string, unknown>;
+            return value.recovery_epoch === NAVIGATION_ORPHAN_RECOVERY_EPOCH && value.marker_hash === markerHash;
+          } catch { return false; }
+        })();
+      if (stop?.stopped !== true && (!existing || !matchingRecoveryState)) {
+        return Response.json({ error: "navigation_recovery_stop_missing" }, { status: 409 });
+      }
+      const workKey = this.navigationWorkKey(ref.request_id);
+      const workValue = canonicalJson(ref);
+      const currentWork = await this.ctx.storage.get<string>(workKey);
+      if (currentWork !== undefined && currentWork !== workValue) {
+        return Response.json({ error: "navigation_recovery_work_conflict" }, { status: 409 });
+      }
+      if (!existing) {
+        existing = {
+          schema_version: "1.0", recovery_epoch: NAVIGATION_ORPHAN_RECOVERY_EPOCH,
+          marker_hash: markerHash, material, workRef: ref, prior_stop: stopRaw!, status: "pending_ack"
+        };
+        await this.ctx.storage.put(key, canonicalJson(existing));
+      }
+      if (currentWork === undefined) await this.ctx.storage.put(workKey, workValue);
+      await this.ctx.storage.put(stopKey, canonicalJson({ stopped: false, next_attempt_at: null, recovery_epoch: NAVIGATION_ORPHAN_RECOVERY_EPOCH, marker_hash: markerHash }));
+      const alarm = await this.ctx.storage.getAlarm();
+      if (alarm === null || alarm > Date.now() + MATERIALIZATION_ALARM_DELAY_MS) {
+        await this.ctx.storage.setAlarm(Date.now() + MATERIALIZATION_ALARM_DELAY_MS);
+      }
+      const armed = { ...existing!, status: "acknowledged" as const };
+      await this.ctx.storage.put(key, canonicalJson(armed));
+      return Response.json({ project_id: this.projectId, request_id: ref.request_id, status: "scheduled", marker_hash: markerHash, replayed }, { status: 202 });
+    });
+  }
+
+  private async markNavigationOrphanRecoveryConsumed(requestId: string): Promise<void> {
+    const key = this.navigationOrphanRecoveryKey(requestId);
+    const raw = await this.ctx.storage.get<string>(key);
+    if (raw === undefined) return;
+    try {
+      const marker = JSON.parse(raw) as StoredNavigationOrphanRecoveryMarker;
+      if (marker.status !== "consumed") await this.ctx.storage.put(key, canonicalJson({ ...marker, status: "consumed" }));
+    } catch {
+      // A malformed marker cannot change navigation selection or recovery state.
+    }
+  }
+
   private async acknowledgeVerifiedHumanHead(revision: number, projectionVersion: number): Promise<void> {
     const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
     const readRuntime = createProductionPersistence(
@@ -2096,6 +2285,36 @@ function parseNavigationWorkDiagnostic(
   } catch {
     return null;
   }
+}
+
+function navigationOrphanCheckpointMatches(
+  checkpoint: RecoverableOrphanCheckpoint,
+  material: NavigationOrphanRecoveryMaterial,
+  request: NavigationReconcileRequest,
+  sourceGeneration: number
+): boolean {
+  return checkpoint.project_id === request.project_id
+    && checkpoint.request_id === request.request_id
+    && checkpoint.request_hash === material.request_hash
+    && checkpoint.snapshot_id === material.source_snapshot_id
+    && checkpoint.snapshot_id === `source:${sourceGeneration}`
+    && checkpoint.page === checkpoint.page_count
+    && checkpoint.legacy === true
+    && checkpoint.cursor_envelope === null
+    && checkpoint.cursor_after === undefined
+    && checkpoint.cursor_before === material.checkpoint.cursor_before
+    && checkpoint.rawprogress_sha256 === material.checkpoint.progress_sha256
+    && checkpoint.orphan_page_sha256 === material.checkpoint.orphan_page_sha256
+    && checkpoint.page === material.checkpoint.page
+    && checkpoint.target_generation === material.checkpoint.target_generation
+    && sourceGeneration >= 0
+    && checkpoint.target_generation === request.expected_generation + 1
+    && checkpoint.entry_count > 0
+    && checkpoint.gap_count === 0
+    && checkpoint.proof_count === checkpoint.entry_count
+    && checkpoint.persisted_proof_count <= checkpoint.proof_count
+    && request.purpose !== "compact_catalog_rebuild"
+    && checkpoint.writer === "inventory";
 }
 
 function materializationRetryDelayMs(error: unknown): number {

@@ -148,12 +148,29 @@ describe("saved initial listing deadline behavior", () => {
     const orphanPath = `${journalRoot}/navigation/snapshot/00000000.json`;
     h.put(orphanPath, canonicalJson(legacyOrphan));
     const engine = new ZoneNavigationEngine(h.runtime, h.inventory);
-    let navigationResult = await engine.reconcile(navRequest, navState, navAdmission as never, budget(32), { deferPublication: true });
+    const sharedSlice = budget(32);
+    await h.sources.readState(projectId, "WORKING", sharedSlice);
+    expect(sharedSlice.calls_left).toBe(30);
+    const inventoryTrace: unknown[] = [];
+    const originalListPage = h.inventory.listPage.bind(h.inventory);
+    vi.spyOn(h.inventory, "listPage").mockImplementation(async (input) => {
+      const before = input.budget.calls_left;
+      try {
+        const page = await originalListPage(input);
+        inventoryTrace.push({ before, after: input.budget.calls_left, entries: page.entries.map((entry) => entry.resource_id), next_cursor: page.next_cursor });
+        return page;
+      } catch (error) {
+        inventoryTrace.push({ before, after: input.budget.calls_left, error: error instanceof Error ? error.message : String(error) });
+        throw error;
+      }
+    });
+    let navigationResult = await engine.reconcile(navRequest, navState, navAdmission as never, sharedSlice, { deferPublication: true });
     let slices = 1;
     let savedProgress = JSON.parse(h.files.get(`${journalRoot}/navigation-progress.json`)!.content);
     expect(savedProgress.source_count).toBe(0);
     expect(savedProgress.page_count).toBe(0);
-    expect(savedProgress.cursor).toContain("@navigation-orphan-replay:v1:");
+    expect(savedProgress.cursor, JSON.stringify({ navigationResult, calls_left: sharedSlice.calls_left,
+      provider_calls: h.providerCalls, inventoryTrace, savedProgress })).toContain("@navigation-orphan-replay:v1:");
     for (; navigationResult.status === "pending" && slices < 20; slices += 1) {
       navigationResult = await engine.reconcile(navRequest, navState, navAdmission as never, budget(32), { deferPublication: true });
       savedProgress = JSON.parse(h.files.get(`${journalRoot}/navigation-progress.json`)!.content);

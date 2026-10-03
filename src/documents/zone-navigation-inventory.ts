@@ -216,7 +216,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     projectId: string,
     zone: NavigationZone,
     cursor: string | null,
-    _requestedLimit: number,
+    requestedLimit: number,
     snapshotId: string,
     budget: SliceBudget,
     persistCatalog = true
@@ -268,6 +268,7 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
     const headCache = new Map<string, InitialHeadReadCache>();
     let offset = 0;
     while (offset < listedEntries.length) {
+      if (entries.length >= requestedLimit) break;
       const item = listedEntries[offset];
       // Only ordinary, identity-matching active heads can share a slice. The
       // preflight spends four calls and the two unchanged proof/CAS chains
@@ -279,7 +280,8 @@ export class ZoneNavigationInventory implements NavigationInventoryPort {
       // A slow/non-ordinary second head can consume the shared deadline even
       // though the first head is independently verifiable; retrying the same
       // saved cursor would otherwise repeat that preflight forever.
-      if (persistCatalog && !protectCheckpoint && !(offset === 0 && reusingSavedListing)
+      const remainingEntrySlots = requestedLimit - entries.length;
+      if (persistCatalog && remainingEntrySlots >= 2 && !protectCheckpoint && !(offset === 0 && reusingSavedListing)
         && offset + 1 < listedEntries.length && pageBudget.canStartEffect(22)) {
         const pair = await this.ordinaryInitialPair(projectId, zone, listedEntries.slice(offset, offset + 2), snapshotId, pageBudget, headCache);
         if (pair) {

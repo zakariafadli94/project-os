@@ -473,6 +473,13 @@ export interface ManagedDocumentReconcileAllSummary {
   cursor_resets: number;
   jobs_pending: number;
   job_failures: number;
+  local_handoffs_acknowledged: number;
+  unread_feed: boolean;
+  budget_yield_slices: number;
+  future_eligible_jobs: number;
+  stopped_unresolved_jobs: number;
+  safe_error_count: number;
+  earliest_local_wake_at: number | null;
 }
 
 export interface SearchFleetReconcileSummary {
@@ -493,6 +500,13 @@ interface ManagedDocumentProjectSummary {
   cursor_reset: boolean;
   jobs_pending: number;
   job_failures: number;
+  local_handoff_acknowledged: boolean;
+  unread_feed: boolean;
+  budget_yield: boolean;
+  future_eligible_jobs: number;
+  stopped_unresolved_jobs: number;
+  safe_errors: string[];
+  next_local_wake_at: number | null;
 }
 
 interface MaterializationStatusResponse {
@@ -1017,7 +1031,14 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
     conflicts: 0,
     cursor_resets: 0,
     jobs_pending: 0,
-    job_failures: 0
+    job_failures: 0,
+    local_handoffs_acknowledged: 0,
+    unread_feed: false,
+    budget_yield_slices: 0,
+    future_eligible_jobs: 0,
+    stopped_unresolved_jobs: 0,
+    safe_error_count: 0,
+    earliest_local_wake_at: null
   };
 
   let cursor = 0;
@@ -1033,6 +1054,14 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
         const response = await stub.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
         if (!response.ok) throw new Error(`ProjectGuard returned ${response.status}`);
         const projectSummary = await response.json<ManagedDocumentProjectSummary>();
+        if (!projectSummary || typeof projectSummary !== "object"
+          || !Number.isSafeInteger(projectSummary.jobs_pending) || projectSummary.jobs_pending < 0
+          || !Number.isSafeInteger(projectSummary.future_eligible_jobs) || projectSummary.future_eligible_jobs < 0
+          || !Number.isSafeInteger(projectSummary.stopped_unresolved_jobs) || projectSummary.stopped_unresolved_jobs < 0
+          || !Array.isArray(projectSummary.safe_errors) || projectSummary.safe_errors.length > 8
+          || !projectSummary.safe_errors.every(value => typeof value === "string" && /^[a-z_]{1,64}$/.test(value))) {
+          throw new Error("ProjectGuard returned an invalid local document continuation summary");
+        }
         summary.provider_entries_scanned += projectSummary.scanned;
         summary.captured += projectSummary.captured;
         summary.ingested += projectSummary.ingested;
@@ -1042,6 +1071,19 @@ export async function reconcileManagedDocuments(env: Env): Promise<ManagedDocume
         summary.cursor_resets += projectSummary.cursor_reset ? 1 : 0;
         summary.jobs_pending += projectSummary.jobs_pending;
         summary.job_failures += projectSummary.job_failures;
+        if (projectSummary.local_handoff_acknowledged === true) summary.local_handoffs_acknowledged += 1;
+        summary.unread_feed = summary.unread_feed || projectSummary.unread_feed === true;
+        if (projectSummary.budget_yield === true) summary.budget_yield_slices += 1;
+        summary.future_eligible_jobs += projectSummary.future_eligible_jobs;
+        summary.stopped_unresolved_jobs += projectSummary.stopped_unresolved_jobs;
+        summary.safe_error_count += projectSummary.safe_errors.filter(code =>
+          !(projectSummary.stopped_unresolved_jobs > 0
+            && (code === "identical_internal_feed_failure_limit" || code === "identical_internal_document_prelude_failure_limit"))).length;
+        if (Number.isSafeInteger(projectSummary.next_local_wake_at) && projectSummary.next_local_wake_at !== null) {
+          summary.earliest_local_wake_at = summary.earliest_local_wake_at === null
+            ? projectSummary.next_local_wake_at
+            : Math.min(summary.earliest_local_wake_at, projectSummary.next_local_wake_at);
+        }
       } catch (error) {
         summary.projects_failed += 1;
         console.error("Project OS managed document reconcile failed", {

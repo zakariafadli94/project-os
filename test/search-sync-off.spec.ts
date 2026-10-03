@@ -164,7 +164,16 @@ describe("PROJECT_OS_SEARCH_SYNC_MODE real off environment", () => {
               restored: 0,
               conflicts: 0,
               cursor_reset: false,
-              changed_document_ids: []
+              changed_document_ids: [],
+              jobs_pending: 0,
+              job_failures: 0,
+              local_handoff_acknowledged: true,
+              unread_feed: false,
+              budget_yield: false,
+              future_eligible_jobs: 0,
+              stopped_unresolved_jobs: 0,
+              safe_errors: [],
+              next_local_wake_at: null
             });
           }
         })

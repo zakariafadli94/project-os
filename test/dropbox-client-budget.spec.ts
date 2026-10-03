@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DropboxClient } from "../src/persistence/providers/dropbox/client";
+import { createProductionPersistence } from "../src/persistence/production-factory";
 import { installDropboxMock } from "./helpers/mock-dropbox";
+import type { Env } from "../src/env";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -8,6 +10,28 @@ afterEach(() => {
 });
 
 describe("DropboxClient bounded request scope", () => {
+  it("opts only document slices into one transport attempt while preserving other scoped defaults", async () => {
+    const attempts = async (singleAttempt: boolean) => {
+      let metadataCalls = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (url.pathname === "/oauth2/token") return Response.json({ access_token: "test-access-token", expires_in: 14_400 });
+        metadataCalls += 1;
+        return Response.json({ error_summary: "server_error" }, { status: 500 });
+      });
+      const scope = { deadlineMs: Date.now() + 60_000, signal: new AbortController().signal, beforeHttp: () => undefined };
+      const runtime = createProductionPersistence({
+        DROPBOX_APP_KEY: "test-key", DROPBOX_APP_SECRET: "test-secret", DROPBOX_REFRESH_TOKEN: "test-refresh"
+      } as unknown as Env, "PRJ-0001", scope, singleAttempt ? { singleAttempt: true } : {});
+      await expect(runtime.objects.getMetadata("/retry-test")).rejects.toBeDefined();
+      vi.restoreAllMocks();
+      return metadataCalls;
+    };
+
+    await expect(attempts(false)).resolves.toBeGreaterThan(1);
+    await expect(attempts(true)).resolves.toBe(1);
+  }, 15_000);
+
   it("charges the token refresh and metadata request to the same slice", async () => {
     installDropboxMock();
     let calls = 0;

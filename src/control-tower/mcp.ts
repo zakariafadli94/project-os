@@ -22,6 +22,14 @@ const localRecoveryDiagnosticSchema = z.object({
   failure_attempts: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
   failure_code: z.string().regex(/^[A-Za-z0-9._/-]{1,96}$/).nullable(),
   failure_next_attempt_at: z.string().datetime().nullable(),
+  failure_identity: z.object({
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    classification: z.enum(["provider_temporary", "provider_blocked", "continuation", "internal"]),
+    error_name: z.enum(["Error", "TypeError", "RangeError", "SyntaxError", "UnknownError",
+      "ProviderOperationError", "ProviderConflictError", "ProviderNotFoundError"]),
+    progress_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    external_progress_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional()
+  }).optional(),
   alarm_readable: z.boolean(),
   alarm_at: z.string().datetime().nullable(),
   local_receipt_present: z.boolean().nullable(),

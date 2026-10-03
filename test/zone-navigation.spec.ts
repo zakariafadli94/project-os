@@ -1064,17 +1064,16 @@ describe("zone navigation identity and resumable reconciliation", () => {
     const readBytes = harness.runtime.objects.readBytes!.bind(harness.runtime.objects);
     let pageReads = 0;
     harness.runtime.objects.readBytes = async (path, maxBytes) => {
-      if (path === pagePath && ++pageReads === 2) {
-        harness.put(pagePath, canonicalJson({ ...page, entries: [] }));
-      }
-      return readBytes(path, maxBytes);
+      const bytes = await readBytes(path, maxBytes);
+      if (path === pagePath && ++pageReads === 1) harness.put(pagePath, canonicalJson({ ...page, entries: [] }));
+      return bytes;
     };
 
     const result = await new ZoneNavigationEngine(harness.runtime, inventory.port)
       .reconcile(input, project, admission, budget(256), { deferPublication: true });
 
     expect(result).toMatchObject({ status: "conflict" });
-    expect(pageReads).toBe(2);
+    expect(pageReads).toBe(1);
     expect(JSON.parse(harness.files.get(`${root}/navigation-progress.json`)!.content)).toMatchObject({ page_count: 0, source_count: 0, cursor: null });
   });
 

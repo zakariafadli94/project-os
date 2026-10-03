@@ -50,6 +50,56 @@ describe("compact catalog adoption gate", () => {
 });
 
 describe("saved initial listing deadline behavior", () => {
+  it("honors a one-entry limit and carries the unprocessed saved-head suffix forward", async () => {
+    const h = harness();
+    const ids = [0, 1, 2].map((index) => `DOC-${index.toString(16).toUpperCase().padStart(24, "0")}`);
+    for (const [index, id] of ids.entries()) {
+      await addWorkingHead(h, `limit body ${index}`, `rev-limit-${index}`, id,
+        `VER-REQ-${index.toString(16).toUpperCase().padStart(24, "0")}`, `limit-${index}.md`);
+    }
+    const cursor = `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: ids.map((id) => ({ kind: "file" as const, name: `${id}.json`, path: machineDocumentHeadPath(projectId, id) })),
+      provider_cursor: null,
+      listing_limit: 512
+    }))}`;
+
+    const first = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 1,
+      mode: "canonical_catalog_rebuild", budget: budget(256) });
+    expect(first.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[0]}`]);
+    expect(first.next_cursor).toContain(ids[1]);
+    expect(first.next_cursor).toContain(ids[2]);
+
+    const second = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: first.next_cursor, limit: 1,
+      mode: "canonical_catalog_rebuild", budget: budget(256) });
+    expect(second.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[1]}`]);
+    expect(second.next_cursor).toContain(ids[2]);
+  });
+
+  it("does not use a two-head pair when a saved page has only one entry slot left", async () => {
+    const h = harness();
+    const ids = [0, 1, 2].map((index) => `DOC-${(index + 10).toString(16).toUpperCase().padStart(24, "0")}`);
+    h.put(machineDocumentHeadPath(projectId, ids[0]), JSON.stringify({
+      schema_version: "1.0", project_id: projectId, document_id: ids[0], kind: "work_product",
+      logical_path: "inactive-prefix.md", reconciliation_status: "clean"
+    }));
+    for (const [index, id] of ids.slice(1).entries()) {
+      await addWorkingHead(h, `pair limit body ${index}`, `rev-pair-limit-${index}`, id,
+        `VER-REQ-${(index + 10).toString(16).toUpperCase().padStart(24, "0")}`, `pair-limit-${index}.md`);
+    }
+    const cursor = `initial:${encodeURIComponent(JSON.stringify({
+      kind: "zone-navigation-head-batch-v1",
+      entries: ids.map((id) => ({ kind: "file" as const, name: `${id}.json`, path: machineDocumentHeadPath(projectId, id) })),
+      provider_cursor: null,
+      listing_limit: 512
+    }))}`;
+
+    const page = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor, limit: 1, budget: budget(256) });
+
+    expect(page.entries.map((entry) => entry.resource_id)).toEqual([`head:${ids[1]}`]);
+    expect(page.next_cursor).toContain(ids[2]);
+  });
+
   it("leaves checkpoint budget after compact-cache head updates on a saved active-head page", async () => {
     const h = harness();
     const ids = ["DOC-05620E091406A4614730CCDE", "DOC-BB8C797FFF67374EF24A4CF4"];
@@ -148,12 +198,29 @@ describe("saved initial listing deadline behavior", () => {
     const orphanPath = `${journalRoot}/navigation/snapshot/00000000.json`;
     h.put(orphanPath, canonicalJson(legacyOrphan));
     const engine = new ZoneNavigationEngine(h.runtime, h.inventory);
-    let navigationResult = await engine.reconcile(navRequest, navState, navAdmission as never, budget(32), { deferPublication: true });
+    const sharedSlice = budget(32);
+    await h.sources.readState(projectId, "WORKING", sharedSlice);
+    expect(sharedSlice.calls_left).toBe(30);
+    const inventoryTrace: unknown[] = [];
+    const originalListPage = h.inventory.listPage.bind(h.inventory);
+    vi.spyOn(h.inventory, "listPage").mockImplementation(async (input) => {
+      const before = input.budget.calls_left;
+      try {
+        const page = await originalListPage(input);
+        inventoryTrace.push({ before, after: input.budget.calls_left, entries: page.entries.map((entry) => entry.resource_id), next_cursor: page.next_cursor });
+        return page;
+      } catch (error) {
+        inventoryTrace.push({ before, after: input.budget.calls_left, error: error instanceof Error ? error.message : String(error) });
+        throw error;
+      }
+    });
+    let navigationResult = await engine.reconcile(navRequest, navState, navAdmission as never, sharedSlice, { deferPublication: true });
     let slices = 1;
     let savedProgress = JSON.parse(h.files.get(`${journalRoot}/navigation-progress.json`)!.content);
     expect(savedProgress.source_count).toBe(0);
     expect(savedProgress.page_count).toBe(0);
-    expect(savedProgress.cursor).toContain("@navigation-orphan-replay:v1:");
+    expect(savedProgress.cursor, JSON.stringify({ navigationResult, calls_left: sharedSlice.calls_left,
+      provider_calls: h.providerCalls, inventoryTrace, savedProgress })).toContain("@navigation-orphan-replay:v1:");
     for (; navigationResult.status === "pending" && slices < 20; slices += 1) {
       navigationResult = await engine.reconcile(navRequest, navState, navAdmission as never, budget(32), { deferPublication: true });
       savedProgress = JSON.parse(h.files.get(`${journalRoot}/navigation-progress.json`)!.content);

@@ -111,6 +111,10 @@ export interface RecoverableOrphanCheckpoint {
   replay: { cursor: string | null; offset: number } | null;
 }
 
+interface ValidatedRecoverableOrphanCheckpoint extends RecoverableOrphanCheckpoint {
+  validated_page: SnapshotPage;
+}
+
 interface LegacyOrphanReplay {
   cursor_before: string | null;
   cursor: string | null;
@@ -152,6 +156,18 @@ export class ZoneNavigationEngine {
     admission: ExecutionAdmission,
     budget: SliceBudget
   ): Promise<RecoverableOrphanCheckpoint | null> {
+    const proof = await this.readRecoverableOrphanCheckpointWithPage(rawRequest, state, admission, budget);
+    if (!proof) return null;
+    const { validated_page: _validatedPage, ...descriptor } = proof;
+    return descriptor;
+  }
+
+  private async readRecoverableOrphanCheckpointWithPage(
+    rawRequest: NavigationReconcileRequest,
+    state: ProjectState,
+    admission: ExecutionAdmission,
+    budget: SliceBudget
+  ): Promise<ValidatedRecoverableOrphanCheckpoint | null> {
     const request = navigationReconcileSchema.parse(rawRequest);
     const requestHash = await executionHash(request);
     const journal = new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id);
@@ -249,7 +265,8 @@ export class ZoneNavigationEngine {
       rawprogress_sha256: await sha256Text(progressRaw), orphan_page_sha256: await sha256Text(pageRaw),
       entry_count: entries.length, gap_count: gaps.length, proof_count: proofRows.length,
       persisted_proof_count: proofRows.filter((proof) => proof.persisted).length,
-      replay: replay ? { cursor: replay.cursor, offset: replay.offset } : null
+      replay: replay ? { cursor: replay.cursor, offset: replay.offset } : null,
+      validated_page: page
     };
   }
 
@@ -342,13 +359,6 @@ export class ZoneNavigationEngine {
     return { text, metadata: before };
   }
 
-  private async readOrphanPageAtDigest(path: string, digest: string, budget: SliceBudget): Promise<SnapshotPage> {
-    const proof = await this.readBoundedPublicationProof(path, 2_000_000, budget);
-    if (await sha256Text(proof.text) !== digest) throw new NavigationConflict("navigation_orphan_page_changed");
-    try { return JSON.parse(proof.text) as SnapshotPage; }
-    catch { throw new NavigationConflict("navigation_orphan_page_invalid"); }
-  }
-
   private async proveTargetWasNeverPublished(
     request: NavigationReconcileRequest,
     headPath: string,
@@ -417,13 +427,7 @@ export class ZoneNavigationEngine {
         : null;
       while (current.status === "scanning") {
         if (orphan?.writer === "catalog_rebuild" && orphan.page === current.page_count) {
-          const pagePath = `${pagesRoot}/${orphan.page.toString().padStart(8, "0")}.json`;
-          let orphanPage: SnapshotPage;
-          try { orphanPage = await this.readOrphanPageAtDigest(pagePath, orphan.orphan_page_sha256, budget); }
-          catch (error) {
-            if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
-            throw error;
-          }
+          const orphanPage = orphan.validated_page;
           if (orphanPage.snapshot_id !== current.source_snapshot_id || orphanPage.page !== current.page_count) {
             return { status: "conflict", code: "navigation_catalog_rebuild_snapshot_page_invalid" };
           }
@@ -1246,14 +1250,14 @@ export class ZoneNavigationEngine {
     pageCount: number,
     pagesRoot: string,
     budget: SliceBudget
-  ): Promise<RecoverableOrphanCheckpoint | null> {
+  ): Promise<ValidatedRecoverableOrphanCheckpoint | null> {
     // The caller already loaded and schema-validated the current progress.
     // Probe its exact next-page path first: ordinary (non-orphan) slices need
     // only this one metadata check, while a present page still receives the
     // full stable progress/page proof in readRecoverableOrphanCheckpoint.
     const pagePath = `${pagesRoot}/${pageCount.toString().padStart(8, "0")}.json`;
     if (!await this.metadata(pagePath, budget)) return null;
-    return await this.readRecoverableOrphanCheckpoint(request, state, admission, budget);
+    return await this.readRecoverableOrphanCheckpointWithPage(request, state, admission, budget);
   }
 
   private async resumeInventory(
@@ -1271,13 +1275,7 @@ export class ZoneNavigationEngine {
     );
     while (!progress.inventory_complete) {
       if (orphan?.writer === "inventory" && orphan.page === progress.page_count) {
-        const pagePath = `${pagesRoot}/${orphan.page.toString().padStart(8, "0")}.json`;
-        let page: SnapshotPage;
-        try { page = await this.readOrphanPageAtDigest(pagePath, orphan.orphan_page_sha256, budget); }
-        catch (error) {
-          if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
-          throw error;
-        }
+        const page = orphan.validated_page;
         if (page.snapshot_id !== orphan.snapshot_id || page.page !== progress.page_count) {
           return { status: "conflict", code: "navigation_orphan_page_invalid" };
         }

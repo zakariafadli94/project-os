@@ -207,7 +207,7 @@ async function seedAdoptingProgress(
   harness: ReturnType<typeof runtimeHarness>,
   input: NavigationReconcileRequest,
   pageCount: number,
-  cursor: string,
+  cursor: string | null,
   sourceEntry?: NavigationInventoryEntry
 ) {
   const root = await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).root();
@@ -544,6 +544,63 @@ describe("zone navigation identity and resumable reconciliation", () => {
     await expensiveEngine.prepareCompactCatalogRebuild(input, project, admission, budget(32));
     expect(JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content)).toMatchObject({ verify_page: 1, verify_cursor: null });
   });
+
+  it("recovers a catalog rebuild orphan from its embedded cursor envelope", async () => {
+    const h = runtimeHarness();
+    const project = state();
+    const input = navigationReconcileSchema.parse({
+      ...request("REVIEW"), request_id: "DOCREQ-NAV-CATALOG-ORPHAN-0001",
+      purpose: "compact_catalog_rebuild", expected_source_generation: 0,
+      expected_catalog_manifest: { object_id: "manifest-object", revision_token: "manifest-rev", content_sha256: "a".repeat(64) }
+    }) as NavigationCatalogRebuildRequest;
+    const root = await new ExecutionJournal(h.runtime, input.project_id, "document", input.request_id).root();
+    const entry = {
+      project_id: input.project_id, zone: input.zone, resource_id: "head:DOC-000000000000000000000001",
+      version: "VER-1", logical_path: "plans/one.md",
+      path: `${workspaceProjectRoot(input.project_id, project.slug)}/REVIEW/plans/one.md`,
+      expected: { object_id: "id:one", revision_token: "rev:one", content_sha256: "b".repeat(64), size: 1 }
+    } as NavigationInventoryEntry;
+    const second = { ...entry, resource_id: "head:DOC-000000000000000000000002", version: "VER-2", logical_path: "plans/two.md",
+      path: `${workspaceProjectRoot(input.project_id, project.slug)}/REVIEW/plans/two.md`, expected: { ...entry.expected, object_id: "id:two", revision_token: "rev:two" } };
+    const page = { schema_version: "1.0", page: 0, project_id: input.project_id, request_id: input.request_id,
+      snapshot_id: "source:0", entries: [entry, second], gaps: [],
+      cursor_envelope: { request_hash: await executionHash(input), cursor_before: null, cursor_after: "after-original-page" } };
+    h.put(`${root}/navigation/catalog-rebuild/snapshot/00000000.json`, canonicalJson(page));
+    h.put(`${root}/navigation-catalog-rebuild-progress.json`, canonicalJson(navigationCatalogRebuildProgressSchema.parse({
+      schema_version: "1.0", purpose: "compact_catalog_rebuild", project_id: input.project_id, request_id: input.request_id,
+      request_hash: await executionHash(input), zone: input.zone, source_generation: 0, source_snapshot_id: "source:0",
+      cursor: null, page_count: 0, source_count: 0, source_ids: [], shard_cursor: 0, shard_count: 0,
+      stage_page: 0, staging_entries: [], staged_shards: [], invalidated_manifest: null, chunk_evidence: [],
+      status: "scanning", finalization_ref: null, coverage_gaps: []
+    })));
+    const manifestPath = `${machineDocumentRoot(input.project_id)}/navigation-sources/REVIEW/catalog/compact/ready.json`;
+    const admission = { ...(await admissionFor(input)), resource_effect_scopes: [{
+      resource_id: "navigation:REVIEW", resource_version: "0", provider_id: "test-provider",
+      sources: [{ path: manifestPath, logical_path: manifestPath }], destinations: [{ path: manifestPath, logical_path: manifestPath }], preservation_copies: []
+    }] } as ExecutionAdmission;
+    let listCalls = 0;
+    const port: NavigationInventoryPort = {
+      listPage: async ({ cursor, budget: slice }) => {
+        listCalls += 1; slice.beforeHttp();
+        if (cursor === "after-original-page") return { entries: [], gaps: [], snapshot_id: "source:0", next_cursor: null };
+        throw new Error("orphan page should be reused");
+      },
+      verifySnapshot: async () => true,
+      verifyEntry: async () => false
+    };
+
+    const engine = new ZoneNavigationEngine(h.runtime, port);
+    const checkpoint = await engine.readRecoverableOrphanCheckpoint(input, project, admission, budget(32));
+    expect(checkpoint).toMatchObject({ writer: "catalog_rebuild", page: 0, cursor_before: null, cursor_after: "after-original-page" });
+    const result = await engine.prepareCompactCatalogRebuild(input, project, admission, budget(256));
+
+    expect(listCalls).toBe(1);
+    expect(result.status).toBe("conflict");
+    expect(JSON.parse(h.files.get(`${root}/navigation-catalog-rebuild-progress.json`)!.content)).toMatchObject({
+      cursor: null, page_count: 2, source_count: 2, source_ids: [entry.resource_id, second.resource_id]
+    });
+    expect(JSON.parse(h.files.get(`${root}/navigation/catalog-rebuild/snapshot/00000000.json`)!.content)).toEqual(page);
+  });
   it("keeps legacy reconcile requests compatible and binds catalog rebuild purpose to the exact manifest", () => {
     const normal = request();
     expect(normal.purpose).toBeUndefined();
@@ -740,7 +797,7 @@ describe("zone navigation identity and resumable reconciliation", () => {
     const saved = JSON.parse(harness.files.get(`${root}/navigation-progress.json`)!.content) as { cursor: string | null; page_count: number };
     const artifactPageCalls = harness.listingCalls.filter((call) => call.path === artifactsRoot).length - initialArtifactPageCount;
     expect(result.status).toBe("pending");
-    expect(artifactPageCalls, JSON.stringify({ result, saved, listing: harness.listingCalls })).toBe(7);
+    expect(artifactPageCalls, JSON.stringify({ result, saved, listing: harness.listingCalls })).toBe(6);
     expect(saved.cursor).not.toBe(`artifacts:${encodeURIComponent(firstProviderEntry)}`);
     expect(saved.page_count).toBe(1);
     expect(saved.page_count).toBeLessThan(artifactPageCalls);
@@ -851,6 +908,194 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(result).toMatchObject({ status: "prepared", source_snapshot_id: "snapshot-1" });
     expect(harness.files.has(`${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/00-CURRENT.md`)).toBe(false);
     expect(harness.files.has(`${machineDocumentRoot(project.project_id)}/navigation/WORKING/head.json`)).toBe(false);
+    const root = await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).root();
+    const snapshotPage = JSON.parse(harness.files.get(`${root}/navigation/snapshot/00000000.json`)!.content);
+    expect(snapshotPage.cursor_envelope).toEqual({
+      request_hash: await executionHash(input),
+      cursor_before: null,
+      cursor_after: null
+    });
+  });
+
+  it("recovers a page after its immutable write when the resumed inventory batch is smaller", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const inventory = await inventoryHarness(project);
+    seedTarget(harness, inventory);
+    const secondPath = `${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/plans/roadmap-2.md`;
+    const secondContent = "Second canonical content\n";
+    const secondMetadata = harness.put(secondPath, secondContent, "id:target-2");
+    const secondEntry: NavigationInventoryEntry = {
+      ...inventory.entry,
+      resource_id: "DOC-1123456789ABCDEF01234567",
+      version: "VER-REQ-1123456789ABCDEF01234567",
+      logical_path: "plans/roadmap-2.md",
+      path: secondPath,
+      expected: {
+        object_id: secondMetadata.objectId!,
+        revision_token: secondMetadata.revisionToken!,
+        content_sha256: await sha256Text(secondContent),
+        size: new TextEncoder().encode(secondContent).byteLength
+      }
+    };
+    const firstProof = { resource_id: inventory.entry.resource_id, entry_hash: await executionHash(inventory.entry), persisted: false };
+    const secondProof = { resource_id: secondEntry.resource_id, entry_hash: await executionHash(secondEntry), persisted: false };
+    const originalPage = {
+      entries: [inventory.entry, secondEntry],
+      verified_entries: [firstProof, secondProof],
+      gaps: [],
+      snapshot_id: "snapshot-1",
+      next_cursor: "after-original-page"
+    };
+    let inventoryCalls = 0;
+    inventory.port.listPage = async ({ cursor, budget: slice }) => {
+      slice.beforeHttp();
+      inventoryCalls += 1;
+      if (inventoryCalls === 1) return originalPage;
+      if (cursor === null) return { ...originalPage, entries: [inventory.entry], verified_entries: [firstProof], next_cursor: "after-smaller-batch" };
+      if (cursor === "after-original-page") return { entries: [], gaps: [], snapshot_id: "snapshot-1", next_cursor: null };
+      return { entries: [], gaps: [], snapshot_id: "snapshot-1", next_cursor: cursor };
+    };
+    const admission = await admissionFor(input);
+    await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).commit(admission, null);
+    const root = await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).root();
+    const progressPath = `${root}/navigation-progress.json`;
+    const pagePath = `${root}/navigation/snapshot/00000000.json`;
+    const originalConditionalWrite = harness.runtime.conditionalWrite.writeTextConditional.bind(harness.runtime.conditionalWrite);
+    let interrupted = false;
+    harness.runtime.conditionalWrite.writeTextConditional = async (path, content, expectedToken) => {
+      if (path === progressPath && JSON.parse(content).page_count === 1 && !interrupted) {
+        interrupted = true;
+        throw new ProviderPreconditionFailedError("injected progress interruption");
+      }
+      return originalConditionalWrite(path, content, expectedToken);
+    };
+
+    const engine = new ZoneNavigationEngine(harness.runtime, inventory.port);
+    const interruptedResult = await engine.reconcile(input, project, admission, budget(256), { deferPublication: true });
+    expect(interruptedResult).toMatchObject({ status: "conflict", code: "navigation_provider_conflict" });
+    expect(interrupted).toBe(true);
+    const immutableBytes = harness.files.get(pagePath)!.content;
+    const orphan = JSON.parse(immutableBytes);
+    expect(orphan.entries).toEqual([inventory.entry, secondEntry]);
+    expect(JSON.parse(harness.files.get(progressPath)!.content)).toMatchObject({ cursor: null, page_count: 0, source_count: 0 });
+
+    harness.runtime.conditionalWrite.writeTextConditional = originalConditionalWrite;
+    const resumed = await engine.reconcile(input, project, admission, budget(256), { deferPublication: true });
+    expect(resumed.status, JSON.stringify(resumed)).toBe("prepared");
+    expect(inventoryCalls).toBe(2);
+    expect(harness.files.get(pagePath)!.content).toBe(immutableBytes);
+    expect(JSON.parse(harness.files.get(progressPath)!.content)).toMatchObject({
+      cursor: null, page_count: 2, source_count: 2, inventory_complete: true
+    });
+  });
+
+  it("resumes a null-start legacy orphan after persisting a bounded replay offset", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const inventory = await inventoryHarness(project);
+    seedTarget(harness, inventory);
+    const secondPath = `${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/plans/roadmap-2.md`;
+    const secondContent = "Second canonical content\n";
+    const secondMetadata = harness.put(secondPath, secondContent, "id:target-2");
+    const secondEntry: NavigationInventoryEntry = {
+      ...inventory.entry,
+      resource_id: "DOC-2123456789ABCDEF01234567",
+      version: "VER-REQ-2123456789ABCDEF01234567",
+      logical_path: "plans/roadmap-2.md",
+      path: secondPath,
+      expected: {
+        object_id: secondMetadata.objectId!, revision_token: secondMetadata.revisionToken!,
+        content_sha256: await sha256Text(secondContent), size: new TextEncoder().encode(secondContent).byteLength
+      }
+    };
+    const admission = await admissionFor(input);
+    await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).commit(admission, null);
+    const { root, progress } = await seedAdoptingProgress(harness, input, 0, null);
+    progress.snapshot_id = "snapshot-1";
+    harness.put(`${root}/navigation-progress.json`, JSON.stringify(progress));
+    const page = { schema_version: "1.0", page: 0, project_id: input.project_id, request_id: input.request_id,
+      snapshot_id: "snapshot-1", entries: [inventory.entry, secondEntry], verified_entries: [], gaps: [] };
+    harness.put(`${root}/navigation/snapshot/00000000.json`, JSON.stringify(page));
+    let calls = 0;
+    inventory.port.listPage = async ({ cursor, budget: slice }) => {
+      slice.beforeHttp();
+      calls += 1;
+      if (calls === 1 && cursor === null) return { snapshot_id: "snapshot-1", entries: [inventory.entry], gaps: [], next_cursor: "replay-1" };
+      if (calls === 2 && cursor === "replay-1") return { snapshot_id: "snapshot-1", entries: [secondEntry], gaps: [], next_cursor: "after-orphan" };
+      if (cursor === "after-orphan") return { snapshot_id: "snapshot-1", entries: [], gaps: [], next_cursor: null };
+      return { snapshot_id: "snapshot-1", entries: [], gaps: [], next_cursor: cursor };
+    };
+    const engine = new ZoneNavigationEngine(harness.runtime, inventory.port);
+    const first = await engine.reconcile(input, project, admission, budget(256), { deferPublication: true });
+    expect(first.status).toBe("pending");
+    const saved = JSON.parse(harness.files.get(`${root}/navigation-progress.json`)!.content);
+    expect(saved.cursor).toContain("@navigation-orphan-replay:v1:");
+    const checkpoint = await engine.readRecoverableOrphanCheckpoint(input, project, admission, budget(32));
+    expect(checkpoint).toMatchObject({ legacy: true, cursor_before: null, replay: { cursor: "replay-1", offset: 1 } });
+
+    const resumed = await engine.reconcile(input, project, admission, budget(256), { deferPublication: true });
+    expect(resumed.status, JSON.stringify(resumed)).toBe("prepared");
+    expect(calls).toBe(3);
+    expect(harness.files.get(`${root}/navigation/snapshot/00000000.json`)!.content).toBe(JSON.stringify(page));
+    expect(JSON.parse(harness.files.get(`${root}/navigation-progress.json`)!.content)).toMatchObject({
+      page_count: 2, source_count: 2, cursor: null, inventory_complete: true
+    });
+  });
+
+  it("fails closed when the orphan changes between proof and adoption", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const inventory = await inventoryHarness(project);
+    seedTarget(harness, inventory);
+    const admission = await admissionFor(input);
+    await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).commit(admission, null);
+    const { root, progress } = await seedAdoptingProgress(harness, input, 0, null);
+    progress.snapshot_id = "snapshot-1";
+    harness.put(`${root}/navigation-progress.json`, JSON.stringify(progress));
+    const page = { schema_version: "1.0", page: 0, project_id: input.project_id, request_id: input.request_id,
+      snapshot_id: "snapshot-1", entries: [inventory.entry], gaps: [],
+      cursor_envelope: { request_hash: await executionHash(input), cursor_before: null, cursor_after: null } };
+    const pagePath = `${root}/navigation/snapshot/00000000.json`;
+    harness.put(pagePath, canonicalJson(page));
+    const readBytes = harness.runtime.objects.readBytes!.bind(harness.runtime.objects);
+    let pageReads = 0;
+    harness.runtime.objects.readBytes = async (path, maxBytes) => {
+      if (path === pagePath && ++pageReads === 2) {
+        harness.put(pagePath, canonicalJson({ ...page, entries: [] }));
+      }
+      return readBytes(path, maxBytes);
+    };
+
+    const result = await new ZoneNavigationEngine(harness.runtime, inventory.port)
+      .reconcile(input, project, admission, budget(256), { deferPublication: true });
+
+    expect(result).toMatchObject({ status: "conflict" });
+    expect(pageReads).toBe(2);
+    expect(JSON.parse(harness.files.get(`${root}/navigation-progress.json`)!.content)).toMatchObject({ page_count: 0, source_count: 0, cursor: null });
+  });
+
+  it("rejects oversized and malformed orphan proof bytes before adopting progress", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = request();
+    const admission = await admissionFor(input);
+    await new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id).commit(admission, null);
+    const { root, progress } = await seedAdoptingProgress(harness, input, 0, null);
+    progress.snapshot_id = "snapshot-1";
+    harness.put(`${root}/navigation-progress.json`, canonicalJson(progress));
+    const pagePath = `${root}/navigation/snapshot/00000000.json`;
+    harness.put(pagePath, "x".repeat(2_000_001));
+    const readBytes = vi.spyOn(harness.runtime.objects, "readBytes");
+    const engine = new ZoneNavigationEngine(harness.runtime, (await inventoryHarness(project)).port);
+
+    await expect(engine.readRecoverableOrphanCheckpoint(input, project, admission, budget(32))).rejects.toThrow();
+    expect(readBytes.mock.calls.some(([path]) => path === pagePath)).toBe(false);
+    harness.put(pagePath, "not-json");
+    await expect(engine.readRecoverableOrphanCheckpoint(input, project, admission, budget(32))).rejects.toThrow();
   });
 
   it("finalizes an immutable historical receipt after a newer navigation generation replaces the head", async () => {

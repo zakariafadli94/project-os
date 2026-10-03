@@ -85,7 +85,41 @@ interface SnapshotPage {
   entries: NavigationInventoryEntry[];
   verified_entries?: { resource_id: string; entry_hash: string; persisted: boolean }[];
   gaps: { resource_id: string; code: string }[];
+  cursor_envelope?: { request_hash: string; cursor_before: string | null; cursor_after: string | null };
 }
+
+export interface RecoverableOrphanCheckpoint {
+  writer: "inventory" | "catalog_rebuild";
+  project_id: string;
+  request_id: string;
+  request_hash: string;
+  snapshot_id: string;
+  page: number;
+  page_count: number;
+  target_generation?: number;
+  source_generation?: number;
+  cursor_before: string | null;
+  cursor_after?: string | null;
+  cursor_envelope: { request_hash: string; cursor_before: string | null; cursor_after: string | null } | null;
+  legacy: boolean;
+  rawprogress_sha256: string;
+  orphan_page_sha256: string;
+  entry_count: number;
+  gap_count: number;
+  proof_count: number;
+  persisted_proof_count: number;
+  replay: { cursor: string | null; offset: number } | null;
+}
+
+interface LegacyOrphanReplay {
+  cursor_before: string | null;
+  cursor: string | null;
+  offset: number;
+  gap_offset: number;
+  orphan_page_sha256: string;
+}
+
+const LEGACY_ORPHAN_REPLAY_PREFIX = "@navigation-orphan-replay:v1:";
 
 function catalogRebuildShardMatchesSourceIds(sourceIds: readonly string[], shard: number, entries: readonly NavigationInventoryEntry[]): boolean {
   const expectedIds = sourceIds.filter((resourceId) => zoneNavigationCatalogShardForResource(resourceId) === shard);
@@ -108,6 +142,116 @@ export class ZoneNavigationEngine {
     private readonly postchecks?: NavigationPostcheckPort,
     private readonly postcheckRules: readonly RuleVersion[] = []
   ) {}
+
+  /** Read a bounded proof that the immutable page at the current progress
+   * cursor can be safely resumed. Legacy pages intentionally expose no
+   * cursor-after claim; callers must replay the exact ordered entries. */
+  async readRecoverableOrphanCheckpoint(
+    rawRequest: NavigationReconcileRequest,
+    state: ProjectState,
+    admission: ExecutionAdmission,
+    budget: SliceBudget
+  ): Promise<RecoverableOrphanCheckpoint | null> {
+    const request = navigationReconcileSchema.parse(rawRequest);
+    const requestHash = await executionHash(request);
+    const journal = new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id);
+    const root = await journal.root();
+    const rebuild = request.purpose === "compact_catalog_rebuild";
+    if (rebuild) this.assertCatalogRebuildAdmission(request as NavigationCatalogRebuildRequest, state, admission, requestHash);
+    else this.assertAdmission(request, state, admission, requestHash,
+      this.indexPath(state, request.zone, request.expected_index?.basename ?? "00-CURRENT.md"), false);
+    const progressPath = `${root}/${rebuild ? "navigation-catalog-rebuild-progress.json" : "navigation-progress.json"}`;
+    const progressProof = await this.readBoundedPublicationProof(progressPath, 2_000_000, budget, true);
+    if (!progressProof) return null;
+    const progressRaw = progressProof.text;
+    let progressValue: unknown;
+    try { progressValue = JSON.parse(progressRaw); }
+    catch { throw new NavigationConflict("navigation_orphan_progress_invalid"); }
+    if (!isRecord(progressValue)) throw new NavigationConflict("navigation_orphan_progress_invalid");
+    let pageCount: number;
+    let snapshotId: string | null;
+    let persistedCursor: string | null;
+    let targetGeneration: number | undefined;
+    let sourceGeneration: number | undefined;
+    if (rebuild) {
+      const parsed = navigationCatalogRebuildProgressSchema.safeParse(progressValue);
+      if (!parsed.success) throw new NavigationConflict("navigation_orphan_progress_invalid");
+      const progress = parsed.data;
+      if (progress.project_id !== request.project_id || progress.request_id !== request.request_id
+        || progress.request_hash !== requestHash || progress.zone !== request.zone
+        || progress.source_generation !== request.expected_source_generation || progress.status !== "scanning") return null;
+      pageCount = progress.page_count;
+      snapshotId = progress.source_snapshot_id;
+      persistedCursor = progress.cursor;
+      sourceGeneration = progress.source_generation;
+    } else {
+      const parsed = navigationProgressSchema.safeParse(progressValue);
+      if (!parsed.success) throw new NavigationConflict("navigation_orphan_progress_invalid");
+      const progress = parsed.data;
+      if (progress.project_id !== request.project_id || progress.request_id !== request.request_id
+        || progress.request_hash !== requestHash || progress.target_generation !== request.expected_generation + 1
+        || progress.status !== "adopting" || progress.inventory_complete) return null;
+      pageCount = progress.page_count;
+      snapshotId = progress.snapshot_id;
+      persistedCursor = progress.cursor;
+      targetGeneration = progress.target_generation;
+    }
+    const replay = decodeLegacyOrphanReplay(persistedCursor);
+    if (persistedCursor?.startsWith(LEGACY_ORPHAN_REPLAY_PREFIX) && !replay) throw new NavigationConflict("navigation_orphan_replay_invalid");
+    const cursorBefore = replay ? replay.cursor_before : persistedCursor;
+    const pagesRoot = rebuild ? `${root}/navigation/catalog-rebuild/snapshot` : `${root}/navigation/snapshot`;
+    const pagePath = `${pagesRoot}/${pageCount.toString().padStart(8, "0")}.json`;
+    const pageProof = await this.readBoundedPublicationProof(pagePath, 2_000_000, budget, true);
+    if (!pageProof) return null;
+    const pageRaw = pageProof.text;
+    let rawPage: unknown;
+    try { rawPage = JSON.parse(pageRaw); }
+    catch { throw new NavigationConflict("navigation_orphan_page_invalid"); }
+    if (!isRecord(rawPage) || rawPage.schema_version !== "1.0" || rawPage.page !== pageCount
+      || rawPage.project_id !== request.project_id || rawPage.request_id !== request.request_id
+      || typeof rawPage.snapshot_id !== "string" || (snapshotId !== null && rawPage.snapshot_id !== snapshotId)
+      || !Array.isArray(rawPage.entries) || rawPage.entries.length > 512 || !Array.isArray(rawPage.gaps) || rawPage.gaps.length > 512
+      || (rawPage.verified_entries !== undefined && !Array.isArray(rawPage.verified_entries))) throw new NavigationConflict("navigation_orphan_page_invalid");
+    const page = rawPage as unknown as SnapshotPage;
+    let entries: NavigationInventoryEntry[];
+    let gaps: { resource_id: string; code: string }[];
+    try {
+      entries = page.entries.map((entry) => navigationInventoryEntrySchema.parse(entry));
+      gaps = page.gaps.map((gap) => navigationCoverageGapSchema.parse(gap));
+    } catch { throw new NavigationConflict("navigation_orphan_page_invalid"); }
+    for (const entry of entries) this.assertEntry(entry, state, request.zone);
+    const proofRows = page.verified_entries ?? [];
+    for (const proof of proofRows) {
+      if (!isRecord(proof)) throw new NavigationConflict("navigation_orphan_page_invalid");
+      const matching = entries.find((entry) => entry.resource_id === proof.resource_id);
+      if (!matching || !/^[a-f0-9]{64}$/.test(proof.entry_hash) || typeof proof.persisted !== "boolean"
+        || await executionHash(matching) !== proof.entry_hash) throw new NavigationConflict("navigation_orphan_page_invalid");
+    }
+    const envelope = page.cursor_envelope ?? null;
+    if (envelope) {
+      if (!isRecord(envelope) || Object.keys(envelope).length !== 3
+        || envelope.request_hash !== requestHash || envelope.cursor_before !== cursorBefore
+        || (typeof envelope.cursor_after !== "string" && envelope.cursor_after !== null)) {
+        throw new NavigationConflict("navigation_orphan_cursor_invalid");
+      }
+    }
+    if (replay && (replay.orphan_page_sha256 !== await sha256Text(pageRaw)
+      || replay.cursor_before !== cursorBefore || replay.offset < 0 || replay.offset > entries.length)) {
+      throw new NavigationConflict("navigation_orphan_replay_invalid");
+    }
+    return {
+      writer: rebuild ? "catalog_rebuild" : "inventory", project_id: request.project_id,
+      request_id: request.request_id, request_hash: requestHash, snapshot_id: page.snapshot_id,
+      page: pageCount, page_count: pageCount, ...(targetGeneration === undefined ? {} : { target_generation: targetGeneration }),
+      ...(sourceGeneration === undefined ? {} : { source_generation: sourceGeneration }),
+      cursor_before: cursorBefore, ...(envelope ? { cursor_after: envelope.cursor_after } : {}),
+      cursor_envelope: envelope, legacy: envelope === null,
+      rawprogress_sha256: await sha256Text(progressRaw), orphan_page_sha256: await sha256Text(pageRaw),
+      entry_count: entries.length, gap_count: gaps.length, proof_count: proofRows.length,
+      persisted_proof_count: proofRows.filter((proof) => proof.persisted).length,
+      replay: replay ? { cursor: replay.cursor, offset: replay.offset } : null
+    };
+  }
 
   /** Read-only recovery proof: a later source mutation does not undo a
    * publication already committed for this exact request. This is not a
@@ -198,6 +342,13 @@ export class ZoneNavigationEngine {
     return { text, metadata: before };
   }
 
+  private async readOrphanPageAtDigest(path: string, digest: string, budget: SliceBudget): Promise<SnapshotPage> {
+    const proof = await this.readBoundedPublicationProof(path, 2_000_000, budget);
+    if (await sha256Text(proof.text) !== digest) throw new NavigationConflict("navigation_orphan_page_changed");
+    try { return JSON.parse(proof.text) as SnapshotPage; }
+    catch { throw new NavigationConflict("navigation_orphan_page_invalid"); }
+  }
+
   private async proveTargetWasNeverPublished(
     request: NavigationReconcileRequest,
     headPath: string,
@@ -261,7 +412,64 @@ export class ZoneNavigationEngine {
       }
       if (current.status === "conflict") return { status: "conflict", code: current.coverage_gaps[0]?.code ?? "navigation_catalog_rebuild_conflict" };
 
+      let orphan = current.status === "scanning"
+        ? await this.readOrphanCheckpointIfPresent(request, state, admission, current.page_count, pagesRoot, budget)
+        : null;
       while (current.status === "scanning") {
+        if (orphan?.writer === "catalog_rebuild" && orphan.page === current.page_count) {
+          const pagePath = `${pagesRoot}/${orphan.page.toString().padStart(8, "0")}.json`;
+          let orphanPage: SnapshotPage;
+          try { orphanPage = await this.readOrphanPageAtDigest(pagePath, orphan.orphan_page_sha256, budget); }
+          catch (error) {
+            if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
+            throw error;
+          }
+          if (orphanPage.snapshot_id !== current.source_snapshot_id || orphanPage.page !== current.page_count) {
+            return { status: "conflict", code: "navigation_catalog_rebuild_snapshot_page_invalid" };
+          }
+          if (orphanPage.gaps.length) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_source_gap", budget);
+          if (orphan.cursor_envelope) {
+            if (orphan.cursor_before !== current.cursor) return { status: "conflict", code: "navigation_catalog_rebuild_cursor_invalid" };
+            const prior = new Set(current.source_ids ?? []);
+            if (orphanPage.entries.some((entry) => prior.has(entry.resource_id))) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_duplicate_source", budget);
+            current.cursor = orphan.cursor_after ?? null;
+            current.page_count += 1;
+            current.source_count += orphanPage.entries.length;
+            current.source_ids.push(...orphanPage.entries.map((entry) => entry.resource_id));
+            if (current.cursor === null) current.status = "verifying";
+            current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+            orphan = null;
+            continue;
+          }
+          const replay = orphan.replay
+            ? decodeLegacyOrphanReplay(current.cursor)!
+            : { cursor_before: orphan.cursor_before, cursor: orphan.cursor_before, offset: 0, gap_offset: 0, orphan_page_sha256: orphan.orphan_page_sha256 };
+          const replayPage = await this.inventory.listPage({ project_id: request.project_id, zone: request.zone, cursor: replay.cursor, limit: Math.max(1, orphanPage.entries.length - replay.offset), mode: "canonical_catalog_rebuild", budget });
+          if (replayPage.snapshot_id !== orphan.snapshot_id || replayPage.gaps.length) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_changed", budget);
+          const replayEntries = replayPage.entries.map((entry) => navigationInventoryEntrySchema.parse(entry));
+          const remaining = orphanPage.entries.slice(replay.offset);
+          if (replayEntries.length > remaining.length || canonicalJson(replayEntries) !== canonicalJson(remaining.slice(0, replayEntries.length))) {
+            return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_orphan_replay_mismatch", budget);
+          }
+          const nextReplay: LegacyOrphanReplay = { ...replay, cursor: replayPage.next_cursor, offset: replay.offset + replayEntries.length };
+          if (nextReplay.offset === orphanPage.entries.length) {
+            if (replayPage.next_cursor === replay.cursor && replayEntries.length === 0) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_listing_stalled", budget);
+            const prior = new Set(current.source_ids ?? []);
+            if (orphanPage.entries.some((entry) => prior.has(entry.resource_id))) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_duplicate_source", budget);
+            current.cursor = replayPage.next_cursor;
+            current.page_count += 1;
+            current.source_count += orphanPage.entries.length;
+            current.source_ids.push(...orphanPage.entries.map((entry) => entry.resource_id));
+            if (current.cursor === null) current.status = "verifying";
+            current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+            orphan = null;
+            continue;
+          }
+          if (replayPage.next_cursor === null || replayPage.next_cursor === replay.cursor) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_orphan_replay_mismatch", budget);
+          current.cursor = encodeLegacyOrphanReplay(nextReplay);
+          current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+          return { status: "pending", cursor: current.cursor };
+        }
         if (!budget.canStartEffect(5)) return { status: "pending", cursor: current.cursor };
         const page = await this.inventory.listPage({ project_id: request.project_id, zone: request.zone, cursor: current.cursor, limit: PAGE_LIMIT, mode: "canonical_catalog_rebuild", budget });
         if (page.snapshot_id !== current.source_snapshot_id) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_snapshot_changed", budget);
@@ -276,7 +484,7 @@ export class ZoneNavigationEngine {
         for (const entry of entries) this.assertEntry(entry, state, request.zone);
         const seen = new Set(current.source_ids ?? []);
         if (entries.some((entry) => seen.has(entry.resource_id)) || new Set(entries.map((entry) => entry.resource_id)).size !== entries.length) return await this.catalogRebuildConflict(progressPath, current, "navigation_catalog_rebuild_duplicate_source", budget);
-        const pageRecord: SnapshotPage = { schema_version: "1.0", page: current.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, verified_entries: page.verified_entries, gaps: [] };
+        const pageRecord: SnapshotPage = { schema_version: "1.0", page: current.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, verified_entries: page.verified_entries, gaps: [], cursor_envelope: { request_hash: requestHash, cursor_before: current.cursor, cursor_after: page.next_cursor } };
         await this.immutableSnapshotPage(`${pagesRoot}/${current.page_count.toString().padStart(8, "0")}.json`, pageRecord, budget);
         current.cursor = page.next_cursor;
         current.page_count += 1;
@@ -284,6 +492,7 @@ export class ZoneNavigationEngine {
         current.source_ids = [...(current.source_ids ?? []), ...entries.map((entry) => entry.resource_id)];
         if (page.next_cursor === null) current.status = "verifying";
         current = await this.saveCatalogRebuildProgress(progressPath, current, await this.token(progressPath, budget), budget);
+        orphan = null;
       }
 
       while (current.status === "verifying" && current.verify_page < current.page_count) {
@@ -733,7 +942,7 @@ export class ZoneNavigationEngine {
         progress.verify_page = progress.page_count;
         progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
       }
-      const done = await this.resumeInventory(request, state, progress, progressPath, pagesRoot, budget);
+      const done = await this.resumeInventory(request, state, admission, progress, progressPath, pagesRoot, budget);
       if (done.status === "pending" || done.status === "conflict") return done;
       progress = done.progress;
       if (progress.status === "finalized" && progress.receipt) {
@@ -1030,16 +1239,99 @@ export class ZoneNavigationEngine {
     return { status: "ready", progress };
   }
 
+  private async readOrphanCheckpointIfPresent(
+    request: NavigationReconcileRequest,
+    state: ProjectState,
+    admission: ExecutionAdmission,
+    pageCount: number,
+    pagesRoot: string,
+    budget: SliceBudget
+  ): Promise<RecoverableOrphanCheckpoint | null> {
+    // The caller already loaded and schema-validated the current progress.
+    // Probe its exact next-page path first: ordinary (non-orphan) slices need
+    // only this one metadata check, while a present page still receives the
+    // full stable progress/page proof in readRecoverableOrphanCheckpoint.
+    const pagePath = `${pagesRoot}/${pageCount.toString().padStart(8, "0")}.json`;
+    if (!await this.metadata(pagePath, budget)) return null;
+    return await this.readRecoverableOrphanCheckpoint(request, state, admission, budget);
+  }
+
   private async resumeInventory(
     request: NavigationReconcileRequest,
     state: ProjectState,
+    admission: ExecutionAdmission,
     initial: NavigationProgress,
     progressPath: string,
     pagesRoot: string,
     budget: SliceBudget
   ): Promise<{ status: "pending"; cursor: string | null } | { status: "conflict"; code: string } | { status: "done"; progress: NavigationProgress }> {
     let progress = initial;
+    let orphan = progress.inventory_complete ? null : await this.readOrphanCheckpointIfPresent(
+      request, state, admission, progress.page_count, pagesRoot, budget
+    );
     while (!progress.inventory_complete) {
+      if (orphan?.writer === "inventory" && orphan.page === progress.page_count) {
+        const pagePath = `${pagesRoot}/${orphan.page.toString().padStart(8, "0")}.json`;
+        let page: SnapshotPage;
+        try { page = await this.readOrphanPageAtDigest(pagePath, orphan.orphan_page_sha256, budget); }
+        catch (error) {
+          if (error instanceof NavigationConflict) return { status: "conflict", code: error.code };
+          throw error;
+        }
+        if (page.snapshot_id !== orphan.snapshot_id || page.page !== progress.page_count) {
+          return { status: "conflict", code: "navigation_orphan_page_invalid" };
+        }
+        if (orphan.cursor_envelope) {
+          if (orphan.cursor_before !== progress.cursor) return { status: "conflict", code: "navigation_orphan_cursor_invalid" };
+          const prior = new Set(progress.source_ids);
+          if (page.entries.some((entry) => prior.has(entry.resource_id))) return { status: "conflict", code: "navigation_duplicate_source" };
+          progress = this.adoptInventoryPage(progress, page, orphan.cursor_after ?? null);
+          progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+          orphan = null;
+          continue;
+        }
+        if (orphan.replay && orphan.replay.offset > page.entries.length) return { status: "conflict", code: "navigation_orphan_replay_invalid" };
+        const replay = orphan.replay
+          ? decodeLegacyOrphanReplay(progress.cursor)!
+          : { cursor_before: orphan.cursor_before, cursor: orphan.cursor_before, offset: 0, gap_offset: 0, orphan_page_sha256: orphan.orphan_page_sha256 };
+        const replayPage = await this.inventory.listPage({
+          project_id: request.project_id, zone: request.zone, cursor: replay.cursor, limit: Math.max(1, page.entries.length - replay.offset), budget
+        });
+        if (replayPage.snapshot_id !== orphan.snapshot_id) return { status: "conflict", code: "navigation_snapshot_changed" };
+        const replayEntries = replayPage.entries.map((value) => navigationInventoryEntrySchema.parse(value));
+        const replayGaps = replayPage.gaps.map((value) => navigationCoverageGapSchema.parse(value));
+        const remainingEntries = page.entries.slice(replay.offset);
+        const remainingGaps = page.gaps.slice(replay.gap_offset);
+        if (replayEntries.length > remainingEntries.length || replayGaps.length > remainingGaps.length
+          || canonicalJson(replayEntries) !== canonicalJson(remainingEntries.slice(0, replayEntries.length))
+          || canonicalJson(replayGaps) !== canonicalJson(remainingGaps.slice(0, replayGaps.length))) {
+          return { status: "conflict", code: "navigation_orphan_replay_mismatch" };
+        }
+        const nextReplay: LegacyOrphanReplay = {
+          ...replay, cursor: replayPage.next_cursor, offset: replay.offset + replayEntries.length,
+          gap_offset: replay.gap_offset + replayGaps.length
+        };
+        if (nextReplay.offset === page.entries.length && nextReplay.gap_offset === page.gaps.length) {
+          // Legacy records never told us the cursor after the page. Even an
+          // empty page needs one real response before this cursor is trusted.
+          if (replayPage.next_cursor === replay.cursor && replayEntries.length === 0 && replayGaps.length === 0) {
+            return { status: "conflict", code: "navigation_listing_stalled" };
+          }
+          const prior = new Set(progress.source_ids);
+          if (page.entries.some((entry) => prior.has(entry.resource_id))) return { status: "conflict", code: "navigation_duplicate_source" };
+          progress = this.adoptInventoryPage(progress, page, replayPage.next_cursor);
+          progress.cursor = replayPage.next_cursor;
+          progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+          orphan = null;
+          continue;
+        }
+        if (replayPage.next_cursor === null || replayPage.next_cursor === replay.cursor) {
+          return { status: "conflict", code: "navigation_orphan_replay_mismatch" };
+        }
+        progress.cursor = encodeLegacyOrphanReplay(nextReplay);
+        progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+        return { status: "pending", cursor: progress.cursor };
+      }
       if (!budget.canStartEffect(4)) return { status: "pending", cursor: progress.cursor };
       const page = await this.inventory.listPage({ project_id: request.project_id, zone: request.zone, cursor: progress.cursor, limit: PAGE_LIMIT, budget });
       if (!page.snapshot_id || (progress.snapshot_id && progress.snapshot_id !== page.snapshot_id)) return { status: "conflict", code: "navigation_snapshot_changed" };
@@ -1055,7 +1347,7 @@ export class ZoneNavigationEngine {
           return { status: "conflict", code: "navigation_inventory_proof_invalid" };
         }
       }
-      const savedPage: SnapshotPage = { schema_version: "1.0", page: progress.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, ...(verifiedEntries.length ? { verified_entries: verifiedEntries } : {}), gaps };
+      const savedPage: SnapshotPage = { schema_version: "1.0", page: progress.page_count, project_id: request.project_id, request_id: request.request_id, snapshot_id: page.snapshot_id, entries, ...(verifiedEntries.length ? { verified_entries: verifiedEntries } : {}), gaps, cursor_envelope: { request_hash: progress.request_hash, cursor_before: progress.cursor, cursor_after: page.next_cursor } };
       await this.immutableSnapshotPage(`${pagesRoot}/${progress.page_count.toString().padStart(8, "0")}.json`, savedPage, budget);
       progress.cursor = page.next_cursor;
       progress.snapshot_id = page.snapshot_id;
@@ -1065,9 +1357,21 @@ export class ZoneNavigationEngine {
       progress.coverage_gaps.push(...gaps);
       progress.inventory_complete = page.next_cursor === null;
       progress = await this.saveProgress(progressPath, progress, await this.token(progressPath, budget), budget);
+      orphan = null;
     }
     if (!progress.snapshot_id) return { status: "conflict", code: "navigation_snapshot_changed" };
     return { status: "done", progress };
+  }
+
+  private adoptInventoryPage(progress: NavigationProgress, page: SnapshotPage, cursorAfter: string | null): NavigationProgress {
+    progress.cursor = cursorAfter;
+    progress.snapshot_id = page.snapshot_id;
+    progress.page_count += 1;
+    progress.source_count += page.entries.length;
+    progress.source_ids.push(...page.entries.map((entry) => entry.resource_id));
+    progress.coverage_gaps.push(...page.gaps);
+    progress.inventory_complete = cursorAfter === null;
+    return progress;
   }
 
   private async immutableSnapshotPage(path: string, page: SnapshotPage, budget: SliceBudget): Promise<void> {
@@ -1084,7 +1388,8 @@ export class ZoneNavigationEngine {
       if (existing.schema_version !== page.schema_version || existing.page !== page.page ||
           existing.project_id !== page.project_id || existing.request_id !== page.request_id ||
           existing.snapshot_id !== page.snapshot_id || canonicalJson(existing.entries) !== canonicalJson(page.entries) ||
-          canonicalJson(existing.gaps) !== canonicalJson(page.gaps)) throw error;
+          canonicalJson(existing.gaps) !== canonicalJson(page.gaps) ||
+          canonicalJson(existing.cursor_envelope ?? null) !== canonicalJson(page.cursor_envelope ?? null)) throw error;
     }
   }
 
@@ -1789,6 +2094,22 @@ function withSliceBudgetReserve(budget: SliceBudget, reserveCalls: number): Slic
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function encodeLegacyOrphanReplay(replay: LegacyOrphanReplay): string {
+  return `${LEGACY_ORPHAN_REPLAY_PREFIX}${encodeURIComponent(canonicalJson(replay))}`;
+}
+
+function decodeLegacyOrphanReplay(cursor: string | null): LegacyOrphanReplay | null {
+  if (cursor === null || !cursor.startsWith(LEGACY_ORPHAN_REPLAY_PREFIX)) return null;
+  try {
+    const parsed = JSON.parse(decodeURIComponent(cursor.slice(LEGACY_ORPHAN_REPLAY_PREFIX.length)));
+    if (!isRecord(parsed) || (parsed.cursor_before !== null && typeof parsed.cursor_before !== "string")
+      || (parsed.cursor !== null && typeof parsed.cursor !== "string") || typeof parsed.offset !== "number" || !Number.isSafeInteger(parsed.offset) || parsed.offset < 0
+      || typeof parsed.gap_offset !== "number" || !Number.isSafeInteger(parsed.gap_offset) || parsed.gap_offset < 0
+      || typeof parsed.orphan_page_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(parsed.orphan_page_sha256)) return null;
+    return parsed as unknown as LegacyOrphanReplay;
+  } catch { return null; }
 }
 
 class NavigationConflict extends Error {

@@ -113,6 +113,56 @@ describe("saved initial listing deadline behavior", () => {
     const refreshedChunkPath = `${zoneNavigationCatalogRoot(projectId, "WORKING")}/compact/${zoneNavigationCatalogShardForResource(`head:${ids[1]}`).toString(16).padStart(2, "0")}.json`;
     expect(JSON.parse(h.files.get(refreshedChunkPath)!.content).entries.find((saved: { resource_id: string }) => saved.resource_id === `head:${ids[1]}`))
       .toMatchObject({ source_generation: 2, entry: entries[1] });
+
+    const navState = emptyProjectState(projectId, "Project OS", slug);
+    const navRequest = navigationReconcileSchema.parse({ operation: "navigation.reconcile", request_id: "DOCREQ-NAV-READY-ORPHAN-0001",
+      project_id: projectId, zone: "WORKING", expected_project_revision: navState.revision, expected_generation: 0,
+      expected_index: null, created_at: "2026-10-03T00:00:00.000Z" });
+    const navRequestHash = await executionHash(navRequest);
+    const navIndexPath = `${workspaceProjectRoot(projectId, slug)}/WORKING/00-CURRENT.md`;
+    const navAdmission = { project_id: projectId, request_id: navRequest.request_id, kind: "document", operation: "navigation.reconcile",
+      request_hash: navRequestHash, actor: { actor_id: "operator:test", authority: "project_guard" },
+      resources: [{ resource_id: "navigation:WORKING", resource_type: "navigation", zone: "WORKING", version: "0" }],
+      resource_effect_scopes: [{ resource_id: "navigation:WORKING", resource_version: "0", provider_id: h.runtime.providerId,
+        sources: [], destinations: [{ path: navIndexPath, logical_path: "WORKING/00-CURRENT.md" }], preservation_copies: [] }],
+      global_revision: 0, project_revision: navState.revision,
+      ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: navState.revision },
+      verdict: "allow", results: [], gaps: [], deferred_rules: [] };
+    const originalPage = await h.inventory.listPage({ project_id: projectId, zone: "WORKING", cursor: savedCursor, limit: 8, budget: budget(2000) });
+    expect(originalPage.entries.map((entry) => entry.resource_id)).toEqual(ids.map((id) => `head:${id}`));
+    const journal = new ExecutionJournal(h.runtime, projectId, "document", navRequest.request_id);
+    const journalRoot = await journal.root();
+    await journal.commit(navAdmission as never, null);
+    const progress = { schema_version: "1.0", project_id: projectId, request_id: navRequest.request_id,
+      request_hash: navRequestHash, target_generation: 1, index_basename: "00-CURRENT.md", expected_index: null,
+      head_revision_token: null, cursor: savedCursor, page_count: 0, inventory_complete: false,
+      snapshot_id: originalPage.snapshot_id, verify_page: 0, verify_entry: 0, verify_cursor: null, completion_cursor: null,
+      source_count: 0, source_ids: [], published_index: null, coverage_gaps: [], rendered_links: [], generated_sha256: null,
+      legacy_archive_ref: null, valid_links_work: null, status: "adopting", receipt: null, postchecks: [] };
+    h.put(`${journalRoot}/navigation-intention.json`, canonicalJson({ schema_version: "1.0", request: navRequest,
+      request_hash: navRequestHash, target_generation: 1, initial_progress: progress }));
+    h.put(`${journalRoot}/navigation-progress.json`, canonicalJson(progress));
+    const legacyOrphan = { schema_version: "1.0", page: 0, project_id: projectId, request_id: navRequest.request_id,
+      snapshot_id: originalPage.snapshot_id, entries: originalPage.entries,
+      ...(originalPage.verified_entries ? { verified_entries: originalPage.verified_entries } : {}), gaps: originalPage.gaps };
+    const orphanPath = `${journalRoot}/navigation/snapshot/00000000.json`;
+    h.put(orphanPath, canonicalJson(legacyOrphan));
+    const engine = new ZoneNavigationEngine(h.runtime, h.inventory);
+    let navigationResult = await engine.reconcile(navRequest, navState, navAdmission as never, budget(32), { deferPublication: true });
+    let slices = 1;
+    let savedProgress = JSON.parse(h.files.get(`${journalRoot}/navigation-progress.json`)!.content);
+    expect(savedProgress.source_count).toBe(0);
+    expect(savedProgress.page_count).toBe(0);
+    expect(savedProgress.cursor).toContain("@navigation-orphan-replay:v1:");
+    for (; navigationResult.status === "pending" && slices < 20; slices += 1) {
+      navigationResult = await engine.reconcile(navRequest, navState, navAdmission as never, budget(32), { deferPublication: true });
+      savedProgress = JSON.parse(h.files.get(`${journalRoot}/navigation-progress.json`)!.content);
+    }
+    expect(navigationResult.status, JSON.stringify(navigationResult)).toBe("prepared");
+    expect(savedProgress).toMatchObject({ inventory_complete: true, source_count: 2, source_ids: ids.map((id) => `head:${id}`) });
+    expect(new Set(savedProgress.source_ids).size).toBe(2);
+    expect(h.files.get(orphanPath)!.content).toBe(canonicalJson(legacyOrphan));
+    expect(slices).toBeGreaterThan(1);
   });
 
   it("checkpoints a completed prefix instead of repeatedly pairing heads against an older ready compact cache", async () => {

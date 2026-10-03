@@ -34,7 +34,7 @@ import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinato
 import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
 import { TransactionRequestLedger } from "../transactions/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
-import { ZoneNavigationEngine, zoneNavigationHeadPath } from "../documents/zone-navigation";
+import { ZoneNavigationEngine, zoneNavigationHeadPath, type RecoverableOrphanCheckpoint } from "../documents/zone-navigation";
 import { ZoneNavigationInventory } from "../documents/zone-navigation-inventory";
 import { ZoneNavigationSources, zoneNavigationCompactCatalogRoot, ZONE_NAVIGATION_CATALOG_SHARDS } from "../documents/zone-navigation-sources";
 import { DocumentLedgerRepository } from "../documents/repository";
@@ -265,6 +265,32 @@ const MATERIALIZATION_FINALIZATION_COVERAGE_VERSION = 2;
 const MATERIALIZATION_FINALIZATION_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000] as const;
 const MATERIALIZATION_FINALIZATION_INTERNAL_FAILURE_LIMIT = 6;
 const RECOVERY_MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1_000;
+const NAVIGATION_ORPHAN_RECOVERY_EPOCH = "navigation-orphan-cursor-v1";
+const NAVIGATION_ORPHAN_CANDIDATE_CURSOR_KEY = "navigation-orphan-candidate-cursor-v1";
+
+interface NavigationOrphanRecoveryMaterial {
+  epoch: typeof NAVIGATION_ORPHAN_RECOVERY_EPOCH;
+  request_id: string;
+  request_hash: string;
+  source_snapshot_id: string;
+  checkpoint: {
+    progress_sha256: string;
+    orphan_page_sha256: string;
+    page: number;
+    cursor_before: string | null;
+    target_generation: number;
+  };
+  prior_failure: { fingerprint: string; count: number; message_sha256: string };
+}
+
+interface StoredNavigationOrphanRecoveryMarker {
+  schema_version: "1.0";
+  recovery_epoch: typeof NAVIGATION_ORPHAN_RECOVERY_EPOCH;
+  marker_hash: string;
+  material: NavigationOrphanRecoveryMaterial;
+  workRef: NavigationWorkRef;
+  status: "pending_ack" | "acknowledged";
+}
 
 function retryAfterDelayMs(value: string | null): number | undefined {
   if (!value?.trim()) return undefined;
@@ -606,6 +632,7 @@ export class ProjectGuard extends DurableObject<Env> {
           const proof = await this.admitRules(state, normalized);
           await this.persistAdmissionProof("document-reconcile", `document-reconcile@${state.revision}`, proof);
         }
+        if (scheduled) await this.recoverOneKnownNavigationOrphan(state);
         // The coordinator may write several canonical heads before its
         // durable cursor is advanced. Keep a wake armed across that boundary;
         // the alarm discovers any dirty marker whose SQL outbox write was
@@ -2508,6 +2535,209 @@ export class ProjectGuard extends DurableObject<Env> {
     }
   }
 
+  private navigationOrphanRecoveryKey(requestId: string): string {
+    return `navigation-orphan-recovery:${NAVIGATION_ORPHAN_RECOVERY_EPOCH}:${requestId}`;
+  }
+
+  private async recoverOneKnownNavigationOrphan(state: ProjectState): Promise<void> {
+    const existingMarkers = await this.ctx.storage.list<string>({
+      prefix: `navigation-orphan-recovery:${NAVIGATION_ORPHAN_RECOVERY_EPOCH}:`, limit: 16
+    });
+    for (const [key, pendingRaw] of existingMarkers.entries()) {
+      let pending: StoredNavigationOrphanRecoveryMarker;
+      try { pending = JSON.parse(pendingRaw) as StoredNavigationOrphanRecoveryMarker; }
+      catch { continue; }
+      if (pending.schema_version !== "1.0" || pending.recovery_epoch !== NAVIGATION_ORPHAN_RECOVERY_EPOCH
+        || pending.status !== "pending_ack" || await sha256Canonical(pending.material) !== pending.marker_hash) continue;
+      await this.sendKnownNavigationOrphanRecovery(key, pending);
+      return;
+    }
+
+    const cursor = await this.ctx.storage.get<string>(NAVIGATION_ORPHAN_CANDIDATE_CURSOR_KEY);
+    const row = this.ctx.storage.sql.exec<{
+      [key: string]: SqlStorageValue;
+      request_id: string;
+      request_json: string;
+      request_sha256: string;
+      fingerprint: string;
+      count: number;
+      stopped: number;
+      message: string;
+    }>(
+      `SELECT p.request_id, p.request_json, p.request_sha256, f.fingerprint, f.count, f.stopped, f.message
+       FROM request_recovery_payload p
+       JOIN request_recovery_failures f ON f.kind = p.kind AND f.request_id = p.request_id
+       WHERE p.kind = 'document' AND f.stopped = 1
+       ORDER BY CASE WHEN ? IS NULL OR p.request_id > ? THEN 0 ELSE 1 END, p.request_id
+       LIMIT 1`,
+      cursor ?? null,
+      cursor ?? null
+    ).toArray()[0];
+    if (!row) return;
+    const requestId = String(row.request_id);
+    await this.ctx.storage.put(NAVIGATION_ORPHAN_CANDIDATE_CURSOR_KEY, requestId);
+    const key = this.navigationOrphanRecoveryKey(requestId);
+    const previousMarkerRaw = await this.ctx.storage.get<string>(key);
+    if (previousMarkerRaw !== undefined) {
+      let previousMarker: StoredNavigationOrphanRecoveryMarker;
+      try { previousMarker = JSON.parse(previousMarkerRaw) as StoredNavigationOrphanRecoveryMarker; }
+      catch { return; }
+      if (previousMarker.recovery_epoch !== NAVIGATION_ORPHAN_RECOVERY_EPOCH
+        || previousMarker.status !== "pending_ack"
+        || await sha256Canonical(previousMarker.material) !== previousMarker.marker_hash) return;
+      await this.sendKnownNavigationOrphanRecovery(key, previousMarker);
+      return;
+    }
+    if (row.count < MATERIALIZATION_FINALIZATION_INTERNAL_FAILURE_LIMIT
+      || row.request_sha256 !== await sha256Text(row.request_json)) return;
+
+    let request: NavigationReconcileRequest;
+    let diagnostic: RecoveryFailureDiagnostic | null;
+    try {
+      request = navigationReconcileSchema.parse(JSON.parse(row.request_json));
+      diagnostic = this.parseRecoveryFailureDiagnostic(row.message);
+    } catch { return; }
+    if (request.project_id !== state.project_id || request.project_id !== this.ctx.id.name
+      || request.request_id !== requestId || request.zone !== "REVIEW"
+      || !diagnostic || diagnostic.classification !== "internal"
+      || diagnostic.code !== "identical_internal_failure_limit" || diagnostic.error_name !== "Error"
+      || diagnostic.next_attempt_at !== null) return;
+    const errorName = diagnostic.error_name;
+    const errorSha256 = await sha256Text(`${errorName}:navigation_immutable_record_conflict`);
+    const expectedFingerprint = await sha256Text(JSON.stringify({
+      classification: "internal", error_name: errorName, error_sha256: errorSha256,
+      progress_sha256: diagnostic.progress_sha256,
+      external_progress_sha256: diagnostic.external_progress_sha256 ?? null
+    }));
+    if (row.fingerprint !== expectedFingerprint) return;
+
+    try {
+      const intent = await this.managedDocumentRequests.readRecoverableIntent(request.project_id, request.request_id);
+      const payloadHash = await sha256Text(row.request_json);
+      if (!intent || intent.project_id !== request.project_id || intent.request_id !== request.request_id
+        || intent.request_sha256 !== payloadHash || intent.request_json !== row.request_json) return;
+      if (this.ctx.storage.sql.exec(
+        "SELECT request_id FROM document_requests WHERE request_id = ?", request.request_id
+      ).toArray().length > 0) return;
+      if (this.ctx.storage.sql.exec(
+        "SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id
+      ).toArray().length > 0) return;
+      if (await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id)) return;
+
+      const requestHash = await sha256Canonical(request);
+      const journal = new ExecutionJournal(this.persistence, request.project_id, "document", request.request_id);
+      const admitted = await journal.readAdmission();
+      if (!admitted || admitted.plan !== null || admitted.admission.kind !== "document"
+        || admitted.admission.operation !== "navigation.reconcile" || admitted.admission.verdict !== "allow"
+        || admitted.admission.project_id !== request.project_id || admitted.admission.request_id !== request.request_id
+        || admitted.admission.request_hash !== requestHash || admitted.admission.project_revision !== request.expected_project_revision
+        || admitted.admission.resources.length !== 1
+        || admitted.admission.resources[0]?.resource_id !== `navigation:${request.zone}`
+        || admitted.admission.resources[0]?.resource_type !== "navigation"
+        || admitted.admission.resources[0]?.zone !== request.zone
+        || admitted.admission.resources[0]?.version !== String(request.expected_generation)) return;
+      const execution = await journal.status();
+      if (!execution || execution.terminal || execution.status === "conflict") return;
+      const budget = createSliceBudget(() => Date.now(), new AbortController().signal);
+      const frozenState = await this.readFrozenNavigationState(request, requestHash, budget, true);
+      if (canonicalJson(frozenState) !== canonicalJson(state)
+        || frozenState.revision !== request.expected_project_revision) return;
+      const sources = new ZoneNavigationSources(this.persistence);
+      const source = await sources.readState(request.project_id, request.zone, budget);
+      if (source.adopted || source.in_flight_resource_ids.length > 0
+        || (source.adoption_request_id !== null && source.adoption_request_id !== request.request_id)
+        || (source.adoption_request_id === null && source.adoption_generation !== null)
+        || (source.adoption_request_id === request.request_id && source.adoption_generation !== source.generation)) return;
+      const expectedSourceGeneration = request.purpose === "compact_catalog_rebuild"
+        ? request.expected_source_generation
+        : source.generation;
+      if (expectedSourceGeneration !== source.generation) return;
+      const checkpoint = await new ZoneNavigationEngine(this.persistence, new ZoneNavigationInventory(this.persistence, sources))
+        .readRecoverableOrphanCheckpoint(request, frozenState, admitted.admission, budget);
+      if (!checkpoint || !this.isKnownLegacyNavigationOrphan(checkpoint, request, diagnostic)) return;
+      if (checkpoint.snapshot_id !== `source:${source.generation}`) return;
+      const sourceAfterProof = await sources.readState(request.project_id, request.zone, budget);
+      if (sourceAfterProof.generation !== source.generation || sourceAfterProof.adopted
+        || sourceAfterProof.in_flight_resource_ids.length > 0
+        || (sourceAfterProof.adoption_request_id !== null && sourceAfterProof.adoption_request_id !== request.request_id)
+        || (sourceAfterProof.adoption_request_id === null && sourceAfterProof.adoption_generation !== null)
+        || (sourceAfterProof.adoption_request_id === request.request_id && sourceAfterProof.adoption_generation !== sourceAfterProof.generation)) return;
+      const targetGeneration = checkpoint.target_generation;
+      if (!Number.isSafeInteger(targetGeneration) || targetGeneration !== request.expected_generation + 1) return;
+      const workRef = navigationWorkRefSchema.parse({
+        project_id: request.project_id, request_id: request.request_id, zone: request.zone,
+        expected_generation: request.expected_generation,
+        source_snapshot_id: checkpoint.snapshot_id,
+        authority_ref: `${await journal.root()}/admission.json`, request_hash: requestHash
+      });
+      const material: NavigationOrphanRecoveryMaterial = {
+        epoch: NAVIGATION_ORPHAN_RECOVERY_EPOCH,
+        request_id: request.request_id,
+        request_hash: requestHash,
+        source_snapshot_id: workRef.source_snapshot_id,
+        checkpoint: {
+          progress_sha256: checkpoint.rawprogress_sha256,
+          orphan_page_sha256: checkpoint.orphan_page_sha256,
+          page: checkpoint.page,
+          cursor_before: checkpoint.cursor_before,
+          target_generation: targetGeneration
+        },
+        prior_failure: {
+          fingerprint: row.fingerprint,
+          count: row.count,
+          message_sha256: await sha256Text(row.message)
+        }
+      };
+      const marker: StoredNavigationOrphanRecoveryMarker = {
+        schema_version: "1.0", recovery_epoch: NAVIGATION_ORPHAN_RECOVERY_EPOCH,
+        marker_hash: await sha256Canonical(material), material, workRef, status: "pending_ack"
+      };
+      await this.ctx.storage.put(key, canonicalJson(marker));
+      await this.sendKnownNavigationOrphanRecovery(key, marker);
+    } catch {
+      // An unavailable proof keeps the original failure and request stopped.
+    }
+  }
+
+  private isKnownLegacyNavigationOrphan(
+    checkpoint: RecoverableOrphanCheckpoint,
+    request: NavigationReconcileRequest,
+    diagnostic: RecoveryFailureDiagnostic
+  ): boolean {
+    const targetGeneration = checkpoint.target_generation;
+    return diagnostic.code === "identical_internal_failure_limit"
+      && checkpoint.project_id === request.project_id && checkpoint.request_id === request.request_id
+      && /^[a-f0-9]{64}$/.test(checkpoint.request_hash)
+      && checkpoint.page === checkpoint.page_count && checkpoint.legacy
+      && checkpoint.cursor_envelope === null && checkpoint.cursor_after === undefined
+      && checkpoint.entry_count > 0 && checkpoint.gap_count === 0
+      && checkpoint.proof_count === checkpoint.entry_count
+      && checkpoint.persisted_proof_count <= checkpoint.proof_count
+      && targetGeneration === request.expected_generation + 1
+      && request.purpose !== "compact_catalog_rebuild"
+      && checkpoint.writer === "inventory";
+  }
+
+  private async sendKnownNavigationOrphanRecovery(
+    key: string,
+    marker: StoredNavigationOrphanRecoveryMarker
+  ): Promise<void> {
+    try {
+      const response = await this.env.MATERIALIZATION_GUARD.getByName(marker.workRef.project_id).fetch(
+        "https://materialization-guard.internal/navigation-work-recovery",
+        { method: "POST", headers: { "content-type": "application/json" },
+          body: canonicalJson({ recovery_epoch: marker.recovery_epoch, marker_hash: marker.marker_hash,
+            workRef: marker.workRef, material: marker.material }) }
+      );
+      const body = await response.json<Record<string, unknown>>();
+      if (response.status !== 202 || body.status !== "scheduled" || body.project_id !== marker.workRef.project_id
+        || body.request_id !== marker.workRef.request_id || body.marker_hash !== marker.marker_hash) return;
+      await this.ctx.storage.put(key, canonicalJson({ ...marker, status: "acknowledged" }));
+    } catch {
+      // Keep pending_ack so the exact marker can be retried after a lost response.
+    }
+  }
+
   private async recordObservedNavigationSourceMutation(
     projectId: string,
     zone: NavigationZone,
@@ -2969,6 +3199,20 @@ export class ProjectGuard extends DurableObject<Env> {
       } catch {
         // A missing/slow progress probe is not evidence that it is safe to stop.
         stopped = false;
+      }
+    }
+    if (kind === "document" && message === "navigation_immutable_record_conflict" && previous
+      && previous.count >= MATERIALIZATION_FINALIZATION_INTERNAL_FAILURE_LIMIT) {
+      const markerRaw = await this.ctx.storage.get<string>(this.navigationOrphanRecoveryKey(requestId));
+      let marker: StoredNavigationOrphanRecoveryMarker | null = null;
+      try { marker = markerRaw === undefined ? null : JSON.parse(markerRaw) as StoredNavigationOrphanRecoveryMarker; }
+      catch { marker = null; }
+      if (marker?.recovery_epoch === NAVIGATION_ORPHAN_RECOVERY_EPOCH
+        && marker.status === "acknowledged" && marker.marker_hash === await sha256Canonical(marker.material)) {
+        // The one authorized cursor re-arm has already run. A repeated exact
+        // defect must stay stopped even if replay advanced ordinary progress.
+        count = Math.max(MATERIALIZATION_FINALIZATION_INTERNAL_FAILURE_LIMIT, previous.count + 1);
+        stopped = true;
       }
     }
     const retryAfterMs = error instanceof ProviderOperationError ? error.diagnostics?.retryAfterMs ?? NaN : NaN;

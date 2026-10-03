@@ -128,6 +128,19 @@ interface RecoveryRequestRow {
 
 type RecoveryFailureClassification = "provider_temporary" | "provider_blocked" | "continuation" | "internal";
 
+interface LocalRecoveryFailureIdentity {
+  fingerprint: string;
+  classification: RecoveryFailureClassification;
+  error_name: string;
+  progress_sha256: string;
+  external_progress_sha256?: string;
+}
+
+const SAFE_RECOVERY_ERROR_NAMES = new Set([
+  "Error", "TypeError", "RangeError", "SyntaxError", "UnknownError",
+  "ProviderOperationError", "ProviderConflictError", "ProviderNotFoundError"
+]);
+
 interface RecoveryFailureDiagnostic {
   code: string;
   classification: RecoveryFailureClassification;
@@ -159,6 +172,7 @@ interface LocalRecoveryDiagnostic {
   failure_attempts: number | null;
   failure_code: string | null;
   failure_next_attempt_at: string | null;
+  failure_identity?: LocalRecoveryFailureIdentity;
   alarm_readable: boolean;
   alarm_at: string | null;
   local_receipt_present: boolean | null;
@@ -5793,14 +5807,24 @@ export class ProjectGuard extends DurableObject<Env> {
       ).toArray().length > 0;
     } catch { diagnostic.queue_present = null; }
     try {
-      const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; stopped: number; count: number; message: string }>(
-        "SELECT stopped, count, message FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
+      const failure = this.ctx.storage.sql.exec<{ [key: string]: SqlStorageValue; fingerprint: string; stopped: number; count: number; message: string }>(
+        "SELECT fingerprint, stopped, count, message FROM request_recovery_failures WHERE kind = ? AND request_id = ?", kind, requestId
       ).toArray()[0] ?? null;
       diagnostic.failure_stopped = failure ? failure.stopped !== 0 : false;
       diagnostic.failure_attempts = failure?.count ?? 0;
       const parsed = this.parseRecoveryFailureDiagnostic(failure?.message);
       diagnostic.failure_code = parsed?.code ?? null;
       diagnostic.failure_next_attempt_at = parsed?.next_attempt_at ?? null;
+      if (failure && typeof failure.fingerprint === "string" && /^[a-f0-9]{64}$/.test(failure.fingerprint)
+        && parsed && SAFE_RECOVERY_ERROR_NAMES.has(parsed.error_name)) {
+        diagnostic.failure_identity = {
+          fingerprint: failure.fingerprint,
+          classification: parsed.classification,
+          error_name: parsed.error_name,
+          progress_sha256: parsed.progress_sha256,
+          ...(parsed.external_progress_sha256 ? { external_progress_sha256: parsed.external_progress_sha256 } : {})
+        };
+      }
     } catch {
       diagnostic.failure_stopped = null;
       diagnostic.failure_attempts = null;

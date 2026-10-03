@@ -1306,6 +1306,107 @@ describe("managed document crash recovery", () => {
     expect(JSON.stringify(body.local_recovery_diagnostic)).not.toContain(request.content);
   });
 
+  it("exposes only the bounded SQL failure identity and preserves stopped recovery history", async () => {
+    installDropboxMock({ faults, immutableRevisions: true });
+    const created = await createProject("LOCAL-RECOVERY-FAILURE-IDENTITY");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const request = {
+      operation: "working.write" as const,
+      request_id: "DOCREQ-LOCAL-FAILURE-IDENTITY-0001",
+      project_id: created.project_id,
+      logical_path: "strategy/failure-identity.md",
+      content: "Keep this private request body out of recovery identity.",
+      content_sha256: await sha256Text("Keep this private request body out of recovery identity."),
+      created_at: at
+    };
+    const requestJson = JSON.stringify(request);
+    const requestSha256 = await sha256Text(requestJson);
+    const originalFailure = {
+      fingerprint: "b".repeat(64),
+      count: 6,
+      stopped: 1,
+      message: JSON.stringify({
+        code: "identical_internal_failure_limit",
+        classification: "internal",
+        error_name: "Error",
+        progress_sha256: "c".repeat(64),
+        external_progress_sha256: "d".repeat(64),
+        next_attempt_at: null
+      })
+    };
+    await runInDurableObject(guard, async (_instance, durableState) => {
+      durableState.storage.sql.exec(
+        "INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES ('document', ?, ?, ?)",
+        request.request_id, requestJson, requestSha256
+      );
+      durableState.storage.sql.exec(
+        "INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message) VALUES ('document', ?, ?, ?, ?, ?)",
+        request.request_id, originalFailure.fingerprint, originalFailure.count, originalFailure.stopped, originalFailure.message
+      );
+      durableState.storage.sql.exec(
+        "INSERT INTO document_requests (request_id, request_json, receipt_json) VALUES (?, ?, ?)",
+        request.request_id, requestJson, JSON.stringify({ status: "pending" })
+      );
+    });
+    vi.spyOn(ExecutionJournal.prototype, "status").mockRejectedValue(new Error("provider_busy"));
+
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(response.status).toBe(503);
+    const body = await response.json<any>();
+    expect(body.local_recovery_diagnostic.failure_identity).toEqual({
+      fingerprint: "b".repeat(64),
+      classification: "internal",
+      error_name: "Error",
+      progress_sha256: "c".repeat(64),
+      external_progress_sha256: "d".repeat(64)
+    });
+    expect(JSON.stringify(body.local_recovery_diagnostic)).not.toContain(request.content);
+    const persistedAfter = await runInDurableObject(guard, (_instance, durableState) =>
+      durableState.storage.sql.exec<{ fingerprint: string; count: number; stopped: number; message: string }>(
+        "SELECT fingerprint, count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?",
+        request.request_id
+      ).one()
+    );
+    expect(persistedAfter).toEqual(originalFailure);
+  });
+
+  it.each([
+    ["malformed fingerprint", "fingerprint", "not-a-hash"],
+    ["unsupported classification", "classification", "mystery"],
+    ["unsafe error name", "error_name", "Error\nprivate-detail"],
+    ["unknown error name", "error_name", "PrivateProviderError"],
+    ["malformed progress hash", "progress_sha256", "not-a-hash"],
+    ["malformed external progress hash", "external_progress_sha256", "not-a-hash"]
+  ])("omits malformed failure identity fields (%s)", async (label, field, invalidValue) => {
+    installDropboxMock({ faults, immutableRevisions: true });
+    const caseId = String(label).toUpperCase().replace(/[^A-Z0-9]+/g, "-");
+    const created = await createProject(`LOCAL-RECOVERY-FAILURE-IDENTITY-INVALID-${caseId}`);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const requestId = `DOCREQ-FAILURE-IDENTITY-INVALID-${caseId}-0001`;
+    const diagnostic: Record<string, unknown> = {
+      code: "identical_internal_failure_limit",
+      classification: "internal",
+      error_name: "Error",
+      progress_sha256: "c".repeat(64),
+      next_attempt_at: null
+    };
+    if (field !== "fingerprint") diagnostic[field as string] = invalidValue;
+    const message = JSON.stringify(diagnostic);
+    await runInDurableObject(guard, (_instance, durableState) => {
+      durableState.storage.sql.exec(
+        "INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message) VALUES ('document', ?, ?, 6, 1, ?)",
+        requestId, field === "fingerprint" ? invalidValue : "b".repeat(64), message
+      );
+    });
+    vi.spyOn(ExecutionJournal.prototype, "status").mockRejectedValue(new Error("provider_busy"));
+
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${requestId}`);
+    expect(response.status).toBe(503);
+    const body = await response.json<any>();
+    expect(body.local_recovery_diagnostic).not.toHaveProperty("failure_identity");
+    expect(JSON.stringify(body.local_recovery_diagnostic)).not.toContain("private-detail");
+  });
+
   it("does not stage a refused write and hash-cleans only a pre-admission staged payload", async () => {
     const mock = installDropboxMock({ faults, immutableRevisions: true });
     const created = await createProject("ADMISSION-REFUSAL-STAGED-CLEANUP");

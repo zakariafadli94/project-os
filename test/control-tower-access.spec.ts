@@ -94,13 +94,20 @@ describe("effective Control Tower token permissions", () => {
       scope: "local_only", payload_present: true, payload_hash_valid: true,
       staged_marker_matches_payload: false, queue_present: false,
       failure_stopped: null, failure_attempts: null, failure_code: null,
-      failure_next_attempt_at: null, alarm_readable: true, alarm_at: null,
+      failure_next_attempt_at: null,
+      failure_identity: {
+        fingerprint: "b".repeat(64), classification: "internal", error_name: "Error",
+        progress_sha256: "c".repeat(64), external_progress_sha256: "d".repeat(64)
+      },
+      alarm_readable: true, alarm_at: null,
       local_receipt_present: false, local_observation_present: null
     };
-    let diagnostic: unknown = { ...safeDiagnostic, raw_payload: "nested-provider-secret" };
+    let diagnostic: unknown = { ...safeDiagnostic, raw_payload: "nested-provider-secret",
+      failure_identity: { ...safeDiagnostic.failure_identity, private_detail: "nested-provider-secret" } };
+    let upstreamCode = "PROJECT_OS_READ_BUSY";
     const owner = { getByName: () => ({ fetch: async () => Response.json({
       project_id: "PRJ-0003", kind: "transaction", request_id: "TXN-ORIGINAL",
-      status: "unknown", code: "PROJECT_OS_READ_BUSY", private_detail: "provider-secret",
+      status: "unknown", code: upstreamCode, private_detail: "provider-secret",
       local_recovery_diagnostic: diagnostic
     }, { status: 503, headers: { "Retry-After": "1" } }) }) } as unknown as DurableObjectNamespace;
     const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {
@@ -114,6 +121,16 @@ describe("effective Control Tower token permissions", () => {
       request_id: "TXN-ORIGINAL", recovery: { action: "check_status", preserve_request_id: true } });
     expect(body.local_recovery_diagnostic).toEqual(safeDiagnostic);
     expect(result.content[0]!.text).not.toContain("provider-secret");
+    upstreamCode = "request_status_unavailable";
+    diagnostic = { ...safeDiagnostic, raw_payload: "nested-provider-secret",
+      failure_identity: { ...safeDiagnostic.failure_identity, private_detail: "nested-provider-secret" } };
+    const unknownFallback = await server._registeredTools.project_os_get_request_status!.handler({
+      project_id: "PRJ-0003", request_id: "TXN-ORIGINAL", kind: "transaction"
+    });
+    const unknownBody = JSON.parse(unknownFallback.content[0]!.text);
+    expect(unknownBody).toMatchObject({ status: "unknown", code: "request_status_unavailable" });
+    expect(unknownBody.local_recovery_diagnostic).toEqual(safeDiagnostic);
+    expect(unknownFallback.content[0]!.text).not.toContain("provider-secret");
     diagnostic = { ...safeDiagnostic, payload_hash_valid: "invalid-provider-secret" };
     const invalid = await server._registeredTools.project_os_get_request_status!.handler({
       project_id: "PRJ-0003", request_id: "TXN-ORIGINAL", kind: "transaction"

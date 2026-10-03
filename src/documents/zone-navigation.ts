@@ -111,6 +111,28 @@ export interface RecoverableOrphanCheckpoint {
   replay: { cursor: string | null; offset: number } | null;
 }
 
+export interface StaleNavigationProgressProof {
+  project_id: string;
+  request_id: string;
+  request_hash: string;
+  snapshot_id: string;
+  snapshot_generation: number;
+  target_generation: number;
+  page_count: number;
+  progress_sha256: string;
+}
+
+export interface NavigationProgressBinding {
+  project_id: string;
+  request_id: string;
+  request_hash: string;
+  snapshot_id: string;
+  snapshot_generation: number | null;
+  target_generation: number;
+  page_count: number;
+  progress_sha256: string;
+}
+
 interface ValidatedRecoverableOrphanCheckpoint extends RecoverableOrphanCheckpoint {
   validated_page: SnapshotPage;
 }
@@ -160,6 +182,86 @@ export class ZoneNavigationEngine {
     if (!proof) return null;
     const { validated_page: _validatedPage, ...descriptor } = proof;
     return descriptor;
+  }
+
+  /** Validate the complete immutable prepublication checkpoint for a stale
+   * request. This is read-only and exposes digests rather than saved pages. */
+  async readStaleNavigationProgressProof(
+    rawRequest: NavigationReconcileRequest,
+    state: ProjectState,
+    admission: ExecutionAdmission,
+    budget: SliceBudget
+  ): Promise<StaleNavigationProgressProof> {
+    const request = navigationReconcileSchema.parse(rawRequest);
+    if (request.purpose === "compact_catalog_rebuild") throw new NavigationConflict("navigation_stale_progress_invalid");
+    const requestHash = await executionHash(request);
+    this.assertAdmission(request, state, admission, requestHash,
+      this.indexPath(state, request.zone, request.expected_index?.basename ?? "00-CURRENT.md"));
+    const root = await new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id).root();
+    const progressProof = await this.readBoundedPublicationProof(`${root}/navigation-progress.json`, 2_000_000, budget);
+    let rawValue: unknown;
+    try { rawValue = JSON.parse(progressProof.text); }
+    catch { throw new NavigationConflict("navigation_stale_progress_invalid"); }
+    const parsed = navigationProgressSchema.safeParse(rawValue);
+    if (!parsed.success || canonicalJson(parsed.data) !== progressProof.text) {
+      throw new NavigationConflict("navigation_stale_progress_invalid");
+    }
+    const progress = parsed.data;
+    const snapshotMatch = typeof progress.snapshot_id === "string"
+      ? /^source:(0|[1-9][0-9]*)$/.exec(progress.snapshot_id) : null;
+    const snapshotGeneration = snapshotMatch ? Number(snapshotMatch[1]) : NaN;
+    if (progress.project_id !== request.project_id || progress.request_id !== request.request_id
+      || progress.request_hash !== requestHash || progress.target_generation !== request.expected_generation + 1
+      || progress.status !== "adopting" || progress.inventory_complete || progress.receipt !== null
+      || progress.published_index !== null || progress.generated_sha256 !== null
+      || progress.page_count < 1 || progress.page_count > 1024
+      || progress.verify_page !== progress.page_count || progress.verify_entry !== 0
+      || progress.source_count !== 0 || progress.source_ids.length !== 0 || progress.coverage_gaps.length !== 0
+      || progress.postchecks.length !== 0 || !Number.isSafeInteger(snapshotGeneration)) {
+      throw new NavigationConflict("navigation_stale_progress_invalid");
+    }
+    return {
+      project_id: request.project_id, request_id: request.request_id, request_hash: requestHash,
+      snapshot_id: progress.snapshot_id!, snapshot_generation: snapshotGeneration, target_generation: progress.target_generation,
+      page_count: progress.page_count, progress_sha256: await sha256Text(progressProof.text)
+    };
+  }
+
+  /** Read only the stable, request-bound snapshot identity needed to invoke
+   * readVerifiedPublication before deciding whether work is prepublication. */
+  async readNavigationProgressBinding(
+    rawRequest: NavigationReconcileRequest,
+    state: ProjectState,
+    admission: ExecutionAdmission,
+    budget: SliceBudget
+  ): Promise<NavigationProgressBinding> {
+    const request = navigationReconcileSchema.parse(rawRequest);
+    if (request.purpose === "compact_catalog_rebuild") throw new NavigationConflict("navigation_progress_binding_invalid");
+    const requestHash = await executionHash(request);
+    this.assertAdmission(request, state, admission, requestHash,
+      this.indexPath(state, request.zone, request.expected_index?.basename ?? "00-CURRENT.md"));
+    const root = await new ExecutionJournal(this.runtime, request.project_id, "document", request.request_id).root();
+    const progressProof = await this.readBoundedPublicationProof(`${root}/navigation-progress.json`, 2_000_000, budget);
+    let rawValue: unknown;
+    try { rawValue = JSON.parse(progressProof.text); }
+    catch { throw new NavigationConflict("navigation_progress_binding_invalid"); }
+    const parsed = navigationProgressSchema.safeParse(rawValue);
+    if (!parsed.success || canonicalJson(parsed.data) !== progressProof.text) {
+      throw new NavigationConflict("navigation_progress_binding_invalid");
+    }
+    const progress = parsed.data;
+    const match = typeof progress.snapshot_id === "string" ? /^source:(0|[1-9][0-9]*)$/.exec(progress.snapshot_id) : null;
+    const snapshotGeneration = match ? Number(match[1]) : null;
+    if (progress.project_id !== request.project_id || progress.request_id !== request.request_id
+      || progress.request_hash !== requestHash || progress.target_generation !== request.expected_generation + 1
+      || typeof progress.snapshot_id !== "string" || progress.snapshot_id.length === 0
+      || (snapshotGeneration !== null && !Number.isSafeInteger(snapshotGeneration))) throw new NavigationConflict("navigation_progress_binding_invalid");
+    return {
+      project_id: request.project_id, request_id: request.request_id, request_hash: requestHash,
+      snapshot_id: progress.snapshot_id!, snapshot_generation: snapshotGeneration,
+      target_generation: progress.target_generation, page_count: progress.page_count,
+      progress_sha256: await sha256Text(progressProof.text)
+    };
   }
 
   private async readRecoverableOrphanCheckpointWithPage(

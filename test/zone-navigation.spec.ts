@@ -1077,6 +1077,37 @@ describe("zone navigation identity and resumable reconciliation", () => {
     expect(JSON.parse(harness.files.get(`${root}/navigation-progress.json`)!.content)).toMatchObject({ page_count: 0, source_count: 0, cursor: null });
   });
 
+  it("binds a stale request only to canonical adopting progress and rejects partial or mismatched progress", async () => {
+    const harness = runtimeHarness();
+    const project = state();
+    const input = navigationReconcileSchema.parse({ ...request(), expected_generation: 4 });
+    const admission = await admissionFor(input);
+    const journal = new ExecutionJournal(harness.runtime, input.project_id, "document", input.request_id);
+    await journal.commit(admission, null);
+    const { root, progress: seededProgress } = await seedAdoptingProgress(harness, input, 4, "saved-source-cursor");
+    const progress = {
+      ...seededProgress, target_generation: 5, snapshot_id: "source:116", verify_page: 4,
+      cursor: "saved-source-116-cursor", valid_links_work: null
+    };
+    const progressPath = `${root}/navigation-progress.json`;
+    harness.put(progressPath, canonicalJson(progress));
+    const engine = new ZoneNavigationEngine(harness.runtime, (await inventoryHarness(project)).port);
+
+    expect(await engine.readNavigationProgressBinding(input, project, admission, budget())).toMatchObject({
+      snapshot_id: "source:116", snapshot_generation: 116, target_generation: 5, page_count: 4
+    });
+    expect(await engine.readStaleNavigationProgressProof(input, project, admission, budget())).toMatchObject({
+      snapshot_id: "source:116", snapshot_generation: 116, target_generation: 5, page_count: 4
+    });
+
+    harness.put(progressPath, canonicalJson({ ...progress, status: "publishing" }));
+    await expect(engine.readStaleNavigationProgressProof(input, project, admission, budget())).rejects.toThrow("navigation_stale_progress_invalid");
+    harness.put(progressPath, canonicalJson({ ...progress, request_hash: "f".repeat(64) }));
+    await expect(engine.readNavigationProgressBinding(input, project, admission, budget())).rejects.toThrow("navigation_progress_binding_invalid");
+    harness.files.delete(progressPath);
+    await expect(engine.readNavigationProgressBinding(input, project, admission, budget())).rejects.toThrow();
+  });
+
   it("rejects oversized and malformed orphan proof bytes before adopting progress", async () => {
     const harness = runtimeHarness();
     const project = state();
@@ -1981,6 +2012,10 @@ describe("zone navigation identity and resumable reconciliation", () => {
     const original = await reconcileUntilTerminal(oldEngine, oldRequest, project, oldAdmission);
     expect(original.status).toBe("finalized");
     if (original.status !== "finalized") throw new Error("expected first generation to finalize");
+    expect(await oldEngine.readNavigationProgressBinding(oldRequest, project, oldAdmission, budget()))
+      .toMatchObject({ snapshot_id: original.receipt.source_snapshot_id, target_generation: original.receipt.generation });
+    expect(await oldEngine.readVerifiedPublication(oldRequest, project, oldAdmission, budget(), original.receipt.source_snapshot_id))
+      .toEqual(original.receipt);
 
     const newPath = `${workspaceProjectRoot(project.project_id, project.slug)}/WORKING/plans/new-roadmap.md`;
     const newContent = "new canonical content\n";

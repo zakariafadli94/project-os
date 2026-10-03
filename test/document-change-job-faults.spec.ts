@@ -40,6 +40,66 @@ async function createProject(transactionId: string, slug: string): Promise<Recei
 describe("durable managed-document change jobs", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("reports a bounded checkpoint without advancing verification or changing durable jobs", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-CHECKPOINT-READ-0001", "checkpoint-read");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const snapshot = async () => runInDurableObject(guard, async (_instance, state) =>
+      ["managed_document_change_control", "managed_document_drift_control", "managed_document_change_jobs", "managed_document_change_quarantine", "managed_document_drift_findings"]
+        .map(table => state.storage.sql.exec(`SELECT * FROM ${table}`).toArray()));
+    await runInDurableObject(guard, async (_instance, state) => {
+      const jobs = new ManagedDocumentChangeJobStore(state.storage);
+      jobs.registerPage({ expected_cursor: null, next_cursor: "private-provider-cursor", jobs: [] });
+      jobs.completeScheduledVerification("2026-10-01T12:00:00.000Z");
+      for (let index = 0; index < 8; index += 1) {
+        const job = { job_id: `CHGJOB-${index.toString(16).toUpperCase().padStart(24, "0")}`,
+          change: { kind: "file" as const, path: `/private/target-${index}`, name: `target-${index}` }, detection_source: "incremental" as const, priority: 10 };
+        jobs.registerPage({ expected_cursor: jobs.cursor(), next_cursor: "private-provider-cursor", jobs: [job] });
+        jobs.markQuarantined({ ...job, ordinal: index, attempts: 0, last_error: null }, "file_target_missing", "2026-10-02T12:00:00.000Z");
+        jobs.recordDriftFinding({ finding_id: `DRIFT-${index.toString(16).toUpperCase().padStart(24, "0")}`,
+          job_id: job.job_id, path: job.change.path, change_kind: "file", status: "unexpected_conflict", code: "file_target_missing",
+          resource: { resource_type: "document", resource_id: "PRIVATE-RESOURCE", version: "private-version", zone: "WORKING" }, observed_at: "2026-10-02T12:00:00.000Z" });
+      }
+      const pending = { job_id: `CHGJOB-${"F".repeat(24)}`, change: { kind: "file" as const, path: "/private/pending", name: "pending" }, detection_source: "incremental" as const, priority: 10 };
+      jobs.registerPage({ expected_cursor: jobs.cursor(), next_cursor: "private-provider-cursor", jobs: [pending] });
+      jobs.markFailed(pending.job_id, "private-error-payload");
+    });
+    const before = await snapshot();
+    const response = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
+    expect(response.status).toBe(200);
+    const value = await response.json<any>();
+    expect(value.document_change_checkpoint).toMatchObject({ read_only: true, project_id: created.project_id,
+      schedule: { last_verified_at: "2026-10-01T12:00:00.000Z", next_verification_at: "2026-10-02T12:00:00.000Z", late_since: null, due: true },
+      cursor: { present: true }, counts: { pending_jobs: 1, pending_jobs_with_error: 1, quarantines: 8, findings_by_status: { unexpected_conflict: 8 } } });
+    expect(value.document_change_checkpoint.schedule.overdue_by_ms).toBeGreaterThan(0);
+    expect(value.document_change_checkpoint.cursor.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(value.document_change_checkpoint.recent_quarantines).toHaveLength(5);
+    expect(value.document_change_checkpoint.recent_findings).toHaveLength(5);
+    expect(JSON.stringify(value)).not.toMatch(/private-|PRIVATE-RESOURCE|\/private\//);
+    expect(await snapshot()).toEqual(before);
+  });
+
+  it("omits the checkpoint when quarantine counters contain malformed stored values", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-CHECKPOINT-COUNTERS-0001", "checkpoint-counters");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const rows = async () => runInDurableObject(guard, async (_instance, state) =>
+      state.storage.sql.exec("SELECT * FROM managed_document_change_quarantine ORDER BY job_id").toArray());
+    await runInDurableObject(guard, async (_instance, state) => {
+      for (const [id, attempts] of [["A", "private-row-secret"], ["B", -1], ["C", 1.5], ["D", 1]] as const) {
+        state.storage.sql.exec("INSERT INTO managed_document_change_quarantine (job_id, path, code, attempts, quarantined_at) VALUES (?, ?, ?, ?, ?)",
+          `CHGJOB-${id.repeat(24)}`, "/private/target", "file_target_missing", attempts, "2026-10-02T12:00:00.000Z");
+      }
+    });
+    const before = await rows();
+    const response = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
+    const body = await response.json<any>();
+    expect(response.status).toBe(200);
+    expect(body.document_change_checkpoint).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain("private-row-secret");
+    expect(await rows()).toEqual(before);
+  });
+
   it("bounds a scheduled document slice and leaves durable work for the next cron", async () => {
     const mock = installDropboxMock();
     const slug = "scheduled-document-budget";

@@ -3,14 +3,21 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
+import type { ProjectState } from "../src/domain/project-state";
+import type { ExecutionAdmission } from "../src/execution/contract";
 import { encodeAdmission } from "../src/admission/transport";
 import { AdmissionError } from "../src/admission/mutation-context";
 import { sha256Text } from "../src/documents/hash";
 import { sha256Canonical } from "../src/materialization/hash";
-import { machineDocumentRoot, machineDocumentVersionPath, workspaceManagedDocumentPath } from "../src/persistence/layout";
-import { ExecutionJournal } from "../src/execution/journal";
+import { canonicalJson } from "../src/rules/contract";
+import { machineDocumentRoot, machineDocumentVersionPath, workspaceManagedDocumentPath, workspaceProjectRoot } from "../src/persistence/layout";
+import { ExecutionJournal, executionHash } from "../src/execution/journal";
+import { ZoneNavigationEngine } from "../src/documents/zone-navigation";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
+import { ManagedDocumentChangeJobStore } from "../src/documents/change-job-store";
+import { ManagedDocumentRequestLedger } from "../src/documents/request-ledger";
+import { createProductionPersistence } from "../src/persistence/production-factory";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-25T01:05:00+01:00";
@@ -1237,6 +1244,441 @@ describe("managed document crash recovery", () => {
       queueRows: 0,
       stagedMarkers: 0
     });
+  });
+
+  it.each([
+    { name: "original request binding", current: { generation: 127, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: true },
+    { name: "same request ID on another project", projectId: "PRJ-0004", current: { generation: 127, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: false },
+    { name: "wrong admitted revision", expectedRevision: 517, current: { generation: 127, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: false },
+    { name: "changed original index payload", expectedIndex: { basename: "00-CURRENT-INDEX.md" as const, object_id: "id:VI4Cv070g6AAAAAAAAA9TQ", revision_token: "0165cd03b6f4372000000037a835733", content_sha256: "4255d6800bbb675795a22443ed86dd0d9250198299dbe3c1fc1ecb6212bb6898" }, current: { generation: 127, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: false },
+    { name: "strictly advanced, adopted, and unowned", current: { generation: 127, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: true, crashAfterReceipt: true },
+    { name: "already published at original source generation", current: { generation: 116, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: true, alreadyPublished: true, crashAfterReceipt: true },
+    { name: "cross-request published receipt replay", current: { generation: 116, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: true, alreadyPublished: true, crashAfterReceipt: true, corruptReceiptReplay: true },
+    { name: "publication proof unavailable", current: { generation: 127, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: false, publicationUnavailable: true },
+    { name: "same generation", current: { generation: 116, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: false },
+    { name: "source reversal", current: { generation: 115, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: false },
+    { name: "not adopted", current: { generation: 127, adopted: false, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] }, settles: false },
+    { name: "owned by another request", current: { generation: 127, adopted: true, adoption_request_id: "DOCREQ-OTHER-OWNER-0001", adoption_generation: 127, in_flight_writes: [] }, settles: false },
+    { name: "ownerless but adoption fenced", current: { generation: 127, adopted: true, adoption_request_id: null, adoption_generation: 127, in_flight_writes: [] }, settles: false },
+    { name: "in-flight head write", current: { generation: 127, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [{ resource_id: "head:DOC-000000000000000000000001", generation: 127, write_hash: "a".repeat(64) }] }, settles: false }
+  ])("settles only when stopped navigation source is $name", async ({ name, current, settles, publicationUnavailable, crashAfterReceipt, alreadyPublished, corruptReceiptReplay, projectId, expectedRevision, expectedIndex }) => {
+    const mock = installDropboxMock({ faults, immutableRevisions: true });
+    const targetProjectId = projectId ?? "PRJ-0003";
+    const targetRevision = expectedRevision ?? 516;
+    const guard = testEnv.PROJECT_GUARD.getByName(targetProjectId);
+    await runInDurableObject(guard, (_instance, durableState) => {
+      durableState.storage.sql.exec("DELETE FROM request_recovery WHERE kind = 'document' AND request_id = ?", "DOCREQ-NAV-AUTO-WORKING-S116-R516-G4");
+      durableState.storage.sql.exec("DELETE FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", "DOCREQ-NAV-AUTO-WORKING-S116-R516-G4");
+      durableState.storage.sql.exec("DELETE FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", "DOCREQ-NAV-AUTO-WORKING-S116-R516-G4");
+      durableState.storage.sql.exec("DELETE FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?", "DOCREQ-NAV-AUTO-WORKING-S116-R516-G4");
+      durableState.storage.sql.exec("DELETE FROM document_requests WHERE request_id = ?", "DOCREQ-NAV-AUTO-WORKING-S116-R516-G4");
+    });
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAV-AUTO-WORKING-S116-R516-G4",
+      project_id: targetProjectId,
+      zone: "WORKING" as const,
+      expected_project_revision: targetRevision,
+      expected_generation: 4,
+      expected_index: expectedIndex ?? {
+        basename: "00-CURRENT-INDEX.md" as const,
+        object_id: "id:VI4Cv070g6AAAAAAAAA9TQ",
+        revision_token: "0165cd03b6f4372000000037a835733",
+        content_sha256: "3255d6800bbb675795a22443ed86dd0d9250198299dbe3c1fc1ecb6212bb6898"
+      },
+      created_at: "2026-10-02T21:56:41.654Z"
+    };
+    const requestHash = await sha256Canonical(request);
+    if (targetProjectId === "PRJ-0003" && targetRevision === 516 && !expectedIndex) {
+      expect(requestHash).toBe("736755ecdf6a616df576153fd4c64d6530673b68564ec70def3ee72e8ff81df2");
+    }
+    const state: ProjectState = {
+      schema_version: "2.0", project_id: targetProjectId, name: "Original WORKING navigation", slug: "project-0003",
+      aliases: [], objective: "fixture", framing: { scope: [], out_of_scope: [], success_criteria: [], stakeholders: [], open_questions: [] },
+      discovery: { confirmed_findings: [], provisional_findings: [], unresolved_questions: [], next_exploration: [] },
+      status: "active", revision: targetRevision, current_phase_id: null, artifact_routes: {}, local_rules: {},
+      rule_exceptions: {}, approvals: {}, constraints: {}, tasks: {}, plan_phases: {}, decisions: {}, research: {},
+      deliverables: {}, last_event_id: null, created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-10-02T21:56:41.654Z"
+    };
+    const source = { generation: 116, adopted: true, adoption_request_id: null, adoption_generation: null, in_flight_writes: [] };
+    mock.files.set(`${machineDocumentRoot(targetProjectId)}/navigation-sources/state.json`, JSON.stringify({
+      schema_version: "1.0", project_id: targetProjectId, state_revision: 2,
+      zones: { WORKING: source, REVIEW: { ...source, generation: 0 }, DELIVERABLES: { ...source, generation: 0 } }
+    }));
+    const runtime = createProductionPersistence(testEnv, targetProjectId);
+    const journal = new ExecutionJournal(runtime, targetProjectId, "document", request.request_id);
+    const indexPath = workspaceManagedDocumentPath(targetProjectId, state.slug, "working", request.expected_index!.basename);
+    const indexLogicalPath = `WORKING/${request.expected_index!.basename}`;
+    const archiveLogicalPath = `ARCHIVES/NAVIGATION/WORKING/5-${request.expected_index!.content_sha256}.md`;
+    const admission: ExecutionAdmission = {
+      project_id: targetProjectId, request_id: request.request_id, kind: "document", operation: "navigation.reconcile",
+      request_hash: requestHash, actor: { actor_id: "system:test", authority: "system" },
+      resources: [{ resource_id: "navigation:WORKING", resource_type: "navigation", zone: "WORKING", version: "4" }],
+      resource_effect_scopes: [{
+        resource_id: "navigation:WORKING", resource_version: "4", provider_id: runtime.providerId,
+        sources: [{ path: indexPath, logical_path: indexLogicalPath }],
+        destinations: [{ path: indexPath, logical_path: indexLogicalPath }],
+        preservation_copies: [{ path: `${workspaceProjectRoot(targetProjectId, state.slug)}/${archiveLogicalPath}`, logical_path: archiveLogicalPath }]
+      }],
+      global_revision: 1, project_revision: targetRevision,
+      ruleset: { digest: "a".repeat(64), rules: [], global_revision: 1, project_revision: targetRevision },
+      verdict: "allow", results: [], gaps: [], deferred_rules: []
+    };
+    await journal.commit(admission, null);
+    await new ManagedDocumentRequestLedger(runtime.objects).ensureIntent(targetProjectId, request.request_id, JSON.stringify(request));
+    const frozenRecord = {
+      schema_version: "1.0", project_id: targetProjectId, request_id: request.request_id,
+      request_hash: requestHash, project_revision: targetRevision, state, state_hash: await sha256Canonical(state)
+    };
+    mock.files.set(`${machineDocumentRoot(targetProjectId)}/requests/${request.request_id}/navigation-admitted-state.json`, canonicalJson(frozenRecord));
+    const root = await journal.root();
+    const progress = {
+      schema_version: "1.0", project_id: targetProjectId, request_id: request.request_id,
+      request_hash: requestHash, target_generation: 5, index_basename: request.expected_index?.basename ?? "00-CURRENT.md",
+      expected_index: request.expected_index, head_revision_token: null, cursor: "saved-source-116-cursor",
+      page_count: 4, inventory_complete: false, snapshot_id: "source:116", verify_page: 4, verify_entry: 0,
+      source_count: 0, source_ids: [], published_index: null, coverage_gaps: [], rendered_links: [],
+      generated_sha256: null, legacy_archive_ref: null, valid_links_work: null, status: "adopting",
+      receipt: null, postchecks: []
+    };
+    let provenPublication: NonNullable<Awaited<ReturnType<ZoneNavigationEngine["readVerifiedPublication"]>>> | undefined;
+    if (alreadyPublished) {
+      const index = request.expected_index!;
+      const publishedReceipt = {
+        schema_version: "1.0" as const, status: "committed" as const, project_id: targetProjectId,
+        request_id: request.request_id, zone: "WORKING" as const, generation: 5,
+        head_ref: `${machineDocumentRoot(targetProjectId)}/navigation/WORKING/head.json`,
+        finalization_ref: "", index, source_snapshot_id: "source:116", source_count: 0, coverage_gaps: []
+      };
+      provenPublication = publishedReceipt;
+      const certificate = {
+        schema_version: "1.0", project_id: targetProjectId, request_id: request.request_id,
+        request_hash: requestHash, zone: "WORKING", generation: 5, source_snapshot_id: "source:116",
+        source_count: 0, index, coverage_gaps: [], generated_content_sha256: index.content_sha256, postchecks: []
+      };
+      publishedReceipt.finalization_ref = `${root}/navigation/finalizations/${await executionHash(certificate)}.json`;
+      mock.files.set(publishedReceipt.finalization_ref, canonicalJson(certificate));
+      mock.files.set(publishedReceipt.head_ref, canonicalJson({
+        schema_version: "1.0", project_id: targetProjectId, zone: "WORKING", generation: 5,
+        source_request_id: request.request_id, index, finalization_ref: publishedReceipt.finalization_ref,
+        source_snapshot_id: "source:116", source_count: 0, coverage_gaps: []
+      }));
+      Object.assign(progress, {
+        status: "finalized", inventory_complete: true, receipt: publishedReceipt,
+        published_index: index, generated_sha256: index.content_sha256
+      });
+    }
+    mock.files.set(`${root}/navigation-progress.json`, canonicalJson(progress));
+    for (let pageNumber = 0; pageNumber < 4; pageNumber += 1) {
+      mock.files.set(`${root}/navigation/snapshot/${pageNumber.toString().padStart(8, "0")}.json`, canonicalJson({
+        schema_version: "1.0", page: pageNumber, project_id: targetProjectId,
+        request_id: request.request_id, snapshot_id: "source:116", entries: [], gaps: []
+      }));
+    }
+    const currentSource = { ...source, ...current };
+    const currentSourcePath = `${machineDocumentRoot(targetProjectId)}/navigation-sources/state.json`;
+    const currentSourceBytes = JSON.stringify({
+      schema_version: "1.0", project_id: targetProjectId, state_revision: 3,
+      zones: { WORKING: currentSource, REVIEW: { ...source, generation: 0 }, DELIVERABLES: { ...source, generation: 0 } }
+    });
+    mock.files.set(currentSourcePath, currentSourceBytes);
+    const requestJson = JSON.stringify(request);
+    const requestSha256 = await sha256Text(requestJson);
+    const failure = {
+      fingerprint: "b".repeat(64), count: 6, stopped: 1,
+      message: canonicalJson({ code: "identical_internal_failure_limit", classification: "internal", error_name: "Error",
+        progress_sha256: "c".repeat(64), next_attempt_at: null })
+    };
+    await runInDurableObject(guard, (_instance, durableState) => {
+      durableState.storage.sql.exec(
+        "INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES ('document', ?, ?, ?)",
+        request.request_id, requestJson, requestSha256
+      );
+      durableState.storage.sql.exec(
+        `INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message)
+         VALUES ('document', ?, ?, ?, ?, ?)`, request.request_id, failure.fingerprint, failure.count, failure.stopped, failure.message
+      );
+    });
+    const beforeRecovery = await runInDurableObject(guard, (_instance, state) => ({
+      payload: state.storage.sql.exec("SELECT request_id FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", request.request_id).toArray().length,
+      queue: state.storage.sql.exec("SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id).toArray().length
+    }));
+    expect(beforeRecovery).toEqual({ payload: 1, queue: 0 });
+    const clearFixtureRows = () => runInDurableObject(guard, (_instance, durableState) => {
+      durableState.storage.sql.exec("DELETE FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id);
+      durableState.storage.sql.exec("DELETE FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", request.request_id);
+      durableState.storage.sql.exec("DELETE FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id);
+      durableState.storage.sql.exec("DELETE FROM request_recovery_staged WHERE kind = 'document' AND request_id = ?", request.request_id);
+      durableState.storage.sql.exec("DELETE FROM document_requests WHERE request_id = ?", request.request_id);
+    });
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(targetProjectId);
+    await runInDurableObject(materialization, async (_instance, state) => {
+      await state.storage.delete(`navigation-work:${request.request_id}`);
+      await state.storage.delete(`navigation-context:${request.request_id}`);
+      await state.storage.put(`navigation-retry:${request.request_id}`, canonicalJson({ stopped: true, next_attempt_at: null }));
+      await state.storage.deleteAlarm();
+    });
+    const workerBefore = await runInDurableObject(materialization, async (_instance, state) => ({
+      retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`),
+      alarm: await state.storage.getAlarm()
+    }));
+
+    if (publicationUnavailable) {
+      vi.spyOn(ZoneNavigationEngine.prototype, "readVerifiedPublication").mockRejectedValueOnce(new Error("proof_unavailable"));
+    }
+    if (alreadyPublished) {
+      if (!provenPublication) throw new Error("expected seeded historical publication");
+      vi.spyOn(ZoneNavigationEngine.prototype, "readVerifiedPublication").mockResolvedValue(provenPublication);
+    }
+    if (crashAfterReceipt) {
+      await runInDurableObject(guard, (instance) => {
+        vi.spyOn(instance as any, "storeCanonicalTerminalObservation").mockRejectedValueOnce(new Error("crash_after_receipt"));
+      });
+    }
+
+    const progressBytes = mock.files.get(`${root}/navigation-progress.json`)!;
+    const pageBytes = Array.from({ length: 4 }, (_, pageNumber) => mock.files.get(
+      `${root}/navigation/snapshot/${pageNumber.toString().padStart(8, "0")}.json`
+    )!);
+    const settled = await runInDurableObject(guard, (instance) =>
+      (instance as unknown as { settleOneStaleWorkingNavigation(state: ProjectState): Promise<boolean> })
+        .settleOneStaleWorkingNavigation(state));
+    expect(settled).toBe(true);
+    const receiptPath = `${machineDocumentRoot(targetProjectId)}/requests/${request.request_id}/receipt.json`;
+    if (!settles) {
+      expect(mock.files.has(receiptPath)).toBe(false);
+      expect(await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec<{ fingerprint: string; count: number; stopped: number; message: string }>(
+        "SELECT fingerprint, count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+      ).toArray()[0])).toEqual(failure);
+      expect(mock.files.get(currentSourcePath)).toBe(currentSourceBytes);
+      expect(mock.files.get(`${root}/navigation-progress.json`)).toBe(progressBytes);
+      expect(await runInDurableObject(materialization, async (_instance, state) => ({
+        retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`), alarm: await state.storage.getAlarm()
+      }))).toEqual(workerBefore);
+      await clearFixtureRows();
+      return;
+    }
+    expect(mock.files.has(receiptPath)).toBe(true);
+    const receiptRecord = JSON.parse(mock.files.get(receiptPath)!);
+    const receipt = JSON.parse(receiptRecord.receipt_json);
+    const receiptBytes = mock.files.get(receiptPath)!;
+    expect(receipt).toMatchObject(alreadyPublished
+      ? { status: "committed", execution_status: "pending", navigation_receipt: { source_snapshot_id: "source:116" } }
+      : { status: "conflict", execution_status: "conflict", code: "navigation_snapshot_changed" });
+    expect(receipt.recovery_settlement).toMatchObject({
+      original_snapshot_id: "source:116", current_source_generation: alreadyPublished ? 116 : 127,
+      result: alreadyPublished ? "already_published" : "snapshot_advanced",
+      failure: { fingerprint: failure.fingerprint, count: 6, stopped: true,
+        diagnostic: { code: "identical_internal_failure_limit", classification: "internal", error_name: "Error",
+          progress_sha256: "c".repeat(64), next_attempt_at: null } }
+    });
+    if (crashAfterReceipt) {
+      expect(await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec(
+        "SELECT fingerprint, count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+      ).toArray()[0])).toEqual(failure);
+      if (corruptReceiptReplay) {
+        const corruptedRecord = JSON.parse(receiptBytes);
+        const corruptedReceipt = JSON.parse(corruptedRecord.receipt_json);
+        corruptedReceipt.navigation_receipt.request_id = "DOCREQ-NAV-OTHER-PUBLISHED-0001";
+        corruptedRecord.receipt_json = JSON.stringify(corruptedReceipt);
+        mock.files.set(receiptPath, JSON.stringify(corruptedRecord));
+        await runInDurableObject(guard, (instance) =>
+          (instance as unknown as { settleOneStaleWorkingNavigation(state: ProjectState): Promise<boolean> })
+            .settleOneStaleWorkingNavigation(state));
+        expect(await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec(
+          "SELECT fingerprint, count, stopped, message FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+        ).toArray()[0])).toEqual(failure);
+        await clearFixtureRows();
+        return;
+      }
+      await runInDurableObject(guard, (instance) =>
+        (instance as unknown as { settleOneStaleWorkingNavigation(state: ProjectState): Promise<boolean> })
+          .settleOneStaleWorkingNavigation(state));
+      if (alreadyPublished) expect(ZoneNavigationEngine.prototype.readVerifiedPublication).toHaveBeenCalledTimes(2);
+      expect(mock.files.get(receiptPath)).toBe(receiptBytes);
+    }
+    const remainingFailures = await runInDurableObject(guard, (_instance, state) => state.storage.sql.exec(
+      "SELECT request_id FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", request.request_id
+    ).toArray());
+    expect(remainingFailures).toHaveLength(0);
+    expect(mock.files.get(`${root}/navigation-progress.json`)).toBe(progressBytes);
+    expect(Array.from({ length: 4 }, (_, pageNumber) => mock.files.get(
+      `${root}/navigation/snapshot/${pageNumber.toString().padStart(8, "0")}.json`
+    )!)).toEqual(pageBytes);
+    expect(mock.files.get(currentSourcePath)).toBe(currentSourceBytes);
+    expect(await runInDurableObject(guard, (instance) =>
+      (instance as unknown as { settleOneStaleWorkingNavigation(state: ProjectState): Promise<boolean> })
+        .settleOneStaleWorkingNavigation(state))).toBe(false);
+    expect(mock.files.get(receiptPath)).toBe(receiptBytes);
+    expect(await runInDurableObject(materialization, async (_instance, state) => ({
+      retry: await state.storage.get<string>(`navigation-retry:${request.request_id}`),
+      alarm: await state.storage.getAlarm()
+    }))).toEqual(workerBefore);
+    await clearFixtureRows();
+  });
+
+  it("exposes the project-local change checkpoint on a validated navigation status without changing state", async () => {
+    const mock = installDropboxMock({ faults, immutableRevisions: true });
+    const created = await createProject("LOCAL-NAVIGATION-STATUS-CHECKPOINT");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const request = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAV-STATUS-CHECKPOINT-0001",
+      project_id: created.project_id, zone: "WORKING" as const, expected_project_revision: created.new_revision,
+      expected_generation: 0, expected_index: null, created_at: at
+    };
+    const requestJson = JSON.stringify(request);
+    const requestSha256 = await sha256Text(requestJson);
+    await runInDurableObject(guard, async (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES ('document', ?, ?, ?)",
+        request.request_id, requestJson, requestSha256);
+      state.storage.sql.exec("INSERT INTO request_recovery_failures (kind, request_id, fingerprint, count, stopped, message) VALUES ('document', ?, ?, 6, 1, ?)",
+        request.request_id, "a".repeat(64), JSON.stringify({ code: "identical_internal_failure_limit", classification: "internal", error_name: "Error", progress_sha256: "b".repeat(64), next_attempt_at: null }));
+      const jobs = new ManagedDocumentChangeJobStore(state.storage);
+      jobs.registerPage({ expected_cursor: null, next_cursor: "secret-cursor-value", jobs: [] });
+      jobs.completeScheduledVerification("2026-10-01T12:00:00.000Z");
+      jobs.recordDriftFinding({ finding_id: `DRIFT-${"A".repeat(24)}`, job_id: `CHGJOB-${"A".repeat(24)}`,
+        path: "/private/project-wide-path", change_kind: "deleted", status: "unexpected_conflict", code: "file_target_missing", observed_at: "2026-10-02T12:00:00.000Z" });
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+    const before = await runInDurableObject(guard, async (_instance, state) => ({
+      payload: state.storage.sql.exec("SELECT * FROM request_recovery_payload WHERE request_id = ?", request.request_id).toArray(),
+      failures: state.storage.sql.exec("SELECT * FROM request_recovery_failures WHERE request_id = ?", request.request_id).toArray(),
+      changes: ["managed_document_change_control", "managed_document_drift_control", "managed_document_change_jobs", "managed_document_change_quarantine", "managed_document_drift_findings"]
+        .map(table => state.storage.sql.exec(`SELECT * FROM ${table}`).toArray()),
+      alarm: await state.storage.getAlarm()
+    }));
+    const providerCallsDuringCheckpoint: number[] = [];
+    const originalReadCheckpoint = ManagedDocumentChangeJobStore.prototype.readCheckpoint;
+    vi.spyOn(ManagedDocumentChangeJobStore.prototype, "readCheckpoint").mockImplementation(async function (this: ManagedDocumentChangeJobStore, now: string) {
+      const callsBefore = mock.providerCalls.length;
+      const result = await originalReadCheckpoint.call(this, now);
+      providerCallsDuringCheckpoint.push(mock.providerCalls.length - callsBefore);
+      return result;
+    });
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(response.status).toBe(200);
+    const body = await response.json<any>();
+    expect(body.document_change_checkpoint).toMatchObject({ scope: "project", observation_scope: "local_only", read_only: true });
+    expect(body.document_change_checkpoint.cursor.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(body.document_change_checkpoint.recent_findings).toHaveLength(1);
+    expect(JSON.stringify(body.document_change_checkpoint)).not.toMatch(/secret-cursor-value|private-project-wide-path|identical_internal_failure_limit/);
+    expect(providerCallsDuringCheckpoint).toEqual([0]);
+    const after = await runInDurableObject(guard, async (_instance, state) => ({
+      payload: state.storage.sql.exec("SELECT * FROM request_recovery_payload WHERE request_id = ?", request.request_id).toArray(),
+      failures: state.storage.sql.exec("SELECT * FROM request_recovery_failures WHERE request_id = ?", request.request_id).toArray(),
+      changes: ["managed_document_change_control", "managed_document_drift_control", "managed_document_change_jobs", "managed_document_change_quarantine", "managed_document_drift_findings"]
+        .map(table => state.storage.sql.exec(`SELECT * FROM ${table}`).toArray()),
+      alarm: await state.storage.getAlarm()
+    }));
+    expect(after).toEqual(before);
+    expect(mock.calls.length).toBeGreaterThan(0);
+
+    const nonNavigation = {
+      operation: "working.write" as const, request_id: "DOCREQ-NAV-STATUS-CONTROL-0001", project_id: created.project_id,
+      logical_path: "strategy/status-control.md", content: "private non-navigation request", content_sha256: await sha256Text("private non-navigation request"), created_at: at
+    };
+    const malformedNavigation = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAV-STATUS-MALFORMED-0001", project_id: created.project_id,
+      zone: "WORKING" as const, expected_project_revision: created.new_revision, expected_generation: 0, expected_index: null, created_at: at
+    };
+    const nonNavigationJson = JSON.stringify(nonNavigation);
+    const nonNavigationHash = await sha256Text(nonNavigationJson);
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES ('document', ?, ?, ?)",
+        nonNavigation.request_id, nonNavigationJson, nonNavigationHash);
+      state.storage.sql.exec("INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES ('document', ?, ?, ?)",
+        malformedNavigation.request_id, JSON.stringify(malformedNavigation), "f".repeat(64));
+    });
+    for (const requestId of [nonNavigation.request_id, malformedNavigation.request_id, "DOCREQ-NAV-STATUS-NO-LOCAL-INTENT-0001"]) {
+      const control = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${requestId}`);
+      expect(control.status).toBe(200);
+      expect((await control.json<any>()).document_change_checkpoint).toBeUndefined();
+    }
+    const mismatchedScope = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}&project_id=PRJ-9999`);
+    expect(mismatchedScope.status).toBe(404);
+    const unavailableRequest = {
+      ...request, request_id: "DOCREQ-NAV-STATUS-UNAVAILABLE-0001"
+    };
+    const unavailableJson = JSON.stringify(unavailableRequest);
+    const unavailableHash = await sha256Text(unavailableJson);
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO request_recovery_payload (kind, request_id, request_json, request_sha256) VALUES ('document', ?, ?, ?)",
+        unavailableRequest.request_id, unavailableJson, unavailableHash);
+    });
+    vi.spyOn(ExecutionJournal.prototype, "status").mockRejectedValueOnce(new Error("provider_busy"));
+    const unavailable = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${unavailableRequest.request_id}`);
+    expect(unavailable.status).toBe(503);
+    expect((await unavailable.json<any>()).document_change_checkpoint).toBeUndefined();
+  });
+
+  it("exposes a project checkpoint beside a terminal navigation receipt only when local request hash matches validated execution", async () => {
+    installDropboxMock({ faults, immutableRevisions: true });
+    const created = await createProject("LOCAL-NAVIGATION-TERMINAL-CHECKPOINT");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const admissionSecret = "terminal-navigation-checkpoint-admission";
+    await runInDurableObject(guard, (instance) => Object.assign((instance as unknown as { env: Env }).env, {
+      PROJECT_OS_ADMISSION_PROJECT_MODES: JSON.stringify({ [created.project_id]: "strict" }),
+      MUTATION_CONTEXT_SIGNING_KEY: "terminal-navigation-checkpoint-context",
+      RULE_ADMISSION_SIGNING_KEY: admissionSecret
+    }));
+    await bootstrapRuleAdmissionGovernance(testEnv, admissionSecret, created.project_id);
+    const request = {
+      operation: "navigation.reconcile" as const, request_id: "DOCREQ-NAV-TERMINAL-CHECKPOINT-0001",
+      project_id: created.project_id, zone: "WORKING" as const, expected_project_revision: created.new_revision,
+      expected_generation: 0, expected_index: null, created_at: at
+    };
+    const requestJson = JSON.stringify(request);
+    const contextResponse = await guard.fetch("https://project-guard.internal/mutation-context");
+    const { context } = await contextResponse.json<{ context: Parameters<typeof encodeAdmission>[1] }>();
+    const admitted = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(encodeAdmission(request, context))
+    });
+    expect(admitted.status).toBe(202);
+    const journal = new ExecutionJournal(createProductionPersistence(testEnv, created.project_id), created.project_id, "document", request.request_id);
+    const receiptPath = `${machineDocumentRoot(created.project_id)}/requests/${request.request_id}/receipt.json`;
+    await journal.recordReceipt("conflict", receiptPath);
+    const receipt = {
+      operation: "navigation.reconcile", request_id: request.request_id, project_id: created.project_id,
+      status: "conflict", execution_status: "conflict", code: "navigation_snapshot_changed"
+    };
+    const ledger = new ManagedDocumentRequestLedger(createProductionPersistence(testEnv, created.project_id).objects);
+    await ledger.writeReceipt(created.project_id, request.request_id, requestJson, JSON.stringify(receipt));
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("INSERT OR REPLACE INTO document_requests (request_id, request_json, receipt_json) VALUES (?, ?, ?)",
+        request.request_id, requestJson, JSON.stringify(receipt));
+      state.storage.sql.exec("DELETE FROM request_recovery_payload WHERE kind = 'document' AND request_id = ?", request.request_id);
+      state.storage.sql.exec("DELETE FROM request_recovery WHERE kind = 'document' AND request_id = ?", request.request_id);
+    });
+
+    const response = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect(response.status).toBe(200);
+    const body = await response.json<any>();
+    expect(body.status).toBe("conflict");
+    expect(body.execution.request_hash).toBe(await sha256Canonical(request));
+    expect(body.receipt).toEqual(receipt);
+    expect(body.document_change_checkpoint).toMatchObject({ scope: "project", observation_scope: "local_only", read_only: true });
+
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("UPDATE document_requests SET receipt_json = ? WHERE request_id = ?",
+        JSON.stringify({ ...receipt, request_id: "DOCREQ-NAV-OTHER-0001" }), request.request_id);
+    });
+    const mismatchedReceipt = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect((await mismatchedReceipt.json<any>()).document_change_checkpoint).toBeUndefined();
+
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("UPDATE document_requests SET request_json = ? WHERE request_id = ?",
+        JSON.stringify({ ...request, expected_generation: 1 }), request.request_id);
+      state.storage.sql.exec("UPDATE document_requests SET receipt_json = ? WHERE request_id = ?",
+        JSON.stringify(receipt), request.request_id);
+    });
+    const mismatchedIntent = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect((await mismatchedIntent.json<any>()).document_change_checkpoint).toBeUndefined();
+
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM document_requests WHERE request_id = ?", request.request_id);
+    });
+    const prunedIntent = await guard.fetch(`https://project-guard.internal/request-status?kind=document&request_id=${request.request_id}`);
+    expect((await prunedIntent.json<any>()).document_change_checkpoint).toBeUndefined();
   });
 
   it("adds a local-only diagnostic to an unknown canonical request-status response", async () => {

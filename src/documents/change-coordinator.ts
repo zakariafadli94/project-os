@@ -152,6 +152,10 @@ export class ManagedDocumentChangeCoordinator {
     }
   }
 
+  readCheckpoint(now: string) {
+    return this.jobs?.readCheckpoint(now) ?? Promise.resolve(null);
+  }
+
   async reconcile(state: ProjectState, options: ManagedDocumentReconcileOptions = {}): Promise<ManagedDocumentChangeSummary> {
     if (!this.jobs) return this.reconcileLegacyTestSeam(state);
 

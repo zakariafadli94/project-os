@@ -1,5 +1,6 @@
 import type { ProviderChangeEntry } from "../persistence/provider/contract";
 import type { RuleResource } from "../rules/contract";
+import { sha256Text } from "./hash";
 
 export type ManagedDocumentDetectionSource = "baseline" | "incremental" | "cursor_reset";
 
@@ -301,6 +302,50 @@ export class ManagedDocumentChangeJobStore {
     ).one().count;
   }
 
+  async readCheckpoint(now: string) {
+    const nowMs = dateMs(now);
+    // Capture existing rows synchronously before hashing; reporting never marks
+    // a verification overdue, advances a cursor, or initializes a schema.
+    const schedule = this.scheduledControl();
+    for (const timestamp of Object.values(schedule)) if (timestamp !== null) dateMs(String(timestamp));
+    const cursor = this.cursor();
+    const counts = {
+      pending_jobs: this.pendingCount(),
+      pending_jobs_with_error: this.storage.sql.exec<CountRow>(
+        "SELECT COUNT(*) AS count FROM managed_document_change_jobs WHERE status = 'pending' AND last_error IS NOT NULL"
+      ).one().count,
+      quarantines: this.storage.sql.exec<CountRow>("SELECT COUNT(*) AS count FROM managed_document_change_quarantine").one().count,
+      findings_by_status: Object.fromEntries(this.storage.sql.exec<{ [key: string]: SqlStorageValue; status: string; count: number }>(
+        "SELECT status, COUNT(*) AS count FROM managed_document_drift_findings GROUP BY status"
+      ).toArray().filter(row => ["expected_reconciled", "unexpected_conflict", "obsolete"].includes(row.status))
+        .map(row => [row.status, row.count]))
+    };
+    const quarantines = this.storage.sql.exec<QuarantineRow>(
+      "SELECT job_id, path, code, attempts, quarantined_at FROM managed_document_change_quarantine ORDER BY quarantined_at DESC, job_id DESC LIMIT 5"
+    ).toArray();
+    const findings = this.storage.sql.exec<DriftFindingRow>(
+      "SELECT finding_id, job_id, path, change_kind, status, code, observed_at, opened_at FROM managed_document_drift_findings ORDER BY observed_at DESC, finding_id DESC LIMIT 5"
+    ).toArray();
+    const nextMs = schedule.next_verification_at === null ? null : dateMs(schedule.next_verification_at);
+    return {
+      schedule: { ...schedule, due: nextMs === null || nowMs >= nextMs, overdue_by_ms: nextMs === null ? 0 : Math.max(0, nowMs - nextMs) },
+      cursor: { present: cursor !== null, sha256: cursor === null ? null : await sha256Text(cursor) },
+      counts,
+      recent_quarantines: await Promise.all(quarantines.map(async row => ({
+        job_id: assertJobId(row.job_id), path_sha256: await sha256Text(row.path), code: diagnosticCode(row.code),
+        attempts: diagnosticAttempts(row.attempts), quarantined_at: new Date(dateMs(row.quarantined_at)).toISOString()
+      }))),
+      recent_findings: await Promise.all(findings.map(async row => {
+        if (!/^DRIFT-[A-F0-9]{24}$/.test(row.finding_id)
+          || !["expected_reconciled", "unexpected_conflict", "obsolete"].includes(row.status)
+          || !["file", "folder", "deleted"].includes(row.change_kind)) throw new Error("Invalid document checkpoint finding");
+        return { finding_id: row.finding_id, job_id: assertJobId(row.job_id), path_sha256: await sha256Text(row.path),
+          change_kind: row.change_kind, status: row.status, code: diagnosticCode(row.code),
+          observed_at: new Date(dateMs(row.observed_at)).toISOString(), opened_at: new Date(dateMs(row.opened_at)).toISOString() };
+      }))
+    };
+  }
+
   recordDriftFinding(input: ManagedDocumentDriftFindingInput): void {
     assertFinding(input);
     this.storage.sql.exec(
@@ -457,4 +502,18 @@ function dateMs(value: string): number {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) throw new Error("Invalid scheduled document verification timestamp");
   return parsed;
+}
+
+function diagnosticCode(value: string): string | null {
+  return ["directory_used_as_file_target", "mutation_candidate_evidence_conflict", "file_target_missing",
+    "navigation_index_external_change", "PACKAGE_CURRENT_INDEX_SNAPSHOT", "PACKAGE_UNEXPECTED_MUTATION",
+    "PACKAGE_UNEXPECTED_DISAPPEARANCE", "PACKAGE_NAVIGATION_UNAVAILABLE", "PACKAGE_EXPECTED_WRITE",
+    "PACKAGE_EXPECTED_DELETE", "PACKAGE_EXPECTED_EFFECT_DIVERGED"].includes(value) ? value : null;
+}
+
+function diagnosticAttempts(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error("Invalid document checkpoint attempts");
+  }
+  return value;
 }

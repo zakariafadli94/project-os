@@ -301,6 +301,8 @@ describe("Worker routing", () => {
       canonical_revision: 1,
       materialized_head: null,
       requested: { revision: 1, projection_version: CURRENT_PROJECTION_VERSION },
+      document_change_checkpoint: { read_only: true, project_id: project.project_id,
+        counts: { pending_jobs: 0, quarantines: 0 }, cursor: { present: false, sha256: null } },
       diagnostic: {
         read_only: true,
         final_verification_pending_count: 0,

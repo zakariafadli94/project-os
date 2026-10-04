@@ -1940,13 +1940,26 @@ describe("durable managed-document change jobs", () => {
         endpoint: "/2/files/list_folder",
         occurrence: 1,
         status: 400,
-        error_summary: "invalid_arg/..."
+        error_summary: "invalid_arg/...",
+        path: root
       }
     );
 
+    const unrelatedListing = await fetch("https://api.dropboxapi.com/2/files/list_folder", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "/PROJECT_OS/WORKSPACE/UNRELATED-PROJECT" })
+    });
+    expect(unrelatedListing.status).toBe(200);
+
+    const providerCallOffset = mock.providerCalls.length;
     const firstReset = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
     expect(firstReset.status).toBe(200);
     await expect(firstReset.json()).resolves.toMatchObject({ safe_errors: ["provider_blocked"], unread_feed: true });
+
+    const firstResetProviderCalls = mock.providerCalls.slice(providerCallOffset);
+    expect(firstResetProviderCalls).toContainEqual({ endpoint: "POST /2/files/list_folder/continue", paths: [] });
+    expect(firstResetProviderCalls).toContainEqual({ endpoint: "POST /2/files/list_folder", paths: [root] });
 
     let cursorAfterFailure: string | null = null;
     await runInDurableObject(guard, async (_instance, state) => {
@@ -1970,6 +1983,7 @@ describe("durable managed-document change jobs", () => {
       });
     });
 
+    const retryProviderCallOffset = mock.providerCalls.length;
     const retry = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
     expect(retry.status).toBe(200);
     expect(await retry.json()).toMatchObject({
@@ -1977,6 +1991,9 @@ describe("durable managed-document change jobs", () => {
       baseline: true,
       cursor_advanced: true
     });
+    const retryProviderCalls = mock.providerCalls.slice(retryProviderCallOffset);
+    expect(retryProviderCalls).toContainEqual({ endpoint: "POST /2/files/list_folder/continue", paths: [] });
+    expect(retryProviderCalls).toContainEqual({ endpoint: "POST /2/files/list_folder", paths: [root] });
   });
 
   it("deduplicates a replayed page and preserves global pending order across later pages", async () => {

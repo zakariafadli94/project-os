@@ -52,7 +52,7 @@ async function createProject(transactionId: string, slug: string): Promise<Recei
 describe("durable managed-document change jobs", () => {
   afterEach(async () => {
     try { await restoreTestEnvBindings?.(); }
-    finally { restoreTestEnvBindings = null; vi.restoreAllMocks(); }
+    finally { restoreTestEnvBindings = null; vi.useRealTimers(); vi.restoreAllMocks(); }
   });
 
   it("reports a bounded checkpoint without advancing verification or changing durable jobs", async () => {
@@ -973,17 +973,40 @@ describe("durable managed-document change jobs", () => {
     const startedAt = Date.now() - 17_900;
     let apiStarted!: () => void;
     const requestStarted = new Promise<void>(resolve => { apiStarted = resolve; });
-    const apiSignals: AbortSignal[] = [];
+    const sourceStatePath = `/PROJECT_OS/.project-os/projects/${created.project_id}/documents/navigation-sources/state.json`;
+    let scopedApiCalls = 0;
+    let scopedSignalPresent = false;
+    let scopedSignalType = "missing";
     let scopedSignalAborted = false;
+    const delegateFetch = mock.spy.getMockImplementation();
+    if (!delegateFetch) throw new Error("Dropbox mock implementation unavailable");
     mock.spy.mockImplementation(async (input, init) => {
-      const url = new URL(input instanceof Request ? input.url : String(input));
-      if (url.pathname === "/oauth2/token") {
-        return Response.json({ access_token: "test-access-token", expires_in: 14_400 });
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      const url = new URL(request.url);
+      let requestedPath: string | undefined;
+      const apiArg = request.headers.get("Dropbox-API-Arg");
+      if (apiArg) {
+        try { requestedPath = (JSON.parse(apiArg) as { path?: string }).path; }
+        catch { /* The delegated mock handles malformed test requests. */ }
       }
-      apiSignals.push(init?.signal as AbortSignal);
+      if (!requestedPath && url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/get_metadata") {
+        try { requestedPath = (JSON.parse(await request.clone().text()) as { path?: string }).path; }
+        catch { /* The delegated mock handles malformed test requests. */ }
+      }
+      const readsNavigationState = requestedPath === sourceStatePath
+        && (url.pathname === "/2/files/get_metadata" || url.pathname === "/2/files/download");
+      if (!readsNavigationState) return delegateFetch(input, init);
+
+      scopedApiCalls += 1;
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      scopedSignalPresent = signal !== undefined && signal !== null;
+      scopedSignalType = signal instanceof AbortSignal ? "AbortSignal" : typeof signal;
       apiStarted();
       return new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        signal?.addEventListener("abort", () => {
+          scopedSignalAborted = true;
+          reject(signal.reason);
+        }, { once: true });
       });
     });
 
@@ -1007,15 +1030,15 @@ describe("durable managed-document change jobs", () => {
         }).enqueueNavigationRefreshForDirtyZones(created.project_id, slice.runtime);
         const rejected = expect(scan).rejects.toThrow("slice_budget_exhausted");
         await requestStarted;
-        expect(apiSignals).toHaveLength(1);
-        expect(apiSignals[0]).toBeInstanceOf(AbortSignal);
         await vi.advanceTimersByTimeAsync(101);
         await rejected;
-        scopedSignalAborted = apiSignals[0].aborted;
       } finally {
         clearTimeout(slice.abortTimer);
       }
     });
+    expect(scopedApiCalls).toBe(1);
+    expect(scopedSignalPresent).toBe(true);
+    expect(scopedSignalType).toBe("AbortSignal");
     expect(scopedSignalAborted).toBe(true);
     const checkpoint = await runInDurableObject(guard, async (_instance, state) => ({
       continuation: new ManagedDocumentChangeJobStore(state.storage).continuation(),

@@ -162,6 +162,11 @@ describe("durable managed-document change jobs", () => {
           raw_error_message: "private-error-payload", provider_path: "/private/provider-path",
           cursor: "private-provider-cursor", request_body: "private-request-body"
         } });
+      await state.storage.put("navigation-head-recovery-diagnostic-v1", {
+        project_id: created.project_id, observed_at: "Sat, 03 Oct 2026 09:59:59 GMT (private-token)", slice_ordinal: 12,
+        resource_id: `head:DOC-${"A".repeat(24)}`, stage: "version_metadata", code: "proof_unavailable",
+        raw_error_message: "private-error-payload", provider_path: "/private/provider-path"
+      });
     });
     const before = await snapshot();
     const providerCallCount = mock.providerCalls.length;
@@ -189,6 +194,9 @@ describe("durable managed-document change jobs", () => {
         }
       } });
     expect(value.document_change_checkpoint.schedule.overdue_by_ms).toBeGreaterThan(0);
+    expect(value.head_write_recovery_checkpoint).toEqual({ read_only: true, observation_scope: "local_only",
+      project_id: created.project_id, observed_at: "2026-10-03T09:59:59.000Z", slice_ordinal: 12,
+      resource_id: `head:DOC-${"A".repeat(24)}`, stage: "version_metadata", code: "proof_unavailable" });
     expect(value.document_change_checkpoint.cursor.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(value.document_change_checkpoint.recent_quarantines).toHaveLength(5);
     expect(value.document_change_checkpoint.recent_findings).toHaveLength(5);
@@ -203,6 +211,48 @@ describe("durable managed-document change jobs", () => {
     expect(repeatedValue.document_change_checkpoint.eligibility).toEqual(value.document_change_checkpoint.eligibility);
     expect(repeatedValue.document_change_checkpoint.continuation).toEqual(value.document_change_checkpoint.continuation);
     expect(await snapshot()).toEqual(before);
+  });
+
+  it("persists the safe recovery boundary on provider failure without clearing the original fence", async () => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-HEAD-DIAGNOSTIC-0001", "head-diagnostic");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const saved = await runInDurableObject(guard, async (instance, durableState) => {
+      const target = instance as unknown as {
+        persistence: ProjectOsPersistenceRuntime;
+        loadOrRecoverState(): Promise<ProjectState>;
+        managedDocumentService: ManagedDocumentService;
+        recoverOneUnownedNavigationHeadWrite(id: string, runtime: ProjectOsPersistenceRuntime, ordinal: number): Promise<unknown>;
+      };
+      const state = await target.loadOrRecoverState();
+      const content = "immutable diagnostic fixture";
+      const working = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-WORKING-DIAGNOSTIC-0001",
+        project_id: created.project_id, logical_path: "diagnostic.md", content,
+        content_sha256: await sha256Text(content), created_at: at }, state);
+      const sources = new ZoneNavigationSources(target.persistence);
+      await sources.markCatalogReady(created.project_id, "WORKING", 0);
+      await sources.beginAdoption(created.project_id, "WORKING", "DOCREQ-NAV-DIAGNOSTIC-0001", 0);
+      await sources.finishAdoption(created.project_id, "WORKING", "DOCREQ-NAV-DIAGNOSTIC-0001", 0);
+      const resourceId = `head:${working.document_id}`;
+      await sources.beginHeadWrite(created.project_id, "WORKING", resourceId, undefined, "a".repeat(64));
+      const before = [...mock.files.entries()];
+      const original = target.persistence.objects.getMetadata.bind(target.persistence.objects);
+      target.persistence.objects.getMetadata = async path => {
+        if (path === machineDocumentHeadPath(created.project_id, working.document_id)) {
+          throw new ProviderOperationError("private-token-provider-body", true, { providerId: "dropbox", code: "private-provider-code", status: 503 });
+        }
+        return original(path);
+      };
+      try {
+        await expect(target.recoverOneUnownedNavigationHeadWrite(created.project_id, target.persistence, 7)).rejects.toThrow();
+      } finally { target.persistence.objects.getMetadata = original; }
+      expect([...mock.files.entries()]).toEqual(before);
+      expect((await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids).toEqual([resourceId]);
+      return { resourceId, diagnostic: await durableState.storage.get("navigation-head-recovery-diagnostic-v1") };
+    });
+    expect(saved.diagnostic).toMatchObject({ project_id: created.project_id, resource_id: saved.resourceId,
+      slice_ordinal: 7, observed_at: expect.any(String), stage: "head_metadata", code: "provider_retryable" });
+    expect(JSON.stringify(saved.diagnostic)).not.toContain("private-");
   });
 
   it("discovers bounded navigation refresh identities without provider calls or local mutations", async () => {

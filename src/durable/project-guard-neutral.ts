@@ -38,7 +38,7 @@ import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocum
 import { ZoneNavigationEngine, zoneNavigationHeadPath, type RecoverableOrphanCheckpoint } from "../documents/zone-navigation";
 import { ZoneNavigationInventory } from "../documents/zone-navigation-inventory";
 import { ZoneNavigationSources, zoneNavigationCompactCatalogRoot, ZONE_NAVIGATION_CATALOG_SHARDS } from "../documents/zone-navigation-sources";
-import { DocumentLedgerRepository, type HeadWriteRecoveryOptions } from "../documents/repository";
+import { DocumentLedgerRepository, HEAD_WRITE_RECOVERY_STAGES, HEAD_WRITE_RECOVERY_CODES, type HeadWriteRecoveryDiagnostic, type HeadWriteRecoveryOptions } from "../documents/repository";
 import type { ProviderObjectMetadata, ProviderRequestScope } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError, MutationGateRepository } from "../mutation-gate/repository";
@@ -897,7 +897,8 @@ export class ProjectGuard extends DurableObject<Env> {
         const checkpoint = await this.managedDocumentChanges.readCheckpoint(observedAt);
         if (!checkpoint) return response;
         const body = await response.clone().json<Record<string, unknown>>();
-        return Response.json({ ...body, navigation_refresh_checkpoint: this.readNavigationRefreshCheckpoint(this.ctx.id.name!), document_change_checkpoint: {
+        return Response.json({ ...body, head_write_recovery_checkpoint: await this.readHeadWriteRecoveryCheckpoint(this.ctx.id.name!),
+          navigation_refresh_checkpoint: this.readNavigationRefreshCheckpoint(this.ctx.id.name!), document_change_checkpoint: {
           read_only: true, project_id: this.ctx.id.name, observed_at: observedAt,
           current_runtime: deploymentIdentity(this.env), ...checkpoint
         } }, { status: response.status });
@@ -3511,7 +3512,9 @@ export class ProjectGuard extends DurableObject<Env> {
       }
     };
     if (locators.length) await saveLocators();
+    let diagnostic: HeadWriteRecoveryDiagnostic | null = null;
     const options: HeadWriteRecoveryOptions = {
+      onDiagnostic: value => { diagnostic = value; },
       pending_recovery_hash: pendingHash,
       excluded_resource_ids: pendingHash === null ? locators.map(item => item.resource_id) : [],
       rememberRecovery: async (hash, resourceId) => {
@@ -3547,8 +3550,20 @@ export class ProjectGuard extends DurableObject<Env> {
       // A denied/unavailable NEW recovery never clears its original fence and
       // must not prevent the independent document coordinator from progressing.
       // Provider/deadline failures retain their normal bounded continuation path.
-      if (error instanceof RuleAdmissionRejection) return { status: "unresolved", remainingCandidates: true };
+      if (error instanceof RuleAdmissionRejection) {
+        if (diagnostic) diagnostic = { ...(diagnostic as HeadWriteRecoveryDiagnostic), code: "admission_unavailable" };
+        return { status: "unresolved", remainingCandidates: true };
+      }
       throw error;
+    } finally {
+      // One local diagnostic per attempted resource, no extra provider writes.
+      // A read-only probe never changes this checkpoint. Reporting failure must
+      // not replace the actual recovery outcome or weaken its evidence gates.
+      if (!probeOnly && diagnostic && (diagnostic as HeadWriteRecoveryDiagnostic).stage !== "idle") {
+        try { await this.ctx.storage.put("navigation-head-recovery-diagnostic-v1", {
+          project_id: projectId, observed_at: new Date().toISOString(), slice_ordinal: sliceOrdinal, ...diagnostic
+        }); } catch { /* optional local diagnostics unavailable */ }
+      }
     }
     if (result.status === "recovered" && pendingHash !== null) {
       const index = locators.findIndex(item => item.request_hash === pendingHash);
@@ -3557,6 +3572,20 @@ export class ProjectGuard extends DurableObject<Env> {
       await saveLocators();
     }
     return locators.length ? { status: result.status === "none" ? "unresolved" : result.status, remainingCandidates: true } : result;
+  }
+
+  private async readHeadWriteRecoveryCheckpoint(projectId: string) {
+    const value = await this.ctx.storage.get<Record<string, unknown>>("navigation-head-recovery-diagnostic-v1");
+    if (!value || value.project_id !== projectId || typeof value.observed_at !== "string"
+      || !Number.isFinite(Date.parse(value.observed_at)) || !Number.isSafeInteger(value.slice_ordinal)
+      || (value.slice_ordinal as number) < 0 || !(value.resource_id === null
+        || typeof value.resource_id === "string" && /^head:DOC-[A-F0-9]{24}$/.test(value.resource_id))
+      || !HEAD_WRITE_RECOVERY_STAGES.includes(value.stage as HeadWriteRecoveryDiagnostic["stage"])
+      || !HEAD_WRITE_RECOVERY_CODES.includes(value.code as HeadWriteRecoveryDiagnostic["code"])) return null;
+    // Explicit allowlist: never spread persisted diagnostics into a response.
+    return { read_only: true, observation_scope: "local_only", project_id: projectId,
+      observed_at: new Date(value.observed_at).toISOString(), slice_ordinal: value.slice_ordinal,
+      resource_id: value.resource_id, stage: value.stage, code: value.code };
   }
 
   private async resumePendingNavigationRefreshes(): Promise<void> {
@@ -6777,7 +6806,8 @@ export class ProjectGuard extends DurableObject<Env> {
       const observedAt = new Date().toISOString();
       const checkpoint = await this.managedDocumentChanges.readCheckpoint(observedAt);
       if (!checkpoint) return response;
-      return Response.json({ ...body, navigation_refresh_checkpoint: this.readNavigationRefreshCheckpoint(projectId), document_change_checkpoint: {
+      return Response.json({ ...body, head_write_recovery_checkpoint: await this.readHeadWriteRecoveryCheckpoint(projectId),
+        navigation_refresh_checkpoint: this.readNavigationRefreshCheckpoint(projectId), document_change_checkpoint: {
         read_only: true, scope: "project", observation_scope: "local_only",
         observed_at: observedAt, current_runtime: deploymentIdentity(this.env), ...checkpoint
       } }, { status: response.status, headers: response.headers });

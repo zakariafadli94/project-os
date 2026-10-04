@@ -532,7 +532,49 @@ describe("ManagedDocumentReconciler external edits", () => {
     expect(JSON.parse(dropbox.files.get(dirtyPath)!)).toMatchObject({ resource_id: `head:${budgeted.document_id}`, generation: budgetedTicket!.generation });
   });
 
-  it.each(["baseline", "probe", "drained", "drained-without-witness", "cleared-without-witness", "coalesced-cas", "head-race", "payload-race"])("disposes an authorized stale head fence against the exact current head without changing source generation: %s", async (scenario) => {
+  it.each(["missing-version", "malformed-version", "malformed-head", "admission-error", "admission-error-observer"])("diagnoses the exact pre-intent recovery boundary without mutating fences or leaking errors: %s", async scenario => {
+    const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
+    runtime.objects.readBytes = async (path, maxBytes) => {
+      const raw = dropbox.files.get(path);
+      if (raw === undefined) return null;
+      const bytes = new TextEncoder().encode(raw);
+      return bytes.byteLength <= maxBytes ? bytes : null;
+    };
+    const project = state();
+    const working = await createWorking(new ManagedDocumentService(runtime), project, "exact proof bytes");
+    const sources = new ZoneNavigationSources(runtime);
+    await sources.markCatalogReady(project.project_id, "WORKING", 0);
+    await sources.beginAdoption(project.project_id, "WORKING", "DOCREQ-NAV-DIAGNOSTIC-ADOPT", 0);
+    await sources.finishAdoption(project.project_id, "WORKING", "DOCREQ-NAV-DIAGNOSTIC-ADOPT", 0);
+    const resourceId = `head:${working.document_id}`;
+    await sources.beginHeadWrite(project.project_id, "WORKING", resourceId, undefined, "a".repeat(64));
+    const head = JSON.parse(dropbox.files.get(machineDocumentHeadPath(project.project_id, working.document_id))!);
+    const versionPath = machineDocumentVersionPath(project.project_id, working.document_id, head.working_version_id);
+    if (scenario === "missing-version") { dropbox.files.delete(versionPath); dropbox.metadata.delete(versionPath); }
+    if (scenario === "malformed-version") await dropbox.externalWrite(versionPath, "private-token-do-not-expose");
+    if (scenario === "malformed-head") await dropbox.externalWrite(machineDocumentHeadPath(project.project_id, working.document_id), "private-token-do-not-expose");
+    const filesBefore = [...dropbox.files.entries()];
+    const diagnostics: unknown[] = [];
+    const options = {
+      pending_recovery_hash: null,
+      onDiagnostic: (value: unknown) => { diagnostics.push(value); if (scenario === "admission-error-observer") throw new Error("observer-error"); },
+      authorize: async (): Promise<ExecutionAdmission> => { throw new Error("private-token-do-not-expose"); },
+      rememberRecovery: async () => { throw new Error("must_not_reach_pointer"); }
+    };
+    const attempt = new DocumentLedgerRepository(runtime).recoverOneUnownedHeadWrite(project.project_id, 0, false, options);
+    if (scenario === "missing-version") expect(await attempt).toMatchObject({ status: "unresolved" });
+    else if (scenario.startsWith("admission-error")) await expect(attempt).rejects.toThrow("private-token-do-not-expose");
+    else await expect(attempt).rejects.toThrow();
+    expect(diagnostics.at(-1)).toEqual({ resource_id: resourceId,
+      stage: scenario.startsWith("admission-error") ? "admission" : scenario === "missing-version" ? "version_metadata" : scenario === "malformed-head" ? "head_decode" : "version_decode",
+      code: scenario === "missing-version" ? "proof_unavailable" : scenario.startsWith("malformed-") ? "invalid_evidence" : "internal_error" });
+    expect(JSON.stringify(diagnostics)).not.toContain("private-token");
+    expect([...dropbox.files.entries()]).toEqual(filesBefore);
+    expect((await sources.readState(project.project_id, "WORKING")).in_flight_resource_ids).toEqual([resourceId]);
+  });
+
+  it.each(["baseline", "throwing-observer", "probe", "drained", "drained-without-witness", "cleared-without-witness", "coalesced-cas", "head-race", "payload-race"])("disposes an authorized stale head fence against the exact current head without changing source generation: %s", async (scenario) => {
     const drained = scenario.startsWith("drained");
     const dropbox = new FakeDocumentDropbox();
     const runtime = persistenceFromDropbox(dropbox);
@@ -586,6 +628,7 @@ describe("ManagedDocumentReconciler external edits", () => {
     let admittedIntentHash: string | null = null;
     const ledger = new DocumentLedgerRepository(runtime);
     const recoveryOptions: HeadWriteRecoveryOptions = {
+      onDiagnostic: scenario === "throwing-observer" ? () => { throw new Error("observer-error"); } : undefined,
       pending_recovery_hash: null,
       authorize: async (intent): Promise<ExecutionAdmission> => {
         admittedIntentHash = await sha256(canonicalJson(intent));

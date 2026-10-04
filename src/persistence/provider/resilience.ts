@@ -79,6 +79,9 @@ export function withProviderResilience(
     createText: (path, content) => retry("create", path, () => runtime.objects.createText(path, content)),
     upsertText: (path, content) => retry("upsert", path, () => runtime.objects.upsertText(path, content)),
     getMetadata: (path) => retry("metadata", path, () => runtime.objects.getMetadata(path)),
+    ...(runtime.objects.getEntryKind ? {
+      getEntryKind: (path: string) => retry("metadata", path, () => runtime.objects.getEntryKind!(path))
+    } : {}),
     listChildren: (path) => retry("list", path, () => runtime.objects.listChildren(path)),
     move: (from, to) => retry("move", `${from} -> ${to}`, async () => {
       try {

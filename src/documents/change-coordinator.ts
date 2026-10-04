@@ -593,6 +593,11 @@ export class ManagedDocumentChangeCoordinator {
 
   private async actualChangeKind(change: ProviderChangeEntry): Promise<ProviderChangeEntry["kind"]> {
     if (change.kind !== "file") return change.kind;
+    if (this.runtime.objects.getEntryKind) {
+      const kind = await this.runtime.objects.getEntryKind(change.path);
+      if (kind === null) throw new MissingChangeTargetError(change.path);
+      return kind;
+    }
     const separator = change.path.lastIndexOf("/");
     if (separator <= 0) return change.kind;
     const parent = change.path.slice(0, separator);

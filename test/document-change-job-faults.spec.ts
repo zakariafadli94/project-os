@@ -2450,6 +2450,143 @@ describe("durable managed-document change jobs", () => {
     })]);
   });
 
+  it("keeps parent-list routing when an older runtime has no exact-kind capability", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-FOLDER-FALLBACK-0001", "folder-kind-fallback");
+    const { runtime } = packageRuntime();
+    const folder = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-folder-kind-fallback/DELIVERABLES/REVENUE-OS`;
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    const listedParents: string[] = [];
+    runtime.objects.listChildren = async parent => {
+      listedParents.push(parent);
+      return [{ kind: "folder", name: "REVENUE-OS", path: folder }];
+    };
+    const state = emptyProjectState(created.project_id, "Folder fallback", "folder-kind-fallback");
+
+    const summary = await runInDurableObject(guard, async (_instance, durableState) => {
+      const store = new ManagedDocumentChangeJobStore(durableState.storage);
+      const cursor = store.cursor();
+      if (cursor === null) throw new Error("Folder fallback fixture baseline cursor is missing");
+      store.registerPage({ expected_cursor: cursor, next_cursor: cursor, jobs: [{
+        job_id: "CHGJOB-FAFAFAFAFAFAFAFAFAFAFAFA",
+        change: { kind: "file", name: "REVENUE-OS", path: folder },
+        detection_source: "incremental", priority: 10
+      }] });
+      return new ManagedDocumentChangeCoordinator(runtime, durableState.storage)
+        .reconcile(state, { now: "2026-10-04T18:00:00.000Z" });
+    });
+
+    expect(listedParents).toEqual([folder.slice(0, folder.lastIndexOf("/"))]);
+    expect(summary).toMatchObject({ jobs_quarantined: 1, jobs_pending: 0, job_failures: 0 });
+  });
+
+  it("quarantines a first-page folder target without draining its entire parent listing", async () => {
+    const mock = installDropboxMock();
+    const slug = "change-job-large-parent-folder-target";
+    const created = await createProject("TXN-CHANGEJOB-LARGE-PARENT-FOLDER-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
+    const parent = `${root}/DELIVERABLES`;
+    const folder = `${parent}/REVENUE-OS`;
+    const jobId = "CHGJOB-121212121212121212121212";
+    mock.writeExternalFolder(folder);
+
+    await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    await runInDurableObject(guard, async (_instance, state) => {
+      initializeManagedDocumentChangeJobSchema(state.storage);
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      const cursor = store.cursor();
+      if (cursor === null) throw new Error("Large-parent fixture baseline cursor is missing");
+      store.registerPage({
+        expected_cursor: cursor,
+        next_cursor: cursor,
+        jobs: [{
+          job_id: jobId,
+          change: { kind: "file", name: "REVENUE-OS", path: folder },
+          detection_source: "incremental",
+          priority: 10
+        }]
+      });
+    });
+
+    const documentRoot = `${machineDocumentRoot(created.project_id)}/`;
+    const documentFilesBefore = [...mock.files.keys()].filter(path => path.startsWith(documentRoot)).sort();
+    const delegateFetch = mock.spy.getMockImplementation();
+    if (!delegateFetch) throw new Error("Dropbox mock implementation unavailable");
+    const listingRequests: string[] = [];
+    const pageOneEntries = [{
+      ".tag": "folder",
+      id: "id:whole-parent-target",
+      name: "REVENUE-OS",
+      path_display: folder,
+      path_lower: folder.toLowerCase()
+    }];
+    mock.spy.mockImplementation(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      const url = new URL(request.url);
+      if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder") {
+        const body = await request.clone().json() as { path?: unknown };
+        if (body.path === parent) {
+          listingRequests.push("first-page");
+          return Response.json({ entries: pageOneEntries, cursor: "whole-parent-page-1", has_more: true });
+        }
+      }
+      if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder/continue") {
+        const body = await request.clone().json() as { cursor?: unknown };
+        if (typeof body.cursor === "string" && /^whole-parent-page-\d+$/.test(body.cursor)) {
+          listingRequests.push(body.cursor);
+          const page = Number(body.cursor.slice("whole-parent-page-".length));
+          return Response.json({
+            entries: [{
+              ".tag": "folder",
+              id: `id:whole-parent-unrelated-${page}`,
+              name: `unrelated-${page}`,
+              path_display: `${parent}/unrelated-${page}`,
+              path_lower: `${parent}/unrelated-${page}`.toLowerCase()
+            }],
+            cursor: `whole-parent-page-${page + 1}`,
+            has_more: page < 65
+          });
+        }
+      }
+      return delegateFetch(input, init);
+    });
+
+    const firstResponse = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
+    const secondResponse = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
+    expect(firstResponse.status).toBe(200);
+    expect(secondResponse.status).toBe(200);
+    const [first, second] = await Promise.all([
+      firstResponse.json<Record<string, unknown>>(),
+      secondResponse.json<Record<string, unknown>>()
+    ]);
+    const durable = await runInDurableObject(guard, async (_instance, state) => {
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      return {
+        pending: store.pending().map(job => ({ job_id: job.job_id, attempts: job.attempts })),
+        quarantines: store.quarantines()
+      };
+    });
+
+    expect([first, second], `Whole-parent request diagnostics: ${JSON.stringify({
+      listing_http_requests: listingRequests.length,
+      first_page_restarts: listingRequests.filter(cursor => cursor === "first-page").length
+    })}`).toMatchObject([
+      { jobs_pending: 0, jobs_quarantined: 1, job_failures: 0, budget_yield: false },
+      { jobs_pending: 0, jobs_quarantined: 0, job_failures: 0, budget_yield: false }
+    ]);
+    expect(durable.pending).toEqual([]);
+    expect(durable.quarantines).toEqual([expect.objectContaining({
+      job_id: jobId,
+      path: folder,
+      code: "directory_used_as_file_target",
+      attempts: 1
+    })]);
+    expect(mock.files.has(folder)).toBe(false);
+    expect([...mock.files.keys()].filter(path => path.startsWith(documentRoot)).sort()).toEqual(documentFilesBefore);
+  });
+
   it("quarantines a proven-absent file target once and admits a new observation after it reappears", async () => {
     const mock = installDropboxMock();
     const slug = "change-job-missing-metadata";
@@ -2499,7 +2636,7 @@ describe("durable managed-document change jobs", () => {
     expect(quarantines).toHaveLength(1);
   });
 
-  it("keeps a file-kind change retryable when the provider listing fails", async () => {
+  it("keeps a file-kind change retryable when exact metadata lookup fails", async () => {
     const faults: DropboxMockFault[] = [];
     installDropboxMock({ faults });
     const slug = "change-job-list-failure";
@@ -2507,7 +2644,6 @@ describe("durable managed-document change jobs", () => {
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
     const absentPath = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}/DELIVERABLES/unknown.pdf`;
-    const parent = absentPath.slice(0, absentPath.lastIndexOf("/"));
     await runInDurableObject(guard, async (_instance, state) => {
       const store = new ManagedDocumentChangeJobStore(state.storage);
       store.registerPage({ expected_cursor: store.cursor(), next_cursor: "list-failure-cursor", jobs: [{
@@ -2515,9 +2651,7 @@ describe("durable managed-document change jobs", () => {
         change: { kind: "file", name: "unknown.pdf", path: absentPath }, detection_source: "incremental", priority: 10
       }] });
     });
-    for (let occurrence = 1; occurrence <= 10; occurrence += 1) {
-      faults.push({ endpoint: "/2/files/list_folder", occurrence: 1, status: 503, error_summary: "temporarily_unavailable", path: parent });
-    }
+    faults.push({ endpoint: "/2/files/get_metadata", occurrence: 1, status: 503, error_summary: "temporarily_unavailable", path: absentPath });
 
     const response = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
     expect(response.status).toBe(200);
@@ -2527,7 +2661,7 @@ describe("durable managed-document change jobs", () => {
       pending = new ManagedDocumentChangeJobStore(state.storage).pending();
     });
     expect(pending).toEqual([expect.objectContaining({
-      job_id: "CHGJOB-EEEEEEEEEEEEEEEEEEEEEEEE", attempts: expect.any(Number), last_error: expect.stringContaining("Dropbox list_folder failed")
+      job_id: "CHGJOB-EEEEEEEEEEEEEEEEEEEEEEEE", attempts: expect.any(Number), last_error: expect.stringContaining("Dropbox metadata lookup failed")
     })]);
   }, 15_000);
 

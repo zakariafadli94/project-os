@@ -11,6 +11,7 @@ export interface DropboxTransport {
   listFolder?(path: string): Promise<DropboxEntry[]>;
   listFolderPage?(path: string, cursor: string | null, limit: number): Promise<DropboxListPage>;
   getMetadata?(path: string): Promise<DropboxFileMetadata | null>;
+  getEntryKind?(path: string): Promise<"file" | "folder" | null>;
   uploadConditional?(path: string, content: string, expectedRev: string): Promise<DropboxFileMetadata>;
   copy?(from: string, to: string): Promise<DropboxFileMetadata>;
   listFolderChanges?(root?: string, cursor?: string): Promise<DropboxChangePage>;
@@ -286,6 +287,37 @@ export class DropboxClient implements DropboxTransport {
     if (response.ok) return parseFileMetadata(JSON.parse(text) as RawDropboxMetadata, path);
     if (response.status === 409 && text.includes("not_found")) return null;
     throw this.errorFromResponse(`Dropbox metadata lookup failed for ${path}`, response, text);
+  }
+
+  async getEntryKind(path: string): Promise<"file" | "folder" | null> {
+    const token = await this.accessToken();
+    const response = await this.runtimeFetch("files/get_metadata", "https://api.dropboxapi.com/2/files/get_metadata", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ path })
+    }, path);
+    const text = await response.text();
+    if (!response.ok) {
+      if (response.status === 409 && isProviderPathNotFound(text)) return null;
+      throw this.errorFromResponse(`Dropbox metadata lookup failed for ${path}`, response, text);
+    }
+
+    const raw = JSON.parse(text) as RawDropboxMetadata;
+    validateMetadataTarget(raw, path);
+    if (raw[".tag"] === "folder") return "folder";
+    if (raw[".tag"] === "file") {
+      if (typeof raw.rev !== "string" || !raw.rev.trim()
+        || typeof raw.content_hash !== "string" || !raw.content_hash.trim()
+        || typeof raw.size !== "number" || !Number.isFinite(raw.size) || raw.size < 0) {
+        throw new Error(`Dropbox file metadata incomplete for ${path}`);
+      }
+      parseFileMetadata(raw, path);
+      return "file";
+    }
+    throw new Error(`Unsupported Dropbox metadata entry tag: ${String(raw[".tag"])}`);
   }
 
   async move(from: string, to: string): Promise<void> {
@@ -731,6 +763,39 @@ function parseFileMetadata(raw: RawDropboxMetadata, fallbackPath: string): Dropb
     size: raw.size,
     ...(raw.server_modified ? { server_modified: raw.server_modified } : {})
   };
+}
+
+function validateMetadataTarget(raw: RawDropboxMetadata, requestedPath: string): void {
+  if (typeof raw.id !== "string" || !raw.id.trim()
+    || typeof raw.name !== "string" || !raw.name.trim()
+    || (raw.path_display !== undefined && (typeof raw.path_display !== "string" || !raw.path_display.trim()))
+    || (raw.path_lower !== undefined && (typeof raw.path_lower !== "string" || !raw.path_lower.trim()))
+    || (!raw.path_display && !raw.path_lower)) {
+    throw new Error(`Dropbox metadata identity incomplete for ${requestedPath}`);
+  }
+  const expectedPathLower = requestedPath.toLowerCase();
+  if (raw.path_display && raw.path_display !== requestedPath
+    && raw.path_display.toLowerCase() !== expectedPathLower) {
+    throw new Error(`Dropbox metadata path mismatch for ${requestedPath}`);
+  }
+  if (raw.path_lower && raw.path_lower !== expectedPathLower) {
+    throw new Error(`Dropbox metadata path mismatch for ${requestedPath}`);
+  }
+  const separator = requestedPath.lastIndexOf("/");
+  const expectedName = requestedPath.slice(separator + 1);
+  if (raw.name.toLowerCase() !== expectedName.toLowerCase()) {
+    throw new Error(`Dropbox metadata name mismatch for ${requestedPath}`);
+  }
+}
+
+function isProviderPathNotFound(responseBody: string): boolean {
+  try {
+    const parsed = JSON.parse(responseBody) as { error_summary?: unknown };
+    return typeof parsed.error_summary === "string"
+      && /^path\/not_found(?:\/|$)/.test(parsed.error_summary);
+  } catch {
+    return false;
+  }
 }
 
 function parseChangeEntry(raw: RawDropboxMetadata): DropboxChangeEntry {

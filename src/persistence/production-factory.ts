@@ -13,7 +13,8 @@ import type { ProviderRequestScope } from "./provider/contract";
 export function createProductionPersistence(
   env: Env,
   projectId?: string | null,
-  requestScope?: ProviderRequestScope
+  requestScope?: ProviderRequestScope,
+  options: { singleAttempt?: boolean } = {}
 ): ProjectOsPersistenceRuntime {
   const raw = new DropboxClient({
     appKey: env.DROPBOX_APP_KEY,
@@ -24,6 +25,7 @@ export function createProductionPersistence(
   });
   const runtime = requireProjectOsPersistence(withProviderResilience(createDropboxPersistence(raw), {
     ...(requestScope ? {
+      ...(options.singleAttempt ? { maxAttempts: 1 } : {}),
       remainingBudgetMs: () => requestScope.deadlineMs - (requestScope.now?.() ?? Date.now())
     } : {})
   }));

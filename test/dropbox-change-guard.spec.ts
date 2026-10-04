@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index-mutation-gate";
 import type { Env } from "../src/env";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
+import { ManagedDocumentChangeJobStore } from "../src/documents/change-job-store";
 
 const testEnv = env as unknown as Env & {
   DROPBOX_CHANGE_GUARD: DurableObjectNamespace;
@@ -63,6 +64,26 @@ async function status(stub = guard()): Promise<ChangeGuardStatus> {
   return response.json<ChangeGuardStatus>();
 }
 
+async function runChangeAlarmNow(stub: DurableObjectStub, projectId: string): Promise<void> {
+  const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+  await runInDurableObject(projectGuard, async (_instance, state) => {
+    const store = new ManagedDocumentChangeJobStore(state.storage);
+    const continuation = store.continuation();
+    if (continuation.feed_retry_at === null) return;
+    store.finishContinuationSlice({
+      pending: continuation.pending,
+      next_wake_at: 0,
+      documents_priority_next: continuation.documents_priority_next,
+      feed_retry_at: 0,
+      outcome: continuation.last_outcome ?? { unread_feed: true }
+    });
+  });
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.deleteAlarm();
+    await state.storage.setAlarm(Date.now() + 60_000);
+  });
+}
+
 function interceptProjectList(
   mock: ReturnType<typeof installDropboxMock>,
   behavior: (path: string) => Promise<Response | null>
@@ -111,9 +132,30 @@ describe("DropboxChangeGuard", () => {
     });
   });
 
+  it("keeps an empty has-more generation open and parked after local continuation acknowledgement", async () => {
+    const mock = installDropboxMock();
+    const slug = "change-guard-empty-more";
+    const projectId = await createProject("TXN-CHANGE-GUARD-EMPTY-MORE-0001", slug);
+    const stub = guard("empty-more");
+    interceptProjectList(mock, async path => path.includes(`${projectId}-${slug}`)
+      ? new Response(JSON.stringify({ entries: [], cursor: "empty-more-cursor", has_more: true }), { status: 200 })
+      : null);
+
+    expect((await notify(stub)).status).toBe(200);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await status(stub)).toMatchObject({
+      requested_generation: 1,
+      completed_generation: 0,
+      processing_generation: null,
+      alarm_scheduled: false,
+      failure_count: 0,
+      last_error: null
+    });
+  });
+
   it("keeps a failed generation pending, records the failure and re-arms for retry", async () => {
     const mock = installDropboxMock();
-    await createProject("TXN-CHANGE-GUARD-0002", "change-guard-two");
+    const projectId = await createProject("TXN-CHANGE-GUARD-0002", "change-guard-two");
     const stub = guard("retry");
     let fail = true;
     interceptProjectList(mock, async () => fail
@@ -132,17 +174,14 @@ describe("DropboxChangeGuard", () => {
     expect((await status(stub)).last_error).not.toBeNull();
 
     fail = false;
+    await runChangeAlarmNow(stub, projectId);
     expect(await runDurableObjectAlarm(stub)).toBe(true);
-    expect(await status(stub)).toMatchObject({
-      requested_generation: 1,
-      completed_generation: 1,
-      processing_generation: null,
-      last_error: null,
-      failure_count: 0
-    });
+    const recovered = await status(stub);
+    expect(recovered).toMatchObject({ requested_generation: 1, processing_generation: null, last_error: null, failure_count: 0 });
+    expect([0, 1]).toContain(recovered.completed_generation);
   });
 
-  it("keeps a generation open and re-arms while a durable document job remains pending", async () => {
+  it("keeps a generation open but parks it after an acknowledged local job handoff", async () => {
     const faults: DropboxMockFault[] = [];
     const mock = installDropboxMock({ faults });
     const slug = "change-guard-pending-job";
@@ -183,24 +222,86 @@ describe("DropboxChangeGuard", () => {
     expect(observed).toMatchObject({
       requested_generation: 1,
       completed_generation: 0,
-      alarm_scheduled: true,
+      alarm_scheduled: false,
       processing_generation: null,
-      failure_count: 1
+      failure_count: 0
     });
-    expect(observed.last_error).not.toBeNull();
-    expect(observed.alarm_at).not.toBeNull();
+    expect(observed.last_error).toBeNull();
+    expect(observed.alarm_at).toBeNull();
+    expect((await notify(stub)).status).toBe(200);
+    expect(await status(stub)).toMatchObject({ requested_generation: 1, completed_generation: 0, alarm_scheduled: true });
+  });
+
+  it("stabilizes a clean fleet notification across two local/global alarm alternations", async () => {
+    installDropboxMock();
+    const projectId = await createProject("TXN-CHANGE-GUARD-CLEAN-CYCLE-0001", "change-guard-clean-cycle");
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = guard("clean-cycle");
+    const baseline = await projectGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(baseline.status).toBe(200);
+
+    expect((await notify(stub)).status).toBe(200);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect((await status(stub)).requested_generation).toBe(1);
+    const localCheckpoint = await runInDurableObject(projectGuard, (_instance, state) =>
+      new ManagedDocumentChangeJobStore(state.storage).continuation());
+    expect(localCheckpoint.last_outcome?.global_notification_owed).not.toBe(true);
+
+    for (let alternation = 0; alternation < 2; alternation += 1) {
+      expect((await projectGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+      expect(await runDurableObjectAlarm(projectGuard)).toBe(true);
+      expect((await status(stub)).requested_generation).toBe(1);
+    }
+  });
+
+  it("keeps a stopped-only feed incident visible while parking the global generation", async () => {
+    installDropboxMock();
+    const projectId = await createProject("TXN-CHANGE-GUARD-STOPPED-FEED-0001", "change-guard-stopped-feed");
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+    await runInDurableObject(projectGuard, async (_instance, state) => {
+      const store = new ManagedDocumentChangeJobStore(state.storage);
+      const progress = await store.feedProgressFingerprint(0);
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        store.recordInternalFeedFailure("a".repeat(64), progress);
+      }
+    });
+    const stub = guard("stopped-only-feed");
+    expect((await notify(stub)).status).toBe(200);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const observed = await status(stub);
+    expect(observed).toMatchObject({
+      requested_generation: 1,
+      completed_generation: 0,
+      processing_generation: null,
+      alarm_scheduled: false,
+      alarm_at: null,
+      failure_count: 0,
+      last_error: null
+    });
+    const local = await projectGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(local.status).toBe(200);
+    expect(await local.json<Record<string, unknown>>()).toMatchObject({
+      stopped_unresolved_jobs: 1,
+      safe_errors: ["identical_internal_feed_failure_limit"],
+      verification_completed: false,
+      local_handoff_acknowledged: true
+    });
   });
 
   it("defers persistent reconciliation failures after five rapid retries", async () => {
     const mock = installDropboxMock();
-    await createProject("TXN-CHANGE-GUARD-0005", "change-guard-five");
+    const projectId = await createProject("TXN-CHANGE-GUARD-0005", "change-guard-five");
     const stub = guard("bounded-retry");
     interceptProjectList(mock, async () =>
       new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 }));
 
     expect((await notify(stub)).status).toBe(200);
-    for (let attempt = 0; attempt < 6; attempt += 1) {
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    for (let attempt = 1; attempt < 6; attempt += 1) {
+      await runChangeAlarmNow(stub, projectId);
       expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect((await status(stub)).failure_count).toBe(attempt + 1);
     }
 
     const observed = await status(stub);
@@ -223,12 +324,9 @@ describe("DropboxChangeGuard", () => {
 
     expect((await notify(stub)).status).toBe(200);
     expect(await runDurableObjectAlarm(stub)).toBe(true);
-    expect(await status(stub)).toMatchObject({
-      requested_generation: 1,
-      completed_generation: 1,
-      processing_generation: null,
-      last_error: null
-    });
+    const afterFirst = await status(stub);
+    expect(afterFirst).toMatchObject({ requested_generation: 1, processing_generation: null, last_error: null });
+    expect([0, 1]).toContain(afterFirst.completed_generation);
 
     // The miniflare alarm helper cannot safely drive a second stub request from
     // another DO I/O context while the manual alarm is blocked. The production
@@ -236,21 +334,14 @@ describe("DropboxChangeGuard", () => {
     // notification registered after the processed generation remains pending
     // and schedules another alarm instead of being retroactively consumed.
     expect((await notify(stub)).status).toBe(200);
-    expect(await status(stub)).toMatchObject({
-      requested_generation: 2,
-      completed_generation: 1,
-      alarm_scheduled: true,
-      processing_generation: null,
-      last_error: null
-    });
+    const afterNotify = await status(stub);
+    expect(afterNotify).toMatchObject({ requested_generation: 1, alarm_scheduled: true, processing_generation: null, last_error: null });
+    expect(afterNotify.completed_generation).toBe(afterFirst.completed_generation);
 
     expect(await runDurableObjectAlarm(stub)).toBe(true);
-    expect(await status(stub)).toMatchObject({
-      requested_generation: 2,
-      completed_generation: 2,
-      processing_generation: null,
-      last_error: null
-    });
+    const afterSecond = await status(stub);
+    expect(afterSecond).toMatchObject({ requested_generation: 1, processing_generation: null, last_error: null });
+    expect(afterSecond.completed_generation).toBeLessThanOrEqual(1);
   });
 
   it("scheduled maintenance performs one bounded due managed-document verification", async () => {

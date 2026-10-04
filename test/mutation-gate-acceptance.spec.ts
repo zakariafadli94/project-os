@@ -1,4 +1,5 @@
 import { env } from "cloudflare:workers";
+import { runDurableObjectAlarm } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { documentIdFor } from "../src/domain/managed-document";
@@ -169,8 +170,23 @@ describe("IMP-MUTATIONGATE001 acceptance matrix", () => {
     );
     await Promise.all([...governedWrites, ...externalWrites]);
 
-    const reconciliation = await externalGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
-    expect(await reconciliation.json()).toMatchObject({ candidates: 25, baseline: false });
+    vi.useFakeTimers();
+    try {
+      const reconciliation = await externalGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+      expect(await reconciliation.json()).toMatchObject({ baseline: false });
+      let candidateCount = (await listCandidates(externalGuard)).length;
+      expect(candidateCount).toBeGreaterThan(0);
+      for (let alarm = 0; alarm < 32 && candidateCount < 25; alarm += 1) {
+        await vi.advanceTimersByTimeAsync(2_000);
+        await runDurableObjectAlarm(externalGuard);
+        const nextCount = (await listCandidates(externalGuard)).length;
+        expect(nextCount).toBeGreaterThanOrEqual(candidateCount);
+        candidateCount = nextCount;
+      }
+      expect(candidateCount).toBe(25);
+    } finally {
+      vi.useRealTimers();
+    }
     expect(await listCandidates(governedGuard)).toHaveLength(0);
     expect(await listCandidates(externalGuard)).toHaveLength(25);
     expect(await canonicalRevision(governedGuard)).toBe(governedRevision);

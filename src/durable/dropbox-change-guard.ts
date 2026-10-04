@@ -99,10 +99,24 @@ export class DropboxChangeGuard extends DurableObject<Env> {
       if (summary.projects_failed > 0) {
         throw new Error(`Managed-document fleet reconciliation failed for ${summary.projects_failed} project(s)`);
       }
-      if (summary.jobs_pending > 0) {
-        throw new Error(
-          `Managed-document fleet reconciliation left ${summary.jobs_pending} job(s) pending after ${summary.job_failures} failure(s)`
-        );
+      if (summary.safe_error_count > 0) {
+        throw new Error(`Managed-document project feed failed for ${summary.safe_error_count} project slice(s)`);
+      }
+      const localWorkRemains = summary.jobs_pending > 0 || summary.unread_feed
+        || summary.budget_yield_slices > 0 || summary.future_eligible_jobs > 0
+        || summary.stopped_unresolved_jobs > 0 || summary.safe_error_count > 0;
+      if (localWorkRemains) {
+        if (summary.local_handoffs_acknowledged !== summary.projects_scanned) {
+          throw new Error("Managed-document fleet has remaining work without acknowledged local continuation");
+        }
+        // Local ProjectGuard alarms own autonomous progress. Keep this global
+        // notification generation open but parked; a new webhook wakes it.
+        const latestRequested = await this.ctx.storage.get<number>(REQUESTED_GENERATION_KEY) ?? processingGeneration;
+        await this.ctx.storage.delete(PROCESSING_GENERATION_KEY);
+        await this.ctx.storage.delete(LAST_ERROR_KEY);
+        await this.ctx.storage.delete(FAILURE_COUNT_KEY);
+        if (latestRequested > processingGeneration) await this.ctx.storage.setAlarm(Date.now() + CHANGE_ALARM_DELAY_MS);
+        return;
       }
       await this.ctx.storage.put(COMPLETED_GENERATION_KEY, processingGeneration);
       await this.ctx.storage.delete(LAST_ERROR_KEY);

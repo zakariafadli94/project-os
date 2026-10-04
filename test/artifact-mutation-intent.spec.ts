@@ -168,17 +168,23 @@ describe("ArtifactMutationIntentService", () => {
     }], cursor: "artifact-route-observed" }) };
     const values = new Map<string, unknown>([["managed-document-change-cursor-v1", "before-observation"]]);
     const invalidations: unknown[] = [];
+    const scopedRuntimes: unknown[] = [];
     const coordinator = new ManagedDocumentChangeCoordinator(runtime, {
       get: async <T>(key: string) => values.get(key) as T | undefined,
       put: async (key: string, value: unknown) => { values.set(key, value); },
       delete: async (key: string) => values.delete(key)
-    }, "observe", undefined, async (...args) => { invalidations.push(args); });
+    }, "observe", undefined, async (projectId, zone, resourceId, scopedRuntime) => {
+      invalidations.push([projectId, zone, resourceId]);
+      scopedRuntimes.push(scopedRuntime);
+    });
 
     const summary = await coordinator.reconcile(state);
 
     expect(prepared.destination.path).toContain("/DELIVERABLES/REVENUE-OS/foo.md");
     expect(summary.artifact_destination_paths).toEqual([prepared.destination.path]);
     expect(invalidations).toEqual([[state.project_id, "DELIVERABLES", `artifact:${await sha256Text(prepared.destination.path)}`]]);
+    expect(scopedRuntimes).toHaveLength(1);
+    expect(scopedRuntimes[0]).toBe(runtime);
   });
 
   it("invalidates a deleted routed artifact before completing its durable change job", async () => {
@@ -204,17 +210,21 @@ describe("ArtifactMutationIntentService", () => {
       listChanges: async () => ({ entries: [{ kind: "deleted", name: "foo.md", path: prepared.destination.path }], cursor: "artifact-delete-cursor" })
     };
     const invalidations: unknown[] = [];
+    const scopedRuntimes: unknown[] = [];
     const guard = (env as unknown as Env).PROJECT_GUARD.getByName(state.project_id);
     const summary = await runInDurableObject(guard, async (_instance, durableState) => {
       const jobs = new ManagedDocumentChangeJobStore(durableState.storage);
       jobs.registerPage({ expected_cursor: null, next_cursor: "before-artifact-delete", jobs: [] });
-      return new ManagedDocumentChangeCoordinator(runtime, durableState.storage, "observe", undefined, async (...args) => {
-        invalidations.push(args);
+      return new ManagedDocumentChangeCoordinator(runtime, durableState.storage, "observe", undefined, async (projectId, zone, resourceId, scopedRuntime) => {
+        invalidations.push([projectId, zone, resourceId]);
+        scopedRuntimes.push(scopedRuntime);
       }).reconcile(state);
     });
 
     expect(summary).toMatchObject({ jobs_completed: 1, jobs_pending: 0 });
     expect(invalidations).toEqual([[state.project_id, "DELIVERABLES", `artifact:${await sha256Text(prepared.destination.path)}`]]);
+    expect(scopedRuntimes).toHaveLength(1);
+    expect(scopedRuntimes[0]).toBe(runtime);
   });
 
   it("rejects exact request-id replay when durable intent binds different request JSON", async () => {

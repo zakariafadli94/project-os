@@ -15,13 +15,15 @@ import type {
   ProviderChangePage,
   ProviderObjectMetadata
 } from "../persistence/provider/contract";
-import { ProviderCursorResetError } from "../persistence/provider/errors";
+import { ProviderCursorResetError, ProviderOperationError } from "../persistence/provider/errors";
+import { InternalExecutionFailure } from "../execution/coordinator";
 import { ManagedDocumentBootstrapper, type BootstrapManagedStage } from "./bootstrap";
 import {
   initializeManagedDocumentChangeJobSchema,
   ManagedDocumentChangeJobStore,
   type ManagedDocumentChangeJob,
   type ManagedDocumentChangeJobInput,
+  type ManagedDocumentFailureClassification,
   type ManagedDocumentDetectionSource
 } from "./change-job-store";
 import { sha256Text } from "./hash";
@@ -73,23 +75,37 @@ export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSu
   scheduled_due: boolean;
   late_since: string | null;
   last_scheduled_verified_at: string | null;
+  budget_yield: boolean;
+  semantic_progress: number;
+  unread_feed: boolean;
+  executable_jobs: number;
+  future_eligible_jobs: number;
+  stopped_unresolved_jobs: number;
+  verification_completed: boolean;
+  earliest_eligible_at: number | null;
+  feed_retry_at: number | null;
+  safe_errors: string[];
 }
 
 export interface ManagedDocumentReconcileOptions {
   scheduled?: boolean;
   now?: string;
+  /** Internal local-alarm cap; public POST caps remain scheduled=1/non-scheduled=256. */
+  local_alarm_job_limit?: number;
 }
 
 export type ObservedPackageDriftAdmission = (
   state: ProjectState,
   operation: NormalizedAdmissionOperation,
-  findingId: string
+  findingId: string,
+  runtime: ProjectOsPersistenceRuntime
 ) => Promise<void>;
 
 export type ObservedNavigationSourceMutation = (
   projectId: string,
   zone: "WORKING" | "REVIEW" | "DELIVERABLES",
-  resourceId: string
+  resourceId: string,
+  runtime: ProjectOsPersistenceRuntime
 ) => Promise<void>;
 
 interface BootstrapCandidate {
@@ -111,6 +127,8 @@ interface BootstrapBaselineResult {
 interface DrainPendingResult {
   attempted: number;
   deferred: boolean;
+  budget_yield: boolean;
+  cohort_max_ordinal: number | null;
 }
 
 export class ManagedDocumentChangeCoordinator {
@@ -129,7 +147,8 @@ export class ManagedDocumentChangeCoordinator {
     storage: DurableObjectStorage | ManagedDocumentCursorStore,
     private readonly gateMode: MutationGateMode = "observe",
     private readonly admitObservedPackageDrift?: ObservedPackageDriftAdmission,
-    private readonly recordObservedNavigationSourceMutation?: ObservedNavigationSourceMutation
+    private readonly recordObservedNavigationSourceMutation?: ObservedNavigationSourceMutation,
+    private readonly clock: () => number = Date.now
   ) {
     this.runtime = asProjectOsPersistence(input);
     this.reconciler = new ManagedDocumentReconciler(this.runtime);
@@ -169,36 +188,148 @@ export class ManagedDocumentChangeCoordinator {
       summary.last_scheduled_verified_at = verification.last_verified_at;
       if (!verification.due) return summary;
     }
+    const attemptAtMs = Date.parse(options.now ?? new Date().toISOString());
+    if (!Number.isSafeInteger(attemptAtMs) || attemptAtMs < 0) throw new Error("Invalid managed document reconcile time");
 
     // Retry durable work first. A failed job remains pending, but never prevents
     // healthy siblings or later provider pages from being durably registered.
-    const jobLimit = options.scheduled ? SCHEDULED_DOCUMENT_JOB_LIMIT : 256;
-    const firstDrain = await this.drainPending(state, summary, jobLimit);
+    const jobLimit = options.local_alarm_job_limit ?? (options.scheduled ? SCHEDULED_DOCUMENT_JOB_LIMIT : 256);
+    if (!Number.isSafeInteger(jobLimit) || jobLimit < 1 || jobLimit > 8) {
+      if (options.local_alarm_job_limit !== undefined) throw new Error("Invalid local document alarm job limit");
+    }
+    const priorContinuation = this.jobs.continuation();
+    summary.unread_feed = priorContinuation.last_outcome?.unread_feed === true;
+    summary.feed_retry_at = priorContinuation.feed_retry_at;
+    const firstDrain = await this.drainPending(state, summary, jobLimit, attemptAtMs, null, true);
+    if (firstDrain.budget_yield) {
+      this.populateContinuationCounts(summary, attemptAtMs);
+      summary.semantic_progress = summary.jobs_registered + summary.jobs_completed;
+      return summary;
+    }
 
     const root = workspaceProjectRoot(state.project_id, state.slug);
     let existingCursor = this.jobs.cursor();
     let cursorReset = false;
     let baseline = !existingCursor;
     let page: ProviderChangePage;
-
-    try {
-      page = existingCursor
-        ? await this.runtime.changeFeed.listChanges({ cursor: existingCursor })
-        : await this.runtime.changeFeed.listChanges({ root });
-    } catch (error) {
-      if (!(error instanceof ProviderCursorResetError)) throw error;
-      cursorReset = true;
-      baseline = true;
-      page = await this.runtime.changeFeed.listChanges({ root });
+    let feedDeferred = priorContinuation.feed_retry_at !== null
+      && priorContinuation.feed_retry_at > attemptAtMs;
+    summary.feed_retry_at = feedDeferred ? priorContinuation.feed_retry_at : null;
+    const priorFeedFailure = this.jobs.feedFailureCheckpoint();
+    const feedProgressFingerprint = await this.jobs.feedProgressFingerprint(summary.jobs_registered + summary.jobs_completed);
+    if (priorFeedFailure?.stopped && priorFeedFailure.progress_fingerprint === feedProgressFingerprint) {
+      summary.unread_feed = true;
+      summary.feed_retry_at = Number.MAX_SAFE_INTEGER;
+      summary.safe_errors.push("identical_internal_feed_failure_limit");
+      summary.cursor_reset = cursorReset;
+      summary.baseline = baseline;
+      this.populateContinuationCounts(summary, attemptAtMs);
+      summary.stopped_unresolved_jobs = 1;
+      summary.semantic_progress = summary.jobs_registered + summary.jobs_completed;
+      return summary;
     }
+    if (priorFeedFailure?.stopped && priorFeedFailure.progress_fingerprint !== feedProgressFingerprint) feedDeferred = false;
+    if (feedDeferred) {
+      page = { entries: [], cursor: existingCursor ?? "", has_more: true };
+    } else {
+      try {
+        page = existingCursor
+          ? await this.runtime.changeFeed.listChanges({ cursor: existingCursor })
+          : await this.runtime.changeFeed.listChanges({ root });
+      } catch (error) {
+        if (isBudgetYield(error)) {
+          summary.budget_yield = true;
+          summary.unread_feed = true;
+          summary.cursor_reset = cursorReset;
+          summary.baseline = baseline;
+          this.populateContinuationCounts(summary, attemptAtMs);
+          summary.semantic_progress = summary.jobs_registered + summary.jobs_completed;
+          return summary;
+        }
+        const classification = failureClassification(error);
+        if (classification === "internal") {
+          const failureFingerprint = await sha256Text(JSON.stringify(failureIdentity(error, classification)));
+          const progressFingerprint = await this.jobs.feedProgressFingerprint(summary.jobs_registered + summary.jobs_completed);
+          const failure = this.jobs.recordInternalFeedFailure(failureFingerprint, progressFingerprint);
+          summary.unread_feed = true;
+          summary.safe_errors.push(failure.stopped ? "identical_internal_feed_failure_limit" : "internal_feed_failure");
+          summary.feed_retry_at = failure.stopped ? Number.MAX_SAFE_INTEGER : safeNextTime(this.clock(), 1_000);
+          summary.cursor_reset = cursorReset;
+          summary.baseline = baseline;
+          this.populateContinuationCounts(summary, attemptAtMs);
+          if (failure.stopped) summary.stopped_unresolved_jobs = 1;
+          summary.semantic_progress = summary.jobs_registered + summary.jobs_completed;
+          return summary;
+        }
+        this.jobs.breakInternalFeedFailureStreak();
+        if (!(error instanceof ProviderCursorResetError)) {
+          summary.unread_feed = true;
+          summary.cursor_reset = cursorReset;
+          summary.baseline = baseline;
+          summary.safe_errors.push(safeErrorCode(error));
+          const failureObservedAtMs = this.clock();
+          const retryAfter = error instanceof ProviderOperationError && error.retryable
+            ? error.diagnostics?.retryAfterMs : undefined;
+          const delay = Number.isFinite(retryAfter) && (retryAfter ?? -1) >= 0
+            ? Math.max(1_000, Math.ceil(retryAfter!)) : 1_000;
+          summary.feed_retry_at = safeNextTime(failureObservedAtMs, delay);
+          this.populateContinuationCounts(summary, attemptAtMs);
+          summary.semantic_progress = summary.jobs_registered + summary.jobs_completed;
+          return summary;
+        }
+        cursorReset = true;
+        baseline = true;
+        try {
+          page = await this.runtime.changeFeed.listChanges({ root });
+        } catch (retryError) {
+          if (isBudgetYield(retryError)) {
+            summary.budget_yield = true;
+            summary.unread_feed = true;
+          } else {
+            const classification = failureClassification(retryError);
+            if (classification === "internal") {
+              const failureFingerprint = await sha256Text(JSON.stringify(failureIdentity(retryError, classification)));
+              const progressFingerprint = await this.jobs.feedProgressFingerprint(summary.jobs_registered + summary.jobs_completed);
+              const failure = this.jobs.recordInternalFeedFailure(failureFingerprint, progressFingerprint);
+              summary.unread_feed = true;
+              summary.safe_errors.push(failure.stopped ? "identical_internal_feed_failure_limit" : "internal_feed_failure");
+              summary.feed_retry_at = failure.stopped ? Number.MAX_SAFE_INTEGER : safeNextTime(this.clock(), 1_000);
+              summary.cursor_reset = cursorReset;
+              summary.baseline = baseline;
+              this.populateContinuationCounts(summary, attemptAtMs);
+              if (failure.stopped) summary.stopped_unresolved_jobs = 1;
+              summary.semantic_progress = summary.jobs_registered + summary.jobs_completed;
+              return summary;
+            }
+            this.jobs.breakInternalFeedFailureStreak();
+            summary.unread_feed = true;
+            summary.cursor_reset = cursorReset;
+            summary.baseline = baseline;
+            summary.safe_errors.push(safeErrorCode(retryError));
+            const failureObservedAtMs = this.clock();
+            const retryAfter = retryError instanceof ProviderOperationError && retryError.retryable
+              ? retryError.diagnostics?.retryAfterMs : undefined;
+            summary.feed_retry_at = safeNextTime(failureObservedAtMs, Number.isFinite(retryAfter) && (retryAfter ?? -1) >= 0
+              ? Math.max(1_000, Math.ceil(retryAfter!)) : 1_000);
+          }
+          this.populateContinuationCounts(summary, attemptAtMs);
+          summary.semantic_progress = summary.jobs_registered + summary.jobs_completed;
+          return summary;
+        }
+      }
+    }
+
+    if (!feedDeferred) this.jobs.breakInternalFeedFailureStreak();
+
+    summary.unread_feed = page.has_more === true;
 
     const detectionSource: ManagedDocumentDetectionSource = cursorReset
       ? "cursor_reset"
       : baseline
         ? "baseline"
         : "incremental";
-    const pageJobs = await this.pageJobs(state, page, existingCursor, detectionSource);
-    const registration = this.jobs.registerPage({
+    const pageJobs = feedDeferred ? [] : await this.pageJobs(state, page, existingCursor, detectionSource);
+    const registration = feedDeferred ? { inserted: 0, cursor_advanced: false } : this.jobs.registerPage({
       expected_cursor: existingCursor,
       next_cursor: page.cursor,
       reset_cursor: cursorReset,
@@ -209,19 +340,35 @@ export class ManagedDocumentChangeCoordinator {
     summary.cursor_reset = cursorReset;
     summary.baseline = baseline;
     summary.cursor_advanced = registration.cursor_advanced;
+    if (!feedDeferred) summary.feed_retry_at = null;
 
     // The cursor now represents only work that has already been journaled in
     // the ProjectGuard SQLite store. Execution may fail safely after this point.
     const remainingJobBudget = firstDrain.deferred ? 0 : Math.max(0, jobLimit - firstDrain.attempted);
-    if (remainingJobBudget > 0) await this.drainPending(state, summary, remainingJobBudget);
-    summary.jobs_pending = this.jobs.pendingCount();
-    if (options.scheduled && !page.has_more && summary.jobs_pending === 0 && summary.job_failures === 0) {
+    if (remainingJobBudget > 0) {
+      const secondDrain = await this.drainPending(state, summary, remainingJobBudget, attemptAtMs,
+        firstDrain.cohort_max_ordinal, true);
+      summary.budget_yield = summary.budget_yield || secondDrain.budget_yield;
+    }
+    this.populateContinuationCounts(summary, attemptAtMs);
+    if (options.scheduled && !summary.budget_yield && !page.has_more && summary.jobs_pending === 0 && summary.job_failures === 0) {
       const completedAt = options.now ?? new Date().toISOString();
       this.jobs.completeScheduledVerification(completedAt);
       summary.late_since = null;
       summary.last_scheduled_verified_at = new Date(Date.parse(completedAt)).toISOString();
+      summary.verification_completed = true;
     }
+    summary.semantic_progress = summary.jobs_registered + summary.jobs_completed;
     return summary;
+  }
+
+  private populateContinuationCounts(summary: ManagedDocumentChangeSummary, nowMs: number): void {
+    const counts = this.jobs?.eligibilityCounts(nowMs) ?? { executable: 0, future: 0, stopped: 0, earliest_eligible_at: null };
+    summary.jobs_pending = this.jobs?.pendingCount() ?? 0;
+    summary.executable_jobs = counts.executable;
+    summary.future_eligible_jobs = counts.future;
+    summary.stopped_unresolved_jobs = counts.stopped;
+    summary.earliest_eligible_at = counts.earliest_eligible_at;
   }
 
   private async reconcileLegacyTestSeam(state: ProjectState): Promise<ManagedDocumentChangeSummary> {
@@ -308,14 +455,20 @@ export class ManagedDocumentChangeCoordinator {
   private async drainPending(
     state: ProjectState,
     summary: ManagedDocumentChangeSummary,
-    limit = 256
+    limit = 256,
+    nowMs = Date.now(),
+    cohortMaxOrdinal: number | null = null,
+    beginCohort = false
   ): Promise<DrainPendingResult> {
     const jobs = this.jobs;
-    if (!jobs) return { attempted: 0, deferred: false };
-    const pending = jobs.pending(limit);
+    if (!jobs) return { attempted: 0, deferred: false, budget_yield: false, cohort_max_ordinal: null };
+    if (beginCohort) cohortMaxOrdinal = jobs.beginSelectionCohort(nowMs);
     let attempted = 0;
     let deferred = false;
-    for (const job of pending) {
+    let budgetYield = false;
+    while (attempted < limit) {
+      const job = jobs.selectNextPending(cohortMaxOrdinal, nowMs);
+      if (!job) break;
       attempted += 1;
       try {
         const actualKind = await this.actualChangeKind(job.change);
@@ -337,6 +490,12 @@ export class ManagedDocumentChangeCoordinator {
         jobs.markCompleted(job.job_id);
         summary.jobs_completed += 1;
       } catch (error) {
+        if (isBudgetYield(error)) {
+          summary.budget_yield = true;
+          budgetYield = true;
+          deferred = true;
+          break;
+        }
         // The candidate id binds immutable Dropbox identity and revision. A
         // different observation for that same id cannot become valid by
         // retrying this job; preserve it as a visible quarantine instead of
@@ -365,8 +524,34 @@ export class ManagedDocumentChangeCoordinator {
           });
           continue;
         }
-        jobs.markFailed(job.job_id, errorMessage(error));
+        const failureObservedAtMs = this.clock();
+        if (!Number.isSafeInteger(failureObservedAtMs) || failureObservedAtMs < 0) {
+          throw new Error("Invalid managed document failure observation time");
+        }
+        const classification = failureClassification(error);
+        const failureFingerprint = await sha256Text(JSON.stringify(failureIdentity(error, classification)));
+        const progressFingerprint = await this.jobProgressFingerprint(job);
+        const hadStopFinding = jobs.driftFindingsForJob(job.job_id)
+          .some(finding => finding.code === "identical_internal_failure_limit");
+        const findingId = classification === "internal"
+          ? `DRIFT-${(await sha256Text(`${job.job_id}:identical_internal_failure_limit`)).slice(0, 24).toUpperCase()}`
+          : undefined;
+        const retryAfterMs = error instanceof ProviderOperationError
+          && error.retryable
+          && Number.isFinite(error.diagnostics?.retryAfterMs)
+          && (error.diagnostics?.retryAfterMs ?? -1) >= 0
+          ? error.diagnostics?.retryAfterMs
+          : undefined;
+        const failure = jobs.recordFailure(job, errorMessage(error), {
+          failure_fingerprint: failureFingerprint,
+          progress_fingerprint: progressFingerprint,
+          classification,
+          now_ms: failureObservedAtMs,
+          ...(retryAfterMs === undefined ? {} : { retry_after_ms: retryAfterMs }),
+          ...(findingId === undefined ? {} : { finding_id: findingId })
+        }, new Date(failureObservedAtMs).toISOString());
         summary.job_failures += 1;
+        if (failure.stopped && !hadStopFinding) summary.drift_findings += 1;
         console.error("Project OS managed document change job failed", {
           project_id: state.project_id,
           job_id: job.job_id,
@@ -376,7 +561,31 @@ export class ManagedDocumentChangeCoordinator {
         });
       }
     }
-    return { attempted, deferred };
+    return { attempted, deferred, budget_yield: budgetYield, cohort_max_ordinal: cohortMaxOrdinal };
+  }
+
+  private async jobProgressFingerprint(job: ManagedDocumentChangeJob): Promise<string> {
+    const findings = this.jobs?.driftFindingsForJob(job.job_id) ?? [];
+    return sha256Text(JSON.stringify({
+      job_id: job.job_id,
+      change: job.change,
+      detection_source: job.detection_source,
+      priority: job.priority,
+      findings: findings.map(finding => ({
+        finding_id: finding.finding_id,
+        path: finding.path,
+        change_kind: finding.change_kind,
+        status: finding.status,
+        code: finding.code,
+        request_id: finding.request_id,
+        resource: finding.resource ? {
+          resource_type: finding.resource.resource_type,
+          resource_id: finding.resource.resource_id,
+          version: finding.resource.version,
+          zone: finding.resource.zone
+        } : null
+      }))
+    }));
   }
 
   private async actualChangeKind(change: ProviderChangeEntry): Promise<ProviderChangeEntry["kind"]> {
@@ -472,7 +681,7 @@ export class ManagedDocumentChangeCoordinator {
         const findingId = await this.packageIndexResourceFindingId(jobId, change.path, drift.snapshot_request_id, resource);
         if (doneIds.has(findingId)) continue;
         if (processed >= PACKAGE_INDEX_FANOUT_LIMIT) return "deferred";
-        await this.recordObservedNavigationSourceMutation?.(state.project_id, resource.zone as "WORKING" | "REVIEW" | "DELIVERABLES", `package:${resource.resource_id}`);
+          await this.recordObservedNavigationSourceMutation?.(state.project_id, resource.zone as "WORKING" | "REVIEW" | "DELIVERABLES", `package:${resource.resource_id}`, this.runtime);
         if (this.admitObservedPackageDrift) {
           await this.admitObservedPackageDrift(state, {
             project_id: state.project_id,
@@ -485,7 +694,7 @@ export class ManagedDocumentChangeCoordinator {
               resource,
               expected_request_id: drift.snapshot_request_id
             })
-          }, findingId);
+          }, findingId, this.runtime);
         }
         this.jobs.recordDriftFinding({
           finding_id: findingId,
@@ -511,7 +720,8 @@ export class ManagedDocumentChangeCoordinator {
       await this.recordObservedNavigationSourceMutation?.(
         state.project_id,
         drift.resource.zone as "WORKING" | "REVIEW" | "DELIVERABLES",
-        `package:${drift.resource.resource_id}`
+        `package:${drift.resource.resource_id}`,
+        this.runtime
       );
     }
     summary.drift_findings += 1;
@@ -551,7 +761,7 @@ export class ManagedDocumentChangeCoordinator {
             resource: drift.resource,
             expected_request_id: drift.request_id ?? null
           })
-        }, findingId);
+        }, findingId, this.runtime);
       }
     }
     return "handled";
@@ -577,7 +787,8 @@ export class ManagedDocumentChangeCoordinator {
       await this.recordObservedNavigationSourceMutation?.(
         state.project_id,
         zone,
-        `artifact:${await sha256Text(path)}`
+        `artifact:${await sha256Text(path)}`,
+        this.runtime
       );
     }
   }
@@ -589,7 +800,7 @@ export class ManagedDocumentChangeCoordinator {
     const match = /^(WORKING|REVIEW|DELIVERABLES)\/(.+)$/.exec(relative);
     if (!match || !await this.mutationGate.hasArtifactDestinationBinding(state.project_id, path)) return;
     const zone = match[1].toUpperCase() as "WORKING" | "REVIEW" | "DELIVERABLES";
-    await this.recordObservedNavigationSourceMutation?.(state.project_id, zone, `artifact:${await sha256Text(path)}`);
+    await this.recordObservedNavigationSourceMutation?.(state.project_id, zone, `artifact:${await sha256Text(path)}`, this.runtime);
   }
 
   private async observeNavigationIndexDrift(
@@ -806,7 +1017,17 @@ function emptySummary(flags: { archived: boolean }, mode: MutationGateMode): Man
     scheduled: false,
     scheduled_due: false,
     late_since: null,
-    last_scheduled_verified_at: null
+    last_scheduled_verified_at: null,
+    budget_yield: false,
+    semantic_progress: 0,
+    unread_feed: false,
+    executable_jobs: 0,
+    future_eligible_jobs: 0,
+    stopped_unresolved_jobs: 0,
+    verification_completed: false,
+    earliest_eligible_at: null,
+    feed_retry_at: null,
+    safe_errors: []
   };
 }
 
@@ -819,4 +1040,44 @@ function isDurableObjectStorage(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isBudgetYield(error: unknown): boolean {
+  return error instanceof Error && /(?:^|:)\s*slice_budget_exhausted\s*$/.test(error.message);
+}
+
+function safeErrorCode(error: unknown): string {
+  if (error instanceof ProviderOperationError) return error.retryable ? "provider_retryable" : "provider_blocked";
+  if (error instanceof Error && error.name === "ProviderCursorResetError") return "provider_cursor_reset";
+  return "feed_error";
+}
+
+function safeNextTime(now: number, delay: number): number {
+  const next = now + delay;
+  return Number.isSafeInteger(next) ? next : Number.MAX_SAFE_INTEGER;
+}
+
+function failureClassification(error: unknown): ManagedDocumentFailureClassification {
+  if (error instanceof InternalExecutionFailure) return "internal";
+  if (error instanceof ProviderOperationError) return error.retryable ? "provider_retryable" : "provider_blocked";
+  return "unknown";
+}
+
+function failureIdentity(error: unknown, classification: ManagedDocumentFailureClassification): unknown {
+  if (error instanceof InternalExecutionFailure) {
+    return { classification, name: "InternalExecutionFailure", code: error.code, stage: error.stage };
+  }
+  if (error instanceof ProviderOperationError) {
+    return {
+      classification,
+      name: error.name,
+      code: error.diagnostics?.code ?? null,
+      status: error.diagnostics?.status ?? null
+    };
+  }
+  return {
+    classification,
+    name: error instanceof Error && error.name ? error.name : typeof error,
+    message: errorMessage(error)
+  };
 }

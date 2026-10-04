@@ -31,6 +31,7 @@ import { unavailableQualificationResolver, type RuleQualificationEvidenceResolve
 import { prepareLocalRuleActivation, type LocalRuleActivationCapability } from "../rules/local-rule-qualification";
 import { createProductionRuleQualificationResolver } from "../rules/production-qualification";
 import { ManagedDocumentChangeCoordinator } from "../documents/change-coordinator";
+import { ManagedDocumentChangeJobStore } from "../documents/change-job-store";
 import { ManagedDocumentRequestIntentConflictError, ManagedDocumentRequestLedger } from "../documents/request-ledger";
 import { TransactionRequestLedger } from "../transactions/request-ledger";
 import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocumentReceipt } from "../documents/service";
@@ -70,7 +71,7 @@ import { ruleVersionSchema } from "../domain/rule-governance";
 import { matchesResource } from "../rules/resolution";
 import { ExecutionJournal } from "../execution/journal";
 import type { ExecutionAdmission, ExecutionAdapter, ExecutionPlan } from "../execution/contract";
-import { ExecutionCoordinator } from "../execution/coordinator";
+import { ExecutionCoordinator, InternalExecutionFailure } from "../execution/coordinator";
 import {
   isStoredPersistenceObservation,
   persistenceObservation,
@@ -160,6 +161,10 @@ interface RecoveryCursorRow {
   [key: string]: SqlStorageValue;
   kind: string;
   request_id: string;
+}
+
+function isManagedDocumentSliceBudgetYield(error: unknown): boolean {
+  return error instanceof Error && /(?:^|:)\s*slice_budget_exhausted$/i.test(error.message);
 }
 
 interface LocalRecoveryDiagnostic {
@@ -329,6 +334,14 @@ function retryAfterDelayMs(value: string | null): number | undefined {
   return Number.isFinite(delay) && delay > 0 ? Math.min(RECOVERY_MAX_RETRY_AFTER_MS, Math.ceil(delay)) : undefined;
 }
 
+function safeDocumentRetryDeadline(now: number, retryAfterMs: number | undefined): number {
+  const requestedDelay = retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+    ? Math.ceil(retryAfterMs) : REQUEST_RECOVERY_RETRY_DELAY_MS;
+  if (!Number.isSafeInteger(requestedDelay) || requestedDelay >= Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+  const deadline = now + Math.max(REQUEST_RECOVERY_RETRY_DELAY_MS, requestedDelay);
+  return Number.isSafeInteger(deadline) ? deadline : Number.MAX_SAFE_INTEGER;
+}
+
 function isTransientRecoveryFailure(error: unknown): boolean {
   return error instanceof Error && (
     error.name === "AbortError"
@@ -444,6 +457,120 @@ export class ProjectGuard extends DurableObject<Env> {
    * later instance must prove the cached state against its exact commit again. */
   private contextVerifiedState: ProjectState | null = null;
   private contextCheckpointWriteQueue: Promise<void> = Promise.resolve();
+  private readonly governanceScopeCalls = new WeakMap<object, number>();
+
+  private createManagedDocumentSlice(startedAt: number): {
+    scope: ProviderRequestScope;
+    runtime: ProjectOsPersistenceRuntime;
+    abortTimer: ReturnType<typeof setTimeout>;
+    calls: () => number;
+  } {
+    const deadlineMs = startedAt + 18_000;
+    const controller = new AbortController();
+    let calls = 0;
+    const scope: ProviderRequestScope = {
+      deadlineMs,
+      signal: controller.signal,
+      now: () => Date.now(),
+      beforeHttp: () => {
+        if (controller.signal.aborted || Date.now() >= deadlineMs || calls >= 64) {
+          const error = new Error("slice_budget_exhausted");
+          controller.abort(error);
+          throw error;
+        }
+        calls += 1;
+      }
+    };
+    const abortTimer = setTimeout(() => controller.abort(new Error("slice_budget_exhausted")), Math.max(1, deadlineMs - Date.now()));
+    const projectId = this.ctx.id.name;
+    if (!projectId) {
+      clearTimeout(abortTimer);
+      throw new Error("project_binding_required");
+    }
+    return { scope, runtime: createProductionPersistence(this.env, projectId, scope, { singleAttempt: true }), abortTimer, calls: () => calls };
+  }
+
+  private async readManagedDocumentState(
+    runtime: ProjectOsPersistenceRuntime,
+    scope: ProviderRequestScope
+  ): Promise<ProjectState | null> {
+    const projectId = this.ctx.id.name;
+    if (!projectId) return null;
+    const repository = new ProjectRepository(runtime, this.layoutMode);
+    if (this.layoutMode === "v2") {
+      const state = await this.readCanonicalState(repository, projectId, scope.deadlineMs, { calls: 0, maxCalls: 64 });
+      if (state) {
+        this.persistState(state);
+        this.contextVerifiedState = state;
+      }
+      return state;
+    }
+    const local = this.loadState();
+    if (local) return local;
+    const recovered = await repository.readProjectState(projectId);
+    if (recovered) this.persistState(recovered);
+    return recovered;
+  }
+
+  private createManagedDocumentChangeCoordinator(
+    runtime: ProjectOsPersistenceRuntime,
+    scope: ProviderRequestScope,
+    sliceOrdinal: number
+  ): ManagedDocumentChangeCoordinator {
+    return new ManagedDocumentChangeCoordinator(
+      runtime,
+      this.ctx.storage,
+      parseMutationGateMode(this.env.PROJECT_OS_MUTATION_GATE_MODE),
+      async (state, operation, findingId, scopedRuntime) => {
+        if (!await this.ruleAdmissionRequired(state, operation, scope)) return;
+        const proof = await this.admitRules(state, operation, undefined, scope);
+        await this.persistAdmissionProof("document-drift", `${findingId}-slice-${sliceOrdinal}`, proof, scopedRuntime);
+      },
+      (projectId, zone, resourceId, scopedRuntime) =>
+        this.recordObservedNavigationSourceMutation(projectId, zone, resourceId, scopedRuntime)
+    );
+  }
+
+  private documentContinuationOutcome(result: Awaited<ReturnType<ManagedDocumentChangeCoordinator["reconcile"]>>): Record<string, unknown> {
+    return {
+      semantic_progress: result.semantic_progress,
+      jobs_registered: result.jobs_registered,
+      jobs_completed: result.jobs_completed,
+      unread_feed: result.unread_feed,
+      executable_jobs: result.executable_jobs,
+      future_eligible_jobs: result.future_eligible_jobs,
+      stopped_unresolved_jobs: result.stopped_unresolved_jobs,
+      earliest_eligible_at: result.earliest_eligible_at,
+      feed_retry_at: result.feed_retry_at,
+      safe_errors: result.safe_errors.slice(0, 8),
+      budget_yield: result.budget_yield,
+      verification_completed: result.verification_completed
+    };
+  }
+
+  private documentContinuationWake(
+    result: Awaited<ReturnType<ManagedDocumentChangeCoordinator["reconcile"]>>,
+    now: number
+  ): { pending: boolean; at: number | null } {
+    const pending = result.jobs_pending > 0 || result.unread_feed || result.safe_errors.length > 0;
+    if (!pending) return { pending: false, at: null };
+    const feedDue = result.unread_feed && (result.feed_retry_at === null || result.feed_retry_at <= now);
+    if (result.executable_jobs > 0 || feedDue) return { pending: true, at: now + 1_000 };
+    const future = [result.earliest_eligible_at, result.feed_retry_at]
+      .filter((value): value is number => value !== null && Number.isSafeInteger(value)
+        && value < Number.MAX_SAFE_INTEGER && value > now);
+    return { pending: true, at: future.length ? Math.min(...future) : null };
+  }
+
+  private documentScanRecoveryWake(
+    result: Awaited<ReturnType<ManagedDocumentChangeCoordinator["reconcile"]>>,
+    now: number
+  ): number {
+    // A dirty-zone scan is itself durable outstanding work.  Keep a bounded
+    // wake even when the coordinator has no remaining work, while honoring a
+    // provider Retry-After or eligible sibling when either is already known.
+    return this.documentContinuationWake(result, now).at ?? now + 20_000;
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -648,46 +775,97 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (request.method === "POST" && pathname === "/reconcile-documents") {
+      const requestEnteredAt = Date.now();
       return this.serialize(async () => {
-        const state = await this.loadOrRecoverState();
-        if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
         // A supplied body is always a typed repair request.  It must not be
         // ignored merely because this project is still in the legacy rollout:
         // repair authorization is bound to the signed intent and exact
         // server-side diagnosis below.
         if (request.body && url.searchParams.get("scheduled") !== "1") {
+          const state = await this.loadOrRecoverState();
+          if (!state) return Response.json({ error: "project_not_initialized" }, { status: 404 });
           return this.handleTypedRepair(request, state);
         }
         const scheduled = url.searchParams.get("scheduled") === "1";
-        const normalized = await normalizeSystemAdmission(
-          state.project_id,
-          scheduled ? "project.materialize" : "project.repair",
-          "DOCUMENTS",
-          `document-reconcile@${state.revision}`,
-          String(state.revision)
-        );
-        if (await this.ruleAdmissionRequired(state, normalized)) {
-          const proof = await this.admitRules(state, normalized);
-          await this.persistAdmissionProof("document-reconcile", `document-reconcile@${state.revision}`, proof);
-        }
-        if (scheduled && !await this.settleOneStaleWorkingNavigation(state)) {
-          await this.recoverOneKnownNavigationOrphan(state);
-        }
-        // The coordinator may write several canonical heads before its
-        // durable cursor is advanced. Keep a wake armed across that boundary;
-        // the alarm discovers any dirty marker whose SQL outbox write was
-        // interrupted.
-        this.ctx.storage.sql.exec(
-          "INSERT INTO navigation_refresh_scan (singleton, requested_at) VALUES (1, ?) ON CONFLICT(singleton) DO NOTHING",
-          new Date().toISOString()
-        );
+        const continuationStore = new ManagedDocumentChangeJobStore(this.ctx.storage);
+        const continuation = continuationStore.beginContinuationSlice(scheduled, requestEnteredAt);
+        const slice = this.createManagedDocumentSlice(requestEnteredAt);
         await this.armRequestRecoveryAlarm(1_000);
-        const result = await this.managedDocumentChanges.reconcile(state, {
-          scheduled: url.searchParams.get("scheduled") === "1"
-        });
-        await this.enqueueNavigationRefreshForDirtyZones(state.project_id);
-        this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_scan WHERE singleton = 1");
-        return Response.json(result);
+        try {
+          const state = await this.readManagedDocumentState(slice.runtime, slice.scope);
+          if (!state) {
+            continuationStore.finishContinuationSlice({ pending: false, next_wake_at: null,
+              documents_priority_next: false, feed_retry_at: null, outcome: {} });
+            return Response.json({ error: "project_not_initialized" }, { status: 404 });
+          }
+          const normalized = await normalizeSystemAdmission(
+            state.project_id,
+            scheduled ? "project.materialize" : "project.repair",
+            "DOCUMENTS",
+            `document-reconcile@${state.revision}`,
+            String(state.revision)
+          );
+          if (await this.ruleAdmissionRequired(state, normalized, slice.scope)) {
+            const proof = await this.admitRules(state, normalized, undefined, slice.scope);
+            await this.persistAdmissionProof("document-reconcile", `document-reconcile-slice-${continuation.slice_ordinal}`, proof, slice.runtime);
+          }
+          if (scheduled && !await this.settleOneStaleWorkingNavigation(state)) {
+            await this.recoverOneKnownNavigationOrphan(state);
+          }
+          // Persist and arm the local continuation before bounded provider I/O.
+          this.ctx.storage.sql.exec(
+            "INSERT INTO navigation_refresh_scan (singleton, requested_at) VALUES (1, ?) ON CONFLICT(singleton) DO NOTHING",
+            new Date().toISOString()
+          );
+          const result = await this.createManagedDocumentChangeCoordinator(slice.runtime, slice.scope, continuation.slice_ordinal)
+            .reconcile(state, { scheduled, now: new Date(requestEnteredAt).toISOString() });
+          const scanWakeAt = this.documentScanRecoveryWake(result, Date.now());
+          const scanOutcome = this.documentContinuationOutcome(result);
+          if (continuation.last_outcome?.global_notification_owed === true) {
+            scanOutcome.global_notification_owed = true;
+          }
+          continuationStore.finishContinuationSlice({
+            pending: true,
+            next_wake_at: scanWakeAt,
+            documents_priority_next: false,
+            feed_retry_at: result.feed_retry_at,
+            outcome: scanOutcome
+          });
+          await this.armRequestRecoveryAlarm(Math.max(1, scanWakeAt - Date.now()));
+          let navigationRefreshBudgetYield = false;
+          let navigationRefreshFailed = false;
+          try {
+            await this.enqueueNavigationRefreshForDirtyZones(state.project_id, slice.runtime);
+            this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_scan WHERE singleton = 1");
+          } catch (error) {
+            if (isManagedDocumentSliceBudgetYield(error)) navigationRefreshBudgetYield = true;
+            else navigationRefreshFailed = true;
+          }
+          const continuationResult = navigationRefreshBudgetYield
+            ? { ...result, budget_yield: true }
+            : navigationRefreshFailed
+              ? { ...result, safe_errors: [...result.safe_errors, "navigation_refresh_scan_failed"].slice(0, 8) }
+              : result;
+          const resultWake = this.documentContinuationWake(continuationResult, Date.now());
+          const next = navigationRefreshBudgetYield || navigationRefreshFailed
+            ? { pending: true, at: resultWake.at ?? Date.now() + 20_000 }
+            : resultWake;
+          const nextOutcome = this.documentContinuationOutcome(continuationResult);
+          if (scanOutcome.global_notification_owed === true) {
+            nextOutcome.global_notification_owed = true;
+          }
+          continuationStore.finishContinuationSlice({
+            pending: next.pending,
+            next_wake_at: next.at,
+            documents_priority_next: false,
+            feed_retry_at: result.feed_retry_at,
+            outcome: nextOutcome
+          });
+          if (next.at !== null) await this.armRequestRecoveryAlarm(Math.max(1, next.at - Date.now()));
+          return Response.json({ ...continuationResult, local_handoff_acknowledged: true, next_local_wake_at: next.at });
+        } finally {
+          clearTimeout(slice.abortTimer);
+        }
       }).catch((error) => this.admissionErrorResponse(error));
     }
 
@@ -1075,14 +1253,238 @@ export class ProjectGuard extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    await this.resumePendingRequestRecovery();
-    await this.serialize(async () => {
-      await this.resumePendingNavigationRefreshes();
-      await this.resumePendingMaterializationFinalization();
-    });
-    // Transaction replay must enter the normal serialized admission path, so
-    // it runs after the document/artifact recovery lock has been released.
-    await this.resumePendingTransactionRecovery();
+    const alarmEnteredAt = Date.now();
+    const store = new ManagedDocumentChangeJobStore(this.ctx.storage);
+    let continuation = store.continuation();
+    let documentsFirst = false;
+    try {
+      documentsFirst = continuation.pending && continuation.documents_priority_next;
+      if (documentsFirst) await this.resumeManagedDocumentContinuation(alarmEnteredAt);
+      await this.resumePendingRequestRecovery();
+      await this.serialize(async () => {
+        await this.resumePendingNavigationRefreshes();
+        await this.resumePendingMaterializationFinalization();
+      });
+
+      continuation = store.continuation();
+      if (!documentsFirst && continuation.pending && continuation.next_wake_at !== null && continuation.next_wake_at <= Date.now()) {
+        if (Date.now() >= alarmEnteredAt + 18_000) {
+          store.finishContinuationSlice({ pending: true, next_wake_at: Date.now() + 1_000,
+            documents_priority_next: true, feed_retry_at: continuation.feed_retry_at,
+            outcome: continuation.last_outcome ?? { budget_yield: true, safe_errors: ["recovery_phase_consumed_document_envelope"] } });
+        } else {
+          await this.resumeManagedDocumentContinuation(alarmEnteredAt);
+        }
+      }
+      // Transaction replay must enter the normal serialized admission path, so
+      // it runs after the document/artifact recovery lock has been released.
+      await this.resumePendingTransactionRecovery();
+      continuation = store.continuation();
+      if (continuation.last_outcome?.global_notification_owed === true) {
+        await this.serialize(async () => {
+          const slice = this.createManagedDocumentSlice(alarmEnteredAt);
+          try { await this.notifyDropboxChangeCoordinator(store, slice.scope); }
+          finally { clearTimeout(slice.abortTimer); }
+        });
+      }
+    } finally {
+      continuation = store.continuation();
+      if (continuation.pending && continuation.next_wake_at !== null
+        && continuation.next_wake_at < Number.MAX_SAFE_INTEGER) {
+        await this.armRequestRecoveryAlarm(Math.max(1, continuation.next_wake_at - Date.now()));
+      }
+      if (continuation.last_outcome?.global_notification_owed === true) await this.armRequestRecoveryAlarm(1_000);
+      // Keep an unrelated recovery wake armed even when document work is parked.
+      if (this.hasPendingRequestRecovery() && await this.ctx.storage.getAlarm() === null) {
+        await this.armRequestRecoveryAlarm(REQUEST_RECOVERY_RETRY_DELAY_MS);
+      }
+    }
+  }
+
+  private async resumeManagedDocumentContinuation(alarmEnteredAt: number): Promise<void> {
+    const store = new ManagedDocumentChangeJobStore(this.ctx.storage);
+    const before = store.continuation();
+    if (!before.pending) return;
+    const priorPreludeFailure = store.preludeFailureCheckpoint();
+    if (priorPreludeFailure?.stopped) {
+      const semanticProgress = typeof before.last_outcome?.semantic_progress === "number"
+        && Number.isSafeInteger(before.last_outcome.semantic_progress) && before.last_outcome.semantic_progress >= 0
+        ? before.last_outcome.semantic_progress : 0;
+      const currentProgress = await store.feedProgressFingerprint(semanticProgress);
+      if (currentProgress === priorPreludeFailure.progress_fingerprint) {
+        store.finishContinuationSlice({ pending: true, next_wake_at: Number.MAX_SAFE_INTEGER,
+          documents_priority_next: false, feed_retry_at: before.feed_retry_at,
+          outcome: { ...(before.last_outcome ?? {}), stopped_unresolved_jobs: 1, verification_completed: false,
+            safe_errors: ["identical_internal_document_prelude_failure_limit"], global_notification_owed: true } });
+        return;
+      }
+    }
+    if (Date.now() >= alarmEnteredAt + 18_000) {
+      store.finishContinuationSlice({ pending: true, next_wake_at: Date.now() + 1_000,
+        documents_priority_next: true, feed_retry_at: before.feed_retry_at,
+        outcome: before.last_outcome ?? { budget_yield: true, safe_errors: ["document_io_deadline_elapsed"] } });
+      await this.armRequestRecoveryAlarm(1_000);
+      return;
+    }
+    const continuation = store.beginContinuationSlice(undefined, alarmEnteredAt);
+    const slice = this.createManagedDocumentSlice(alarmEnteredAt);
+    const resultCapture: { value: Awaited<ReturnType<ManagedDocumentChangeCoordinator["reconcile"]>> | null } = { value: null };
+    try {
+      await this.serialize(async () => {
+        const state = await this.readManagedDocumentState(slice.runtime, slice.scope);
+        if (!state || !this.ctx.id.name || state.project_id !== this.ctx.id.name) {
+          store.finishContinuationSlice({ pending: true, next_wake_at: Date.now() + 300_000,
+            documents_priority_next: false, feed_retry_at: continuation.feed_retry_at,
+            outcome: { safe_errors: ["project_state_unavailable"] } });
+          return;
+        }
+        const normalized = await normalizeSystemAdmission(state.project_id,
+          continuation.scheduled ? "project.materialize" : "project.repair", "DOCUMENTS",
+          `document-reconcile@${state.revision}`, String(state.revision));
+        if (await this.ruleAdmissionRequired(state, normalized, slice.scope)) {
+          const proof = await this.admitRules(state, normalized, undefined, slice.scope);
+          await this.persistAdmissionProof("document-reconcile", `document-reconcile-slice-${continuation.slice_ordinal}`, proof, slice.runtime);
+        }
+        this.ctx.storage.sql.exec(
+          "INSERT INTO navigation_refresh_scan (singleton, requested_at) VALUES (1, ?) ON CONFLICT(singleton) DO NOTHING",
+          new Date().toISOString()
+        );
+        const result = await this.createManagedDocumentChangeCoordinator(slice.runtime, slice.scope, continuation.slice_ordinal)
+          .reconcile(state, { scheduled: continuation.scheduled, local_alarm_job_limit: 8, now: new Date(alarmEnteredAt).toISOString() });
+        resultCapture.value = result;
+        const previousPreludeFailure = store.preludeFailureCheckpoint();
+        if (previousPreludeFailure) {
+          const currentProgress = await store.feedProgressFingerprint(result.semantic_progress);
+          if (currentProgress !== previousPreludeFailure.progress_fingerprint) store.breakInternalPreludeFailureStreak();
+        }
+        const scanWakeAt = this.documentScanRecoveryWake(result, Date.now());
+        const scanOutcome = this.documentContinuationOutcome(result);
+        const predictedNext = this.documentContinuationWake(result, Date.now());
+        if (before.last_outcome?.global_notification_owed === true || (!predictedNext.pending && before.pending)) {
+          scanOutcome.global_notification_owed = true;
+        }
+        store.finishContinuationSlice({ pending: true, next_wake_at: scanWakeAt,
+          documents_priority_next: false, feed_retry_at: result.feed_retry_at ?? continuation.feed_retry_at,
+          outcome: scanOutcome });
+        await this.armRequestRecoveryAlarm(Math.max(1, scanWakeAt - Date.now()));
+        await this.enqueueNavigationRefreshForDirtyZones(state.project_id, slice.runtime);
+        this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_scan WHERE singleton = 1");
+        const next = this.documentContinuationWake(result, Date.now());
+        const nextOutcome = this.documentContinuationOutcome(result);
+        if (scanOutcome.global_notification_owed === true || (!next.pending && before.pending)) {
+          nextOutcome.global_notification_owed = true;
+        }
+        store.finishContinuationSlice({ pending: next.pending, next_wake_at: next.at,
+          documents_priority_next: false,
+          feed_retry_at: result.feed_retry_at ?? continuation.feed_retry_at,
+          outcome: nextOutcome });
+      });
+    } catch (error) {
+      const now = Date.now();
+      const budgetYield = error instanceof Error && error.message.includes("slice_budget_exhausted");
+      const previousOutcome = before.last_outcome ?? {};
+      const result = resultCapture.value;
+      const currentOutcome = result ? this.documentContinuationOutcome(result) : previousOutcome;
+      const owedCheckpoint = store.continuation().last_outcome?.global_notification_owed === true;
+      if (owedCheckpoint || before.last_outcome?.global_notification_owed === true) {
+        currentOutcome.global_notification_owed = true;
+      }
+      const preludeInternalFailure = result === null && error instanceof InternalExecutionFailure;
+      const preludeFailure = preludeInternalFailure
+        ? store.recordInternalPreludeFailure(
+          await sha256Text(JSON.stringify({ type: "InternalExecutionFailure", code: error.code, stage: error.stage })),
+          await store.feedProgressFingerprint(typeof previousOutcome.semantic_progress === "number"
+            && Number.isSafeInteger(previousOutcome.semantic_progress) && previousOutcome.semantic_progress >= 0
+            ? previousOutcome.semantic_progress : 0)
+        )
+        : null;
+      if (result === null && !preludeInternalFailure && !budgetYield) store.breakInternalPreludeFailureStreak();
+      const preludeRetryAt = result === null && !budgetYield
+        ? safeDocumentRetryDeadline(now, error instanceof ProviderOperationError ? error.diagnostics?.retryAfterMs : undefined)
+        : null;
+      const retryAt = result ? result.feed_retry_at : budgetYield
+        ? before.feed_retry_at
+        : preludeRetryAt === null
+          ? before.feed_retry_at
+          : Math.max(before.feed_retry_at ?? 0, preludeRetryAt);
+      const executable = result
+        ? result.executable_jobs > 0
+        : false;
+      const unreadFeed = result ? result.unread_feed : previousOutcome.unread_feed === true;
+      const feedDue = result !== null && unreadFeed && (retryAt === null || retryAt <= now);
+      const futureWake = [before.next_wake_at, result?.earliest_eligible_at ?? null, retryAt]
+        .filter((value): value is number => value !== null && value > now && value < Number.MAX_SAFE_INTEGER);
+      const nextWake = preludeFailure?.stopped
+        ? Number.MAX_SAFE_INTEGER
+        : result === null && !budgetYield
+        ? retryAt ?? now + REQUEST_RECOVERY_RETRY_DELAY_MS
+        : result === null && budgetYield
+        ? Math.max(now + 20_000, retryAt ?? 0)
+        : executable || feedDue
+        ? now + 1_000
+        : futureWake.length
+          ? Math.min(...futureWake)
+          : budgetYield
+            ? now + 20_000
+            : now + REQUEST_RECOVERY_RETRY_DELAY_MS;
+      const previousErrors = Array.isArray(currentOutcome.safe_errors)
+        ? currentOutcome.safe_errors.filter((value): value is string => typeof value === "string").slice(0, 8)
+        : [];
+      const preludeError = preludeFailure?.stopped
+        ? "identical_internal_document_prelude_failure_limit"
+        : preludeInternalFailure ? "internal_document_prelude_failure" : null;
+      store.finishContinuationSlice({ pending: true, next_wake_at: nextWake,
+        documents_priority_next: false, feed_retry_at: retryAt,
+        outcome: preludeFailure?.stopped
+          ? { ...currentOutcome, stopped_unresolved_jobs: 1, verification_completed: false, global_notification_owed: true,
+            safe_errors: [preludeError!] }
+          : preludeInternalFailure
+            ? { ...currentOutcome, stopped_unresolved_jobs: 0, verification_completed: false,
+              safe_errors: [preludeError!] }
+        : budgetYield
+          ? { ...currentOutcome, budget_yield: true, safe_errors: previousErrors }
+          : { ...currentOutcome, verification_completed: false,
+            safe_errors: [...previousErrors, error instanceof RuleAdmissionRejection ? "rule_admission_unavailable" : "document_slice_failed"].slice(0, 8), budget_yield: false } });
+    } finally {
+      clearTimeout(slice.abortTimer);
+    }
+    const after = store.continuation();
+    if (after.next_wake_at !== null && after.next_wake_at < Number.MAX_SAFE_INTEGER) {
+      await this.armRequestRecoveryAlarm(Math.max(1, after.next_wake_at - Date.now()));
+    }
+  }
+
+  private async notifyDropboxChangeCoordinator(store: ManagedDocumentChangeJobStore, scope: ProviderRequestScope): Promise<boolean> {
+    const continuation = store.continuation();
+    store.finishContinuationSlice({ pending: continuation.pending, next_wake_at: continuation.next_wake_at,
+      documents_priority_next: continuation.documents_priority_next, feed_retry_at: continuation.feed_retry_at,
+      outcome: { ...(continuation.last_outcome ?? {}), global_notification_owed: true } });
+    // Durable owed state and its retry wake precede the remote acknowledgement.
+    await this.armRequestRecoveryAlarm(1_000);
+    if (scope.signal.aborted || (scope.now?.() ?? Date.now()) >= scope.deadlineMs) return false;
+    try {
+      const response = await this.raceProviderScope(scope, this.env.DROPBOX_CHANGE_GUARD.getByName("global").fetch(
+        "https://dropbox-change-guard.internal/notify", { method: "POST", signal: scope.signal }
+      ));
+      if (!response.ok) return false;
+      const body = await this.raceProviderScope(scope, response.text());
+      if (body.length > 2_048) return false;
+      let acknowledgement: unknown;
+      try { acknowledgement = JSON.parse(body); } catch { return false; }
+      if (!acknowledgement || typeof acknowledgement !== "object" || Array.isArray(acknowledgement)
+        || (acknowledgement as Record<string, unknown>).status !== "registered"
+        || !Number.isSafeInteger((acknowledgement as Record<string, unknown>).requested_generation)) return false;
+      const latest = store.continuation();
+      if (latest.last_outcome?.global_notification_owed === true) {
+        const outcome = { ...(latest.last_outcome ?? {}) };
+        delete outcome.global_notification_owed;
+        store.finishContinuationSlice({ pending: latest.pending, next_wake_at: latest.next_wake_at,
+          documents_priority_next: latest.documents_priority_next, feed_retry_at: latest.feed_retry_at, outcome });
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async handleArtifact(request: Request): Promise<Response> {
@@ -2572,8 +2974,8 @@ export class ProjectGuard extends DurableObject<Env> {
     if ((await journal.status())?.terminal && !capacityManaged) this.clearRequestRecovery("artifact", request.request_id);
   }
 
-  private async enqueueNavigationRefreshForDirtyZones(projectId: string): Promise<void> {
-    const sources = new ZoneNavigationSources(this.persistence);
+  private async enqueueNavigationRefreshForDirtyZones(projectId: string, runtime = this.persistence): Promise<void> {
+    const sources = new ZoneNavigationSources(runtime);
     for (const zone of ["WORKING", "REVIEW", "DELIVERABLES"] as const) {
       const source = await sources.readState(projectId, zone);
       if (!source.adopted || source.in_flight_resource_ids.length) continue;
@@ -2973,9 +3375,10 @@ export class ProjectGuard extends DurableObject<Env> {
   private async recordObservedNavigationSourceMutation(
     projectId: string,
     zone: NavigationZone,
-    resourceId: string
+    resourceId: string,
+    runtime: ProjectOsPersistenceRuntime = this.persistence
   ): Promise<void> {
-    const sources = new ZoneNavigationSources(this.persistence);
+    const sources = new ZoneNavigationSources(runtime);
     const source = await sources.readState(projectId, zone);
     if (!source.adopted && !source.adoption_request_id) return;
     const hasInFlightTicket = source.in_flight_resource_ids.includes(resourceId);
@@ -4666,9 +5069,9 @@ export class ProjectGuard extends DurableObject<Env> {
    * the existing per-project storage, so an unavailable global reader after
    * activation fails closed in admitRules rather than selecting a client rule
    * subset or silently returning to observe mode. */
-  protected async ruleAdmissionRequired(state: ProjectState, normalized: NormalizedAdmissionOperation): Promise<boolean> {
+  protected async ruleAdmissionRequired(state: ProjectState, normalized: NormalizedAdmissionOperation, scope?: ProviderRequestScope): Promise<boolean> {
     if (this.strictAdmissionEnabled(state.project_id)) return true;
-    const global = await this.readGlobalGovernanceSnapshot();
+    const global = await this.readGlobalGovernanceSnapshot(scope);
     if (this.hasApplicableActiveRule(state.local_rules, normalized)) {
       this.persistAdmissionFloor();
       return true;
@@ -5060,8 +5463,8 @@ export class ProjectGuard extends DurableObject<Env> {
     throw error;
   }
 
-  protected async admitRules(state: ProjectState, normalized: NormalizedAdmissionOperation, actor = { actor_id: "project_guard", authority: "durable_object" }): Promise<AdmissionProof> {
-    const global = await this.readGlobalGovernance();
+  protected async admitRules(state: ProjectState, normalized: NormalizedAdmissionOperation, actor = { actor_id: "project_guard", authority: "durable_object" }, scope?: ProviderRequestScope): Promise<AdmissionProof> {
+    const global = await this.readGlobalGovernance(scope);
     const evaluate = async (global_governance: GlobalGovernanceState): Promise<EvaluationResult> => {
       const approvalRule = [...Object.values(global_governance.rules), ...Object.values(state.local_rules ?? {})].find(rule =>
         rule.status === "active" && rule.operations.includes(normalized.operation)
@@ -5131,11 +5534,11 @@ export class ProjectGuard extends DurableObject<Env> {
       global_revision: global.revision,
       ruleset: first.ruleset
     };
-    const permit = await this.requestRulePermit(input);
+    const permit = await this.requestRulePermit(input, scope);
     const secret = this.env.RULE_ADMISSION_SIGNING_KEY;
     if (!secret) throw new RuleAdmissionRejection({ ...first, verdict: "unavailable", code: "GLOBAL_GOVERNANCE_UNAVAILABLE", expected: "Rule admission signing key", observed: "Missing signing key", required_action: "Restore rule-admission authority" });
     await verifyRuleAdmissionPermit(permit, input, secret, Date.now());
-    const currentGlobal = await this.readGlobalGovernance();
+    const currentGlobal = await this.readGlobalGovernance(scope);
     const final = await evaluate(currentGlobal);
     if (final.verdict !== "allow" || final.ruleset.digest !== permit.ruleset.digest || currentGlobal.revision !== permit.global_revision) {
       throw new RuleAdmissionRejection(final.verdict === "allow"
@@ -5211,15 +5614,16 @@ export class ProjectGuard extends DurableObject<Env> {
     return observations;
   }
 
-  protected async persistAdmissionProof(kind: string, requestId: string, proof: AdmissionProof): Promise<ExecutionAdmission> {
+  protected async persistAdmissionProof(kind: string, requestId: string, proof: AdmissionProof, runtime: ProjectOsPersistenceRuntime = this.persistence): Promise<ExecutionAdmission> {
     const admission: ExecutionAdmission = { ...proof, kind, request_id: requestId };
     if (kind === "transaction") await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
     // The canonical journal is authority. SQL is only a cache; awaiting this
     // boundary is mandatory before every admitted family starts an effect.
     let admitted: ExecutionAdmission;
     try {
-      admitted = await new ExecutionJournal(this.persistence, proof.project_id, kind, requestId).commit(admission, await this.executionPlanResolver(admission));
+      admitted = await new ExecutionJournal(runtime, proof.project_id, kind, requestId).commit(admission, await this.executionPlanResolver(admission));
     } catch (error) {
+      if (isManagedDocumentSliceBudgetYield(error)) throw error;
       if (error instanceof Error && (error.message.startsWith("execution_") || error.message === "repair_diagnosed_drift_required")) throw error;
       throw new Error("execution_evidence_unavailable");
     }
@@ -5235,44 +5639,84 @@ export class ProjectGuard extends DurableObject<Env> {
     return admitted;
   }
 
-  private async readGlobalGovernance(): Promise<GlobalGovernanceState> {
-    return this.readGlobalGovernanceSnapshot();
+  private async readGlobalGovernance(scope?: ProviderRequestScope): Promise<GlobalGovernanceState> {
+    return this.readGlobalGovernanceSnapshot(scope);
   }
 
   /** The Registry alone can attest that no governance history exists.  A
    * missing/invalid snapshot is not an empty ruleset: callers suspend until
    * they can read this canonical distinction. */
-  private async readGlobalGovernanceSnapshot(): Promise<GlobalGovernanceState> {
+  private async readGlobalGovernanceSnapshot(scope?: ProviderRequestScope): Promise<GlobalGovernanceState> {
     let response: Response;
-    try { response = await this.env.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/governance", { method: "GET" }); }
-    catch { throw new RuleAdmissionRejection(this.unavailableGlobalResult()); }
+    try { response = await this.scopedGovernanceRequest(scope, () => this.env.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/governance", { method: "GET", ...(scope ? { signal: scope.signal } : {}) })); }
+    catch (error) {
+      if (isManagedDocumentSliceBudgetYield(error)) throw error;
+      throw new RuleAdmissionRejection(this.unavailableGlobalResult());
+    }
     if (response.status === 404) {
       try {
-        const body = await response.json<{ error?: unknown }>();
+        const body = await this.scopedGovernanceJson<{ error?: unknown }>(response, scope);
         if (body.error === "governance_not_initialized") return { revision: 0, rules: {}, exceptions: {} };
-      } catch {
+      } catch (error) {
+        if (isManagedDocumentSliceBudgetYield(error)) throw error;
         // A malformed 404 is not a canonical absence proof.
       }
       throw new RuleAdmissionRejection(this.unavailableGlobalResult());
     }
     if (!response.ok) throw new RuleAdmissionRejection(this.unavailableGlobalResult());
     try {
-      const state = await response.json<GlobalGovernanceState>();
+      const state = await this.scopedGovernanceJson<GlobalGovernanceState>(response, scope);
       if (!Number.isSafeInteger(state.revision) || state.revision < 0 || !state.rules || !state.exceptions) throw new Error("invalid governance");
       return state;
-    } catch { throw new RuleAdmissionRejection(this.unavailableGlobalResult()); }
+    } catch (error) {
+      if (isManagedDocumentSliceBudgetYield(error)) throw error;
+      throw new RuleAdmissionRejection(this.unavailableGlobalResult());
+    }
   }
 
-  private async requestRulePermit(input: RuleAdmissionInput): Promise<RuleAdmissionPermit> {
+  private async requestRulePermit(input: RuleAdmissionInput, scope?: ProviderRequestScope): Promise<RuleAdmissionPermit> {
     let response: Response;
     try {
-      response = await this.env.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/rule-admission", {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input)
-      });
-    } catch { throw new RuleAdmissionRejection(this.unavailableGlobalResult()); }
+      response = await this.scopedGovernanceRequest(scope, () => this.env.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/rule-admission", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input), ...(scope ? { signal: scope.signal } : {})
+      }));
+    } catch (error) {
+      if (isManagedDocumentSliceBudgetYield(error)) throw error;
+      throw new RuleAdmissionRejection(this.unavailableGlobalResult());
+    }
     if (!response.ok) throw new RuleAdmissionRejection(this.unavailableGlobalResult());
-    try { return await response.json<RuleAdmissionPermit>(); }
-    catch { throw new RuleAdmissionRejection(this.unavailableGlobalResult()); }
+    try { return await this.scopedGovernanceJson<RuleAdmissionPermit>(response, scope); }
+    catch (error) {
+      if (isManagedDocumentSliceBudgetYield(error)) throw error;
+      throw new RuleAdmissionRejection(this.unavailableGlobalResult());
+    }
+  }
+
+  private async scopedGovernanceRequest(scope: ProviderRequestScope | undefined, request: () => Promise<Response>): Promise<Response> {
+    if (!scope) return request();
+    const now = scope.now?.() ?? Date.now();
+    if (scope.signal.aborted || now >= scope.deadlineMs) throw new Error("slice_budget_exhausted");
+    const calls = this.governanceScopeCalls.get(scope as object) ?? 0;
+    // Governance has its own finite request bound, but it must leave room for
+    // the initial admission plus at least one separately bound drift admission.
+    if (calls >= 16) throw new Error("slice_budget_exhausted");
+    this.governanceScopeCalls.set(scope as object, calls + 1);
+    return this.raceProviderScope(scope, request());
+  }
+
+  private async scopedGovernanceJson<T>(response: Response, scope?: ProviderRequestScope): Promise<T> {
+    if (!scope) return response.json<T>();
+    return this.raceProviderScope(scope, response.json<T>());
+  }
+
+  private async raceProviderScope<T>(scope: ProviderRequestScope, operation: Promise<T>): Promise<T> {
+    if (scope.signal.aborted || (scope.now?.() ?? Date.now()) >= scope.deadlineMs) throw new Error("slice_budget_exhausted");
+    let rejectAbort!: (reason: Error) => void;
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+    const onAbort = () => rejectAbort(new Error("slice_budget_exhausted"));
+    scope.signal.addEventListener("abort", onAbort, { once: true });
+    try { return await Promise.race([operation, aborted]); }
+    finally { scope.signal.removeEventListener("abort", onAbort); }
   }
 
   private unavailableGlobalResult(): EvaluationResult {

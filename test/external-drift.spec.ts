@@ -334,11 +334,15 @@ describe("package external drift", () => {
     const values = new Map<string, unknown>();
     const observed: unknown[] = [];
     const invalidations: unknown[] = [];
+    const scopedRuntimes: unknown[] = [];
     const coordinator = new ManagedDocumentChangeCoordinator(f.runtime, {
       get: async <T>(key: string) => values.get(key) as T | undefined,
       put: async (key: string, value: unknown) => { values.set(key, value); },
       delete: async (key: string) => values.delete(key)
-    }, "observe", async (_state, operation) => { observed.push(operation); }, async (...args) => { invalidations.push(args); });
+    }, "observe", async (_state, operation) => { observed.push(operation); }, async (projectId, zone, resourceId, scopedRuntime) => {
+      invalidations.push([projectId, zone, resourceId]);
+      scopedRuntimes.push(scopedRuntime);
+    });
 
     const summary = await coordinator.reconcile(f.state);
 
@@ -354,5 +358,7 @@ describe("package external drift", () => {
       })]
     })]);
     expect(invalidations).toEqual([[f.state.project_id, "WORKING", `package:${f.v2.package_id}`]]);
+    expect(scopedRuntimes).toHaveLength(1);
+    expect(scopedRuntimes[0]).toBe(f.runtime);
   });
 });

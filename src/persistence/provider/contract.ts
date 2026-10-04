@@ -59,6 +59,7 @@ export interface ObjectPersistence {
   createText(path: string, content: string): Promise<void>;
   upsertText(path: string, content: string): Promise<void>;
   getMetadata(path: string): Promise<ProviderObjectMetadata | null>;
+  getEntryKind?(path: string): Promise<"file" | "folder" | null>;
   listChildren(path: string): Promise<ProviderEntry[]>;
   move(from: string, to: string): Promise<void>;
   delete(path: string): Promise<void>;

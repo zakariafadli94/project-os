@@ -77,6 +77,7 @@ function wrapObjects(
       observe(path, content);
     },
     getMetadata: (path) => objects.getMetadata(path),
+    ...(objects.getEntryKind ? { getEntryKind: (path: string) => objects.getEntryKind!(path) } : {}),
     listChildren: (path) => objects.listChildren(path),
     move: (from, to) => objects.move(from, to),
     delete: (path) => objects.delete(path),

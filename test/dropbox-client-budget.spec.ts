@@ -50,6 +50,84 @@ describe("DropboxClient bounded request scope", () => {
     expect(calls).toBe(2);
   });
 
+  it("reads an exact Dropbox file or folder kind and treats only provider not-found as absence", async () => {
+    const requestedPaths: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      const url = new URL(request.url);
+      if (url.pathname === "/oauth2/token") {
+        return Response.json({ access_token: "test-access-token", expires_in: 14_400 });
+      }
+      const body = await request.json() as { path?: string };
+      const path = body.path ?? "";
+      requestedPaths.push(path);
+      if (path === "/missing-target") {
+        return Response.json({ error_summary: "path/not_found/" }, { status: 409 });
+      }
+      if (path === "/folder-target") {
+        return Response.json({ ".tag": "folder", id: "id:folder", name: "folder-target",
+          path_display: path, path_lower: path.toLowerCase() });
+      }
+      return Response.json({ ".tag": "file", id: "id:file", name: "file-target",
+        path_display: path,
+        path_lower: path.toLowerCase(), rev: "rev-file", content_hash: "a".repeat(64), size: 7 });
+    });
+    const client = new DropboxClient({ appKey: "test-key", appSecret: "test-secret", refreshToken: "test-refresh" });
+    await expect(client.getEntryKind("/file-target")).resolves.toBe("file");
+    await expect(client.getEntryKind("/folder-target")).resolves.toBe("folder");
+    await expect(client.getEntryKind("/missing-target")).resolves.toBeNull();
+    await expect(client.getMetadata("/folder-target")).rejects.toThrow("Dropbox file metadata incomplete");
+    expect(requestedPaths).toEqual(["/file-target", "/folder-target", "/missing-target", "/folder-target"]);
+  });
+
+  it("fails closed on malformed, unsupported, or mismatched metadata kinds", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      const url = new URL(request.url);
+      if (url.pathname === "/oauth2/token") {
+        return Response.json({ access_token: "test-access-token", expires_in: 14_400 });
+      }
+      const body = await request.json() as { path?: string };
+      if (body.path === "/unsupported") return Response.json({ ".tag": "deleted", id: "id:deleted", name: "unsupported",
+        path_display: body.path, path_lower: body.path?.toLowerCase() });
+      if (body.path === "/missing-tag") return Response.json({ id: "id:untagged", name: "missing-tag",
+        path_display: body.path, path_lower: body.path?.toLowerCase() });
+      if (body.path === "/wrong-path") return Response.json({ ".tag": "folder", id: "id:wrong", name: "wrong-path",
+        path_display: "/elsewhere", path_lower: "/elsewhere" });
+      if (body.path === "/missing-identity") return Response.json({ ".tag": "folder", name: "missing-identity", path_display: body.path });
+      if (body.path === "/numeric-identity") return Response.json({ ".tag": "folder", id: 42, name: "numeric-identity", path_display: body.path });
+      return Response.json({ path_display: body.path, path_lower: body.path?.toLowerCase() });
+    });
+    const client = new DropboxClient({ appKey: "test-key", appSecret: "test-secret", refreshToken: "test-refresh" });
+    await expect(client.getEntryKind("/missing-tag")).rejects.toBeDefined();
+    await expect(client.getEntryKind("/unsupported")).rejects.toBeDefined();
+    await expect(client.getEntryKind("/wrong-path")).rejects.toBeDefined();
+    await expect(client.getEntryKind("/missing-identity")).rejects.toBeDefined();
+    await expect(client.getEntryKind("/numeric-identity")).rejects.toBeDefined();
+  });
+
+  it("preserves retryable Dropbox metadata failures for exact-kind lookup", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      const url = new URL(request.url);
+      if (url.pathname === "/oauth2/token") {
+        return Response.json({ access_token: "test-access-token", expires_in: 14_400 });
+      }
+      if ((await request.clone().json() as { path?: string }).path === "/misleading-not-found") {
+        return Response.json({ error_summary: "path/no_permission/not_found/" }, { status: 409 });
+      }
+      return Response.json({ error_summary: "temporarily_unavailable/" }, {
+        status: 503,
+        headers: { "Retry-After": "60" }
+      });
+    });
+    const client = new DropboxClient({ appKey: "test-key", appSecret: "test-secret", refreshToken: "test-refresh" });
+    await expect(client.getEntryKind("/temporary-failure"))
+      .rejects.toMatchObject({ name: "DropboxApiError", status: 503, retryAfterMs: 60_000 });
+    await expect(client.getEntryKind("/misleading-not-found"))
+      .rejects.toMatchObject({ name: "DropboxApiError", status: 409 });
+  });
+
   it("returns one bounded listing page instead of draining a folder", async () => {
     installDropboxMock();
     const client = new DropboxClient({ appKey: "key", appSecret: "secret", refreshToken: "refresh" });

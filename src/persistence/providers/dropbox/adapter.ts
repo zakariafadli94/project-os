@@ -31,6 +31,9 @@ export function createDropboxPersistence(raw: DropboxTransport): PersistenceRunt
         const metadata = await call("metadata", path, () => raw.getMetadata!(path));
         return metadata ? mapMetadata(metadata) : null;
       },
+      ...(raw.getEntryKind ? {
+        getEntryKind: (path: string) => call("metadata", path, () => raw.getEntryKind!(path))
+      } : {}),
       listChildren: async (path) => {
         const entries = await call("list", path, () => raw.listFolder!(path));
         return entries.map(mapEntry);

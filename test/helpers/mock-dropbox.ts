@@ -7,6 +7,7 @@ export interface DropboxMockFault {
   error_summary: string;
   method?: string;
   path?: string;
+  cursor?: string;
   phase?: "before" | "after";
   pause?: Promise<void>;
   responseHeaders?: Record<string, string>;
@@ -138,6 +139,7 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
 
     const requestPaths = new Set<string>();
     let apiPath: string | undefined;
+    let requestCursor: string | undefined;
     const apiArg = request.headers.get("Dropbox-API-Arg");
     if (apiArg) {
       try {
@@ -155,10 +157,11 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       try {
         const rawBody = await request.clone().text();
         if (rawBody) {
-          const parsed = JSON.parse(rawBody) as { path?: unknown; from_path?: unknown; to_path?: unknown };
+          const parsed = JSON.parse(rawBody) as { path?: unknown; from_path?: unknown; to_path?: unknown; cursor?: unknown };
           for (const value of [parsed.path, parsed.from_path, parsed.to_path]) {
             if (typeof value === "string") requestPaths.add(value);
           }
+          if (typeof parsed.cursor === "string") requestCursor = parsed.cursor;
         }
       } catch {
         // Non-JSON payloads are valid for Dropbox content endpoints and are ignored here.
@@ -194,7 +197,8 @@ export function installDropboxMock(options: DropboxMockOptions = {}) {
       const fault = faults[index];
       const matches = fault.endpoint === url.pathname
         && (fault.method === undefined || fault.method === request.method)
-        && (fault.path === undefined || requestPaths.has(fault.path));
+        && (fault.path === undefined || requestPaths.has(fault.path))
+        && (fault.cursor === undefined || requestCursor === fault.cursor);
       if (!matches) continue;
 
       const occurrence = (matchedFaultOccurrences.get(index) ?? 0) + 1;

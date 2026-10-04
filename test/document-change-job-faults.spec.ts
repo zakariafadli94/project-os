@@ -1990,7 +1990,7 @@ describe("durable managed-document change jobs", () => {
     })]));
   });
 
-  it("keeps the old durable cursor when cursor-reset baseline fetch fails before atomic page registration", async () => {
+  it("keeps the old durable cursor when its reset baseline fails despite a foreign project continuation", async () => {
     const faults: DropboxMockFault[] = [];
     const mock = installDropboxMock({ faults });
     const slug = "change-job-reset-atomic";
@@ -2011,21 +2011,33 @@ describe("durable managed-document change jobs", () => {
     const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
     await mock.writeExternal(`${root}/ARTIFACTS/reset-proof.md`, "# reset proof");
 
-    // The first continue reports reset, then rebuilding the baseline fails. The
-    // second reset fault is reserved for the retry so we can prove the old cursor
-    // survived rather than silently degrading the retry into an ordinary baseline.
+    const foreign = await createProject("TXN-CHANGEJOB-PROJECT-FOREIGN-CURSOR-0001", "foreign-cursor-consumer");
+    const foreignGuard = testEnv.PROJECT_GUARD.getByName(foreign.project_id);
+    const foreignBaseline = await foreignGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(foreignBaseline.status).toBe(200);
+    const foreignCursor = await runInDurableObject(foreignGuard, (_instance, state) =>
+      state.storage.sql.exec<{ cursor: string | null }>(
+        "SELECT cursor FROM managed_document_change_control WHERE singleton = 1"
+      ).one().cursor);
+    expect(foreignCursor).not.toBeNull();
+    expect(foreignCursor).not.toBe(cursorBefore);
+
+    // Both reset responses are bound to the saved target cursor. This preserves
+    // one for its retry even if another project's real continuation runs first.
     faults.push(
       {
         endpoint: "/2/files/list_folder/continue",
         occurrence: 1,
         status: 409,
-        error_summary: "reset/..."
+        error_summary: "reset/...",
+        cursor: cursorBefore!
       },
       {
         endpoint: "/2/files/list_folder/continue",
         occurrence: 1,
         status: 409,
-        error_summary: "reset/..."
+        error_summary: "reset/...",
+        cursor: cursorBefore!
       },
       {
         endpoint: "/2/files/list_folder",
@@ -2057,13 +2069,21 @@ describe("durable managed-document change jobs", () => {
       cursorAfterFailure = state.storage.sql.exec<{ cursor: string | null }>(
         "SELECT cursor FROM managed_document_change_control WHERE singleton = 1"
       ).one().cursor;
+      expect(cursorAfterFailure).toBe(cursorBefore);
+      // This test owns a manual retry; alarm-only recovery is exercised separately.
+      await state.storage.deleteAlarm();
     });
     expect(cursorAfterFailure).toBe(cursorBefore);
+
+    const foreignRetry = await foreignGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(foreignRetry.status).toBe(200);
+    await expect(foreignRetry.json()).resolves.toMatchObject({ cursor_reset: false, baseline: false });
 
     // Advance the durable Retry-After eligibility rather than retrying the
     // failed feed immediately. This test is about atomic cursor preservation.
     await runInDurableObject(guard, async (_instance, state) => {
       const store = new ManagedDocumentChangeJobStore(state.storage);
+      expect(store.cursor()).toBe(cursorBefore);
       const continuation = store.continuation();
       store.finishContinuationSlice({
         pending: continuation.pending,

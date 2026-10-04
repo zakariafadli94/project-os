@@ -173,4 +173,158 @@ describe("DropboxClient bounded request scope", () => {
     await rejection;
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it("shares one cold refresh across concurrent public operations in the same scope", async () => {
+    let releaseRefresh!: () => void;
+    const refreshResponse = new Promise<void>(resolve => { releaseRefresh = resolve; });
+    let refreshRequests = 0;
+    let metadataRequests = 0;
+    let budgetCalls = 0;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const request = input instanceof Request ? input : new Request(String(input));
+      const url = new URL(request.url);
+      if (url.pathname === "/oauth2/token") {
+        refreshRequests += 1;
+        await refreshResponse;
+        return Response.json({ access_token: "cold-token", expires_in: 14_400 });
+      }
+      metadataRequests += 1;
+      return Response.json({ id: `id:${metadataRequests}`, path: `/cold-${metadataRequests}.txt`, rev: "rev-1",
+        content_hash: "hash", size: 1 });
+    });
+
+    const client = new DropboxClient({ appKey: "test-key", appSecret: "test-secret", refreshToken: "test-refresh" }, {
+      requestScope: {
+        deadlineMs: Date.now() + 5_000,
+        signal: new AbortController().signal,
+        beforeHttp: () => { budgetCalls += 1; }
+      }
+    });
+
+    const first = client.getMetadata("/cold-first.txt");
+    const second = client.getMetadata("/cold-second.txt");
+    releaseRefresh();
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+
+    expect({ refreshRequests, metadataRequests, budgetCalls }).toEqual({ refreshRequests: 1, metadataRequests: 2, budgetCalls: 3 });
+  });
+
+  it("shares a failed cold refresh and allows a later public operation to retry", async () => {
+    let releaseRefresh!: () => void;
+    const refreshResponse = new Promise<void>(resolve => { releaseRefresh = resolve; });
+    let refreshRequests = 0;
+    let metadataRequests = 0;
+    let budgetCalls = 0;
+    let refreshIsUnavailable = true;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const request = input instanceof Request ? input : new Request(String(input));
+      const url = new URL(request.url);
+      if (url.pathname === "/oauth2/token") {
+        refreshRequests += 1;
+        await refreshResponse;
+        if (refreshIsUnavailable) {
+          return Response.json({ error_summary: "temporarily_unavailable" }, { status: 503 });
+        }
+        return Response.json({ access_token: "retried-token", expires_in: 14_400 });
+      }
+      metadataRequests += 1;
+      return Response.json({ id: "id:retried", path: "/retry.txt", rev: "rev-1", content_hash: "hash", size: 1 });
+    });
+    const client = new DropboxClient({ appKey: "test-key", appSecret: "test-secret", refreshToken: "test-refresh" }, {
+      requestScope: {
+        deadlineMs: Date.now() + 5_000,
+        signal: new AbortController().signal,
+        beforeHttp: () => { budgetCalls += 1; }
+      }
+    });
+
+    const failedCalls = [client.getMetadata("/first.txt"), client.getMetadata("/second.txt")];
+    releaseRefresh();
+    const firstResults = await Promise.allSettled(failedCalls);
+    const refreshesBeforeRetry = refreshRequests;
+    refreshIsUnavailable = false;
+    const retried = await client.getMetadata("/retry.txt");
+
+    expect(firstResults.every(result => result.status === "rejected")).toBe(true);
+    expect(retried?.path).toBe("/retry.txt");
+    expect({ refreshesBeforeRetry, refreshRequests, metadataRequests, budgetCalls }).toEqual({
+      refreshesBeforeRetry: 1, refreshRequests: 2, metadataRequests: 1, budgetCalls: 3
+    });
+  });
+
+  it("reuses a valid cached token but refreshes after its safety margin expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-04T12:00:00.000Z"));
+    let refreshRequests = 0;
+    let metadataRequests = 0;
+    let budgetCalls = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const request = input instanceof Request ? input : new Request(String(input));
+      const url = new URL(request.url);
+      if (url.pathname === "/oauth2/token") {
+        refreshRequests += 1;
+        return Response.json({ access_token: `token-${refreshRequests}`, expires_in: 120 });
+      }
+      metadataRequests += 1;
+      return Response.json({ id: `id:${metadataRequests}`, path: `/cache-${metadataRequests}.txt`, rev: "rev-1",
+        content_hash: "hash", size: 1 });
+    });
+    const client = new DropboxClient({ appKey: "test-key", appSecret: "test-secret", refreshToken: "test-refresh" }, {
+      requestScope: {
+        deadlineMs: Date.now() + 120_000,
+        signal: new AbortController().signal,
+        beforeHttp: () => { budgetCalls += 1; }
+      }
+    });
+
+    await client.getMetadata("/cache-first.txt");
+    await client.getMetadata("/cache-second.txt");
+    vi.setSystemTime(new Date("2026-10-04T12:01:01.000Z"));
+    await client.getMetadata("/cache-third.txt");
+
+    expect({ refreshRequests, metadataRequests, budgetCalls }).toEqual({ refreshRequests: 2, metadataRequests: 3, budgetCalls: 5 });
+  });
+
+  it("shares an OAuth request's scope abort and clears the shared bounded timer", async () => {
+    vi.useFakeTimers();
+    let signalRefreshStarted!: () => void;
+    const refreshStarted = new Promise<void>(resolve => { signalRefreshStarted = resolve; });
+    const scopeController = new AbortController();
+    let refreshRequests = 0;
+    let metadataRequests = 0;
+    let budgetCalls = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      const url = new URL(request.url);
+      if (url.pathname !== "/oauth2/token") {
+        metadataRequests += 1;
+        return Promise.resolve(Response.json({ id: "id:file", path: "/file.txt", rev: "rev-1", content_hash: "hash", size: 1 }));
+      }
+      refreshRequests += 1;
+      signalRefreshStarted();
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = request.signal;
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+    const client = new DropboxClient({ appKey: "test-key", appSecret: "test-secret", refreshToken: "test-refresh" }, {
+      requestScope: {
+        deadlineMs: Date.now() + 30_000,
+        signal: scopeController.signal,
+        beforeHttp: () => { budgetCalls += 1; }
+      }
+    });
+
+    const calls = [client.getMetadata("/abort-first.txt"), client.getMetadata("/abort-second.txt")];
+    await refreshStarted;
+    scopeController.abort(new Error("slice cancelled"));
+    const results = await Promise.allSettled(calls);
+
+    expect(results.every(result => result.status === "rejected")).toBe(true);
+    expect({ refreshRequests, metadataRequests, budgetCalls, remainingTimers: vi.getTimerCount() }).toEqual({
+      refreshRequests: 1, metadataRequests: 0, budgetCalls: 1, remainingTimers: 0
+    });
+  });
 });

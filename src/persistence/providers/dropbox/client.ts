@@ -110,6 +110,7 @@ interface RawDropboxMetadata {
 
 export class DropboxClient implements DropboxTransport {
   private cachedToken: { value: string; expiresAt: number } | null = null;
+  private tokenRefresh: Promise<string> | null = null;
   private requestIndex = 0;
   private requestOperation: string | null = null;
 
@@ -129,6 +130,18 @@ export class DropboxClient implements DropboxTransport {
     const now = Date.now();
     if (this.cachedToken && this.cachedToken.expiresAt - 60_000 > now) return this.cachedToken.value;
 
+    if (this.tokenRefresh) return this.tokenRefresh;
+
+    const refresh = this.refreshToken(now);
+    this.tokenRefresh = refresh;
+    try {
+      return await refresh;
+    } finally {
+      if (this.tokenRefresh === refresh) this.tokenRefresh = null;
+    }
+  }
+
+  private async refreshToken(now: number): Promise<string> {
     const body = new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: this.credentials.refreshToken

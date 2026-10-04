@@ -27,6 +27,7 @@ import { RuleAdmissionError } from "../src/admission/rule-admission";
 import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-governance";
 import { normalizeSystemAdmission } from "../src/admission/operation-context";
 import { sha256Canonical } from "../src/materialization/hash";
+import { sha256Text } from "../src/documents/hash";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-31T14:20:00+01:00";
@@ -202,6 +203,46 @@ describe("durable managed-document change jobs", () => {
     expect(repeatedValue.document_change_checkpoint.eligibility).toEqual(value.document_change_checkpoint.eligibility);
     expect(repeatedValue.document_change_checkpoint.continuation).toEqual(value.document_change_checkpoint.continuation);
     expect(await snapshot()).toEqual(before);
+  });
+
+  it("discovers bounded navigation refresh identities without provider calls or local mutations", async () => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-NAV-DISCOVERY-0001", "navigation-discovery");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const requestId = "DOCREQ-NAV-DISCOVERY-REVIEW-0001";
+    await runInDurableObject(guard, (_instance, state) => {
+      const request = { operation: "navigation.reconcile", request_id: requestId, project_id: created.project_id,
+        zone: "REVIEW", expected_project_revision: 1, expected_generation: 0, expected_index: null,
+        created_at: "2026-10-04T20:00:00.000Z" };
+      state.storage.sql.exec("INSERT INTO navigation_refresh_outbox VALUES (?, ?, ?)", "REVIEW", 2, JSON.stringify(request));
+      state.storage.sql.exec("INSERT INTO navigation_refresh_outbox VALUES (?, ?, NULL)", "DELIVERABLES", 3);
+      state.storage.sql.exec("INSERT INTO navigation_refresh_outbox VALUES (?, ?, NULL)", "WORKING", 4);
+      state.storage.sql.exec("INSERT INTO navigation_refresh_outbox VALUES (?, ?, NULL)", "WORKING", 5);
+      state.storage.sql.exec("INSERT INTO request_recovery VALUES ('document', ?)", requestId);
+    });
+    const read = async () => runInDurableObject(guard, async (instance, state) => ({
+      checkpoint: (instance as any).readNavigationRefreshCheckpoint(created.project_id),
+      rows: state.storage.sql.exec("SELECT * FROM navigation_refresh_outbox ORDER BY source_generation, zone").toArray(),
+      alarm: await state.storage.getAlarm()
+    }));
+    const providerCalls = mock.providerCalls.length;
+    const first = await read();
+    expect(first.checkpoint).toEqual({ read_only: true, observation_scope: "local_only", has_more: true, requests: [
+      { zone: "REVIEW", source_generation: 2, request_id: requestId, local_recovery_queued: true, local_recovery_stopped: false },
+      { zone: "DELIVERABLES", source_generation: 3, request_id: null, local_recovery_queued: false, local_recovery_stopped: false },
+      { zone: "WORKING", source_generation: 4, request_id: null, local_recovery_queued: false, local_recovery_stopped: false }
+    ] });
+    expect(await read()).toEqual(first);
+    expect(mock.providerCalls).toHaveLength(providerCalls);
+    const response = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
+    expect((await response.json<any>()).navigation_refresh_checkpoint).toEqual(first.checkpoint);
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("UPDATE navigation_refresh_outbox SET request_json = ? WHERE zone = 'REVIEW'", JSON.stringify({ secret: "must-not-leak" }));
+    });
+    const malformed = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
+    const body = await malformed.json<any>();
+    expect(body.navigation_refresh_checkpoint).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain("must-not-leak");
   });
 
   it("omits the checkpoint when a retained continuation outcome field is malformed", async () => {
@@ -440,6 +481,174 @@ describe("durable managed-document change jobs", () => {
     expect(acknowledgement.status).toBe(200);
     expect(await acknowledgement.json<Record<string, unknown>>()).toMatchObject({ requested_generation: 1 });
   }, 15_000);
+
+  it.each(["baseline", "superseded"])("admits current-head recovery through ProjectGuard without rewriting the canonical head: %s", async (scenario) => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-CURRENT-HEAD-RECOVERY-0001", "current-head-recovery");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const registry = testEnv.REGISTRY_GUARD.getByName("global");
+    const originalGuard = await runInDurableObject(guard, instance => (instance as any).env.RULE_ADMISSION_SIGNING_KEY);
+    const originalRegistry = await runInDurableObject(registry, instance => ({
+      signingKey: (instance as any).env.RULE_ADMISSION_SIGNING_KEY, governanceToken: (instance as any).env.RULE_GOVERNANCE_TOKEN
+    }));
+    restoreTestEnvBindings = async () => {
+      await runInDurableObject(guard, instance => restoreOptionalEnvBinding((instance as any).env, "RULE_ADMISSION_SIGNING_KEY", originalGuard));
+      await runInDurableObject(registry, instance => {
+        restoreOptionalEnvBinding((instance as any).env, "RULE_ADMISSION_SIGNING_KEY", originalRegistry.signingKey);
+        restoreOptionalEnvBinding((instance as any).env, "RULE_GOVERNANCE_TOKEN", originalRegistry.governanceToken);
+      });
+    };
+    resetAfterRetryFaultFixture = true;
+    await bootstrapRuleAdmissionGovernance(testEnv, "current-head-recovery-rules", created.project_id);
+    const measured = await runInDurableObject(guard, async (instance) => {
+      const target = instance as any;
+      const state = await target.loadOrRecoverState();
+      const content = "Keep the verified current document, not the unknown former intention.";
+      const document = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-CURRENT-HEAD-RECOVERY-BASE-0001",
+        project_id: created.project_id, logical_path: "recovery/current.md", content,
+        content_sha256: await sha256Text(content), created_at: at }, state);
+      const review = await target.managedDocumentService.promoteToReview({ request_id: "DOCREQ-CURRENT-HEAD-RECOVERY-REVIEW-0001",
+        project_id: created.project_id, document_id: document.document_id, expected_version_id: document.version_id, created_at: at }, state);
+      await target.managedDocumentService.publish({ request_id: "DOCREQ-CURRENT-HEAD-RECOVERY-PUBLISH-0001",
+        project_id: created.project_id, document_id: document.document_id, expected_version_id: review.version_id, created_at: at }, state);
+      const draft = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-CURRENT-HEAD-RECOVERY-DRAFT-0001",
+        project_id: created.project_id, logical_path: "recovery/current.md", content: content + " next version",
+        content_sha256: await sha256Text(content + " next version"), created_at: at }, state);
+      await target.managedDocumentService.promoteToReview({ request_id: "DOCREQ-CURRENT-HEAD-RECOVERY-REVIEW-0002",
+        project_id: created.project_id, document_id: document.document_id, expected_version_id: draft.version_id, created_at: at }, state);
+      const ledger = new DocumentLedgerRepository(target.persistence);
+      const preparedHead = await ledger.readHead(created.project_id, document.document_id);
+      // A genuine supported cycle preserves the published version while its
+      // replacement is reviewed. Do not bypass DOCUMENT_IN_REVIEW to create a
+      // fictitious third visible stage merely for this integration fixture.
+      expect(preparedHead?.working_version_id).toBeUndefined();
+      expect(preparedHead?.review_version_id).toBeTruthy();
+      expect(preparedHead?.published_version_id).toBeTruthy();
+      const sources = new ZoneNavigationSources(target.persistence);
+      expect(await sources.markCatalogReady(created.project_id, "WORKING", 0)).toBe(true);
+      const adoptionId = "DOCREQ-CURRENT-HEAD-RECOVERY-ADOPT-0001";
+      expect(await sources.beginAdoption(created.project_id, "WORKING", adoptionId, 0)).toBe(true);
+      expect(await sources.finishAdoption(created.project_id, "WORKING", adoptionId, 0)).toBe(true);
+      const resource = `head:${document.document_id}`;
+      expect(await sources.beginHeadWrite(created.project_id, "WORKING", resource, undefined, "a".repeat(64))).toBeTruthy();
+      const headPath = machineDocumentHeadPath(created.project_id, document.document_id);
+      const before = mock.files.get(headPath);
+      const uploads = mock.uploadCalls.filter(path => path === headPath).length;
+      const signingKey = target.env.RULE_ADMISSION_SIGNING_KEY;
+      delete target.env.RULE_ADMISSION_SIGNING_KEY;
+      try {
+        const unavailable = await target.recoverOneUnownedNavigationHeadWrite(created.project_id, target.persistence, 0);
+        expect(unavailable.status).toBe("unresolved");
+        expect((await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids).toContain(resource);
+        expect(await target.ctx.storage.get("navigation-head-recovery-pending-v1")).toBeUndefined();
+      } finally { target.env.RULE_ADMISSION_SIGNING_KEY = signingKey; }
+      const delegate = mock.spy.getMockImplementation()!;
+      let interruptedBeforeIntent = false;
+      let interruptedAfterClear = false;
+      mock.spy.mockImplementation(async (input, init) => {
+        const request = input instanceof Request ? input : new Request(String(input), init);
+        const url = new URL(request.url);
+        const arg = request.headers.get("Dropbox-API-Arg");
+        const path = arg ? (JSON.parse(arg) as { path?: string }).path : null;
+        if (!interruptedBeforeIntent && url.pathname === "/2/files/upload" && path?.endsWith("/progress.json")) {
+          const admissionRaw = mock.files.get(path.replace(/progress\.json$/, "admission.json"));
+          if (admissionRaw && JSON.parse(admissionRaw).admission.kind === "navigation-head-recovery") {
+            interruptedBeforeIntent = true;
+            expect(await target.ctx.storage.get("navigation-head-recovery-pending-v1")).toBeUndefined();
+            return new Response(JSON.stringify({ error_summary: "injected_before_recovery_intent" }), { status: 503 });
+          }
+        }
+        if (!interruptedAfterClear && url.pathname === "/2/files/upload"
+          && path?.includes("/head-write-recovery/") && path.endsWith("/receipt.json")) {
+          const source = JSON.parse(mock.files.get(`${machineDocumentRoot(created.project_id)}/navigation-sources/state.json`)!);
+          expect(source.zones.WORKING.in_flight_writes).toEqual([]);
+          interruptedAfterClear = true;
+          return new Response(JSON.stringify({ error_summary: "injected_after_recovery_fence_clear" }), { status: 503 });
+        }
+        return delegate(input, init);
+      });
+      let recovered = false;
+      let siblingResource: string | null = null;
+      const sliceCosts: number[] = [];
+      const interruptions: string[] = [];
+      for (let ordinal = 0; ordinal < 8 && !recovered; ordinal++) {
+        const slice = target.createManagedDocumentSlice(Date.now());
+        try {
+          const result = await target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime,
+            scenario === "superseded" ? 0 : ordinal, false, slice.scope);
+          recovered = scenario === "baseline" ? result.status === "recovered" : siblingResource !== null
+            && !(await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids.includes(siblingResource);
+        } catch (error) {
+          const text = error instanceof Error ? error.message : String(error);
+          interruptions.push(text);
+          if (text === "execution_evidence_unavailable" && interruptedBeforeIntent && !interruptedAfterClear) {
+            expect(await target.ctx.storage.get("navigation-head-recovery-pending-v1")).toBeUndefined();
+            expect((await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids).toContain(resource);
+          } else {
+            if (!text.includes("slice_budget_exhausted") && !interruptedAfterClear) throw error;
+            expect(text.includes("slice_budget_exhausted") || interruptedAfterClear).toBe(true);
+            expect(await target.ctx.storage.get("navigation-head-recovery-pending-v1")).toBeTruthy();
+          }
+        } finally {
+          clearTimeout(slice.abortTimer);
+          sliceCosts.push(slice.calls());
+          expect(slice.calls()).toBeLessThanOrEqual(64);
+        }
+        if (scenario === "superseded" && interruptedAfterClear && siblingResource === null) {
+          // A provider replacement preserves A's valid contents but changes
+          // its exact physical version between slices. Independent B remains
+          // recoverable; A must not monopolize it or acquire a false success.
+          await mock.writeExternal(headPath, before!);
+          const sibling = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-CURRENT-HEAD-RECOVERY-SIBLING-0001",
+            project_id: created.project_id, logical_path: "recovery/sibling.md", content: "independent sibling",
+            content_sha256: await sha256Text("independent sibling"), created_at: at }, state);
+          siblingResource = `head:${sibling.document_id}`;
+          expect(await sources.beginHeadWrite(created.project_id, "WORKING", siblingResource, undefined, "b".repeat(64))).toBeTruthy();
+        }
+      }
+      expect(interruptedBeforeIntent).toBe(true);
+      expect(interruptedAfterClear).toBe(true);
+      expect(recovered, JSON.stringify({ scenario, sliceCosts, interruptions,
+        pending: await target.ctx.storage.get("navigation-head-recovery-pending-v1"), siblingResource,
+        source: await sources.readState(created.project_id, "WORKING") })).toBe(true);
+      if (scenario === "superseded") {
+        expect(mock.files.get(headPath)).toBe(before);
+        const remaining = await target.ctx.storage.get("navigation-head-recovery-pending-v1");
+        expect(remaining).toBeTruthy();
+        const progresses = [...mock.files.entries()].filter(([path]) => path.endsWith("/progress.json"))
+          .map(([, raw]) => JSON.parse(raw)).filter(record => record.kind === "navigation-head-recovery");
+        expect(progresses.some(record => record.status === "finalized" && record.terminal)).toBe(true);
+        expect(progresses.some(record => !record.terminal)).toBe(true);
+        const finalized = progresses.find(record => record.status === "finalized" && record.terminal);
+        expect(JSON.parse(mock.files.get(finalized.receipt_ref)!)).toMatchObject({ resource_id: siblingResource,
+          status: "committed", original_outcome: "unknown" });
+        const pending = remaining as { request_hash: string };
+        expect(progresses.find(record => record.request_hash === pending.request_hash)).toMatchObject({ terminal: false });
+        const compact = await sources.compactCatalogManifest(created.project_id, "WORKING");
+        expect(compact?.coalesced_dirty.find(item => item.resource_id === siblingResource)).toMatchObject({
+          latest_generation: 3, covered_generations: [{ start: 2, end: 2 }] });
+        return { sliceCosts, interruptions, interruptedBeforeIntent, interruptedAfterClear, recovered };
+      }
+      expect((await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids).not.toContain(resource);
+      expect(await sources.hasDirtyMarker(created.project_id, "WORKING", resource)).toBe(true);
+      expect(mock.files.get(headPath)).toBe(before);
+      expect(mock.uploadCalls.filter(path => path === headPath)).toHaveLength(uploads);
+      expect((await target.ctx.storage.get("navigation-head-recovery-pending-v1")) ?? null).toBeNull();
+      const admissions = [...mock.files.entries()].filter(([path]) => path.endsWith("/admission.json")
+        && path.includes("/executions/")).map(([, raw]) => JSON.parse(raw));
+      expect(admissions.some(record => record.admission.kind === "navigation-head-recovery"
+        && record.admission.operation === "project.materialize"
+        && record.admission.resources.some((entry: any) => entry.resource_id === resource && entry.zone === "WORKING"))).toBe(true);
+      const progress = [...mock.files.entries()].filter(([path]) => path.endsWith("/progress.json"))
+        .map(([, raw]) => JSON.parse(raw)).find(record => record.kind === "navigation-head-recovery");
+      expect(progress).toMatchObject({ status: "finalized", terminal: true, code: null });
+      expect(JSON.parse(mock.files.get(progress.receipt_ref)!)).toMatchObject({ status: "committed", original_outcome: "unknown" });
+      expect(JSON.parse(mock.files.get(progress.finalization_ref)!)).toMatchObject({ request_hash: progress.request_hash,
+        postconditions: ["exact_current_head_revalidated", "source_dirty_generation_durable", "recovery_fence_absent"] });
+      return { sliceCosts, interruptions, interruptedBeforeIntent, interruptedAfterClear, recovered };
+    });
+    console.log("current-head recovery real slice costs", JSON.stringify(measured));
+  });
 
   it("recovers a stranded matching head flight in the local continuation without a new provider event", async () => {
     resetAfterRetryFaultFixture = true;
@@ -2210,11 +2419,14 @@ describe("durable managed-document change jobs", () => {
       durableState.storage.sql.exec("UPDATE managed_document_change_jobs SET attempts = 100 WHERE job_id = ?", jobId);
     });
     const runSlice = (day: number) => runInDurableObject(guard, async (_instance, durableState) => {
-      const coordinator = new ManagedDocumentChangeCoordinator(runtime, durableState.storage);
+      const sliceAt = Date.parse("2026-10-03T20:00:00.000Z") + day * 86_400_000;
+      // Failure observation must use the same fixture clock as selection; real
+      // wall time eventually overtakes day 1 and silently skips one attempt.
+      const coordinator = new ManagedDocumentChangeCoordinator(runtime, durableState.storage, "observe", undefined, undefined, () => sliceAt);
       (coordinator as any).processJob = async () => { throw new InternalExecutionFailure(failureCode, "process"); };
       return coordinator.reconcile(state, {
         scheduled: true,
-        now: new Date(Date.parse("2026-10-03T20:00:00.000Z") + day * 86_400_000).toISOString()
+        now: new Date(sliceAt).toISOString()
       });
     });
 

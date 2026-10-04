@@ -68,13 +68,18 @@ export class ExecutionJournal {
         || canonicalJson(existing.admission.resources) !== canonicalJson(admission.resources)
         || canonicalJson(existing.admission.resource_effect_scopes) !== canonicalJson(admission.resource_effect_scopes)) throw new Error("execution_identity_conflict");
       if (!(await this.load())) {
-        if (admission.operation !== "navigation.reconcile"
-          || await this.runtime.objects.readText(`${root}/navigation-intention.json`) !== null) {
+        const navigationBeforeEffects = admission.operation === "navigation.reconcile"
+          && await this.runtime.objects.readText(`${root}/navigation-intention.json`) === null;
+        const headRecoveryBeforeEffects = admission.kind === "navigation-head-recovery"
+          && admission.operation === "project.materialize" && plan === null
+          && await this.runtime.objects.readText(`${machineDocumentRoot(this.projectId)}/navigation-sources/head-write-recovery/${admission.request_hash}/intent.json`) === null;
+        if (!navigationBeforeEffects && !headRecoveryBeforeEffects) {
           throw new Error("execution_progress_unavailable");
         }
         // The navigation admission is persisted before the engine may create
-        // its own immutable intention or perform an effect. A missing progress
-        // record is recoverable only at this exact pre-effect boundary.
+        // its own immutable intention or perform an effect. The server-only
+        // head recovery has the same boundary: no intent means no transferred
+        // fence. All other kinds/post-intent missing progress still fail closed.
         await this.immutable(`${root}/progress.json`, this.initialProgress(admission, path, existing.effect_plan_hash));
       }
       return existing.admission;

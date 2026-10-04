@@ -38,7 +38,7 @@ import { ManagedDocumentConflictError, ManagedDocumentService, type ManagedDocum
 import { ZoneNavigationEngine, zoneNavigationHeadPath, type RecoverableOrphanCheckpoint } from "../documents/zone-navigation";
 import { ZoneNavigationInventory } from "../documents/zone-navigation-inventory";
 import { ZoneNavigationSources, zoneNavigationCompactCatalogRoot, ZONE_NAVIGATION_CATALOG_SHARDS } from "../documents/zone-navigation-sources";
-import { DocumentLedgerRepository } from "../documents/repository";
+import { DocumentLedgerRepository, type HeadWriteRecoveryOptions } from "../documents/repository";
 import type { ProviderObjectMetadata, ProviderRequestScope } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError, MutationGateRepository } from "../mutation-gate/repository";
@@ -813,7 +813,7 @@ export class ProjectGuard extends DurableObject<Env> {
             await this.recoverOneKnownNavigationOrphan(state);
           }
           const scheduledHeadRecovery = scheduled
-            ? await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal)
+            ? await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal, false, slice.scope)
             : null;
           const scheduledVerificationBlocked = Boolean(scheduledHeadRecovery
             && (scheduledHeadRecovery.status === "unresolved"
@@ -897,7 +897,7 @@ export class ProjectGuard extends DurableObject<Env> {
         const checkpoint = await this.managedDocumentChanges.readCheckpoint(observedAt);
         if (!checkpoint) return response;
         const body = await response.clone().json<Record<string, unknown>>();
-        return Response.json({ ...body, document_change_checkpoint: {
+        return Response.json({ ...body, navigation_refresh_checkpoint: this.readNavigationRefreshCheckpoint(this.ctx.id.name!), document_change_checkpoint: {
           read_only: true, project_id: this.ctx.id.name, observed_at: observedAt,
           current_runtime: deploymentIdentity(this.env), ...checkpoint
         } }, { status: response.status });
@@ -1372,7 +1372,7 @@ export class ProjectGuard extends DurableObject<Env> {
         let preCoordinatorRecoveryAttempted = false;
         let scheduledVerificationBlocked = false;
         if (continuation.slice_ordinal % 2 === 1) {
-          const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal);
+          const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal, false, slice.scope);
           preCoordinatorRecoveryAttempted = recovery.status !== "none";
           headWriteRecoveryUnresolved = recovery.status === "unresolved";
           headWriteRecoveryRecovered = recovery.status === "recovered";
@@ -1381,7 +1381,7 @@ export class ProjectGuard extends DurableObject<Env> {
             && (recovery.status === "unresolved" || (recovery.status === "recovered" && recovery.remainingCandidates));
         } else if (continuation.scheduled) {
           const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime,
-            continuation.slice_ordinal, true);
+            continuation.slice_ordinal, true, slice.scope);
           scheduledVerificationBlocked = recovery.status === "unresolved";
         }
         const result = await this.createManagedDocumentChangeCoordinator(slice.runtime, slice.scope, continuation.slice_ordinal)
@@ -1403,7 +1403,7 @@ export class ProjectGuard extends DurableObject<Env> {
         let continuationResult = result;
         if (!preCoordinatorRecoveryAttempted) {
           postCoordinatorRecoveryInProgress = true;
-          const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal);
+          const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal, false, slice.scope);
           postCoordinatorRecoveryInProgress = false;
           headWriteRecoveryUnresolved = recovery.status === "unresolved";
           headWriteRecoveryRecovered = recovery.status === "recovered";
@@ -3467,9 +3467,96 @@ export class ProjectGuard extends DurableObject<Env> {
     projectId: string,
     runtime: ProjectOsPersistenceRuntime,
     sliceOrdinal: number,
-    probeOnly = false
+    probeOnly = false,
+    scope?: ProviderRequestScope
   ): Promise<{ status: "none" | "recovered" | "unresolved"; remainingCandidates: boolean }> {
-    return new DocumentLedgerRepository(runtime).recoverOneUnownedHeadWrite(projectId, sliceOrdinal, probeOnly);
+    const pendingKey = "navigation-head-recovery-pending-v1";
+    type Locator = { request_hash: string; resource_id: string };
+    type Pending = { project_id: string; request_hash: string; resource_id?: string; deferred?: Locator[]; cursor?: number };
+    const stored = await this.ctx.storage.get<Pending>(pendingKey);
+    if (projectId !== this.ctx.id.name || (stored && (stored.project_id !== projectId
+      || !/^[a-f0-9]{64}$/.test(stored.request_hash)))) throw new Error("navigation_head_recovery_pointer_invalid");
+    if (probeOnly && stored) return { status: "unresolved", remainingCandidates: true };
+    const locators: Locator[] = [];
+    if (stored) {
+      let resourceId = stored.resource_id;
+      if (!resourceId) {
+        const raw = await runtime.objects.readText(`${machineDocumentRoot(projectId)}/navigation-sources/head-write-recovery/${stored.request_hash}/intent.json`);
+        if (!raw) throw new Error("navigation_head_recovery_intent_missing");
+        resourceId = JSON.parse(raw).resource_id;
+      }
+      if (stored.deferred !== undefined && !Array.isArray(stored.deferred)) throw new Error("navigation_head_recovery_pointer_invalid");
+      locators.push({ request_hash: stored.request_hash, resource_id: resourceId! }, ...(stored.deferred ?? []));
+      if (locators.length > 32 || locators.some(item => !item || !/^[a-f0-9]{64}$/.test(item.request_hash)
+        || !/^head:DOC-[A-F0-9]{24}$/.test(item.resource_id))
+        || new Set(locators.map(item => item.request_hash)).size !== locators.length
+        || new Set(locators.map(item => item.resource_id)).size !== locators.length) throw new Error("navigation_head_recovery_pointer_invalid");
+    }
+    if (stored?.cursor !== undefined && (!Number.isSafeInteger(stored.cursor) || stored.cursor < 0)) throw new Error("navigation_head_recovery_pointer_invalid");
+    const ordinal = stored?.cursor ?? 0;
+    // Bounded locators only schedule immutable canonical intentions. Rotate
+    // unresolved work and reserve a turn for a new independent resource.
+    // A changed physical head never retargets or certifies its old intention.
+    let pendingHash = locators[ordinal % (locators.length < 32 ? locators.length + 1 : locators.length)]?.request_hash ?? null;
+    let expectedStored = stored;
+    const saveLocators = async () => {
+      const current = await this.ctx.storage.get<Pending>(pendingKey);
+      if (canonicalJson(current ?? null) !== canonicalJson(expectedStored ?? null)) throw new Error("navigation_head_recovery_pointer_conflict");
+      if (!locators.length) {
+        await this.ctx.storage.delete(pendingKey);
+        expectedStored = undefined;
+      } else {
+        expectedStored = { project_id: projectId, ...locators[0], deferred: locators.slice(1), cursor: (ordinal + 1) % 33 };
+        await this.ctx.storage.put(pendingKey, expectedStored);
+      }
+    };
+    if (locators.length) await saveLocators();
+    const options: HeadWriteRecoveryOptions = {
+      pending_recovery_hash: pendingHash,
+      excluded_resource_ids: pendingHash === null ? locators.map(item => item.resource_id) : [],
+      rememberRecovery: async (hash, resourceId) => {
+        if (!/^[a-f0-9]{64}$/.test(hash) || (pendingHash !== null && pendingHash !== hash)) {
+          throw new Error("navigation_head_recovery_pointer_conflict");
+        }
+        const existing = locators.find(item => item.request_hash === hash);
+        if (existing ? existing.resource_id !== resourceId : locators.some(item => item.resource_id === resourceId) || locators.length >= 32) {
+          throw new Error("navigation_head_recovery_pointer_conflict");
+        }
+        if (!existing) locators.push({ request_hash: hash, resource_id: resourceId });
+        await saveLocators();
+        pendingHash = hash;
+      },
+      authorize: async intent => {
+        const state = this.loadState();
+        if (!state || state.project_id !== projectId || intent.project_id !== projectId) throw new Error("project_state_unavailable");
+        const resources = intent.original_tickets.map(ticket => ({
+          resource_id: intent.resource_id, resource_type: "document", zone: ticket.zone,
+          version: intent.current_head.content_sha256
+        }));
+        const requestHash = await sha256Canonical(intent);
+        const normalized: NormalizedAdmissionOperation = { project_id: projectId, operation: "project.materialize",
+          resources, request_hash: requestHash, dependency_classification: "resource_bound", dependency_resources: resources };
+        const proof = await this.admitRules(state, normalized, undefined, scope);
+        return this.persistAdmissionProof("navigation-head-recovery", `DOCREQ-NAV-HEAD-RECOVERY-${requestHash.toUpperCase()}`, proof, runtime);
+      }
+    };
+    let result: { status: "none" | "recovered" | "unresolved"; remainingCandidates: boolean };
+    try {
+      result = await new DocumentLedgerRepository(runtime).recoverOneUnownedHeadWrite(projectId, sliceOrdinal, probeOnly, options);
+    } catch (error) {
+      // A denied/unavailable NEW recovery never clears its original fence and
+      // must not prevent the independent document coordinator from progressing.
+      // Provider/deadline failures retain their normal bounded continuation path.
+      if (error instanceof RuleAdmissionRejection) return { status: "unresolved", remainingCandidates: true };
+      throw error;
+    }
+    if (result.status === "recovered" && pendingHash !== null) {
+      const index = locators.findIndex(item => item.request_hash === pendingHash);
+      if (index < 0) throw new Error("navigation_head_recovery_pointer_conflict");
+      locators.splice(index, 1);
+      await saveLocators();
+    }
+    return locators.length ? { status: result.status === "none" ? "unresolved" : result.status, remainingCandidates: true } : result;
   }
 
   private async resumePendingNavigationRefreshes(): Promise<void> {
@@ -6386,6 +6473,40 @@ export class ProjectGuard extends DurableObject<Env> {
     return this.withNavigationWorkerDiagnostic(stored, projectId, kind, requestId);
   }
 
+  /** Bounded local discovery only: these rows prove neither admission nor
+   * finalization. A null identity means no request was prepared, not a lost receipt. */
+  private readNavigationRefreshCheckpoint(projectId: string) {
+    try {
+      if (projectId !== this.ctx.id.name) return undefined;
+      const rows = this.ctx.storage.sql.exec<{ zone: string; source_generation: number; request_json: string | null }>(
+        "SELECT zone, source_generation, request_json FROM navigation_refresh_outbox ORDER BY source_generation, zone LIMIT 4"
+      ).toArray();
+      const requests = rows.slice(0, 3).map(row => {
+        if (!["WORKING", "REVIEW", "DELIVERABLES"].includes(row.zone)
+          || !Number.isSafeInteger(row.source_generation) || row.source_generation < 0) throw new Error("navigation_discovery_binding");
+        let requestId: string | null = null;
+        if (row.request_json !== null) {
+          if (typeof row.request_json !== "string" || row.request_json.length > 32_768) throw new Error("navigation_discovery_payload");
+          const request = parseManagedDocumentRequest(JSON.parse(row.request_json));
+          if (request.operation !== "navigation.reconcile" || request.project_id !== projectId || request.zone !== row.zone) {
+            throw new Error("navigation_discovery_binding");
+          }
+          requestId = request.request_id;
+        }
+        const queued = requestId !== null && this.ctx.storage.sql.exec(
+          "SELECT request_id FROM request_recovery WHERE kind = 'document' AND request_id = ?", requestId
+        ).toArray().length === 1;
+        const failure = requestId === null ? [] : this.ctx.storage.sql.exec<{ stopped: number }>(
+          "SELECT stopped FROM request_recovery_failures WHERE kind = 'document' AND request_id = ?", requestId
+        ).toArray();
+        if (failure.length && ![0, 1].includes(failure[0].stopped)) throw new Error("navigation_discovery_failure");
+        return { zone: row.zone, source_generation: row.source_generation, request_id: requestId,
+          local_recovery_queued: queued, local_recovery_stopped: failure[0]?.stopped === 1 };
+      });
+      return { read_only: true, observation_scope: "local_only", has_more: rows.length > 3, requests };
+    } catch { return undefined; }
+  }
+
   private async readNavigationWorkerDiagnostic(projectId: string, requestId: string): Promise<{
     queued: boolean; stopped: boolean; next_attempt_at: string | null; diagnostic?: NavigationWorkerDiagnostic | null
   } | null> {
@@ -6656,7 +6777,7 @@ export class ProjectGuard extends DurableObject<Env> {
       const observedAt = new Date().toISOString();
       const checkpoint = await this.managedDocumentChanges.readCheckpoint(observedAt);
       if (!checkpoint) return response;
-      return Response.json({ ...body, document_change_checkpoint: {
+      return Response.json({ ...body, navigation_refresh_checkpoint: this.readNavigationRefreshCheckpoint(projectId), document_change_checkpoint: {
         read_only: true, scope: "project", observation_scope: "local_only",
         observed_at: observedAt, current_runtime: deploymentIdentity(this.env), ...checkpoint
       } }, { status: response.status, headers: response.headers });

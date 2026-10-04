@@ -53,10 +53,12 @@ import { packageIdFor, packageManifestPath, packageRefSchema, parsePackageManife
 import { renderPackageIndex } from "../render/package-navigation";
 import { canonicalJson } from "../rules/contract";
 import { ExecutionJournal, executionHash } from "../execution/journal";
+import type { ExecutionAdmission } from "../execution/contract";
 import type { ProjectState } from "../domain/project-state";
 import { workspaceProjectRoot } from "../persistence/layout";
 
 const MAX_AUDIT_PACKAGE_NAVIGATION_BYTES = 128_000;
+const MAX_HEAD_RECOVERY_BYTES = 128_000;
 const DROPBOX_PROVIDER_ID = "dropbox";
 const DROPBOX_CONTENT_HASH_ALGORITHM = "dropbox-content-hash";
 const headMutationLocks = new WeakMap<object, Map<string, { reservation: string | null; active: boolean }>>();
@@ -79,6 +81,43 @@ export interface ProviderFileBindingRecord {
   project_id: string;
   provider_file_id: string;
   document_id: string;
+}
+
+export interface HeadWriteRecoveryIntent {
+  schema_version: "1.0";
+  intent_type: "navigation.head-write.reconcile";
+  project_id: string;
+  resource_id: string;
+  original_tickets: ZoneNavigationHeadWriteTicket[];
+  original_outcome: "unknown";
+  current_head: {
+    path: string;
+    object_id: string;
+    revision_token: string;
+    content_sha256: string;
+    size: number;
+  };
+  version_proofs: Array<{
+    version_id: string;
+    stage: string;
+    immutable_payload_path: string;
+    record_sha256: string;
+    record_object_id: string;
+    record_revision_token: string;
+    record_size: number;
+    payload_object_id: string;
+    payload_revision_token: string;
+    payload_size: number;
+    payload_integrity_hash?: { algorithm: string; value: string };
+    content_sha256?: string;
+  }>;
+}
+
+export interface HeadWriteRecoveryOptions {
+  pending_recovery_hash: string | null;
+  excluded_resource_ids?: readonly string[];
+  authorize(intent: HeadWriteRecoveryIntent): Promise<ExecutionAdmission>;
+  rememberRecovery(hash: string, resourceId: string): Promise<void>;
 }
 
 export class DocumentLedgerRepository {
@@ -346,17 +385,324 @@ export class DocumentLedgerRepository {
     return candidate ? this.completeUnownedHeadWriteTickets(candidate) : false;
   }
 
-  async recoverOneUnownedHeadWrite(projectId: string, sliceOrdinal: number, probeOnly = false): Promise<{
+  async recoverOneUnownedHeadWrite(projectId: string, sliceOrdinal: number, probeOnly = false, options?: HeadWriteRecoveryOptions): Promise<{
     status: "none" | "recovered" | "unresolved";
     remainingCandidates: boolean;
   }> {
-    const candidates = await new ZoneNavigationSources(this.runtime).unownedHeadWriteRecoveryCandidates(projectId);
-    if (!candidates.length) return { status: "none", remainingCandidates: false };
-    const ordinal = Number.isSafeInteger(sliceOrdinal) && sliceOrdinal >= 0 ? sliceOrdinal : 0;
-    const tickets = candidates[ordinal % candidates.length];
-    if (probeOnly) return { status: "unresolved", remainingCandidates: true };
-    const recovered = await this.completeUnownedHeadWriteTickets(tickets);
-    return { status: recovered ? "recovered" : "unresolved", remainingCandidates: candidates.length > 1 };
+    const sources = new ZoneNavigationSources(this.runtime);
+    const candidates = (await sources.unownedHeadWriteRecoveryCandidates(projectId))
+      .filter(tickets => !options?.excluded_resource_ids?.includes(tickets[0].resource_id));
+    if (probeOnly) return { status: candidates.length || options?.pending_recovery_hash
+      ? "unresolved" : "none", remainingCandidates: Boolean(candidates.length || options?.pending_recovery_hash) };
+    if (!options) {
+      if (!candidates.length) return { status: "none", remainingCandidates: false };
+      const ordinal = Number.isSafeInteger(sliceOrdinal) && sliceOrdinal >= 0 ? sliceOrdinal : 0;
+      const tickets = candidates[ordinal % candidates.length];
+      if (probeOnly) return { status: "unresolved", remainingCandidates: true };
+      const recovered = await this.completeUnownedHeadWriteTickets(tickets);
+      return { status: recovered ? "recovered" : "unresolved", remainingCandidates: candidates.length > 1 };
+    }
+    let intent: HeadWriteRecoveryIntent;
+    let recoveryHash: string;
+    let observedProof: Pick<HeadWriteRecoveryIntent, "current_head" | "version_proofs"> | null = null;
+    if (options.pending_recovery_hash !== null) {
+      recoveryHash = options.pending_recovery_hash;
+      if (!/^[a-f0-9]{64}$/.test(recoveryHash)) throw new Error("navigation_head_recovery_pointer_invalid");
+      const intentPath = this.headWriteRecoveryIntentPath(projectId, recoveryHash);
+      const stored = await this.runtime.objects.readText(intentPath);
+      if (stored === null) throw new Error("navigation_head_recovery_intent_missing");
+      intent = JSON.parse(stored) as HeadWriteRecoveryIntent;
+      if (canonicalJson(intent) !== stored || intent.schema_version !== "1.0" || intent.intent_type !== "navigation.head-write.reconcile"
+        || intent.project_id !== projectId || await sha256Text(canonicalJson(intent)) !== recoveryHash
+        || !this.validHeadRecoveryIntent(intent)) throw new Error("navigation_head_recovery_intent_invalid");
+    } else {
+      if (!candidates.length) return { status: "none", remainingCandidates: false };
+      const ordinal = Number.isSafeInteger(sliceOrdinal) && sliceOrdinal >= 0 ? sliceOrdinal : 0;
+      const selected = candidates[ordinal % candidates.length];
+      if (probeOnly) return { status: "unresolved", remainingCandidates: true };
+      const identity = await this.readCurrentHeadIdentity(projectId, selected[0].resource_id);
+      if (!identity) {
+        return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+      }
+      if (identity.current_head.content_sha256 === selected[0].write_hash) {
+        const recovered = await this.completeUnownedHeadWriteTickets(selected);
+        return { status: recovered ? "recovered" : "unresolved", remainingCandidates: candidates.length > 1 };
+      }
+      const proof = await this.readCurrentHeadRecoveryProof(projectId, selected[0].resource_id);
+      if (!proof || canonicalJson(proof.current_head) !== canonicalJson(identity.current_head)) {
+        return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+      }
+      observedProof = proof;
+      intent = {
+        schema_version: "1.0", intent_type: "navigation.head-write.reconcile", project_id: projectId,
+        resource_id: selected[0].resource_id,
+        original_tickets: selected.map(ticket => ({ ...ticket })).sort((left, right) => left.zone.localeCompare(right.zone)),
+        original_outcome: "unknown", ...proof
+      };
+      recoveryHash = await sha256Text(canonicalJson(intent));
+    }
+
+    // A pending pointer can only resume the exact immutable intent and current
+    // physical head it originally bound. Never retarget an old ticket.
+    const currentProof = observedProof ?? await this.readCurrentHeadIdentity(projectId, intent.resource_id);
+    if (!currentProof || canonicalJson(currentProof.current_head) !== canonicalJson(intent.current_head)
+      || !(await this.verifyHeadRecoveryVersionMetadata(projectId, intent.resource_id, intent.version_proofs))) {
+      return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+    }
+    const requestId = `DOCREQ-NAV-HEAD-RECOVERY-${recoveryHash.toUpperCase()}`;
+    const expectedResources = intent.original_tickets.map(ticket => ({ resource_id: intent.resource_id,
+      resource_type: "document", zone: ticket.zone, version: intent.current_head.content_sha256 }));
+    const journal = new ExecutionJournal(this.runtime, projectId, "navigation-head-recovery", requestId);
+    let persisted = await journal.readAdmission();
+    let admission: ExecutionAdmission;
+    if (options.pending_recovery_hash === null) {
+      admission = await options.authorize(intent);
+      if (admission.project_id !== projectId || admission.kind !== "navigation-head-recovery"
+        || admission.operation !== "project.materialize" || admission.request_id !== requestId
+        || admission.request_hash !== recoveryHash || admission.verdict !== "allow"
+        || admission.deferred_rules.length !== 0 || canonicalJson(admission.resources) !== canonicalJson(expectedResources)) {
+        throw new Error("navigation_head_recovery_admission_invalid");
+      }
+      persisted = await journal.readAdmission();
+      if (!persisted || canonicalJson(persisted.admission) !== canonicalJson(admission)) throw new Error("navigation_head_recovery_admission_unpersisted");
+    } else {
+      if (!persisted) throw new Error("navigation_head_recovery_admission_missing");
+      admission = persisted.admission;
+    }
+    if (admission.project_id !== projectId || admission.kind !== "navigation-head-recovery"
+      || admission.operation !== "project.materialize" || admission.request_id !== requestId
+      || admission.request_hash !== recoveryHash || admission.verdict !== "allow"
+      || admission.deferred_rules.length !== 0 || canonicalJson(admission.resources) !== canonicalJson(expectedResources)) {
+      throw new Error("navigation_head_recovery_admission_invalid");
+    }
+    if (!persisted || persisted.plan !== null) throw new Error("navigation_head_recovery_plan_invalid");
+
+    const intentPath = this.headWriteRecoveryIntentPath(projectId, recoveryHash);
+    const intentJson = canonicalJson(intent);
+    try { await this.runtime.objects.createText(intentPath, intentJson); }
+    catch (error) { if (await this.runtime.objects.readText(intentPath) !== intentJson) throw error; }
+    if (options.pending_recovery_hash === null) await options.rememberRecovery(recoveryHash, intent.resource_id);
+    const ownedTickets: ZoneNavigationHeadWriteTicket[] = intent.original_tickets.map(ticket => ({
+      ...ticket, write_hash: intent.current_head.content_sha256, owner_hash: recoveryHash
+    }));
+    try {
+      // The immutable pointer may precede transfer. Transfer only while those
+      // exact unowned tickets still exist; an owned/cleared retry is verified
+      // by the strict completion helper, not by repeating the transfer work.
+      const originalStillPresent = candidates.some(candidate => canonicalJson([...candidate].sort((left, right) => left.zone.localeCompare(right.zone)))
+        === canonicalJson(intent.original_tickets));
+      if (options.pending_recovery_hash === null || originalStillPresent) {
+        await sources.transferHeadWriteRecoveryTickets(intent.original_tickets, intent.current_head.content_sha256, recoveryHash, undefined,
+          async () => {
+            const latest = await this.readCurrentHeadIdentity(projectId, intent.resource_id);
+            return latest !== null && canonicalJson(latest.current_head) === canonicalJson(intent.current_head)
+              && await this.verifyHeadRecoveryVersionMetadata(projectId, intent.resource_id, intent.version_proofs);
+          });
+      }
+      const completionPath = `${this.headWriteRecoveryIntentPath(projectId, recoveryHash).replace(/\/intent\.json$/, "")}/completion.json`;
+      const completion = { schema_version: "1.0", project_id: projectId, intent_hash: recoveryHash,
+        recovered_tickets: ownedTickets, current_head: intent.current_head, version_proofs: intent.version_proofs };
+      await sources.completeOwnedHeadWriteRecovery(ownedTickets, recoveryHash, intent.current_head.content_sha256, undefined, {
+        verifyCurrent: async () => {
+          const head = await this.runtime.objects.getMetadata(intent.current_head.path);
+          return head?.objectId === intent.current_head.object_id && head.revisionToken === intent.current_head.revision_token
+            && head.size === intent.current_head.size
+            && await this.verifyHeadRecoveryVersionMetadata(projectId, intent.resource_id, intent.version_proofs);
+        },
+        beforeClear: async () => { await this.createExactImmutable(completionPath, completion); },
+        hasCompletionWitness: async () => await this.runtime.objects.readText(completionPath) === canonicalJson(completion)
+      });
+      await this.finalizeHeadWriteRecovery(journal, intent, recoveryHash, ownedTickets);
+      return { status: "recovered", remainingCandidates: candidates.length > 1 };
+    } catch (error) {
+      if (error instanceof Error && ["navigation_source_head_superseded", "navigation_source_ticket_stale",
+        "navigation_source_ticket_future_generation", "navigation_dirty_record_changed", "navigation_dirty_generation_future",
+        "navigation_dirty_generation_stale", "navigation_catalog_rebuild_writer_fenced"].includes(error.message)) {
+        return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+      }
+      throw error;
+    }
+  }
+
+  private headWriteRecoveryIntentPath(projectId: string, hash: string): string {
+    return `${machineDocumentRoot(projectId)}/navigation-sources/head-write-recovery/${hash}/intent.json`;
+  }
+
+  private validHeadRecoveryIntent(value: HeadWriteRecoveryIntent): boolean {
+    return Boolean(value && value.schema_version === "1.0" && value.intent_type === "navigation.head-write.reconcile"
+      && typeof value.project_id === "string" && /^head:DOC-[A-F0-9]{24}$/.test(value.resource_id)
+      && value.original_outcome === "unknown" && Array.isArray(value.original_tickets) && value.original_tickets.length > 0
+      && value.original_tickets.every(ticket => ticket.project_id === value.project_id && ticket.resource_id === value.resource_id
+        && ticket.owner_hash === undefined && ticket.write_hash !== null && /^[a-f0-9]{64}$/.test(ticket.write_hash ?? "")
+        && Number.isSafeInteger(ticket.generation) && ticket.generation > 0 && ["WORKING", "REVIEW", "DELIVERABLES"].includes(ticket.zone))
+      && value.current_head?.path === machineDocumentHeadPath(value.project_id, value.resource_id.slice("head:".length))
+      && typeof value.current_head.object_id === "string" && value.current_head.object_id.length > 0
+      && typeof value.current_head.revision_token === "string" && value.current_head.revision_token.length > 0
+      && /^[a-f0-9]{64}$/.test(value.current_head.content_sha256) && Number.isSafeInteger(value.current_head.size)
+      && Array.isArray(value.version_proofs) && value.version_proofs.length > 0 && value.version_proofs.length <= 4
+      && value.version_proofs.every(proof => typeof proof.version_id === "string" && typeof proof.stage === "string"
+        && typeof proof.immutable_payload_path === "string" && /^[a-f0-9]{64}$/.test(proof.record_sha256)
+        && typeof proof.record_object_id === "string" && typeof proof.record_revision_token === "string"
+        && Number.isSafeInteger(proof.record_size) && typeof proof.payload_object_id === "string"
+        && typeof proof.payload_revision_token === "string" && Number.isSafeInteger(proof.payload_size)));
+  }
+
+  private async finalizeHeadWriteRecovery(journal: ExecutionJournal, intent: HeadWriteRecoveryIntent, hash: string,
+    tickets: readonly ZoneNavigationHeadWriteTicket[]): Promise<void> {
+    // The caller has just completed (or replay-verified) the fence transition.
+    // Do not repeat its provider work before writing the receipt.
+    const root = `${machineDocumentRoot(intent.project_id)}/navigation-sources/head-write-recovery/${hash}`;
+    const completion = { schema_version: "1.0", project_id: intent.project_id, intent_hash: hash,
+      recovered_tickets: tickets, current_head: intent.current_head, version_proofs: intent.version_proofs };
+    if (await this.runtime.objects.readText(`${root}/completion.json`) !== canonicalJson(completion)) {
+      throw new Error("navigation_head_recovery_completion_missing");
+    }
+    const receiptPath = `${root}/receipt.json`;
+    const receipt = { schema_version: "1.0", project_id: intent.project_id,
+      request_id: `DOCREQ-NAV-HEAD-RECOVERY-${hash.toUpperCase()}`, request_hash: hash, intent_hash: hash,
+      status: "committed", original_outcome: "unknown", disposition: "current_head_revalidated", resource_id: intent.resource_id,
+      completion_ref: `${root}/completion.json`, original_tickets: intent.original_tickets, current_head: intent.current_head,
+      version_proofs: intent.version_proofs, recovered_tickets: tickets };
+    await this.createExactImmutable(receiptPath, receipt);
+    const saved = await journal.load();
+    if (!saved) throw new Error("navigation_head_recovery_progress_missing");
+    const receiptHash = await sha256Text(canonicalJson(receipt));
+    const admissionRef = `${await journal.root()}/admission.json`;
+    const certificate = { schema_version: "1.0", project_id: intent.project_id,
+      request_id: saved.progress.request_id, kind: saved.progress.kind, request_hash: hash,
+      admission_ref: admissionRef, receipt_ref: receiptPath, receipt_sha256: receiptHash,
+      intent_ref: `${root}/intent.json`, intent_sha256: hash, completion_ref: `${root}/completion.json`,
+      source_generations: [...new Set(tickets.map(ticket => ticket.generation))].sort((a, b) => a - b),
+      current_head: intent.current_head, original_tickets: intent.original_tickets, recovered_tickets: tickets,
+      postconditions: ["exact_current_head_revalidated", "source_dirty_generation_durable", "recovery_fence_absent"] };
+    const certificatePath = `${root}/certificate-${await executionHash(certificate)}.json`;
+    if (saved.progress.status === "finalized" && saved.progress.terminal) {
+      const ref = saved.progress.finalization_ref;
+      if (saved.progress.receipt_ref !== receiptPath || ref !== certificatePath) throw new Error("navigation_head_recovery_finalization_invalid");
+      const raw = await this.runtime.objects.readText(ref);
+      if (raw !== canonicalJson(certificate)) throw new Error("navigation_head_recovery_finalization_invalid");
+      return;
+    }
+    if (saved.progress.status !== "admitted" && saved.progress.status !== "finalizing") throw new Error("navigation_head_recovery_progress_terminal");
+    if (saved.progress.receipt_ref !== receiptPath) await journal.recordReceipt("committed", receiptPath);
+    const afterReceipt = await journal.load();
+    if (!afterReceipt) throw new Error("navigation_head_recovery_progress_missing");
+    await this.createExactImmutable(certificatePath, certificate);
+    afterReceipt.progress.status = "finalized";
+    afterReceipt.progress.terminal = true;
+    afterReceipt.progress.code = null;
+    afterReceipt.progress.receipt_ref = receiptPath;
+    afterReceipt.progress.finalization_ref = certificatePath;
+    afterReceipt.progress.next_attempt_at = null;
+    afterReceipt.progress.lease = null;
+    afterReceipt.progress.sequence += 1;
+    await journal.save(afterReceipt.progress, afterReceipt.token);
+    const final = await journal.status();
+    if (final?.status !== "finalized" || !final.terminal || final.finalization_ref !== certificatePath) {
+      throw new Error("navigation_head_recovery_finalization_unverified");
+    }
+  }
+
+  private async createExactImmutable(path: string, value: unknown): Promise<void> {
+    const content = canonicalJson(value);
+    try { await this.runtime.objects.createText(path, content); }
+    catch (error) { if (await this.runtime.objects.readText(path) !== content) throw error; }
+    if (await this.runtime.objects.readText(path) !== content) throw new Error("navigation_head_recovery_immutable_unverified");
+  }
+
+  private async readCurrentHeadRecoveryProof(projectId: string, resourceId: string): Promise<Pick<HeadWriteRecoveryIntent, "current_head" | "version_proofs"> | null> {
+    const documentId = resourceId.startsWith("head:") ? resourceId.slice("head:".length) : "";
+    if (!/^DOC-[A-F0-9]{24}$/.test(documentId) || !this.runtime.objects.readBytes) return null;
+    const path = machineDocumentHeadPath(projectId, documentId);
+    const before = await this.runtime.objects.getMetadata(path);
+    if (!before?.objectId || !before.revisionToken || !Number.isSafeInteger(before.size) || before.size <= 0 || before.size > MAX_HEAD_RECOVERY_BYTES) return null;
+    const bytes = await this.runtime.objects.readBytes(path, MAX_HEAD_RECOVERY_BYTES);
+    const after = await this.runtime.objects.getMetadata(path);
+    if (!bytes || bytes.byteLength !== before.size || after?.objectId !== before.objectId
+      || after.revisionToken !== before.revisionToken || after.size !== before.size) return null;
+    const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const parsed = readManagedDocumentHead(JSON.parse(raw)).head;
+    if (parsed.project_id !== projectId || parsed.document_id !== documentId || parsed.reconciliation_status !== "clean") return null;
+    const versionProofs: HeadWriteRecoveryIntent["version_proofs"] = [];
+    const pointerFields: Array<keyof ManagedDocumentHead> = ["reference_version_id", "working_version_id", "review_version_id", "published_version_id"];
+    for (const field of pointerFields) {
+      const versionId = parsed[field];
+      if (typeof versionId !== "string") continue;
+      const versionPath = machineDocumentVersionPath(projectId, documentId, versionId);
+      const versionMetadataBefore = await this.runtime.objects.getMetadata(versionPath);
+      if (!versionMetadataBefore?.objectId || !versionMetadataBefore.revisionToken || !Number.isSafeInteger(versionMetadataBefore.size)
+        || versionMetadataBefore.size <= 0 || versionMetadataBefore.size > MAX_HEAD_RECOVERY_BYTES || !this.runtime.objects.readBytes) return null;
+      const versionBytes = await this.runtime.objects.readBytes(versionPath, MAX_HEAD_RECOVERY_BYTES);
+      const versionMetadataAfter = await this.runtime.objects.getMetadata(versionPath);
+      if (!versionBytes || versionBytes.byteLength !== versionMetadataBefore.size
+        || versionMetadataBefore.objectId !== versionMetadataAfter?.objectId
+        || versionMetadataBefore.revisionToken !== versionMetadataAfter.revisionToken
+        || versionMetadataBefore.size !== versionMetadataAfter.size) return null;
+      const versionRaw = new TextDecoder("utf-8", { fatal: true }).decode(versionBytes);
+      const version = readDocumentVersionRecord(JSON.parse(versionRaw)).record;
+      if (version.project_id !== projectId || version.document_id !== documentId || version.version_id !== versionId
+        || version.kind !== parsed.kind || !pointerAcceptsStage(field, version.stage)) return null;
+      const payloadBefore = await this.runtime.objects.getMetadata(version.immutable_payload_path);
+      if (!payloadBefore?.objectId || !payloadBefore.revisionToken) return null;
+      let payloadIntegrityHash: { algorithm: string; value: string } | undefined;
+      if (version.content_sha256) {
+        if (!this.runtime.objects.readBytes || payloadBefore.size > 1_000_000) return null;
+        const payload = await this.runtime.objects.readBytes(version.immutable_payload_path, 1_000_001);
+        const payloadAfter = await this.runtime.objects.getMetadata(version.immutable_payload_path);
+        if (!payload || payload.byteLength !== payloadBefore.size || payloadAfter?.objectId !== payloadBefore.objectId
+          || payloadAfter.revisionToken !== payloadBefore.revisionToken || await sha256Bytes(payload) !== version.content_sha256) return null;
+      } else {
+        const evidence = version.provider_evidence;
+        if (!evidence || payloadBefore.size !== evidence.size || payloadBefore.integrityHash?.algorithm !== evidence.integrity_hash.algorithm
+          || payloadBefore.integrityHash.value !== evidence.integrity_hash.value) return null;
+        const payloadAfter = await this.runtime.objects.getMetadata(version.immutable_payload_path);
+        if (payloadAfter?.objectId !== payloadBefore.objectId || payloadAfter.revisionToken !== payloadBefore.revisionToken) return null;
+        payloadIntegrityHash = { ...evidence.integrity_hash };
+      }
+      versionProofs.push({ version_id: versionId, stage: version.stage, immutable_payload_path: version.immutable_payload_path,
+        record_sha256: await sha256Text(versionRaw), record_object_id: versionMetadataBefore.objectId,
+        record_revision_token: versionMetadataBefore.revisionToken, record_size: versionMetadataBefore.size,
+        payload_object_id: payloadBefore.objectId, payload_revision_token: payloadBefore.revisionToken,
+        payload_size: payloadBefore.size, ...(payloadIntegrityHash ? { payload_integrity_hash: payloadIntegrityHash } : {}),
+        ...(version.content_sha256 ? { content_sha256: version.content_sha256 } : {}) });
+    }
+    if (versionProofs.length === 0) return null;
+    return { current_head: { path, object_id: before.objectId, revision_token: before.revisionToken,
+      content_sha256: await sha256Bytes(bytes), size: bytes.byteLength }, version_proofs: versionProofs };
+  }
+
+  private async readCurrentHeadIdentity(projectId: string, resourceId: string): Promise<Pick<HeadWriteRecoveryIntent, "current_head"> | null> {
+    const documentId = resourceId.startsWith("head:") ? resourceId.slice("head:".length) : "";
+    if (!/^DOC-[A-F0-9]{24}$/.test(documentId) || !this.runtime.objects.readBytes) return null;
+    const path = machineDocumentHeadPath(projectId, documentId);
+    const before = await this.runtime.objects.getMetadata(path);
+    if (!before?.objectId || !before.revisionToken || !Number.isSafeInteger(before.size)
+      || before.size <= 0 || before.size > MAX_HEAD_RECOVERY_BYTES) return null;
+    const bytes = await this.runtime.objects.readBytes(path, MAX_HEAD_RECOVERY_BYTES);
+    const after = await this.runtime.objects.getMetadata(path);
+    if (!bytes || bytes.byteLength !== before.size || after?.objectId !== before.objectId
+      || after.revisionToken !== before.revisionToken || after.size !== before.size) return null;
+    const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const head = readManagedDocumentHead(JSON.parse(raw)).head;
+    if (head.project_id !== projectId || head.document_id !== documentId || head.reconciliation_status !== "clean") return null;
+    return { current_head: { path, object_id: before.objectId, revision_token: before.revisionToken,
+      content_sha256: await sha256Bytes(bytes), size: bytes.byteLength } };
+  }
+
+  private async verifyHeadRecoveryVersionMetadata(projectId: string, resourceId: string,
+    proofs: HeadWriteRecoveryIntent["version_proofs"]): Promise<boolean> {
+    if (!Array.isArray(proofs) || proofs.length === 0 || proofs.length > 4) return false;
+    const documentId = resourceId.slice("head:".length);
+    for (const proof of proofs) {
+      const recordMetadata = await this.runtime.objects.getMetadata(machineDocumentVersionPath(projectId, documentId, proof.version_id));
+      const payloadMetadata = await this.runtime.objects.getMetadata(proof.immutable_payload_path);
+      if (recordMetadata?.objectId !== proof.record_object_id || recordMetadata.revisionToken !== proof.record_revision_token
+        || recordMetadata.size !== proof.record_size || payloadMetadata?.objectId !== proof.payload_object_id
+        || payloadMetadata.revisionToken !== proof.payload_revision_token || payloadMetadata.size !== proof.payload_size) return false;
+      if (proof.payload_integrity_hash && (payloadMetadata.integrityHash?.algorithm !== proof.payload_integrity_hash.algorithm
+        || payloadMetadata.integrityHash.value !== proof.payload_integrity_hash.value)) return false;
+    }
+    return true;
   }
 
   async readVersion(projectId: string, documentId: string, versionId: string): Promise<CurrentDocumentVersionRecord | null> {

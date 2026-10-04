@@ -812,6 +812,9 @@ export class ManagedDocumentChangeJobStore {
     const schedule = this.scheduledControl();
     for (const timestamp of Object.values(schedule)) if (timestamp !== null) dateMs(String(timestamp));
     const cursor = this.cursor();
+    const eligibility = this.eligibilityCounts(nowMs);
+    const continuation = this.continuation();
+    const safeLastOutcome = sanitizeContinuationOutcome(continuation.last_outcome);
     const counts = {
       pending_jobs: this.pendingCount(),
       pending_jobs_with_error: this.storage.sql.exec<CountRow>(
@@ -833,6 +836,16 @@ export class ManagedDocumentChangeJobStore {
     return {
       schedule: { ...schedule, due: nextMs === null || nowMs >= nextMs, overdue_by_ms: nextMs === null ? 0 : Math.max(0, nowMs - nextMs) },
       cursor: { present: cursor !== null, sha256: cursor === null ? null : await sha256Text(cursor) },
+      eligibility,
+      continuation: {
+        slice_ordinal: continuation.slice_ordinal,
+        pending: continuation.pending,
+        scheduled: continuation.scheduled,
+        next_wake_at: continuation.next_wake_at,
+        documents_priority_next: continuation.documents_priority_next,
+        feed_retry_at: continuation.feed_retry_at,
+        ...(safeLastOutcome === undefined ? {} : { last_outcome: safeLastOutcome })
+      },
       counts,
       recent_quarantines: await Promise.all(quarantines.map(async row => ({
         job_id: assertJobId(row.job_id), path_sha256: await sha256Text(row.path), code: diagnosticCode(row.code),
@@ -1052,4 +1065,34 @@ function diagnosticAttempts(value: unknown): number {
     throw new Error("Invalid document checkpoint attempts");
   }
   return value;
+}
+
+const continuationCountFields = new Set([
+  "semantic_progress", "jobs_registered", "jobs_completed", "jobs_pending", "job_failures",
+  "jobs_quarantined", "drift_findings", "expected_changes", "executable_jobs",
+  "future_eligible_jobs", "stopped_unresolved_jobs"
+]);
+const continuationTimestampFields = new Set(["earliest_eligible_at", "feed_retry_at"]);
+const continuationBooleanFields = new Set(["budget_yield", "unread_feed", "verification_completed", "global_notification_owed"]);
+
+function sanitizeContinuationOutcome(value: Record<string, unknown> | null): Record<string, unknown> | null | undefined {
+  if (value === null) return null;
+  const safe: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (continuationCountFields.has(key)) safe[key] = safeCount(entry);
+    else if (continuationTimestampFields.has(key)) safe[key] = entry === null ? null : safeEpoch(entry);
+    else if (continuationBooleanFields.has(key)) {
+      if (typeof entry !== "boolean") throw new Error("Invalid managed document continuation outcome");
+      safe[key] = entry;
+    } else if (key === "safe_errors") {
+      if (!Array.isArray(entry) || entry.length > 8
+        || entry.some(code => typeof code !== "string" || !/^[a-z_]{1,64}$/.test(code))) {
+        throw new Error("Invalid managed document continuation outcome");
+      }
+      safe[key] = [...entry];
+    }
+  }
+  // Preserve an actually empty legacy object, but do not turn a non-empty
+  // unknown-only object into a fabricated empty or successful outcome.
+  return Object.keys(safe).length > 0 || Object.keys(value).length === 0 ? safe : undefined;
 }

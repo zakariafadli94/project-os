@@ -3,6 +3,13 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import type { Receipt } from "../src/domain/receipt";
+import type { ProjectState } from "../src/domain/project-state";
+import type { ProjectOsPersistenceRuntime } from "../src/persistence/provider/capabilities";
+import type { ProviderRequestScope } from "../src/persistence/provider/contract";
+import { machineDocumentHeadPath, machineDocumentRoot } from "../src/persistence/layout";
+import { ManagedDocumentService } from "../src/documents/service";
+import { DocumentLedgerRepository } from "../src/documents/repository";
+import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
 import {
   initializeManagedDocumentChangeJobSchema,
   ManagedDocumentChangeJobStore,
@@ -229,6 +236,77 @@ describe("durable managed-document change jobs", () => {
     expect(summary).toMatchObject({ jobs_completed: 1, jobs_pending: 0, unread_feed: true, feed_retry_at: now + 60_000, verification_completed: false });
   });
 
+  it("does not certify a scheduled scan while a pre-existing head-write ticket is unresolved", async () => {
+    const mock = installDropboxMock();
+    const slug = "scheduled-head-debt-verification";
+    const created = await createProject("TXN-CHANGEJOB-HEAD-DEBT-VERIFY-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const sha256Raw = async (value: string) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))]
+      .map(byte => byte.toString(16).padStart(2, "0")).join("");
+    const prepared = await runInDurableObject(guard, async instance => {
+      const target = instance as unknown as {
+        persistence: ProjectOsPersistenceRuntime;
+        loadOrRecoverState(): Promise<ProjectState>;
+        managedDocumentService: ManagedDocumentService;
+      };
+      const state = await target.loadOrRecoverState();
+      const document = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-HEAD-DEBT-VERIFY-0001",
+        project_id: created.project_id, logical_path: "verification/debt.md", content: "verified prior head",
+        content_sha256: await sha256Raw("verified prior head"), created_at: at }, state);
+      const sources = new ZoneNavigationSources(target.persistence);
+      expect(await sources.markCatalogReady(created.project_id, "WORKING", 0)).toBe(true);
+      const adoptionId = "DOCREQ-NAV-HEAD-DEBT-VERIFY-ADOPT-0001";
+      expect(await sources.beginAdoption(created.project_id, "WORKING", adoptionId, 0)).toBe(true);
+      expect(await sources.finishAdoption(created.project_id, "WORKING", adoptionId, 0)).toBe(true);
+      const headPath = machineDocumentHeadPath(created.project_id, document.document_id);
+      const headRaw = mock.files.get(headPath);
+      if (headRaw === undefined) throw new Error("scheduled verification fixture head missing");
+      const writeHash = await sha256Raw(headRaw);
+      const ticket = await sources.beginHeadWrite(created.project_id, "WORKING", `head:${document.document_id}`, undefined, writeHash);
+      if (!ticket) throw new Error("scheduled verification fixture ticket missing");
+      mock.files.set(headPath, `${headRaw} `);
+      return { documentId: document.document_id, headPath };
+    });
+    await runInDurableObject(guard, instance => {
+      const target = instance as unknown as {
+        createManagedDocumentChangeCoordinator: (runtime: ProjectOsPersistenceRuntime, scope: ProviderRequestScope,
+          sliceOrdinal: number) => ManagedDocumentChangeCoordinator;
+      };
+      const originalCreateCoordinator = target.createManagedDocumentChangeCoordinator.bind(instance);
+      vi.spyOn(target, "createManagedDocumentChangeCoordinator").mockImplementation((runtime, scope, sliceOrdinal) => {
+        runtime.changeFeed.listChanges = async () => ({ entries: [], cursor: "head-debt-empty-page", has_more: false });
+        return originalCreateCoordinator(runtime, scope, sliceOrdinal);
+      });
+    });
+
+    const response = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
+    expect(response.status).toBe(200);
+    const summary = await response.json<Record<string, unknown>>();
+    expect(summary).toMatchObject({ scheduled: true, scheduled_due: true, jobs_pending: 0, jobs_completed: 0,
+      unread_feed: false, safe_errors: ["navigation_head_write_recovery_unresolved"], verification_completed: false });
+    const durable = await runInDurableObject(guard, async (instance, durableState) => ({
+      verification: new ManagedDocumentChangeJobStore(durableState.storage).scheduledVerification(new Date().toISOString()),
+      jobCount: durableState.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM managed_document_change_jobs").one().count,
+      ticket: await new ZoneNavigationSources((instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence)
+        .readState(created.project_id, "WORKING")
+    }));
+    expect(durable.jobCount).toBe(0);
+    expect(durable.verification).toMatchObject({ last_verified_at: null, next_verification_at: null });
+    expect(durable.ticket.in_flight_resource_ids).toContain(`head:${prepared.documentId}`);
+    expect(mock.files.get(prepared.headPath)).toBeTruthy();
+
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const afterAlarm = await runInDurableObject(guard, async (instance, durableState) => ({
+      verification: new ManagedDocumentChangeJobStore(durableState.storage).scheduledVerification(new Date().toISOString()),
+      outcome: new ManagedDocumentChangeJobStore(durableState.storage).continuation().last_outcome,
+      source: await new ZoneNavigationSources((instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence)
+        .readState(created.project_id, "WORKING")
+    }));
+    expect(afterAlarm.verification).toMatchObject({ last_verified_at: null, next_verification_at: null });
+    expect(afterAlarm.outcome?.verification_completed).toBe(false);
+    expect(afterAlarm.source.in_flight_resource_ids).toContain(`head:${prepared.documentId}`);
+  });
+
   it("keeps an empty has-more page open without claiming semantic progress", async () => {
     installDropboxMock();
     const created = await createProject("TXN-CHANGEJOB-EMPTY-HAS-MORE-0001", "empty-has-more");
@@ -279,6 +357,233 @@ describe("durable managed-document change jobs", () => {
     expect(await acknowledgement.json<Record<string, unknown>>()).toMatchObject({ requested_generation: 1 });
   }, 15_000);
 
+  it("recovers a stranded matching head flight in the local continuation without a new provider event", async () => {
+    resetAfterRetryFaultFixture = true;
+    const faults: DropboxMockFault[] = [];
+    const mock = installDropboxMock({ faults });
+    const slug = "head-flight-local-recovery";
+    const created = await createProject("TXN-CHANGEJOB-HEAD-FLIGHT-RECOVERY-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
+    const visiblePath = `${root}/WORKING/recovery/flight.md`;
+
+    const prepared = await runInDurableObject(guard, async instance => {
+      const target = instance as unknown as {
+        persistence: ProjectOsPersistenceRuntime;
+        loadOrRecoverState(): Promise<ProjectState>;
+        managedDocumentService: ManagedDocumentService;
+      };
+      const state = await target.loadOrRecoverState();
+      const working = await target.managedDocumentService.writeWorking({
+        request_id: "DOCREQ-WORKING-HEAD-FLIGHT-BASE-0001",
+        project_id: created.project_id,
+        logical_path: "recovery/flight.md",
+        content: "original working bytes",
+        content_sha256: [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("original working bytes")))]
+          .map(byte => byte.toString(16).padStart(2, "0")).join(""),
+        created_at: at
+      }, state);
+      const sources = new ZoneNavigationSources(target.persistence);
+      expect(await sources.markCatalogReady(created.project_id, "WORKING", 0)).toBe(true);
+      const adoptionId = "DOCREQ-NAV-WORKING-HEAD-FLIGHT-ADOPT-0001";
+      expect(await sources.beginAdoption(created.project_id, "WORKING", adoptionId, 0)).toBe(true);
+      expect(await sources.finishAdoption(created.project_id, "WORKING", adoptionId, 0)).toBe(true);
+      return { documentId: working.document_id };
+    });
+
+    const baseline = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(baseline.status).toBe(200);
+    const headPath = machineDocumentHeadPath(created.project_id, prepared.documentId);
+    const headUploadsBefore = mock.uploadCalls.filter(path => path === headPath).length;
+    const baselineHead = await runInDurableObject(guard, async instance =>
+      new DocumentLedgerRepository((instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence)
+        .readHead(created.project_id, prepared.documentId));
+    await mock.writeExternal(visiblePath, "external bytes after source adoption");
+    const originalFetch = mock.spy.getMockImplementation();
+    expect(originalFetch).toBeDefined();
+    let postUploadFaultArmed = false;
+    mock.spy.mockImplementation(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      const url = new URL(request.url);
+      const apiArg = request.headers.get("Dropbox-API-Arg");
+      let uploadPath: string | undefined;
+      if (url.hostname === "content.dropboxapi.com" && url.pathname === "/2/files/upload" && apiArg) {
+        try { uploadPath = (JSON.parse(apiArg) as { path?: unknown }).path as string | undefined; } catch { /* delegate malformed test input */ }
+      }
+      const response = await originalFetch!(input, init);
+      if (!postUploadFaultArmed && uploadPath === headPath && response.ok
+        && mock.uploadCalls.filter(path => path === headPath).length === headUploadsBefore + 1) {
+        postUploadFaultArmed = true;
+        faults.push({ endpoint: "/2/files/download", method: "POST", occurrence: 1, status: 409,
+          error_summary: "path/conflict/file/...", path: headPath });
+      }
+      return response;
+    });
+
+    let interrupted: Response;
+    try {
+      interrupted = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    } finally {
+      mock.spy.mockImplementation(originalFetch!);
+    }
+    expect(interrupted.status).toBe(200);
+    expect(postUploadFaultArmed).toBe(true);
+    const interruptedSummary = await interrupted.json<Record<string, unknown>>();
+    expect(interruptedSummary).toMatchObject({ jobs_pending: 1, job_failures: 1 });
+    expect(interruptedSummary.jobs_completed).toBeGreaterThan(0);
+
+    const stranded = await runInDurableObject(guard, async (instance, durableState) => {
+      const store = new ManagedDocumentChangeJobStore(durableState.storage);
+      const job = store.pending().find(item => item.change.path === visiblePath);
+      expect(job).toBeDefined();
+      durableState.storage.sql.exec(
+        "UPDATE managed_document_change_job_failure_state SET next_attempt_at = ? WHERE job_id = ?",
+        Number.MAX_SAFE_INTEGER, job!.job_id
+      );
+      const continuation = store.continuation();
+      store.finishContinuationSlice({ pending: true, next_wake_at: Date.now(), documents_priority_next: true,
+        feed_retry_at: continuation.feed_retry_at, outcome: continuation.last_outcome ?? {} });
+      const runtime = (instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence;
+      const source = await new ZoneNavigationSources(runtime).readState(created.project_id, "WORKING");
+      const head = await new DocumentLedgerRepository(runtime)
+        .readHead(created.project_id, prepared.documentId);
+      const persistedHead = mock.files.get(headPath);
+      const rawSourceState = mock.files.get(`${machineDocumentRoot(created.project_id)}/navigation-sources/state.json`);
+      if (!persistedHead || !rawSourceState) throw new Error("post-upload recovery precondition missing persisted proof bytes");
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(persistedHead));
+      const writeHash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+      const sourceState = JSON.parse(rawSourceState) as { zones?: { WORKING?: { in_flight_writes?: Array<{
+        resource_id: string; generation: number; write_hash?: string | null;
+      }> } } };
+      const ticket = sourceState.zones?.WORKING?.in_flight_writes?.find(item => item.resource_id === `head:${prepared.documentId}`);
+      return { cursor: store.cursor(), targetJobId: job!.job_id, targetAttempts: job!.attempts,
+        eligible: store.eligibilityCounts(Date.now()).executable,
+        generation: source.generation, flights: source.in_flight_resource_ids, headVersion: head?.working_version_id,
+        persistedHead, writeHash, ticket, uploadCount: mock.uploadCalls.filter(path => path === headPath).length };
+    });
+    expect(stranded.eligible).toBe(0);
+    expect(stranded.uploadCount).toBe(headUploadsBefore + 1);
+    expect(stranded.headVersion).toBeTruthy();
+    expect(stranded.headVersion).not.toBe(baselineHead?.working_version_id);
+    expect(stranded.ticket).toMatchObject({ resource_id: `head:${prepared.documentId}`, write_hash: stranded.writeHash });
+    expect(stranded.flights).toContain(`head:${prepared.documentId}`);
+
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+
+    const afterAlarm = await runInDurableObject(guard, async (instance, durableState) => {
+      const sources = new ZoneNavigationSources((instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence);
+      const source = await sources.readState(created.project_id, "WORKING");
+      const dirty = await sources.listDirtyPage(created.project_id, "WORKING", null, 8);
+      const ledger = new DocumentLedgerRepository((instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence);
+      const head = await ledger.readHead(created.project_id, prepared.documentId);
+      const store = new ManagedDocumentChangeJobStore(durableState.storage);
+      const targetJob = store.pending().find(item => item.job_id === stranded.targetJobId);
+      return { targetJob: targetJob ? { job_id: targetJob.job_id, attempts: targetJob.attempts,
+        eligible: store.eligibilityCounts(Date.now()).executable } : null, generation: source.generation,
+        flights: source.in_flight_resource_ids, dirty: dirty.resource_ids, headVersion: head?.working_version_id,
+        outbox: durableState.storage.sql.exec<{ [key: string]: string | number | null; zone: string; source_generation: number }>(
+          "SELECT zone, source_generation FROM navigation_refresh_outbox WHERE zone = ? ORDER BY source_generation", "WORKING"
+        ).toArray(),
+        versionPaths: [...mock.files.keys()].filter(path => path.startsWith(`${machineDocumentRoot(created.project_id)}/versions/${prepared.documentId}/`)).sort() };
+    });
+    expect(afterAlarm.targetJob).toEqual({ job_id: stranded.targetJobId, attempts: stranded.targetAttempts, eligible: 0 });
+    expect(mock.files.get(visiblePath)).toBe("external bytes after source adoption");
+    expect(afterAlarm.generation).toBe(stranded.generation);
+    expect(afterAlarm.flights).toEqual([]);
+    expect(afterAlarm.dirty).toEqual([`head:${prepared.documentId}`]);
+    expect(afterAlarm.headVersion).toBe(stranded.headVersion);
+    expect(afterAlarm.versionPaths.length).toBeGreaterThanOrEqual(2);
+    expect(afterAlarm.versionPaths).toHaveLength(2);
+    expect(mock.uploadCalls.filter(path => path === headPath)).toHaveLength(headUploadsBefore + 1);
+    expect(afterAlarm.outbox).toContainEqual({ zone: "WORKING", source_generation: afterAlarm.generation });
+  });
+
+  it("leaves a mismatched scheduled head debt visible and reaches its valid sibling on the next scheduled slice", async () => {
+    const mock = installDropboxMock();
+    const slug = "scheduled-head-flight-siblings";
+    const created = await createProject("TXN-CHANGEJOB-HEAD-FLIGHT-SIBLINGS-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const seeded = await runInDurableObject(guard, async instance => {
+      const target = instance as unknown as {
+        persistence: ProjectOsPersistenceRuntime;
+        loadOrRecoverState(): Promise<ProjectState>;
+        managedDocumentService: ManagedDocumentService;
+      };
+      const state = await target.loadOrRecoverState();
+      const write = async (requestId: string, logicalPath: string, content: string) => {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
+        return target.managedDocumentService.writeWorking({ request_id: requestId, project_id: created.project_id,
+          logical_path: logicalPath, content,
+          content_sha256: [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join(""), created_at: at }, state);
+      };
+      const mismatch = await write("DOCREQ-WORKING-HEAD-SIBLING-MISMATCH-0001", "recovery/mismatch.md", "mismatch");
+      const valid = await write("DOCREQ-WORKING-HEAD-SIBLING-VALID-0001", "recovery/valid.md", "valid");
+      const sources = new ZoneNavigationSources(target.persistence);
+      expect(await sources.markCatalogReady(created.project_id, "WORKING", 0)).toBe(true);
+      const adoptionId = "DOCREQ-NAV-WORKING-HEAD-SIBLING-ADOPT-0001";
+      expect(await sources.beginAdoption(created.project_id, "WORKING", adoptionId, 0)).toBe(true);
+      expect(await sources.finishAdoption(created.project_id, "WORKING", adoptionId, 0)).toBe(true);
+      return { mismatchId: mismatch.document_id, validId: valid.document_id };
+    });
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+    const before = await runInDurableObject(guard, async (instance, durableState) => {
+      const runtime = (instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence;
+      const sources = new ZoneNavigationSources(runtime);
+      const hash = async (documentId: string) => {
+        const path = machineDocumentHeadPath(created.project_id, documentId);
+        const raw = await runtime.objects.readText(path);
+        if (raw === null) throw new Error("scheduled sibling head missing");
+        return { path, raw, digest: [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw)))]
+          .map(byte => byte.toString(16).padStart(2, "0")).join("") };
+      };
+      const mismatchHead = await hash(seeded.mismatchId);
+      const validHead = await hash(seeded.validId);
+      expect(await sources.beginHeadWrite(created.project_id, "WORKING", `head:${seeded.mismatchId}`, undefined, mismatchHead.digest)).toBeTruthy();
+      expect(await sources.beginHeadWrite(created.project_id, "WORKING", `head:${seeded.validId}`, undefined, validHead.digest)).toBeTruthy();
+      // The canonical bytes change without a provider change-feed event: this is the exact refusal case.
+      mock.files.set(mismatchHead.path, `${mismatchHead.raw} `);
+      const candidates = await sources.unownedHeadWriteRecoveryCandidates(created.project_id);
+      const mismatchIndex = candidates.findIndex(group => group[0]?.resource_id === `head:${seeded.mismatchId}`);
+      if (mismatchIndex < 0 || !candidates.some(group => group[0]?.resource_id === `head:${seeded.validId}`)) {
+        throw new Error("scheduled sibling recovery candidates missing");
+      }
+      const ordinalBeforeMismatch = (mismatchIndex + candidates.length - 1) % candidates.length;
+      durableState.storage.sql.exec("UPDATE managed_document_change_continuation SET slice_ordinal = ? WHERE singleton = 1", ordinalBeforeMismatch);
+      return { mismatchIndex, ordinalBeforeMismatch };
+    });
+    const route = "https://project-guard.internal/reconcile-documents?scheduled=1";
+    const first = await guard.fetch(route, { method: "POST" });
+    expect(first.status).toBe(200);
+    const firstBody = await first.json<Record<string, unknown>>();
+    expect(firstBody.safe_errors).toContain("navigation_head_write_recovery_unresolved");
+    expect(firstBody.jobs_pending).toBeGreaterThan(0);
+    expect(firstBody.next_local_wake_at).toEqual(expect.any(Number));
+    const afterMismatch = await runInDurableObject(guard, async instance => {
+      const runtime = (instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence;
+      return new ZoneNavigationSources(runtime).readState(created.project_id, "WORKING");
+    });
+    expect(afterMismatch.in_flight_resource_ids).toEqual(expect.arrayContaining([
+      `head:${seeded.mismatchId}`, `head:${seeded.validId}`
+    ]));
+
+    const second = await guard.fetch(route, { method: "POST" });
+    expect(second.status).toBe(200);
+    const secondBody = await second.json<Record<string, unknown>>();
+    expect(secondBody.safe_errors).not.toContain("navigation_head_write_recovery_unresolved");
+    expect(secondBody.next_local_wake_at).toEqual(expect.any(Number));
+    const afterSibling = await runInDurableObject(guard, async instance => {
+      const runtime = (instance as unknown as { persistence: ProjectOsPersistenceRuntime }).persistence;
+      const sources = new ZoneNavigationSources(runtime);
+      const state = await sources.readState(created.project_id, "WORKING");
+      const dirty = await sources.listDirtyPage(created.project_id, "WORKING", null, 8);
+      return { state, dirty };
+    });
+    expect(afterSibling.state.in_flight_resource_ids).toContain(`head:${seeded.mismatchId}`);
+    expect(afterSibling.state.in_flight_resource_ids).not.toContain(`head:${seeded.validId}`);
+    expect(afterSibling.dirty.resource_ids).toContain(`head:${seeded.validId}`);
+    expect(before.mismatchIndex).toBeGreaterThanOrEqual(0);
+  });
+
   it("keeps the initial document continuation wakeable when admission fails before the first scan", async () => {
     const mock = installDropboxMock();
     const slug = "initial-admission-retry";
@@ -293,7 +598,7 @@ describe("durable managed-document change jobs", () => {
     vi.useFakeTimers();
     try {
       const requestAt = Date.now();
-      await runInDurableObject(guard, instance => {
+      await runInDurableObject(guard, (instance, durableState) => {
         const target = instance as unknown as { ruleAdmissionRequired: (...args: unknown[]) => Promise<boolean> };
         vi.spyOn(target, "ruleAdmissionRequired").mockImplementation(async () => {
           admissionCalls += 1;
@@ -347,7 +652,7 @@ describe("durable managed-document change jobs", () => {
       });
       let admissionCalls = 0;
       let coordinatorCalls = 0;
-      await runInDurableObject(guard, instance => {
+      await runInDurableObject(guard, (instance, durableState) => {
         const target = instance as unknown as {
           ruleAdmissionRequired: (...args: unknown[]) => Promise<boolean>;
           createManagedDocumentChangeCoordinator: (...args: unknown[]) => ManagedDocumentChangeCoordinator;
@@ -860,6 +1165,198 @@ describe("durable managed-document change jobs", () => {
         future_eligible_jobs: 0,
         budget_yield: true
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("persists coordinator progress and its feed Retry-After before a post-recovery provider failure", async () => {
+    const mock = installDropboxMock();
+    const slug = "post-recovery-failure-vector";
+    const created = await createProject("TXN-CHANGEJOB-POST-RECOVERY-VECTOR-0001", slug);
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+    await mock.writeExternal(`${root}/INPUTS/unread.pdf`, "%PDF post recovery retry");
+    const jobId = "CHGJOB-777777777777777777777777";
+    const cursor = await runInDurableObject(guard, async (_instance, durableState) => {
+      const store = new ManagedDocumentChangeJobStore(durableState.storage);
+      store.registerPage({ expected_cursor: store.cursor(), next_cursor: "post-recovery-feed-cursor", jobs: [{
+        job_id: jobId,
+        change: { kind: "deleted", name: "completed-before-hook.md", path: "/inputs/completed-before-hook.md" },
+        detection_source: "incremental", priority: 10
+      }] });
+      return store.cursor();
+    });
+    if (typeof cursor !== "string") throw new Error("Expected exact continuation cursor");
+    const retryAfter = injectRetryAfterForCursor(mock, cursor);
+    const coordinatorWitnessKey = "test-post-recovery-fresh-coordinator-witness";
+    const recoveryWitnessKey = "test-post-recovery-hook-entry-witness";
+    const probeOnlyWitnessKey = "test-post-recovery-probe-only-delegated";
+    vi.useFakeTimers();
+    try {
+      const requestAt = Date.now();
+      await runInDurableObject(guard, async (_instance, durableState) => {
+        const store = new ManagedDocumentChangeJobStore(durableState.storage);
+        store.beginContinuationSlice(true, requestAt);
+        store.finishContinuationSlice({ pending: true, next_wake_at: requestAt + 1_000,
+          documents_priority_next: true, feed_retry_at: null,
+          outcome: { semantic_progress: 0, jobs_registered: 0, jobs_completed: 0, unread_feed: false,
+            executable_jobs: 0, future_eligible_jobs: 0, stopped_unresolved_jobs: 0, safe_errors: [] } });
+        durableState.storage.sql.exec("UPDATE managed_document_change_continuation SET slice_ordinal = 1 WHERE singleton = 1");
+        await durableState.storage.setAlarm(requestAt + 1_000);
+      });
+      await runInDurableObject(guard, (instance, durableState) => {
+        const target = instance as unknown as {
+          recoverOneUnownedNavigationHeadWrite: (...args: unknown[]) => Promise<unknown>;
+          createManagedDocumentChangeCoordinator: (...args: unknown[]) => ManagedDocumentChangeCoordinator;
+        };
+        const createCoordinator = target.createManagedDocumentChangeCoordinator.bind(instance);
+        vi.spyOn(target, "createManagedDocumentChangeCoordinator").mockImplementation((...args) => {
+          const coordinator = createCoordinator(...args);
+          const reconcile = coordinator.reconcile.bind(coordinator);
+          vi.spyOn(coordinator, "reconcile").mockImplementation(async (...reconcileArgs) => {
+            const outcome = await reconcile(...reconcileArgs);
+            await durableState.storage.put(coordinatorWitnessKey, {
+              jobs_completed: outcome.jobs_completed, semantic_progress: outcome.semantic_progress,
+              unread_feed: outcome.unread_feed, feed_retry_at: outcome.feed_retry_at
+            });
+            return outcome;
+          });
+          vi.spyOn(coordinator as any, "processJob").mockResolvedValue(true);
+          return coordinator;
+        });
+        const recoverHeadWrite = target.recoverOneUnownedNavigationHeadWrite.bind(instance);
+        vi.spyOn(target, "recoverOneUnownedNavigationHeadWrite").mockImplementation(async (...args) => {
+          if (args[3] === true) {
+            const result = await recoverHeadWrite(...args);
+            await durableState.storage.put(probeOnlyWitnessKey, true);
+            return result;
+          }
+          const outcome = await durableState.storage.get<Record<string, unknown>>(coordinatorWitnessKey);
+          const jobStatus = durableState.storage.sql.exec<{ status: string }>(
+            "SELECT status FROM managed_document_change_jobs WHERE job_id = ?", jobId).one().status;
+          await durableState.storage.put(recoveryWitnessKey, { outcome, jobStatus });
+          throw new ProviderOperationError("recovery proof read delayed", true,
+            { providerId: "dropbox", retryAfterMs: 90_000 });
+        });
+      });
+      vi.setSystemTime(requestAt + 2_000);
+      expect(await runDurableObjectAlarm(guard)).toBe(true);
+      const persisted = await runInDurableObject(guard, async (_instance, durableState) => {
+        const store = new ManagedDocumentChangeJobStore(durableState.storage);
+        const jobStatus = durableState.storage.sql.exec<{ status: string }>(
+          "SELECT status FROM managed_document_change_jobs WHERE job_id = ?", jobId).one().status;
+        return { continuation: store.continuation(), failure: store.preludeFailureCheckpoint(), jobStatus,
+          coordinatorWitness: await durableState.storage.get<Record<string, unknown>>(coordinatorWitnessKey),
+          recoveryWitness: await durableState.storage.get<Record<string, unknown>>(recoveryWitnessKey),
+          probeOnlyDelegated: await durableState.storage.get<boolean>(probeOnlyWitnessKey),
+          job: store.pending().find(item => item.job_id === jobId) ?? null };
+      });
+      expect(persisted.coordinatorWitness).toMatchObject({ jobs_completed: 1, semantic_progress: 1,
+        unread_feed: true, feed_retry_at: expect.any(Number) });
+      expect(persisted.recoveryWitness).toMatchObject({ jobStatus: "completed", outcome: persisted.coordinatorWitness });
+      expect(persisted.probeOnlyDelegated).toBe(true);
+      expect(persisted.jobStatus).toBe("completed");
+      expect(retryAfter.didInject()).toBe(true);
+      expect(persisted.continuation.last_outcome).toMatchObject({ jobs_completed: 1, semantic_progress: 1,
+        unread_feed: true, safe_errors: ["provider_retryable", "document_slice_failed"] });
+      expect(persisted.continuation.feed_retry_at).toBeGreaterThan(requestAt + 50_000);
+      expect(persisted.continuation.next_wake_at).toBeGreaterThanOrEqual(requestAt + 90_000);
+      expect(persisted.continuation.next_wake_at).toBeGreaterThanOrEqual(persisted.continuation.feed_retry_at!);
+      expect(persisted.job).toBeNull();
+      expect(persisted.failure).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 10_000);
+
+  it("breaks the identical typed post-recovery streak after a non-internal hook failure", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-POST-RECOVERY-STREAK-0001", "post-recovery-streak-reset");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    expect((await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+    vi.useFakeTimers();
+    try {
+      const startedAt = Date.now();
+      await runInDurableObject(guard, async (_instance, durableState) => {
+        const store = new ManagedDocumentChangeJobStore(durableState.storage);
+        store.beginContinuationSlice(false, startedAt);
+        store.finishContinuationSlice({ pending: true, next_wake_at: startedAt + 1_000,
+          documents_priority_next: false, feed_retry_at: null,
+          outcome: { semantic_progress: 0, jobs_registered: 0, jobs_completed: 0, unread_feed: false,
+            executable_jobs: 0, future_eligible_jobs: 0, stopped_unresolved_jobs: 0, safe_errors: [] } });
+        durableState.storage.sql.exec("UPDATE managed_document_change_continuation SET slice_ordinal = 1 WHERE singleton = 1");
+        await durableState.storage.setAlarm(startedAt + 1_000);
+      });
+      let attempts = 0;
+      const coordinatorWitnessKey = "test-post-recovery-streak-coordinator-witness";
+      const hookWitnessesKey = "test-post-recovery-streak-hook-witnesses";
+      await runInDurableObject(guard, (instance, durableState) => {
+        const target = instance as unknown as {
+          recoverOneUnownedNavigationHeadWrite: (...args: unknown[]) => Promise<unknown>;
+          createManagedDocumentChangeCoordinator: (...args: unknown[]) => ManagedDocumentChangeCoordinator;
+        };
+        let coordinatorSequence = 0;
+        const createCoordinator = target.createManagedDocumentChangeCoordinator.bind(instance);
+        vi.spyOn(target, "createManagedDocumentChangeCoordinator").mockImplementation((...args) => {
+          const coordinator = createCoordinator(...args);
+          const reconcile = coordinator.reconcile.bind(coordinator);
+          vi.spyOn(coordinator, "reconcile").mockImplementation(async (...reconcileArgs) => {
+            const outcome = await reconcile(...reconcileArgs);
+            await durableState.storage.put(coordinatorWitnessKey,
+              { sequence: ++coordinatorSequence, semantic_progress: outcome.semantic_progress });
+            return outcome;
+          });
+          return coordinator;
+        });
+        const recover = target.recoverOneUnownedNavigationHeadWrite.bind(instance);
+        const sequence = [
+          new InternalExecutionFailure("same_post_recovery_internal", "head_write_recovery"),
+          new Error("non-internal post-recovery uncertainty"),
+          new InternalExecutionFailure("same_post_recovery_internal", "head_write_recovery")
+        ];
+        vi.spyOn(target, "recoverOneUnownedNavigationHeadWrite").mockImplementation(async (...args) => {
+          if (args[3] === true) return recover(...args);
+          const witness = await durableState.storage.get<Record<string, unknown>>(coordinatorWitnessKey);
+          const previous = await durableState.storage.get<Array<Record<string, unknown>>>(hookWitnessesKey) ?? [];
+          previous.push(witness ?? { missing: true });
+          await durableState.storage.put(hookWitnessesKey, previous);
+          const failure = sequence[attempts++];
+          if (!failure) throw new Error("Unexpected extra head-write recovery attempt");
+          throw failure;
+        });
+      });
+
+      const checkpoints: Array<{ failure: ReturnType<ManagedDocumentChangeJobStore["preludeFailureCheckpoint"]>; progress: number | undefined; progressFingerprint: string; witnesses: Array<Record<string, unknown>> }> = [];
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        vi.setSystemTime(startedAt + attempt * 31_000);
+        await runInDurableObject(guard, (_instance, durableState) => {
+          durableState.storage.sql.exec("UPDATE managed_document_change_continuation SET slice_ordinal = 1 WHERE singleton = 1");
+        });
+        expect(await runDurableObjectAlarm(guard)).toBe(true);
+        checkpoints.push(await runInDurableObject(guard, async (_instance, durableState) => {
+          const store = new ManagedDocumentChangeJobStore(durableState.storage);
+          const outcome = store.continuation().last_outcome;
+          return { failure: store.preludeFailureCheckpoint(), progress: typeof outcome?.semantic_progress === "number"
+            ? outcome.semantic_progress : undefined,
+            progressFingerprint: await store.feedProgressFingerprint(0),
+            witnesses: await durableState.storage.get<Array<Record<string, unknown>>>(hookWitnessesKey) ?? [] };
+        }));
+      }
+
+      expect(attempts).toBe(3);
+      expect(checkpoints.every(checkpoint => checkpoint.progress === checkpoints[0].progress)).toBe(true);
+      expect(checkpoints.every(checkpoint => checkpoint.progressFingerprint === checkpoints[0].progressFingerprint)).toBe(true);
+      expect(checkpoints.map(checkpoint => checkpoint.witnesses.length)).toEqual([1, 2, 3]);
+      expect(checkpoints.map(checkpoint => checkpoint.witnesses.at(-1))).toEqual([
+        { sequence: 1, semantic_progress: checkpoints[0].progress },
+        { sequence: 2, semantic_progress: checkpoints[1].progress },
+        { sequence: 3, semantic_progress: checkpoints[2].progress }
+      ]);
+      expect(checkpoints[0].failure).toMatchObject({ consecutive_failures: 1, total_attempts: 1, stopped: false });
+      expect(checkpoints[1].failure).toMatchObject({ consecutive_failures: 0, total_attempts: 1, stopped: false });
+      expect(checkpoints[2].failure).toMatchObject({ consecutive_failures: 1, total_attempts: 2, stopped: false });
     } finally {
       vi.useRealTimers();
     }

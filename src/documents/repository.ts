@@ -1,3 +1,4 @@
+import { ZodError } from "zod";
 import {
   documentIdForProviderFile,
   type DocumentVersionRecord,
@@ -47,7 +48,7 @@ import { upcastDropboxV1Observation, type ProviderObservation } from "../schema/
 import { schemaWriterStageFor } from "../schema/runtime-policy";
 import { writesProviderV2, type SchemaWriterStage } from "../schema/writer-stage";
 import { sha256Text } from "./hash";
-import { ZoneNavigationSources } from "./zone-navigation-sources";
+import { ZoneNavigationSources, type ZoneNavigationHeadWriteTicket } from "./zone-navigation-sources";
 import { packageIdFor, packageManifestPath, packageRefSchema, parsePackageManifest, packageNavigationPath, packageNavigationLedgerSchema, type PackageNavigation, type FrozenPackageManifest, type PackageRef } from "../domain/document-package";
 import { renderPackageIndex } from "../render/package-navigation";
 import { canonicalJson } from "../rules/contract";
@@ -283,6 +284,79 @@ export class DocumentLedgerRepository {
       throw new Error(`Managed document head binding mismatch for ${projectId}/${documentId}`);
     }
     return head;
+  }
+
+  /** Complete only a persisted unowned head-write ticket whose exact canonical
+   * bytes and strict immutable version references still match. */
+  async completeUnownedHeadWriteTickets(tickets: readonly ZoneNavigationHeadWriteTicket[]): Promise<boolean> {
+    if (!tickets.length) return false;
+    const first = tickets[0];
+    const documentId = first.resource_id.startsWith("head:") ? first.resource_id.slice("head:".length) : "";
+    if (!/^DOC-[A-F0-9]{24}$/.test(documentId) || first.write_hash === null || first.owner_hash !== undefined
+      || tickets.some(ticket => ticket.project_id !== first.project_id || ticket.resource_id !== first.resource_id
+        || ticket.write_hash !== first.write_hash || ticket.owner_hash !== undefined
+        || !Number.isSafeInteger(ticket.generation) || ticket.generation < 1)) return false;
+    const raw = await this.runtime.objects.readText(machineDocumentHeadPath(first.project_id, documentId));
+    if (raw === null || await sha256Text(raw) !== first.write_hash) return false;
+    let head: CurrentManagedDocumentHead;
+    try {
+      head = readManagedDocumentHead(JSON.parse(raw)).head;
+      if (head.project_id !== first.project_id || head.document_id !== documentId) {
+        throw new Error("Managed document head binding mismatch");
+      }
+    } catch (error) {
+      if (isDeterministicHeadWriteProofFailure(error)) return false;
+      throw error;
+    }
+    const pointers: Array<[keyof ManagedDocumentHead, string | undefined]> = [
+      ["reference_version_id", head.reference_version_id],
+      ["working_version_id", head.working_version_id],
+      ["review_version_id", head.review_version_id],
+      ["published_version_id", head.published_version_id]
+    ];
+    for (const [field, versionId] of pointers) {
+      if (!versionId) continue;
+      const versionRaw = await this.runtime.objects.readText(machineDocumentVersionPath(head.project_id, documentId, versionId));
+      if (versionRaw === null) return false;
+      let version: CurrentDocumentVersionRecord;
+      try {
+        version = readDocumentVersionRecord(JSON.parse(versionRaw)).record;
+        if (version.project_id !== head.project_id || version.document_id !== documentId || version.version_id !== versionId) {
+          throw new Error("Managed document version binding mismatch");
+        }
+      } catch (error) {
+        if (isDeterministicHeadWriteProofFailure(error)) return false;
+        throw error;
+      }
+      if (!version || version.kind !== head.kind || !pointerAcceptsStage(field, version.stage)) return false;
+    }
+    try {
+      await new ZoneNavigationSources(this.runtime).completeUnownedHeadWritesPreservingMismatch(tickets);
+    } catch (error) {
+      if (error instanceof Error && error.message === "navigation_source_ticket_future_generation") return false;
+      throw error;
+    }
+    return true;
+  }
+
+  async recoverUnownedHeadWriteForResource(projectId: string, resourceId: string): Promise<boolean> {
+    const sources = new ZoneNavigationSources(this.runtime);
+    const candidate = (await sources.unownedHeadWriteRecoveryCandidates(projectId))
+      .find(tickets => tickets[0]?.resource_id === resourceId);
+    return candidate ? this.completeUnownedHeadWriteTickets(candidate) : false;
+  }
+
+  async recoverOneUnownedHeadWrite(projectId: string, sliceOrdinal: number, probeOnly = false): Promise<{
+    status: "none" | "recovered" | "unresolved";
+    remainingCandidates: boolean;
+  }> {
+    const candidates = await new ZoneNavigationSources(this.runtime).unownedHeadWriteRecoveryCandidates(projectId);
+    if (!candidates.length) return { status: "none", remainingCandidates: false };
+    const ordinal = Number.isSafeInteger(sliceOrdinal) && sliceOrdinal >= 0 ? sliceOrdinal : 0;
+    const tickets = candidates[ordinal % candidates.length];
+    if (probeOnly) return { status: "unresolved", remainingCandidates: true };
+    const recovered = await this.completeUnownedHeadWriteTickets(tickets);
+    return { status: recovered ? "recovered" : "unresolved", remainingCandidates: candidates.length > 1 };
   }
 
   async readVersion(projectId: string, documentId: string, versionId: string): Promise<CurrentDocumentVersionRecord | null> {
@@ -1027,4 +1101,12 @@ function navigationHeadZonesPresent(
 
 function pretty(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function isDeterministicHeadWriteProofFailure(error: unknown): boolean {
+  if (error instanceof SyntaxError || error instanceof ZodError) return true;
+  if (!(error instanceof Error)) return false;
+  return /^(?:ManagedDocumentHead|DocumentVersionRecord) must be an object$/.test(error.message)
+    || /^Unsupported schema version for (?:ManagedDocumentHead|DocumentVersionRecord):/.test(error.message)
+    || /^Managed document (?:head|version) binding mismatch(?:$|\s)/.test(error.message);
 }

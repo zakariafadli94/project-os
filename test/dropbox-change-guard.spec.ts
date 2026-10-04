@@ -3,6 +3,7 @@ import {
   createExecutionContext,
   runDurableObjectAlarm,
   runInDurableObject,
+  reset,
   waitOnExecutionContext
 } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +15,7 @@ import { ManagedDocumentChangeJobStore } from "../src/documents/change-job-store
 const testEnv = env as unknown as Env & {
   DROPBOX_CHANGE_GUARD: DurableObjectNamespace;
 };
+let resetAfterMaintenanceFixture = false;
 
 interface ChangeGuardStatus {
   requested_generation: number;
@@ -105,7 +107,15 @@ function interceptProjectList(
 }
 
 describe("DropboxChangeGuard", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(async () => {
+    const shouldReset = resetAfterMaintenanceFixture;
+    resetAfterMaintenanceFixture = false;
+    try {
+      if (shouldReset) await reset();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
 
   it("durably coalesces duplicate notifications and completes one pending generation", async () => {
     installDropboxMock();
@@ -345,8 +355,13 @@ describe("DropboxChangeGuard", () => {
   });
 
   it("scheduled maintenance performs one bounded due managed-document verification", async () => {
+    await reset();
+    resetAfterMaintenanceFixture = true;
     const mock = installDropboxMock();
     const projectId = await createProject("TXN-CHANGE-GUARD-0004", "change-guard-four");
+    const registry = await testEnv.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/registry", { method: "GET" });
+    const registeredProjects = (await registry.json<{ projects: Array<{ project_id: string }> }>()).projects;
+    expect(registeredProjects.map(project => project.project_id)).toEqual([projectId]);
     const projectListPaths: string[] = [];
     interceptProjectList(mock, async (path) => {
       projectListPaths.push(path);

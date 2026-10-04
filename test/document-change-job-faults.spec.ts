@@ -1,4 +1,4 @@
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { reset, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
@@ -24,6 +24,7 @@ import { sha256Canonical } from "../src/materialization/hash";
 const testEnv = env as unknown as Env;
 const at = "2026-08-31T14:20:00+01:00";
 let restoreTestEnvBindings: (() => Promise<void>) | null = null;
+let resetAfterRetryFaultFixture = false;
 
 function restoreOptionalEnvBinding(target: Record<string, unknown>, key: string, value: unknown): void {
   if (value === undefined) delete target[key];
@@ -49,10 +50,47 @@ async function createProject(transactionId: string, slug: string): Promise<Recei
   return receipt;
 }
 
+function injectRetryAfterForCursor(mock: ReturnType<typeof installDropboxMock>, targetCursor: string) {
+  const delegateFetch = mock.spy.getMockImplementation();
+  if (!delegateFetch) throw new Error("Dropbox mock implementation unavailable");
+  const continuedCursors: string[] = [];
+  let retryAfterInjected = false;
+  mock.spy.mockImplementation(async (input, init) => {
+    const request = input instanceof Request ? input : new Request(String(input), init);
+    const url = new URL(request.url);
+    if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder/continue") {
+      const body = await request.clone().json() as { cursor?: unknown };
+      if (typeof body.cursor === "string") continuedCursors.push(body.cursor);
+      if (body.cursor === targetCursor && !retryAfterInjected) {
+        retryAfterInjected = true;
+        return new Response(JSON.stringify({ error_summary: "too_many_requests/" }), {
+          status: 429,
+          headers: { "Retry-After": "60" }
+        });
+      }
+    }
+    return delegateFetch(input, init);
+  });
+  return { continuedCursors, didInject: () => retryAfterInjected };
+}
+
 describe("durable managed-document change jobs", () => {
   afterEach(async () => {
     try { await restoreTestEnvBindings?.(); }
-    finally { restoreTestEnvBindings = null; vi.useRealTimers(); vi.restoreAllMocks(); }
+    finally {
+      restoreTestEnvBindings = null;
+      const shouldReset = resetAfterRetryFaultFixture;
+      resetAfterRetryFaultFixture = false;
+      try {
+        vi.useRealTimers();
+      } finally {
+        try {
+          if (shouldReset) await reset();
+        } finally {
+          vi.restoreAllMocks();
+        }
+      }
+    }
   });
 
   it("reports a bounded checkpoint without advancing verification or changing durable jobs", async () => {
@@ -726,10 +764,9 @@ describe("durable managed-document change jobs", () => {
   }, 10_000);
 
   it("preserves fresh feed and job progress when route and alarm dirty scans yield", async () => {
-    const mock = installDropboxMock({ faults: [{
-      endpoint: "/2/files/list_folder/continue", occurrence: 1, status: 429,
-      error_summary: "too_many_requests/", responseHeaders: { "Retry-After": "60" }
-    }] });
+    await reset();
+    resetAfterRetryFaultFixture = true;
+    const mock = installDropboxMock();
     const slug = "dirty-scan-yield-vector";
     const created = await createProject("TXN-CHANGEJOB-DIRTY-SCAN-VECTOR-0001", slug);
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
@@ -746,6 +783,15 @@ describe("durable managed-document change jobs", () => {
         priority: 10
       })) });
     });
+    const targetCursor = await runInDurableObject(guard, (_instance, durableState) =>
+      new ManagedDocumentChangeJobStore(durableState.storage).cursor());
+    if (typeof targetCursor !== "string") throw new Error("Expected persisted Dropbox cursor after baseline");
+    const retryAfter = injectRetryAfterForCursor(mock, targetCursor);
+    const unrelatedContinue = await fetch("https://api.dropboxapi.com/2/files/list_folder/continue", {
+      method: "POST",
+      body: JSON.stringify({ cursor: "unrelated-preflight-cursor" })
+    });
+    expect(unrelatedContinue.status).not.toBe(429);
     let dirtyScanCalls = 0;
     const checkpointsSeenBeforeDirtyScan: Array<{ outcome: Record<string, unknown> | null; next_wake_at: number | null }> = [];
     vi.useFakeTimers();
@@ -774,6 +820,8 @@ describe("durable managed-document change jobs", () => {
       const first = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
       expect(first.status).toBe(200);
       const firstBody = await first.json<any>();
+      expect(retryAfter.didInject()).toBe(true);
+      expect(retryAfter.continuedCursors).toContain(targetCursor);
       expect(firstBody).toMatchObject({ jobs_completed: 1, jobs_pending: 2, unread_feed: true, budget_yield: true });
       expect(firstBody.feed_retry_at).toBeGreaterThan(requestAt + 50_000);
       expect(checkpointsSeenBeforeDirtyScan[0].outcome).toMatchObject({
@@ -899,15 +947,23 @@ describe("durable managed-document change jobs", () => {
   });
 
   it("retains the fresh Retry-After vector when a route dirty scan fails non-budget", async () => {
-    const mock = installDropboxMock({ faults: [{
-      endpoint: "/2/files/list_folder/continue", occurrence: 1, status: 429,
-      error_summary: "too_many_requests/", responseHeaders: { "Retry-After": "60" }
-    }] });
+    await reset();
+    resetAfterRetryFaultFixture = true;
+    const mock = installDropboxMock();
     const slug = "dirty-scan-error-vector";
     const created = await createProject("TXN-CHANGEJOB-DIRTY-SCAN-ERROR-0001", slug);
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
     expect((await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+    const targetCursor = await runInDurableObject(guard, (_instance, durableState) =>
+      new ManagedDocumentChangeJobStore(durableState.storage).cursor());
+    if (typeof targetCursor !== "string") throw new Error("Expected persisted Dropbox cursor after baseline");
+    const retryAfter = injectRetryAfterForCursor(mock, targetCursor);
+    const unrelatedContinue = await fetch("https://api.dropboxapi.com/2/files/list_folder/continue", {
+      method: "POST",
+      body: JSON.stringify({ cursor: "unrelated-preflight-cursor" })
+    });
+    expect(unrelatedContinue.status).not.toBe(429);
     await mock.writeExternal(`${root}/INPUTS/unread.pdf`, "%PDF unread page");
     await runInDurableObject(guard, instance => {
       const target = instance as unknown as { enqueueNavigationRefreshForDirtyZones: (...args: unknown[]) => Promise<void> };
@@ -927,6 +983,8 @@ describe("durable managed-document change jobs", () => {
     const body = await response.json<any>();
     const continuation = await runInDurableObject(guard, (_instance, durableState) =>
       new ManagedDocumentChangeJobStore(durableState.storage).continuation());
+    expect(retryAfter.didInject()).toBe(true);
+    expect(retryAfter.continuedCursors).toContain(targetCursor);
     console.log("g4-scan-failure-outcome", JSON.stringify(continuation.last_outcome));
 
     expect(body).toMatchObject({ unread_feed: true, jobs_registered: 0, jobs_completed: 0,
@@ -939,15 +997,23 @@ describe("durable managed-document change jobs", () => {
   });
 
   it("keeps a future feed Retry-After instead of forcing a route one-second wake after dirty-scan yield", async () => {
-    const mock = installDropboxMock({ faults: [{
-      endpoint: "/2/files/list_folder/continue", occurrence: 1, status: 429,
-      error_summary: "too_many_requests/", responseHeaders: { "Retry-After": "60" }
-    }] });
+    await reset();
+    resetAfterRetryFaultFixture = true;
+    const mock = installDropboxMock();
     const slug = "dirty-scan-feed-backoff";
     const created = await createProject("TXN-CHANGEJOB-DIRTY-SCAN-BACKOFF-0001", slug);
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${created.project_id}-${slug}`;
     expect((await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" })).status).toBe(200);
+    const targetCursor = await runInDurableObject(guard, (_instance, durableState) =>
+      new ManagedDocumentChangeJobStore(durableState.storage).cursor());
+    if (typeof targetCursor !== "string") throw new Error("Expected persisted Dropbox cursor after baseline");
+    const retryAfter = injectRetryAfterForCursor(mock, targetCursor);
+    const unrelatedContinue = await fetch("https://api.dropboxapi.com/2/files/list_folder/continue", {
+      method: "POST",
+      body: JSON.stringify({ cursor: "unrelated-preflight-cursor" })
+    });
+    expect(unrelatedContinue.status).not.toBe(429);
     await mock.writeExternal(`${root}/INPUTS/unread.pdf`, "%PDF unread page");
     await runInDurableObject(guard, instance => {
       const target = instance as unknown as { enqueueNavigationRefreshForDirtyZones: (...args: unknown[]) => Promise<void> };
@@ -960,6 +1026,8 @@ describe("durable managed-document change jobs", () => {
     const body = await response.json<any>();
     const continuation = await runInDurableObject(guard, (_instance, durableState) =>
       new ManagedDocumentChangeJobStore(durableState.storage).continuation());
+    expect(retryAfter.didInject()).toBe(true);
+    expect(retryAfter.continuedCursors).toContain(targetCursor);
     expect(body).toMatchObject({ unread_feed: true, budget_yield: true, jobs_pending: 0, executable_jobs: 0 });
     expect(body.feed_retry_at).toBeGreaterThan(requestedAt + 50_000);
     expect(continuation.next_wake_at).toBeGreaterThan(requestedAt + 50_000);

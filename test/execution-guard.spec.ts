@@ -3452,23 +3452,51 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(navHeadPath).toBeDefined();
     expect(JSON.parse(mock.files.get(navHeadPath!)!).generation).toBe(1);
 
+    const targetRequestId = "DOCREQ-NAV-AUTO-SOURCE-8321";
+    const targetDurableObjectId = await runInDurableObject(guard, (instance) => (instance as unknown as {
+      ctx: { id: { toString(): string } };
+    }).ctx.id.toString());
+    const settlingRequestIds = new WeakMap<object, string>();
+    const settleDocumentReceipt = (ProjectGuard.prototype as any).settleDocumentReceipt;
+    vi.spyOn(ProjectGuard.prototype as any, "settleDocumentReceipt").mockImplementation(async function (
+      this: ProjectGuard,
+      ...args: unknown[]
+    ) {
+      const request = args[0] as { request_id?: unknown } | undefined;
+      const previousRequestId = settlingRequestIds.get(this);
+      if (typeof request?.request_id === "string") settlingRequestIds.set(this, request.request_id);
+      else settlingRequestIds.delete(this);
+      try {
+        return await settleDocumentReceipt.call(this, ...args);
+      } finally {
+        if (previousRequestId === undefined) settlingRequestIds.delete(this);
+        else settlingRequestIds.set(this, previousRequestId);
+      }
+    });
+
     let interruptOutboxOnce = true;
     const enqueueDirtyZones = (ProjectGuard.prototype as any).enqueueNavigationRefreshForDirtyZones;
     vi.spyOn(ProjectGuard.prototype as any, "enqueueNavigationRefreshForDirtyZones").mockImplementation(async function (
       this: ProjectGuard,
       ...args: unknown[]
     ) {
-      if (interruptOutboxOnce) {
+      if (interruptOutboxOnce
+        && this.ctx.id.toString() === targetDurableObjectId
+        && settlingRequestIds.get(this) === targetRequestId) {
         interruptOutboxOnce = false;
         throw new Error("injected dirty-to-outbox interruption");
       }
-      return enqueueDirtyZones.call(this, args[0]);
+      return enqueueDirtyZones.call(this, ...args);
     });
+
+    await expect(runInDurableObject(guard, (instance) => (instance as unknown as {
+      enqueueNavigationRefreshForDirtyZones(projectId: string): Promise<void>;
+    }).enqueueNavigationRefreshForDirtyZones(projectId))).resolves.toBeUndefined();
 
     const content = "# Automatically refreshed\n";
     const workingWrite = {
       operation: "working.write" as const,
-      request_id: "DOCREQ-NAV-AUTO-SOURCE-8321",
+      request_id: targetRequestId,
       project_id: projectId,
       logical_path: "notes/automatic.md",
       content,

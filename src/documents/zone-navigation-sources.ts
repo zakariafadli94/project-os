@@ -1026,6 +1026,222 @@ export class ZoneNavigationSources {
       () => this.completeHeadWritesUnlocked(tickets, new Map(), budget, true));
   }
 
+  /** Transfer an exact stale recovery ticket to the already-proved current
+   * head without creating a new source generation. */
+  async transferHeadWriteRecoveryTickets(
+    originalTickets: readonly ZoneNavigationHeadWriteTicket[], currentHash: string, ownerHash: string, budget?: SliceBudget,
+    verifyHead?: () => Promise<boolean>
+  ): Promise<void> {
+    if (!originalTickets.length || !/^[a-f0-9]{64}$/.test(currentHash) || !/^[a-f0-9]{64}$/.test(ownerHash)) {
+      throw new Error("navigation_head_recovery_ticket_invalid");
+    }
+    const projectId = originalTickets[0].project_id;
+    const resourceId = originalTickets[0].resource_id;
+    if (originalTickets.some(ticket => ticket.project_id !== projectId || ticket.resource_id !== resourceId
+      || ticket.owner_hash !== undefined || ticket.write_hash === null || !/^[a-f0-9]{64}$/.test(ticket.write_hash ?? "")
+      || !Number.isSafeInteger(ticket.generation) || ticket.generation < 1)) throw new Error("navigation_head_recovery_ticket_invalid");
+    await this.withMutationLock(projectId, resourceId, async () => {
+      if (verifyHead && !(await verifyHead())) throw new Error("navigation_source_head_superseded");
+      const state = await this.readProjectState(projectId, budget);
+      let changed = false;
+      for (const ticket of originalTickets) {
+        const zone = state.zones[ticket.zone] ?? { ...DEFAULT_ZONE_STATE };
+        if (zone.catalog_rebuild_request_id) throw new Error("navigation_catalog_rebuild_writer_fenced");
+        if (zone.generation < ticket.generation) throw new Error("navigation_source_ticket_future_generation");
+        const exact = zone.in_flight_writes.find(write => write.resource_id === resourceId
+          && write.generation === ticket.generation && write.write_hash === ticket.write_hash && write.owner_hash === undefined);
+        const already = zone.in_flight_writes.find(write => write.resource_id === resourceId
+          && write.generation === ticket.generation && write.write_hash === currentHash && write.owner_hash === ownerHash);
+        if (already && zone.in_flight_writes.filter(write => write.resource_id === resourceId).length === 1) continue;
+        if (!exact && !already && !zone.in_flight_writes.some(write => write.resource_id === resourceId)) {
+          // Crash after the fence was cleared but before journal finalization:
+          // accept absence only when the exact dirty generation is durable.
+          const dirtyPath = await resourcePath(zoneNavigationDirtyRoot(projectId, ticket.zone), resourceId);
+          const token = await this.readWriteToken(dirtyPath, budget);
+          if (!token) throw new Error("navigation_source_ticket_stale");
+          charge(budget);
+          const raw = await this.runtime.objects.readText(dirtyPath);
+          if (!raw) throw new Error("navigation_source_ticket_stale");
+          const marker = dirtySchema.parse(JSON.parse(raw));
+          if (marker.resource_id !== resourceId || marker.generation < ticket.generation || marker.generation > zone.generation) {
+            throw new Error("navigation_source_ticket_stale");
+          }
+          if (marker.generation > ticket.generation) {
+            const manifest = await this.readCompactManifest(projectId, ticket.zone, budget);
+            const ranges = manifest?.coalesced_dirty.find(item => item.resource_id === resourceId
+              && item.latest_generation === marker.generation)?.covered_generations ?? [];
+            if (!ranges.some(range => range.start <= ticket.generation && range.end >= ticket.generation)) {
+              throw new Error("navigation_source_ticket_stale");
+            }
+          }
+          if (await this.readWriteToken(dirtyPath, budget) !== token) throw new Error("navigation_dirty_record_changed");
+          continue;
+        }
+        if (already || !exact || zone.in_flight_writes.some(write => write.resource_id === resourceId && write !== exact)) {
+          throw new Error("navigation_source_ticket_stale");
+        }
+        exact.write_hash = currentHash;
+        exact.owner_hash = ownerHash;
+        state.zones[ticket.zone] = zone;
+        changed = true;
+      }
+      if (verifyHead && !(await verifyHead())) throw new Error("navigation_source_head_superseded");
+      if (changed) await this.writeProjectState(projectId, state, budget);
+    });
+  }
+
+  /** Complete only the recovery-owned replacement fence. Newer dirty markers
+   * are retained and the recovered generation is coalesced into their range. */
+  async completeOwnedHeadWriteRecovery(
+    tickets: readonly ZoneNavigationHeadWriteTicket[], ownerHash: string, currentHash: string, budget?: SliceBudget,
+    proof?: { verifyCurrent(): Promise<boolean>; beforeClear(): Promise<void>; hasCompletionWitness(): Promise<boolean> }
+  ): Promise<void> {
+    if (!tickets.length || !/^[a-f0-9]{64}$/.test(ownerHash) || !/^[a-f0-9]{64}$/.test(currentHash)
+      || tickets.some(ticket => ticket.owner_hash !== ownerHash || ticket.write_hash !== currentHash
+        || ticket.project_id !== tickets[0].project_id || ticket.resource_id !== tickets[0].resource_id)) {
+      throw new Error("navigation_head_recovery_ticket_invalid");
+    }
+    const { project_id: projectId, resource_id: resourceId } = tickets[0];
+    await this.withMutationLock(projectId, resourceId, async () => {
+      const assertHead = async () => {
+        charge(budget);
+        const raw = await this.runtime.objects.readText(machineDocumentHeadPath(projectId, resourceId.slice("head:".length)));
+        if (raw === null || await sha256Text(raw) !== currentHash) throw new Error("navigation_source_head_superseded");
+      };
+      const assertTickets = async () => {
+        const state = await this.readProjectState(projectId, budget);
+        for (const ticket of tickets) {
+          const zone = state.zones[ticket.zone] ?? DEFAULT_ZONE_STATE;
+          if (ticket.generation > zone.generation) throw new Error("navigation_source_ticket_future_generation");
+          if (zone.catalog_rebuild_request_id) throw new Error("navigation_catalog_rebuild_writer_fenced");
+          const exact = zone.in_flight_writes.some(write => write.resource_id === resourceId && write.generation === ticket.generation
+            && write.write_hash === currentHash && write.owner_hash === ownerHash);
+          if (!exact) {
+            if (zone.in_flight_writes.some(write => write.resource_id === resourceId)) throw new Error("navigation_source_ticket_stale");
+            const dirtyPath = await resourcePath(zoneNavigationDirtyRoot(projectId, ticket.zone), resourceId);
+            const token = await this.readWriteToken(dirtyPath, budget);
+            if (!token) {
+              const manifest = await this.readCompactManifest(projectId, ticket.zone, budget);
+              const covered = manifest && !manifest.rebuild_repair_required && !manifest.rebuilding_request_id
+                && manifest.ready_generation !== null && (manifest.ready_generation >= ticket.generation
+                  || manifest.completed_generations.some(range => range.start <= ticket.generation && range.end >= ticket.generation));
+              if (!covered || !proof || !(await proof.hasCompletionWitness())) throw new Error("navigation_source_ticket_stale");
+              if (await this.readWriteToken(dirtyPath, budget) !== null) throw new Error("navigation_dirty_record_changed");
+              continue;
+            }
+            charge(budget);
+            const raw = await this.runtime.objects.readText(dirtyPath);
+            if (!raw) throw new Error("navigation_source_ticket_stale");
+            const marker = dirtySchema.parse(JSON.parse(raw));
+            if (marker.resource_id !== resourceId || marker.generation < ticket.generation || marker.generation > zone.generation) {
+              throw new Error("navigation_source_ticket_stale");
+            }
+            if (marker.generation > ticket.generation) {
+              const manifest = await this.readCompactManifest(projectId, ticket.zone, budget);
+              const ranges = manifest?.coalesced_dirty.find(item => item.resource_id === resourceId
+                && item.latest_generation === marker.generation)?.covered_generations ?? [];
+              if (!ranges.some(range => range.start <= ticket.generation && range.end >= ticket.generation)) {
+                throw new Error("navigation_source_ticket_stale");
+              }
+            }
+            if (await this.readWriteToken(dirtyPath, budget) !== token) throw new Error("navigation_dirty_record_changed");
+          }
+        }
+        return state;
+      };
+      const initialState = await assertTickets();
+      if (tickets.every(ticket => !(initialState.zones[ticket.zone]?.in_flight_writes ?? [])
+        .some(write => write.resource_id === resourceId))) {
+        // Receipt/certificate resumption after clear is read-only. The exact
+        // durable dirty/coalesced proof is checked twice with the current head;
+        // do not rewrite state or repeat the already-completed transition.
+        if (proof && !(await proof.hasCompletionWitness())) throw new Error("navigation_source_ticket_stale");
+        await assertHead();
+        await assertTickets();
+        await assertHead();
+        if (proof && !(await proof.verifyCurrent())) throw new Error("navigation_source_head_superseded");
+        return;
+      }
+      await assertHead();
+      const dirtySnapshots: Array<{ ticket: ZoneNavigationHeadWriteTicket; path: string; token: string | null; raw: string; marker: z.infer<typeof dirtySchema> | null }> = [];
+      for (const ticket of tickets) {
+        const path = await resourcePath(zoneNavigationDirtyRoot(projectId, ticket.zone), resourceId);
+        let token = await this.readWriteToken(path, budget);
+        let raw: string | null = null;
+        let marker: z.infer<typeof dirtySchema> | null = null;
+        if (token !== null) {
+          charge(budget);
+          raw = await this.runtime.objects.readText(path);
+          if (raw === null) throw new Error("navigation_dirty_record_changed");
+          marker = dirtySchema.parse(JSON.parse(raw));
+          if (marker.resource_id !== resourceId) throw new Error("navigation_dirty_record_binding");
+          const sourceGeneration = (await this.readProjectState(projectId, budget)).zones[ticket.zone]?.generation ?? 0;
+          if (marker.generation > sourceGeneration) throw new Error("navigation_dirty_generation_future");
+          if (marker.generation > ticket.generation) {
+            const manifest = await this.readCompactManifest(projectId, ticket.zone, budget);
+            const covered = manifest?.coalesced_dirty.find(item => item.resource_id === resourceId
+              && item.latest_generation === marker!.generation)?.covered_generations ?? [];
+            await this.recordCoalescedDirty(projectId, ticket.zone, resourceId, ticket.generation,
+              marker.generation, covered, budget);
+          } else if (marker.generation < ticket.generation) {
+            // A newer stranded fence may follow a still-pending older dirty
+            // marker. The exact current head is independently verified: carry
+            // the older obligation into this generation rather than strand
+            // either one. CAS preserves a concurrently changed marker.
+            const manifest = await this.readCompactManifest(projectId, ticket.zone, budget);
+            const covered = manifest?.coalesced_dirty.find(item => item.resource_id === resourceId
+              && (item.latest_generation === marker!.generation || item.latest_generation === ticket.generation))?.covered_generations ?? [];
+            await this.recordCoalescedDirty(projectId, ticket.zone, resourceId, marker.generation,
+              ticket.generation, covered, budget);
+            raw = JSON.stringify({ schema_version: "1.0", resource_id: resourceId,
+              generation: ticket.generation, entry_hash: null });
+            await this.writeAtToken(path, raw, token, budget);
+            token = await this.readWriteToken(path, budget);
+            if (!token) throw new Error("navigation_dirty_record_revision_missing");
+            marker = dirtySchema.parse(JSON.parse(raw));
+          }
+        } else {
+          raw = JSON.stringify({ schema_version: "1.0", resource_id: resourceId,
+            generation: ticket.generation, entry_hash: null });
+          await this.writeAtToken(path, raw, null, budget);
+          const createdToken = await this.readWriteToken(path, budget);
+          if (!createdToken) throw new Error("navigation_dirty_record_revision_missing");
+          dirtySnapshots.push({ ticket, path, token: createdToken, raw, marker: null });
+          continue;
+        }
+        dirtySnapshots.push({ ticket, path, token, raw: raw!, marker });
+      }
+      await assertHead();
+      const latest = await assertTickets();
+      for (const snapshot of dirtySnapshots) {
+        const token = await this.readWriteToken(snapshot.path, budget);
+        if (token !== snapshot.token) {
+          const raw = await this.runtime.objects.readText(snapshot.path);
+          if (raw !== snapshot.raw) throw new Error("navigation_dirty_record_changed");
+        }
+        const zone = latest.zones[snapshot.ticket.zone] ?? DEFAULT_ZONE_STATE;
+        const ticket = snapshot.ticket;
+        const exact = zone.in_flight_writes.some(write => write.resource_id === resourceId && write.generation === ticket.generation
+          && write.write_hash === currentHash && write.owner_hash === ownerHash);
+        if (!exact && zone.in_flight_writes.some(write => write.resource_id === resourceId)) throw new Error("navigation_source_ticket_stale");
+      }
+      await assertHead();
+      const finalState = await assertTickets();
+      if (proof) {
+        if (!(await proof.verifyCurrent())) throw new Error("navigation_source_head_superseded");
+        await proof.beforeClear();
+        if (!(await proof.verifyCurrent())) throw new Error("navigation_source_head_superseded");
+      }
+      for (const ticket of tickets) {
+        const zone = finalState.zones[ticket.zone] ?? { ...DEFAULT_ZONE_STATE };
+        zone.in_flight_writes = zone.in_flight_writes.filter(write => !(write.resource_id === resourceId
+          && write.generation === ticket.generation && write.write_hash === currentHash && write.owner_hash === ownerHash));
+        finalState.zones[ticket.zone] = zone;
+      }
+      await this.writeProjectState(projectId, finalState, budget);
+    });
+  }
+
   private async completeHeadWritesUnlocked(tickets: readonly ZoneNavigationHeadWriteTicket[], observedEntries: ReadonlyMap<NavigationZone, NavigationInventoryEntry | null>, budget: SliceBudget | undefined, preserveMismatchedTicket: boolean): Promise<void> {
     if (!tickets.length) return;
     const projectId = tickets[0].project_id, resourceId = tickets[0].resource_id;

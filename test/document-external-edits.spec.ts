@@ -5,7 +5,8 @@ import type { DropboxFileMetadata, DropboxTransport } from "../src/dropbox/clien
 import { DropboxConflictError } from "../src/dropbox/client";
 import { workspaceManagedDocumentPath } from "../src/dropbox/layout";
 import { ManagedDocumentReconciler } from "../src/documents/reconciler";
-import { DocumentLedgerRepository } from "../src/documents/repository";
+import { DocumentLedgerRepository, type HeadWriteRecoveryOptions } from "../src/documents/repository";
+import { ZoneNavigationInventory } from "../src/documents/zone-navigation-inventory";
 import { ManagedDocumentService } from "../src/documents/service";
 import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
 import type { ProviderChangeEntry } from "../src/persistence/provider/contract";
@@ -14,6 +15,9 @@ import { machineDocumentHeadPath, machineDocumentRoot, machineDocumentVersionPat
 import { zoneNavigationDirtyRoot } from "../src/documents/zone-navigation-sources";
 import { persistenceFromDropbox } from "./helpers/persistence-runtime";
 import { ProviderOperationError } from "../src/persistence/provider/errors";
+import type { ExecutionAdmission } from "../src/execution/contract";
+import { canonicalJson } from "../src/rules/contract";
+import { ExecutionJournal } from "../src/execution/journal";
 
 class FakeDocumentDropbox implements DropboxTransport {
   files = new Map<string, string>();
@@ -526,6 +530,225 @@ describe("ManagedDocumentReconciler external edits", () => {
     await sources.completeUnownedHeadWritesPreservingMismatch([budgetedTicket!]);
     expect((await sources.readState(project.project_id, "WORKING")).in_flight_resource_ids).not.toContain(`head:${budgeted.document_id}`);
     expect(JSON.parse(dropbox.files.get(dirtyPath)!)).toMatchObject({ resource_id: `head:${budgeted.document_id}`, generation: budgetedTicket!.generation });
+  });
+
+  it.each(["baseline", "probe", "drained", "drained-without-witness", "cleared-without-witness", "coalesced-cas", "head-race", "payload-race"])("disposes an authorized stale head fence against the exact current head without changing source generation: %s", async (scenario) => {
+    const drained = scenario.startsWith("drained");
+    const dropbox = new FakeDocumentDropbox();
+    const runtime = persistenceFromDropbox(dropbox);
+    // The generic Dropbox test adapter deliberately does not promise raw-byte
+    // reads. This fixture supplies the real exact-byte capability locally so
+    // the disposition cannot mistake text extraction for physical evidence.
+    runtime.objects.readBytes = async (path, maxBytes) => {
+      const raw = dropbox.files.get(path);
+      if (raw === undefined) return null;
+      const bytes = new TextEncoder().encode(raw);
+      return bytes.byteLength <= maxBytes ? bytes : null;
+    };
+    const project = state();
+    const service = new ManagedDocumentService(runtime);
+    const original = await createWorking(service, project, "original immutable working bytes");
+    const sources = new ZoneNavigationSources(runtime);
+    expect(await sources.markCatalogReady(project.project_id, "WORKING", 0)).toBe(true);
+    const adoptionId = "DOCREQ-NAV-WORKING-HEAD-RECOVERY-ADOPT-0001";
+    expect(await sources.beginAdoption(project.project_id, "WORKING", adoptionId, 0)).toBe(true);
+    expect(await sources.finishAdoption(project.project_id, "WORKING", adoptionId, 0)).toBe(true);
+
+    const resourceId = `head:${original.document_id}`;
+    const headPath = machineDocumentHeadPath(project.project_id, original.document_id);
+    const originalRaw = dropbox.files.get(headPath);
+    expect(originalRaw).toBeDefined();
+    const originalHash = await sha256(originalRaw!);
+    const orphanHash = drained ? "a".repeat(64) : originalHash;
+    const orphan = await sources.beginHeadWrite(project.project_id, "WORKING", resourceId, undefined, orphanHash);
+    expect(orphan).toMatchObject({ generation: 1, write_hash: orphanHash });
+
+    // A later legitimate write to the same document has advanced the source
+    // and left the newer dirty marker. Recovery must account for generation 1
+    // without downgrading that marker or inventing generation 3.
+    if (!drained) await service.writeWorking({ request_id: "DOCREQ-WORKING-HEAD-RECOVERY-LATER-0001",
+      project_id: project.project_id, logical_path: "strategy/commerciale.md",
+      content: "later canonical working bytes", content_sha256: await sha256("later canonical working bytes"), created_at: at }, project);
+    const currentRaw = dropbox.files.get(headPath);
+    expect(currentRaw).toBeDefined();
+    const currentHash = await sha256(currentRaw!);
+    expect(currentHash).not.toBe(orphanHash);
+    const currentSource = await sources.readState(project.project_id, "WORKING");
+    const expectedGeneration = drained ? 1 : 2;
+    expect(currentSource.generation).toBe(expectedGeneration);
+    expect(currentSource.in_flight_resource_ids).toEqual([resourceId]);
+    const dirtyPath = `${zoneNavigationDirtyRoot(project.project_id, "WORKING")}/${await sha256(resourceId)}.json`;
+    if (!drained) expect(JSON.parse(dropbox.files.get(dirtyPath)!)).toMatchObject({ resource_id: resourceId, generation: 2 });
+    const currentMetadata = dropbox.metadata.get(headPath);
+    expect(currentMetadata).toBeDefined();
+    const uploadsBeforeRecovery = dropbox.files.get(headPath);
+    let rememberedHash: string | null = null;
+    let admittedIntentHash: string | null = null;
+    const ledger = new DocumentLedgerRepository(runtime);
+    const recoveryOptions: HeadWriteRecoveryOptions = {
+      pending_recovery_hash: null,
+      authorize: async (intent): Promise<ExecutionAdmission> => {
+        admittedIntentHash = await sha256(canonicalJson(intent));
+        const admission: ExecutionAdmission = {
+          project_id: project.project_id,
+          operation: "project.materialize",
+          request_id: `DOCREQ-NAV-HEAD-RECOVERY-${admittedIntentHash.toUpperCase()}`,
+          kind: "navigation-head-recovery",
+          request_hash: admittedIntentHash,
+          actor: { actor_id: "project_guard", authority: "durable_object" },
+          resources: [{ resource_id: intent.resource_id, resource_type: "document", zone: "WORKING", version: intent.current_head.content_sha256 }],
+          resource_effect_scopes: [],
+          global_revision: 0,
+          project_revision: project.revision,
+          ruleset: { digest: "a".repeat(64), rules: [], global_revision: 0, project_revision: project.revision },
+          verdict: "allow", results: [], gaps: [], deferred_rules: []
+        };
+        await new ExecutionJournal(runtime, project.project_id, admission.kind, admission.request_id).commit(admission, null);
+        return admission;
+      },
+      rememberRecovery: async (hash: string) => {
+        rememberedHash = hash;
+        if (scenario === "probe") throw new Error("interrupted_after_intent");
+      }
+    };
+    const originalCreate = runtime.objects.createText.bind(runtime.objects);
+    const originalRead = runtime.objects.readText.bind(runtime.objects);
+    let faultInjected = false;
+    if (drained || scenario === "cleared-without-witness") runtime.objects.createText = async (path, raw) => {
+      if (!faultInjected && path.includes("/head-write-recovery/") && path.endsWith("/receipt.json")) {
+        faultInjected = true;
+        throw new Error("interrupted_after_clear");
+      }
+      return originalCreate(path, raw);
+    };
+    if (scenario === "head-race" || scenario === "payload-race") runtime.objects.readText = async path => {
+      const raw = await originalRead(path);
+      if (!faultInjected && path === headPath && rememberedHash !== null) {
+        faultInjected = true;
+        if (scenario === "head-race") await dropbox.externalWrite(headPath, raw!);
+        else {
+          const head = JSON.parse(raw!);
+          const version = JSON.parse(dropbox.files.get(machineDocumentVersionPath(project.project_id, original.document_id, head.working_version_id))!);
+          await dropbox.externalWrite(version.immutable_payload_path, "changed after exact proof");
+        }
+      }
+      return raw;
+    };
+    let result;
+    if (scenario === "probe") {
+      await expect(ledger.recoverOneUnownedHeadWrite(project.project_id, 0, false, recoveryOptions)).rejects.toThrow("interrupted_after_intent");
+      const filesBefore = [...dropbox.files.entries()];
+      const metadataBefore = [...dropbox.metadata.entries()];
+      const probe = await ledger.recoverOneUnownedHeadWrite(project.project_id, 0, true, { ...recoveryOptions,
+        pending_recovery_hash: rememberedHash, authorize: async () => { throw new Error("probe_admitted"); },
+        rememberRecovery: async () => { throw new Error("probe_remembered"); } });
+      expect(probe.status).toBe("unresolved");
+      expect([...dropbox.files.entries()]).toEqual(filesBefore);
+      expect([...dropbox.metadata.entries()]).toEqual(metadataBefore);
+      return;
+    } else if (drained || scenario === "cleared-without-witness") {
+      await expect(ledger.recoverOneUnownedHeadWrite(project.project_id, 0, false, recoveryOptions)).rejects.toThrow("interrupted_after_clear");
+      expect((await sources.readState(project.project_id, "WORKING")).in_flight_resource_ids).toEqual([]);
+      if (drained) {
+      // This transport fixture supplies the same exact conditional deletion
+      // capability as production; generic text-only test adapters omit it.
+      runtime.objects.deleteIfUnchanged = async (path, expected) => {
+        const actual = dropbox.metadata.get(path);
+        if (!actual) return "missing";
+        if (actual.id !== expected.objectId || actual.rev !== expected.revisionToken) return "changed";
+        await dropbox.delete(path);
+        return "deleted";
+      };
+      const inventory = new ZoneNavigationInventory(runtime, sources);
+      let cursor: string | null = null;
+      for (let step = 0; step < 8 && await sources.hasDirtyMarker(project.project_id, "WORKING", resourceId); step++) {
+        const page = await inventory.listPage({ project_id: project.project_id, zone: "WORKING", cursor, limit: 8,
+          budget: { deadline_ms: Date.now() + 60_000, calls_left: 2000, now: () => Date.now(),
+            signal: new AbortController().signal, beforeHttp: () => {}, canStartEffect: () => true } });
+        expect(page.gaps).toEqual([]);
+        cursor = page.next_cursor;
+      }
+      expect(await sources.hasDirtyMarker(project.project_id, "WORKING", resourceId)).toBe(false);
+      expect((await sources.compactCatalogManifest(project.project_id, "WORKING"))?.ready_generation).toBe(1);
+      }
+      runtime.objects.createText = originalCreate;
+      if (scenario.endsWith("without-witness")) {
+        const witness = `${machineDocumentRoot(project.project_id)}/navigation-sources/head-write-recovery/${rememberedHash}/completion.json`;
+        expect(dropbox.files.has(witness)).toBe(true);
+        await dropbox.delete(witness);
+      }
+      result = await ledger.recoverOneUnownedHeadWrite(project.project_id, 0, false, { ...recoveryOptions, pending_recovery_hash: rememberedHash });
+      if (scenario.endsWith("without-witness")) {
+        expect(result.status).toBe("unresolved");
+        expect([...dropbox.files.keys()].some(path => path.includes("/head-write-recovery/") && path.endsWith("/receipt.json"))).toBe(false);
+        return;
+      }
+      expect(result.status).toBe("recovered");
+    } else {
+      result = await ledger.recoverOneUnownedHeadWrite(project.project_id, 0, false, recoveryOptions);
+      runtime.objects.readText = originalRead;
+      if (scenario.endsWith("race")) {
+        expect(faultInjected).toBe(true);
+        expect(result.status).toBe("unresolved");
+        expect((await sources.readState(project.project_id, "WORKING")).in_flight_resource_ids).toContain(resourceId);
+        expect([...dropbox.files.keys()].some(path => path.includes("/head-write-recovery/") && path.endsWith("/receipt.json"))).toBe(false);
+        return;
+      }
+    }
+
+    expect(result.status).toBe("recovered");
+    expect(admittedIntentHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(rememberedHash).toBe(admittedIntentHash);
+    expect(rememberedHash).not.toBeNull();
+    const recoveryRoot = `${machineDocumentRoot(project.project_id)}/navigation-sources/head-write-recovery/${rememberedHash}`;
+    const intentRaw = dropbox.files.get(`${recoveryRoot}/intent.json`);
+    expect(intentRaw).toBeDefined();
+    expect(JSON.parse(intentRaw!)).toMatchObject({
+      schema_version: "1.0", project_id: project.project_id, resource_id: resourceId,
+      original_outcome: "unknown", original_tickets: [orphan],
+      current_head: { path: headPath, object_id: currentMetadata!.id, revision_token: currentMetadata!.rev,
+        content_sha256: currentHash, size: currentMetadata!.size }
+    });
+    expect(dropbox.files.get(headPath)).toBe(uploadsBeforeRecovery);
+    expect(dropbox.metadata.get(headPath)).toEqual(currentMetadata);
+    const afterSource = await sources.readState(project.project_id, "WORKING");
+    expect(afterSource.generation).toBe(expectedGeneration);
+    expect(afterSource.in_flight_resource_ids).toEqual([]);
+    if (!drained) expect(JSON.parse(dropbox.files.get(dirtyPath)!)).toMatchObject({ resource_id: resourceId, generation: 2 });
+    const readyRaw = dropbox.files.get(`${machineDocumentRoot(project.project_id)}/navigation-sources/WORKING/catalog/compact/ready.json`);
+    if (!drained) {
+      expect(readyRaw).toContain(`\"resource_id\":\"${resourceId}\"`);
+      expect(readyRaw).toContain("covered_generations");
+    }
+    if (scenario === "coalesced-cas") {
+      // First recovery covered generation1 under the pending marker2. A new
+      // stranded fence3 upgrades that marker. Interrupt exactly after compact
+      // coverage [1,2] was persisted, before marker2's conditional write.
+      expect(await sources.beginHeadWrite(project.project_id, "WORKING", resourceId, undefined, "b".repeat(64)))
+        .toMatchObject({ generation: 3 });
+      const originalConditional = runtime.conditionalWrite!.writeTextConditional.bind(runtime.conditionalWrite);
+      let interrupted = false;
+      runtime.conditionalWrite!.writeTextConditional = async (path, raw, token) => {
+        if (!interrupted && path === dirtyPath) {
+          interrupted = true;
+          expect((await sources.compactCatalogManifest(project.project_id, "WORKING"))?.coalesced_dirty)
+            .toContainEqual({ resource_id: resourceId, latest_generation: 3, covered_generations: [{ start: 1, end: 2 }] });
+          throw new Error("interrupted_after_coalesced_before_marker_cas");
+        }
+        return originalConditional(path, raw, token);
+      };
+      await expect(ledger.recoverOneUnownedHeadWrite(project.project_id, 0, false, recoveryOptions))
+        .rejects.toThrow("interrupted_after_coalesced_before_marker_cas");
+      expect(interrupted).toBe(true);
+      expect(JSON.parse(dropbox.files.get(dirtyPath)!)).toMatchObject({ generation: 2 });
+      runtime.conditionalWrite!.writeTextConditional = originalConditional;
+      expect(await ledger.recoverOneUnownedHeadWrite(project.project_id, 0, false,
+        { ...recoveryOptions, pending_recovery_hash: rememberedHash })).toMatchObject({ status: "recovered" });
+      expect((await sources.compactCatalogManifest(project.project_id, "WORKING"))?.coalesced_dirty)
+        .toContainEqual({ resource_id: resourceId, latest_generation: 3, covered_generations: [{ start: 1, end: 2 }] });
+      expect(JSON.parse(dropbox.files.get(dirtyPath)!)).toMatchObject({ generation: 3 });
+      expect((await sources.readState(project.project_id, "WORKING")).generation).toBe(3);
+    }
   });
 
   it("restores a deleted WORKING file from its immutable active version without advancing history", async () => {

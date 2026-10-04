@@ -92,6 +92,8 @@ export interface ManagedDocumentReconcileOptions {
   now?: string;
   /** Internal local-alarm cap; public POST caps remain scheduled=1/non-scheduled=256. */
   local_alarm_job_limit?: number;
+  /** A verified pre-existing navigation head debt prevents daily verification completion. */
+  scheduled_verification_blocked?: boolean;
 }
 
 export type ObservedPackageDriftAdmission = (
@@ -351,7 +353,8 @@ export class ManagedDocumentChangeCoordinator {
       summary.budget_yield = summary.budget_yield || secondDrain.budget_yield;
     }
     this.populateContinuationCounts(summary, attemptAtMs);
-    if (options.scheduled && !summary.budget_yield && !page.has_more && summary.jobs_pending === 0 && summary.job_failures === 0) {
+    if (options.scheduled && options.scheduled_verification_blocked !== true && !summary.budget_yield
+      && !page.has_more && summary.jobs_pending === 0 && summary.job_failures === 0) {
       const completedAt = options.now ?? new Date().toISOString();
       this.jobs.completeScheduledVerification(completedAt);
       summary.late_since = null;

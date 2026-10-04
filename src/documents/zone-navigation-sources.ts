@@ -894,6 +894,32 @@ export class ZoneNavigationSources {
     return this.withMutationLock(projectId, resourceId, () => this.beginHeadWritesUnlocked(projectId, affectedZones, resourceId, budget, recoveryZones, writeHash, forceGeneration, ownerHash));
   }
 
+  /** Return bounded-work candidates for exact recovery of persisted head writes.
+   * This is a read-only view: callers must independently verify canonical head
+   * bytes before completing any ticket. */
+  async unownedHeadWriteRecoveryCandidates(projectId: string, budget?: SliceBudget): Promise<ZoneNavigationHeadWriteTicket[][]> {
+    const state = await this.readProjectState(projectId, budget);
+    const groups = new Map<string, ZoneNavigationHeadWriteTicket[]>();
+    for (const zone of zones) {
+      const current = state.zones[zone] ?? DEFAULT_ZONE_STATE;
+      if (current.catalog_rebuild_request_id || (!current.adopted && !current.adoption_request_id)) continue;
+      for (const write of current.in_flight_writes) {
+        if (write.owner_hash !== undefined || !/^head:DOC-[A-F0-9]{24}$/.test(write.resource_id)
+          || typeof write.write_hash !== "string" || !/^[a-f0-9]{64}$/.test(write.write_hash)) continue;
+        const key = `${write.resource_id}\u0000${write.write_hash}`;
+        const tickets = groups.get(key) ?? [];
+        tickets.push({ project_id: projectId, zone, resource_id: write.resource_id,
+          generation: write.generation, write_hash: write.write_hash });
+        groups.set(key, tickets);
+      }
+    }
+    return [...groups.values()].sort((left, right) => {
+      const leftKey = `${left[0].resource_id}\u0000${left[0].write_hash}`;
+      const rightKey = `${right[0].resource_id}\u0000${right[0].write_hash}`;
+      return leftKey.localeCompare(rightKey);
+    });
+  }
+
   private async beginHeadWritesUnlocked(projectId: string, affectedZones: readonly NavigationZone[], resourceId: string, budget?: SliceBudget, recoveryZones: readonly NavigationZone[] = [], writeHash: string | null = null, forceGeneration = false, ownerHash?: string): Promise<ZoneNavigationHeadWriteTicket[]> {
     if (writeHash !== null && !/^[a-f0-9]{64}$/.test(writeHash)) throw new Error("navigation_source_write_hash_invalid");
     if (ownerHash !== undefined && !/^[a-f0-9]{64}$/.test(ownerHash)) throw new Error("navigation_source_owner_hash_invalid");
@@ -986,19 +1012,32 @@ export class ZoneNavigationSources {
   /** Durable dirty marker is written before clearing the in-flight fence. */
   async completeHeadWrites(tickets: readonly ZoneNavigationHeadWriteTicket[], observedEntries: ReadonlyMap<NavigationZone, NavigationInventoryEntry | null> = new Map(), budget?: SliceBudget): Promise<void> {
     if (!tickets.length) return;
-    return this.withMutationLock(tickets[0].project_id, tickets[0].resource_id, () => this.completeHeadWritesUnlocked(tickets, observedEntries, budget));
+    return this.withMutationLock(tickets[0].project_id, tickets[0].resource_id, () => this.completeHeadWritesUnlocked(tickets, observedEntries, budget, false));
   }
 
-  private async completeHeadWritesUnlocked(tickets: readonly ZoneNavigationHeadWriteTicket[], observedEntries: ReadonlyMap<NavigationZone, NavigationInventoryEntry | null>, budget?: SliceBudget): Promise<void> {
+  /** Exact recovery may leave a raced or mismatched ticket unresolved, but it
+   * must never discard that ticket as a side effect of attempting completion. */
+  async completeUnownedHeadWritesPreservingMismatch(tickets: readonly ZoneNavigationHeadWriteTicket[], budget?: SliceBudget): Promise<void> {
+    if (!tickets.length || tickets.some(ticket => ticket.write_hash === null || ticket.owner_hash !== undefined
+      || !/^head:DOC-[A-F0-9]{24}$/.test(ticket.resource_id) || !/^[a-f0-9]{64}$/.test(ticket.write_hash ?? ""))) {
+      throw new Error("navigation_source_recovery_ticket_invalid");
+    }
+    return this.withMutationLock(tickets[0].project_id, tickets[0].resource_id,
+      () => this.completeHeadWritesUnlocked(tickets, new Map(), budget, true));
+  }
+
+  private async completeHeadWritesUnlocked(tickets: readonly ZoneNavigationHeadWriteTicket[], observedEntries: ReadonlyMap<NavigationZone, NavigationInventoryEntry | null>, budget: SliceBudget | undefined, preserveMismatchedTicket: boolean): Promise<void> {
     if (!tickets.length) return;
     const projectId = tickets[0].project_id, resourceId = tickets[0].resource_id;
     if (tickets.some((ticket) => ticket.project_id !== projectId || ticket.resource_id !== resourceId)) throw new Error("navigation_source_ticket_binding");
     const before = await this.readProjectState(projectId, budget);
     for (const { zone, generation } of tickets) {
-      if (!(before.zones[zone] ?? DEFAULT_ZONE_STATE).in_flight_writes.some((write) => { const ticket = tickets.find((item) => item.zone === zone)!; return write.resource_id === resourceId && write.generation === generation && (write.write_hash ?? null) === ticket.write_hash && write.owner_hash === ticket.owner_hash; })) throw new Error("navigation_source_ticket_stale");
+      const source = before.zones[zone] ?? DEFAULT_ZONE_STATE;
+      if (preserveMismatchedTicket && generation > source.generation) throw new Error("navigation_source_ticket_future_generation");
+      if (!source.in_flight_writes.some((write) => { const ticket = tickets.find((item) => item.zone === zone)!; return write.resource_id === resourceId && write.generation === generation && (write.write_hash ?? null) === ticket.write_hash && write.owner_hash === ticket.owner_hash; })) throw new Error("navigation_source_ticket_stale");
     }
     for (const ticket of tickets) if (!await this.headWriteIsCurrent(ticket, budget)) {
-      await this.discardHeadWrite(ticket, budget);
+      if (!preserveMismatchedTicket) await this.discardHeadWrite(ticket, budget);
       throw new Error("navigation_source_head_superseded");
     }
     // Capture per-resource CAS tokens before the final ticket validation. If a
@@ -1034,7 +1073,9 @@ export class ZoneNavigationSources {
     }
     const beforeWrites = await this.readProjectState(projectId, budget);
     for (const { zone, generation } of tickets) {
-      if (!(beforeWrites.zones[zone] ?? DEFAULT_ZONE_STATE).in_flight_writes.some((write) => { const ticket = tickets.find((item) => item.zone === zone)!; return write.resource_id === resourceId && write.generation === generation && (write.write_hash ?? null) === ticket.write_hash && write.owner_hash === ticket.owner_hash; })) throw new Error("navigation_source_ticket_stale");
+      const source = beforeWrites.zones[zone] ?? DEFAULT_ZONE_STATE;
+      if (preserveMismatchedTicket && generation > source.generation) throw new Error("navigation_source_ticket_future_generation");
+      if (!source.in_flight_writes.some((write) => { const ticket = tickets.find((item) => item.zone === zone)!; return write.resource_id === resourceId && write.generation === generation && (write.write_hash ?? null) === ticket.write_hash && write.owner_hash === ticket.owner_hash; })) throw new Error("navigation_source_ticket_stale");
     }
     for (const { zone, generation, catalogPath, dirtyPath, catalogToken, dirtyToken, previousGeneration, coveredGenerations } of mutations) {
       const observedEntry = observedEntries.get(zone);
@@ -1044,18 +1085,21 @@ export class ZoneNavigationSources {
         if (previousGeneration !== null) await this.recordCoalescedDirty(projectId, zone, resourceId, previousGeneration, generation, coveredGenerations, budget);
         await this.writeAtToken(dirtyPath, JSON.stringify({ schema_version: "1.0", resource_id: resourceId, generation, entry_hash: observedEntry ? await entryHash(observedEntry) : null }), dirtyToken, budget);
       } catch (error) {
-        for (const ticket of tickets) if (!await this.headWriteIsCurrent(ticket, budget)) await this.discardHeadWrite(ticket, budget);
+        if (!preserveMismatchedTicket) {
+          for (const ticket of tickets) if (!await this.headWriteIsCurrent(ticket, budget)) await this.discardHeadWrite(ticket, budget);
+        }
         throw error;
       }
     }
     for (const ticket of tickets) if (!await this.headWriteIsCurrent(ticket, budget)) {
-      await this.discardHeadWrite(ticket, budget);
+      if (!preserveMismatchedTicket) await this.discardHeadWrite(ticket, budget);
       throw new Error("navigation_source_head_superseded");
     }
     const state = await this.readProjectState(projectId, budget);
     for (const { zone } of tickets) {
       const current = state.zones[zone] ?? { ...DEFAULT_ZONE_STATE };
       const ticket = tickets.find((item) => item.zone === zone)!;
+      if (preserveMismatchedTicket && ticket.generation > current.generation) throw new Error("navigation_source_ticket_future_generation");
       if (!current.in_flight_writes.some((write) => write.resource_id === resourceId && write.generation === ticket.generation && (write.write_hash ?? null) === ticket.write_hash && write.owner_hash === ticket.owner_hash)) throw new Error("navigation_source_ticket_stale");
       current.in_flight_writes = current.in_flight_writes.filter((write) => !(write.resource_id === resourceId && write.generation === ticket.generation && (write.write_hash ?? null) === ticket.write_hash && write.owner_hash === ticket.owner_hash));
       state.zones[zone] = current;

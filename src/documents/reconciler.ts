@@ -325,7 +325,10 @@ export class ManagedDocumentReconciler {
     const head = await this.ledger.readHead(state.project_id, documentId);
     if (!head || head.kind !== "work_product") return null;
     const currentObservation = zone === "working" ? head.provider?.working : head.provider?.review;
-    if (sameObservation(currentObservation, metadata)) return null;
+    if (sameObservation(currentObservation, metadata)) {
+      await this.ledger.recoverUnownedHeadWriteForResource(state.project_id, `head:${head.document_id}`);
+      return null;
+    }
 
     const parentVersionId = zone === "working" ? head.working_version_id : head.review_version_id;
     if (!parentVersionId) return null;

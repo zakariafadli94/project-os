@@ -812,13 +812,23 @@ export class ProjectGuard extends DurableObject<Env> {
           if (scheduled && !await this.settleOneStaleWorkingNavigation(state)) {
             await this.recoverOneKnownNavigationOrphan(state);
           }
+          const scheduledHeadRecovery = scheduled
+            ? await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal)
+            : null;
+          const scheduledVerificationBlocked = Boolean(scheduledHeadRecovery
+            && (scheduledHeadRecovery.status === "unresolved"
+              || (scheduledHeadRecovery.status === "recovered" && scheduledHeadRecovery.remainingCandidates)));
           // Persist and arm the local continuation before bounded provider I/O.
           this.ctx.storage.sql.exec(
             "INSERT INTO navigation_refresh_scan (singleton, requested_at) VALUES (1, ?) ON CONFLICT(singleton) DO NOTHING",
             new Date().toISOString()
           );
-          const result = await this.createManagedDocumentChangeCoordinator(slice.runtime, slice.scope, continuation.slice_ordinal)
-            .reconcile(state, { scheduled, now: new Date(requestEnteredAt).toISOString() });
+          const reconciled = await this.createManagedDocumentChangeCoordinator(slice.runtime, slice.scope, continuation.slice_ordinal)
+            .reconcile(state, { scheduled, now: new Date(requestEnteredAt).toISOString(),
+              scheduled_verification_blocked: scheduledVerificationBlocked });
+          const result = scheduledHeadRecovery?.status === "unresolved"
+            ? { ...reconciled, safe_errors: [...reconciled.safe_errors, "navigation_head_write_recovery_unresolved"].slice(0, 8) }
+            : reconciled;
           const scanWakeAt = this.documentScanRecoveryWake(result, Date.now());
           const scanOutcome = this.documentContinuationOutcome(result);
           if (continuation.last_outcome?.global_notification_owed === true) {
@@ -846,10 +856,16 @@ export class ProjectGuard extends DurableObject<Env> {
             : navigationRefreshFailed
               ? { ...result, safe_errors: [...result.safe_errors, "navigation_refresh_scan_failed"].slice(0, 8) }
               : result;
-          const resultWake = this.documentContinuationWake(continuationResult, Date.now());
+          const wakeInput = scheduledHeadRecovery?.status === "unresolved"
+            ? { ...continuationResult, safe_errors: reconciled.safe_errors }
+            : continuationResult;
+          const resultWake = this.documentContinuationWake(wakeInput, Date.now());
+          const recoveredSiblingWake = scheduledHeadRecovery?.status === "recovered" && scheduledHeadRecovery.remainingCandidates;
           const next = navigationRefreshBudgetYield || navigationRefreshFailed
             ? { pending: true, at: resultWake.at ?? Date.now() + 20_000 }
-            : resultWake;
+            : recoveredSiblingWake
+              ? { pending: true, at: Math.max(resultWake.at ?? 0, Date.now() + 20_000) }
+              : resultWake;
           const nextOutcome = this.documentContinuationOutcome(continuationResult);
           if (scanOutcome.global_notification_owed === true) {
             nextOutcome.global_notification_owed = true;
@@ -1329,6 +1345,7 @@ export class ProjectGuard extends DurableObject<Env> {
     const continuation = store.beginContinuationSlice(undefined, alarmEnteredAt);
     const slice = this.createManagedDocumentSlice(alarmEnteredAt);
     const resultCapture: { value: Awaited<ReturnType<ManagedDocumentChangeCoordinator["reconcile"]>> | null } = { value: null };
+    let postCoordinatorRecoveryInProgress = false;
     try {
       await this.serialize(async () => {
         const state = await this.readManagedDocumentState(slice.runtime, slice.scope);
@@ -1349,34 +1366,78 @@ export class ProjectGuard extends DurableObject<Env> {
           "INSERT INTO navigation_refresh_scan (singleton, requested_at) VALUES (1, ?) ON CONFLICT(singleton) DO NOTHING",
           new Date().toISOString()
         );
+        let headWriteRecoveryUnresolved = false;
+        let headWriteRecoveryRecovered = false;
+        let headWriteRecoveryCandidatesRemain = false;
+        let preCoordinatorRecoveryAttempted = false;
+        let scheduledVerificationBlocked = false;
+        if (continuation.slice_ordinal % 2 === 1) {
+          const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal);
+          preCoordinatorRecoveryAttempted = recovery.status !== "none";
+          headWriteRecoveryUnresolved = recovery.status === "unresolved";
+          headWriteRecoveryRecovered = recovery.status === "recovered";
+          headWriteRecoveryCandidatesRemain = recovery.remainingCandidates;
+          scheduledVerificationBlocked = continuation.scheduled
+            && (recovery.status === "unresolved" || (recovery.status === "recovered" && recovery.remainingCandidates));
+        } else if (continuation.scheduled) {
+          const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime,
+            continuation.slice_ordinal, true);
+          scheduledVerificationBlocked = recovery.status === "unresolved";
+        }
         const result = await this.createManagedDocumentChangeCoordinator(slice.runtime, slice.scope, continuation.slice_ordinal)
-          .reconcile(state, { scheduled: continuation.scheduled, local_alarm_job_limit: 8, now: new Date(alarmEnteredAt).toISOString() });
+          .reconcile(state, { scheduled: continuation.scheduled, local_alarm_job_limit: 8,
+            scheduled_verification_blocked: scheduledVerificationBlocked, now: new Date(alarmEnteredAt).toISOString() });
         resultCapture.value = result;
         const previousPreludeFailure = store.preludeFailureCheckpoint();
         if (previousPreludeFailure) {
           const currentProgress = await store.feedProgressFingerprint(result.semantic_progress);
           if (currentProgress !== previousPreludeFailure.progress_fingerprint) store.breakInternalPreludeFailureStreak();
         }
-        const scanWakeAt = this.documentScanRecoveryWake(result, Date.now());
-        const scanOutcome = this.documentContinuationOutcome(result);
-        const predictedNext = this.documentContinuationWake(result, Date.now());
+        const coordinatorOutcome = this.documentContinuationOutcome(result);
+        if (before.last_outcome?.global_notification_owed === true) coordinatorOutcome.global_notification_owed = true;
+        const coordinatorWake = this.documentScanRecoveryWake(result, Date.now());
+        store.finishContinuationSlice({ pending: true, next_wake_at: coordinatorWake,
+          documents_priority_next: false, feed_retry_at: result.feed_retry_at ?? continuation.feed_retry_at,
+          outcome: coordinatorOutcome });
+        await this.armRequestRecoveryAlarm(Math.max(1, coordinatorWake - Date.now()));
+        let continuationResult = result;
+        if (!preCoordinatorRecoveryAttempted) {
+          postCoordinatorRecoveryInProgress = true;
+          const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal);
+          postCoordinatorRecoveryInProgress = false;
+          headWriteRecoveryUnresolved = recovery.status === "unresolved";
+          headWriteRecoveryRecovered = recovery.status === "recovered";
+          headWriteRecoveryCandidatesRemain = recovery.remainingCandidates;
+        }
+        if (headWriteRecoveryUnresolved) continuationResult = { ...continuationResult,
+          safe_errors: [...continuationResult.safe_errors, "navigation_head_write_recovery_unresolved"].slice(0, 8) };
+        resultCapture.value = continuationResult;
+        const scanWakeAt = this.documentScanRecoveryWake(continuationResult, Date.now());
+        const scanOutcome = this.documentContinuationOutcome(continuationResult);
+        const predictedNext = this.documentContinuationWake(continuationResult, Date.now());
         if (before.last_outcome?.global_notification_owed === true || (!predictedNext.pending && before.pending)) {
           scanOutcome.global_notification_owed = true;
         }
         store.finishContinuationSlice({ pending: true, next_wake_at: scanWakeAt,
-          documents_priority_next: false, feed_retry_at: result.feed_retry_at ?? continuation.feed_retry_at,
+          documents_priority_next: false, feed_retry_at: continuationResult.feed_retry_at ?? continuation.feed_retry_at,
           outcome: scanOutcome });
         await this.armRequestRecoveryAlarm(Math.max(1, scanWakeAt - Date.now()));
         await this.enqueueNavigationRefreshForDirtyZones(state.project_id, slice.runtime);
         this.ctx.storage.sql.exec("DELETE FROM navigation_refresh_scan WHERE singleton = 1");
-        const next = this.documentContinuationWake(result, Date.now());
-        const nextOutcome = this.documentContinuationOutcome(result);
+        const wakeInput = headWriteRecoveryUnresolved
+          ? { ...continuationResult, safe_errors: result.safe_errors }
+          : continuationResult;
+        const predictedOutcome = this.documentContinuationWake(wakeInput, Date.now());
+        const next = headWriteRecoveryRecovered && headWriteRecoveryCandidatesRemain
+          ? { pending: true, at: Math.max(predictedOutcome.at ?? 0, Date.now() + 20_000) }
+          : predictedOutcome;
+        const nextOutcome = this.documentContinuationOutcome(continuationResult);
         if (scanOutcome.global_notification_owed === true || (!next.pending && before.pending)) {
           nextOutcome.global_notification_owed = true;
         }
         store.finishContinuationSlice({ pending: next.pending, next_wake_at: next.at,
           documents_priority_next: false,
-          feed_retry_at: result.feed_retry_at ?? continuation.feed_retry_at,
+          feed_retry_at: continuationResult.feed_retry_at ?? continuation.feed_retry_at,
           outcome: nextOutcome });
       });
     } catch (error) {
@@ -1389,24 +1450,29 @@ export class ProjectGuard extends DurableObject<Env> {
       if (owedCheckpoint || before.last_outcome?.global_notification_owed === true) {
         currentOutcome.global_notification_owed = true;
       }
-      const preludeInternalFailure = result === null && error instanceof InternalExecutionFailure;
+      const preludeInternalFailure = error instanceof InternalExecutionFailure
+        && (result === null || postCoordinatorRecoveryInProgress);
       const preludeFailure = preludeInternalFailure
         ? store.recordInternalPreludeFailure(
           await sha256Text(JSON.stringify({ type: "InternalExecutionFailure", code: error.code, stage: error.stage })),
-          await store.feedProgressFingerprint(typeof previousOutcome.semantic_progress === "number"
-            && Number.isSafeInteger(previousOutcome.semantic_progress) && previousOutcome.semantic_progress >= 0
-            ? previousOutcome.semantic_progress : 0)
+          await store.feedProgressFingerprint(result?.semantic_progress
+            ?? (typeof previousOutcome.semantic_progress === "number"
+              && Number.isSafeInteger(previousOutcome.semantic_progress) && previousOutcome.semantic_progress >= 0
+              ? previousOutcome.semantic_progress : 0))
         )
         : null;
-      if (result === null && !preludeInternalFailure && !budgetYield) store.breakInternalPreludeFailureStreak();
-      const preludeRetryAt = result === null && !budgetYield
+      if ((result === null || postCoordinatorRecoveryInProgress) && !preludeInternalFailure && !budgetYield) {
+        store.breakInternalPreludeFailureStreak();
+      }
+      const preludeRetryAt = (result === null || postCoordinatorRecoveryInProgress) && !budgetYield
         ? safeDocumentRetryDeadline(now, error instanceof ProviderOperationError ? error.diagnostics?.retryAfterMs : undefined)
         : null;
-      const retryAt = result ? result.feed_retry_at : budgetYield
-        ? before.feed_retry_at
-        : preludeRetryAt === null
-          ? before.feed_retry_at
-          : Math.max(before.feed_retry_at ?? 0, preludeRetryAt);
+      const retryAt = result
+        ? [result.feed_retry_at, preludeRetryAt].filter((value): value is number => value !== null)
+          .reduce<number | null>((latest, value) => Math.max(latest ?? 0, value), null)
+        : budgetYield ? before.feed_retry_at
+          : preludeRetryAt === null ? before.feed_retry_at
+            : Math.max(before.feed_retry_at ?? 0, preludeRetryAt);
       const executable = result
         ? result.executable_jobs > 0
         : false;
@@ -1416,6 +1482,8 @@ export class ProjectGuard extends DurableObject<Env> {
         .filter((value): value is number => value !== null && value > now && value < Number.MAX_SAFE_INTEGER);
       const nextWake = preludeFailure?.stopped
         ? Number.MAX_SAFE_INTEGER
+        : result !== null && postCoordinatorRecoveryInProgress && retryAt !== null
+        ? Math.max(retryAt, executable || feedDue ? now + 1_000 : futureWake.length ? Math.min(...futureWake) : now + 1_000)
         : result === null && !budgetYield
         ? retryAt ?? now + REQUEST_RECOVERY_RETRY_DELAY_MS
         : result === null && budgetYield
@@ -1443,8 +1511,12 @@ export class ProjectGuard extends DurableObject<Env> {
               safe_errors: [preludeError!] }
         : budgetYield
           ? { ...currentOutcome, budget_yield: true, safe_errors: previousErrors }
-          : { ...currentOutcome, verification_completed: false,
-            safe_errors: [...previousErrors, error instanceof RuleAdmissionRejection ? "rule_admission_unavailable" : "document_slice_failed"].slice(0, 8), budget_yield: false } });
+        : { ...currentOutcome, verification_completed: false,
+            safe_errors: Array.from(new Set([...previousErrors,
+              error instanceof RuleAdmissionRejection ? "rule_admission_unavailable"
+                : error instanceof ProviderOperationError && error.retryable ? "provider_retryable" : "document_slice_failed",
+              ...(error instanceof ProviderOperationError && error.retryable ? ["document_slice_failed"] : [])])).slice(0, 8),
+            budget_yield: false } });
     } finally {
       clearTimeout(slice.abortTimer);
     }
@@ -3389,6 +3461,15 @@ export class ProjectGuard extends DurableObject<Env> {
     if (!hasInFlightTicket && await sources.hasDirtyMarker(projectId, zone, resourceId)) return;
     const ticket = await sources.beginHeadWrite(projectId, zone, resourceId, undefined, null);
     if (ticket) await sources.completeHeadWrites([ticket]);
+  }
+
+  private async recoverOneUnownedNavigationHeadWrite(
+    projectId: string,
+    runtime: ProjectOsPersistenceRuntime,
+    sliceOrdinal: number,
+    probeOnly = false
+  ): Promise<{ status: "none" | "recovered" | "unresolved"; remainingCandidates: boolean }> {
+    return new DocumentLedgerRepository(runtime).recoverOneUnownedHeadWrite(projectId, sliceOrdinal, probeOnly);
   }
 
   private async resumePendingNavigationRefreshes(): Promise<void> {

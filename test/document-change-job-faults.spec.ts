@@ -101,12 +101,18 @@ describe("durable managed-document change jobs", () => {
   });
 
   it("reports a bounded checkpoint without advancing verification or changing durable jobs", async () => {
-    installDropboxMock();
+    const mock = installDropboxMock();
     const created = await createProject("TXN-CHANGEJOB-CHECKPOINT-READ-0001", "checkpoint-read");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     const snapshot = async () => runInDurableObject(guard, async (_instance, state) =>
-      ["managed_document_change_control", "managed_document_drift_control", "managed_document_change_jobs", "managed_document_change_quarantine", "managed_document_drift_findings"]
-        .map(table => state.storage.sql.exec(`SELECT * FROM ${table}`).toArray()));
+      ({
+        tables: ["managed_document_change_control", "managed_document_drift_control", "managed_document_change_jobs",
+          "managed_document_change_selection_control", "managed_document_change_continuation", "managed_document_change_job_failure_state",
+          "managed_document_change_quarantine", "managed_document_drift_findings"]
+          .map(table => state.storage.sql.exec(`SELECT * FROM ${table}`).toArray()),
+        values: Array.from((await state.storage.list()).entries()),
+        alarm: await state.storage.getAlarm()
+      }));
     await runInDurableObject(guard, async (_instance, state) => {
       const jobs = new ManagedDocumentChangeJobStore(state.storage);
       jobs.registerPage({ expected_cursor: null, next_cursor: "private-provider-cursor", jobs: [] });
@@ -123,20 +129,98 @@ describe("durable managed-document change jobs", () => {
       const pending = { job_id: `CHGJOB-${"F".repeat(24)}`, change: { kind: "file" as const, path: "/private/pending", name: "pending" }, detection_source: "incremental" as const, priority: 10 };
       jobs.registerPage({ expected_cursor: jobs.cursor(), next_cursor: "private-provider-cursor", jobs: [pending] });
       jobs.markFailed(pending.job_id, "private-error-payload");
+
+      const baseNow = Date.parse("2026-10-03T10:00:00.000Z");
+      const executable = { job_id: "CHGJOB-111111111111111111111111", change: { kind: "file" as const, path: "/private/executable", name: "executable" }, detection_source: "incremental" as const, priority: 10 };
+      const future = { job_id: "CHGJOB-222222222222222222222222", change: { kind: "file" as const, path: "/private/future", name: "future" }, detection_source: "incremental" as const, priority: 10 };
+      const stopped = { job_id: "CHGJOB-333333333333333333333333", change: { kind: "file" as const, path: "/private/stopped", name: "stopped" }, detection_source: "incremental" as const, priority: 10 };
+      for (const job of [executable, future, stopped]) {
+        jobs.registerPage({ expected_cursor: jobs.cursor(), next_cursor: "private-provider-cursor", jobs: [job] });
+      }
+      const futureJob = jobs.pending().find(job => job.job_id === future.job_id)!;
+      jobs.recordFailure(futureJob, "provider_retryable", {
+        failure_fingerprint: "a".repeat(64), progress_fingerprint: "b".repeat(64),
+        classification: "provider_retryable", now_ms: baseNow, retry_after_ms: 7 * 24 * 60 * 60 * 1000
+      });
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const stoppedJob = jobs.pending().find(job => job.job_id === stopped.job_id)!;
+        jobs.recordFailure(stoppedJob, "internal_failure", {
+          failure_fingerprint: "c".repeat(64), progress_fingerprint: "d".repeat(64),
+          classification: "internal", now_ms: baseNow + attempt
+        });
+      }
+      const wakeAt = baseNow + 90_000;
+      jobs.beginContinuationSlice(true);
+      jobs.finishContinuationSlice({ pending: true, next_wake_at: wakeAt, documents_priority_next: true,
+        feed_retry_at: wakeAt + 30_000, outcome: {
+          semantic_progress: 7, jobs_registered: 2, jobs_completed: 1, jobs_pending: 4, job_failures: 2,
+          jobs_quarantined: 8, executable_jobs: 2, future_eligible_jobs: 1, stopped_unresolved_jobs: 1,
+          earliest_eligible_at: baseNow + 7 * 24 * 60 * 60 * 1000,
+          budget_yield: true, unread_feed: true, verification_completed: false, global_notification_owed: true,
+          safe_errors: ["provider_retryable", "document_slice_failed"],
+          raw_error_message: "private-error-payload", provider_path: "/private/provider-path",
+          cursor: "private-provider-cursor", request_body: "private-request-body"
+        } });
     });
     const before = await snapshot();
+    const providerCallCount = mock.providerCalls.length;
+    const localCheckpoint = await runInDurableObject(guard, async (_instance, state) =>
+      new ManagedDocumentChangeJobStore(state.storage).readCheckpoint("2026-10-03T10:00:00.000Z"));
+    expect(localCheckpoint.eligibility).toEqual({ executable: 2, future: 1, stopped: 1, earliest_eligible_at: Date.parse("2026-10-10T10:00:00.000Z") });
+    expect(localCheckpoint.continuation.last_outcome?.verification_completed).toBe(false);
+    expect(mock.providerCalls).toHaveLength(providerCallCount);
     const response = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
     expect(response.status).toBe(200);
     const value = await response.json<any>();
     expect(value.document_change_checkpoint).toMatchObject({ read_only: true, project_id: created.project_id,
       schedule: { last_verified_at: "2026-10-01T12:00:00.000Z", next_verification_at: "2026-10-02T12:00:00.000Z", late_since: null, due: true },
-      cursor: { present: true }, counts: { pending_jobs: 1, pending_jobs_with_error: 1, quarantines: 8, findings_by_status: { unexpected_conflict: 8 } } });
+      cursor: { present: true }, counts: { pending_jobs: 4, pending_jobs_with_error: 3, quarantines: 8, findings_by_status: { unexpected_conflict: 8 } },
+      eligibility: { executable: 2, future: 1, stopped: 1, earliest_eligible_at: Date.parse("2026-10-10T10:00:00.000Z") },
+      continuation: {
+        slice_ordinal: 1, pending: true, scheduled: true, next_wake_at: Date.parse("2026-10-03T10:01:30.000Z"),
+        documents_priority_next: true, feed_retry_at: Date.parse("2026-10-03T10:02:00.000Z"),
+        last_outcome: {
+          semantic_progress: 7, jobs_registered: 2, jobs_completed: 1, jobs_pending: 4, job_failures: 2,
+          jobs_quarantined: 8, executable_jobs: 2, future_eligible_jobs: 1, stopped_unresolved_jobs: 1,
+          earliest_eligible_at: Date.parse("2026-10-10T10:00:00.000Z"),
+          budget_yield: true, unread_feed: true, verification_completed: false, global_notification_owed: true,
+          safe_errors: ["provider_retryable", "document_slice_failed"]
+        }
+      } });
     expect(value.document_change_checkpoint.schedule.overdue_by_ms).toBeGreaterThan(0);
     expect(value.document_change_checkpoint.cursor.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(value.document_change_checkpoint.recent_quarantines).toHaveLength(5);
     expect(value.document_change_checkpoint.recent_findings).toHaveLength(5);
     expect(JSON.stringify(value)).not.toMatch(/private-|PRIVATE-RESOURCE|\/private\//);
+    expect(value.document_change_checkpoint.continuation.last_outcome).not.toHaveProperty("raw_error_message");
+    expect(value.document_change_checkpoint.continuation.last_outcome).not.toHaveProperty("provider_path");
+    expect(value.document_change_checkpoint.continuation.last_outcome).not.toHaveProperty("cursor");
+    expect(value.document_change_checkpoint.continuation.last_outcome).not.toHaveProperty("request_body");
+    const repeated = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
+    expect(repeated.status).toBe(200);
+    const repeatedValue = await repeated.json<any>();
+    expect(repeatedValue.document_change_checkpoint.eligibility).toEqual(value.document_change_checkpoint.eligibility);
+    expect(repeatedValue.document_change_checkpoint.continuation).toEqual(value.document_change_checkpoint.continuation);
     expect(await snapshot()).toEqual(before);
+  });
+
+  it("omits the checkpoint when a retained continuation outcome field is malformed", async () => {
+    installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-CHECKPOINT-OUTCOME-0001", "checkpoint-outcome");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const legacyResponse = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
+    const legacyBody = await legacyResponse.json<any>();
+    expect(legacyResponse.status).toBe(200);
+    expect(legacyBody.document_change_checkpoint.continuation.last_outcome).toBeNull();
+    await runInDurableObject(guard, async (_instance, state) => {
+      state.storage.sql.exec("UPDATE managed_document_change_continuation SET last_outcome_json = ? WHERE singleton = 1",
+        JSON.stringify({ jobs_pending: "private-malformed-value", verification_completed: true, private_diagnostic: "must-not-leak" }));
+    });
+    const response = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
+    const body = await response.json<any>();
+    expect(response.status).toBe(200);
+    expect(body.document_change_checkpoint).toBeUndefined();
+    expect(JSON.stringify(body)).not.toMatch(/private-malformed-value|must-not-leak/);
   });
 
   it("omits the checkpoint when quarantine counters contain malformed stored values", async () => {

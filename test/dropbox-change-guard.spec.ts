@@ -86,6 +86,19 @@ async function runChangeAlarmNow(stub: DurableObjectStub, projectId: string): Pr
   });
 }
 
+async function holdLocalAlarmForManualDrive(stub: DurableObjectStub) {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const setAlarm = state.storage.setAlarm.bind(state.storage);
+    const heldUntil = Date.now() + 60_000;
+    // Only this project's timer is held; reconciliation and durable checkpoints
+    // still run unchanged. Explicit runDurableObjectAlarm calls drive the order.
+    const alarm = vi.spyOn(state.storage, "setAlarm").mockImplementation((time, options) =>
+      setAlarm(Math.max(time instanceof Date ? time.getTime() : time, heldUntil), options));
+    await state.storage.setAlarm(heldUntil);
+    return alarm;
+  });
+}
+
 function interceptProjectList(
   mock: ReturnType<typeof installDropboxMock>,
   behavior: (path: string) => Promise<Response | null>
@@ -303,28 +316,102 @@ describe("DropboxChangeGuard", () => {
     const mock = installDropboxMock();
     const projectId = await createProject("TXN-CHANGE-GUARD-0005", "change-guard-five");
     const stub = guard("bounded-retry");
-    interceptProjectList(mock, async () =>
-      new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 }));
-
-    expect((await notify(stub)).status).toBe(200);
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
-    for (let attempt = 1; attempt < 6; attempt += 1) {
-      await runChangeAlarmNow(stub, projectId);
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
-      expect((await status(stub)).failure_count).toBe(attempt + 1);
-    }
-
-    const observed = await status(stub);
-    expect(observed).toMatchObject({
-      requested_generation: 1,
-      completed_generation: 0,
-      alarm_scheduled: true,
-      processing_generation: null,
-      failure_count: 6
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-change-guard-five`;
+    let providerFailures = 0;
+    interceptProjectList(mock, async (path) => {
+      if (path !== root) return null;
+      providerFailures += 1;
+      return new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 });
     });
-    expect(observed.last_error).not.toBeNull();
-    expect(observed.alarm_at).not.toBeNull();
-    expect((observed.alarm_at ?? 0) - Date.now()).toBeGreaterThan(240_000);
+    const localAlarm = await holdLocalAlarmForManualDrive(projectGuard);
+    try {
+      expect((await notify(stub)).status).toBe(200);
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(providerFailures).toBe(1);
+      expect((await status(stub)).failure_count).toBe(1);
+      for (let attempt = 1; attempt < 6; attempt += 1) {
+        await runChangeAlarmNow(stub, projectId);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        expect(providerFailures).toBe(attempt + 1);
+        expect((await status(stub)).failure_count).toBe(attempt + 1);
+      }
+
+      const observed = await status(stub);
+      expect(observed).toMatchObject({
+        requested_generation: 1,
+        completed_generation: 0,
+        alarm_scheduled: true,
+        processing_generation: null,
+        failure_count: 6
+      });
+      expect(observed.last_error).not.toBeNull();
+      expect(observed.alarm_at).not.toBeNull();
+      expect((observed.alarm_at ?? 0) - Date.now()).toBeGreaterThan(240_000);
+    } finally {
+      await runInDurableObject(projectGuard, async (_instance, state) => state.storage.deleteAlarm());
+      localAlarm.mockRestore();
+    }
+  });
+
+  it("parks the global retry without completing its generation when local recovery consumes the sixth feed failure", async () => {
+    const mock = installDropboxMock();
+    const slug = "change-guard-local-sixth";
+    const projectId = await createProject("TXN-CHANGE-GUARD-LOCAL-SIXTH-0001", slug);
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = guard("local-sixth-feed-failure");
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-${slug}`;
+    let providerFailures = 0;
+    interceptProjectList(mock, async (path) => {
+      if (path !== root) return null;
+      providerFailures += 1;
+      return new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 });
+    });
+    const localAlarm = await holdLocalAlarmForManualDrive(projectGuard);
+    try {
+      expect((await notify(stub)).status).toBe(200);
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(providerFailures).toBe(1);
+      for (let attempt = 1; attempt < 5; attempt += 1) {
+        await runChangeAlarmNow(stub, projectId);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        expect(providerFailures).toBe(attempt + 1);
+        expect((await status(stub)).failure_count).toBe(attempt + 1);
+      }
+      await runChangeAlarmNow(stub, projectId);
+      expect(await runDurableObjectAlarm(projectGuard)).toBe(true);
+      expect(providerFailures).toBe(6);
+      expect((await status(stub)).failure_count).toBe(5);
+      const beforeGlobal = await runInDurableObject(projectGuard, async (_instance, state) => ({
+        continuation: new ManagedDocumentChangeJobStore(state.storage).continuation(),
+        alarm_at: await state.storage.getAlarm()
+      }));
+      expect(beforeGlobal.continuation.pending).toBe(true);
+      expect(beforeGlobal.continuation.feed_retry_at).toBeGreaterThan(Date.now());
+      expect(beforeGlobal.continuation.last_outcome?.safe_errors).toEqual(["provider_blocked"]);
+
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(providerFailures).toBe(6);
+      expect(await status(stub)).toMatchObject({
+        requested_generation: 1, completed_generation: 0,
+        processing_generation: null, failure_count: 0, last_error: null,
+        alarm_scheduled: false, alarm_at: null
+      });
+      const afterGlobal = await runInDurableObject(projectGuard, async (_instance, state) => ({
+        continuation: new ManagedDocumentChangeJobStore(state.storage).continuation(),
+        alarm_at: await state.storage.getAlarm()
+      }));
+      expect(afterGlobal.continuation.pending).toBe(true);
+      expect(afterGlobal.continuation.last_outcome?.unread_feed).toBe(true);
+      expect(afterGlobal.continuation.last_outcome?.safe_errors).toEqual([]);
+      expect(afterGlobal.continuation.feed_retry_at).toBe(beforeGlobal.continuation.feed_retry_at);
+      expect(afterGlobal.continuation.next_wake_at).toBe(beforeGlobal.continuation.next_wake_at);
+      expect(afterGlobal.alarm_at).toBe(beforeGlobal.alarm_at);
+      expect(afterGlobal.alarm_at).toBeGreaterThanOrEqual(afterGlobal.continuation.next_wake_at!);
+    } finally {
+      await runInDurableObject(projectGuard, async (_instance, state) => state.storage.deleteAlarm());
+      localAlarm.mockRestore();
+    }
   });
 
   it("leaves a later notification pending for a subsequent alarm generation", async () => {

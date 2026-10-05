@@ -23,17 +23,25 @@ async function submit(tx: unknown, token: string = authority) {
 describe("RegistryGuard global governance", () => {
   let dropbox: ReturnType<typeof installDropboxMock>;
   const canonicalPath = "/PROJECT_OS/.project-os/registry/RULE_GOVERNANCE.json";
-  async function seededRepository() {
-    const { runtime, files } = packageRuntime();
+  async function seededRepository(ruleOverrides: Record<string, unknown> = {}) {
+    const { runtime, files, put } = packageRuntime();
     const repository = new RuleGovernanceRepository(runtime);
-    const transaction = globalGovernanceTransactionSchema.parse(governanceTx("rule.propose", { rule: ruleFixture("GLOBAL") }, 0, "GLOBAL"));
+    const transaction = globalGovernanceTransactionSchema.parse(governanceTx("rule.propose", { rule: ruleFixture("GLOBAL", ruleOverrides) }, 0, "GLOBAL"));
     const result = applyRuleGovernance({ rules: {}, exceptions: {} }, transaction, "GLOBAL");
     if (result.kind !== "commit") throw new Error("Governance fixture did not commit");
     const eventId = eventIdForRevision(1);
     const event = { schema_version: "1.0" as const, event_id: eventId, project_id: "GLOBAL" as const, revision: 1, transaction_id: transaction.transaction_id, type: transaction.operation, timestamp: transaction.created_at, payload: transaction.payload };
     const receipt = { schema_version: "1.0" as const, transaction_id: transaction.transaction_id, project_id: "GLOBAL" as const, status: "committed" as const, previous_revision: 0, new_revision: 1, event_id: eventId, committed_at: transaction.created_at };
     await repository.write({ ...result.state, revision: 1, journal: { [transaction.transaction_id]: { transaction, receipt, event } } }, null);
-    return { repository, runtime, files };
+    return { repository, runtime, files, put };
+  }
+  function countGovernanceReads(runtime: ReturnType<typeof packageRuntime>["runtime"]) {
+    let count = 0;
+    const original = runtime.objects.getMetadata.bind(runtime.objects);
+    const originalReadText = runtime.objects.readText.bind(runtime.objects);
+    runtime.objects.getMetadata = async path => { count += 1; return original(path); };
+    runtime.objects.readText = async path => { count += 1; return originalReadText(path); };
+    return { get count() { return count; }, reset() { count = 0; } };
   }
   beforeEach(() => { dropbox = installDropboxMock(); registryName = `governance-${crypto.randomUUID()}`; });
   afterEach(() => vi.restoreAllMocks());
@@ -100,6 +108,138 @@ describe("RegistryGuard global governance", () => {
     };
 
     await expect(repository.read()).rejects.toThrow(/changed during read/);
+  });
+  it("reuses fully verified governance data with fresh two-object metadata checks and isolated return values", async () => {
+    const { repository, runtime } = await seededRepository();
+    const reads = countGovernanceReads(runtime);
+
+    const cold = await repository.read();
+    expect(cold?.state.revision).toBe(1);
+    expect(reads.count).toBe(6);
+
+    const warm = await repository.read();
+    expect(warm?.state.rules["RULE-7101@1"].title).toBe("Verify destination");
+    expect(reads.count).toBe(8);
+    warm!.state.rules["RULE-7101@1"].title = "caller mutation";
+
+    const isolated = await repository.read();
+    expect(isolated?.state.rules["RULE-7101@1"].title).toBe("Verify destination");
+    expect(reads.count).toBe(10);
+  });
+  it("expires governance data from its original acquisition time and invalidates on clock rollback", async () => {
+    const { repository, runtime } = await seededRepository();
+    const reads = countGovernanceReads(runtime);
+    let now = 50_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await repository.read();
+      reads.reset();
+      now += 299_999;
+      await repository.read();
+      expect(reads.count).toBe(2);
+
+      reads.reset();
+      now += 1;
+      await repository.read();
+      expect(reads.count).toBe(6);
+
+      reads.reset();
+      now -= 1;
+      await repository.read();
+      expect(reads.count).toBe(6);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  it.each([globalGovernancePath, globalGovernanceBootstrapPath])("does not reuse cached data after %s metadata drifts", async changedPath => {
+    const { repository, runtime, files, put } = await seededRepository();
+    const reads = countGovernanceReads(runtime);
+    await repository.read();
+    reads.reset();
+    put(changedPath, files.get(changedPath)!.content);
+
+    expect((await repository.read())?.state.revision).toBe(1);
+    expect(reads.count).toBe(8);
+  });
+  it("fails closed rather than serving stale data when fresh bootstrap metadata is unavailable or absent", async () => {
+    const { repository, runtime, files } = await seededRepository();
+    await repository.read();
+    const original = runtime.objects.getMetadata.bind(runtime.objects);
+    let unavailable = true;
+    runtime.objects.getMetadata = async path => {
+      if (path === globalGovernanceBootstrapPath && unavailable) {
+        throw new Error("metadata unavailable");
+      }
+      return original(path);
+    };
+
+    await expect(repository.read()).rejects.toThrow("metadata unavailable");
+    unavailable = false;
+    files.delete(globalGovernanceBootstrapPath);
+    await expect(repository.read()).rejects.toThrow(/initialization evidence missing/);
+  });
+  it.each([globalGovernancePath, globalGovernanceBootstrapPath])("does not serve a cached value when fresh metadata for %s is unavailable", async unavailablePath => {
+    const { repository, runtime } = await seededRepository();
+    await repository.read();
+    const original = runtime.objects.getMetadata.bind(runtime.objects);
+    runtime.objects.getMetadata = async path => {
+      if (path === unavailablePath) throw new Error("metadata unavailable");
+      return original(path);
+    };
+
+    await expect(repository.read()).rejects.toThrow("metadata unavailable");
+  });
+  it.each([globalGovernancePath, globalGovernanceBootstrapPath])("falls back to a full read when %s metadata loses its object identity", async changedPath => {
+    const { repository, runtime } = await seededRepository();
+    const reads = countGovernanceReads(runtime);
+    await repository.read();
+    reads.reset();
+    const original = runtime.objects.getMetadata.bind(runtime.objects);
+    runtime.objects.getMetadata = async path => {
+      const metadata = await original(path);
+      return path === changedPath && metadata ? { ...metadata, objectId: undefined } : metadata;
+    };
+
+    expect((await repository.read())?.state.revision).toBe(1);
+    expect(reads.count).toBe(8);
+    runtime.objects.getMetadata = original;
+    reads.reset();
+    expect((await repository.read())?.state.revision).toBe(1);
+    expect(reads.count).toBe(6);
+  });
+  it("does not publish a hint from the read that initializes a pending bootstrap", async () => {
+    const { repository, runtime, files, put } = await seededRepository();
+    await repository.read();
+    const bootstrap = JSON.parse(files.get(globalGovernanceBootstrapPath)!.content);
+    put(globalGovernanceBootstrapPath, JSON.stringify({ ...bootstrap, status: "pending" }));
+    const reads = countGovernanceReads(runtime);
+
+    expect((await repository.read())?.state.revision).toBe(1);
+    reads.reset();
+    expect((await repository.read())?.state.revision).toBe(1);
+    expect(reads.count).toBe(6);
+    reads.reset();
+    expect((await repository.read())?.state.revision).toBe(1);
+    expect(reads.count).toBe(2);
+  });
+  it("does not cache a validated graph whose serialized form exceeds one MiB", async () => {
+    const { repository, runtime } = await seededRepository({ title: "x".repeat(1_048_600) });
+    const reads = countGovernanceReads(runtime);
+
+    expect((await repository.read())?.state.revision).toBe(1);
+    reads.reset();
+    expect((await repository.read())?.state.revision).toBe(1);
+    expect(reads.count).toBe(6);
+  });
+  it("invalidates the hint around canonical governance writes", async () => {
+    const { repository, runtime } = await seededRepository();
+    const reads = countGovernanceReads(runtime);
+    const current = (await repository.read())!;
+    await repository.write(current.state, current.token);
+    reads.reset();
+
+    expect((await repository.read())?.state.revision).toBe(1);
+    expect(reads.count).toBe(6);
   });
   it.each(["CONTROL_TOWER_OPERATOR_TOKEN", "INPUT_RECOVERY_OPERATOR_TOKEN", "MUTATION_GATE_OPERATOR_TOKEN", "MUTATION_CONTEXT_SIGNING_KEY", "RULE_ADMISSION_SIGNING_KEY"] as const)("refuses shared authority with %s", async (binding) => {
     await configure(authority);

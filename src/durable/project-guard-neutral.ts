@@ -42,6 +42,7 @@ import { DocumentLedgerRepository, HEAD_WRITE_RECOVERY_STAGES, HEAD_WRITE_RECOVE
 import type { ProviderObjectMetadata, ProviderRequestScope } from "../persistence/provider/contract";
 import { requestMaterializationTargetSafely } from "../materialization/handoff";
 import { MutationIntentConflictError, MutationGateRepository } from "../mutation-gate/repository";
+import { machineConvergenceRoot } from "../persistence/layout";
 import { parseLayoutMode, machineCommitRecordPath, machineReceiptPath, machineArtifactReceiptPath, machineMutationIntentPath, machineDocumentRoot, machineDocumentHeadPath, machineDocumentInstanceRepairFencePath, machineDocumentInstanceRepairPath, machineDocumentVersionPath, machineMaterializationHeadPath, machineMaterializationRecordPath, machineMaterializationRoot, workspaceProjectRoot, type LayoutMode } from "../persistence/layout";
 import { createProductionPersistence } from "../persistence/production-factory";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
@@ -69,7 +70,7 @@ import { canonicalJson, type EvaluationResult, type RuleObservation, type RuleRe
 import type { GlobalGovernanceState, RuleVersion } from "../domain/rule-governance";
 import { ruleVersionSchema } from "../domain/rule-governance";
 import { matchesResource } from "../rules/resolution";
-import { ExecutionJournal } from "../execution/journal";
+import { ExecutionJournal, headRecoveryParentRequestId, type HeadRecoveryParentBinding } from "../execution/journal";
 import type { ExecutionAdmission, ExecutionAdapter, ExecutionPlan } from "../execution/contract";
 import { ExecutionCoordinator, InternalExecutionFailure } from "../execution/coordinator";
 import {
@@ -1355,6 +1356,34 @@ export class ProjectGuard extends DurableObject<Env> {
     let postCoordinatorRecoveryInProgress = false;
     try {
       await this.serialize(async () => {
+        // Recovery of its own frozen intention has two original signed
+        // admissions. Ordinary coordinator work below still gets its own NEW
+        // generic gate; a recovery parent never certifies that coordinator.
+        const projectId = this.ctx.id.name;
+        if (projectId) {
+          // Local rows are scheduling hints only. When none exist, first
+          // observe whether there is actual head debt; an empty project must
+          // reach its independent coordinator before a post-recovery hook.
+          const queued = await this.ctx.storage.get("navigation-head-recovery-pending-v1") !== undefined
+            || await this.ctx.storage.get("navigation-head-recovery-preparation-v1") !== undefined
+            || this.ctx.storage.sql.exec("SELECT 1 FROM admission_proofs WHERE kind = 'navigation-head-recovery' LIMIT 1").toArray().length > 0;
+          const observed = queued ? null : await this.recoverOneUnownedNavigationHeadWrite(projectId, slice.runtime,
+            continuation.slice_ordinal, true, slice.scope);
+          if (queued || observed?.status !== "none") {
+            preCoordinatorHeadRecoveryInProgress = true;
+            const recovery = await this.recoverOneUnownedNavigationHeadWrite(projectId, slice.runtime,
+              continuation.slice_ordinal, false, slice.scope, undefined, continuation.scheduled ? "project.materialize" : "project.repair");
+            preCoordinatorHeadRecoveryInProgress = false;
+            if (recovery.status !== "none" && (queued || recovery.status !== "recovered")) {
+              const wake = recovery.next_attempt_at ?? Date.now() + 1_000;
+              store.finishContinuationSlice({ pending: true, next_wake_at: wake, documents_priority_next: !prioritizedHeadRecovery,
+                feed_retry_at: continuation.feed_retry_at, outcome: { ...(before.last_outcome ?? {}),
+                  head_write_recovery_retry: true, verification_completed: false } });
+              await this.armRequestRecoveryAlarm(Math.max(1, wake - Date.now()));
+              return;
+            }
+          }
+        }
         const state = await this.readManagedDocumentState(slice.runtime, slice.scope);
         if (!state || !this.ctx.id.name || state.project_id !== this.ctx.id.name) {
           store.finishContinuationSlice({ pending: true, next_wake_at: Date.now() + 300_000,
@@ -3488,12 +3517,41 @@ export class ProjectGuard extends DurableObject<Env> {
     runtime: ProjectOsPersistenceRuntime,
     sliceOrdinal: number,
     probeOnly = false,
-    scope?: ProviderRequestScope
-  ): Promise<{ status: "none" | "recovered" | "unresolved"; remainingCandidates: boolean }> {
+    scope?: ProviderRequestScope,
+    freshState?: ProjectState,
+    originalOperation: "project.repair" | "project.materialize" = "project.materialize"
+  ): Promise<{ status: "none" | "recovered" | "unresolved"; remainingCandidates: boolean; next_attempt_at?: number }> {
     const pendingKey = "navigation-head-recovery-pending-v1";
-    type Locator = { request_hash: string; resource_id: string };
-    type Pending = { project_id: string; request_hash: string; resource_id?: string; deferred?: Locator[]; cursor?: number };
-    const stored = await this.ctx.storage.get<Pending>(pendingKey);
+    type Locator = { request_hash: string; resource_id: string; next_attempt_at?: number };
+    type Pending = { project_id: string; request_hash: string; resource_id?: string; next_attempt_at?: number; deferred?: Locator[]; cursor?: number; other_candidates?: boolean };
+    let stored = await this.ctx.storage.get<Pending>(pendingKey);
+    if (!stored && scope) {
+      // Existing SQL rows provide bounded request discovery only. The actual
+      // journal and immutable intention are reread before scheduling anything.
+      const cursor = await this.ctx.storage.get<number>("navigation-head-recovery-discovery-v1");
+      const row = this.ctx.storage.sql.exec<{ rowid: number; request_id: string }>(
+        "SELECT rowid, request_id FROM admission_proofs WHERE kind = 'navigation-head-recovery' AND rowid < ? ORDER BY rowid DESC LIMIT 1",
+        cursor ?? Number.MAX_SAFE_INTEGER).toArray()[0];
+      if (row) {
+        const terminalKey = `navigation-head-recovery-terminal-v1:${row.request_id}`;
+        if (await this.ctx.storage.get(terminalKey)) await this.ctx.storage.put("navigation-head-recovery-discovery-v1", row.rowid);
+        else {
+          const journal = new ExecutionJournal(runtime, projectId, "navigation-head-recovery", row.request_id);
+          const canonical = await journal.readAdmission();
+          if (!canonical || canonical.admission.diagnosed_drift_refs?.length !== 1
+            || !canonical.admission.diagnosed_drift_refs[0].startsWith(`${machineConvergenceRoot(projectId)}/executions/`)) {
+            await this.ctx.storage.put("navigation-head-recovery-discovery-v1", row.rowid);
+          } else {
+            const raw = await runtime.objects.readText(`${machineDocumentRoot(projectId)}/navigation-sources/head-write-recovery/${canonical.admission.request_hash}/intent.json`);
+            if (raw === null) throw new Error("navigation_head_recovery_intent_missing");
+            const intent = JSON.parse(raw);
+            if (await sha256Canonical(intent) !== canonical.admission.request_hash || intent.project_id !== projectId) throw new Error("navigation_head_recovery_intent_invalid");
+            stored = { project_id: projectId, request_hash: canonical.admission.request_hash, resource_id: intent.resource_id, cursor: 0 };
+            await this.ctx.storage.put(pendingKey, stored);
+          }
+        }
+      }
+    }
     if (projectId !== this.ctx.id.name || (stored && (stored.project_id !== projectId
       || !/^[a-f0-9]{64}$/.test(stored.request_hash)))) throw new Error("navigation_head_recovery_pointer_invalid");
     if (probeOnly && stored) return { status: "unresolved", remainingCandidates: true };
@@ -3506,18 +3564,32 @@ export class ProjectGuard extends DurableObject<Env> {
         resourceId = JSON.parse(raw).resource_id;
       }
       if (stored.deferred !== undefined && !Array.isArray(stored.deferred)) throw new Error("navigation_head_recovery_pointer_invalid");
-      locators.push({ request_hash: stored.request_hash, resource_id: resourceId! }, ...(stored.deferred ?? []));
+      locators.push({ request_hash: stored.request_hash, resource_id: resourceId!,
+        ...(stored.next_attempt_at === undefined ? {} : { next_attempt_at: stored.next_attempt_at }) }, ...(stored.deferred ?? []));
       if (locators.length > 32 || locators.some(item => !item || !/^[a-f0-9]{64}$/.test(item.request_hash)
-        || !/^head:DOC-[A-F0-9]{24}$/.test(item.resource_id))
+        || !/^head:DOC-[A-F0-9]{24}$/.test(item.resource_id)
+        || item.next_attempt_at !== undefined && (!Number.isSafeInteger(item.next_attempt_at)
+          || item.next_attempt_at < 0 || item.next_attempt_at > Date.now() + REQUEST_RECOVERY_RETRY_DELAY_MS))
         || new Set(locators.map(item => item.request_hash)).size !== locators.length
         || new Set(locators.map(item => item.resource_id)).size !== locators.length) throw new Error("navigation_head_recovery_pointer_invalid");
     }
     if (stored?.cursor !== undefined && (!Number.isSafeInteger(stored.cursor) || stored.cursor < 0)) throw new Error("navigation_head_recovery_pointer_invalid");
     const ordinal = stored?.cursor ?? 0;
+    let otherCandidates = stored?.other_candidates === true;
     // Bounded locators only schedule immutable canonical intentions. Rotate
     // unresolved work and reserve a turn for a new independent resource.
     // A changed physical head never retargets or certifies its old intention.
-    let pendingHash = locators[ordinal % (locators.length < 32 ? locators.length + 1 : locators.length)]?.request_hash ?? null;
+    const eligibleLocators = locators.filter(item => item.next_attempt_at === undefined || item.next_attempt_at <= Date.now());
+    if (locators.length && !eligibleLocators.length && (locators.length === 32 || !otherCandidates
+      && await this.ctx.storage.get("navigation-head-recovery-preparation-v1") === undefined)) {
+      return { status: "unresolved", remainingCandidates: true,
+        next_attempt_at: Math.min(...locators.map(item => item.next_attempt_at!)) };
+    }
+    // At capacity, only an eligible existing intention can run: never admit
+    // a parent first and discover the locator limit after persisting it.
+    const selectionSlots = eligibleLocators.length + (locators.length < 32 ? 1 : 0);
+    let pendingHash = eligibleLocators[ordinal % selectionSlots]?.request_hash ?? null;
+    if (eligibleLocators.length === 1 && !otherCandidates) pendingHash = eligibleLocators[0].request_hash;
     let expectedStored = stored;
     const saveLocators = async () => {
       const current = await this.ctx.storage.get<Pending>(pendingKey);
@@ -3526,16 +3598,71 @@ export class ProjectGuard extends DurableObject<Env> {
         await this.ctx.storage.delete(pendingKey);
         expectedStored = undefined;
       } else {
-        expectedStored = { project_id: projectId, ...locators[0], deferred: locators.slice(1), cursor: (ordinal + 1) % 33 };
+        expectedStored = { project_id: projectId, ...locators[0], deferred: locators.slice(1), cursor: (ordinal + 1) % 33, other_candidates: otherCandidates };
         await this.ctx.storage.put(pendingKey, expectedStored);
       }
     };
     if (locators.length) await saveLocators();
     let diagnostic: HeadWriteRecoveryDiagnostic | null = null;
     const options: HeadWriteRecoveryOptions = {
+      bound: {
+        observeOtherCandidates: present => { otherCandidates = present; },
+        readCheckpoint: hash => this.ctx.storage.get(`navigation-head-recovery-bound-v1:${hash}`),
+        writeCheckpoint: async (hash, value) => { await this.ctx.storage.put(`navigation-head-recovery-bound-v1:${hash}`, value); },
+        authorizeParent: async (intent, source) => {
+          const state = freshState ?? await this.readManagedDocumentState(runtime, scope!);
+          if (!state || state.project_id !== projectId || !source.objectId || !source.revisionToken || !source.integrityHash) throw new Error("project_state_unavailable");
+          const binding: HeadRecoveryParentBinding = { discriminator: "navigation.head-write.recovery-parent@1",
+            provider_id: runtime.providerId, project_id: projectId, actor: { actor_id: "project_guard", authority: "durable_object" },
+            operation: originalOperation, project_revision: state.revision, intent_hash: await sha256Canonical(intent),
+            source_state: { path: source.path, object_id: source.objectId, revision_token: source.revisionToken,
+              integrity_hash_algorithm: source.integrityHash.algorithm, integrity_hash: source.integrityHash.value } };
+          const normalized = await normalizeSystemAdmission(projectId, binding.operation, "DOCUMENTS",
+            `document-reconcile@${binding.project_revision}`, String(binding.project_revision), binding);
+          const proof = await this.admitRules(state, normalized, undefined, scope);
+          const sourceRef = providerEvidenceReference(source);
+          if (!sourceRef) throw new Error("navigation_head_recovery_source_unavailable");
+          proof.diagnosed_drift_refs = [sourceRef];
+          return this.persistAdmissionProof("navigation-head-recovery-parent", await headRecoveryParentRequestId(binding), proof, runtime, binding);
+        },
+        assertCompatible: async (parent, child) => {
+          const state = freshState ?? await this.readManagedDocumentState(runtime, scope!);
+          if (!state || state.project_id !== projectId || state.status !== "active" || !this.env.RULE_ADMISSION_SIGNING_KEY) {
+            throw new RuleAdmissionRejection(this.unavailableGlobalResult());
+          }
+          const global = await this.readGlobalGovernance(scope);
+          for (const original of [parent, child]) {
+            if (original.project_id !== projectId || original.actor.actor_id !== "project_guard" || original.actor.authority !== "durable_object"
+              || state.revision < original.project_revision || global.revision < original.global_revision) throw new Error("navigation_head_recovery_admission_invalid");
+            const normalized: NormalizedAdmissionOperation = { project_id: projectId, operation: original.operation,
+              resources: original.resources, request_hash: original.request_hash };
+            const result = await evaluateRules({ actor: original.actor, project_id: projectId, operation: original.operation,
+              expected_project_revision: state.revision, stage: "pre_admission", now: new Date().toISOString(), state,
+              global_governance: global, resources: original.resources, observations: await this.resolveServerObservations(state, normalized),
+              approvals: Object.values(state.approvals ?? {}) });
+            if (result.verdict !== "allow") throw new RuleAdmissionRejection(result);
+            const grants = (results: ExecutionAdmission["results"]) => results.filter(item => item.approval_id || item.exception_id)
+              .map(item => ({ rule: item.rule, resource_id: item.resource_id, approval_id: item.approval_id,
+                exception_id: item.exception_id, evidence_refs: item.evidence_refs }));
+            if (result.deferred_rules.length || canonicalJson(result.ruleset.rules) !== canonicalJson(original.ruleset.rules)
+              || canonicalJson(grants(result.results)) !== canonicalJson(grants(original.results))) {
+              throw new RuleAdmissionRejection({ ...result, verdict: "unavailable", code: "RULE_ADMISSION_STALE",
+                expected: "The original active rule versions and exact live approvals/exceptions for this frozen recovery",
+                observed: "Applicable rule or grant binding changed", required_action: "Resolve the incompatible governed recovery without replaying its business transaction" });
+            }
+          }
+          // A cold governance refill may leave too little scope for the next
+          // physical phase. Yield before any effect; the next alarm repeats
+          // the complete fresh compatibility evaluation, never a cached allow.
+          if (scope && scope.deadlineMs - (scope.now?.() ?? Date.now()) < 9_100) throw new Error("slice_budget_exhausted");
+        }
+      },
       onDiagnostic: value => { diagnostic = value; },
       pending_recovery_hash: pendingHash,
       excluded_resource_ids: pendingHash === null ? locators.map(item => item.resource_id) : [],
+      readPreparation: async () => this.ctx.storage.get("navigation-head-recovery-preparation-v1"),
+      writePreparation: async value => { await this.ctx.storage.put("navigation-head-recovery-preparation-v1", value); },
+      clearPreparation: async () => { await this.ctx.storage.delete("navigation-head-recovery-preparation-v1"); },
       rememberRecovery: async (hash, resourceId) => {
         if (!/^[a-f0-9]{64}$/.test(hash) || (pendingHash !== null && pendingHash !== hash)) {
           throw new Error("navigation_head_recovery_pointer_conflict");
@@ -3548,8 +3675,8 @@ export class ProjectGuard extends DurableObject<Env> {
         await saveLocators();
         pendingHash = hash;
       },
-      authorize: async intent => {
-        const state = this.loadState();
+      authorize: async (intent, parentAdmissionRef) => {
+        const state = freshState ?? (scope ? await this.readManagedDocumentState(runtime, scope) : this.loadState());
         if (!state || state.project_id !== projectId || intent.project_id !== projectId) throw new Error("project_state_unavailable");
         const resources = intent.original_tickets.map(ticket => ({
           resource_id: intent.resource_id, resource_type: "document", zone: ticket.zone,
@@ -3559,13 +3686,39 @@ export class ProjectGuard extends DurableObject<Env> {
         const normalized: NormalizedAdmissionOperation = { project_id: projectId, operation: "project.materialize",
           resources, request_hash: requestHash, dependency_classification: "resource_bound", dependency_resources: resources };
         const proof = await this.admitRules(state, normalized, undefined, scope);
+        if (parentAdmissionRef) proof.diagnosed_drift_refs = [parentAdmissionRef];
         return this.persistAdmissionProof("navigation-head-recovery", `DOCREQ-NAV-HEAD-RECOVERY-${requestHash.toUpperCase()}`, proof, runtime);
       }
     };
+    if (!scope) options.bound = undefined; // legacy standalone family adapter; alarms always carry their charged scope
     let result: { status: "none" | "recovered" | "unresolved"; remainingCandidates: boolean };
     try {
       result = await new DocumentLedgerRepository(runtime).recoverOneUnownedHeadWrite(projectId, sliceOrdinal, probeOnly, options);
     } catch (error) {
+      if (pendingHash !== null && error instanceof Error && error.message === "navigation_head_recovery_completion_missing") {
+        // A frozen physical target no longer provable is not a terminal
+        // success. Observe the current bounded source before parking only
+        // this locator; an old absence hint must not exclude a later sibling.
+        const snapshot = await new ZoneNavigationSources(runtime).headWriteRecoveryCandidateSnapshot(projectId);
+        if (snapshot) {
+          otherCandidates = snapshot.candidates.some(group => !locators.some(item => item.resource_id === group[0].resource_id));
+          const blocked = locators.findIndex(item => item.request_hash === pendingHash);
+          locators[blocked] = { ...locators[blocked], next_attempt_at: safeDocumentRetryDeadline(Date.now(), undefined) };
+          await saveLocators();
+          const preparationKey = "navigation-head-recovery-preparation-v1";
+          const preparation = await this.ctx.storage.get<Record<string, unknown>>(preparationKey);
+          if (preparation?.schema_version === "1.0" && preparation.preparation_type === "navigation-head-recovery-preparation"
+            && preparation.project_id === projectId && preparation.provider_id === runtime.providerId
+            && preparation.resource_id === locators[blocked].resource_id && typeof preparation.preparation_digest === "string") {
+            // Only the superseded resource's scheduling hint is invalidated.
+            // A concurrently replaced sibling preparation must survive.
+            await this.ctx.storage.transaction(async txn => {
+              const current = await txn.get<Record<string, unknown>>(preparationKey);
+              if (current && canonicalJson(current) === canonicalJson(preparation)) await txn.delete(preparationKey);
+            });
+          }
+        }
+      }
       // A denied/unavailable NEW recovery never clears its original fence and
       // must not prevent the independent document coordinator from progressing.
       // Provider/deadline failures retain their normal bounded continuation path.
@@ -3588,7 +3741,12 @@ export class ProjectGuard extends DurableObject<Env> {
       const index = locators.findIndex(item => item.request_hash === pendingHash);
       if (index < 0) throw new Error("navigation_head_recovery_pointer_conflict");
       locators.splice(index, 1);
+      await this.ctx.storage.put(`navigation-head-recovery-terminal-v1:DOCREQ-NAV-HEAD-RECOVERY-${pendingHash.toUpperCase()}`, { observed_terminal: true });
       await saveLocators();
+    }
+    else if (locators.length) await saveLocators();
+    if (pendingHash !== null && result.status === "recovered") {
+      await this.ctx.storage.delete("navigation-head-recovery-preparation-v1");
     }
     return locators.length ? { status: result.status === "none" ? "unresolved" : result.status, remainingCandidates: true } : result;
   }
@@ -5830,14 +5988,15 @@ export class ProjectGuard extends DurableObject<Env> {
     return observations;
   }
 
-  protected async persistAdmissionProof(kind: string, requestId: string, proof: AdmissionProof, runtime: ProjectOsPersistenceRuntime = this.persistence): Promise<ExecutionAdmission> {
+  protected async persistAdmissionProof(kind: string, requestId: string, proof: AdmissionProof, runtime: ProjectOsPersistenceRuntime = this.persistence,
+    headParentBinding?: HeadRecoveryParentBinding): Promise<ExecutionAdmission> {
     const admission: ExecutionAdmission = { ...proof, kind, request_id: requestId };
     if (kind === "transaction") await this.ctx.storage.delete(MATERIALIZATION_FINALIZATION_COMPLETED_HEAD_KEY);
     // The canonical journal is authority. SQL is only a cache; awaiting this
     // boundary is mandatory before every admitted family starts an effect.
     let admitted: ExecutionAdmission;
     try {
-      admitted = await new ExecutionJournal(runtime, proof.project_id, kind, requestId).commit(admission, await this.executionPlanResolver(admission));
+      admitted = await new ExecutionJournal(runtime, proof.project_id, kind, requestId).commit(admission, await this.executionPlanResolver(admission), headParentBinding);
     } catch (error) {
       if (isManagedDocumentSliceBudgetYield(error)) throw error;
       if (error instanceof Error && (error.message.startsWith("execution_") || error.message === "repair_diagnosed_drift_required")) throw error;
@@ -5852,6 +6011,7 @@ export class ProjectGuard extends DurableObject<Env> {
     if (["transaction", "document", "package-admission", "artifact"].includes(kind)) {
       await this.rememberAdmissionGaps(admitted);
     }
+    if (kind === "navigation-head-recovery") await this.ctx.storage.delete("navigation-head-recovery-discovery-v1");
     return admitted;
   }
 

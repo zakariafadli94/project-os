@@ -4581,13 +4581,31 @@ describe("durable managed-document change jobs", () => {
     const created = await createProject("TXN-CHANGEJOB-PROJECT-PAGED-0001", "change-job-paged-daily");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    let initialCursor: string | null = null;
+    await runInDurableObject(guard, async (_instance, state) => {
+      initialCursor = state.storage.sql.exec<{ cursor: string | null }>(
+        "SELECT cursor FROM managed_document_change_control WHERE singleton = 1"
+      ).one().cursor;
+    });
+    expect(initialCursor).not.toBeNull();
     const previousFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
-    let page = 0;
-    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+    const cursorTransitions: Array<{ requested: string; returned: string; has_more: boolean }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder/continue") {
-        page += 1;
-        return Promise.resolve(Response.json({ entries: [], cursor: `daily-page-${page}`, has_more: page === 1 }));
+        const request = input instanceof Request ? input.clone() : new Request(input, init);
+        const body = await request.json<{ cursor: string }>();
+        // The provider fixture has two immutable pages, not one page per call.
+        // Polling the terminal cursor again cannot invent a third change page.
+        const response = body.cursor === initialCursor
+          ? { entries: [], cursor: "daily-page-1", has_more: true }
+          : body.cursor === "daily-page-1" || body.cursor === "daily-page-2"
+            ? { entries: [], cursor: "daily-page-2", has_more: false }
+            : null;
+        if (response) {
+          cursorTransitions.push({ requested: body.cursor, returned: response.cursor, has_more: response.has_more });
+          return Response.json(response);
+        }
       }
       return previousFetch(input, init);
     });
@@ -4608,6 +4626,10 @@ describe("durable managed-document change jobs", () => {
     const result = await second.json<{ scheduled_due: boolean; last_scheduled_verified_at: string | null }>();
     expect(result.scheduled_due).toBe(true);
     expect(result.last_scheduled_verified_at).not.toBeNull();
+    // An independent incremental poll may legitimately run before readback.
+    const independentPoll = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(independentPoll.status).toBe(200);
+    console.info("daily cursor interleaving", { project_id: created.project_id, initialCursor, cursorTransitions });
     let finalCursor: string | null = null;
     await runInDurableObject(guard, async (_instance, state) => {
       finalCursor = state.storage.sql.exec<{ cursor: string | null }>(

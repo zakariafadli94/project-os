@@ -860,11 +860,15 @@ export class ProjectGuard extends DurableObject<Env> {
             ? { ...continuationResult, safe_errors: reconciled.safe_errors }
             : continuationResult;
           const resultWake = this.documentContinuationWake(wakeInput, Date.now());
-          const recoveredSiblingWake = scheduledHeadRecovery?.status === "recovered" && scheduledHeadRecovery.remainingCandidates;
+          const admittedHeadRecoveryPending = scheduledHeadRecovery?.status === "unresolved"
+            && await this.ctx.storage.get("navigation-head-recovery-pending-v1") !== undefined;
+          const recoveredSiblingWake = admittedHeadRecoveryPending
+            || (scheduledHeadRecovery?.status === "recovered" && scheduledHeadRecovery.remainingCandidates);
           const next = navigationRefreshBudgetYield || navigationRefreshFailed
             ? { pending: true, at: resultWake.at ?? Date.now() + 20_000 }
             : recoveredSiblingWake
-              ? { pending: true, at: Math.max(resultWake.at ?? 0, Date.now() + 20_000) }
+              ? { pending: true, at: Math.min(resultWake.at ?? Number.MAX_SAFE_INTEGER,
+                Math.max(Date.now() + 20_000, continuationResult.feed_retry_at ?? 0)) }
               : resultWake;
           const nextOutcome = this.documentContinuationOutcome(continuationResult);
           if (scanOutcome.global_notification_owed === true) {
@@ -1346,6 +1350,8 @@ export class ProjectGuard extends DurableObject<Env> {
     const continuation = store.beginContinuationSlice(undefined, alarmEnteredAt);
     const slice = this.createManagedDocumentSlice(alarmEnteredAt);
     const resultCapture: { value: Awaited<ReturnType<ManagedDocumentChangeCoordinator["reconcile"]>> | null } = { value: null };
+    const prioritizedHeadRecovery = before.documents_priority_next && before.last_outcome?.head_write_recovery_retry === true;
+    let preCoordinatorHeadRecoveryInProgress = false;
     let postCoordinatorRecoveryInProgress = false;
     try {
       await this.serialize(async () => {
@@ -1372,8 +1378,10 @@ export class ProjectGuard extends DurableObject<Env> {
         let headWriteRecoveryCandidatesRemain = false;
         let preCoordinatorRecoveryAttempted = false;
         let scheduledVerificationBlocked = false;
-        if (continuation.slice_ordinal % 2 === 1) {
+        if (continuation.slice_ordinal % 2 === 1 || prioritizedHeadRecovery) {
+          preCoordinatorHeadRecoveryInProgress = true;
           const recovery = await this.recoverOneUnownedNavigationHeadWrite(state.project_id, slice.runtime, continuation.slice_ordinal, false, slice.scope);
+          preCoordinatorHeadRecoveryInProgress = false;
           preCoordinatorRecoveryAttempted = recovery.status !== "none";
           headWriteRecoveryUnresolved = recovery.status === "unresolved";
           headWriteRecoveryRecovered = recovery.status === "recovered";
@@ -1429,8 +1437,14 @@ export class ProjectGuard extends DurableObject<Env> {
           ? { ...continuationResult, safe_errors: result.safe_errors }
           : continuationResult;
         const predictedOutcome = this.documentContinuationWake(wakeInput, Date.now());
-        const next = headWriteRecoveryRecovered && headWriteRecoveryCandidatesRemain
-          ? { pending: true, at: Math.max(predictedOutcome.at ?? 0, Date.now() + 20_000) }
+        // Clearing the source fence is not finalization. An admitted immutable
+        // recovery still needs an alarm, including its independent-resource
+        // rotation turn, until its certificate and locator removal complete.
+        const admittedHeadRecoveryPending = headWriteRecoveryUnresolved
+          && await this.ctx.storage.get("navigation-head-recovery-pending-v1") !== undefined;
+        const next = admittedHeadRecoveryPending || (headWriteRecoveryRecovered && headWriteRecoveryCandidatesRemain)
+          ? { pending: true, at: Math.min(predictedOutcome.at ?? Number.MAX_SAFE_INTEGER,
+            Math.max(Date.now() + 20_000, continuationResult.feed_retry_at ?? 0)) }
           : predictedOutcome;
         const nextOutcome = this.documentContinuationOutcome(continuationResult);
         if (scanOutcome.global_notification_owed === true || (!next.pending && before.pending)) {
@@ -1502,8 +1516,13 @@ export class ProjectGuard extends DurableObject<Env> {
       const preludeError = preludeFailure?.stopped
         ? "identical_internal_document_prelude_failure_limit"
         : preludeInternalFailure ? "internal_document_prelude_failure" : null;
+      // One fresh alarm envelope for a head attempt interrupted before the
+      // coordinator. Consume it even on another yield; never starve the other
+      // recovery families or reset the shared time/HTTP budgets.
+      const prioritizeHeadRecovery = budgetYield && result === null && preCoordinatorHeadRecoveryInProgress
+        && !prioritizedHeadRecovery;
       store.finishContinuationSlice({ pending: true, next_wake_at: nextWake,
-        documents_priority_next: false, feed_retry_at: retryAt,
+        documents_priority_next: prioritizeHeadRecovery, feed_retry_at: retryAt,
         outcome: preludeFailure?.stopped
           ? { ...currentOutcome, stopped_unresolved_jobs: 1, verification_completed: false, global_notification_owed: true,
             safe_errors: [preludeError!] }
@@ -1511,7 +1530,7 @@ export class ProjectGuard extends DurableObject<Env> {
             ? { ...currentOutcome, stopped_unresolved_jobs: 0, verification_completed: false,
               safe_errors: [preludeError!] }
         : budgetYield
-          ? { ...currentOutcome, budget_yield: true, safe_errors: previousErrors }
+          ? { ...currentOutcome, budget_yield: true, safe_errors: previousErrors, head_write_recovery_retry: prioritizeHeadRecovery }
         : { ...currentOutcome, verification_completed: false,
             safe_errors: Array.from(new Set([...previousErrors,
               error instanceof RuleAdmissionRejection ? "rule_admission_unavailable"

@@ -360,6 +360,24 @@ describe("DropboxChangeGuard", () => {
     const projectId = await createProject("TXN-CHANGE-GUARD-LOCAL-SIXTH-0001", slug);
     const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
     const stub = guard("local-sixth-feed-failure");
+    let targetStorage: DurableObjectStorage;
+    let localSliceActive = false;
+    let expectedLocalOrdinal: number | null = null;
+    let persistedLocalSlice: ReturnType<ManagedDocumentChangeJobStore["continuation"]> | null = null;
+    const originalFinish = ManagedDocumentChangeJobStore.prototype.finishContinuationSlice;
+    await runInDurableObject(projectGuard, async (_instance, state) => {
+      targetStorage = state.storage;
+    });
+    const finishSlice = vi.spyOn(ManagedDocumentChangeJobStore.prototype, "finishContinuationSlice").mockImplementation(function (this: ManagedDocumentChangeJobStore, input) {
+      const result = originalFinish.call(this, input);
+      if (localSliceActive && (this as unknown as { storage: DurableObjectStorage }).storage === targetStorage) {
+        const persisted = this.continuation();
+        // Capture the actual successful SQL write, not its input or an outcome
+        // selected by error. A later fleet slice may legitimately replace it.
+        if (persisted.slice_ordinal === expectedLocalOrdinal) persistedLocalSlice = structuredClone(persisted);
+      }
+      return result;
+    });
     const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-${slug}`;
     let providerFailures = 0;
     interceptProjectList(mock, async (path) => {
@@ -379,7 +397,24 @@ describe("DropboxChangeGuard", () => {
         expect((await status(stub)).failure_count).toBe(attempt + 1);
       }
       await runChangeAlarmNow(stub, projectId);
-      expect(await runDurableObjectAlarm(projectGuard)).toBe(true);
+      expectedLocalOrdinal = await runInDurableObject(projectGuard, async (_instance, state) =>
+        new ManagedDocumentChangeJobStore(state.storage).continuation().slice_ordinal + 1);
+      localSliceActive = true;
+      try {
+        expect(await runDurableObjectAlarm(projectGuard)).toBe(true);
+      } finally {
+        localSliceActive = false;
+      }
+      expect(persistedLocalSlice).not.toBeNull();
+      const localSlice = persistedLocalSlice! as ReturnType<ManagedDocumentChangeJobStore["continuation"]>;
+      expect(localSlice.slice_ordinal).toBe(expectedLocalOrdinal);
+      expect(localSlice.last_outcome?.safe_errors).toEqual(["provider_blocked"]);
+
+      // Exercise an independent fleet pass before reading the current checkpoint.
+      // Its deferred slice must not overwrite the captured local failure proof.
+      const independentFleet = guard("ci2044-independent-fleet");
+      expect((await notify(independentFleet)).status).toBe(200);
+      expect(await runDurableObjectAlarm(independentFleet)).toBe(true);
       expect(providerFailures).toBe(6);
       expect((await status(stub)).failure_count).toBe(5);
       const beforeGlobal = await runInDurableObject(projectGuard, async (_instance, state) => ({
@@ -387,8 +422,11 @@ describe("DropboxChangeGuard", () => {
         alarm_at: await state.storage.getAlarm()
       }));
       expect(beforeGlobal.continuation.pending).toBe(true);
+      expect(beforeGlobal.continuation.last_outcome?.unread_feed).toBe(true);
       expect(beforeGlobal.continuation.feed_retry_at).toBeGreaterThan(Date.now());
-      expect(beforeGlobal.continuation.last_outcome?.safe_errors).toEqual(["provider_blocked"]);
+      expect(beforeGlobal.continuation.feed_retry_at).toBe(localSlice.feed_retry_at);
+      expect(beforeGlobal.continuation.next_wake_at).toBe(localSlice.next_wake_at);
+      expect(localSlice.last_outcome?.safe_errors).toEqual(["provider_blocked"]);
 
       expect(await runDurableObjectAlarm(stub)).toBe(true);
       expect(providerFailures).toBe(6);
@@ -411,6 +449,7 @@ describe("DropboxChangeGuard", () => {
     } finally {
       await runInDurableObject(projectGuard, async (_instance, state) => state.storage.deleteAlarm());
       localAlarm.mockRestore();
+      finishSlice.mockRestore();
     }
   });
 

@@ -5,6 +5,7 @@ import type { Receipt } from "../domain/receipt";
 import type { DomainEvent } from "../domain/event";
 import { eventIdForRevision } from "../domain/event";
 import type { ProjectOsPersistenceRuntime } from "./provider/capabilities";
+import type { ProviderObjectMetadata } from "./provider/contract";
 import { ProviderConflictError } from "./provider/errors";
 import { MACHINE_ROOT } from "./layout";
 
@@ -13,7 +14,30 @@ export const globalGovernanceBootstrapPath = `${MACHINE_ROOT}/registry/RULE_GOVE
 const bootstrapSchema = z.strictObject({ status: z.enum(["pending", "initialized"]), transaction: globalGovernanceTransactionSchema });
 export interface GovernanceJournalEntry { transaction: GlobalGovernanceTransaction; receipt: Receipt; event?: DomainEvent; qualification?: GovernanceQualification; qualification_required?: true }
 export interface CanonicalGovernance extends GlobalGovernanceState { journal: Record<string, GovernanceJournalEntry> }
-interface StableBootstrap { value: z.infer<typeof bootstrapSchema>; token: string }
+interface GovernanceMetadataBinding { path: string; objectId: string; revisionToken: string; size: number }
+interface StableBootstrap { value: z.infer<typeof bootstrapSchema>; token: string; metadata: GovernanceMetadataBinding | null; metadataStable: boolean }
+interface VerifiedGovernanceHint {
+  acquiredAtMs: number;
+  state: CanonicalGovernance;
+  token: string;
+  initialTransaction: string;
+  canonical: GovernanceMetadataBinding;
+  bootstrap: GovernanceMetadataBinding;
+}
+const GOVERNANCE_HINT_TTL_MS = 300_000;
+const GOVERNANCE_HINT_MAX_BYTES = 1_048_576;
+
+function governanceMetadataBinding(metadata: ProviderObjectMetadata | null, path: string): GovernanceMetadataBinding | null {
+  if (!metadata || metadata.path !== path || typeof metadata.objectId !== "string" || metadata.objectId.length === 0
+    || typeof metadata.revisionToken !== "string" || metadata.revisionToken.length === 0
+    || !Number.isSafeInteger(metadata.size) || metadata.size < 0) return null;
+  return { path, objectId: metadata.objectId, revisionToken: metadata.revisionToken, size: metadata.size };
+}
+
+function sameGovernanceMetadata(left: GovernanceMetadataBinding | null, right: GovernanceMetadataBinding | null): boolean {
+  return left !== null && right !== null && left.path === right.path && left.objectId === right.objectId
+    && left.revisionToken === right.revisionToken && left.size === right.size;
+}
 const recordSchema = z.strictObject({
   revision: z.number().int().nonnegative(), rules: z.unknown(), exceptions: z.unknown(), journal: z.record(z.string(), z.unknown())
 });
@@ -27,6 +51,7 @@ const receiptSchema = z.strictObject({
 /** One conditional canonical object keeps state, history and receipts in the same commit boundary. */
 export class RuleGovernanceRepository {
   private verifiedBootstrap: { canonicalToken: string; initialTransaction: string } | null = null;
+  private verifiedGovernanceHint: VerifiedGovernanceHint | null = null;
   constructor(private readonly runtime: ProjectOsPersistenceRuntime) {}
 
   /** Absence is usable only before any canonical initialization evidence exists. Read faults propagate. */
@@ -49,7 +74,12 @@ export class RuleGovernanceRepository {
     const text = await this.runtime.objects.readText(globalGovernanceBootstrapPath);
     const after = await this.runtime.objects.getMetadata(globalGovernanceBootstrapPath);
     if (text === null || !after || before.revisionToken !== after.revisionToken) throw new ProviderConflictError("Governance bootstrap changed during read");
-    return { value: bootstrapSchema.parse(JSON.parse(text)), token: before.revisionToken };
+    const metadata = governanceMetadataBinding(before, globalGovernanceBootstrapPath);
+    const afterMetadata = governanceMetadataBinding(after, globalGovernanceBootstrapPath);
+    return {
+      value: bootstrapSchema.parse(JSON.parse(text)), token: before.revisionToken, metadata,
+      metadataStable: sameGovernanceMetadata(metadata, afterMetadata)
+    };
   }
 
   private async ensureBootstrapIntent(transaction: GlobalGovernanceTransaction): Promise<void> {
@@ -79,6 +109,8 @@ export class RuleGovernanceRepository {
 
   async read(): Promise<{ state: CanonicalGovernance; token: string } | null> {
     this.verifiedBootstrap = null;
+    const hinted = await this.readVerifiedGovernanceHint();
+    if (hinted) return hinted;
     const [canonicalResult, bootstrapResult] = await Promise.all([
       this.readCanonicalStable().then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
       this.readBootstrap().then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }))
@@ -91,32 +123,73 @@ export class RuleGovernanceRepository {
     const state = await parseCanonicalGovernance(JSON.parse(text));
     if (!bootstrapResult.ok) throw bootstrapResult.error;
     await this.confirmBootstrap(state, bootstrapResult.value);
-    this.verifiedBootstrap = { canonicalToken: token, initialTransaction: JSON.stringify(Object.values(state.journal)[0].transaction) };
+    const initialTransaction = JSON.stringify(Object.values(state.journal)[0].transaction);
+    this.verifiedBootstrap = { canonicalToken: token, initialTransaction };
+    const canonicalBinding = canonicalResult.value.metadataStable
+      ? governanceMetadataBinding(canonicalResult.value.metadata, globalGovernancePath) : null;
+    const bootstrapBinding = bootstrapResult.value?.metadataStable ? bootstrapResult.value.metadata : null;
+    if (bootstrapResult.value?.value.status === "initialized" && canonicalBinding && bootstrapBinding) {
+      const candidate = { state, token, initialTransaction, canonical: canonicalBinding, bootstrap: bootstrapBinding };
+      if (new TextEncoder().encode(JSON.stringify(candidate)).byteLength <= GOVERNANCE_HINT_MAX_BYTES) {
+        this.verifiedGovernanceHint = { ...candidate, state: structuredClone(state), acquiredAtMs: Date.now() };
+      }
+    }
     return { state, token };
   }
 
-  private async readCanonicalStable(): Promise<{ text: string; token: string } | null> {
+  private async readVerifiedGovernanceHint(): Promise<{ state: CanonicalGovernance; token: string } | null> {
+    const hint = this.verifiedGovernanceHint;
+    if (!hint) return null;
+    const now = Date.now();
+    if (now < hint.acquiredAtMs || now - hint.acquiredAtMs >= GOVERNANCE_HINT_TTL_MS) {
+      this.verifiedGovernanceHint = null;
+      return null;
+    }
+    let canonicalMetadata: ProviderObjectMetadata | null;
+    let bootstrapMetadata: ProviderObjectMetadata | null;
+    try {
+      [canonicalMetadata, bootstrapMetadata] = await Promise.all([
+        this.runtime.objects.getMetadata(globalGovernancePath),
+        this.runtime.objects.getMetadata(globalGovernanceBootstrapPath)
+      ]);
+    } catch {
+      this.verifiedGovernanceHint = null;
+      return null;
+    }
+    if (!sameGovernanceMetadata(governanceMetadataBinding(canonicalMetadata, globalGovernancePath), hint.canonical)
+      || !sameGovernanceMetadata(governanceMetadataBinding(bootstrapMetadata, globalGovernanceBootstrapPath), hint.bootstrap)) {
+      this.verifiedGovernanceHint = null;
+      return null;
+    }
+    this.verifiedBootstrap = { canonicalToken: hint.token, initialTransaction: hint.initialTransaction };
+    return { state: structuredClone(hint.state), token: hint.token };
+  }
+
+  private async readCanonicalStable(): Promise<{ text: string; token: string; metadata: ProviderObjectMetadata; metadataStable: boolean } | null> {
     const before = await this.runtime.objects.getMetadata(globalGovernancePath);
     if (!before) return null;
     if (!before.revisionToken) throw new Error("Global governance revision token missing");
     const text = await this.runtime.objects.readText(globalGovernancePath);
     const after = await this.runtime.objects.getMetadata(globalGovernancePath);
     if (text === null || !after || before.revisionToken !== after.revisionToken) throw new ProviderConflictError("Global governance changed during read");
-    return { text, token: before.revisionToken };
+    const metadata = governanceMetadataBinding(before, globalGovernancePath);
+    const afterMetadata = governanceMetadataBinding(after, globalGovernancePath);
+    return { text, token: before.revisionToken, metadata: before, metadataStable: sameGovernanceMetadata(metadata, afterMetadata) };
   }
 
   async write(state: CanonicalGovernance, expectedToken: string | null): Promise<void> {
+    this.verifiedGovernanceHint = null;
     const verified = this.verifiedBootstrap;
     this.verifiedBootstrap = null;
-    const canonical = await parseCanonicalGovernance(state);
-    const content = JSON.stringify(canonical);
-    const initial = Object.values(canonical.journal)[0]?.transaction;
-    if (expectedToken === null) await this.ensureBootstrapIntent(initial!);
-    else if (!verified || verified.canonicalToken !== expectedToken || verified.initialTransaction !== JSON.stringify(initial)) {
-      // Validate before publication when this write cannot consume an exact verified read.
-      await this.confirmBootstrap(canonical);
-    }
     try {
+      const canonical = await parseCanonicalGovernance(state);
+      const content = JSON.stringify(canonical);
+      const initial = Object.values(canonical.journal)[0]?.transaction;
+      if (expectedToken === null) await this.ensureBootstrapIntent(initial!);
+      else if (!verified || verified.canonicalToken !== expectedToken || verified.initialTransaction !== JSON.stringify(initial)) {
+        // Validate before publication when this write cannot consume an exact verified read.
+        await this.confirmBootstrap(canonical);
+      }
       try {
         if (expectedToken === null) await this.runtime.objects.createText(globalGovernancePath, content);
         else await this.runtime.conditionalWrite.writeTextConditional(globalGovernancePath, content, expectedToken);
@@ -130,6 +203,7 @@ export class RuleGovernanceRepository {
       if (expectedToken === null) await this.confirmBootstrap(canonical);
     } finally {
       this.verifiedBootstrap = null;
+      this.verifiedGovernanceHint = null;
     }
   }
 }

@@ -9,7 +9,7 @@ import type { ProviderRequestScope } from "../src/persistence/provider/contract"
 import { machineDocumentHeadPath, machineDocumentRoot } from "../src/persistence/layout";
 import { ManagedDocumentService } from "../src/documents/service";
 import { DocumentLedgerRepository } from "../src/documents/repository";
-import { ZoneNavigationSources } from "../src/documents/zone-navigation-sources";
+import { ZoneNavigationSources, zoneNavigationDirtyRoot } from "../src/documents/zone-navigation-sources";
 import {
   initializeManagedDocumentChangeJobSchema,
   ManagedDocumentChangeJobStore,
@@ -19,7 +19,8 @@ import {
 } from "../src/documents/change-job-store";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
 import { ManagedDocumentChangeCoordinator } from "../src/documents/change-coordinator";
-import { emptyProjectState } from "../src/domain/transitions";
+import { applyTransaction, emptyProjectState } from "../src/domain/transitions";
+import { parseTransaction } from "../src/domain/transaction";
 import { packageRuntime } from "./helpers/package-runtime";
 import { InternalExecutionFailure } from "../src/execution/coordinator";
 import { ProviderOperationError } from "../src/persistence/provider/errors";
@@ -28,6 +29,14 @@ import { bootstrapRuleAdmissionGovernance } from "./helpers/rule-admission-gover
 import { normalizeSystemAdmission } from "../src/admission/operation-context";
 import { sha256Canonical } from "../src/materialization/hash";
 import { sha256Text } from "../src/documents/hash";
+import { ExecutionJournal, executionHash } from "../src/execution/journal";
+import type { ExecutionAdmission } from "../src/execution/contract";
+import { canonicalJson } from "../src/rules/contract";
+import { applyRuleGovernance, globalGovernanceTransactionSchema, ruleVersionSchema } from "../src/domain/rule-governance";
+import { RuleGovernanceRepository, globalGovernancePath } from "../src/persistence/rule-governance-repository";
+import { eventIdForRevision } from "../src/domain/event";
+import { governanceTx, ruleFixture, exceptionFixture } from "./helpers/rule-fixtures";
+import { evaluateRules } from "../src/rules/evaluator";
 
 const testEnv = env as unknown as Env;
 const at = "2026-08-31T14:20:00+01:00";
@@ -99,6 +108,460 @@ describe("durable managed-document change jobs", () => {
         }
       }
     }
+  });
+
+  async function tornRecoveryParent(intentHash = "a".repeat(64)) {
+    const fixture = packageRuntime();
+    fixture.runtime.pagedListing = { listPage: async ({ path, limit }) => {
+      const children = [...fixture.files.keys()].filter(file => file.startsWith(`${path}/`)
+        && !file.slice(path.length + 1).includes("/"));
+      return { entries: children.slice(0, limit).map(file => ({ kind: "file" as const,
+        name: file.slice(path.length + 1), path: file })), cursor: children.length > limit ? "more-history" : null };
+    } };
+    const projectId = "PRJ-9258";
+    const sourcePath = `${machineDocumentRoot(projectId)}/navigation-sources/state.json`;
+    fixture.put(sourcePath, canonicalJson({ schema_version: "1.0", project_id: projectId, state_revision: 1,
+      zones: Object.fromEntries(["WORKING", "REVIEW", "DELIVERABLES"].map(zone => [zone, {
+        generation: 0, adopted: false, adoption_request_id: null, adoption_generation: null,
+        catalog_rebuild_request_id: null, catalog_cache_write_permits: [], in_flight_writes: [] }])) }));
+    const metadata = await fixture.runtime.objects.getMetadata(sourcePath);
+    if (!metadata?.integrityHash || !metadata.objectId || !metadata.revisionToken) throw new Error("source fixture unavailable");
+    const binding = {
+      discriminator: "navigation.head-write.recovery-parent@1",
+      provider_id: fixture.runtime.providerId,
+      project_id: projectId,
+      actor: { actor_id: "project_guard", authority: "durable_object" },
+      operation: "project.repair",
+      project_revision: 12,
+      intent_hash: intentHash,
+      source_state: { path: sourcePath, object_id: metadata.objectId, revision_token: metadata.revisionToken,
+        integrity_hash_algorithm: metadata.integrityHash.algorithm, integrity_hash: metadata.integrityHash.value }
+    };
+    const bindingHash = await executionHash(binding);
+    const requestId = `DOCREQ-NAV-HEAD-PARENT-REPAIR-12-${intentHash.toUpperCase()}-${bindingHash.toUpperCase()}`;
+    const normalized = await normalizeSystemAdmission(projectId, "project.repair", "DOCUMENTS", "document-reconcile@12", "12", binding);
+    const sourceRef = `${sourcePath}#object_id=${encodeURIComponent(metadata.objectId!)}&revision_token=${encodeURIComponent(metadata.revisionToken!)}&integrity_hash_algorithm=${encodeURIComponent(metadata.integrityHash.algorithm)}&integrity_hash=${encodeURIComponent(metadata.integrityHash.value)}`;
+    const admission: ExecutionAdmission = {
+      project_id: projectId, request_id: requestId, kind: "navigation-head-recovery-parent", operation: "project.repair",
+      request_hash: normalized.request_hash, actor: binding.actor, resources: normalized.resources,
+      diagnosed_drift_refs: [sourceRef], global_revision: 1, project_revision: 12,
+      ruleset: { global_revision: 1, project_revision: 12, digest: "b".repeat(64), rules: [] },
+      verdict: "allow", results: [], gaps: [], deferred_rules: []
+    };
+    const journal = new ExecutionJournal(fixture.runtime, projectId, admission.kind, requestId);
+    const root = await journal.root();
+    // Real canonical admission exists, but its initial progress create was interrupted.
+    fixture.put(`${root}/admission.json`, canonicalJson({ schema_version: "1.0", admission, plan: null, effect_plan_hash: await executionHash(null) }));
+    return { ...fixture, projectId, sourcePath, intentHash, binding, admission, journal, root };
+  }
+
+  // Synthetic, memory-only qualification, not production tuple qualification.
+  // Real controls, qualification, activation, signatures and Registry checks
+  // still execute. The injected evidence resolver is restored immediately.
+  async function appendGovernanceFixture(runtime: ProjectOsPersistenceRuntime, operation: string, payload: unknown) {
+    const repository = new RuleGovernanceRepository(runtime);
+    const saved = await repository.read();
+    if (!saved) throw new Error("governance fixture not initialized");
+    const transaction = globalGovernanceTransactionSchema.parse({ ...governanceTx(operation, payload, saved.state.revision, "GLOBAL"),
+      created_at: new Date().toISOString() });
+    if (transaction.operation === "rule.activate") {
+      const registry = testEnv.REGISTRY_GUARD.getByName("global");
+      const original = await runInDurableObject(registry, instance => (instance as any).ruleQualificationResolver);
+      try {
+        await runInDurableObject(registry, instance => {
+          (instance as any).ruleQualificationResolver = { resolve: async ({ rule, now }: any) => {
+            const active = ruleVersionSchema.parse({ ...rule, status: "active" });
+            const state = emptyProjectState("PRJ-9258", "Synthetic control probe", "synthetic-control-probe");
+            state.revision = 1;
+            const resource = { resource_id: "document-reconcile@1", resource_type: "project", zone: "DOCUMENTS", version: "1", expected_version: "1" };
+            const probe = (operation: string, currentVersion: string) => evaluateRules({
+              actor: { actor_id: "project_guard", authority: "durable_object" }, project_id: state.project_id,
+              expected_project_revision: 1, stage: "pre_admission", now, state, operation, resources: [resource], approvals: [],
+              global_governance: { revision: 1, rules: { [`${rule.rule_id}@${rule.version}`]: active }, exceptions: {} },
+              observations: [{ project_id: state.project_id, resource_id: resource.resource_id, resource_version: "1",
+                current_version: currentVersion, observed_at: now, expires_at: "2099-01-01T00:00:00.000Z", evidence_refs: ["fixture:current-version"] }]
+            });
+            for (const operation of rule.operations) {
+              expect(await probe(operation, "1")).toMatchObject({ verdict: "allow" });
+              expect(await probe(operation, "2")).toMatchObject({ verdict: "deny", results: [expect.objectContaining({ code: "STALE_DOCUMENT_VERSION" })] });
+            }
+            const binding = { status: "verified", evidence_ref: "fixture:current-version",
+              verification_ref: "test/document-change-job-faults.spec.ts#synthetic-real-evaluator-version-probes" };
+            return { active_rules: [], evidence: { rule_id: rule.rule_id, rule_version: rule.version, rule_scope: rule.scope,
+              evidence_refs: transaction.payload.activation_evidence, accepted_source_refs: rule.source_refs,
+              deployed_check_id: "expected_version", deployment_ref: "fixture:memory-only-not-production",
+              check_evidence: { current_version: binding },
+              entry_coverage: rule.operations.map((operation: string) => ({ operation, entries: ["GI"],
+                not_applicable_entries: ["API", "CT", "FB", "IN", "CF", "AD", "RP"], evidence_refs: [binding.verification_ref] })),
+              positive_test_refs: ["fixture:real-expected-version-match"], negative_test_refs: ["fixture:real-stale-version-denial"],
+              contradiction_scan_ref: "fixture:exact-version-and-scope", historical_drift_ref: "fixture:empty-memory-inventory",
+              qualified_at: now, expires_at: "2099-01-01T00:00:00.000Z" } };
+          } };
+        });
+        const response = await registry.fetch("https://registry-guard.internal/governance/transaction", { method: "POST",
+          headers: { authorization: "Bearer rule-admission-test-authority", "content-type": "application/json" }, body: JSON.stringify(transaction) });
+        const receipt = await response.json();
+        expect(response.status, JSON.stringify(receipt)).toBe(200);
+        expect(receipt).toMatchObject({ status: "committed" });
+        const current = await repository.read();
+        expect(current?.state.rules[`${transaction.payload.rule_id}@${transaction.payload.version}`].status).toBe("active");
+        expect(current?.state.journal[transaction.transaction_id].qualification?.proof.evidence.deployment_ref).toBe("fixture:memory-only-not-production");
+        return;
+      } finally { await runInDurableObject(registry, instance => { (instance as any).ruleQualificationResolver = original; }); }
+    }
+    const result = applyRuleGovernance(saved.state, transaction, "GLOBAL");
+    if (result.kind !== "commit") throw new Error(`governance fixture refused: ${JSON.stringify(result)}`);
+    const revision = saved.state.revision + 1, eventId = eventIdForRevision(revision);
+    const receipt = { schema_version: "1.0" as const, project_id: "GLOBAL", transaction_id: transaction.transaction_id,
+      status: "committed" as const, previous_revision: saved.state.revision, new_revision: revision,
+      event_id: eventId, committed_at: transaction.created_at };
+    const event = { schema_version: "1.0" as const, event_id: eventId, project_id: "GLOBAL", revision,
+      transaction_id: transaction.transaction_id, type: transaction.operation, timestamp: transaction.created_at, payload: transaction.payload };
+    await repository.write({ ...result.state, revision,
+      journal: { ...saved.state.journal, [transaction.transaction_id]: { transaction, receipt, event } } }, saved.token);
+  }
+
+  it("reconstructs only initial typed head parent progress before child admission or effects", async () => {
+    const f = await tornRecoveryParent();
+    await expect(f.journal.commit(f.admission, null, f.binding)).resolves.toEqual(f.admission);
+    const saved = await f.journal.load();
+    expect(saved?.progress).toMatchObject({ status: "admitted", terminal: false, sequence: 0, completed_steps: [] });
+    expect(f.effects).toEqual([`create:${f.root}/progress.json`]);
+    await expect(f.journal.commit(f.admission, null, f.binding)).resolves.toEqual(f.admission);
+    expect(f.effects).toHaveLength(1);
+  });
+
+  it("refuses missing or invalid synthetic qualification through the real Registry reader and permit route", async () => {
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-HEAD-QUALIFICATION-NEGATIVE-0001", "head-qualification-negative");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id), registry = testEnv.REGISTRY_GUARD.getByName("global");
+    const originalGuard = await runInDurableObject(guard, instance => (instance as any).env.RULE_ADMISSION_SIGNING_KEY);
+    const originalRegistry = await runInDurableObject(registry, instance => ({ signing: (instance as any).env.RULE_ADMISSION_SIGNING_KEY,
+      governance: (instance as any).env.RULE_GOVERNANCE_TOKEN }));
+    restoreTestEnvBindings = async () => {
+      await runInDurableObject(guard, instance => restoreOptionalEnvBinding((instance as any).env, "RULE_ADMISSION_SIGNING_KEY", originalGuard));
+      await runInDurableObject(registry, instance => {
+        restoreOptionalEnvBinding((instance as any).env, "RULE_ADMISSION_SIGNING_KEY", originalRegistry.signing);
+        restoreOptionalEnvBinding((instance as any).env, "RULE_GOVERNANCE_TOKEN", originalRegistry.governance);
+      });
+    };
+    resetAfterRetryFaultFixture = true;
+    await bootstrapRuleAdmissionGovernance(testEnv, "synthetic-qualification-negative", created.project_id);
+    await runInDurableObject(guard, async instance => {
+      const runtime = (instance as any).persistence;
+      const rule = ruleFixture("GLOBAL", { rule_id: "RULE-SYNTHETIC-QUALIFICATION", operations: ["project.materialize"],
+        resource_scope: { resource_types: ["project"], zones: ["DOCUMENTS"] }, check_id: "expected_version", parameters: { required: false } });
+      await appendGovernanceFixture(runtime, "rule.propose", { rule });
+      await appendGovernanceFixture(runtime, "rule.accept", { rule_id: rule.rule_id, version: 1 });
+      await appendGovernanceFixture(runtime, "rule.activate", { rule_id: rule.rule_id, version: 1, activation_evidence: ["fixture:synthetic-only"] });
+    });
+    const positive = await registry.fetch("https://registry-guard.internal/governance");
+    expect(positive.status).toBe(200);
+    const global: any = await positive.json();
+    const state = emptyProjectState(created.project_id, "Synthetic qualification", "head-qualification-negative");
+    state.revision = 1;
+    const normalized = await normalizeSystemAdmission(created.project_id, "project.materialize", "DOCUMENTS", "document-reconcile@1", "1", {});
+    const actor = { actor_id: "project_guard", authority: "durable_object" };
+    const evaluation = await evaluateRules({ actor, project_id: created.project_id, operation: "project.materialize",
+      expected_project_revision: 1, stage: "pre_admission", now: new Date().toISOString(), state,
+      global_governance: global, resources: normalized.resources, observations: [], approvals: [] });
+    expect(evaluation.verdict).toBe("allow");
+    const request = { actor, project_id: normalized.project_id, operation: normalized.operation,
+      resources: normalized.resources, request_hash: normalized.request_hash,
+      global_revision: global.revision, ruleset: evaluation.ruleset };
+    const original = mock.files.get(globalGovernancePath)!;
+    for (const condition of ["missing", "invalid"]) {
+      const changed = JSON.parse(original);
+      const activation: any = Object.values(changed.journal).find((entry: any) => entry.transaction.operation === "rule.activate");
+      if (condition === "missing") { delete activation.qualification; delete activation.qualification_required; }
+      else activation.qualification.sha256 = "0".repeat(64);
+      await mock.writeExternal(globalGovernancePath, JSON.stringify(changed));
+      const before = new Map(mock.files);
+      const refused = await registry.fetch("https://registry-guard.internal/governance");
+      expect(refused.status).toBe(503);
+      expect(await refused.json()).toMatchObject({ error: condition === "missing" ? "governance_qualification_unavailable" : "governance_unavailable" });
+      const permit = await registry.fetch("https://registry-guard.internal/rule-admission", { method: "POST",
+        headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
+      expect(permit.status).toBe(503);
+      expect(new Map(mock.files)).toEqual(before);
+      await mock.writeExternal(globalGovernancePath, original);
+    }
+  });
+
+  it.each(["source changed", "child admitted", "intent present", "completion present", "wrong actor", "wrong binding"])(
+    "never reconstructs typed parent progress when %s", async (condition) => {
+      const f = await tornRecoveryParent();
+      if (condition === "source changed") f.put(f.sourcePath, f.files.get(f.sourcePath)!.content);
+      if (condition === "child admitted") {
+        const child = new ExecutionJournal(f.runtime, f.projectId, "navigation-head-recovery", `DOCREQ-NAV-HEAD-RECOVERY-${f.intentHash.toUpperCase()}`);
+        f.put(`${await child.root()}/admission.json`, "{}");
+      }
+      if (condition === "intent present" || condition === "completion present") {
+        f.put(`${machineDocumentRoot(f.projectId)}/navigation-sources/head-write-recovery/${f.intentHash}/${condition === "intent present" ? "intent" : "completion"}.json`, "{}");
+      }
+      if (condition === "wrong actor") f.binding.actor.actor_id = "other";
+      if (condition === "wrong binding") f.binding.intent_hash = "c".repeat(64);
+      await expect(f.journal.commit(f.admission, null, f.binding)).rejects.toThrow();
+      expect(f.files.has(`${f.root}/progress.json`)).toBe(false);
+      expect(f.effects).toEqual([]);
+    }
+  );
+
+  it("never applies the missing-progress exception to an ordinary repair family", async () => {
+    const f = await tornRecoveryParent();
+    const admission = { ...f.admission, kind: "document-reconcile", request_id: "legacy-repair" };
+    const journal = new ExecutionJournal(f.runtime, f.projectId, admission.kind, admission.request_id);
+    f.put(`${await journal.root()}/admission.json`, canonicalJson({ schema_version: "1.0", admission, plan: null, effect_plan_hash: await executionHash(null) }));
+    await expect(journal.commit(admission, null)).rejects.toThrow("execution_progress_unavailable");
+    expect(f.effects).toEqual([]);
+  });
+
+  it.each(["noninitial history", "listing unavailable", "incomplete listing", "listing failed"])(
+    "never resets a typed parent when its own history absence is unproved: %s", async condition => {
+      const f = await tornRecoveryParent();
+      if (condition === "noninitial history") f.put(`${f.root}/history/000000004.json`, canonicalJson({
+        sequence: 4, status: "finalizing", completed_steps: [{ step_id: "prior-effect" }] }));
+      if (condition === "listing unavailable") delete f.runtime.pagedListing;
+      if (condition === "incomplete listing") f.runtime.pagedListing = { listPage: async () => ({ entries: [], cursor: "unread-history" }) };
+      if (condition === "listing failed") f.runtime.pagedListing = { listPage: async () => { throw new Error("provider_unavailable"); } };
+      const before = [...f.files.entries()];
+      await expect(f.journal.commit(f.admission, null, f.binding)).rejects.toThrow();
+      expect([...f.files.entries()]).toEqual(before);
+      expect(f.files.has(`${f.root}/progress.json`)).toBe(false);
+      expect(f.effects).toEqual([]);
+    }
+  );
+
+  it("binds a new recovery child to its sole canonical parent before creating intention", async () => {
+    const f = await tornRecoveryParent();
+    await f.journal.commit(f.admission, null, f.binding);
+    const parentRef = `${f.root}/admission.json`;
+    const childAdmission: ExecutionAdmission = { ...f.admission, kind: "navigation-head-recovery", operation: "project.materialize",
+      request_id: `DOCREQ-NAV-HEAD-RECOVERY-${f.intentHash.toUpperCase()}`, request_hash: f.intentHash,
+      diagnosed_drift_refs: [parentRef] };
+    const child = new ExecutionJournal(f.runtime, f.projectId, childAdmission.kind, childAdmission.request_id);
+    await child.commit(childAdmission, null);
+    // Feature absence is measured on real journal progress, not by mocking a claim method.
+    if ("claimHeadRecoveryParent" in child) await child.claimHeadRecoveryParent(f.journal, f.binding);
+    const claimed = await child.load();
+    expect(claimed?.progress.completed_steps).toEqual([{ step_id: "head-recovery-parent", evidence_refs: [parentRef],
+      observation_hash: await executionHash(f.binding) }]);
+    expect(claimed?.progress.sequence).toBe(1);
+    if ("claimHeadRecoveryParent" in child) await child.claimHeadRecoveryParent(f.journal, f.binding);
+    expect((await child.load())?.progress.sequence).toBe(1);
+  });
+
+  async function claimedRecoveryChild() {
+    const f = await tornRecoveryParent();
+    await f.journal.commit(f.admission, null, f.binding);
+    const admission: ExecutionAdmission = { ...f.admission, kind: "navigation-head-recovery", operation: "project.materialize",
+      request_id: `DOCREQ-NAV-HEAD-RECOVERY-${f.intentHash.toUpperCase()}`, request_hash: f.intentHash,
+      diagnosed_drift_refs: [`${f.root}/admission.json`] };
+    const child = new ExecutionJournal(f.runtime, f.projectId, admission.kind, admission.request_id);
+    await child.commit(admission, null);
+    return { ...f, child, childAdmission: admission, childRoot: await child.root() };
+  }
+
+  it("does not reset a missing child progress after its canonical parent claim", async () => {
+    const f = await claimedRecoveryChild();
+    await f.child.claimHeadRecoveryParent(f.journal, f.binding);
+    f.files.delete(`${f.childRoot}/progress.json`);
+    f.effects.length = 0;
+    const before = [...f.files.entries()];
+    await expect(f.child.commit(f.childAdmission, null)).rejects.toThrow("execution_progress_unavailable");
+    expect([...f.files.entries()]).toEqual(before);
+    expect(f.effects).toEqual([]);
+  });
+
+  it.each(["claim CAS", "claim history"])("recovers an acknowledgement lost after successful %s without replaying its claim", async boundary => {
+    const f = await claimedRecoveryChild();
+    let injected = false;
+    if (boundary === "claim CAS") {
+      const original = f.runtime.conditionalWrite.writeTextConditional;
+      f.runtime.conditionalWrite.writeTextConditional = async (...args) => {
+        const result = await original(...args);
+        if (!injected && args[0] === `${f.childRoot}/progress.json`) { injected = true; throw new Error("ack_lost_after_write"); }
+        return result;
+      };
+      await expect(f.child.claimHeadRecoveryParent(f.journal, f.binding)).rejects.toThrow("ack_lost_after_write");
+    } else {
+      const original = f.runtime.objects.createText;
+      f.runtime.objects.createText = async (...args) => {
+        await original(...args);
+        if (!injected && args[0].startsWith(`${f.childRoot}/history/`)) { injected = true; throw new Error("ack_lost_after_write"); }
+      };
+      await f.child.claimHeadRecoveryParent(f.journal, f.binding);
+    }
+    expect(injected).toBe(true);
+    const recovered = await f.child.claimHeadRecoveryParent(f.journal, f.binding);
+    expect(recovered.progress.sequence).toBe(1);
+    expect(recovered.progress.completed_steps).toEqual([{ step_id: "head-recovery-parent", evidence_refs: [`${f.root}/admission.json`],
+      observation_hash: await executionHash(f.binding) }]);
+    expect([...f.files.keys()].filter(path => path.startsWith(`${f.childRoot}/history/`))).toHaveLength(1);
+    expect(f.effects.filter(effect => effect === `write:${f.childRoot}/progress.json`)).toHaveLength(1);
+  });
+
+  it("permits only one concurrent canonical parent claim", async () => {
+    const f = await claimedRecoveryChild();
+    const first = (await f.child.load())!, second = (await f.child.load())!;
+    const parent1 = (await f.journal.load())!, parent2 = (await f.journal.load())!;
+    const results = await Promise.allSettled([
+      f.child.claimHeadRecoveryParent(f.journal, f.binding, { parent: parent1, child: first }),
+      f.child.claimHeadRecoveryParent(f.journal, f.binding, { parent: parent2, child: second })
+    ]);
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect((await f.child.load())?.progress.sequence).toBe(1);
+    expect((await f.child.load())?.progress.completed_steps).toHaveLength(1);
+    expect(f.effects.filter(effect => effect === `write:${f.childRoot}/progress.json`)).toHaveLength(1);
+  });
+
+  it.each(["resource", "zone", "version"].flatMap(field => ["claim", "effects", "tail"].map(phase => ({ field, phase }))))(
+    "refuses recovery with a child resource vector outside intention before $phase: $field", async ({ field, phase }) => {
+      const projectId = "PRJ-9258", resourceId = `head:DOC-${"A".repeat(24)}`;
+      const intent = { schema_version: "1.0" as const, intent_type: "navigation.head-write.reconcile" as const,
+        project_id: projectId, resource_id: resourceId, original_outcome: "unknown" as const,
+        original_tickets: [{ project_id: projectId, zone: "WORKING" as const, resource_id: resourceId,
+          generation: 1, write_hash: "a".repeat(64) }],
+        current_head: { path: machineDocumentHeadPath(projectId, resourceId.slice(5)), object_id: "id:head",
+          revision_token: "rev:head", content_sha256: "c".repeat(64), size: 10 },
+        version_proofs: [{ version_id: "VER-FIXTURE", stage: "working" as const, immutable_payload_path: "/fixture/payload.md",
+          record_sha256: "d".repeat(64), record_object_id: "id:record", record_revision_token: "rev:record", record_size: 10,
+          payload_object_id: "id:payload", payload_revision_token: "rev:payload", payload_size: 10 }] };
+      const hash = await executionHash(intent);
+      const f = await tornRecoveryParent(hash);
+      await f.journal.commit(f.admission, null, f.binding);
+      const parentRef = `${f.root}/admission.json`;
+      const resource = { resource_id: resourceId, resource_type: "document", zone: "WORKING", version: "c".repeat(64) };
+      if (field === "resource") resource.resource_id = `head:DOC-${"B".repeat(24)}`;
+      if (field === "zone") resource.zone = "REVIEW";
+      if (field === "version") resource.version = "e".repeat(64);
+      const admission: ExecutionAdmission = { ...f.admission, kind: "navigation-head-recovery", operation: "project.materialize",
+        request_id: `DOCREQ-NAV-HEAD-RECOVERY-${hash.toUpperCase()}`, request_hash: hash,
+        resources: [resource], diagnosed_drift_refs: [parentRef] };
+      const child = new ExecutionJournal(f.runtime, projectId, admission.kind, admission.request_id);
+      await child.commit(admission, null);
+      if (phase !== "claim") await child.claimHeadRecoveryParent(f.journal, f.binding);
+      if (phase === "tail") {
+        const loaded = (await child.load())!;
+        loaded.progress.status = "finalizing";
+        loaded.progress.sequence++;
+        await child.save(loaded.progress, loaded.token);
+      }
+      const intentPath = `${machineDocumentRoot(projectId)}/navigation-sources/head-write-recovery/${hash}/intent.json`;
+      if (phase !== "claim") f.put(intentPath, canonicalJson(intent));
+      const checkpoint = { intent_hash: hash, parent_request_id: f.admission.request_id, child_created: true, intent,
+        discovery: { cursor: null, pending_roots: [], complete: true }, dirty: [null], cleared: 0, completion: [null] };
+      const before = [...f.files.entries()];
+      f.effects.length = 0;
+      await expect(new DocumentLedgerRepository(f.runtime).recoverOneUnownedHeadWrite(projectId, 0, false, {
+        pending_recovery_hash: hash, authorize: async () => { throw new Error("unexpected_new_admission"); },
+        rememberRecovery: async () => { throw new Error("unexpected_new_locator"); },
+        bound: { readCheckpoint: async () => checkpoint, writeCheckpoint: async () => {},
+          authorizeParent: async () => { throw new Error("unexpected_new_parent"); }, assertCompatible: async () => {} }
+      })).rejects.toThrow("navigation_head_recovery_parent_claim_invalid");
+      expect([...f.files.entries()]).toEqual(before);
+      expect(f.effects).toEqual([]);
+    });
+
+  it("prepares one recovery dirty marker without clearing its owned source fence", async () => {
+    const f = packageRuntime();
+    const projectId = "PRJ-9258";
+    const resourceId = `head:DOC-${"A".repeat(24)}`;
+    const rawHead = "physically verified head";
+    const currentHash = await sha256Text(rawHead);
+    const ownerHash = "d".repeat(64);
+    f.put(machineDocumentHeadPath(projectId, resourceId.slice(5)), rawHead);
+    f.runtime.pagedListing = { listPage: async ({ path }) => ({ entries: [...f.files.keys()]
+      .filter(file => file.startsWith(`${path}/`) && !file.slice(path.length + 1).includes("/"))
+      .map(file => ({ kind: "file" as const, name: file.slice(path.length + 1), path: file })), cursor: null }) };
+    const sources = new ZoneNavigationSources(f.runtime);
+    await sources.markCatalogReady(projectId, "WORKING", 0);
+    await sources.beginAdoption(projectId, "WORKING", "DOCREQ-TEST-RECOVERY-ADOPT", 0);
+    await sources.finishAdoption(projectId, "WORKING", "DOCREQ-TEST-RECOVERY-ADOPT", 0);
+    const ticket = await sources.beginHeadWrite(projectId, "WORKING", resourceId, undefined, currentHash, false, ownerHash);
+    expect(ticket).not.toBeNull();
+    let witnessCreated = false;
+    await sources.completeOwnedHeadWriteRecovery([ticket!], ownerHash, currentHash, undefined, {
+      verifyCurrent: async () => await f.runtime.objects.readText(machineDocumentHeadPath(projectId, resourceId.slice(5))) === rawHead,
+      beforeClear: async () => { witnessCreated = true; }, hasCompletionWitness: async () => witnessCreated
+    }, { kind: "dirty", index: 0, hint: null });
+    expect((await sources.readState(projectId, "WORKING")).in_flight_resource_ids).toContain(resourceId);
+    expect(await sources.hasDirtyMarker(projectId, "WORKING", resourceId)).toBe(true);
+    expect(witnessCreated).toBe(false);
+  });
+
+  it.each([{ legacy: false, corrupt: "none" }, { legacy: true, corrupt: "none" },
+    ...["dirty", "manifest"].flatMap(component => ["future", "invalid"].map(value => ({ legacy: false, corrupt: `${component}-${value}` })))])(
+    "ages recovery hints by real component acquisitions, preserving legacy age: $legacy corruption=$corrupt", async ({ legacy, corrupt }) => {
+    const f = packageRuntime();
+    const projectId = "PRJ-9258";
+    const resourceId = `head:DOC-${"A".repeat(24)}`;
+    const currentHash = "c".repeat(64);
+    const ownerHash = "d".repeat(64);
+    f.runtime.pagedListing = { listPage: async ({ path }) => ({ entries: [...f.files.keys()]
+      .filter(file => file.startsWith(`${path}/`) && !file.slice(path.length + 1).includes("/"))
+      .map(file => ({ kind: "file" as const, name: file.slice(path.length + 1), path: file })), cursor: null }) };
+    const sources = new ZoneNavigationSources(f.runtime);
+    await sources.markCatalogReady(projectId, "WORKING", 0);
+    await sources.beginAdoption(projectId, "WORKING", "DOCREQ-HINT-AGE-ADOPT", 0);
+    await sources.finishAdoption(projectId, "WORKING", "DOCREQ-HINT-AGE-ADOPT", 0);
+    const original = await sources.beginHeadWrite(projectId, "WORKING", resourceId, undefined, currentHash, false, ownerHash);
+    const sourcePath = `${machineDocumentRoot(projectId)}/navigation-sources/state.json`;
+    const state = JSON.parse(f.files.get(sourcePath)!.content);
+    state.zones.WORKING.generation = 2;
+    state.zones.WORKING.in_flight_writes[0].generation = 2;
+    state.state_revision++;
+    f.put(sourcePath, JSON.stringify(state));
+    const dirtyPath = `${zoneNavigationDirtyRoot(projectId, "WORKING")}/${await sha256Text(resourceId)}.json`;
+    f.put(dirtyPath, JSON.stringify({ schema_version: "1.0", resource_id: resourceId, generation: 1, entry_hash: null }));
+    const ticket = { ...original!, generation: 2 };
+    const proof = { verifyCurrent: async () => true, beforeClear: async () => { throw new Error("dirty must not clear"); },
+      hasCompletionWitness: async () => false };
+    const base = Date.parse("2026-10-05T10:00:00.000Z");
+    const advance = (hint: any) => sources.completeOwnedHeadWriteRecovery([ticket], ownerHash, currentHash, undefined, proof,
+      { kind: "dirty", index: 0, hint }) as Promise<any>;
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(base);
+      let hint = await advance(null);
+      vi.setSystemTime(base + 10_000);
+      hint = await advance(hint);
+      vi.setSystemTime(base + 20_000);
+      hint = await advance(hint);
+      expect(hint.phase).toBe("manifest_published");
+      if (legacy) { delete hint.dirty_acquired_at_ms; delete hint.manifest_acquired_at_ms; }
+      vi.setSystemTime(base + 30_000);
+      hint = await advance(hint);
+      // Dirty was physically written/read at +30s; manifest at +20s. The
+      // older *real* component wins. A missing date never becomes +30s.
+      const groupAcquiredAt = base + (legacy ? 0 : 20_000);
+      expect(hint.acquired_at_ms).toBe(groupAcquiredAt);
+      expect(hint.dirty_acquired_at_ms).toBe(base + 30_000);
+      if (!legacy) expect(hint.manifest_acquired_at_ms).toBe(base + 20_000);
+      const effectsBeforeHit = f.effects.length;
+      vi.setSystemTime(base + 40_000);
+      if (corrupt !== "none") {
+        const invalid = { ...hint, [corrupt.startsWith("dirty") ? "dirty_acquired_at_ms" : "manifest_acquired_at_ms"]:
+          corrupt.endsWith("future") ? Date.now() + 1 : -1 };
+        const reacquired = await advance(invalid);
+        expect(reacquired.phase).toBe("ready"); // the actual reread marker already matches generation 2
+        expect(reacquired.manifest).toBeNull();
+        expect(reacquired.dirty_acquired_at_ms).toBe(Date.now());
+        expect(f.effects).toHaveLength(effectsBeforeHit);
+        expect((await sources.readState(projectId, "WORKING")).in_flight_resource_ids).toContain(resourceId);
+        return;
+      }
+      hint = await advance(hint);
+      expect(hint.acquired_at_ms).toBe(groupAcquiredAt);
+      expect(hint.dirty_acquired_at_ms).toBe(base + 30_000);
+      expect(f.effects).toHaveLength(effectsBeforeHit);
+      // A forged newer scalar cannot hide expiration of the retained bodies.
+      vi.setSystemTime(groupAcquiredAt + 300_000);
+      const expired = await advance(legacy ? hint : { ...hint, acquired_at_ms: Date.now() });
+      expect(expired.manifest).toBeNull();
+      expect(expired.acquired_at_ms).toBe(Date.now());
+      expect((await sources.readState(projectId, "WORKING")).in_flight_resource_ids).toContain(resourceId);
+    } finally { vi.useRealTimers(); }
   });
 
   it("reports a bounded checkpoint without advancing verification or changing durable jobs", async () => {
@@ -532,7 +995,87 @@ describe("durable managed-document change jobs", () => {
     expect(await acknowledgement.json<Record<string, unknown>>()).toMatchObject({ requested_generation: 1 });
   }, 15_000);
 
-  it.each(["baseline", "superseded"])("admits current-head recovery through ProjectGuard without rewriting the canonical head: %s", async (scenario) => {
+  it.each([
+    { count: 1, other: false, preparation: false },
+    { count: 32, other: false, preparation: false },
+    { count: 32, other: true, preparation: false },
+    { count: 32, other: true, preparation: true }
+  ])("parks a full or solitary recovery cohort before discovery until its deadline: $count/$other/$preparation", async ({ count, other, preparation }) => {
+    // A capacity check after parent admission is too late: it must prevent
+    // fresh provider discovery, even with a sibling hint/preparation present.
+    const mock = installDropboxMock();
+    resetAfterRetryFaultFixture = true;
+    const created = await createProject("TXN-CHANGEJOB-PARKED-COHORT-0001", "parked-cohort");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const prepared = await runInDurableObject(guard, async (instance, durableState) => {
+      const target = instance as any;
+      const state = await target.loadOrRecoverState();
+      const document = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-PARKED-COHORT-SIBLING-0001",
+        project_id: created.project_id, logical_path: "parked/sibling.md", content: "late independent document",
+        content_sha256: await sha256Text("late independent document"), created_at: at }, state);
+      const sources = new ZoneNavigationSources(target.persistence);
+      expect(await sources.markCatalogReady(created.project_id, "WORKING", 0)).toBe(true);
+      expect(await sources.beginAdoption(created.project_id, "WORKING", "DOCREQ-PARKED-COHORT-ADOPT-0001", 0)).toBe(true);
+      expect(await sources.finishAdoption(created.project_id, "WORKING", "DOCREQ-PARKED-COHORT-ADOPT-0001", 0)).toBe(true);
+      expect(await sources.beginHeadWrite(created.project_id, "WORKING", `head:${document.document_id}`, undefined, "b".repeat(64))).toBeTruthy();
+      const now = Date.now();
+      const deadline = now + 30_000;
+      const locators = Array.from({ length: count }, (_, index) => ({
+        request_hash: (index + 1).toString(16).padStart(64, "0"),
+        resource_id: `head:DOC-${(index + 1).toString(16).toUpperCase().padStart(24, "0")}`,
+        next_attempt_at: deadline
+      }));
+      const key = "navigation-head-recovery-pending-v1";
+      const stored = { project_id: created.project_id, ...locators[0], deferred: locators.slice(1), cursor: 0, other_candidates: other };
+      await durableState.storage.put(key, stored);
+      if (preparation) await durableState.storage.put("navigation-head-recovery-preparation-v1", { intentionally_unconsulted: true });
+      return { now, deadline, stored };
+    });
+    const before = new Map(mock.files);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(prepared.now);
+      await runInDurableObject(guard, async (instance, durableState) => {
+        const target = instance as any;
+        const key = "navigation-head-recovery-pending-v1";
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const slice = target.createManagedDocumentSlice(Date.now());
+          try {
+            expect(await target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime, attempt, false, slice.scope))
+              .toEqual({ status: "unresolved", remainingCandidates: true, next_attempt_at: prepared.deadline });
+            expect(slice.calls()).toBe(0);
+          } finally { clearTimeout(slice.abortTimer); }
+          expect(await durableState.storage.get(key)).toEqual(prepared.stored);
+          expect(mock.files).toEqual(before);
+        }
+      });
+      vi.setSystemTime(prepared.deadline);
+      await runInDurableObject(guard, async (instance, durableState) => {
+        const target = instance as any;
+        const key = "navigation-head-recovery-pending-v1";
+        // At the deadline rotate an EXISTING locator. These local fixture
+        // hints have no canonical I: the real engine refuses it, never
+        // inventing an admission or occupying a 33rd slot.
+        for (let ordinal = 0; ordinal < Math.min(count, 2); ordinal++) {
+          const slice = target.createManagedDocumentSlice(Date.now());
+          const downloadStart = mock.downloadCalls.length;
+          try {
+            await expect(target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime, ordinal, false, slice.scope))
+              .rejects.toThrow("navigation_head_recovery_reacquisition_conflict");
+            expect(mock.downloadCalls[downloadStart]).toBe(`${machineDocumentRoot(created.project_id)}/navigation-sources/head-write-recovery/${(ordinal + 1).toString(16).padStart(64, "0")}/intent.json`);
+            expect(slice.calls()).toBeGreaterThan(0);
+            expect(slice.calls()).toBeLessThanOrEqual(64);
+          } finally { clearTimeout(slice.abortTimer); }
+          expect(mock.files).toEqual(before);
+          const pending = await durableState.storage.get<any>(key);
+          expect([pending, ...pending.deferred]).toHaveLength(count);
+          expect(pending.cursor).toBe(ordinal + 1);
+        }
+      });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["baseline", "superseded", "superseded-alone", "superseded-prepared"])("admits current-head recovery through ProjectGuard without rewriting the canonical head: %s", async (scenario) => {
     const mock = installDropboxMock();
     const created = await createProject("TXN-CHANGEJOB-CURRENT-HEAD-RECOVERY-0001", "current-head-recovery");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
@@ -550,6 +1093,7 @@ describe("durable managed-document change jobs", () => {
     };
     resetAfterRetryFaultFixture = true;
     await bootstrapRuleAdmissionGovernance(testEnv, "current-head-recovery-rules", created.project_id);
+    vi.useFakeTimers();
     const measured = await runInDurableObject(guard, async (instance) => {
       const target = instance as any;
       const state = await target.loadOrRecoverState();
@@ -595,6 +1139,8 @@ describe("durable managed-document change jobs", () => {
       const delegate = mock.spy.getMockImplementation()!;
       let interruptedBeforeIntent = false;
       let interruptedAfterClear = false;
+      let observedOrdinal = -1;
+      const faultBoundaries: Array<{ phase: string; ordinal: number }> = [];
       mock.spy.mockImplementation(async (input, init) => {
         const request = input instanceof Request ? input : new Request(String(input), init);
         const url = new URL(request.url);
@@ -604,7 +1150,13 @@ describe("durable managed-document change jobs", () => {
           const admissionRaw = mock.files.get(path.replace(/progress\.json$/, "admission.json"));
           if (admissionRaw && JSON.parse(admissionRaw).admission.kind === "navigation-head-recovery") {
             interruptedBeforeIntent = true;
-            expect(await target.ctx.storage.get("navigation-head-recovery-pending-v1")).toBeUndefined();
+            faultBoundaries.push({ phase: "child_initial_progress_before_write", ordinal: observedOrdinal });
+            const locator = await target.ctx.storage.get("navigation-head-recovery-pending-v1");
+            expect(locator).toMatchObject({ resource_id: resource });
+            const childAdmission = JSON.parse(admissionRaw).admission;
+            expect(childAdmission.diagnosed_drift_refs).toHaveLength(1);
+            expect(JSON.parse(mock.files.get(childAdmission.diagnosed_drift_refs[0])!).admission)
+              .toMatchObject({ kind: "navigation-head-recovery-parent", project_id: created.project_id });
             return new Response(JSON.stringify({ error_summary: "injected_before_recovery_intent" }), { status: 503 });
           }
         }
@@ -613,26 +1165,35 @@ describe("durable managed-document change jobs", () => {
           const source = JSON.parse(mock.files.get(`${machineDocumentRoot(created.project_id)}/navigation-sources/state.json`)!);
           expect(source.zones.WORKING.in_flight_writes).toEqual([]);
           interruptedAfterClear = true;
+          faultBoundaries.push({ phase: "receipt_before_write_after_fence_clear", ordinal: observedOrdinal });
           return new Response(JSON.stringify({ error_summary: "injected_after_recovery_fence_clear" }), { status: 503 });
         }
         return delegate(input, init);
       });
       let recovered = false;
+      let parked = false;
+      let replaced = false;
       let siblingResource: string | null = null;
+      let preservedA: Array<[string, string]> = [];
+      let siblingPreparation: unknown = null;
+      let concurrentPreparationReplaced = false;
+      let oldResourceBecameDueDuringSibling = false;
       const sliceCosts: number[] = [];
       const interruptions: string[] = [];
-      for (let ordinal = 0; ordinal < 8 && !recovered; ordinal++) {
+      let oldEightCallOutcome: unknown = null;
+      for (let ordinal = 0; ordinal < (["superseded-alone", "superseded-prepared"].includes(scenario) ? 16 : 30) && !recovered && !parked; ordinal++) {
+        observedOrdinal = ordinal;
         const slice = target.createManagedDocumentSlice(Date.now());
         try {
           const result = await target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime,
-            scenario === "superseded" ? 0 : ordinal, false, slice.scope);
-          recovered = scenario === "baseline" ? result.status === "recovered" : siblingResource !== null
+            scenario.startsWith("superseded") ? 0 : ordinal, false, slice.scope);
+          recovered = scenario === "baseline" ? result.status === "recovered" : siblingResource !== null && result.status === "recovered"
             && !(await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids.includes(siblingResource);
         } catch (error) {
           const text = error instanceof Error ? error.message : String(error);
           interruptions.push(text);
           if (text === "execution_evidence_unavailable" && interruptedBeforeIntent && !interruptedAfterClear) {
-            expect(await target.ctx.storage.get("navigation-head-recovery-pending-v1")).toBeUndefined();
+            expect(await target.ctx.storage.get("navigation-head-recovery-pending-v1")).toMatchObject({ resource_id: resource });
             expect((await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids).toContain(resource);
           } else {
             if (!text.includes("slice_budget_exhausted") && !interruptedAfterClear) throw error;
@@ -644,24 +1205,96 @@ describe("durable managed-document change jobs", () => {
           sliceCosts.push(slice.calls());
           expect(slice.calls()).toBeLessThanOrEqual(64);
         }
-        if (scenario === "superseded" && interruptedAfterClear && siblingResource === null) {
+        if (ordinal === 7) oldEightCallOutcome = { recovered, interruptedBeforeIntent, interruptedAfterClear,
+          diagnostic: await target.ctx.storage.get("navigation-head-recovery-diagnostic-v1"),
+          pending: await target.ctx.storage.get("navigation-head-recovery-pending-v1"),
+          progress: [...mock.files.entries()].filter(([path]) => path.endsWith("/progress.json"))
+            .map(([, raw]) => JSON.parse(raw)).filter(record => ["navigation-head-recovery", "navigation-head-recovery-parent"].includes(record.kind)) };
+        const pointer = await target.ctx.storage.get("navigation-head-recovery-pending-v1") as { next_attempt_at: number } | undefined;
+        parked = ["superseded-alone", "superseded-prepared"].includes(scenario) && pointer !== undefined && pointer.next_attempt_at > Date.now();
+        if (scenario === "superseded" && !oldResourceBecameDueDuringSibling && siblingResource) {
+          const childB = [...mock.files.values()].map(raw => { try { return JSON.parse(raw); } catch { return null; } })
+            .find(record => record?.admission?.kind === "navigation-head-recovery"
+              && record.admission.resources.some((entry: any) => entry.resource_id === siblingResource));
+          const current = pointer as unknown as { resource_id: string; next_attempt_at?: number; deferred: Array<{ resource_id: string; next_attempt_at?: number }> };
+          const parkedA = current && [current, ...current.deferred].find(item => item.resource_id === resource);
+          if (childB && parkedA?.next_attempt_at) {
+            vi.setSystemTime(parkedA.next_attempt_at);
+            oldResourceBecameDueDuringSibling = true;
+          }
+        }
+        if (scenario.startsWith("superseded") && interruptedAfterClear && !replaced) {
           // A provider replacement preserves A's valid contents but changes
           // its exact physical version between slices. Independent B remains
           // recoverable; A must not monopolize it or acquire a false success.
           await mock.writeExternal(headPath, before!);
-          const sibling = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-CURRENT-HEAD-RECOVERY-SIBLING-0001",
+          replaced = true;
+          preservedA = [...mock.files.entries()].filter(([path]) => path.includes("/executions/")
+            || path.includes("/head-write-recovery/"));
+          if (["superseded", "superseded-prepared"].includes(scenario)) {
+            const sibling = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-CURRENT-HEAD-RECOVERY-SIBLING-0001",
             project_id: created.project_id, logical_path: "recovery/sibling.md", content: "independent sibling",
             content_sha256: await sha256Text("independent sibling"), created_at: at }, state);
-          siblingResource = `head:${sibling.document_id}`;
-          expect(await sources.beginHeadWrite(created.project_id, "WORKING", siblingResource, undefined, "b".repeat(64))).toBeTruthy();
+            siblingResource = `head:${sibling.document_id}`;
+            expect(await sources.beginHeadWrite(created.project_id, "WORKING", siblingResource, undefined, "b".repeat(64))).toBeTruthy();
+            if (scenario === "superseded-prepared") {
+              // Acquire real DATA for B, not an authority or a model's claim.
+              const repository = new DocumentLedgerRepository(target.persistence) as any;
+              const snapshot = await sources.headWriteRecoveryCandidateSnapshot(created.project_id);
+              const tickets = snapshot!.candidates.find(group => group[0].resource_id === siblingResource)!;
+              const proof = await repository.readCurrentHeadRecoveryProof(created.project_id, siblingResource, undefined, undefined, true);
+              expect(proof.next_pointer_index).toBe(proof.pointer_bindings.length);
+              siblingPreparation = await repository.makeHeadWriteRecoveryPreparation({ schema_version: "1.0",
+                preparation_type: "navigation-head-recovery-preparation", project_id: created.project_id, provider_id: "dropbox",
+                created_at_ms: Date.now(), expires_at_ms: Date.now() + 300_000, resource_id: siblingResource,
+                original_tickets: tickets, source_state: snapshot!.source_state, ...proof });
+              const transaction = target.ctx.storage.transaction.bind(target.ctx.storage);
+              vi.spyOn(target.ctx.storage, "transaction").mockImplementation(async (closure: any) => {
+                if (!concurrentPreparationReplaced) {
+                  await target.ctx.storage.put("navigation-head-recovery-preparation-v1", siblingPreparation);
+                  concurrentPreparationReplaced = true;
+                }
+                return transaction(closure);
+              });
+            }
+          }
         }
       }
       expect(interruptedBeforeIntent).toBe(true);
       expect(interruptedAfterClear).toBe(true);
+      if (scenario.startsWith("superseded")) for (const [path, raw] of preservedA) expect(mock.files.get(path)).toBe(raw);
+      if (scenario === "superseded-prepared") {
+        expect(parked).toBe(true);
+        expect(concurrentPreparationReplaced).toBe(true);
+        expect(await target.ctx.storage.get("navigation-head-recovery-preparation-v1")).toEqual(siblingPreparation);
+        expect([...mock.files.values()].map(raw => { try { return JSON.parse(raw); } catch { return null; } })
+          .filter(record => record?.admission?.kind === "navigation-head-recovery-parent")).toHaveLength(1);
+        return { sliceCosts, interruptions, parked, concurrentSiblingPreparationPreserved: true, oldEightCallOutcome };
+      }
+      if (scenario === "superseded-alone") {
+        expect(parked).toBe(true);
+        const pointer = await target.ctx.storage.get("navigation-head-recovery-pending-v1") as { next_attempt_at: number; other_candidates: boolean };
+        const beforeIdle = new Map(mock.files);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const slice = target.createManagedDocumentSlice(Date.now());
+          try {
+            expect(await target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime, attempt, false, slice.scope))
+              .toEqual({ status: "unresolved", remainingCandidates: true, next_attempt_at: pointer.next_attempt_at });
+            expect(slice.calls()).toBe(0);
+          } finally { clearTimeout(slice.abortTimer); }
+          expect(mock.files).toEqual(beforeIdle);
+        }
+        expect(pointer.other_candidates).toBe(false);
+        expect(mock.files.get(headPath)).toBe(before);
+        return { sliceCosts, interruptions, parked, originalIdentityPreserved: true, oldEightCallOutcome,
+          next_attempt_at: pointer.next_attempt_at };
+      }
       expect(recovered, JSON.stringify({ scenario, sliceCosts, interruptions,
         pending: await target.ctx.storage.get("navigation-head-recovery-pending-v1"), siblingResource,
         source: await sources.readState(created.project_id, "WORKING") })).toBe(true);
       if (scenario === "superseded") {
+        expect(oldResourceBecameDueDuringSibling).toBe(true);
+        expect(interruptions.filter(code => code === "navigation_head_recovery_completion_missing")).toHaveLength(2);
         expect(mock.files.get(headPath)).toBe(before);
         const remaining = await target.ctx.storage.get("navigation-head-recovery-pending-v1");
         expect(remaining).toBeTruthy();
@@ -677,7 +1310,8 @@ describe("durable managed-document change jobs", () => {
         const compact = await sources.compactCatalogManifest(created.project_id, "WORKING");
         expect(compact?.coalesced_dirty.find(item => item.resource_id === siblingResource)).toMatchObject({
           latest_generation: 3, covered_generations: [{ start: 2, end: 2 }] });
-        return { sliceCosts, interruptions, interruptedBeforeIntent, interruptedAfterClear, recovered };
+        return { sliceCosts, interruptions, interruptedBeforeIntent, interruptedAfterClear, recovered, faultBoundaries, oldEightCallOutcome,
+          oldResourceBecameDueDuringSibling };
       }
       expect((await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids).not.toContain(resource);
       expect(await sources.hasDirtyMarker(created.project_id, "WORKING", resource)).toBe(true);
@@ -695,9 +1329,540 @@ describe("durable managed-document change jobs", () => {
       expect(JSON.parse(mock.files.get(progress.receipt_ref)!)).toMatchObject({ status: "committed", original_outcome: "unknown" });
       expect(JSON.parse(mock.files.get(progress.finalization_ref)!)).toMatchObject({ request_hash: progress.request_hash,
         postconditions: ["exact_current_head_revalidated", "source_dirty_generation_durable", "recovery_fence_absent"] });
-      return { sliceCosts, interruptions, interruptedBeforeIntent, interruptedAfterClear, recovered };
+      return { sliceCosts, interruptions, interruptedBeforeIntent, interruptedAfterClear, recovered, faultBoundaries, oldEightCallOutcome };
     });
+    if (scenario === "superseded-alone") {
+      const beforeDeadlineRetry = new Map(mock.files);
+      vi.setSystemTime((measured as { next_attempt_at: number }).next_attempt_at);
+      await runInDurableObject(guard, async (instance, durableState) => {
+        const target = instance as any;
+        const slice = target.createManagedDocumentSlice(Date.now());
+        try {
+          await expect(target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime, 0, false, slice.scope))
+            .rejects.toThrow("navigation_head_recovery_completion_missing");
+          expect(slice.calls()).toBeGreaterThan(0);
+          expect(slice.calls()).toBeLessThanOrEqual(64);
+          expect((await durableState.storage.get<any>("navigation-head-recovery-pending-v1")).next_attempt_at).toBe(Date.now() + 30_000);
+          expect(mock.files).toEqual(beforeDeadlineRetry);
+        } finally { clearTimeout(slice.abortTimer); }
+      });
+    }
+    vi.useRealTimers();
     console.log("current-head recovery real slice costs", JSON.stringify(measured));
+  });
+
+  it.each([{ latencyMs: 150, maximum: false, policy: "bootstrap" }, { latencyMs: 650, maximum: false, policy: "bootstrap" },
+    { latencyMs: 650, maximum: true, policy: "bootstrap" }, { latencyMs: 650, maximum: false, policy: "active" },
+    { latencyMs: 650, maximum: false, policy: "repair-only-refusal" }, { latencyMs: 650, maximum: false, policy: "retired" },
+    { latencyMs: 650, maximum: false, policy: "exception-revoked" }, { latencyMs: 650, maximum: false, policy: "incompatible" },
+    { latencyMs: 150, maximum: false, policy: "unrelated" },
+    ...["source", "receipt", "certificate", "history"].map(boundary => ({ latencyMs: 150, maximum: false, policy: `ack-${boundary}` })),
+    ...["receipt", "certificate", "history"].map(boundary => ({ latencyMs: 150, maximum: false, policy: `ack-parent-${boundary}` })),
+    ...["oversized", "foreign-project", "foreign-provider", "wrong-head-id", "future"].map(kind => ({ latencyMs: 650, maximum: false, policy: `prep-${kind}` })),
+    { latencyMs: 150, maximum: false, policy: "four-pointers" }, { latencyMs: 150, maximum: false, policy: "project-unrelated" },
+    { latencyMs: 650, maximum: false, policy: "project-paused" }, { latencyMs: 650, maximum: false, policy: "concurrent-discovery" },
+    { latencyMs: 650, maximum: false, policy: "fairness" }])(
+    "finishes current-head recovery across real alarms with positive provider latency: $latencyMs ms maximum=$maximum policy=$policy", async ({ latencyMs, maximum, policy }) => {
+    // Break caught: repeating the complete preflight before each NEW admission
+    // can starve an unchanged, provable head forever under the real18s scope.
+    const mock = installDropboxMock();
+    const created = await createProject("TXN-CHANGEJOB-SLOW-HEAD-0001", "slow-head");
+    const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
+    const registry = testEnv.REGISTRY_GUARD.getByName("global");
+    const guardKey = await runInDurableObject(guard, instance => (instance as any).env.RULE_ADMISSION_SIGNING_KEY);
+    const registryKeys = await runInDurableObject(registry, instance => ({
+      signing: (instance as any).env.RULE_ADMISSION_SIGNING_KEY, governance: (instance as any).env.RULE_GOVERNANCE_TOKEN
+    }));
+    restoreTestEnvBindings = async () => {
+      await runInDurableObject(guard, instance => restoreOptionalEnvBinding((instance as any).env, "RULE_ADMISSION_SIGNING_KEY", guardKey));
+      await runInDurableObject(registry, instance => {
+        restoreOptionalEnvBinding((instance as any).env, "RULE_ADMISSION_SIGNING_KEY", registryKeys.signing);
+        restoreOptionalEnvBinding((instance as any).env, "RULE_GOVERNANCE_TOKEN", registryKeys.governance);
+      });
+    };
+    resetAfterRetryFaultFixture = true;
+    await bootstrapRuleAdmissionGovernance(testEnv, "slow-head-rules", created.project_id);
+    const prepared = await runInDurableObject(guard, async (instance, durableState) => {
+      const target = instance as any;
+      const state = await target.loadOrRecoverState();
+      const content = "Unchanged bytes must survive slow but successful provider reads.";
+      const document = await target.managedDocumentService.writeWorking({ request_id: "DOCREQ-SLOW-HEAD-BASE-0001",
+        project_id: created.project_id, logical_path: "slow/current.md", content,
+        content_sha256: await sha256Text(content), created_at: at }, state);
+      if (maximum) {
+        const ledger = new DocumentLedgerRepository(target.persistence);
+        const head = await ledger.readHead(created.project_id, document.document_id);
+        const working = await ledger.readVersion(created.project_id, document.document_id, head!.working_version_id!);
+        const reviewId = `VER-REQ-${"B".repeat(24)}`;
+        const publishedId = `VER-REQ-${"C".repeat(24)}`;
+        await ledger.writeVersion({ ...working!, version_id: reviewId, stage: "review", parent_version_id: working!.version_id });
+        await ledger.writeVersion({ ...working!, version_id: publishedId, stage: "published", parent_version_id: reviewId });
+        await ledger.writeHead({ ...head!, review_version_id: reviewId, published_version_id: publishedId });
+      }
+      const sources = new ZoneNavigationSources(target.persistence);
+      const resource = `head:${document.document_id}`;
+      const zones = maximum ? ["WORKING", "REVIEW", "DELIVERABLES"] as const : ["WORKING"] as const;
+      for (const zone of zones) {
+        const adoptionId = `DOCREQ-SLOW-HEAD-ADOPT-${zone}-0001`;
+        expect(await sources.markCatalogReady(created.project_id, zone, 0)).toBe(true);
+        expect(await sources.beginAdoption(created.project_id, zone, adoptionId, 0)).toBe(true);
+        expect(await sources.finishAdoption(created.project_id, zone, adoptionId, 0)).toBe(true);
+        expect(await sources.beginHeadWrite(created.project_id, zone, resource, undefined, "a".repeat(64))).toBeTruthy();
+      }
+      if (maximum) {
+        // Historical fixture: three legal pointers/three zones, two older
+        // markers and one newer marker. Never reduce it after a failure.
+        const sourcePath = `${machineDocumentRoot(created.project_id)}/navigation-sources/state.json`;
+        const source = JSON.parse((await target.persistence.objects.readText(sourcePath))!);
+        for (const zone of zones) {
+          source.zones[zone].generation = 2;
+          if (zone !== "REVIEW") source.zones[zone].in_flight_writes[0].generation = 2;
+          await target.persistence.objects.upsertText(`${zoneNavigationDirtyRoot(created.project_id, zone)}/${await sha256Text(resource)}.json`,
+            JSON.stringify({ schema_version: "1.0", resource_id: resource, generation: zone === "REVIEW" ? 2 : 1, entry_hash: null }));
+        }
+        source.state_revision++;
+        await target.persistence.objects.upsertText(sourcePath, JSON.stringify(source));
+      }
+      if (policy === "four-pointers") {
+        const headPath = machineDocumentHeadPath(created.project_id, document.document_id);
+        const current = JSON.parse(mock.files.get(headPath)!);
+        await mock.writeExternal(headPath, JSON.stringify({ ...current, reference_version_id: `VER-REQ-${"D".repeat(24)}`,
+          review_version_id: `VER-REQ-${"B".repeat(24)}`, published_version_id: `VER-REQ-${"C".repeat(24)}` }));
+      }
+      if (!["bootstrap", "four-pointers", "concurrent-discovery"].includes(policy) && !policy.startsWith("ack-") && !policy.startsWith("prep-")) {
+        const rule = ruleFixture("GLOBAL", { rule_id: "RULE-HEAD-RECOVERY-ACTIVE", operations: policy === "repair-only-refusal"
+          ? ["project.repair"] : ["project.materialize", "project.repair"],
+          resource_scope: { resource_types: ["project", "document"], zones: ["DOCUMENTS", "WORKING", "REVIEW", "DELIVERABLES"] },
+          check_id: "expected_version", parameters: { required: ["repair-only-refusal", "exception-revoked"].includes(policy) } });
+        await appendGovernanceFixture(target.persistence, "rule.propose", { rule });
+        await appendGovernanceFixture(target.persistence, "rule.accept", { rule_id: rule.rule_id, version: 1 });
+        await appendGovernanceFixture(target.persistence, "rule.activate", { rule_id: rule.rule_id, version: 1,
+          activation_evidence: ["fixture:legacy-active-control"] });
+        if (policy === "exception-revoked") await appendGovernanceFixture(target.persistence, "rule.exception.grant", {
+          exception: exceptionFixture({ exception_id: "EXC-HEAD-RECOVERY", rule_id: rule.rule_id, project_id: created.project_id,
+            resources: [`document-reconcile@${state.revision}`, resource], operations: rule.operations,
+            granted_at: new Date().toISOString(), expires_at: "2099-01-01T00:00:00.000Z" }) });
+        if (policy === "repair-only-refusal") {
+          let refused = false;
+          for (let attempt = 0; attempt < 4; attempt++) {
+            const slice = target.createManagedDocumentSlice(Date.now());
+            try { await target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime, attempt, false,
+              slice.scope, undefined, "project.repair");
+              refused ||= (await durableState.storage.get<{ code?: string }>("navigation-head-recovery-diagnostic-v1"))?.code === "admission_unavailable"; }
+            catch (error) { expect(String(error)).toContain("EXPECTED_VERSION_REQUIRED"); refused = true; }
+            finally { clearTimeout(slice.abortTimer); }
+          }
+          expect(refused).toBe(true);
+          const parents = [...mock.files.values()].map(raw => { try { return JSON.parse(raw).admission; } catch { return null; } })
+            .filter(admission => admission?.kind === "navigation-head-recovery-parent");
+          expect(parents).toEqual([]);
+          expect((await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids).toContain(resource);
+          await durableState.storage.delete("navigation-head-recovery-preparation-v1");
+        }
+      }
+      let originalParentId: string | null = null;
+      let originalParentBytes: string | null = null;
+      if (policy === "concurrent-discovery") {
+        const attempt = async (ordinal: number) => {
+          const slice = target.createManagedDocumentSlice(Date.now());
+          try { return await target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime, ordinal, false, slice.scope); }
+          finally { clearTimeout(slice.abortTimer); }
+        };
+        await attempt(0); // actual bounded preparation, no pre-intent effect
+        const concurrent = await Promise.allSettled([attempt(1), attempt(1)]);
+        expect(concurrent.some(result => result.status === "fulfilled")).toBe(true);
+        const parents = [...mock.files.values()].map(raw => { try { return { raw, record: JSON.parse(raw) }; } catch { return null; } })
+          .filter(item => item?.record.admission?.kind === "navigation-head-recovery-parent");
+        expect(parents).toHaveLength(1);
+        originalParentId = parents[0]!.record.admission.request_id;
+        originalParentBytes = parents[0]!.raw;
+        expect([...mock.files.keys()].some(path => path.includes("/head-write-recovery/") && path.endsWith("/intent.json"))).toBe(false);
+        for (const key of (await durableState.storage.list({ prefix: "navigation-head-recovery-" })).keys()) await durableState.storage.delete(key);
+        expect((await sources.readState(created.project_id, "WORKING")).in_flight_resource_ids).toContain(resource);
+      }
+      const startedAt = Date.now();
+      const store = new ManagedDocumentChangeJobStore(durableState.storage);
+      store.beginContinuationSlice(true, startedAt);
+      store.finishContinuationSlice({ pending: true, next_wake_at: startedAt + 1_000,
+        documents_priority_next: false, feed_retry_at: null, outcome: {} });
+      durableState.storage.sql.exec("UPDATE managed_document_change_continuation SET slice_ordinal = 0 WHERE singleton = 1");
+      // The explicit helper still runs the real alarm; the host must not claim
+      // the fixture before the latency observer has been installed.
+      await durableState.storage.setAlarm(startedAt + 60_000);
+      return { resource, revision: state.revision, startedAt, originalParentId, originalParentBytes,
+        headPath: machineDocumentHeadPath(created.project_id, document.document_id) };
+    });
+    const originalHead = mock.files.get(prepared.headPath);
+    const delegate = mock.spy.getMockImplementation()!;
+    let inActualAlarm = false;
+    let transportCalls = 0;
+    const scopes: Array<{ calls: () => number; scope: ProviderRequestScope; governanceCalls: () => number }> = [];
+    const observations: unknown[] = [];
+    const recoveryMeasurements: unknown[] = [];
+    const admissionMeasurements: unknown[] = [];
+    const providerOperations: Array<Record<string, unknown>> = [];
+    let activeAlarmTurn = -1;
+    let alarmCallStart = 0;
+    let lostAckPath: string | null = null;
+    let parentAckPreserved: Map<string, string> | null = null;
+    let parentAckAdmission: { path: string; bytes: string } | null = null;
+    let parentAckSequence: number | null = null;
+    vi.useFakeTimers();
+    try {
+      mock.spy.mockImplementation(async (input, init) => {
+        const request = input instanceof Request ? input : new Request(String(input), init);
+        if (inActualAlarm && new URL(request.url).hostname.endsWith("dropboxapi.com")) {
+          transportCalls += 1;
+          vi.setSystemTime(Date.now() + latencyMs);
+        }
+        const response = await delegate(input, init);
+        const argument = request.headers.get("Dropbox-API-Arg");
+        const path = argument ? JSON.parse(argument).path as string : null;
+        if (inActualAlarm && response.ok && !lostAckPath && policy.startsWith("ack-parent-")
+          && new URL(request.url).pathname === "/2/files/upload" && path) {
+          const child = [...mock.files.values()].map(raw => { try { return JSON.parse(raw); } catch { return null; } })
+            .find(record => record?.kind === "navigation-head-recovery" && record.status === "finalized" && record.terminal);
+          if (child) {
+            const childAdmission = JSON.parse(mock.files.get(child.admission_ref)!).admission;
+            const admissionPath = childAdmission.diagnosed_drift_refs[0];
+            const admissionBytes = mock.files.get(admissionPath)!;
+            const parent = JSON.parse(admissionBytes).admission;
+            const parentRoot = admissionPath.replace(/\/admission\.json$/, "");
+            const written = JSON.parse(mock.files.get(path)!);
+            const matches = policy === "ack-parent-receipt" && path === `${parentRoot}/receipt.json`
+              || policy === "ack-parent-certificate" && path.startsWith(`${parentRoot}/finalizations/`)
+              || policy === "ack-parent-history" && path.startsWith(`${parentRoot}/history/`)
+                && written.status === "finalized" && written.terminal === true;
+            if (matches) {
+              expect(parent.kind).toBe("navigation-head-recovery-parent");
+              expect(written.request_id).toBe(parent.request_id);
+              expect(written.request_hash).toBe(parent.request_hash);
+              parentAckAdmission = { path: admissionPath, bytes: admissionBytes };
+              parentAckSequence = JSON.parse(mock.files.get(`${parentRoot}/progress.json`)!).sequence;
+              // All child, source, intention, catalog and business bytes are
+              // frozen at this actual successful parent-tail upload. Only
+              // that parent's original journal may advance afterward.
+              parentAckPreserved = new Map([...mock.files.entries()].filter(([file]) => !file.startsWith(`${parentRoot}/`)));
+              lostAckPath = path;
+              return new Response(JSON.stringify({ error_summary: "parent_ack_lost_AFTER_successful_upload" }), { status: 503 });
+            }
+          }
+        }
+        if (inActualAlarm && response.ok && !lostAckPath && policy.startsWith("ack-")
+          && new URL(request.url).pathname === "/2/files/upload" && path
+          && (policy === "ack-source" && path.endsWith("/navigation-sources/state.json")
+            || policy === "ack-receipt" && path.includes("/head-write-recovery/") && path.endsWith("/receipt.json")
+            || policy === "ack-certificate" && path.includes("/head-write-recovery/") && path.includes("/certificate-")
+            || policy === "ack-history" && path.includes("/history/"))) {
+          expect(mock.files.has(path), "loss must occur after successful physical upload").toBe(true);
+          lostAckPath = path;
+          return new Response(JSON.stringify({ error_summary: "ack_lost_AFTER_successful_upload" }), { status: 503 });
+        }
+        return response;
+      });
+      await runInDurableObject(guard, instance => {
+        const target = instance as any;
+        const createSlice = target.createManagedDocumentSlice.bind(instance);
+        vi.spyOn(target, "createManagedDocumentSlice").mockImplementation((...args: unknown[]) => {
+          const slice = createSlice(...args);
+          scopes.push({ ...slice, governanceCalls: () => target.governanceScopeCalls.get(slice.scope) ?? 0 });
+          for (const [port, methods] of [[slice.runtime.objects, ["getMetadata", "readText", "createText"]],
+            [slice.runtime.conditionalWrite, ["writeTextConditional"]]] as const) {
+            for (const method of methods) {
+              const original = (port as any)[method].bind(port);
+              vi.spyOn(port as any, method).mockImplementation(async (...operationArgs: any[]) => {
+                if (!inActualAlarm) return original(...operationArgs);
+                const observation: Record<string, unknown> = { turn: activeAlarmTurn, method, path: operationArgs[0],
+                  calls_at_entry: transportCalls - alarmCallStart,
+                  elapsed_at_entry_ms: Date.now() - (slice.scope.deadlineMs - 18_000), completed: false };
+                providerOperations.push(observation);
+                try { const result = await original(...operationArgs); observation.completed = true; return result; }
+                catch (error) { observation.error = error instanceof Error ? error.message : String(error); throw error; }
+                finally {
+                  observation.calls_at_exit = transportCalls - alarmCallStart;
+                  observation.elapsed_at_exit_ms = Date.now() - (slice.scope.deadlineMs - 18_000);
+                }
+              });
+            }
+          }
+          return slice;
+        });
+        for (const method of ["readManagedDocumentState", "ruleAdmissionRequired", "admitRules",
+          "persistAdmissionProof", "readGlobalGovernance", "requestRulePermit"] as const) {
+          const original = target[method].bind(instance);
+          vi.spyOn(target, method).mockImplementation(async (...args: any[]) => {
+            if (!inActualAlarm) return original(...args);
+            const startedAt = Date.now();
+            const callsBefore = transportCalls;
+            const slice = scopes[scopes.length - 1];
+            let completed = false;
+            let required: boolean | undefined;
+            let rejection: unknown;
+            try {
+              const result = await original(...args);
+              completed = true;
+              if (method === "ruleAdmissionRequired") required = result;
+              return result;
+            } catch (error) {
+              rejection = { message: String(error), evaluation: (error as any)?.evaluation ?? (error as any)?.result };
+              throw error;
+            } finally {
+              const normalized = method === "admitRules" || method === "ruleAdmissionRequired" ? args[1] : undefined;
+              admissionMeasurements.push({ method, operation: normalized?.operation,
+                kind: method === "persistAdmissionProof" ? args[0] : undefined, required, completed, rejection,
+                elapsed_ms: Date.now() - startedAt, provider_calls: transportCalls - callsBefore,
+                provider_calls_at_entry: callsBefore - alarmCallStart,
+                elapsed_from_alarm_entry_ms: slice ? startedAt - (slice.scope.deadlineMs - 18_000) : null,
+                scoped_calls_at_exit: slice?.calls(),
+                governance_calls_at_exit: slice ? target.governanceScopeCalls.get(slice.scope) ?? 0 : null });
+            }
+          });
+        }
+        const recover = target.recoverOneUnownedNavigationHeadWrite.bind(instance);
+        vi.spyOn(target, "recoverOneUnownedNavigationHeadWrite").mockImplementation(async (...args: any[]) => {
+          const startedAt = Date.now();
+          const callsBefore = transportCalls;
+          try { return await recover(...args); }
+          finally {
+            const scope = args[4] as ProviderRequestScope | undefined;
+            recoveryMeasurements.push({ elapsed_ms: Date.now() - startedAt,
+              provider_calls: transportCalls - callsBefore, probe: args[3] === true,
+              provider_calls_at_entry: callsBefore - alarmCallStart,
+              elapsed_from_alarm_entry_ms: scope ? startedAt - (scope.deadlineMs - 18_000) : null,
+              deadline_elapsed: scope ? Date.now() >= scope.deadlineMs : null,
+              scoped_calls: scope ? scopes.find(slice => slice.scope === scope)?.calls() : null,
+              governance_calls: scope ? target.governanceScopeCalls.get(scope) ?? 0 : null });
+          }
+        });
+      });
+      const read = () => runInDurableObject(guard, async (instance, durableState) => ({
+        source: await new ZoneNavigationSources((instance as any).persistence).readState(created.project_id, "WORKING"),
+        continuation: new ManagedDocumentChangeJobStore(durableState.storage).continuation(),
+        diagnostic: await durableState.storage.get("navigation-head-recovery-diagnostic-v1"),
+        preparation: await durableState.storage.get("navigation-head-recovery-preparation-v1"),
+        locator: await durableState.storage.get("navigation-head-recovery-pending-v1"),
+        checkpoints: [...(await durableState.storage.list({ prefix: "navigation-head-recovery-bound-v1:" })).values()],
+        revision: (instance as any).loadState().revision
+      }));
+      const finalizedProgress = () => [...mock.files.values()].map(raw => { try { return JSON.parse(raw); } catch { return null; } })
+        .find(record => record?.kind === "navigation-head-recovery" && record?.status === "finalized" && record?.terminal);
+      const finalizedParent = () => [...mock.files.values()].map(raw => { try { return JSON.parse(raw); } catch { return null; } })
+        .find(record => record?.kind === "navigation-head-recovery-parent" && record?.status === "finalized" && record?.terminal);
+      let current = await read();
+      const alarmLimit = maximum ? 30 : 10;
+      let evicted = false;
+      let changedPolicy = false;
+      let suspensionBaseline: Map<string, string> | null = null;
+      let suspendedAlarms = 0;
+      let invalidPreparationApplied = false;
+      for (let turn = 0; turn < alarmLimit && !(finalizedProgress() && finalizedParent()); turn++) {
+        vi.setSystemTime(Math.max(Date.now(), current.continuation.next_wake_at ?? Date.now()) + 1);
+        const callsBefore = transportCalls;
+        const providerTraceBefore = mock.providerCalls.length;
+        const scopesBefore = scopes.length;
+        const alarmStartedAt = Date.now();
+        alarmCallStart = callsBefore;
+        activeAlarmTurn = turn;
+        inActualAlarm = true;
+        try { expect(await runDurableObjectAlarm(guard)).toBe(true); }
+        finally { inActualAlarm = false; }
+        const elapsedMs = Date.now() - alarmStartedAt;
+        current = await read();
+        if (policy.startsWith("prep-") && turn === 0) {
+          expect(current.preparation).toBeDefined();
+          const value = structuredClone(current.preparation) as any;
+          if (policy === "prep-oversized") value.extra = "x".repeat(65_536);
+          if (policy === "prep-foreign-project") value.project_id = "PRJ-9999";
+          if (policy === "prep-foreign-provider") value.provider_id = "foreign";
+          if (policy === "prep-wrong-head-id") value.current_head.object_id = "id:foreign-head";
+          if (policy === "prep-future") { value.created_at_ms = Date.now() + 600_000; value.expires_at_ms = value.created_at_ms + 300_000; }
+          const { preparation_digest: _digest, ...base } = value;
+          value.preparation_digest = await sha256Text(canonicalJson(base));
+          await runInDurableObject(guard, async (_instance, state) => { await state.storage.put("navigation-head-recovery-preparation-v1", value); });
+          invalidPreparationApplied = true;
+        }
+        if (suspensionBaseline) {
+          for (const [path, bytes] of suspensionBaseline) expect(mock.files.get(path), `suspended effect ${path}`).toBe(bytes);
+          expect([...mock.files.keys()].filter(path => !suspensionBaseline!.has(path))).toEqual([]);
+          suspendedAlarms++;
+        } else if (!changedPolicy && ["retired", "exception-revoked", "incompatible", "unrelated", "project-unrelated", "project-paused"].includes(policy)
+          && [...mock.files.values()].some(raw => { try {
+            const progress = JSON.parse(raw);
+            return progress.kind === "navigation-head-recovery" && progress.completed_steps?.some((step: any) => step.step_id === "head-recovery-parent");
+          } catch { return false; } })) {
+          await runInDurableObject(guard, async instance => {
+            const runtime = (instance as any).persistence;
+            if (policy.startsWith("project-")) {
+              const target = instance as any;
+              const state = await target.loadOrRecoverState();
+              const transaction = parseTransaction({ schema_version: "1.0", project_id: created.project_id,
+                transaction_id: `TXN-HEAD-POLICY-${policy.toUpperCase()}-0001`, base_revision: state.revision,
+                created_at: new Date().toISOString(), operation: policy === "project-paused" ? "project.pause" : "research.add",
+                payload: policy === "project-paused" ? { reason: "fixture pause between phases" }
+                  : { research_id: "RES-UNRELATEDHEAD", title: "Unrelated accepted fixture observation", body: "No document or rule change" } });
+              const result = applyTransaction(state, transaction);
+              if (result.kind !== "commit") throw new Error(`typed fixture transition failed: ${JSON.stringify(result)}`);
+              const receipt = { schema_version: "1.0", transaction_id: transaction.transaction_id, project_id: created.project_id,
+                status: "committed", previous_revision: state.revision, new_revision: result.state.revision,
+                event_id: result.event.event_id, committed_at: transaction.created_at };
+              await target.repository.writeCommitRecord({ schema_version: "1.0", project_id: created.project_id,
+                previous_revision: state.revision, new_revision: result.state.revision, transaction, state: result.state, event: result.event, receipt });
+              target.persistCommit(result.state, receipt);
+            } else if (policy === "exception-revoked") await appendGovernanceFixture(runtime, "rule.exception.revoke", {
+              exception_id: "EXC-HEAD-RECOVERY", reason: "fixture revoked between phases", revoked_by: "founder" });
+            else if (policy === "retired") await appendGovernanceFixture(runtime, "rule.retire", {
+              rule_id: "RULE-HEAD-RECOVERY-ACTIVE", version: 1, reason: "fixture retired between phases" });
+            else if (policy === "unrelated") await appendGovernanceFixture(runtime, "rule.propose", {
+              rule: ruleFixture("GLOBAL", { rule_id: "RULE-UNRELATED-DRAFT" }) });
+            else {
+              const rule = ruleFixture("GLOBAL", { rule_id: "RULE-HEAD-RECOVERY-ACTIVE", version: 2, supersedes: 1,
+                operations: ["project.materialize", "project.repair"],
+                resource_scope: { resource_types: ["project", "document"], zones: ["DOCUMENTS", "WORKING"] },
+                check_id: "expected_version", parameters: { required: true } });
+              await appendGovernanceFixture(runtime, "rule.propose", { rule });
+              await appendGovernanceFixture(runtime, "rule.accept", { rule_id: rule.rule_id, version: 2 });
+              await appendGovernanceFixture(runtime, "rule.activate", { rule_id: rule.rule_id, version: 2,
+                activation_evidence: ["fixture:legacy-replacement-control"] });
+            }
+          });
+          changedPolicy = true;
+          if (!["unrelated", "project-unrelated"].includes(policy)) suspensionBaseline = new Map(mock.files);
+        }
+        if (maximum && !evicted && [...mock.files.values()].some(raw => {
+          try { const progress = JSON.parse(raw); return progress.kind === "navigation-head-recovery" && progress.status === "finalizing"; }
+          catch { return false; }
+        })) {
+          await runInDurableObject(guard, async (_instance, durableState) => {
+            const keys = await durableState.storage.list({ prefix: "navigation-head-recovery-" });
+            for (const key of keys.keys()) await durableState.storage.delete(key);
+            // Both bounded observations AND the scheduler locator are lost.
+            // Existing SQL IDs may locate work; canonical journal/intention
+            // reads still provide its only authority.
+          });
+          evicted = true;
+        }
+        if (latencyMs === 650 && turn === 0) {
+          expect(current.preparation, "slow first alarm must preserve bounded proof acquisition for the next slice").toBeDefined();
+          expect(current.locator).toBeUndefined();
+          expect(current.source.in_flight_resource_ids).toContain(prepared.resource);
+          expect(current.revision).toBe(prepared.revision);
+        }
+        observations.push({ turn, calls: transportCalls - callsBefore, elapsed_ms: elapsedMs,
+          scoped_calls: scopes.slice(scopesBefore).map(slice => slice.calls()),
+          governance_calls: scopes.slice(scopesBefore).map(slice => slice.governanceCalls()), diagnostic: current.diagnostic,
+          checkpoints: current.checkpoints.map((value: any) => ({ dirty: value.dirty.map((hint: any) => hint?.phase ?? null),
+            cleared: value.cleared, finalization_started: value.finalization_started,
+            child_certificate_ref: value.child_certificate_ref })),
+          provider_trace: mock.providerCalls.slice(providerTraceBefore),
+          locator_present: current.locator !== undefined, priority: current.continuation.documents_priority_next });
+        if (policy === "fairness" && turn === 1) expect(current.continuation.documents_priority_next,
+          "one early head turn must release priority for independent recovery families").toBe(false);
+        if (suspendedAlarms >= 2) break;
+        if ((invalidPreparationApplied || policy === "four-pointers") && turn >= 1) break;
+      }
+      console.log("slow-provider actual head recovery", JSON.stringify({ latencyMs, maximum, policy, observations, recoveryMeasurements,
+        admissionMeasurements, providerOperations }));
+      expect(scopes.every(slice => slice.calls() <= 64)).toBe(true);
+      expect(scopes.every(slice => slice.governanceCalls() <= 16)).toBe(true);
+      expect(observations.every(value => (value as { elapsed_ms: number }).elapsed_ms <= 18_000)).toBe(true);
+      if (maximum) expect(evicted, "maximum fixture must actually lose its local observations").toBe(true);
+      expect(current.revision).toBe(prepared.revision + (policy.startsWith("project-") ? 1 : 0));
+      expect(mock.files.get(prepared.headPath)).toBe(originalHead);
+      if (policy.startsWith("prep-") || policy === "four-pointers") {
+        expect(current.locator).toBeUndefined();
+        expect(current.source.in_flight_resource_ids).toContain(prepared.resource);
+        expect([...mock.files.values()].some(raw => { try {
+          return ["navigation-head-recovery-parent", "navigation-head-recovery"].includes(JSON.parse(raw).admission?.kind);
+        } catch { return false; } })).toBe(false);
+        expect(finalizedProgress()).toBeUndefined();
+        expect(finalizedParent()).toBeUndefined();
+        return;
+      }
+      if (suspensionBaseline) {
+        expect(suspendedAlarms).toBe(2);
+        expect(finalizedProgress()).toBeUndefined();
+        expect(finalizedParent()).toBeUndefined();
+        expect(current.source.in_flight_resource_ids).toContain(prepared.resource);
+        expect(current.locator).toBeTruthy();
+        return;
+      }
+      const progress = finalizedProgress();
+      expect(progress, JSON.stringify(observations)).toMatchObject({ terminal: true, code: null });
+      const parent = finalizedParent();
+      expect(parent, "the original generic operation must have its own real terminal certificate").toMatchObject({ terminal: true, code: null });
+      const parentAdmission = JSON.parse(mock.files.get(parent.admission_ref)!).admission;
+      const parentReceipt = JSON.parse(mock.files.get(parent.receipt_ref)!);
+      const childAdmission = JSON.parse(mock.files.get(progress.admission_ref)!).admission;
+      const parentCertificate = JSON.parse(mock.files.get(parent.finalization_ref)!);
+      expect(parentReceipt).toMatchObject({ project_id: created.project_id, kind: parent.kind, request_id: parent.request_id,
+        request_hash: parent.request_hash, status: "committed", original_operation: "project.materialize",
+        child_receipt_ref: progress.receipt_ref, child_finalization_ref: progress.finalization_ref, intent_hash: progress.request_hash });
+      expect(parentCertificate).toEqual({ ...parentReceipt, admission_ref: parent.admission_ref, receipt_ref: parent.receipt_ref,
+        receipt_sha256: await executionHash(parentReceipt), child_admission_ref: progress.admission_ref,
+        postconditions: ["bound_child_finalized", "original_generic_admission_preserved"] });
+      expect(childAdmission.diagnosed_drift_refs).toEqual([parent.admission_ref]);
+      expect(parentAdmission).toMatchObject({ request_hash: parent.request_hash, operation: "project.materialize" });
+      if (policy === "concurrent-discovery") {
+        expect(parent.request_id).toBe(prepared.originalParentId);
+        expect(mock.files.get(parent.admission_ref)).toBe(prepared.originalParentBytes);
+        expect([...mock.files.values()].filter(raw => { try { return JSON.parse(raw).admission?.kind === "navigation-head-recovery-parent"; }
+          catch { return false; } })).toHaveLength(1);
+      }
+      if (["active", "unrelated"].includes(policy)) {
+        expect(parentAdmission.ruleset.rules).toEqual([expect.objectContaining({ rule_id: "RULE-HEAD-RECOVERY-ACTIVE", version: 1 })]);
+        expect(childAdmission.ruleset.rules).toEqual(parentAdmission.ruleset.rules);
+      }
+      if (["unrelated", "project-unrelated"].includes(policy)) expect(changedPolicy).toBe(true);
+      if (policy.startsWith("ack-")) {
+        expect(lostAckPath).not.toBeNull();
+        expect(mock.files.get(lostAckPath!)).toBeTruthy();
+        const parentIds = [...mock.files.values()].map(raw => { try { return JSON.parse(raw).admission; } catch { return null; } })
+          .filter(admission => admission?.kind === "navigation-head-recovery-parent").map(admission => admission.request_id);
+        expect(parentIds).toEqual([parent.request_id]);
+        const histories = [...mock.files.entries()].filter(([path]) => path.startsWith(parent.admission_ref.replace("/admission.json", "/history/")))
+          .map(([, bytes]) => JSON.parse(bytes).sequence);
+        expect(histories.every(sequence => sequence > 0)).toBe(true);
+      }
+      if (policy.startsWith("ack-parent-")) {
+        expect(parentAckPreserved).not.toBeNull();
+        expect(parentAckAdmission).not.toBeNull();
+        expect(parent.admission_ref).toBe(parentAckAdmission!.path);
+        expect(mock.files.get(parentAckAdmission!.path)).toBe(parentAckAdmission!.bytes);
+        const parentRoot = parent.admission_ref.replace(/\/admission\.json$/, "");
+        expect(new Map([...mock.files.entries()].filter(([file]) => !file.startsWith(`${parentRoot}/`)))).toEqual(parentAckPreserved);
+        expect(parent.sequence).toBeGreaterThan(parentAckSequence!);
+        const histories = [...mock.files.entries()].filter(([path]) => path.startsWith(`${parentRoot}/history/`))
+          .map(([, bytes]) => JSON.parse(bytes));
+        expect(histories.map(record => record.sequence).sort()).toEqual([1, 2]);
+        expect(histories.find(record => record.sequence === 2)).toEqual(parent);
+        expect(current.locator ?? null).toBeNull();
+      }
+      if (policy === "active") {
+        for (const certificatePath of [progress.finalization_ref, parent.finalization_ref]) for (const condition of ["missing", "foreign"]) {
+          const original = mock.files.get(certificatePath)!;
+          if (condition === "missing") mock.files.delete(certificatePath);
+          else mock.files.set(certificatePath, canonicalJson({ ...JSON.parse(original), project_id: "PRJ-9999" }));
+          const uploads = mock.uploadCalls.length;
+          try {
+            await runInDurableObject(guard, async (instance, storage) => {
+              const target = instance as any;
+              await storage.storage.put("navigation-head-recovery-pending-v1", { project_id: created.project_id,
+                request_hash: progress.request_hash, resource_id: prepared.resource, cursor: 0 });
+              const slice = target.createManagedDocumentSlice(Date.now());
+              try { await expect(target.recoverOneUnownedNavigationHeadWrite(created.project_id, slice.runtime, 0, false, slice.scope))
+                .rejects.toThrow(certificatePath === progress.finalization_ref
+                  ? "navigation_head_recovery_finalization_invalid" : "navigation_head_recovery_parent_finalization_invalid"); }
+              finally { clearTimeout(slice.abortTimer); }
+            });
+            expect(mock.uploadCalls).toHaveLength(uploads);
+          } finally { mock.files.set(certificatePath, original); }
+        }
+      }
+      expect(JSON.parse(mock.files.get(progress.finalization_ref)!)).toMatchObject({ request_hash: progress.request_hash,
+        postconditions: ["exact_current_head_revalidated", "source_dirty_generation_durable", "recovery_fence_absent"] });
+      expect(current.source.in_flight_resource_ids).not.toContain(prepared.resource);
+      expect(current.locator ?? null).toBeNull();
+    } finally { inActualAlarm = false; vi.useRealTimers(); }
   });
 
   it.each(["recover", "yield-again", "scheduled-recover", "future-sibling", "scheduled-future-sibling"])("gives a late head admission one early real alarm turn without permanent priority: %s", async scenario => {
@@ -731,6 +1896,15 @@ describe("durable managed-document change jobs", () => {
       expect(await sources.finishAdoption(created.project_id, "WORKING", "DOCREQ-HEAD-PRIORITY-ADOPT-0001", 0)).toBe(true);
       const resource = `head:${document.document_id}`;
       expect(await sources.beginHeadWrite(created.project_id, "WORKING", resource, undefined, "a".repeat(64))).toBeTruthy();
+      // Prepare DATA under its actual bounded scope, before the admission
+      // fault. The first recovery phase is no longer an admission itself.
+      const preparationSlice = target.createManagedDocumentSlice(Date.now());
+      try {
+        expect(await target.recoverOneUnownedNavigationHeadWrite(created.project_id, preparationSlice.runtime, 0, false, preparationSlice.scope))
+          .toMatchObject({ status: "unresolved" });
+        expect(preparationSlice.calls()).toBeLessThanOrEqual(64);
+        expect(target.ctx.storage.sql.exec("SELECT 1 FROM admission_proofs WHERE kind = 'navigation-head-recovery-parent'").toArray()).toEqual([]);
+      } finally { clearTimeout(preparationSlice.abortTimer); }
       const store = new ManagedDocumentChangeJobStore(durableState.storage);
       const startedAt = Date.now();
       store.beginContinuationSlice(true, startedAt);
@@ -738,12 +1912,17 @@ describe("durable managed-document change jobs", () => {
         documents_priority_next: false, feed_retry_at: null, outcome: {} });
       durableState.storage.sql.exec("UPDATE managed_document_change_continuation SET slice_ordinal = 0 WHERE singleton = 1");
       await durableState.storage.setAlarm(startedAt + 1_000);
-      return { resource, headPath: machineDocumentHeadPath(created.project_id, document.document_id), stateRevision: state.revision, startedAt };
+      return { resource, headPath: machineDocumentHeadPath(created.project_id, document.document_id), stateRevision: state.revision, startedAt,
+        preparationCalls: preparationSlice.calls(),
+        genericHash: (await normalizeSystemAdmission(created.project_id, "project.materialize", "DOCUMENTS", `document-reconcile@${state.revision}`, String(state.revision))).request_hash };
     });
     const headBefore = mock.files.get(prepared.headPath);
     const events: string[] = [];
     const scopes: Array<{ calls: () => number; scope: ProviderRequestScope; abortTimer: ReturnType<typeof setTimeout> }> = [];
     let admissionAttempts = 0;
+    let alarmTurns = 0;
+    let oldSixLoopOutcome: unknown = null;
+    const phaseTrace: unknown[] = [{ phase: "DATA_prime_outside_alarm", calls: prepared.preparationCalls }];
     vi.useFakeTimers();
     try {
       await runInDurableObject(guard, instance => {
@@ -764,7 +1943,7 @@ describe("durable managed-document change jobs", () => {
         });
         const admit = target.admitRules.bind(instance);
         vi.spyOn(target, "admitRules").mockImplementation(async (...args: any[]) => {
-          if (args[1].resources.some((resource: any) => resource.resource_id === prepared.resource)) {
+          if (args[1].resources.some((resource: any) => resource.zone === "DOCUMENTS") && args[1].request_hash !== prepared.genericHash) {
             admissionAttempts += 1;
             events.push("head-admission");
             vi.setSystemTime(Date.now() + (scenario === "yield-again" && admissionAttempts > 1 ? 19_000 : 13_000));
@@ -774,15 +1953,23 @@ describe("durable managed-document change jobs", () => {
       });
       vi.setSystemTime(prepared.startedAt + 1_000);
       expect(await runDurableObjectAlarm(guard)).toBe(true);
+      alarmTurns += 1;
       const read = () => runInDurableObject(guard, async (instance, durableState) => ({
         continuation: new ManagedDocumentChangeJobStore(durableState.storage).continuation(),
         diagnostic: await durableState.storage.get("navigation-head-recovery-diagnostic-v1"),
         pending: await durableState.storage.get("navigation-head-recovery-pending-v1"),
         source: await new ZoneNavigationSources((instance as any).persistence).readState(created.project_id, "WORKING"),
-        revision: (instance as any).loadState().revision
+        revision: (instance as any).loadState().revision,
+        executions: [...mock.files.entries()].filter(([path]) => path.endsWith("/progress.json"))
+          .map(([, raw]) => JSON.parse(raw)).filter(record => ["navigation-head-recovery", "navigation-head-recovery-parent"].includes(record.kind))
+          .map(record => ({ kind: record.kind, status: record.status, terminal: record.terminal, sequence: record.sequence }))
       }));
       const first = await read();
-      expect(first.diagnostic).toMatchObject({ resource_id: prepared.resource, stage: "admission", code: "budget_exhausted" });
+      phaseTrace.push({ alarm: alarmTurns, diagnostic: first.diagnostic, pending: first.pending, executions: first.executions,
+        calls: scopes.map(slice => slice.calls()), injected_admission_delay_ms: 13_000 });
+      expect(first.diagnostic, JSON.stringify({ events, admissionAttempts,
+        calls: scopes.map(slice => slice.calls()), first })).toMatchObject({ resource_id: prepared.resource, stage: "admission" });
+      expect(first.continuation.last_outcome?.budget_yield).toBe(true);
       expect(first.pending).toBeUndefined();
       expect(first.source.in_flight_resource_ids).toContain(prepared.resource);
       expect(mock.files.get(prepared.headPath)).toBe(headBefore);
@@ -790,7 +1977,10 @@ describe("durable managed-document change jobs", () => {
       events.length = 0;
       vi.setSystemTime(first.continuation.next_wake_at! + 1);
       expect(await runDurableObjectAlarm(guard)).toBe(true);
+      alarmTurns += 1;
       const second = await read();
+      phaseTrace.push({ alarm: alarmTurns, diagnostic: second.diagnostic, pending: second.pending, executions: second.executions,
+        calls: scopes.map(slice => slice.calls()), injected_admission_delay_ms: scenario === "yield-again" ? 19_000 : 13_000 });
       expect(second.continuation.slice_ordinal).toBe(2);
       expect(events.indexOf("head-admission")).toBe(0);
       expect(events).toContain("other-recovery");
@@ -798,7 +1988,8 @@ describe("durable managed-document change jobs", () => {
       if (scenario === "yield-again") {
         expect(second.source.in_flight_resource_ids).toContain(prepared.resource);
         expect(second.pending).toBeUndefined();
-        expect(second.diagnostic).toMatchObject({ stage: "admission", code: "budget_exhausted" });
+        expect(second.diagnostic).toMatchObject({ stage: "admission" });
+        expect(second.continuation.last_outcome?.budget_yield).toBe(true);
       } else {
         let final = second;
         const hasFutureSibling = scenario.includes("future-sibling");
@@ -814,24 +2005,37 @@ describe("durable managed-document change jobs", () => {
         });
         if (scenario.startsWith("scheduled")) {
           expect(second.pending).toBeDefined();
-          expect(second.source.in_flight_resource_ids).not.toContain(prepared.resource);
+          expect(second.source.in_flight_resource_ids).toContain(prepared.resource);
+          const parents = [...mock.files.values()].map(raw => { try { return JSON.parse(raw); } catch { return null; } })
+            .filter(record => record?.admission?.kind === "navigation-head-recovery-parent");
+          expect(parents).toHaveLength(1);
+          expect(parents[0].admission.resources[0]).toMatchObject({ zone: "DOCUMENTS", resource_id: `document-reconcile@${prepared.stateRevision}` });
           // The scheduled entry rotates to the independent slot after the
           // fence cleared. It must preserve the admitted certificate work.
           const scheduled = await guard.fetch("https://project-guard.internal/reconcile-documents?scheduled=1", { method: "POST" });
           expect(scheduled.status).toBe(200);
           final = await read();
+          phaseTrace.push({ phase: "scheduled_route", pending: final.pending, executions: final.executions, calls: scopes.map(slice => slice.calls()) });
           expect(final.continuation.pending).toBe(true);
           expect(final.continuation.next_wake_at).not.toBeNull();
         } else if (hasFutureSibling) {
           vi.setSystemTime(final.continuation.next_wake_at! + 1);
           expect(await runDurableObjectAlarm(guard)).toBe(true);
+          alarmTurns += 1;
           final = await read();
+          phaseTrace.push({ alarm: alarmTurns, pending: final.pending, executions: final.executions, calls: scopes.map(slice => slice.calls()) });
         }
         if (hasFutureSibling) expect(final.continuation.next_wake_at).toBeLessThanOrEqual(Date.now() + 20_000);
-        for (let attempt = 0; attempt < 6 && final.pending; attempt++) {
+        // C0 diagnostic ruling: retain the old six-loop result; at most ten
+        // ACTUAL alarms plus the explicitly counted DATA prime. This does not
+        // prove the unchanged ten-alarm cold-entry positive gate.
+        for (let attempt = 0; alarmTurns < 10 && final.pending; attempt++) {
           vi.setSystemTime(final.continuation.next_wake_at! + 1);
           expect(await runDurableObjectAlarm(guard)).toBe(true);
+          alarmTurns += 1;
           final = await read();
+          phaseTrace.push({ alarm: alarmTurns, pending: final.pending, executions: final.executions, calls: scopes.map(slice => slice.calls()) });
+          if (attempt === 5) oldSixLoopOutcome = { pending: final.pending, executions: final.executions, alarmTurns };
         }
         expect(final.source.in_flight_resource_ids).not.toContain(prepared.resource);
         expect(final.pending ?? null, JSON.stringify({ diagnostic: final.diagnostic, continuation: final.continuation,
@@ -851,6 +2055,8 @@ describe("durable managed-document change jobs", () => {
       expect(admissionAttempts).toBe(2);
       expect((await read()).revision).toBe(prepared.stateRevision);
       expect(mock.files.get(prepared.headPath)).toBe(headBefore);
+      console.log("late-admission diagnostic phases", JSON.stringify({ scenario, alarmTurns, endToEndPhases: 1 + scopes.length,
+        oldSixLoopOutcome, phaseTrace }));
     } finally { vi.useRealTimers(); }
   });
 
@@ -3375,13 +4581,31 @@ describe("durable managed-document change jobs", () => {
     const created = await createProject("TXN-CHANGEJOB-PROJECT-PAGED-0001", "change-job-paged-daily");
     const guard = testEnv.PROJECT_GUARD.getByName(created.project_id);
     await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    let initialCursor: string | null = null;
+    await runInDurableObject(guard, async (_instance, state) => {
+      initialCursor = state.storage.sql.exec<{ cursor: string | null }>(
+        "SELECT cursor FROM managed_document_change_control WHERE singleton = 1"
+      ).one().cursor;
+    });
+    expect(initialCursor).not.toBeNull();
     const previousFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
-    let page = 0;
-    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+    const cursorTransitions: Array<{ requested: string; returned: string; has_more: boolean }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       if (url.hostname === "api.dropboxapi.com" && url.pathname === "/2/files/list_folder/continue") {
-        page += 1;
-        return Promise.resolve(Response.json({ entries: [], cursor: `daily-page-${page}`, has_more: page === 1 }));
+        const request = input instanceof Request ? input.clone() : new Request(input, init);
+        const body = await request.json<{ cursor: string }>();
+        // The provider fixture has two immutable pages, not one page per call.
+        // Polling the terminal cursor again cannot invent a third change page.
+        const response = body.cursor === initialCursor
+          ? { entries: [], cursor: "daily-page-1", has_more: true }
+          : body.cursor === "daily-page-1" || body.cursor === "daily-page-2"
+            ? { entries: [], cursor: "daily-page-2", has_more: false }
+            : null;
+        if (response) {
+          cursorTransitions.push({ requested: body.cursor, returned: response.cursor, has_more: response.has_more });
+          return Response.json(response);
+        }
       }
       return previousFetch(input, init);
     });
@@ -3402,6 +4626,10 @@ describe("durable managed-document change jobs", () => {
     const result = await second.json<{ scheduled_due: boolean; last_scheduled_verified_at: string | null }>();
     expect(result.scheduled_due).toBe(true);
     expect(result.last_scheduled_verified_at).not.toBeNull();
+    // An independent incremental poll may legitimately run before readback.
+    const independentPoll = await guard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
+    expect(independentPoll.status).toBe(200);
+    console.info("daily cursor interleaving", { project_id: created.project_id, initialCursor, cursorTransitions });
     let finalCursor: string | null = null;
     await runInDurableObject(guard, async (_instance, state) => {
       finalCursor = state.storage.sql.exec<{ cursor: string | null }>(

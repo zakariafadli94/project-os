@@ -3,6 +3,7 @@ import { navigationCatalogManifestIdentitySchema, navigationInventoryEntrySchema
 import type { SliceBudget } from "../convergence/contract";
 import { machineDocumentHeadPath, machineDocumentRoot } from "../persistence/layout";
 import type { ProjectOsPersistenceRuntime } from "../persistence/provider/capabilities";
+import type { ProviderObjectMetadata } from "../persistence/provider/contract";
 import { canonicalJson } from "../rules/contract";
 import { sha256Text } from "./hash";
 
@@ -60,6 +61,31 @@ const DEFAULT_ZONE_STATE: z.infer<typeof zoneStateSchema> = {
 const STATE_REVISION_TOKEN = Symbol("zone-navigation-state-revision-token");
 type StoredProjectState = z.infer<typeof stateSchema> & { [STATE_REVISION_TOKEN]?: string };
 const sourceMutationQueues = new WeakMap<object, Map<string, Promise<void>>>();
+
+/** Verified canonical DATA only. Every use rechecks its provider identity;
+ * this checkpoint neither grants admission nor proves fence completion. */
+export interface HeadRecoveryDirtyHint {
+  provider_id: string;
+  acquired_at_ms: number;
+  /** Optional local DATA provenance. Missing legacy dates keep the old group
+   * age; metadata hits never advance either body's acquisition time. */
+  dirty_acquired_at_ms?: number;
+  manifest_acquired_at_ms?: number;
+  ticket: ZoneNavigationHeadWriteTicket;
+  current_hash: string;
+  phase: "dirty_observed" | "manifest_observed" | "manifest_published" | "ready";
+  clear_verified?: boolean;
+  dirty: { path: string; raw: string; metadata: ProviderObjectMetadata };
+  manifest: { path: string; raw: string; metadata: ProviderObjectMetadata } | null;
+}
+export interface HeadRecoveryCompletionObservation {
+  provider_id: string;
+  acquired_at_ms: number;
+  ticket: ZoneNavigationHeadWriteTicket;
+  dirty: { path: string; raw: string; metadata: ProviderObjectMetadata } | null;
+  manifest: { path: string; raw: string; metadata: ProviderObjectMetadata } | null;
+}
+type HeadRecoveryCompletionStep = { kind: "dirty" | "clear"; index: number; hint: HeadRecoveryDirtyHint | null };
 
 export interface ZoneNavigationSourceState {
   schema_version: "1.0";
@@ -151,6 +177,17 @@ async function resourcePath(root: string, resourceId: string): Promise<string> {
 
 export class ZoneNavigationSources {
   constructor(private readonly runtime: ProjectOsPersistenceRuntime) {}
+
+  async headWriteRecoverySourceIdentity(projectId: string, budget?: SliceBudget): Promise<{ object_id: string; revision_token: string } | null> {
+    charge(budget);
+    const metadata = await this.runtime.objects.getMetadata(statePath(projectId));
+    if (!metadata) return null;
+    if (typeof metadata.objectId !== "string" || !metadata.objectId
+      || typeof metadata.revisionToken !== "string" || !metadata.revisionToken) {
+      throw new Error("navigation_source_state_revision_missing");
+    }
+    return { object_id: metadata.objectId, revision_token: metadata.revisionToken };
+  }
 
   async readState(projectId: string, zone: NavigationZone, budget?: SliceBudget): Promise<ZoneNavigationSourceState> {
     const state = await this.readProjectState(projectId, budget);
@@ -899,6 +936,31 @@ export class ZoneNavigationSources {
    * bytes before completing any ticket. */
   async unownedHeadWriteRecoveryCandidates(projectId: string, budget?: SliceBudget): Promise<ZoneNavigationHeadWriteTicket[][]> {
     const state = await this.readProjectState(projectId, budget);
+    return this.headWriteRecoveryCandidatesFromState(projectId, state);
+  }
+
+  async headWriteRecoveryCandidateSnapshot(projectId: string, budget?: SliceBudget): Promise<{
+    source_state: { object_id: string; revision_token: string };
+    candidates: ZoneNavigationHeadWriteTicket[][];
+  } | null> {
+    const path = statePath(projectId);
+    charge(budget);
+    const before = await this.runtime.objects.getMetadata(path);
+    if (!before?.objectId || !before.revisionToken || !Number.isSafeInteger(before.size) || before.size <= 0) return null;
+    charge(budget);
+    const raw = await this.runtime.objects.readText(path);
+    if (raw === null) return null;
+    charge(budget);
+    const after = await this.runtime.objects.getMetadata(path);
+    if (after?.objectId !== before.objectId || after.revisionToken !== before.revisionToken || after.size !== before.size) return null;
+    const state = stateSchema.parse(JSON.parse(raw)) as StoredProjectState;
+    if (state.project_id !== projectId) throw new Error("navigation_source_state_binding");
+    for (const zone of zones) state.zones[zone] ??= { ...DEFAULT_ZONE_STATE, in_flight_writes: [] };
+    return { source_state: { object_id: before.objectId, revision_token: before.revisionToken },
+      candidates: this.headWriteRecoveryCandidatesFromState(projectId, state) };
+  }
+
+  private headWriteRecoveryCandidatesFromState(projectId: string, state: StoredProjectState): ZoneNavigationHeadWriteTicket[][] {
     const groups = new Map<string, ZoneNavigationHeadWriteTicket[]>();
     for (const zone of zones) {
       const current = state.zones[zone] ?? DEFAULT_ZONE_STATE;
@@ -1030,7 +1092,8 @@ export class ZoneNavigationSources {
    * head without creating a new source generation. */
   async transferHeadWriteRecoveryTickets(
     originalTickets: readonly ZoneNavigationHeadWriteTicket[], currentHash: string, ownerHash: string, budget?: SliceBudget,
-    verifyHead?: () => Promise<boolean>
+    verifyHead?: () => Promise<boolean>, verifyOnceAtCas = false,
+    observeCandidates?: (groups: ZoneNavigationHeadWriteTicket[][]) => void
   ): Promise<void> {
     if (!originalTickets.length || !/^[a-f0-9]{64}$/.test(currentHash) || !/^[a-f0-9]{64}$/.test(ownerHash)) {
       throw new Error("navigation_head_recovery_ticket_invalid");
@@ -1041,8 +1104,9 @@ export class ZoneNavigationSources {
       || ticket.owner_hash !== undefined || ticket.write_hash === null || !/^[a-f0-9]{64}$/.test(ticket.write_hash ?? "")
       || !Number.isSafeInteger(ticket.generation) || ticket.generation < 1)) throw new Error("navigation_head_recovery_ticket_invalid");
     await this.withMutationLock(projectId, resourceId, async () => {
-      if (verifyHead && !(await verifyHead())) throw new Error("navigation_source_head_superseded");
+      if (!verifyOnceAtCas && verifyHead && !(await verifyHead())) throw new Error("navigation_source_head_superseded");
       const state = await this.readProjectState(projectId, budget);
+      observeCandidates?.(this.headWriteRecoveryCandidatesFromState(projectId, state));
       let changed = false;
       for (const ticket of originalTickets) {
         const zone = state.zones[ticket.zone] ?? { ...DEFAULT_ZONE_STATE };
@@ -1094,14 +1158,20 @@ export class ZoneNavigationSources {
    * are retained and the recovered generation is coalesced into their range. */
   async completeOwnedHeadWriteRecovery(
     tickets: readonly ZoneNavigationHeadWriteTicket[], ownerHash: string, currentHash: string, budget?: SliceBudget,
-    proof?: { verifyCurrent(): Promise<boolean>; beforeClear(): Promise<void>; hasCompletionWitness(): Promise<boolean> }
-  ): Promise<void> {
+    proof?: { verifyCurrent(): Promise<boolean>; beforeClear(): Promise<void>; hasCompletionWitness(): Promise<boolean>;
+      observeCandidates?(groups: ZoneNavigationHeadWriteTicket[][]): void },
+    step?: HeadRecoveryCompletionStep
+  ): Promise<HeadRecoveryDirtyHint | void> {
     if (!tickets.length || !/^[a-f0-9]{64}$/.test(ownerHash) || !/^[a-f0-9]{64}$/.test(currentHash)
       || tickets.some(ticket => ticket.owner_hash !== ownerHash || ticket.write_hash !== currentHash
         || ticket.project_id !== tickets[0].project_id || ticket.resource_id !== tickets[0].resource_id)) {
       throw new Error("navigation_head_recovery_ticket_invalid");
     }
     const { project_id: projectId, resource_id: resourceId } = tickets[0];
+    if (step) {
+      if (!proof || !Number.isSafeInteger(step.index) || !tickets[step.index]) throw new Error("navigation_head_recovery_step_invalid");
+      return this.withMutationLock(projectId, resourceId, () => this.advanceHeadRecoveryZone(tickets[step.index], ownerHash, currentHash, proof, step, budget));
+    }
     await this.withMutationLock(projectId, resourceId, async () => {
       const assertHead = async () => {
         charge(budget);
@@ -1240,6 +1310,203 @@ export class ZoneNavigationSources {
       }
       await this.writeProjectState(projectId, finalState, budget);
     });
+  }
+
+  private async advanceHeadRecoveryZone(ticket: ZoneNavigationHeadWriteTicket, ownerHash: string, currentHash: string,
+    proof: { verifyCurrent(): Promise<boolean>; beforeClear(): Promise<void>; hasCompletionWitness(): Promise<boolean>;
+      observeCandidates?(groups: ZoneNavigationHeadWriteTicket[][]): void },
+    step: HeadRecoveryCompletionStep, budget?: SliceBudget): Promise<HeadRecoveryDirtyHint> {
+    const projectId = ticket.project_id;
+    const dirtyPath = await resourcePath(zoneNavigationDirtyRoot(projectId, ticket.zone), ticket.resource_id);
+    const manifestPath = compactReadyPath(projectId, ticket.zone);
+    const exactMetadata = (a: ProviderObjectMetadata | null, b: ProviderObjectMetadata) => a?.path === b.path
+      && Boolean(a.objectId && a.revisionToken) && a.objectId === b.objectId && a.revisionToken === b.revisionToken && a.size === b.size;
+    const withAcquisition = (value: HeadRecoveryDirtyHint,
+      dates: Partial<Pick<HeadRecoveryDirtyHint, "dirty_acquired_at_ms" | "manifest_acquired_at_ms">> = {}): HeadRecoveryDirtyHint => {
+      const dated = { ...value, ...dates };
+      return { ...dated, acquired_at_ms: Math.min(dated.dirty_acquired_at_ms ?? value.acquired_at_ms,
+        dated.manifest ? dated.manifest_acquired_at_ms ?? value.acquired_at_ms : Infinity) };
+    };
+    const readStable = async (path: string) => {
+      charge(budget); const before = await this.runtime.objects.getMetadata(path);
+      // Create-only handles a race after an absent observation. No missing
+      // object is converted into a completion proof by this acquisition.
+      if (!before) return null;
+      charge(budget); const raw = await this.runtime.objects.readText(path);
+      charge(budget); const after = await this.runtime.objects.getMetadata(path);
+      if (!before && raw === null && !after) return null;
+      if (!before || raw === null || !exactMetadata(after, before) || before.size !== new TextEncoder().encode(raw).byteLength
+        || before.size > 64 * 1024) throw new Error("navigation_head_recovery_observation_unstable");
+      return { path, raw, metadata: before };
+    };
+    const state = await this.readProjectState(projectId, budget);
+    proof.observeCandidates?.(this.headWriteRecoveryCandidatesFromState(projectId, state));
+    const zone = state.zones[ticket.zone] ?? DEFAULT_ZONE_STATE;
+    const writes = zone.in_flight_writes.filter(write => write.resource_id === ticket.resource_id);
+    const exact = writes.find(write => write.generation === ticket.generation && write.write_hash === currentHash && write.owner_hash === ownerHash);
+    if (zone.catalog_rebuild_request_id) throw new Error("navigation_catalog_rebuild_writer_fenced");
+    if (ticket.generation > zone.generation) throw new Error("navigation_source_ticket_future_generation");
+    if (writes.length && (writes.length !== 1 || !exact)) throw new Error("navigation_source_ticket_stale");
+    if (!(await proof.verifyCurrent())) throw new Error("navigation_source_head_superseded");
+    let hint = step.hint;
+    if (hint && [hint.acquired_at_ms, hint.dirty_acquired_at_ms, hint.manifest_acquired_at_ms]
+      .some(value => value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > Date.now()))) hint = null;
+    if (hint) hint = withAcquisition(hint);
+    if (hint && (hint.provider_id !== this.runtime.providerId || canonicalJson(hint.ticket) !== canonicalJson(ticket)
+      || hint.current_hash !== currentHash || hint.dirty.path !== dirtyPath || hint.manifest && hint.manifest.path !== manifestPath
+      || Date.now() < hint.acquired_at_ms || Date.now() - hint.acquired_at_ms >= 300_000
+      || new TextEncoder().encode(canonicalJson(hint)).byteLength > 64 * 1024)) hint = null;
+    if (hint) {
+      charge(budget); const dirty = await this.runtime.objects.getMetadata(dirtyPath);
+      if (!exactMetadata(dirty, hint.dirty.metadata)) hint = null;
+      else if (hint.manifest) {
+        charge(budget); const manifest = await this.runtime.objects.getMetadata(manifestPath);
+        if (!exactMetadata(manifest, hint.manifest.metadata)) hint = null;
+      }
+    }
+    if (!hint) {
+      const dirty = await readStable(dirtyPath);
+      if (!dirty) {
+        if (step.kind === "clear" || !exact) throw new Error("navigation_source_ticket_stale");
+        const raw = JSON.stringify({ schema_version: "1.0", resource_id: ticket.resource_id, generation: ticket.generation, entry_hash: null });
+        await this.writeAtToken(dirtyPath, raw, null, budget);
+        charge(budget); const metadata = await this.runtime.objects.getMetadata(dirtyPath);
+        if (!metadata?.objectId || !metadata.revisionToken || metadata.path !== dirtyPath) throw new Error("navigation_dirty_record_revision_missing");
+        return { provider_id: this.runtime.providerId, acquired_at_ms: Date.now(), dirty_acquired_at_ms: Date.now(), ticket: { ...ticket }, current_hash: currentHash,
+          phase: "ready", dirty: { path: dirtyPath, raw, metadata }, manifest: null };
+      }
+      const marker = dirtySchema.parse(JSON.parse(dirty.raw));
+      if (marker.resource_id !== ticket.resource_id || marker.generation > zone.generation) throw new Error("navigation_dirty_record_binding");
+      // Read-only reacquisition always yields before a clear/CAS: no inferred
+      // authority from a locator or an absent fence.
+      return { provider_id: this.runtime.providerId, acquired_at_ms: Date.now(), dirty_acquired_at_ms: Date.now(), ticket: { ...ticket }, current_hash: currentHash,
+        phase: marker.generation === ticket.generation ? "ready" : "dirty_observed", dirty, manifest: null };
+    }
+    const marker = dirtySchema.parse(JSON.parse(hint.dirty.raw));
+    if (marker.resource_id !== ticket.resource_id || marker.generation > zone.generation) throw new Error("navigation_dirty_record_binding");
+    if (hint.phase === "dirty_observed") {
+      const manifest = await readStable(manifestPath);
+      if (!manifest) throw new Error("navigation_head_recovery_manifest_unavailable");
+      const parsed = compactReadySchema.parse(JSON.parse(manifest.raw));
+      if (parsed.project_id !== projectId || parsed.zone !== ticket.zone || parsed.rebuilding_request_id || parsed.rebuild_repair_required
+        || parsed.ready_generation === null) throw new Error("navigation_catalog_rebuild_writer_fenced");
+      return withAcquisition({ ...hint, phase: "manifest_observed", manifest }, { manifest_acquired_at_ms: Date.now() });
+    }
+    if (hint.phase === "manifest_observed") {
+      if (!hint.manifest || !exact) throw new Error("navigation_source_ticket_stale");
+      const manifest = compactReadySchema.parse(JSON.parse(hint.manifest.raw));
+      if (manifest.project_id !== projectId || manifest.zone !== ticket.zone || manifest.rebuilding_request_id || manifest.rebuild_repair_required
+        || manifest.ready_generation === null) throw new Error("navigation_catalog_rebuild_writer_fenced");
+      const latest = Math.max(marker.generation, ticket.generation);
+      const prior = Math.min(marker.generation, ticket.generation);
+      const previous = manifest.coalesced_dirty.find(item => item.resource_id === ticket.resource_id);
+      if (previous && ![marker.generation, ticket.generation].includes(previous.latest_generation)) throw new Error("navigation_dirty_record_changed");
+      manifest.coalesced_dirty = [...manifest.coalesced_dirty.filter(item => item.resource_id !== ticket.resource_id), {
+        resource_id: ticket.resource_id, latest_generation: latest,
+        covered_generations: mergeGenerationRanges([...(previous?.covered_generations ?? []), { start: prior, end: prior }])
+      }];
+      compactReadySchema.parse(manifest);
+      const raw = JSON.stringify(manifest);
+      charge(budget); const metadata = await this.runtime.conditionalWrite.writeTextConditional(manifestPath, raw, hint.manifest.metadata.revisionToken!);
+      charge(budget); if (await this.runtime.objects.readText(manifestPath) !== raw) throw new Error("navigation_dirty_record_changed");
+      return withAcquisition({ ...hint, phase: "manifest_published", manifest: { path: manifestPath, raw, metadata } },
+        { manifest_acquired_at_ms: Date.now() });
+    }
+    if (hint.phase === "manifest_published") {
+      if (!hint.manifest || !exact) throw new Error("navigation_source_ticket_stale");
+      const manifest = compactReadySchema.parse(JSON.parse(hint.manifest.raw));
+      const latest = Math.max(marker.generation, ticket.generation);
+      const prior = Math.min(marker.generation, ticket.generation);
+      const ranges = manifest.coalesced_dirty.find(item => item.resource_id === ticket.resource_id && item.latest_generation === latest)?.covered_generations ?? [];
+      if (!ranges.some(range => range.start <= prior && range.end >= prior)) throw new Error("navigation_source_ticket_stale");
+      if (marker.generation < ticket.generation) {
+        const raw = JSON.stringify({ ...marker, generation: ticket.generation, entry_hash: null });
+        charge(budget); const metadata = await this.runtime.conditionalWrite.writeTextConditional(dirtyPath, raw, hint.dirty.metadata.revisionToken!);
+        charge(budget); if (await this.runtime.objects.readText(dirtyPath) !== raw) throw new Error("navigation_dirty_record_changed");
+        return withAcquisition({ ...hint, phase: "ready", dirty: { path: dirtyPath, raw, metadata } },
+          { dirty_acquired_at_ms: Date.now() });
+      }
+      return { ...hint, phase: "ready" };
+    }
+    if (hint.phase !== "ready") throw new Error("navigation_head_recovery_step_invalid");
+    if (marker.generation !== ticket.generation) {
+      const manifest = hint.manifest && compactReadySchema.parse(JSON.parse(hint.manifest.raw));
+      const ranges = manifest && manifest.project_id === projectId && manifest.zone === ticket.zone && !manifest.rebuild_repair_required
+        && !manifest.rebuilding_request_id ? manifest.coalesced_dirty.find(item => item.resource_id === ticket.resource_id
+          && item.latest_generation === marker.generation)?.covered_generations ?? [] : [];
+      if (marker.generation < ticket.generation || !ranges.some(range => range.start <= ticket.generation && range.end >= ticket.generation)) throw new Error("navigation_source_ticket_stale");
+    }
+    if (step.kind === "clear") {
+      if (!exact) {
+        if (!(await proof.hasCompletionWitness())) throw new Error("navigation_source_ticket_stale");
+      } else {
+        await proof.beforeClear();
+        zone.in_flight_writes = zone.in_flight_writes.filter(write => write !== exact);
+        state.zones[ticket.zone] = zone;
+        await this.writeProjectState(projectId, state, budget);
+      }
+      return { ...hint, clear_verified: true };
+    }
+    return hint;
+  }
+
+  /** Read-only cold acquisition, one zone per invocation. Absence is retained
+   * as an observation only; the full completion predicate below decides it. */
+  async observeHeadRecoveryCompletion(ticket: ZoneNavigationHeadWriteTicket): Promise<HeadRecoveryCompletionObservation> {
+    const read = async (path: string) => {
+      const before = await this.runtime.objects.getMetadata(path);
+      if (!before) return null;
+      const raw = await this.runtime.objects.readText(path);
+      const after = await this.runtime.objects.getMetadata(path);
+      if (raw === null || !before.objectId || !before.revisionToken || before.path !== path
+        || before.objectId !== after?.objectId || before.revisionToken !== after.revisionToken || before.size !== after.size
+        || before.size !== new TextEncoder().encode(raw).byteLength || before.size > 64 * 1024) throw new Error("navigation_head_recovery_observation_unstable");
+      return { path, raw, metadata: before };
+    };
+    const dirty = await read(await resourcePath(zoneNavigationDirtyRoot(ticket.project_id, ticket.zone), ticket.resource_id));
+    const manifest = await read(compactReadyPath(ticket.project_id, ticket.zone));
+    if (dirty) dirtySchema.parse(JSON.parse(dirty.raw));
+    if (manifest) compactReadySchema.parse(JSON.parse(manifest.raw));
+    return { provider_id: this.runtime.providerId, acquired_at_ms: Date.now(), ticket: { ...ticket }, dirty, manifest };
+  }
+
+  /** Whole-group physical proof; no effects, no policy verdict cache. */
+  async verifyHeadRecoveryCleared(tickets: readonly ZoneNavigationHeadWriteTicket[],
+    observations: readonly HeadRecoveryCompletionObservation[]): Promise<boolean> {
+    if (!tickets.length || tickets.length > 3 || observations.length !== tickets.length) return false;
+    const state = await this.readProjectState(tickets[0].project_id);
+    for (let index = 0; index < tickets.length; index++) {
+      const ticket = tickets[index];
+      const observation = observations[index];
+      if (!observation || observation.provider_id !== this.runtime.providerId || canonicalJson(observation.ticket) !== canonicalJson(ticket)
+        || Date.now() < observation.acquired_at_ms || Date.now() - observation.acquired_at_ms >= 300_000
+        || new TextEncoder().encode(canonicalJson(observation)).byteLength > 64 * 1024) return false;
+      const zone = state.zones[ticket.zone];
+      if (!zone || zone.generation < ticket.generation || zone.catalog_rebuild_request_id
+        || zone.in_flight_writes.some(write => write.resource_id === ticket.resource_id)) return false;
+      const dirtyPath = await resourcePath(zoneNavigationDirtyRoot(ticket.project_id, ticket.zone), ticket.resource_id);
+      const manifestPath = compactReadyPath(ticket.project_id, ticket.zone);
+      for (const [path, acquired] of [[dirtyPath, observation.dirty], [manifestPath, observation.manifest]] as const) {
+        const fresh = await this.runtime.objects.getMetadata(path);
+        if (!acquired ? fresh !== null : acquired.path !== path || acquired.metadata.path !== path
+          || !acquired.metadata.objectId || !acquired.metadata.revisionToken || fresh?.objectId !== acquired.metadata.objectId
+          || fresh.revisionToken !== acquired.metadata.revisionToken || fresh.size !== acquired.metadata.size) return false;
+      }
+      const marker = observation.dirty ? dirtySchema.parse(JSON.parse(observation.dirty.raw)) : null;
+      const manifest = observation.manifest ? compactReadySchema.parse(JSON.parse(observation.manifest.raw)) : null;
+      if (manifest && (manifest.project_id !== ticket.project_id || manifest.zone !== ticket.zone
+        || manifest.rebuild_repair_required || manifest.rebuilding_request_id)) return false;
+      if (marker) {
+        if (marker.resource_id !== ticket.resource_id || marker.generation < ticket.generation || marker.generation > zone.generation) return false;
+        if (marker.generation > ticket.generation) {
+          const ranges = manifest?.coalesced_dirty.find(item => item.resource_id === ticket.resource_id
+            && item.latest_generation === marker.generation)?.covered_generations ?? [];
+          if (!ranges.some(range => range.start <= ticket.generation && range.end >= ticket.generation)) return false;
+        }
+      } else if (!manifest || manifest.ready_generation === null || !(manifest.ready_generation >= ticket.generation
+        || manifest.completed_generations.some(range => range.start <= ticket.generation && range.end >= ticket.generation))) return false;
+    }
+    return true;
   }
 
   private async completeHeadWritesUnlocked(tickets: readonly ZoneNavigationHeadWriteTicket[], observedEntries: ReadonlyMap<NavigationZone, NavigationInventoryEntry | null>, budget: SliceBudget | undefined, preserveMismatchedTicket: boolean): Promise<void> {

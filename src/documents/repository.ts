@@ -7,6 +7,7 @@ import {
 } from "../domain/managed-document";
 import {
   machineDocumentHeadPath,
+  machineConvergenceRoot,
   machineDocumentProviderPayloadPath,
   machineDocumentRoot,
   machineDocumentTextPayloadPath,
@@ -48,17 +49,19 @@ import { upcastDropboxV1Observation, type ProviderObservation } from "../schema/
 import { schemaWriterStageFor } from "../schema/runtime-policy";
 import { writesProviderV2, type SchemaWriterStage } from "../schema/writer-stage";
 import { sha256Text } from "./hash";
-import { ZoneNavigationSources, type ZoneNavigationHeadWriteTicket } from "./zone-navigation-sources";
+import { ZoneNavigationSources, type ZoneNavigationHeadWriteTicket, type HeadRecoveryDirtyHint, type HeadRecoveryCompletionObservation } from "./zone-navigation-sources";
 import { packageIdFor, packageManifestPath, packageRefSchema, parsePackageManifest, packageNavigationPath, packageNavigationLedgerSchema, type PackageNavigation, type FrozenPackageManifest, type PackageRef } from "../domain/document-package";
 import { renderPackageIndex } from "../render/package-navigation";
 import { canonicalJson } from "../rules/contract";
-import { ExecutionJournal, executionHash } from "../execution/journal";
+import { ExecutionJournal, executionHash, type HeadRecoveryParentBinding, type LoadedExecution } from "../execution/journal";
 import type { ExecutionAdmission } from "../execution/contract";
 import type { ProjectState } from "../domain/project-state";
 import { workspaceProjectRoot } from "../persistence/layout";
 
 const MAX_AUDIT_PACKAGE_NAVIGATION_BYTES = 128_000;
 const MAX_HEAD_RECOVERY_BYTES = 128_000;
+const MAX_HEAD_RECOVERY_PREPARATION_BYTES = 64 * 1024;
+const HEAD_RECOVERY_PREPARATION_TTL_MS = 300_000;
 const DROPBOX_PROVIDER_ID = "dropbox";
 const DROPBOX_CONTENT_HASH_ALGORITHM = "dropbox-content-hash";
 const headMutationLocks = new WeakMap<object, Map<string, { reservation: string | null; active: boolean }>>();
@@ -99,7 +102,7 @@ export interface HeadWriteRecoveryIntent {
   };
   version_proofs: Array<{
     version_id: string;
-    stage: string;
+    stage: CurrentDocumentVersionRecord["stage"];
     immutable_payload_path: string;
     record_sha256: string;
     record_object_id: string;
@@ -111,6 +114,23 @@ export interface HeadWriteRecoveryIntent {
     payload_integrity_hash?: { algorithm: string; value: string };
     content_sha256?: string;
   }>;
+}
+
+export interface HeadWriteRecoveryPreparation {
+  schema_version: "1.0";
+  preparation_type: "navigation-head-recovery-preparation";
+  project_id: string;
+  provider_id: "dropbox";
+  created_at_ms: number;
+  expires_at_ms: number;
+  resource_id: string;
+  original_tickets: ZoneNavigationHeadWriteTicket[];
+  source_state: { object_id: string; revision_token: string };
+  current_head: HeadWriteRecoveryIntent["current_head"];
+  pointer_bindings: Array<{ field: "reference_version_id" | "working_version_id" | "review_version_id" | "published_version_id"; version_id: string }>;
+  version_proofs: HeadWriteRecoveryIntent["version_proofs"];
+  next_pointer_index: number;
+  preparation_digest: string;
 }
 
 export const HEAD_WRITE_RECOVERY_STAGES = ["candidate_read", "intent_read", "head_metadata", "head_bytes", "head_decode",
@@ -127,9 +147,33 @@ export interface HeadWriteRecoveryDiagnostic {
 export interface HeadWriteRecoveryOptions {
   pending_recovery_hash: string | null;
   excluded_resource_ids?: readonly string[];
+  readPreparation?(): Promise<unknown | null>;
+  writePreparation?(value: HeadWriteRecoveryPreparation): Promise<void>;
+  clearPreparation?(): Promise<void>;
   onDiagnostic?(value: HeadWriteRecoveryDiagnostic): void;
-  authorize(intent: HeadWriteRecoveryIntent): Promise<ExecutionAdmission>;
+  authorize(intent: HeadWriteRecoveryIntent, parentAdmissionRef?: string): Promise<ExecutionAdmission>;
   rememberRecovery(hash: string, resourceId: string): Promise<void>;
+  bound?: {
+    readCheckpoint(hash: string): Promise<unknown>;
+    writeCheckpoint(hash: string, value: HeadRecoveryCheckpoint): Promise<void>;
+    authorizeParent(intent: HeadWriteRecoveryIntent, source: ProviderObjectMetadata): Promise<ExecutionAdmission>;
+    assertCompatible(parent: ExecutionAdmission, child: ExecutionAdmission): Promise<void>;
+    observeOtherCandidates?(present: boolean): void;
+  };
+}
+
+export interface HeadRecoveryCheckpoint {
+  intent_hash: string;
+  parent_request_id: string | null;
+  child_created: boolean;
+  finalization_started?: boolean;
+  child_certificate_ref?: string;
+  completion_witness_created?: boolean;
+  intent: HeadWriteRecoveryIntent;
+  discovery: { cursor: string | null; pending_roots: string[]; complete: boolean };
+  dirty: Array<HeadRecoveryDirtyHint | null>;
+  cleared: number;
+  completion: Array<HeadRecoveryCompletionObservation | null>;
 }
 
 export class DocumentLedgerRepository {
@@ -401,6 +445,7 @@ export class DocumentLedgerRepository {
     status: "none" | "recovered" | "unresolved";
     remainingCandidates: boolean;
   }> {
+    if (options?.bound) return this.recoverBoundHeadWrite(projectId, sliceOrdinal, probeOnly, options);
     let diagnostic: HeadWriteRecoveryDiagnostic = { resource_id: null, stage: "candidate_read", code: "observing" };
     const report = (stage: HeadWriteRecoveryDiagnostic["stage"], code: HeadWriteRecoveryDiagnostic["code"] = "observing",
       resourceId = diagnostic.resource_id) => {
@@ -410,8 +455,11 @@ export class DocumentLedgerRepository {
     try {
     report("candidate_read");
     const sources = new ZoneNavigationSources(this.runtime);
-    const candidates = (await sources.unownedHeadWriteRecoveryCandidates(projectId))
+    const preparationEnabled = options?.pending_recovery_hash === null && Boolean(options.readPreparation && options.writePreparation && options.clearPreparation);
+    const initialSnapshot = preparationEnabled ? await sources.headWriteRecoveryCandidateSnapshot(projectId) : null;
+    const candidates = (initialSnapshot?.candidates ?? await sources.unownedHeadWriteRecoveryCandidates(projectId))
       .filter(tickets => !options?.excluded_resource_ids?.includes(tickets[0].resource_id));
+    const sourceIdentityAfter = initialSnapshot?.source_state ?? null;
     if (probeOnly) return { status: candidates.length || options?.pending_recovery_hash
       ? "unresolved" : "none", remainingCandidates: Boolean(candidates.length || options?.pending_recovery_hash) };
     if (!options) {
@@ -439,34 +487,93 @@ export class DocumentLedgerRepository {
       report("proof_recheck", "observing", intent.resource_id);
     } else {
       if (!candidates.length) { report("idle", "none"); return { status: "none", remainingCandidates: false }; }
+      const cachedValue = options.readPreparation ? (await options.readPreparation() ?? null) : null;
+      const cached = cachedValue === null ? null : await this.parseHeadWriteRecoveryPreparation(cachedValue, projectId);
+      if (cachedValue !== null && !cached) {
+        await options.clearPreparation?.();
+        report("proof_recheck", "invalid_evidence");
+        return { status: "unresolved", remainingCandidates: true };
+      }
       const ordinal = Number.isSafeInteger(sliceOrdinal) && sliceOrdinal >= 0 ? sliceOrdinal : 0;
-      const selected = candidates[ordinal % candidates.length];
-      report("head_metadata", "observing", selected[0].resource_id);
+      const selected = cached
+        ? candidates.find(group => group[0]?.resource_id === cached.resource_id
+          && canonicalJson([...group].sort((left, right) => left.zone.localeCompare(right.zone)))
+            === canonicalJson(cached.original_tickets))
+        : candidates[ordinal % candidates.length];
+      if (!selected) {
+        if (cached) await options.clearPreparation?.();
+        report("proof_recheck", "proof_unavailable", cached?.resource_id ?? null);
+        return { status: "unresolved", remainingCandidates: candidates.length > 0 };
+      }
+      report(cached ? "proof_recheck" : "head_metadata", "observing", selected[0].resource_id);
       if (probeOnly) return { status: "unresolved", remainingCandidates: true };
-      const identity = await this.readCurrentHeadIdentity(projectId, selected[0].resource_id, report);
-      if (!identity) {
-        report(diagnostic.stage, "proof_unavailable");
-        return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+      if (options.readPreparation && options.writePreparation && options.clearPreparation) {
+        if (!sourceIdentityAfter) {
+          if (cached) await options.clearPreparation();
+          report("proof_recheck", "proof_unavailable", selected[0].resource_id);
+          return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+        const proof = await this.readCurrentHeadRecoveryProof(projectId, selected[0].resource_id, report, cached ?? undefined, true);
+        if (!proof || cached && canonicalJson(proof.current_head) !== canonicalJson(cached.current_head)) {
+          if (cached) await options.clearPreparation();
+          report(diagnostic.stage, "proof_unavailable", selected[0].resource_id);
+          return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+        const createdAt = cached?.created_at_ms ?? Date.now();
+        const base = { schema_version: "1.0" as const, preparation_type: "navigation-head-recovery-preparation" as const,
+          project_id: projectId, provider_id: "dropbox" as const, created_at_ms: createdAt, expires_at_ms: createdAt + 300_000,
+          resource_id: selected[0].resource_id,
+          original_tickets: selected.map(ticket => ({ ...ticket })).sort((left, right) => left.zone.localeCompare(right.zone)),
+          source_state: sourceIdentityAfter, current_head: proof.current_head, pointer_bindings: proof.pointer_bindings,
+          version_proofs: proof.version_proofs, next_pointer_index: proof.next_pointer_index };
+        const preparation = await this.makeHeadWriteRecoveryPreparation(base);
+        await options.writePreparation(preparation);
+        if (!cached || preparation.next_pointer_index > cached.next_pointer_index) {
+          report("version_bytes", "observing", selected[0].resource_id);
+          return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+        if (preparation.next_pointer_index !== preparation.pointer_bindings.length) {
+          report("version_metadata", "proof_unavailable", selected[0].resource_id);
+          return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+        const latestSnapshot = await sources.headWriteRecoveryCandidateSnapshot(projectId);
+        const latestCandidates = latestSnapshot?.candidates.find(group => group[0]?.resource_id === selected[0].resource_id
+            && canonicalJson([...group].sort((left, right) => left.zone.localeCompare(right.zone)))
+              === canonicalJson(preparation.original_tickets));
+        if (!latestSnapshot || !latestCandidates) {
+          await options.clearPreparation();
+          report("proof_recheck", "proof_unavailable", selected[0].resource_id);
+          return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+        observedProof = proof;
+        intent = { schema_version: "1.0", intent_type: "navigation.head-write.reconcile", project_id: projectId,
+          resource_id: selected[0].resource_id, original_tickets: preparation.original_tickets,
+          original_outcome: "unknown", current_head: proof.current_head, version_proofs: proof.version_proofs };
+        recoveryHash = await sha256Text(canonicalJson(intent));
+      } else {
+        const identity = await this.readCurrentHeadIdentity(projectId, selected[0].resource_id, report);
+        if (!identity) {
+          report(diagnostic.stage, "proof_unavailable");
+          return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+        if (identity.current_head.content_sha256 === selected[0].write_hash) {
+          report("fence_complete");
+          const recovered = await this.completeUnownedHeadWriteTickets(selected);
+          report("complete", recovered ? "recovered" : "proof_unavailable");
+          return { status: recovered ? "recovered" : "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+        const proof = await this.readCurrentHeadRecoveryProof(projectId, selected[0].resource_id, report);
+        if (!proof || canonicalJson(proof.current_head) !== canonicalJson(identity.current_head)) {
+          report(diagnostic.stage, "proof_unavailable");
+          return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+        observedProof = proof;
+        intent = { schema_version: "1.0", intent_type: "navigation.head-write.reconcile", project_id: projectId,
+          resource_id: selected[0].resource_id,
+          original_tickets: selected.map(ticket => ({ ...ticket })).sort((left, right) => left.zone.localeCompare(right.zone)),
+          original_outcome: "unknown", current_head: proof.current_head, version_proofs: proof.version_proofs };
+        recoveryHash = await sha256Text(canonicalJson(intent));
       }
-      if (identity.current_head.content_sha256 === selected[0].write_hash) {
-        report("fence_complete");
-        const recovered = await this.completeUnownedHeadWriteTickets(selected);
-        report("complete", recovered ? "recovered" : "proof_unavailable");
-        return { status: recovered ? "recovered" : "unresolved", remainingCandidates: candidates.length > 1 };
-      }
-      const proof = await this.readCurrentHeadRecoveryProof(projectId, selected[0].resource_id, report);
-      if (!proof || canonicalJson(proof.current_head) !== canonicalJson(identity.current_head)) {
-        report(diagnostic.stage, "proof_unavailable");
-        return { status: "unresolved", remainingCandidates: candidates.length > 1 };
-      }
-      observedProof = proof;
-      intent = {
-        schema_version: "1.0", intent_type: "navigation.head-write.reconcile", project_id: projectId,
-        resource_id: selected[0].resource_id,
-        original_tickets: selected.map(ticket => ({ ...ticket })).sort((left, right) => left.zone.localeCompare(right.zone)),
-        original_outcome: "unknown", ...proof
-      };
-      recoveryHash = await sha256Text(canonicalJson(intent));
     }
 
     // A pending pointer can only resume the exact immutable intent and current
@@ -485,17 +592,25 @@ export class DocumentLedgerRepository {
     report("journal_read");
     let persisted = await journal.readAdmission();
     let admission: ExecutionAdmission;
+    let admissionJustPersisted = false;
     if (options.pending_recovery_hash === null) {
-      report("admission");
-      admission = await options.authorize(intent);
+      if (persisted) {
+        admission = persisted.admission;
+      } else {
+        report("admission");
+        admission = await options.authorize(intent);
+        admissionJustPersisted = true;
+      }
       if (admission.project_id !== projectId || admission.kind !== "navigation-head-recovery"
         || admission.operation !== "project.materialize" || admission.request_id !== requestId
         || admission.request_hash !== recoveryHash || admission.verdict !== "allow"
         || admission.deferred_rules.length !== 0 || canonicalJson(admission.resources) !== canonicalJson(expectedResources)) {
         throw new Error("navigation_head_recovery_admission_invalid");
       }
-      persisted = await journal.readAdmission();
-      if (!persisted || canonicalJson(persisted.admission) !== canonicalJson(admission)) throw new Error("navigation_head_recovery_admission_unpersisted");
+      if (admissionJustPersisted) {
+        persisted = await journal.readAdmission();
+        if (!persisted || canonicalJson(persisted.admission) !== canonicalJson(admission)) throw new Error("navigation_head_recovery_admission_unpersisted");
+      }
     } else {
       if (!persisted) throw new Error("navigation_head_recovery_admission_missing");
       admission = persisted.admission;
@@ -507,13 +622,22 @@ export class DocumentLedgerRepository {
       throw new Error("navigation_head_recovery_admission_invalid");
     }
     if (!persisted || persisted.plan !== null) throw new Error("navigation_head_recovery_plan_invalid");
+    if (admissionJustPersisted && preparationEnabled) {
+      // Admission is durable but never cached as a local permit. Rebind the
+      // canonical record on the next bounded slice before creating intention.
+      return { status: "unresolved", remainingCandidates: candidates.length > 1 };
+    }
 
     const intentPath = this.headWriteRecoveryIntentPath(projectId, recoveryHash);
     const intentJson = canonicalJson(intent);
     report("intent_write");
     try { await this.runtime.objects.createText(intentPath, intentJson); }
     catch (error) { if (await this.runtime.objects.readText(intentPath) !== intentJson) throw error; }
-    if (options.pending_recovery_hash === null) { report("pointer_write"); await options.rememberRecovery(recoveryHash, intent.resource_id); }
+    if (options.pending_recovery_hash === null) {
+      report("pointer_write");
+      await options.rememberRecovery(recoveryHash, intent.resource_id);
+      await options.clearPreparation?.();
+    }
     const ownedTickets: ZoneNavigationHeadWriteTicket[] = intent.original_tickets.map(ticket => ({
       ...ticket, write_hash: intent.current_head.content_sha256, owner_hash: recoveryHash
     }));
@@ -573,6 +697,52 @@ export class DocumentLedgerRepository {
     return `${machineDocumentRoot(projectId)}/navigation-sources/head-write-recovery/${hash}/intent.json`;
   }
 
+  private async makeHeadWriteRecoveryPreparation(
+    base: Omit<HeadWriteRecoveryPreparation, "preparation_digest">
+  ): Promise<HeadWriteRecoveryPreparation> {
+    const preparation = { ...base, preparation_digest: await sha256Text(canonicalJson(base)) };
+    const encoded = new TextEncoder().encode(canonicalJson(preparation));
+    if (encoded.byteLength > MAX_HEAD_RECOVERY_PREPARATION_BYTES) throw new Error("navigation_head_recovery_preparation_oversized");
+    return preparation;
+  }
+
+  private async parseHeadWriteRecoveryPreparation(value: unknown, projectId: string): Promise<HeadWriteRecoveryPreparation | null> {
+    try {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const record = value as HeadWriteRecoveryPreparation;
+      const allowed = ["schema_version", "preparation_type", "project_id", "provider_id", "created_at_ms", "expires_at_ms",
+        "resource_id", "original_tickets", "source_state", "current_head", "pointer_bindings", "version_proofs",
+        "next_pointer_index", "preparation_digest"];
+      if (Object.keys(record).some(key => !allowed.includes(key)) || allowed.some(key => !Object.hasOwn(record, key))) return null;
+      if (new TextEncoder().encode(canonicalJson(record)).byteLength > MAX_HEAD_RECOVERY_PREPARATION_BYTES
+        || record.schema_version !== "1.0" || record.preparation_type !== "navigation-head-recovery-preparation"
+        || record.project_id !== projectId || record.provider_id !== DROPBOX_PROVIDER_ID
+        || !Number.isSafeInteger(record.created_at_ms) || !Number.isSafeInteger(record.expires_at_ms)
+        || record.expires_at_ms - record.created_at_ms !== HEAD_RECOVERY_PREPARATION_TTL_MS
+        || Date.now() < record.created_at_ms || Date.now() > record.expires_at_ms
+        || !record.source_state || typeof record.source_state.object_id !== "string" || !record.source_state.object_id
+        || typeof record.source_state.revision_token !== "string" || !record.source_state.revision_token
+        || !Array.isArray(record.pointer_bindings) || !Array.isArray(record.version_proofs)
+        || !Number.isSafeInteger(record.next_pointer_index) || record.next_pointer_index !== record.version_proofs.length
+        || record.next_pointer_index < 0 || record.next_pointer_index > record.pointer_bindings.length
+        || !/^[a-f0-9]{64}$/.test(record.preparation_digest)) return null;
+      const { preparation_digest: _digest, ...base } = record;
+      if (await sha256Text(canonicalJson(base)) !== record.preparation_digest) return null;
+      if (record.original_tickets.length < 1 || record.original_tickets.length > 3
+        || new Set(record.original_tickets.map(ticket => ticket.zone)).size !== record.original_tickets.length
+        || record.pointer_bindings.length < 1 || record.pointer_bindings.length > 4
+        || record.pointer_bindings.some(binding => !binding || !["reference_version_id", "working_version_id", "review_version_id", "published_version_id"].includes(binding.field)
+          || typeof binding.version_id !== "string" || !binding.version_id)
+        || record.version_proofs.some((proof, index) => !proof || proof.version_id !== record.pointer_bindings[index]?.version_id
+          || !pointerAcceptsStage(record.pointer_bindings[index].field, proof.stage))) return null;
+      const intent: HeadWriteRecoveryIntent = { schema_version: "1.0", intent_type: "navigation.head-write.reconcile",
+        project_id: record.project_id, resource_id: record.resource_id, original_tickets: record.original_tickets,
+        original_outcome: "unknown", current_head: record.current_head, version_proofs: record.version_proofs };
+      if (!this.validHeadRecoveryIntent(intent)) return null;
+      return record;
+    } catch { return null; }
+  }
+
   private validHeadRecoveryIntent(value: HeadWriteRecoveryIntent): boolean {
     return Boolean(value && value.schema_version === "1.0" && value.intent_type === "navigation.head-write.reconcile"
       && typeof value.project_id === "string" && /^head:DOC-[A-F0-9]{24}$/.test(value.resource_id)
@@ -590,6 +760,485 @@ export class DocumentLedgerRepository {
         && typeof proof.record_object_id === "string" && typeof proof.record_revision_token === "string"
         && Number.isSafeInteger(proof.record_size) && typeof proof.payload_object_id === "string"
         && typeof proof.payload_revision_token === "string" && Number.isSafeInteger(proof.payload_size)));
+  }
+
+  private async recoverBoundHeadWrite(projectId: string, sliceOrdinal: number, probeOnly: boolean,
+    options: HeadWriteRecoveryOptions): Promise<{ status: "none" | "recovered" | "unresolved"; remainingCandidates: boolean }> {
+    const bound = options.bound!;
+    const sources = new ZoneNavigationSources(this.runtime);
+    const pending = { status: "unresolved" as const, remainingCandidates: true };
+    const report = (stage: HeadWriteRecoveryDiagnostic["stage"], resourceId: string | null, code: HeadWriteRecoveryDiagnostic["code"] = "observing") =>
+      options.onDiagnostic?.({ stage, resource_id: resourceId, code });
+    let hash = options.pending_recovery_hash;
+    let intent: HeadWriteRecoveryIntent;
+    let newlyPrepared = false;
+    let intentPersisted = false;
+    let headMetadataVerifiedInThisInvocation = false;
+    if (hash === null) {
+      const snapshot = await sources.headWriteRecoveryCandidateSnapshot(projectId);
+      const candidates = snapshot?.candidates.filter(group => !options.excluded_resource_ids?.includes(group[0].resource_id)) ?? [];
+      bound.observeOtherCandidates?.(candidates.length > 1
+        || (Boolean(options.excluded_resource_ids?.length) && candidates.length > 0));
+      if (!candidates.length) return { status: "none", remainingCandidates: false };
+      if (probeOnly) return pending;
+      const rawPreparation = await options.readPreparation?.();
+      const saved = rawPreparation == null ? null : await this.parseHeadWriteRecoveryPreparation(rawPreparation, projectId);
+      if (rawPreparation != null && !saved) { await options.clearPreparation?.(); return pending; }
+      const tickets = saved ? candidates.find(group => canonicalJson([...group].sort((a, b) => a.zone.localeCompare(b.zone)))
+        === canonicalJson(saved.original_tickets)) : candidates[Math.max(0, sliceOrdinal) % candidates.length];
+      if (!tickets || !snapshot) { await options.clearPreparation?.(); return pending; }
+      report("proof_recheck", tickets[0].resource_id);
+      const exactTickets = candidates[Math.max(0, sliceOrdinal) % candidates.length];
+      if (!saved || exactTickets[0].resource_id !== saved.resource_id) {
+        // Preserve the existing exact-write completion: it verifies the
+        // original hash and strict live pointers and never creates a new
+        // disposition for an unknown business outcome.
+        const identity = await this.readCurrentHeadIdentity(projectId, exactTickets[0].resource_id);
+        if (identity?.current_head.content_sha256 === exactTickets[0].write_hash) {
+          const recovered = await this.completeUnownedHeadWriteTickets(exactTickets);
+          return { status: recovered ? "recovered" : "unresolved", remainingCandidates: candidates.length > 1 };
+        }
+      }
+      let preparation = saved;
+      if (!saved || saved.next_pointer_index !== saved.pointer_bindings.length) {
+        const observed = await this.readCurrentHeadRecoveryProof(projectId, tickets[0].resource_id, undefined, saved ?? undefined, true);
+        if (!observed) { await options.clearPreparation?.(); return pending; }
+        const createdAt = saved?.created_at_ms ?? Date.now();
+        preparation = await this.makeHeadWriteRecoveryPreparation({ schema_version: "1.0", preparation_type: "navigation-head-recovery-preparation",
+          project_id: projectId, provider_id: "dropbox", created_at_ms: createdAt, expires_at_ms: createdAt + 300_000,
+          resource_id: tickets[0].resource_id, original_tickets: [...tickets].sort((a, b) => a.zone.localeCompare(b.zone)),
+          source_state: snapshot.source_state, ...observed });
+        await options.writePreparation?.(preparation);
+        newlyPrepared = true;
+        if (preparation.next_pointer_index !== preparation.pointer_bindings.length) return pending;
+      }
+      if (!preparation || !await this.matchesHeadRecoveryMetadata(projectId, preparation.resource_id, preparation)) return pending;
+      headMetadataVerifiedInThisInvocation = true;
+      intent = { schema_version: "1.0", intent_type: "navigation.head-write.reconcile", project_id: projectId,
+        resource_id: preparation.resource_id, original_tickets: preparation.original_tickets, original_outcome: "unknown",
+        current_head: preparation.current_head, version_proofs: preparation.version_proofs };
+      hash = await executionHash(intent);
+    } else {
+      if (probeOnly) return pending;
+      if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error("navigation_head_recovery_pointer_invalid");
+      const raw = await this.runtime.objects.readText(this.headWriteRecoveryIntentPath(projectId, hash));
+      const checkpoint = await bound.readCheckpoint(hash) as HeadRecoveryCheckpoint | undefined;
+      if (raw === null) {
+        if (!checkpoint?.intent || checkpoint.intent_hash !== hash || await executionHash(checkpoint.intent) !== hash) {
+          // Eviction before intention creation is recovered by canonical-parent
+          // discovery plus reacquisition, never by a fresh admission identifier.
+          return this.discoverBoundRecoveryBeforeIntent(projectId, hash, options);
+        }
+        intent = checkpoint.intent;
+      } else {
+        intent = JSON.parse(raw);
+        if (canonicalJson(intent) !== raw) throw new Error("navigation_head_recovery_intent_invalid");
+        intentPersisted = true;
+      }
+    }
+    if (!this.validHeadRecoveryIntent(intent) || intent.project_id !== projectId || await executionHash(intent) !== hash) {
+      throw new Error("navigation_head_recovery_intent_invalid");
+    }
+    report("journal_read", intent.resource_id);
+    const rawCheckpoint = await bound.readCheckpoint(hash) as HeadRecoveryCheckpoint | undefined;
+    let checkpoint: HeadRecoveryCheckpoint = rawCheckpoint?.intent_hash === hash && await executionHash(rawCheckpoint.intent) === hash
+      ? rawCheckpoint : { intent_hash: hash, parent_request_id: null, child_created: false, intent,
+        discovery: { cursor: null, pending_roots: [], complete: false }, dirty: intent.original_tickets.map(() => null),
+        cleared: 0, completion: intent.original_tickets.map(() => null) };
+    if (checkpoint.dirty.length !== intent.original_tickets.length || checkpoint.completion.length !== intent.original_tickets.length
+      || !Number.isSafeInteger(checkpoint.cleared) || checkpoint.cleared < 0 || checkpoint.cleared > intent.original_tickets.length
+      || new TextEncoder().encode(canonicalJson(checkpoint)).byteLength > 64 * 1024) throw new Error("navigation_head_recovery_checkpoint_invalid");
+    const save = async () => { await bound.writeCheckpoint(hash!, checkpoint); };
+    const child = new ExecutionJournal(this.runtime, projectId, "navigation-head-recovery", `DOCREQ-NAV-HEAD-RECOVERY-${hash.toUpperCase()}`);
+    let childLoaded: LoadedExecution | null = null;
+    let discoveredParentRecord: Awaited<ReturnType<ExecutionJournal["readAdmission"]>> = null;
+    if (!checkpoint.parent_request_id && intentPersisted) {
+      childLoaded = await child.load();
+      const ref = childLoaded?.admission.diagnosed_drift_refs?.length === 1 ? childLoaded.admission.diagnosed_drift_refs[0] : null;
+      if (!ref || !ref.startsWith(`${machineConvergenceRoot(projectId)}/executions/`) || !ref.endsWith("/admission.json")) {
+        throw new Error("navigation_head_recovery_legacy_child_unbound");
+      }
+      const rawParent = await this.runtime.objects.readText(ref);
+      if (!rawParent) throw new Error("navigation_head_recovery_parent_admission_missing");
+      const parentRecord = JSON.parse(rawParent);
+      if (parentRecord.schema_version !== "1.0" || parentRecord.effect_plan_hash !== await executionHash(parentRecord.plan)) {
+        throw new Error("execution_admission_invalid");
+      }
+      const identity = parentRecord.admission?.request_id;
+      if (typeof identity !== "string") throw new Error("navigation_head_recovery_parent_binding_invalid");
+      const parent = new ExecutionJournal(this.runtime, projectId, "navigation-head-recovery-parent", identity);
+      const binding = await parent.validateHeadRecoveryParentAdmission(parentRecord.admission, parentRecord.plan);
+      if (binding.intent_hash !== hash || `${await parent.root()}/admission.json` !== ref) throw new Error("navigation_head_recovery_parent_binding_invalid");
+      checkpoint.parent_request_id = identity;
+      checkpoint.child_created = true;
+      discoveredParentRecord = parentRecord;
+      await save();
+    }
+    if (!checkpoint.parent_request_id) {
+      // Check canonical identity on cold discovery, before creating any parent.
+      // Discovery may perform provider reads. Reuse the exact fresh proof only
+      // when discovery is already complete and therefore performs no I/O.
+      if (!checkpoint.discovery.complete) headMetadataVerifiedInThisInvocation = false;
+      await this.discoverBoundRecoveryParent(projectId, hash, checkpoint);
+      await save();
+      if (newlyPrepared || !checkpoint.discovery.complete && !checkpoint.parent_request_id) return pending;
+      if (!checkpoint.parent_request_id) {
+        if (!headMetadataVerifiedInThisInvocation
+          && !await this.matchesHeadRecoveryMetadata(projectId, intent.resource_id, intent)) return pending;
+        const source = await this.runtime.objects.getMetadata(`${machineDocumentRoot(projectId)}/navigation-sources/state.json`);
+        if (!source?.objectId || !source.revisionToken || !source.integrityHash) throw new Error("navigation_head_recovery_source_unavailable");
+        report("admission", intent.resource_id);
+        const parent = await bound.authorizeParent(intent, source);
+        checkpoint.parent_request_id = parent.request_id;
+        await save();
+        await options.rememberRecovery(hash, intent.resource_id);
+        return pending;
+      }
+    }
+    const parent = new ExecutionJournal(this.runtime, projectId, "navigation-head-recovery-parent", checkpoint.parent_request_id);
+    if (checkpoint.child_created && !childLoaded) childLoaded = await child.load();
+    // Canonical child progress, not an evictable locator, identifies the
+    // read-only tail. Original parent admission is still read and validated.
+    const canonicalTerminalPhase = childLoaded?.progress.status === "finalizing"
+      || childLoaded?.progress.status === "finalized" && childLoaded.progress.terminal;
+    const terminalOnly = checkpoint.cleared === intent.original_tickets.length || canonicalTerminalPhase;
+    const parentLoaded = terminalOnly ? null : await parent.load();
+    const parentRecord = terminalOnly ? discoveredParentRecord ?? await parent.readAdmission() : null;
+    if (!terminalOnly && !parentLoaded) {
+      const record = await parent.readAdmission();
+      if (!record) throw new Error("navigation_head_recovery_parent_progress_missing");
+      const originalBinding = await parent.readHeadRecoveryParentBinding();
+      await parent.commit(record.admission, record.plan, originalBinding);
+      return pending;
+    }
+    if (terminalOnly ? !parentRecord || parentRecord.plan !== null : !parentLoaded || parentLoaded.plan !== null) throw new Error("navigation_head_recovery_parent_progress_missing");
+    const binding = parentLoaded ? await parent.readHeadRecoveryParentBinding(parentLoaded)
+      : await parent.validateHeadRecoveryParentAdmission(parentRecord!.admission, parentRecord!.plan);
+    if (binding.intent_hash !== hash) throw new Error("navigation_head_recovery_parent_binding_invalid");
+    const parentRef = `${await parent.root()}/admission.json`;
+    if (!checkpoint.child_created) {
+      const existing = await child.readAdmission();
+      if (!existing) {
+        if (!await this.matchesHeadRecoveryMetadata(projectId, intent.resource_id, intent)) return pending;
+        report("admission", intent.resource_id);
+        await options.authorize(intent, parentRef);
+        checkpoint.child_created = true;
+        await save();
+        return pending;
+      }
+      if (existing.admission.diagnosed_drift_refs?.length !== 1 || existing.admission.diagnosed_drift_refs[0] !== parentRef) {
+        throw new Error("navigation_head_recovery_legacy_child_unbound");
+      }
+      checkpoint.child_created = true;
+      await save();
+      return pending; // cold discovery is read-only, not an extra authority
+    }
+    childLoaded ??= await child.load();
+    const childRecord = childLoaded ? { admission: childLoaded.admission, plan: childLoaded.plan } : await child.readAdmission();
+    const intendedResources = intent.original_tickets.map(ticket => ({ resource_id: intent.resource_id,
+      resource_type: "document", zone: ticket.zone, version: intent.current_head.content_sha256 }));
+    if (!childRecord || childRecord.plan !== null || childRecord.admission.request_hash !== hash
+      || childRecord.admission.operation !== "project.materialize"
+      || canonicalJson(childRecord.admission.actor) !== canonicalJson(binding.actor)
+      || canonicalJson(childRecord.admission.resources) !== canonicalJson(intendedResources)
+      || childRecord.admission.diagnosed_drift_refs?.length !== 1 || childRecord.admission.diagnosed_drift_refs[0] !== parentRef) {
+      throw new Error("navigation_head_recovery_parent_claim_invalid");
+    }
+    if (!childLoaded) {
+      // Recover only a torn initial write under the SAME admission. The
+      // journal independently proves fresh absence of history and intention;
+      // after a claim or any durable step this remains fail-closed.
+      await bound.assertCompatible(parentLoaded?.admission ?? parentRecord!.admission, childRecord.admission);
+      await child.commit(childRecord.admission, childRecord.plan);
+      return pending;
+    }
+    if (canonicalTerminalPhase) {
+      const claims = childLoaded.progress.completed_steps.filter(step => step.step_id === "head-recovery-parent");
+      if (claims.length !== 1 || canonicalJson(claims[0]) !== canonicalJson({ step_id: "head-recovery-parent",
+        evidence_refs: [parentRef], observation_hash: await executionHash(binding) })) {
+        throw new Error("navigation_head_recovery_parent_claim_invalid");
+      }
+      checkpoint.finalization_started = true;
+      await save();
+    }
+    const owned = intent.original_tickets.map(ticket => ({ ...ticket, write_hash: intent.current_head.content_sha256, owner_hash: hash! }));
+    const root = this.headWriteRecoveryIntentPath(projectId, hash).replace(/\/intent\.json$/, "");
+    const completion = { schema_version: "1.0", project_id: projectId, intent_hash: hash, recovered_tickets: owned,
+      current_head: intent.current_head, version_proofs: intent.version_proofs };
+    const currentHead = () => this.matchesHeadRecoveryMetadata(projectId, intent.resource_id, intent);
+    const observeCandidates = (groups: ZoneNavigationHeadWriteTicket[][]) => bound.observeOtherCandidates?.(
+      groups.some(group => group[0].resource_id !== intent.resource_id));
+    const sourceProof = { verifyCurrent: currentHead, beforeClear: async () => {
+      if (checkpoint.completion_witness_created) {
+        if (await this.runtime.objects.readText(`${root}/completion.json`) !== canonicalJson(completion)) throw new Error("navigation_head_recovery_completion_missing");
+      } else {
+        await this.createExactImmutable(`${root}/completion.json`, completion);
+        checkpoint.completion_witness_created = true;
+        await save();
+      }
+    }, hasCompletionWitness: async () => await this.runtime.objects.readText(`${root}/completion.json`) === canonicalJson(completion), observeCandidates };
+    if (childLoaded.progress.status === "admitted" && !terminalOnly) {
+      if (!parentLoaded) throw new Error("navigation_head_recovery_parent_progress_missing");
+      await bound.assertCompatible(parentLoaded.admission, childLoaded.admission);
+      const hasClaim = childLoaded.progress.completed_steps.some(step => step.step_id === "head-recovery-parent");
+      childLoaded = await child.claimHeadRecoveryParent(parent, binding, { parent: parentLoaded, child: childLoaded });
+      if (!hasClaim) {
+        if (intent.version_proofs.length > 1) return pending;
+        await this.createExactImmutable(`${root}/intent.json`, intent);
+        report("fence_transfer", intent.resource_id);
+        await sources.transferHeadWriteRecoveryTickets(intent.original_tickets, intent.current_head.content_sha256, hash,
+          undefined, currentHead, true, observeCandidates);
+        await save();
+        return pending;
+      }
+      if (!intentPersisted) {
+        await this.createExactImmutable(`${root}/intent.json`, intent);
+        await sources.transferHeadWriteRecoveryTickets(intent.original_tickets, intent.current_head.content_sha256, hash, undefined, currentHead, true, observeCandidates);
+        return pending;
+      }
+      const dirtyIndex = owned.findIndex(ticket => !childLoaded!.progress.completed_steps.some(step => step.step_id === `dirty:${ticket.zone}`));
+      if (dirtyIndex >= 0) {
+        report("fence_complete", intent.resource_id);
+        const previous = checkpoint.dirty[dirtyIndex];
+        const hint = await sources.completeOwnedHeadWriteRecovery(owned, hash, intent.current_head.content_sha256, undefined, sourceProof,
+          { kind: "dirty", index: dirtyIndex, hint: previous });
+        if (!hint) throw new Error("navigation_head_recovery_dirty_observation_missing");
+        checkpoint.dirty[dirtyIndex] = hint;
+        if (hint.phase === "ready" && intent.version_proofs.length > 1
+          && previous?.dirty.metadata.revisionToken !== hint.dirty.metadata.revisionToken) {
+          // Do not couple a physical write/read with history+progress CAS.
+          // The next invocation freshly validates this exact written identity
+          // through the normal source/head/compatibility checks before saving.
+          await save();
+          return pending;
+        }
+        if (hint.phase === "ready") {
+          // The simple absent-marker path has spare budget for its manifest
+          // acquisition. The maximum/coalesced path already acquired it.
+          const observation = hint.manifest ? { provider_id: hint.provider_id, acquired_at_ms: hint.acquired_at_ms,
+            ticket: hint.ticket, dirty: hint.dirty, manifest: hint.manifest } : null;
+          checkpoint.completion[dirtyIndex] = observation;
+          childLoaded.progress.completed_steps.push({ step_id: `dirty:${owned[dirtyIndex].zone}`, evidence_refs: [hint.dirty.path],
+            observation_hash: await executionHash({ dirty: hint.dirty.raw, manifest: hint.manifest?.raw ?? null }) });
+          childLoaded.progress.sequence++;
+          await child.save(childLoaded.progress, childLoaded.token);
+        }
+        await save();
+        return pending;
+      }
+      if (checkpoint.cleared < owned.length) {
+        report("fence_complete", intent.resource_id);
+        const index = checkpoint.cleared;
+        const hint = await sources.completeOwnedHeadWriteRecovery(owned, hash, intent.current_head.content_sha256, undefined, sourceProof,
+          { kind: "clear", index, hint: checkpoint.dirty[index] });
+        if (!hint) throw new Error("navigation_head_recovery_dirty_observation_missing");
+        // A cold observation yields first; only a previously ready exact
+        // checkpoint may attempt the guarded clear in this invocation.
+        if (hint.clear_verified) checkpoint.cleared++;
+        checkpoint.dirty[index] = hint;
+        await save();
+        return pending;
+      }
+    }
+    report("finalization", intent.resource_id);
+    return this.advanceBoundRecoveryFinalization(parent, parentLoaded, child, childLoaded, intent, hash, owned, checkpoint, options, save);
+  }
+
+  private async matchesHeadRecoveryMetadata(projectId: string, resourceId: string,
+    proof: Pick<HeadWriteRecoveryIntent, "current_head" | "version_proofs">): Promise<boolean> {
+    const metadata = await this.runtime.objects.getMetadata(proof.current_head.path);
+    return metadata?.path === proof.current_head.path && metadata.objectId === proof.current_head.object_id
+      && metadata.revisionToken === proof.current_head.revision_token && metadata.size === proof.current_head.size
+      && await this.verifyHeadRecoveryVersionMetadata(projectId, resourceId, proof.version_proofs);
+  }
+
+  private async discoverBoundRecoveryParent(projectId: string, hash: string, checkpoint: HeadRecoveryCheckpoint): Promise<void> {
+    if (checkpoint.discovery.complete) return;
+    if (!this.runtime.pagedListing) throw new Error("navigation_paged_listing_unavailable");
+    const root = `${machineConvergenceRoot(projectId)}/executions`;
+    if (!checkpoint.discovery.pending_roots.length) {
+      const page = await this.runtime.pagedListing.listPage({ path: root, cursor: checkpoint.discovery.cursor, limit: 1 });
+      checkpoint.discovery.cursor = page.cursor;
+      checkpoint.discovery.pending_roots = page.entries.filter(entry => entry.kind === "folder")
+        .map(entry => `${root}/${entry.name}`).filter(path => /^\/[\s\S]*\/executions\/[a-f0-9]{64}$/.test(path));
+      if (!checkpoint.discovery.pending_roots.length && page.cursor === null) checkpoint.discovery.complete = true;
+    }
+    const candidate = checkpoint.discovery.pending_roots.shift();
+    if (candidate) {
+      const raw = await this.runtime.objects.readText(`${candidate}/admission.json`);
+      if (raw !== null) {
+        const record = JSON.parse(raw);
+        if (record.admission?.project_id === projectId && record.admission.kind === "navigation-head-recovery-parent"
+          && typeof record.admission.request_id === "string" && record.admission.request_id.includes(`-${hash.toUpperCase()}-`)) {
+          const journal = new ExecutionJournal(this.runtime, projectId, "navigation-head-recovery-parent", record.admission.request_id);
+          if (`${await journal.root()}/admission.json` !== `${candidate}/admission.json`) throw new Error("navigation_head_recovery_parent_binding_invalid");
+          const binding = await journal.readHeadRecoveryParentBinding();
+          if (binding.intent_hash !== hash) throw new Error("navigation_head_recovery_parent_binding_invalid");
+          checkpoint.parent_request_id = record.admission.request_id;
+        }
+      }
+      if (!checkpoint.discovery.pending_roots.length && checkpoint.discovery.cursor === null) checkpoint.discovery.complete = true;
+    }
+  }
+
+  private async discoverBoundRecoveryBeforeIntent(projectId: string, hash: string, options: HeadWriteRecoveryOptions): Promise<{
+    status: "unresolved"; remainingCandidates: boolean;
+  }> {
+    // Reacquire immutable I from unchanged physical data. A new H is never
+    // admitted merely because the local pre-intent checkpoint was evicted.
+    const snapshot = await new ZoneNavigationSources(this.runtime).headWriteRecoveryCandidateSnapshot(projectId);
+    const cachedRaw = await options.readPreparation?.();
+    const cached = cachedRaw == null ? null : await this.parseHeadWriteRecoveryPreparation(cachedRaw, projectId);
+    const selected = cached ? snapshot?.candidates.find(group => group[0].resource_id === cached.resource_id) : snapshot?.candidates[0];
+    if (!snapshot || !selected) throw new Error("navigation_head_recovery_reacquisition_unavailable");
+    const proof = await this.readCurrentHeadRecoveryProof(projectId, selected[0].resource_id, undefined, cached ?? undefined, true);
+    if (!proof) throw new Error("navigation_head_recovery_reacquisition_unavailable");
+    const createdAt = cached?.created_at_ms ?? Date.now();
+    const preparation = await this.makeHeadWriteRecoveryPreparation({ schema_version: "1.0", preparation_type: "navigation-head-recovery-preparation",
+      project_id: projectId, provider_id: "dropbox", created_at_ms: createdAt, expires_at_ms: createdAt + 300_000,
+      resource_id: selected[0].resource_id, original_tickets: [...selected].sort((a, b) => a.zone.localeCompare(b.zone)),
+      source_state: snapshot.source_state, ...proof });
+    await options.writePreparation?.(preparation);
+    if (proof.next_pointer_index === proof.pointer_bindings.length) {
+      const intent: HeadWriteRecoveryIntent = { schema_version: "1.0", intent_type: "navigation.head-write.reconcile", project_id: projectId,
+        resource_id: preparation.resource_id, original_tickets: preparation.original_tickets, original_outcome: "unknown",
+        current_head: proof.current_head, version_proofs: proof.version_proofs };
+      if (await executionHash(intent) !== hash) throw new Error("navigation_head_recovery_reacquisition_conflict");
+      await options.bound!.writeCheckpoint(hash, { intent_hash: hash, parent_request_id: null, child_created: false, intent,
+        discovery: { cursor: null, pending_roots: [], complete: false }, dirty: intent.original_tickets.map(() => null),
+        cleared: 0, completion: intent.original_tickets.map(() => null) });
+    }
+    return { status: "unresolved", remainingCandidates: true };
+  }
+
+  private async advanceBoundRecoveryFinalization(parent: ExecutionJournal, parentLoaded: LoadedExecution | null,
+    child: ExecutionJournal, childLoaded: LoadedExecution, intent: HeadWriteRecoveryIntent, hash: string,
+    tickets: readonly ZoneNavigationHeadWriteTicket[], checkpoint: HeadRecoveryCheckpoint, options: HeadWriteRecoveryOptions,
+    save: () => Promise<void>): Promise<{ status: "recovered" | "unresolved"; remainingCandidates: boolean }> {
+    const pending = { status: "unresolved" as const, remainingCandidates: true };
+    const root = this.headWriteRecoveryIntentPath(intent.project_id, hash).replace(/\/intent\.json$/, "");
+    const completion = { schema_version: "1.0", project_id: intent.project_id, intent_hash: hash,
+      recovered_tickets: tickets, current_head: intent.current_head, version_proofs: intent.version_proofs };
+    const receiptPath = `${root}/receipt.json`;
+    const receipt = { schema_version: "1.0", project_id: intent.project_id,
+      request_id: child.requestId, request_hash: hash, intent_hash: hash, status: "committed", original_outcome: "unknown",
+      disposition: "current_head_revalidated", resource_id: intent.resource_id, completion_ref: `${root}/completion.json`,
+      original_tickets: intent.original_tickets, current_head: intent.current_head, version_proofs: intent.version_proofs, recovered_tickets: tickets };
+    const certificate = { schema_version: "1.0", project_id: intent.project_id,
+      request_id: child.requestId, kind: child.kind, request_hash: hash, admission_ref: `${await child.root()}/admission.json`,
+      receipt_ref: receiptPath, receipt_sha256: await executionHash(receipt), intent_ref: `${root}/intent.json`, intent_sha256: hash,
+      completion_ref: `${root}/completion.json`, source_generations: [...new Set(tickets.map(ticket => ticket.generation))].sort((a, b) => a - b),
+      current_head: intent.current_head, original_tickets: intent.original_tickets, recovered_tickets: tickets,
+      postconditions: ["exact_current_head_revalidated", "source_dirty_generation_durable", "recovery_fence_absent"] };
+    const certificatePath = `${root}/certificate-${await executionHash(certificate)}.json`;
+    const claim = childLoaded.progress.completed_steps.filter(step => step.step_id === "head-recovery-parent");
+    if (claim.length !== 1 || canonicalJson(claim[0].evidence_refs) !== canonicalJson([`${await parent.root()}/admission.json`])) {
+      throw new Error("navigation_head_recovery_parent_claim_invalid");
+    }
+    if (childLoaded.progress.status === "finalized" && childLoaded.progress.terminal) {
+      if (childLoaded.progress.finalization_ref !== certificatePath || childLoaded.progress.receipt_ref !== receiptPath
+        || await this.runtime.objects.readText(certificatePath) !== canonicalJson(certificate)
+        || await this.runtime.objects.readText(receiptPath) !== canonicalJson(receipt)) throw new Error("navigation_head_recovery_finalization_invalid");
+      const head = await this.runtime.objects.getMetadata(intent.current_head.path);
+      if (head?.objectId !== intent.current_head.object_id || head.revisionToken !== intent.current_head.revision_token
+        || head.size !== intent.current_head.size) throw new Error("navigation_source_head_superseded");
+      const saved = parentLoaded ?? await parent.load();
+      if (!saved) throw new Error("navigation_head_recovery_parent_progress_missing");
+      const parentReceiptPath = `${await parent.root()}/receipt.json`;
+      const parentReceipt = { schema_version: "1.0", project_id: intent.project_id, kind: parent.kind, request_id: parent.requestId,
+        request_hash: saved.admission.request_hash, status: "committed", disposition: "bound_head_recovery_completed",
+        original_operation: saved.admission.operation, child_receipt_ref: receiptPath, child_finalization_ref: certificatePath, intent_hash: hash };
+      const parentCertificate = { ...parentReceipt, admission_ref: `${await parent.root()}/admission.json`, receipt_ref: parentReceiptPath,
+        receipt_sha256: await executionHash(parentReceipt), child_admission_ref: `${await child.root()}/admission.json`,
+        postconditions: ["bound_child_finalized", "original_generic_admission_preserved"] };
+      const parentCertificatePath = `${await parent.root()}/finalizations/${await executionHash(parentCertificate)}.json`;
+      if (saved.progress.status === "finalized" && saved.progress.terminal) {
+        if (saved.progress.finalization_ref !== parentCertificatePath || saved.progress.receipt_ref !== parentReceiptPath
+          || await this.runtime.objects.readText(parentCertificatePath) !== canonicalJson(parentCertificate)
+          || await this.runtime.objects.readText(parentReceiptPath) !== canonicalJson(parentReceipt)) throw new Error("navigation_head_recovery_parent_finalization_invalid");
+      } else {
+        if (!["admitted", "finalizing"].includes(saved.progress.status) || saved.progress.terminal) throw new Error("navigation_head_recovery_parent_progress_terminal");
+        await this.createExactImmutable(parentReceiptPath, parentReceipt);
+        if (saved.progress.status !== "finalizing") {
+          saved.progress.status = "finalizing";
+          saved.progress.receipt_ref = parentReceiptPath;
+          saved.progress.code = "MATERIALIZATION_PENDING";
+          saved.progress.sequence++;
+          saved.token = await parent.save(saved.progress, saved.token);
+        } else if (saved.progress.receipt_ref !== parentReceiptPath) throw new Error("navigation_head_recovery_parent_finalization_invalid");
+        await this.createExactImmutable(parentCertificatePath, parentCertificate);
+        saved.progress.status = "finalized";
+        saved.progress.terminal = true;
+        saved.progress.code = null;
+        saved.progress.finalization_ref = parentCertificatePath;
+        saved.progress.next_attempt_at = null;
+        saved.progress.lease = null;
+        saved.progress.sequence++;
+        await parent.save(saved.progress, saved.token);
+      }
+      // These are two real terminal reads, never locator/certificate-as-status.
+      // childLoaded is this invocation's canonical load above; parent is read
+      // again after its final CAS before the scheduler may release its locator.
+      const terminal = await parent.status();
+      if (terminal?.status !== "finalized" || !terminal.terminal || terminal.finalization_ref !== parentCertificatePath
+        || terminal.receipt_ref !== parentReceiptPath) throw new Error("navigation_head_recovery_parent_finalization_unverified");
+      await options.clearPreparation?.();
+      return { status: "recovered", remainingCandidates: false };
+    }
+    if (!["admitted", "finalizing"].includes(childLoaded.progress.status) || childLoaded.progress.terminal) throw new Error("navigation_head_recovery_progress_terminal");
+    const sources = new ZoneNavigationSources(this.runtime);
+    const missing = checkpoint.completion.findIndex(value => value === null || Date.now() < value.acquired_at_ms
+      || Date.now() - value.acquired_at_ms >= 300_000);
+    if (missing >= 0) {
+      for (let index = missing; index < tickets.length; index++) {
+        const observation = checkpoint.completion[index];
+        if (observation && Date.now() >= observation.acquired_at_ms && Date.now() - observation.acquired_at_ms < 300_000) continue;
+        checkpoint.completion[index] = await sources.observeHeadRecoveryCompletion(tickets[index]);
+        await save(); // bounded <=3 data observations; no admission/status proof
+      }
+      // The simple group has enough measured headroom for this cold read and
+      // its tail. Larger groups yield after their bounded read-only acquisition.
+      if (tickets.length > 1 || intent.version_proofs.length > 1) return pending;
+    }
+    const physical = await sources.verifyHeadRecoveryCleared(tickets, checkpoint.completion as HeadRecoveryCompletionObservation[]);
+    if (!physical) {
+      checkpoint.completion = tickets.map(() => null);
+      await save();
+      return pending;
+    }
+    if (!await this.matchesHeadRecoveryMetadata(intent.project_id, intent.resource_id, intent)
+      || await this.runtime.objects.readText(`${root}/completion.json`) !== canonicalJson(completion)) throw new Error("navigation_head_recovery_completion_missing");
+    if (childLoaded.progress.status === "admitted") {
+      await this.createExactImmutable(receiptPath, receipt);
+      childLoaded.progress.status = "finalizing";
+      childLoaded.progress.receipt_ref = receiptPath;
+      childLoaded.progress.code = "MATERIALIZATION_PENDING";
+      childLoaded.progress.sequence++;
+      await child.save(childLoaded.progress, childLoaded.token);
+      checkpoint.finalization_started = true;
+      await save();
+      return pending;
+    }
+    if (childLoaded.progress.receipt_ref !== receiptPath || await this.runtime.objects.readText(receiptPath) !== canonicalJson(receipt)) {
+      throw new Error("navigation_head_recovery_receipt_invalid");
+    }
+    if (!checkpoint.child_certificate_ref) {
+      await this.createExactImmutable(certificatePath, certificate);
+      checkpoint.child_certificate_ref = certificatePath;
+      await save();
+      return pending;
+    }
+    if (checkpoint.child_certificate_ref !== certificatePath
+      || await this.runtime.objects.readText(certificatePath) !== canonicalJson(certificate)) throw new Error("navigation_head_recovery_finalization_invalid");
+    childLoaded.progress.status = "finalized";
+    childLoaded.progress.terminal = true;
+    childLoaded.progress.code = null;
+    childLoaded.progress.finalization_ref = certificatePath;
+    childLoaded.progress.next_attempt_at = null;
+    childLoaded.progress.lease = null;
+    childLoaded.progress.sequence++;
+    await child.save(childLoaded.progress, childLoaded.token);
+    return pending; // parent tail needs its own fresh child terminal read
   }
 
   private async finalizeHeadWriteRecovery(journal: ExecutionJournal, intent: HeadWriteRecoveryIntent, hash: string,
@@ -656,7 +1305,9 @@ export class DocumentLedgerRepository {
   }
 
   private async readCurrentHeadRecoveryProof(projectId: string, resourceId: string,
-    report?: (stage: HeadWriteRecoveryDiagnostic["stage"]) => void): Promise<Pick<HeadWriteRecoveryIntent, "current_head" | "version_proofs"> | null> {
+    report?: (stage: HeadWriteRecoveryDiagnostic["stage"]) => void,
+    saved?: Pick<HeadWriteRecoveryPreparation, "current_head" | "pointer_bindings" | "version_proofs">,
+    acquireNextPointer = true): Promise<Pick<HeadWriteRecoveryPreparation, "current_head" | "pointer_bindings" | "version_proofs" | "next_pointer_index"> | null> {
     const documentId = resourceId.startsWith("head:") ? resourceId.slice("head:".length) : "";
     if (!/^DOC-[A-F0-9]{24}$/.test(documentId) || !this.runtime.objects.readBytes) return null;
     const path = machineDocumentHeadPath(projectId, documentId);
@@ -672,11 +1323,27 @@ export class DocumentLedgerRepository {
     const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     const parsed = readManagedDocumentHead(JSON.parse(raw)).head;
     if (parsed.project_id !== projectId || parsed.document_id !== documentId || parsed.reconciliation_status !== "clean") return null;
-    const versionProofs: HeadWriteRecoveryIntent["version_proofs"] = [];
-    const pointerFields: Array<keyof ManagedDocumentHead> = ["reference_version_id", "working_version_id", "review_version_id", "published_version_id"];
+    const pointerFields: HeadWriteRecoveryPreparation["pointer_bindings"][number]["field"][] = [
+      "reference_version_id", "working_version_id", "review_version_id", "published_version_id"];
+    const pointerBindings: HeadWriteRecoveryPreparation["pointer_bindings"] = [];
     for (const field of pointerFields) {
       const versionId = parsed[field];
-      if (typeof versionId !== "string") continue;
+      if (versionId === undefined) continue;
+      if (typeof versionId !== "string" || !versionId) return null;
+      pointerBindings.push({ field, version_id: versionId });
+    }
+    if (!pointerBindings.length || pointerBindings.length > 4) return null;
+    const versionProofs = [...(saved?.version_proofs ?? [])];
+    if (saved && (canonicalJson(saved.current_head) !== canonicalJson({ path, object_id: before.objectId,
+      revision_token: before.revisionToken, content_sha256: await sha256Bytes(bytes), size: bytes.byteLength })
+      || canonicalJson(saved.pointer_bindings) !== canonicalJson(pointerBindings)
+      || versionProofs.length > pointerBindings.length
+      || versionProofs.some((proof, index) => proof.version_id !== pointerBindings[index].version_id
+        || !pointerAcceptsStage(pointerBindings[index].field, proof.stage)))) return null;
+    if (versionProofs.length && !(await this.verifyHeadRecoveryVersionMetadata(projectId, resourceId, versionProofs))) return null;
+    const nextPointerIndex = versionProofs.length;
+    if (acquireNextPointer && nextPointerIndex < pointerBindings.length) {
+      const { field, version_id: versionId } = pointerBindings[nextPointerIndex];
       const versionPath = machineDocumentVersionPath(projectId, documentId, versionId);
       report?.("version_metadata");
       const versionMetadataBefore = await this.runtime.objects.getMetadata(versionPath);
@@ -721,9 +1388,10 @@ export class DocumentLedgerRepository {
         payload_size: payloadBefore.size, ...(payloadIntegrityHash ? { payload_integrity_hash: payloadIntegrityHash } : {}),
         ...(version.content_sha256 ? { content_sha256: version.content_sha256 } : {}) });
     }
-    if (versionProofs.length === 0) return null;
-    return { current_head: { path, object_id: before.objectId, revision_token: before.revisionToken,
-      content_sha256: await sha256Bytes(bytes), size: bytes.byteLength }, version_proofs: versionProofs };
+    const currentHead = { path, object_id: before.objectId, revision_token: before.revisionToken,
+      content_sha256: await sha256Bytes(bytes), size: bytes.byteLength };
+    return { current_head: currentHead, pointer_bindings: pointerBindings, version_proofs: versionProofs,
+      next_pointer_index: versionProofs.length };
   }
 
   private async readCurrentHeadIdentity(projectId: string, resourceId: string,

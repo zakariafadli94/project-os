@@ -7,6 +7,24 @@ import { z } from "zod";
 import { approvalRecordSchema } from "../domain/approval";
 import { assertEffectBindings, parseExecutionPlan } from "./effects";
 import { navigationCatalogRebuildCertificateSchema, navigationCatalogRebuildProgressSchema, zoneNavigationHeadSchema, zoneNavigationReceiptSchema } from "../domain/zone-navigation";
+import { normalizeSystemAdmission } from "../admission/operation-context";
+
+/** Server-derived binding for the one pre-effects torn-parent exception.
+ * This is not a policy permit and must never be decoded from a client request. */
+export interface HeadRecoveryParentBinding {
+  discriminator: string;
+  provider_id: string;
+  project_id: string;
+  actor: { actor_id: string; authority: string };
+  operation: string;
+  project_revision: number;
+  intent_hash: string;
+  source_state: { path: string; object_id: string; revision_token: string; integrity_hash_algorithm: string; integrity_hash: string };
+}
+
+export async function headRecoveryParentRequestId(binding: HeadRecoveryParentBinding): Promise<string> {
+  return `DOCREQ-NAV-HEAD-PARENT-${binding.operation === "project.repair" ? "REPAIR" : "MATERIALIZE"}-${binding.project_revision}-${binding.intent_hash.toUpperCase()}-${(await executionHash(binding)).toUpperCase()}`;
+}
 
 const nonempty = z.string().min(1);
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -28,8 +46,15 @@ const progressSchema = z.strictObject({
 });
 export const executionHash = (value: unknown): Promise<string> => sha256Text(canonicalJson(value));
 export const requiredRulePostchecks = (admission: ExecutionAdmission): string[] => admission.deferred_rules.map((rule) => `rule:${canonicalJson(rule)}`);
+export interface LoadedExecution {
+  progress: ExecutionProgress;
+  token: string;
+  admission: ExecutionAdmission;
+  plan: ExecutionPlan | null;
+}
 
 export class ExecutionJournal {
+  private readonly loadedSnapshots = new WeakSet<object>();
   constructor(readonly runtime: ProjectOsPersistenceRuntime, readonly projectId: string, readonly kind: string, readonly requestId: string) {
     machineConvergenceRoot(projectId);
     if (!kind || !requestId || requestId.length > 512) throw new Error("execution_identity_invalid");
@@ -39,8 +64,11 @@ export class ExecutionJournal {
     return `${machineConvergenceRoot(this.projectId)}/executions/${await executionHash({ kind: this.kind, request_id: this.requestId })}`;
   }
 
-  async commit(admission: ExecutionAdmission, plan: ExecutionPlan | null): Promise<ExecutionAdmission> {
+  async commit(admission: ExecutionAdmission, plan: ExecutionPlan | null, headParentBinding?: HeadRecoveryParentBinding): Promise<ExecutionAdmission> {
     this.assertAdmission(admission);
+    if (headParentBinding || admission.kind === "navigation-head-recovery-parent") {
+      await this.assertHeadRecoveryParentBinding(admission, plan, headParentBinding);
+    }
     if (!plan && requiredRulePostchecks(admission).length > 0) {
       throw new Error("execution_required_postcheck_adapter_missing");
     }
@@ -68,12 +96,16 @@ export class ExecutionJournal {
         || canonicalJson(existing.admission.resources) !== canonicalJson(admission.resources)
         || canonicalJson(existing.admission.resource_effect_scopes) !== canonicalJson(admission.resource_effect_scopes)) throw new Error("execution_identity_conflict");
       if (!(await this.load())) {
+        const typedParentBeforeEffects = admission.kind === "navigation-head-recovery-parent"
+          && headParentBinding !== undefined && canonicalJson(existing.admission) === canonicalJson(admission)
+          && await this.headRecoveryParentHasNoEffects(headParentBinding);
         const navigationBeforeEffects = admission.operation === "navigation.reconcile"
           && await this.runtime.objects.readText(`${root}/navigation-intention.json`) === null;
         const headRecoveryBeforeEffects = admission.kind === "navigation-head-recovery"
           && admission.operation === "project.materialize" && plan === null
+          && await this.hasNoCanonicalHistory()
           && await this.runtime.objects.readText(`${machineDocumentRoot(this.projectId)}/navigation-sources/head-write-recovery/${admission.request_hash}/intent.json`) === null;
-        if (!navigationBeforeEffects && !headRecoveryBeforeEffects) {
+        if (!navigationBeforeEffects && !headRecoveryBeforeEffects && !typedParentBeforeEffects) {
           throw new Error("execution_progress_unavailable");
         }
         // The navigation admission is persisted before the engine may create
@@ -87,6 +119,131 @@ export class ExecutionJournal {
     await this.immutable(path, record);
     await this.immutable(`${root}/progress.json`, this.initialProgress(admission, path, record.effect_plan_hash));
     return admission;
+  }
+
+  private async assertHeadRecoveryParentBinding(admission: ExecutionAdmission, plan: ExecutionPlan | null,
+    binding?: HeadRecoveryParentBinding): Promise<void> {
+    if (!binding || admission.kind !== "navigation-head-recovery-parent" || plan !== null
+      || binding.discriminator !== "navigation.head-write.recovery-parent@1"
+      || binding.provider_id !== this.runtime.providerId || binding.project_id !== this.projectId
+      || binding.actor.actor_id !== "project_guard" || binding.actor.authority !== "durable_object"
+      || !["project.repair", "project.materialize"].includes(binding.operation)
+      || binding.operation !== admission.operation || binding.project_revision !== admission.project_revision
+      || canonicalJson(binding.actor) !== canonicalJson(admission.actor)
+      || !/^[a-f0-9]{64}$/.test(binding.intent_hash)
+      || binding.source_state.path !== `${machineDocumentRoot(this.projectId)}/navigation-sources/state.json`
+      || !binding.source_state.object_id || !binding.source_state.revision_token
+      || !binding.source_state.integrity_hash_algorithm || !binding.source_state.integrity_hash
+      || admission.request_id !== await headRecoveryParentRequestId(binding)) throw new Error("execution_head_parent_binding_invalid");
+    const normalized = await normalizeSystemAdmission(this.projectId, binding.operation, "DOCUMENTS",
+      `document-reconcile@${binding.project_revision}`, String(binding.project_revision), binding);
+    const source = binding.source_state;
+    const reference = `${source.path}#object_id=${encodeURIComponent(source.object_id)}&revision_token=${encodeURIComponent(source.revision_token)}&integrity_hash_algorithm=${encodeURIComponent(source.integrity_hash_algorithm)}&integrity_hash=${encodeURIComponent(source.integrity_hash)}`;
+    const sourceRefs = admission.diagnosed_drift_refs?.filter(ref => ref.startsWith(`${source.path}#`));
+    if (normalized.request_hash !== admission.request_hash || canonicalJson(normalized.resources) !== canonicalJson(admission.resources)
+      || sourceRefs?.length !== 1 || sourceRefs[0] !== reference || admission.verdict !== "allow" || admission.deferred_rules.length !== 0) {
+      throw new Error("execution_head_parent_binding_invalid");
+    }
+  }
+
+  private async hasNoCanonicalHistory(): Promise<boolean> {
+    // A lost progress object must never erase a parent's recorded progress.
+    // Only an exhaustive, fresh, bounded listing can prove this virgin case.
+    if (!this.runtime.pagedListing) return false;
+    const history = await this.runtime.pagedListing.listPage({ path: `${await this.root()}/history`, cursor: null, limit: 1 });
+    return Array.isArray(history.entries) && history.entries.length === 0 && history.cursor === null;
+  }
+
+  private async headRecoveryParentHasNoEffects(binding: HeadRecoveryParentBinding): Promise<boolean> {
+    if (!await this.hasNoCanonicalHistory()) return false;
+    const child = new ExecutionJournal(this.runtime, this.projectId, "navigation-head-recovery",
+      `DOCREQ-NAV-HEAD-RECOVERY-${binding.intent_hash.toUpperCase()}`);
+    const childRoot = await child.root();
+    // Metadata/text/metadata distinguishes stable absence from an unreadable or
+    // torn child. Any child admission, even without an intention, closes this exception.
+    if (await this.runtime.objects.readText(`${childRoot}/admission.json`) !== null) return false;
+    const progressPath = `${childRoot}/progress.json`;
+    if (await this.runtime.objects.getMetadata(progressPath) !== null
+      || await this.runtime.objects.readText(progressPath) !== null
+      || await this.runtime.objects.getMetadata(progressPath) !== null) return false;
+    const intentRoot = `${machineDocumentRoot(this.projectId)}/navigation-sources/head-write-recovery/${binding.intent_hash}`;
+    if (await this.runtime.objects.readText(`${intentRoot}/intent.json`) !== null
+      || await this.runtime.objects.readText(`${intentRoot}/completion.json`) !== null) return false;
+    const source = await this.runtime.objects.getMetadata(binding.source_state.path);
+    return source?.path === binding.source_state.path && source.objectId === binding.source_state.object_id
+      && source.revisionToken === binding.source_state.revision_token
+      && source.integrityHash?.algorithm === binding.source_state.integrity_hash_algorithm
+      && source.integrityHash.value === binding.source_state.integrity_hash;
+  }
+
+  /** Reconstruct only from original canonical identity, never today's source. */
+  async readHeadRecoveryParentBinding(snapshot?: LoadedExecution): Promise<HeadRecoveryParentBinding> {
+    if (snapshot && !this.loadedSnapshots.has(snapshot)) throw new Error("execution_head_parent_snapshot_invalid");
+    const record = snapshot ? { admission: snapshot.admission, plan: snapshot.plan } : await this.readAdmission();
+    if (!record || record.plan !== null || this.kind !== "navigation-head-recovery-parent") throw new Error("execution_head_parent_binding_invalid");
+    return this.validateHeadRecoveryParentAdmission(record.admission, record.plan);
+  }
+
+  /** Pure validation of an already freshly read immutable canonical record. */
+  async validateHeadRecoveryParentAdmission(admission: ExecutionAdmission, plan: ExecutionPlan | null): Promise<HeadRecoveryParentBinding> {
+    this.assertAdmission(admission);
+    if (plan !== null || this.kind !== "navigation-head-recovery-parent") throw new Error("execution_head_parent_binding_invalid");
+    const identity = /^DOCREQ-NAV-HEAD-PARENT-(REPAIR|MATERIALIZE)-(\d+)-([A-F0-9]{64})-([A-F0-9]{64})$/.exec(this.requestId);
+    const sourcePath = `${machineDocumentRoot(this.projectId)}/navigation-sources/state.json`;
+    const sourceRefs = admission.diagnosed_drift_refs?.filter(ref => ref.startsWith(`${sourcePath}#`)) ?? [];
+    if (!identity || sourceRefs.length !== 1) throw new Error("execution_head_parent_binding_invalid");
+    const fields = new URLSearchParams(sourceRefs[0].slice(sourcePath.length + 1));
+    const binding: HeadRecoveryParentBinding = {
+      discriminator: "navigation.head-write.recovery-parent@1", provider_id: this.runtime.providerId,
+      project_id: this.projectId, actor: admission.actor, operation: admission.operation,
+      project_revision: admission.project_revision, intent_hash: identity[3].toLowerCase(),
+      source_state: { path: sourcePath, object_id: fields.get("object_id") ?? "", revision_token: fields.get("revision_token") ?? "",
+        integrity_hash_algorithm: fields.get("integrity_hash_algorithm") ?? "", integrity_hash: fields.get("integrity_hash") ?? "" }
+    };
+    await this.assertHeadRecoveryParentBinding(admission, plan, binding);
+    return binding;
+  }
+
+  /** The immutable child admission already names the parent. A legacy child
+   * without this original binding can never acquire a parent after admission. */
+  async claimHeadRecoveryParent(parent: ExecutionJournal, binding: HeadRecoveryParentBinding,
+    snapshots?: { parent: LoadedExecution; child: LoadedExecution }): Promise<LoadedExecution> {
+    if (snapshots && (!parent.loadedSnapshots.has(snapshots.parent) || !this.loadedSnapshots.has(snapshots.child))) {
+      throw new Error("execution_head_parent_snapshot_invalid");
+    }
+    const parentSaved = snapshots?.parent ?? await parent.load();
+    const saved = snapshots?.child ?? await this.load();
+    if (!parentSaved) throw new Error("execution_head_parent_admission_missing");
+    await parent.assertHeadRecoveryParentBinding(parentSaved.admission, parentSaved.plan, binding);
+    const parentRef = `${await parent.root()}/admission.json`;
+    if (!saved || saved.plan !== null || this.kind !== "navigation-head-recovery"
+      || saved.admission.operation !== "project.materialize" || saved.admission.request_hash !== binding.intent_hash
+      || this.projectId !== parent.projectId || this.requestId !== `DOCREQ-NAV-HEAD-RECOVERY-${binding.intent_hash.toUpperCase()}`
+      || canonicalJson(saved.admission.actor) !== canonicalJson(binding.actor)
+      || saved.admission.diagnosed_drift_refs?.length !== 1 || saved.admission.diagnosed_drift_refs[0] !== parentRef) {
+      throw new Error("execution_head_parent_claim_invalid");
+    }
+    const expected = { step_id: "head-recovery-parent", evidence_refs: [parentRef], observation_hash: await executionHash(binding) };
+    const claims = saved.progress.completed_steps.filter(step => step.step_id === expected.step_id);
+    if (claims.length) {
+      if (claims.length !== 1 || canonicalJson(claims[0]) !== canonicalJson(expected)) throw new Error("execution_head_parent_claim_conflict");
+      return saved;
+    }
+    const intentionRoot = `${machineDocumentRoot(this.projectId)}/navigation-sources/head-write-recovery/${binding.intent_hash}`;
+    if (!parentSaved || parentSaved.progress.status !== "admitted" || parentSaved.progress.terminal
+      || saved.progress.status !== "admitted" || saved.progress.terminal || saved.progress.sequence !== 0
+      || saved.progress.completed_steps.length || saved.progress.receipt_ref
+      || await this.runtime.objects.readText(`${intentionRoot}/intent.json`) !== null
+      || await this.runtime.objects.readText(`${intentionRoot}/completion.json`) !== null) {
+      throw new Error("execution_head_parent_claim_after_effects");
+    }
+    saved.progress.completed_steps.push(expected);
+    saved.progress.sequence++;
+    this.loadedSnapshots.delete(saved);
+    parent.loadedSnapshots.delete(parentSaved);
+    saved.token = await this.save(saved.progress, saved.token);
+    this.loadedSnapshots.add(saved);
+    return saved;
   }
 
   private initialProgress(admission: ExecutionAdmission, admissionRef: string, effectPlanHash: string): ExecutionProgress {
@@ -113,7 +270,7 @@ export class ExecutionJournal {
     return record;
   }
 
-  async load(): Promise<{ progress: ExecutionProgress; token: string } | null> {
+  async load(): Promise<LoadedExecution | null> {
     const path = `${await this.root()}/progress.json`;
     const first = await this.runtime.objects.getMetadata(path);
     const raw = await this.runtime.objects.readText(path);
@@ -124,7 +281,9 @@ export class ExecutionJournal {
     if (progress.project_id !== this.projectId || progress.request_id !== this.requestId || progress.kind !== this.kind) throw new Error("execution_identity_conflict");
     const record = await this.readAdmission();
     if (!record || progress.admission_ref !== `${await this.root()}/admission.json` || record.admission.request_hash !== progress.request_hash || record.effect_plan_hash !== progress.effect_plan_hash) throw new Error("execution_admission_missing");
-    return { progress, token: first.revisionToken };
+    const loaded = { progress, token: first.revisionToken, admission: record.admission, plan: record.plan };
+    this.loadedSnapshots.add(loaded);
+    return loaded;
   }
 
   async status(): Promise<ExecutionProgress | null> {

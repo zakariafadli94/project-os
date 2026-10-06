@@ -141,6 +141,141 @@ it("does not let diagnostic emission failure change fresh authority or canonical
   expect((await f.subject.handleMutationContextRead(f.request())).status).toBe(503);
 });
 
+function admissionDiagnosticRequest(f: ReturnType<typeof canonicalTraceFixture>, correlation?: string, token = "operator-fixture") {
+  f.subject.env.CONTROL_TOWER_OPERATOR_TOKEN = "operator-fixture";
+  f.subject.env.CF_VERSION_METADATA = { id: "33333333-3333-4333-8333-333333333333", tag: "git-" + "a".repeat(40) };
+  const request = f.request(correlation);
+  const headers = new Headers(request.headers);
+  headers.set("authorization", "Bearer " + token);
+  return new Request(request.url + "&diagnostic=true", { headers });
+}
+
+it("admission diagnostic returns the actual fresh signing verdict without releasing authority", async () => {
+  const f = canonicalTraceFixture("PRJ-8520");
+  const response = await f.subject.handleMutationContextRead(admissionDiagnosticRequest(f));
+  const body = await response.json();
+  expect(response.status).toBe(200);
+  expect(body).toMatchObject({ status: "ready", canonical_revision: 1, freshness: "verified", authority: "issued_discarded", business_mutation: false,
+    reader: { category: "success", provider_call_count: 3, role: "initiator" }, admission: { stage: "after_signature", category: "success" },
+    runtime: { git_sha: "a".repeat(40) } });
+  expect(JSON.stringify(body)).not.toMatch(/trace-fixture-secret|state_hash|"token"|"context"|canonical_state/);
+});
+
+it.each(["wrong", "shared", "missing"])("admission diagnostic refuses %s operator before provider work", async mode => {
+  const f = canonicalTraceFixture("PRJ-8521");
+  const request = admissionDiagnosticRequest(f, undefined, mode === "wrong" ? "wrong" : "operator-fixture");
+  if (mode === "shared") f.subject.env.INGRESS_TOKEN = "operator-fixture";
+  if (mode === "missing") delete f.subject.env.CONTROL_TOWER_OPERATOR_TOKEN;
+  const response = await f.subject.handleMutationContextRead(request);
+  expect(response.status).toBe(403);
+  expect(f.providerCalls()).toBe(0);
+  expect(JSON.stringify(await response.json())).not.toMatch(/"context"|"token"/);
+});
+
+it("admission diagnostic returns provider failures without raw exceptions", async () => {
+  const f = canonicalTraceFixture("PRJ-8522");
+  f.setSnapshot(async () => { throw new Error("PRIVATE_TOKEN_PROVIDER_BODY"); });
+  const response = await f.subject.handleMutationContextRead(admissionDiagnosticRequest(f));
+  expect(response.status).toBe(503);
+  const body = await response.json();
+  expect(body).toMatchObject({ status: "unavailable", authority: "not_issued", reader: { category: "provider_error", phase: "snapshot", provider_call_count: 1 } });
+  expect(JSON.stringify(body)).not.toContain("PRIVATE_TOKEN_PROVIDER_BODY");
+});
+
+it("admission diagnostic preserves joined ownership and does not duplicate provider reads", async () => {
+  const f = canonicalTraceFixture("PRJ-8523");
+  let release!: (state: ProjectState) => void;
+  f.setSnapshot(() => new Promise(resolve => { release = resolve; }));
+  const first = f.subject.handleMutationContextRead(admissionDiagnosticRequest(f));
+  await vi.waitFor(() => expect(f.providerCalls()).toBe(1));
+  const second = f.subject.handleMutationContextRead(admissionDiagnosticRequest(f, "22222222-2222-4222-8222-222222222222"));
+  release(f.records[0]!.state);
+  const bodies = await Promise.all((await Promise.all([first, second])).map(r => r.json()));
+  expect(bodies[1]).toMatchObject({ correlation_id: "22222222-2222-4222-8222-222222222222", reader: { role: "joined", provider_call_count: null, initiator_correlation_id: "11111111-1111-4111-8111-111111111111" } });
+  expect(f.providerCalls()).toBe(3);
+});
+
+it.each(["before_signature", "after_signature"] as const)("admission diagnostic reports real stale %s authority truthfully", async stage => {
+  const f = canonicalTraceFixture("PRJ-8524");
+  let newer = false;
+  f.subject.loadState = () => newer ? { ...f.records[0]!.state, revision: 2 } : null;
+  if (stage === "before_signature") vi.spyOn(console, "log").mockImplementation((name) => {
+    if (name === "project_os_canonical_read_finished") newer = true;
+  });
+  else {
+    const sign = crypto.subtle.sign.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "sign").mockImplementation(async (...args) => { const result = await sign(...args); newer = true; return result; });
+  }
+  const response = await f.subject.handleMutationContextRead(admissionDiagnosticRequest(f));
+  expect(response.status).toBe(503);
+  expect(await response.json()).toMatchObject({ status: "unavailable", authority: stage === "after_signature" ? "issued_discarded" : "not_issued",
+    reader: { category: "success" }, admission: { stage, category: "stale_state" } });
+});
+
+it("admission diagnostic classifies signing error without leaking the key or exception", async () => {
+  const f = canonicalTraceFixture("PRJ-8525");
+  vi.spyOn(crypto.subtle, "sign").mockRejectedValue(new Error("PRIVATE_SIGNATURE_KEY"));
+  const response = await f.subject.handleMutationContextRead(admissionDiagnosticRequest(f));
+  expect(response.status).toBe(503);
+  const body = await response.json();
+  expect(body).toMatchObject({ authority: "not_issued", admission: { stage: "signature", category: "signature_error" } });
+  expect(JSON.stringify(body)).not.toContain("PRIVATE_SIGNATURE_KEY");
+});
+
+it("admission diagnostic keeps deadline proof immutable after late completion", async () => {
+  const f = canonicalTraceFixture("PRJ-8526");
+  f.subject.canonicalContextReadDeadlineMs = () => 20;
+  let release!: (state: ProjectState) => void;
+  f.setSnapshot(() => new Promise(resolve => { release = resolve; }));
+  const response = await f.subject.handleMutationContextRead(admissionDiagnosticRequest(f));
+  const body = await response.json();
+  const frozen = JSON.stringify(body);
+  expect(body).toMatchObject({ reader: { phase: "snapshot", category: "deadline", provider_call_count: 1 }, authority: "not_issued" });
+  expect(f.scope().signal.aborted).toBe(true);
+  release(f.records[0]!.state);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(JSON.stringify(body)).toBe(frozen);
+  expect(f.providerCalls()).toBe(1);
+});
+
+it("admission diagnostic reports the 32-call bound without a thirty-third attempt", async () => {
+  const f = canonicalTraceFixture("PRJ-8527", 40);
+  f.subject.loadState = () => f.records[0]!.state;
+  f.subject.contextVerifiedState = f.records[0]!.state;
+  const body = await (await f.subject.handleMutationContextRead(admissionDiagnosticRequest(f))).json();
+  expect(body).toMatchObject({ reader: { category: "call_budget", provider_call_count: 32 }, authority: "not_issued" });
+  expect(f.providerCalls()).toBe(32);
+});
+
+it("a throwing request observer cannot change real reader success", async () => {
+  const f = canonicalTraceFixture("PRJ-8528");
+  expect((await f.subject.readFreshCanonicalState("PRJ-8528", f.request(), () => { throw new Error("observer failed"); }))?.revision).toBe(1);
+  expect(f.providerCalls()).toBe(3);
+});
+
+it("admission diagnostic missing signing configuration performs no provider work", async () => {
+  const f = canonicalTraceFixture("PRJ-8529");
+  const request = admissionDiagnosticRequest(f);
+  delete f.subject.env.MUTATION_CONTEXT_SIGNING_KEY;
+  const body = await (await f.subject.handleMutationContextRead(request)).json();
+  expect(body).toMatchObject({ status: "unavailable", reader: null, authority: "not_issued", admission: { stage: "configuration" } });
+  expect(f.providerCalls()).toBe(0);
+});
+
+it("admission diagnostic bypasses busy outer queues without starting search or finalization", async () => {
+  const f = canonicalTraceFixture("PRJ-8530");
+  Object.setPrototypeOf(f.subject, DiagnosticProjectGuard.prototype);
+  Object.assign(f.subject, { searchQueueDepth: 1, searchQueue: new Promise(() => undefined), diagnosticsQueue: new Promise(() => undefined) });
+  let sideEffects = 0;
+  f.subject.persistence = { diagnostics: { beginOperation: () => { sideEffects++; } } };
+  f.subject.searchSynchronizer = { synchronize: () => { sideEffects++; throw new Error("unexpected search"); } };
+  f.subject.forwardMaterializationRequest = () => { sideEffects++; throw new Error("unexpected finalization"); };
+  const response = await f.subject.fetch(admissionDiagnosticRequest(f));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ status: "ready", business_mutation: false });
+  expect(sideEffects).toBe(0);
+});
+
 async function seedFinalizedTransactionStatus(projectId: string, requestId: string, revision: number) {
   const mock = installDropboxMock();
   const hash = "a".repeat(64);

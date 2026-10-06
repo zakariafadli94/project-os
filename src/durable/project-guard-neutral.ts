@@ -65,6 +65,7 @@ import {
 } from "../convergence/rollout";
 import { freshnessRejectionMetric, workerLogConvergenceTelemetry } from "../convergence/observability";
 import { deploymentIdentity } from "../deployment/identity";
+import { admissionDiagnosticSchema, type AdmissionDiagnostic, type CanonicalReaderResult, type CanonicalReadPhase, type CanonicalReadCategory } from "../admission/diagnostic";
 import { evaluateRules } from "../rules/evaluator";
 import { canonicalJson, type EvaluationResult, type RuleObservation, type RuleReference } from "../rules/contract";
 import type { GlobalGovernanceState, RuleVersion } from "../domain/rule-governance";
@@ -399,8 +400,6 @@ interface MaterializationFinalizationRequest {
   projection_version: number;
 }
 
-type CanonicalReadPhase = "local_checkpoint" | "local_proof" | "snapshot" | "exact_commit" | "suffix" | "checkpoint" | "before_signature" | "after_signature";
-type CanonicalReadCategory = "success" | "deadline" | "call_budget" | "provider_error" | "internal_error" | "chain_invalid" | "stale_state" | "canonical_absent";
 interface CanonicalReadDiagnostic {
   correlation: string | null;
   started: number;
@@ -5191,37 +5190,69 @@ export class ProjectGuard extends DurableObject<Env> {
   private async handleMutationContextRead(request: Request): Promise<Response> {
     const projectId = this.ctx.id.name;
     const secret = this.env.MUTATION_CONTEXT_SIGNING_KEY;
+    const diagnosticMode = new URL(request.url).searchParams.get("diagnostic") === "true";
+    const correlation = this.canonicalReadCorrelation(request);
+    if (diagnosticMode && (!correlation || this.contextActor(request).authority !== "control_tower_operator")) {
+      return Response.json({ error: "forbidden" }, { status: 403 });
+    }
+    const started = Date.now();
+    let reader: CanonicalReaderResult | null = null;
+    let stage: AdmissionDiagnostic["admission"]["stage"] = "configuration";
+    let authority: AdmissionDiagnostic["authority"] = "not_issued";
+    let revision: number | null = null;
+    const diagnosticResponse = (category: AdmissionDiagnostic["admission"]["category"], ready = false) => {
+      const parsed = admissionDiagnosticSchema.safeParse({ schema_version: "1.0", project_id: projectId, correlation_id: correlation,
+        status: ready ? "ready" : "unavailable", code: ready ? "ADMISSION_DIAGNOSTIC_READY" : "ADMISSION_DIAGNOSTIC_UNAVAILABLE",
+        canonical_revision: revision, freshness: ready ? "verified" : "unknown", authority, business_mutation: false,
+        runtime: deploymentIdentity(this.env), reader,
+        admission: { stage, category, elapsed_ms: Date.now() - started } });
+      return parsed.success ? Response.json(parsed.data, { status: ready ? 200 : 503 })
+        : Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    };
     if (!projectId || projectId === AUTO_PROJECT_ID || !secret) {
-      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+      return diagnosticMode ? diagnosticResponse("unavailable") : Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
     const includeState = new URL(request.url).searchParams.get("include_state") !== "false";
     // A context must be fresh or unavailable. The snapshot is an accelerator,
     // not an authority over newer immutable commits, so verify its bounded
     // suffix before signing. Never authorize from a stale local cache.
     let latest: ProjectState | null;
+    stage = "canonical_read";
     try {
-      latest = await this.readFreshCanonicalState(projectId, request);
+      latest = await this.readFreshCanonicalState(projectId, request, diagnosticMode ? value => { reader = value; } : undefined);
     } catch {
-      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+      return diagnosticMode ? diagnosticResponse("unavailable") : Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
-    if (!latest) return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    if (!latest) return diagnosticMode ? diagnosticResponse("unavailable") : Response.json({ error: "canonical_unavailable" }, { status: 503 });
+    revision = latest.revision;
+    stage = "before_signature";
     const stateBeforePersist = this.loadState();
     if (stateBeforePersist && stateBeforePersist.revision > latest.revision) {
       this.emitCanonicalReadDiagnostic(projectId, this.canonicalReadCorrelation(request), null, "caller", {
         phase: "before_signature", category: "stale_state", elapsed_ms: 0, provider_call_count: null
       });
-      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+      return diagnosticMode ? diagnosticResponse("stale_state") : Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
     this.persistState(latest);
     this.contextVerifiedState = normalizeProjectState(latest);
-    const context = await issueMutationContext(latest, secret, Date.now(), this.contextActor(request));
+    stage = "signature";
+    let context;
+    try {
+      context = await issueMutationContext(latest, secret, Date.now(), this.contextActor(request));
+    } catch (error) {
+      if (!diagnosticMode) throw error;
+      return diagnosticResponse("signature_error");
+    }
+    authority = "issued_discarded";
+    stage = "after_signature";
     const stateAfterSign = this.loadState();
     if (stateAfterSign && stateAfterSign.revision > latest.revision) {
       this.emitCanonicalReadDiagnostic(projectId, this.canonicalReadCorrelation(request), null, "caller", {
         phase: "after_signature", category: "stale_state", elapsed_ms: 0, provider_call_count: null
       });
-      return Response.json({ error: "canonical_unavailable" }, { status: 503 });
+      return diagnosticMode ? diagnosticResponse("stale_state") : Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
+    if (diagnosticMode) return diagnosticResponse("success", true);
     return Response.json(includeState ? { context, canonical_state: latest } : { context });
   }
 
@@ -5257,16 +5288,19 @@ export class ProjectGuard extends DurableObject<Env> {
     } catch { /* Observability must never change admission or provider effects. */ }
   }
 
-  private async readFreshCanonicalState(projectId: string, request?: Request): Promise<ProjectState | null> {
+  private async readFreshCanonicalState(projectId: string, request?: Request, observe?: (value: CanonicalReaderResult) => void): Promise<ProjectState | null> {
     const correlation = this.canonicalReadCorrelation(request);
+    const notify = (value: CanonicalReaderResult) => { try { observe?.(Object.freeze({ ...value })); } catch { /* Observer cannot alter canonical authority. */ } };
     if (this.contextReadPending) {
       const diagnostic = this.contextReadDiagnostic;
       try {
         return await this.contextReadPending;
       } finally {
-        if (diagnostic?.settled) this.emitCanonicalReadDiagnostic(projectId, correlation, diagnostic.correlation, "joined", {
-          ...diagnostic.settled, provider_call_count: null
-        });
+        if (diagnostic?.settled) {
+          const result = { ...diagnostic.settled, provider_call_count: null };
+          notify({ ...result, role: "joined", initiator_correlation_id: diagnostic.correlation });
+          this.emitCanonicalReadDiagnostic(projectId, correlation, diagnostic.correlation, "joined", result);
+        }
       }
     }
     const diagnostic: CanonicalReadDiagnostic = { correlation, started: Date.now(), phase: "local_checkpoint" };
@@ -5291,6 +5325,7 @@ export class ProjectGuard extends DurableObject<Env> {
       if (diagnostic.settled) return;
       diagnostic.settled = Object.freeze({ phase: diagnostic.phase, category,
         elapsed_ms: Date.now() - diagnostic.started, provider_call_count: budget.calls });
+      notify({ ...diagnostic.settled, role: "initiator", initiator_correlation_id: correlation });
       this.emitCanonicalReadDiagnostic(projectId, correlation, correlation, "initiator", diagnostic.settled);
     };
     const pending = new Promise<ProjectState | null>((resolve, reject) => {

@@ -370,6 +370,7 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
   const started = Date.now();
   let boundary: "context" | "submission" = "context";
   let postStarted = false;
+  let upstreamError: { code: string; http_status: 503 } | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const diagnostic = { correlation_id: correlationId, request_id: requestId, family: kind };
   console.log("project_os_submission_started", diagnostic);
@@ -440,7 +441,12 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
           check_status_before_retry: true, requires_new_approval: false, next_attempt_at: null }
       } };
       else if (refusal) submitted = { response, payload: refusal, outcome: "business_refusal" };
-      else if (response.status >= 500) throw new SubmissionFailure("submission");
+      else if (response.status >= 500) {
+        if (kind === "document" && request.operation === "working.write") {
+          upstreamError = safeWorkingWriteFailure(submissionPayload, response.status, projectId, requestId);
+        }
+        throw new SubmissionFailure("submission");
+      }
       else submitted = { response, payload: { status: "rejected", code: "PROJECT_OS_SUBMISSION_REJECTED", request_id: requestId }, outcome: "http_rejection" };
     } else {
       if (!validSubmissionResponse(submissionPayload, kind, requestId, projectId, isProjectCreate)) throw new SubmissionFailure("submission");
@@ -457,6 +463,7 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
     const result = { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify({
       status, code: "PROJECT_OS_SUBMISSION_UNAVAILABLE", request_id: requestId,
       failed_boundary: failedBoundary, correlation_id: correlationId,
+      ...(upstreamError ? { upstream_error: upstreamError } : {}),
       recovery: { owner: "system", action: postStarted ? "check_status" : "retry_context_read",
         preserve_request_id: true, check_status_before_retry: postStarted, requires_new_approval: false,
         next_attempt_at: null, dependency: isProjectCreate ? "control_tower_to_registry_guard" : "control_tower_to_project_guard" }
@@ -486,6 +493,25 @@ function validSubmissionResponse(payload: unknown, kind: "transaction" | "docume
     return result.project_id === AUTO_PROJECT_ID || typeof result.project_id === "string" && /^PRJ-[0-9]{4,}$/.test(result.project_id);
   }
   return result.project_id === projectId;
+}
+
+// Diagnostic only: these errors do not establish whether a durable admission
+// exists. Keep unknown + status-before-retry; never expose exception text.
+const safeWorkingWriteFailureCodes = new Set([
+  "rule_admission_invalid", "rule_admission_request_mismatch",
+  "rule_admission_scope_mismatch", "rule_admission_ruleset_stale",
+  "execution_identity_invalid", "execution_plan_invalid",
+  "execution_required_postcheck_adapter_missing", "execution_required_postcheck_missing",
+  "execution_resource_scope_unavailable", "execution_evidence_unavailable"
+]);
+
+function safeWorkingWriteFailure(payload: unknown, httpStatus: number, projectId: string, requestId: unknown): { code: string; http_status: 503 } | null {
+  if (httpStatus !== 503 || !payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const body = payload as Record<string, unknown>;
+  if (typeof body.error !== "string" || !safeWorkingWriteFailureCodes.has(body.error)
+    || (body.project_id !== undefined && body.project_id !== projectId)
+    || (body.request_id !== undefined && body.request_id !== requestId)) return null;
+  return { code: body.error, http_status: 503 };
 }
 
 const safeAdmissionRefusals = new Set([

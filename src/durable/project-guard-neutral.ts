@@ -399,6 +399,16 @@ interface MaterializationFinalizationRequest {
   projection_version: number;
 }
 
+type CanonicalReadPhase = "local_checkpoint" | "local_proof" | "snapshot" | "exact_commit" | "suffix" | "checkpoint" | "before_signature" | "after_signature";
+type CanonicalReadCategory = "success" | "deadline" | "call_budget" | "provider_error" | "internal_error" | "chain_invalid" | "stale_state" | "canonical_absent";
+interface CanonicalReadDiagnostic {
+  correlation: string | null;
+  started: number;
+  phase: CanonicalReadPhase;
+  category?: CanonicalReadCategory;
+  settled?: Readonly<{ phase: CanonicalReadPhase; category: CanonicalReadCategory; elapsed_ms: number; provider_call_count: number }>;
+}
+
 interface ContextReadCheckpoint {
   schema_version: "1.0";
   project_id: string;
@@ -454,6 +464,7 @@ export class ProjectGuard extends DurableObject<Env> {
    * second legitimate request from being rejected while the first is verifying
    * the same Dropbox state. */
   private contextReadPending: Promise<ProjectState | null> | null = null;
+  private contextReadDiagnostic: CanonicalReadDiagnostic | null = null;
   /** In-memory provenance only. It is intentionally lost on DO eviction; a
    * later instance must prove the cached state against its exact commit again. */
   private contextVerifiedState: ProjectState | null = null;
@@ -5137,7 +5148,7 @@ export class ProjectGuard extends DurableObject<Env> {
     const url = new URL(request.url);
     let state: ProjectState | null;
     try {
-      state = await this.readFreshCanonicalState(projectId);
+      state = await this.readFreshCanonicalState(projectId, request);
     } catch {
       return Response.json({ status: "unknown", freshness: "unknown", error: "canonical_unavailable" }, { status: 503 });
     }
@@ -5189,13 +5200,16 @@ export class ProjectGuard extends DurableObject<Env> {
     // suffix before signing. Never authorize from a stale local cache.
     let latest: ProjectState | null;
     try {
-      latest = await this.readFreshCanonicalState(projectId);
+      latest = await this.readFreshCanonicalState(projectId, request);
     } catch {
       return Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
     if (!latest) return Response.json({ error: "canonical_unavailable" }, { status: 503 });
     const stateBeforePersist = this.loadState();
     if (stateBeforePersist && stateBeforePersist.revision > latest.revision) {
+      this.emitCanonicalReadDiagnostic(projectId, this.canonicalReadCorrelation(request), null, "caller", {
+        phase: "before_signature", category: "stale_state", elapsed_ms: 0, provider_call_count: null
+      });
       return Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
     this.persistState(latest);
@@ -5203,6 +5217,9 @@ export class ProjectGuard extends DurableObject<Env> {
     const context = await issueMutationContext(latest, secret, Date.now(), this.contextActor(request));
     const stateAfterSign = this.loadState();
     if (stateAfterSign && stateAfterSign.revision > latest.revision) {
+      this.emitCanonicalReadDiagnostic(projectId, this.canonicalReadCorrelation(request), null, "caller", {
+        phase: "after_signature", category: "stale_state", elapsed_ms: 0, provider_call_count: null
+      });
       return Response.json({ error: "canonical_unavailable" }, { status: 503 });
     }
     return Response.json(includeState ? { context, canonical_state: latest } : { context });
@@ -5223,8 +5240,37 @@ export class ProjectGuard extends DurableObject<Env> {
     return repository.readProjectState(projectId);
   }
 
-  private async readFreshCanonicalState(projectId: string): Promise<ProjectState | null> {
-    if (this.contextReadPending) return this.contextReadPending;
+  private canonicalReadCorrelation(request?: Request): string | null {
+    const value = request?.headers.get("x-project-os-correlation-id");
+    return value && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value) ? value : null;
+  }
+
+  private emitCanonicalReadDiagnostic(
+    projectId: string, correlation: string | null, initiator: string | null,
+    role: "initiator" | "joined" | "caller",
+    result: { phase: CanonicalReadPhase; category: CanonicalReadCategory; elapsed_ms: number; provider_call_count: number | null }
+  ): void {
+    if (!correlation) return;
+    try {
+      console.log("project_os_canonical_read_finished", { project_id: projectId, correlation_id: correlation,
+        initiator_correlation_id: initiator, role, ...result });
+    } catch { /* Observability must never change admission or provider effects. */ }
+  }
+
+  private async readFreshCanonicalState(projectId: string, request?: Request): Promise<ProjectState | null> {
+    const correlation = this.canonicalReadCorrelation(request);
+    if (this.contextReadPending) {
+      const diagnostic = this.contextReadDiagnostic;
+      try {
+        return await this.contextReadPending;
+      } finally {
+        if (diagnostic?.settled) this.emitCanonicalReadDiagnostic(projectId, correlation, diagnostic.correlation, "joined", {
+          ...diagnostic.settled, provider_call_count: null
+        });
+      }
+    }
+    const diagnostic: CanonicalReadDiagnostic = { correlation, started: Date.now(), phase: "local_checkpoint" };
+    this.contextReadDiagnostic = diagnostic;
     const deadline = Date.now() + this.canonicalContextReadDeadlineMs();
     const controller = new AbortController();
     const budget = { calls: 0, maxCalls: 32 };
@@ -5234,15 +5280,23 @@ export class ProjectGuard extends DurableObject<Env> {
       now: () => Date.now(),
       beforeHttp: () => {
         if (Date.now() >= deadline || budget.calls >= budget.maxCalls) {
+          diagnostic.category = Date.now() >= deadline ? "deadline" : "call_budget";
           throw new Error("canonical_context_budget_exhausted");
         }
         budget.calls += 1;
       }
     });
-    const source = this.readCanonicalState(repository, projectId, deadline, budget);
+    const source = this.readCanonicalState(repository, projectId, deadline, budget, diagnostic);
+    const settle = (category: CanonicalReadCategory) => {
+      if (diagnostic.settled) return;
+      diagnostic.settled = Object.freeze({ phase: diagnostic.phase, category,
+        elapsed_ms: Date.now() - diagnostic.started, provider_call_count: budget.calls });
+      this.emitCanonicalReadDiagnostic(projectId, correlation, correlation, "initiator", diagnostic.settled);
+    };
     const pending = new Promise<ProjectState | null>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
         const error = new Error("canonical_read_deadline");
+        settle("deadline");
         controller.abort(error);
         reject(error);
       }, this.canonicalContextReadDeadlineMs());
@@ -5250,17 +5304,32 @@ export class ProjectGuard extends DurableObject<Env> {
         (state) => {
           if (timer !== undefined) clearTimeout(timer);
           timer = undefined;
+          settle(state ? "success" : "canonical_absent");
           resolve(state);
         },
         (error) => {
           if (timer !== undefined) clearTimeout(timer);
           timer = undefined;
+          let category = diagnostic.category;
+          if (!category) {
+            // Inspect only fixed internal discriminants; never emit raw errors.
+            try {
+              const message = error instanceof Error ? error.message : null;
+              if (message === "canonical_context_budget_exhausted") category = Date.now() >= deadline ? "deadline" : "call_budget";
+              else if (message === "canonical_commit_chain_gap") category = "chain_invalid";
+              else if (message === "canonical_context_raced_unverified_state") category = "stale_state";
+            } catch { /* An exotic error cannot break the original rejection. */ }
+          }
+          settle(category ?? "internal_error");
           reject(error);
         }
       );
     });
     const shared = pending.finally(() => {
-      if (this.contextReadPending === shared) this.contextReadPending = null;
+      if (this.contextReadPending === shared) {
+        this.contextReadPending = null;
+        this.contextReadDiagnostic = null;
+      }
     });
     this.contextReadPending = shared;
     return shared;
@@ -5270,23 +5339,33 @@ export class ProjectGuard extends DurableObject<Env> {
     repository: ProjectRepository,
     projectId: string,
     deadline: number,
-    budget: { calls: number; maxCalls: number }
+    budget: { calls: number; maxCalls: number },
+    diagnostic?: CanonicalReadDiagnostic
   ): Promise<ProjectState | null> {
     const ensureBudget = () => {
       if (Date.now() >= deadline || budget.calls >= budget.maxCalls) {
+        if (diagnostic) diagnostic.category = Date.now() >= deadline ? "deadline" : "call_budget";
         throw new Error("canonical_context_budget_exhausted");
       }
     };
     const readCommit = async (revision: number) => {
       ensureBudget();
-      const record = await repository.readCommitRecord(projectId, revision);
+      let record: Awaited<ReturnType<ProjectRepository["readCommitRecord"]>>;
+      try {
+        record = await repository.readCommitRecord(projectId, revision);
+      } catch (error) {
+        if (diagnostic && !diagnostic.category) diagnostic.category = "provider_error";
+        throw error;
+      }
       if (Date.now() >= deadline) throw new Error("canonical_context_budget_exhausted");
       return record;
     };
     const sameState = (left: ProjectState, right: ProjectState) => canonicalJson(left) === canonicalJson(right);
     const checkpoint = await this.readContextCheckpoint(projectId);
+    if (diagnostic) diagnostic.phase = "local_proof";
     const exactRecordState = async (state: ProjectState): Promise<ProjectState | null> => {
       if (state.project_id !== projectId || state.revision < 1) return null;
+      if (diagnostic) diagnostic.phase = "exact_commit";
       const record = await readCommit(state.revision);
       if (!record || record.project_id !== projectId || record.new_revision !== state.revision) return null;
       return sameState(state, record.state) ? state : record.state;
@@ -5303,6 +5382,7 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (checkpoint && (!latest || checkpoint.revision > latest.revision)) {
+      if (diagnostic) diagnostic.phase = "exact_commit";
       const record = await readCommit(checkpoint.revision);
       if (record && record.project_id === projectId && record.new_revision === checkpoint.revision
         && record.event.event_id === checkpoint.event_id
@@ -5313,10 +5393,18 @@ export class ProjectGuard extends DurableObject<Env> {
     }
 
     if (!latest) {
-      const snapshot = await this.readContextSnapshot(repository, projectId);
+      if (diagnostic) diagnostic.phase = "snapshot";
+      let snapshot: ProjectState | null;
+      try {
+        snapshot = await this.readContextSnapshot(repository, projectId);
+      } catch (error) {
+        if (diagnostic && !diagnostic.category) diagnostic.category = "provider_error";
+        throw error;
+      }
       if (snapshot) latest = await exactRecordState(snapshot);
     }
     if (!latest && this.layoutMode === "v2") {
+      if (diagnostic) diagnostic.phase = "exact_commit";
       const firstRecord = await readCommit(1);
       if (firstRecord) {
         if (firstRecord.previous_revision !== 0) throw new Error("canonical_commit_chain_gap");
@@ -5324,11 +5412,18 @@ export class ProjectGuard extends DurableObject<Env> {
       }
     }
     if (!latest) return null;
-    await this.persistContextCheckpoint(latest, deadline);
+    const persistCheckpoint = async (state: ProjectState) => {
+      const previousPhase = diagnostic?.phase;
+      if (diagnostic) diagnostic.phase = "checkpoint";
+      await this.persistContextCheckpoint(state, deadline);
+      if (diagnostic && previousPhase) diagnostic.phase = previousPhase;
+    };
+    await persistCheckpoint(latest);
 
     // Verify only the immutable suffix from the proven baseline. Provider
     // call accounting is shared with snapshot/baseline reads for this request.
     for (;;) {
+      if (diagnostic) diagnostic.phase = "suffix";
       ensureBudget();
       const next = await readCommit(latest.revision + 1);
       if (next) {
@@ -5336,7 +5431,7 @@ export class ProjectGuard extends DurableObject<Env> {
           throw new Error("canonical_commit_chain_gap");
         }
         latest = next.state;
-        await this.persistContextCheckpoint(latest, deadline);
+        await persistCheckpoint(latest);
         continue;
       }
 
@@ -5348,13 +5443,13 @@ export class ProjectGuard extends DurableObject<Env> {
         if (this.contextVerifiedState && this.contextVerifiedState.revision === local.revision
           && sameState(this.contextVerifiedState, local)) {
           latest = local;
-          await this.persistContextCheckpoint(latest, deadline);
+          await persistCheckpoint(latest);
           continue;
         }
         const newer = await exactRecordState(local);
         if (!newer) throw new Error("canonical_context_raced_unverified_state");
         latest = newer;
-        await this.persistContextCheckpoint(latest, deadline);
+        await persistCheckpoint(latest);
         continue;
       }
       return latest;

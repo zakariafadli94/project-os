@@ -208,6 +208,64 @@ describe("effective Control Tower token permissions", () => {
       code: "PROJECT_OS_SUBMISSION_UNAVAILABLE", request_id: "DOCREQ-PENDING-ORIGINAL" });
   });
 
+  it.each([
+    { error: "rule_admission_invalid", safe: true },
+    { error: "rule_admission_request_mismatch", safe: true },
+    { error: "rule_admission_scope_mismatch", safe: true },
+    { error: "rule_admission_ruleset_stale", safe: true },
+    { error: "execution_identity_invalid", safe: true },
+    { error: "execution_plan_invalid", safe: true },
+    { error: "execution_required_postcheck_adapter_missing", safe: true },
+    { error: "execution_required_postcheck_missing", safe: true },
+    { error: "execution_resource_scope_unavailable", safe: true },
+    { error: "execution_evidence_unavailable", safe: true },
+    { error: "execution_private_provider_secret", safe: false },
+    { error: "unknown_failure", safe: false },
+    { error: ["rule_admission_invalid"], safe: false },
+    { error: null, safe: false },
+    { error: "rule_admission_invalid", http_status: 500, safe: false },
+    { error: "rule_admission_invalid", array_body: true, safe: false },
+    { error: "rule_admission_invalid", project_id: "PRJ-0007", safe: false },
+    { error: "rule_admission_invalid", request_id: "DOCREQ-OTHER", safe: false }
+  ])("keeps working-write recovery unknown while exposing only a bound safe upstream code: $error", async (fixture) => {
+    const calls: string[] = [];
+    const owner = { getByName: () => ({ fetch: async (url: string, init?: RequestInit) => {
+      const path = new URL(url).pathname;
+      calls.push(`${init?.method ?? "GET"} ${path}`);
+      if (path === "/mutation-context") return Response.json({ context: {
+        actor: { actor_id: "tower-test", authority: "operator" }, project_id: "PRJ-0003", canonical_revision: 1,
+        state_hash: "a".repeat(64), observed_at: "2026-09-26T10:00:00.000Z",
+        expiry: "2026-09-26T10:05:00.000Z", token: "a.b"
+      } });
+      expect(path).toBe("/document");
+      expect(JSON.parse(String(init?.body))).toMatchObject({ admission_version: "1.0", request: {
+        project_id: "PRJ-0003", request_id: "DOCREQ-SAFE-ORIGINAL", operation: "working.write"
+      } });
+      const { safe: _safe, ...response } = fixture;
+      const responseBody = { ...response, private_detail: "provider-secret", token: "private-token", content: "private-document" };
+      return Response.json("array_body" in fixture ? [responseBody] : responseBody,
+        { status: "http_status" in fixture ? fixture.http_status : 503 });
+    } }) } as unknown as DurableObjectNamespace;
+    const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {
+      _registeredTools: Record<string, { handler(input: unknown): Promise<{ isError?: boolean; content: Array<{ text: string }> }> }>
+    };
+    const result = await server._registeredTools.project_os_write_working_document!.handler({
+      project_id: "PRJ-0003", request: { project_id: "PRJ-0003", request_id: "DOCREQ-SAFE-ORIGINAL", operation: "working.write" }
+    });
+    const body = JSON.parse(result.content[0]!.text);
+    expect(body).toMatchObject({ status: "unknown", code: "PROJECT_OS_SUBMISSION_UNAVAILABLE",
+      request_id: "DOCREQ-SAFE-ORIGINAL", failed_boundary: "submission", recovery: {
+        owner: "system", action: "check_status", preserve_request_id: true, check_status_before_retry: true,
+        requires_new_approval: false, next_attempt_at: null
+      } });
+    expect(result.isError).toBe(true);
+    expect(body).not.toHaveProperty("receipt");
+    if (fixture.safe) expect(body.upstream_error).toEqual({ code: fixture.error, http_status: 503 });
+    else expect(body).not.toHaveProperty("upstream_error");
+    expect(result.content[0]!.text).not.toMatch(/provider-secret|private-token|private-document|execution_private_provider_secret|unknown_failure/);
+    expect(calls).toEqual(["GET /mutation-context", "POST /document"]);
+  });
+
   it("assigns a technical recovery action after an ambiguous submission", async () => {
     const owner = { getByName: () => ({ fetch: async () => { throw new Error("private-provider-detail"); } }) } as unknown as DurableObjectNamespace;
     const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {

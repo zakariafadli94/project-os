@@ -266,6 +266,72 @@ describe("effective Control Tower token permissions", () => {
     expect(calls).toEqual(["GET /mutation-context", "POST /document"]);
   });
 
+it.each([
+    ...["rule_admission_invalid", "rule_admission_request_mismatch", "rule_admission_scope_mismatch",
+      "rule_admission_ruleset_stale", "execution_identity_invalid", "execution_plan_invalid",
+      "execution_required_postcheck_adapter_missing", "execution_required_postcheck_missing",
+      "execution_resource_scope_unavailable", "execution_evidence_unavailable"].map(error => ({ error, safe: true })),
+    { error: "rule_admission_invalid", transaction_id: "TXN-SAFE-ORIGINAL", safe: true },
+    { error: "rule_admission_invalid", request_id: "TXN-SAFE-ORIGINAL", safe: true },
+    { error: "rule_admission_invalid", transaction_id: "TXN-SAFE-ORIGINAL", request_id: "TXN-SAFE-ORIGINAL", project_id: "PRJ-0003", safe: true },
+    { error: "rule_admission_invalid", transaction_id: "TXN-OTHER", safe: false },
+    { error: "rule_admission_invalid", transaction_id: null, safe: false },
+    { error: "rule_admission_invalid", transaction_id: 7, safe: false },
+    { error: "rule_admission_invalid", request_id: null, safe: false },
+    { error: "rule_admission_invalid", request_id: "TXN-OTHER", safe: false },
+    { error: "rule_admission_invalid", transaction_id: "TXN-SAFE-ORIGINAL", request_id: "TXN-OTHER", safe: false },
+    { error: "rule_admission_invalid", transaction_id: "TXN-OTHER", request_id: "TXN-SAFE-ORIGINAL", safe: false },
+    { error: "rule_admission_invalid", project_id: null, safe: false },
+    { error: "rule_admission_invalid", project_id: "PRJ-0007", safe: false },
+    { error: ["rule_admission_invalid"], safe: false },
+    { error: null, safe: false },
+    { error: "provider-private-secret", safe: false },
+    { error: "rule_admission_invalid", http_status: 500, safe: false },
+    { error: "rule_admission_invalid", array_body: true, safe: false },
+    { error: "rule_admission_invalid", context_failure: true, safe: false },
+    { error: "rule_admission_invalid", family: "artifact", safe: false },
+    { error: "rule_admission_invalid", family: "other_document", safe: false },
+    { error: "rule_admission_invalid", family: "create", safe: false }
+  ])("relays ordinary transaction safe diagnostic only with consistent optional bindings: %j", async fixture => {
+    const calls: string[] = [];
+    const fetch = async (url: string, init?: RequestInit) => {
+      const path = new URL(url).pathname;
+      calls.push(`${init?.method ?? "GET"} ${path}`);
+      if(path === "/mutation-context" && !("context_failure" in fixture)) return Response.json({context:{
+        actor:{actor_id:"tower-test",authority:"operator"},project_id:"PRJ-0003",canonical_revision:1,
+        state_hash:"a".repeat(64),observed_at:"2026-09-26T10:00:00.000Z",expiry:"2026-09-26T10:05:00.000Z",token:"a.b"
+      }});
+      if(init?.method === "POST" && !("family" in fixture)) expect(JSON.parse(String(init.body))).toMatchObject({
+        admission_version:"1.0", mutation_context:{token:"a.b"},request:{transaction_id:"TXN-SAFE-ORIGINAL"}
+      });
+      const {safe:_safe,...fields}=fixture;
+      return Response.json("array_body" in fixture ? [fields] : {...fields,private_detail:"provider-private-secret",token:"private-token",content:"private-document"},
+        {status:"http_status" in fixture ? fixture.http_status : 503});
+    };
+    const owner = {getByName:()=>({fetch})} as unknown as DurableObjectNamespace;
+    const server=createControlTowerServer({PROJECT_GUARD:owner,REGISTRY_GUARD:owner},{read:true,mutate:true}) as unknown as {
+      _registeredTools:Record<string,{handler(input:unknown):Promise<{isError?:boolean;content:Array<{text:string}>}>}>
+    };
+    const family="family" in fixture ? fixture.family : "transaction";
+    const project_id=family==="create" ? "PRJ-AUTO":"PRJ-0003";
+    const tool=family==="artifact" ? "project_os_submit_artifact":family==="other_document" ? "project_os_write_working_document":"project_os_submit_transaction";
+    const result=await server._registeredTools[tool]!.handler({project_id,request:{
+      project_id,transaction_id:"TXN-SAFE-ORIGINAL",request_id:"TXN-SAFE-ORIGINAL",
+      operation:family==="create"?"project.create":family==="other_document"?"review.promote":"decision.accept"
+    }});
+    const body=JSON.parse(result.content[0]!.text);
+    expect(result.isError).toBe(true);
+    expect(body).toMatchObject({status:"context_failure" in fixture?"not_submitted":"unknown",
+      code:"PROJECT_OS_SUBMISSION_UNAVAILABLE",failed_boundary:"context_failure" in fixture?"context":"submission"});
+    expect(body).not.toHaveProperty("receipt");
+    expect(body.correlation_id).toMatch(/^[a-f0-9-]{36}$/);
+    if(fixture.safe) expect(body.upstream_error).toEqual({code:fixture.error,http_status:503});
+    else expect(body).not.toHaveProperty("upstream_error");
+    expect(result.content[0]!.text).not.toMatch(/provider-private-secret|private-token|private-document/);
+    expect(calls).toEqual(family==="create"?["POST /create"]:"context_failure" in fixture?["GET /mutation-context"]:
+      ["GET /mutation-context",family==="artifact"?"POST /artifact":family==="other_document"?"POST /document":"POST /transaction"]);
+  });
+
   it("assigns a technical recovery action after an ambiguous submission", async () => {
     const owner = { getByName: () => ({ fetch: async () => { throw new Error("private-provider-detail"); } }) } as unknown as DurableObjectNamespace;
     const server = createControlTowerServer({ PROJECT_GUARD: owner, REGISTRY_GUARD: owner }, { read: true, mutate: true }) as unknown as {

@@ -4,6 +4,7 @@ import { artifactWriteRequestSchema } from "../domain/artifact-write";
 import { managedDocumentRequestSchema } from "../domain/managed-document-request";
 import { AUTO_PROJECT_ID, transactionSchema } from "../domain/transaction";
 import { parseMutationContextOrNull } from "../admission/mutation-context";
+import { admissionDiagnosticSchema } from "../admission/diagnostic";
 import { DETAIL_FIELDS } from "./context";
 import type { ControlTowerAccess } from "./auth";
 import { persistenceCapabilities } from "../persistence/capabilities";
@@ -39,6 +40,13 @@ const localRecoveryDiagnosticSchema = z.object({
 export function createControlTowerServer(env: { PROJECT_GUARD: DurableObjectNamespace; REGISTRY_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string; CF_VERSION_METADATA?: VersionMetadataLike }, access: ControlTowerAccess = { read: false, mutate: false }) {
   const server = new McpServer({ name: "project-os-control-tower", version: "1.0.0" });
   const projectIdSchema = z.string().regex(/^PRJ-[0-9]{4}$/);
+  server.registerTool("project_os_diagnose_admission", {
+    description: "Observe fresh canonical admission and signing without a business submission or exposing mutation authority",
+    inputSchema: z.strictObject({ project_id: projectIdSchema }), annotations: { readOnlyHint: true }
+  }, async ({ project_id }) => {
+    if (!access.read || !access.mutate) return scopeDenied("project.mutate");
+    return diagnoseAdmission(env, project_id);
+  });
   server.registerTool("project_os_get_capabilities", {
     description: "Read deployed persistence capabilities and token permissions; client tool availability is unknown to the server",
     inputSchema: {}, annotations: { readOnlyHint: true }
@@ -242,6 +250,34 @@ function contextReadError(response: Response, value: unknown): ReadToolResult {
     }
   }
   return { isError: true, content: [{ type: "text", text: JSON.stringify({ status: "unavailable", code: "canonical_unavailable" }) }] };
+}
+
+async function diagnoseAdmission(env: { PROJECT_GUARD: DurableObjectNamespace; CONTROL_TOWER_OPERATOR_TOKEN?: string; CF_VERSION_METADATA?: VersionMetadataLike }, projectId: string): Promise<ReadToolResult> {
+  const correlationId = crypto.randomUUID();
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const unavailable = (): ReadToolResult => ({ isError: true, content: [{ type: "text", text: JSON.stringify({
+    status: "unavailable", code: "ADMISSION_DIAGNOSTIC_TRANSPORT_UNAVAILABLE", project_id: projectId, correlation_id: correlationId,
+    failed_boundary: "control_tower_to_project_guard", guard_result: "unknown", business_mutation: false,
+    runtime: deploymentIdentity(env)
+  }) }] });
+  if (!env.CONTROL_TOWER_OPERATOR_TOKEN?.trim()) return unavailable();
+  try {
+    const work = (async () => {
+      const response = await env.PROJECT_GUARD.getByName(projectId).fetch("https://project-guard.internal/mutation-context?include_state=false&diagnostic=true", {
+        signal: controller.signal, headers: { authorization: `Bearer ${env.CONTROL_TOWER_OPERATOR_TOKEN}`, "x-project-os-correlation-id": correlationId }
+      });
+      const parsed = admissionDiagnosticSchema.safeParse(await response.json());
+      if (!parsed.success || parsed.data.project_id !== projectId || parsed.data.correlation_id !== correlationId
+        || response.status !== (parsed.data.status === "ready" ? 200 : 503)) return unavailable();
+      return { ...(parsed.data.status === "unavailable" ? { isError: true } : {}),
+        content: [{ type: "text" as const, text: JSON.stringify(parsed.data) }] };
+    })();
+    return await Promise.race([work, new Promise<ReadToolResult>(resolve => {
+      timer = setTimeout(() => { controller.abort(); resolve(unavailable()); }, 10_000);
+    })]);
+  } catch { return unavailable(); }
+  finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
 async function readGuard(

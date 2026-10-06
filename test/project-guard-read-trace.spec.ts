@@ -23,6 +23,124 @@ import { installDropboxMock } from "./helpers/mock-dropbox";
 
 afterEach(() => vi.restoreAllMocks());
 
+// These fixtures exercise the actual canonical reader and admission handler;
+// only provider/storage boundaries are replaced. Missing/wrong diagnostics,
+// duplicate provider work, leaked errors or changed admission must fail them.
+function canonicalTraceFixture(projectId: string, revisions = 1) {
+  const records = commitFixture(projectId, revisions);
+  const storage = new Map<string, unknown>();
+  let scope!: ProviderRequestScope;
+  let providerCalls = 0;
+  let snapshot: () => Promise<ProjectState | null> = async () => records[0]!.state;
+  const repository = {
+    readProjectState: async () => { scope.beforeHttp?.(); providerCalls++; return snapshot(); },
+    readCommitRecord: async (_id: string, revision: number) => {
+      scope.beforeHttp?.(); providerCalls++; return records[revision - 1] ?? null;
+    }
+  } as unknown as ProjectRepository;
+  const subject = Object.assign(Object.create(ProjectGuard.prototype), {
+    env: { MUTATION_CONTEXT_SIGNING_KEY: "trace-fixture-secret" },
+    ctx: { id: { name: projectId }, storage: {
+      get: async (key: string) => storage.get(key),
+      put: async (key: string, value: unknown) => { storage.set(key, value); }
+    } },
+    layoutMode: "v2", contextReadPending: null, contextCheckpointWriteQueue: Promise.resolve(),
+    loadState: () => null,
+    persistState: () => undefined,
+    canonicalContextRepository: (_id: string, next: ProviderRequestScope) => { scope = next; return repository; }
+  }) as any;
+  const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  const request = (correlation = "11111111-1111-4111-8111-111111111111") => new Request(
+    "https://project-guard.internal/mutation-context?include_state=false",
+    { headers: { "x-project-os-correlation-id": correlation } }
+  );
+  return { subject, records, request,
+    setSnapshot: (read: typeof snapshot) => { snapshot = read; },
+    scope: () => scope, providerCalls: () => providerCalls,
+    traces: () => log.mock.calls.filter(([name]) => name === "project_os_canonical_read_finished").map(([, value]) => value as any)
+  };
+}
+
+it("diagnoses a frozen canonical deadline with abort without leaking a late provider result", async () => {
+  const f = canonicalTraceFixture("PRJ-8510");
+  f.subject.canonicalContextReadDeadlineMs = () => 20;
+  let release!: (state: ProjectState) => void;
+  f.setSnapshot(() => new Promise(resolve => { release = resolve; }));
+  const response = await f.subject.handleMutationContextRead(f.request());
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({ error: "canonical_unavailable" });
+  expect(f.scope().signal.aborted).toBe(true);
+  expect(f.traces()).toMatchObject([{ phase: "snapshot", category: "deadline", provider_call_count: 1, role: "initiator" }]);
+  const frozen = JSON.stringify(f.traces());
+  release(f.records[0]!.state);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(JSON.stringify(f.traces())).toBe(frozen);
+  expect(f.providerCalls()).toBe(1);
+});
+
+it("diagnoses a provider exception with a safe fixed category and unchanged refusal", async () => {
+  const f = canonicalTraceFixture("PRJ-8511");
+  f.setSnapshot(async () => { throw new Error("PRIVATE payload token https://secret.invalid"); });
+  const response = await f.subject.handleMutationContextRead(f.request());
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({ error: "canonical_unavailable" });
+  expect(f.traces()).toMatchObject([{ phase: "snapshot", category: "provider_error", provider_call_count: 1 }]);
+  expect(JSON.stringify(f.traces())).not.toMatch(/PRIVATE|payload|token|secret\.invalid|trace-fixture-secret/);
+  expect(f.providerCalls()).toBe(1);
+});
+
+it("distinguishes canonical call budget exhaustion from deadline without a thirty-third provider call", async () => {
+  const f = canonicalTraceFixture("PRJ-8512", 40);
+  f.subject.loadState = () => f.records[0]!.state;
+  f.subject.contextVerifiedState = f.records[0]!.state;
+  const response = await f.subject.handleMutationContextRead(f.request());
+  expect(response.status).toBe(503);
+  expect(f.traces()).toMatchObject([{ phase: "suffix", category: "call_budget", provider_call_count: 32 }]);
+  expect(f.providerCalls()).toBe(32);
+});
+
+it("attributes a joined fresh read to its initiator without duplicating provider work", async () => {
+  const f = canonicalTraceFixture("PRJ-8513");
+  let release!: (state: ProjectState) => void;
+  f.setSnapshot(() => new Promise(resolve => { release = resolve; }));
+  const first = f.subject.handleMutationContextRead(f.request());
+  await vi.waitFor(() => expect(f.providerCalls()).toBe(1));
+  const second = f.subject.handleMutationContextRead(f.request("22222222-2222-4222-8222-222222222222"));
+  release(f.records[0]!.state);
+  const responses = await Promise.all([first, second]);
+  expect(responses.map(r => r.status)).toEqual([200, 200]);
+  for (const r of responses) expect(await r.json()).toHaveProperty("context");
+  expect(f.providerCalls()).toBe(3); // snapshot, exact commit, absent suffix
+  expect(f.traces()).toMatchObject([
+    { category: "success", role: "initiator", correlation_id: "11111111-1111-4111-8111-111111111111", provider_call_count: 3 },
+    { category: "success", role: "joined", correlation_id: "22222222-2222-4222-8222-222222222222", initiator_correlation_id: "11111111-1111-4111-8111-111111111111", provider_call_count: null }
+  ]);
+});
+
+it.each(["before_signature", "after_signature"] as const)("diagnoses stale state %s without signing stale authority", async stage => {
+  const f = canonicalTraceFixture(stage === "before_signature" ? "PRJ-8514" : "PRJ-8515", 2);
+  f.subject.readFreshCanonicalState = async () => f.records[0]!.state;
+  let reads = 0;
+  f.subject.loadState = () => (++reads === 1 && stage === "after_signature" ? f.records[0]!.state : f.records[1]!.state);
+  const response = await f.subject.handleMutationContextRead(f.request());
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({ error: "canonical_unavailable" });
+  expect(f.traces()).toMatchObject([{ phase: stage, category: "stale_state", provider_call_count: null }]);
+  expect(f.providerCalls()).toBe(0);
+});
+
+it("does not let diagnostic emission failure change fresh authority or canonical refusal", async () => {
+  const f = canonicalTraceFixture("PRJ-8516");
+  vi.spyOn(console, "log").mockImplementation(() => { throw new Error("log unavailable"); });
+  expect((await f.subject.handleMutationContextRead(f.request())).status).toBe(200);
+  expect(f.providerCalls()).toBe(3);
+  f.subject.contextVerifiedState = null;
+  f.setSnapshot(async () => { throw new Error("provider failed"); });
+  // Remove persisted checkpoint so the real snapshot boundary is exercised.
+  f.subject.ctx.storage.get = async () => null;
+  expect((await f.subject.handleMutationContextRead(f.request())).status).toBe(503);
+});
+
 async function seedFinalizedTransactionStatus(projectId: string, requestId: string, revision: number) {
   const mock = installDropboxMock();
   const hash = "a".repeat(64);

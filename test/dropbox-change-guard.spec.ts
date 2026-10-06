@@ -69,20 +69,24 @@ async function status(stub = guard()): Promise<ChangeGuardStatus> {
 async function runChangeAlarmNow(stub: DurableObjectStub, projectId: string): Promise<void> {
   const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
   await runInDurableObject(projectGuard, async (_instance, state) => {
-    const store = new ManagedDocumentChangeJobStore(state.storage);
-    const continuation = store.continuation();
-    if (continuation.feed_retry_at === null) return;
-    store.finishContinuationSlice({
-      pending: continuation.pending,
-      next_wake_at: 0,
-      documents_priority_next: continuation.documents_priority_next,
-      feed_retry_at: 0,
-      outcome: continuation.last_outcome ?? { unread_feed: true }
-    });
+    makeDocumentContinuationDue(state.storage);
   });
   await runInDurableObject(stub, async (_instance, state) => {
     await state.storage.deleteAlarm();
     await state.storage.setAlarm(Date.now() + 60_000);
+  });
+}
+
+function makeDocumentContinuationDue(storage: DurableObjectStorage): void {
+  const store = new ManagedDocumentChangeJobStore(storage);
+  const continuation = store.continuation();
+  if (continuation.feed_retry_at === null) return;
+  store.finishContinuationSlice({
+    pending: continuation.pending,
+    next_wake_at: 0,
+    documents_priority_next: continuation.documents_priority_next,
+    feed_retry_at: 0,
+    outcome: continuation.last_outcome ?? { unread_feed: true }
   });
 }
 
@@ -363,10 +367,21 @@ describe("DropboxChangeGuard", () => {
     let targetStorage: DurableObjectStorage;
     let localSliceActive = false;
     let expectedLocalOrdinal: number | null = null;
+    const localBegins: number[] = [];
     let persistedLocalSlice: ReturnType<ManagedDocumentChangeJobStore["continuation"]> | null = null;
     const originalFinish = ManagedDocumentChangeJobStore.prototype.finishContinuationSlice;
+    const originalBegin = ManagedDocumentChangeJobStore.prototype.beginContinuationSlice;
     await runInDurableObject(projectGuard, async (_instance, state) => {
       targetStorage = state.storage;
+    });
+    const beginSlice = vi.spyOn(ManagedDocumentChangeJobStore.prototype, "beginContinuationSlice").mockImplementation(function (this: ManagedDocumentChangeJobStore, ...args) {
+      const result = originalBegin.apply(this, args);
+      // Local recovery supplies no scheduled flag; the fleet route supplies one.
+      // Record ownership only after the real SQL begin, never from an outcome.
+      if (localSliceActive && args[0] === undefined && (this as unknown as { storage: DurableObjectStorage }).storage === targetStorage) {
+        localBegins.push(result.slice_ordinal);
+      }
+      return result;
     });
     const finishSlice = vi.spyOn(ManagedDocumentChangeJobStore.prototype, "finishContinuationSlice").mockImplementation(function (this: ManagedDocumentChangeJobStore, input) {
       const result = originalFinish.call(this, input);
@@ -374,7 +389,7 @@ describe("DropboxChangeGuard", () => {
         const persisted = this.continuation();
         // Capture the actual successful SQL write, not its input or an outcome
         // selected by error. A later fleet slice may legitimately replace it.
-        if (persisted.slice_ordinal === expectedLocalOrdinal) persistedLocalSlice = structuredClone(persisted);
+        if (localBegins.includes(persisted.slice_ordinal)) persistedLocalSlice = structuredClone(persisted);
       }
       return result;
     });
@@ -396,15 +411,20 @@ describe("DropboxChangeGuard", () => {
         expect(providerFailures).toBe(attempt + 1);
         expect((await status(stub)).failure_count).toBe(attempt + 1);
       }
-      await runChangeAlarmNow(stub, projectId);
-      expectedLocalOrdinal = await runInDurableObject(projectGuard, async (_instance, state) =>
-        new ManagedDocumentChangeJobStore(state.storage).continuation().slice_ordinal + 1);
-      localSliceActive = true;
-      try {
-        expect(await runDurableObjectAlarm(projectGuard)).toBe(true);
-      } finally {
-        localSliceActive = false;
-      }
+      // Reserve only this project's snapshot-to-alarm gap. Other callers queue
+      // until the actual alarm completes; no fleet consumer is disabled.
+      await runInDurableObject(projectGuard, async (instance, state) => state.blockConcurrencyWhile(async () => {
+        makeDocumentContinuationDue(state.storage);
+        expectedLocalOrdinal = new ManagedDocumentChangeJobStore(state.storage).continuation().slice_ordinal + 1;
+        await state.storage.deleteAlarm();
+        localSliceActive = true;
+        try {
+          await instance.alarm();
+        } finally {
+          localSliceActive = false;
+        }
+      }));
+      expect(localBegins).toEqual([expectedLocalOrdinal]);
       expect(persistedLocalSlice).not.toBeNull();
       const localSlice = persistedLocalSlice! as ReturnType<ManagedDocumentChangeJobStore["continuation"]>;
       expect(localSlice.slice_ordinal).toBe(expectedLocalOrdinal);
@@ -450,6 +470,123 @@ describe("DropboxChangeGuard", () => {
       await runInDurableObject(projectGuard, async (_instance, state) => state.storage.deleteAlarm());
       localAlarm.mockRestore();
       finishSlice.mockRestore();
+      beginSlice.mockRestore();
+    }
+  });
+
+  it("preserves the sixth feed failure when an independent fleet wins before the local alarm", async () => {
+    const mock = installDropboxMock();
+    const slug = "change-guard-fleet-before-local";
+    const projectId = await createProject("TXN-CHANGE-GUARD-FLEET-BEFORE-LOCAL-0001", slug);
+    const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
+    const stub = guard("fleet-before-local-original");
+    const independentFleet = guard("fleet-before-local-winner");
+    const root = `/PROJECT_OS/WORKSPACE/PROJECTS/${projectId}-${slug}`;
+    let providerFailures = 0;
+    let targetStorage: DurableObjectStorage;
+    let winningFleetActive = false;
+    let winningOrdinal: number | null = null;
+    const fleetBegins: number[] = [];
+    let winningProof: ReturnType<ManagedDocumentChangeJobStore["continuation"]> | null = null;
+    await runInDurableObject(projectGuard, async (_instance, state) => { targetStorage = state.storage; });
+    const originalBegin = ManagedDocumentChangeJobStore.prototype.beginContinuationSlice;
+    const originalFinish = ManagedDocumentChangeJobStore.prototype.finishContinuationSlice;
+    const beginSlice = vi.spyOn(ManagedDocumentChangeJobStore.prototype, "beginContinuationSlice").mockImplementation(function (this: ManagedDocumentChangeJobStore, ...args) {
+      const result = originalBegin.apply(this, args);
+      if (winningFleetActive && args[0] !== undefined && (this as unknown as { storage: DurableObjectStorage }).storage === targetStorage) {
+        fleetBegins.push(result.slice_ordinal);
+      }
+      return result;
+    });
+    const finishSlice = vi.spyOn(ManagedDocumentChangeJobStore.prototype, "finishContinuationSlice").mockImplementation(function (this: ManagedDocumentChangeJobStore, input) {
+      const result = originalFinish.call(this, input);
+      if (winningFleetActive && (this as unknown as { storage: DurableObjectStorage }).storage === targetStorage) {
+        const persisted = this.continuation();
+        if (persisted.slice_ordinal === winningOrdinal && fleetBegins.includes(persisted.slice_ordinal)) {
+          winningProof = structuredClone(persisted);
+        }
+      }
+      return result;
+    });
+    interceptProjectList(mock, async (path) => {
+      if (path !== root) return null;
+      providerFailures += 1;
+      // Bind the actual sixth provider attempt to its already-persisted begin.
+      // Neither ownership nor capture is selected by the expected error.
+      if (providerFailures === 6) winningOrdinal = new ManagedDocumentChangeJobStore(targetStorage).continuation().slice_ordinal;
+      return new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 });
+    });
+    const localAlarm = await holdLocalAlarmForManualDrive(projectGuard);
+    try {
+      expect((await notify(stub)).status).toBe(200);
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(providerFailures).toBe(1);
+      for (let attempt = 1; attempt < 5; attempt += 1) {
+        await runChangeAlarmNow(stub, projectId);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        expect(providerFailures).toBe(attempt + 1);
+        expect((await status(stub)).failure_count).toBe(attempt + 1);
+      }
+      await runChangeAlarmNow(stub, projectId);
+      winningFleetActive = true;
+      try {
+        expect((await notify(independentFleet)).status).toBe(200);
+        expect(await runDurableObjectAlarm(independentFleet)).toBe(true);
+      } finally {
+        winningFleetActive = false;
+      }
+      expect(providerFailures).toBe(6);
+      expect(winningOrdinal).not.toBeNull();
+      expect(fleetBegins).toContain(winningOrdinal);
+      expect(winningProof).not.toBeNull();
+      const fleetProof = winningProof! as ReturnType<ManagedDocumentChangeJobStore["continuation"]>;
+      expect(fleetProof.slice_ordinal).toBe(winningOrdinal);
+      expect(fleetProof.pending).toBe(true);
+      expect(fleetProof.last_outcome?.safe_errors).toEqual(["provider_blocked"]);
+      expect(fleetProof.last_outcome?.unread_feed).toBe(true);
+      expect(fleetProof.feed_retry_at).toBeGreaterThan(Date.now());
+      expect(fleetProof.next_wake_at).toBe(fleetProof.feed_retry_at);
+
+      // A further real deferred fleet pass replaces the current checkpoint
+      // before we read it, without overwriting the independent winner proof.
+      const deferredFleet = guard("fleet-before-local-deferred-reader");
+      expect((await notify(deferredFleet)).status).toBe(200);
+      expect(await runDurableObjectAlarm(deferredFleet)).toBe(true);
+      expect(providerFailures).toBe(6);
+      expect((await status(stub)).failure_count).toBe(5);
+      const fleetAlarm = await runInDurableObject(projectGuard, async (_instance, state) => state.storage.getAlarm());
+      expect(await runDurableObjectAlarm(projectGuard)).toBe(true);
+      expect(providerFailures).toBe(6);
+      const afterLocal = await runInDurableObject(projectGuard, async (_instance, state) =>
+        new ManagedDocumentChangeJobStore(state.storage).continuation());
+      expect(afterLocal.pending).toBe(true);
+      expect(afterLocal.last_outcome?.unread_feed).toBe(true);
+      expect(afterLocal.feed_retry_at).toBe(fleetProof.feed_retry_at);
+      expect(afterLocal.next_wake_at).toBe(fleetProof.next_wake_at);
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(providerFailures).toBe(6);
+      expect(await status(stub)).toMatchObject({
+        requested_generation: 1, completed_generation: 0,
+        processing_generation: null, failure_count: 0, last_error: null,
+        alarm_scheduled: false, alarm_at: null
+      });
+      const afterGlobal = await runInDurableObject(projectGuard, async (_instance, state) => ({
+        continuation: new ManagedDocumentChangeJobStore(state.storage).continuation(),
+        alarm_at: await state.storage.getAlarm()
+      }));
+      expect(afterGlobal.continuation.pending).toBe(true);
+      expect(afterGlobal.continuation.last_outcome?.unread_feed).toBe(true);
+      expect(afterGlobal.continuation.last_outcome?.safe_errors).toEqual([]);
+      expect(afterGlobal.continuation.feed_retry_at).toBe(fleetProof.feed_retry_at);
+      expect(afterGlobal.continuation.next_wake_at).toBe(fleetProof.next_wake_at);
+      expect(afterGlobal.alarm_at).toBe(fleetAlarm);
+      expect(afterGlobal.alarm_at).toBeGreaterThanOrEqual(afterGlobal.continuation.next_wake_at!);
+      expect(fleetProof.last_outcome?.safe_errors).toEqual(["provider_blocked"]);
+    } finally {
+      await runInDurableObject(projectGuard, async (_instance, state) => state.storage.deleteAlarm());
+      localAlarm.mockRestore();
+      finishSlice.mockRestore();
+      beginSlice.mockRestore();
     }
   });
 

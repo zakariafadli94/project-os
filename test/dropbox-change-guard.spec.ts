@@ -6,7 +6,7 @@ import {
   reset,
   waitOnExecutionContext
 } from "cloudflare:test";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index-mutation-gate";
 import type { Env } from "../src/env";
 import { installDropboxMock, type DropboxMockFault } from "./helpers/mock-dropbox";
@@ -15,7 +15,6 @@ import { ManagedDocumentChangeJobStore } from "../src/documents/change-job-store
 const testEnv = env as unknown as Env & {
   DROPBOX_CHANGE_GUARD: DurableObjectNamespace;
 };
-let resetAfterMaintenanceFixture = false;
 
 interface ChangeGuardStatus {
   requested_generation: number;
@@ -49,6 +48,10 @@ async function createProject(transactionId: string, slug: string) {
   expect(response.status).toBe(200);
   const receipt = await response.json<{ status: string; project_id: string }>();
   expect(receipt.status).toBe("committed");
+  const registryResponse = await testEnv.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/registry");
+  expect(registryResponse.status).toBe(200);
+  const registry = await registryResponse.json<{ projects: Array<{ project_id: string }> }>();
+  expect(registry.projects.map(project => project.project_id)).toEqual([receipt.project_id]);
   return receipt.project_id;
 }
 
@@ -90,15 +93,16 @@ function makeDocumentContinuationDue(storage: DurableObjectStorage): void {
   });
 }
 
-async function holdLocalAlarmForManualDrive(stub: DurableObjectStub) {
+async function holdAlarmForManualDrive(stub: DurableObjectStub, prearm = false) {
   return runInDurableObject(stub, async (_instance, state) => {
     const setAlarm = state.storage.setAlarm.bind(state.storage);
     const heldUntil = Date.now() + 60_000;
-    // Only this project's timer is held; reconciliation and durable checkpoints
-    // still run unchanged. Explicit runDurableObjectAlarm calls drive the order.
+    // Delegate real scheduling with one fixed floor below the long backoff.
+    // Without explicit prearm, only the product can create the alarm: removing
+    // its notification/retry scheduling must still break the test.
     const alarm = vi.spyOn(state.storage, "setAlarm").mockImplementation((time, options) =>
       setAlarm(Math.max(time instanceof Date ? time.getTime() : time, heldUntil), options));
-    await state.storage.setAlarm(heldUntil);
+    if (prearm) await state.storage.setAlarm(heldUntil);
     return alarm;
   });
 }
@@ -124,11 +128,12 @@ function interceptProjectList(
 }
 
 describe("DropboxChangeGuard", () => {
+  beforeEach(async () => { await reset(); });
   afterEach(async () => {
-    const shouldReset = resetAfterMaintenanceFixture;
-    resetAfterMaintenanceFixture = false;
     try {
-      if (shouldReset) await reset();
+      // All explicit alarm/context calls are awaited by each case. Destroy its
+      // objects while its own provider is still attached, before restoring spies.
+      await reset();
     } finally {
       vi.restoreAllMocks();
     }
@@ -138,6 +143,7 @@ describe("DropboxChangeGuard", () => {
     installDropboxMock();
     await createProject("TXN-CHANGE-GUARD-0001", "change-guard-one");
     const stub = guard("coalesce");
+    await holdAlarmForManualDrive(stub);
 
     expect((await notify(stub)).status).toBe(200);
     expect((await notify(stub)).status).toBe(200);
@@ -184,6 +190,9 @@ describe("DropboxChangeGuard", () => {
     const mock = installDropboxMock();
     const projectId = await createProject("TXN-CHANGE-GUARD-0002", "change-guard-two");
     const stub = guard("retry");
+    await holdAlarmForManualDrive(stub);
+    await holdAlarmForManualDrive(guard());
+    await holdAlarmForManualDrive(testEnv.PROJECT_GUARD.getByName(projectId), true);
     let fail = true;
     interceptProjectList(mock, async () => fail
       ? new Response(JSON.stringify({ error_summary: "invalid_arg/test_failure" }), { status: 400 })
@@ -215,6 +224,9 @@ describe("DropboxChangeGuard", () => {
     const projectId = await createProject("TXN-CHANGE-GUARD-0006", slug);
     const projectGuard = testEnv.PROJECT_GUARD.getByName(projectId);
 
+    await holdAlarmForManualDrive(projectGuard, true);
+    await holdAlarmForManualDrive(guard());
+
     const baseline = await projectGuard.fetch("https://project-guard.internal/reconcile-documents", { method: "POST" });
     expect(baseline.status).toBe(200);
 
@@ -230,6 +242,7 @@ describe("DropboxChangeGuard", () => {
     await mock.writeExternal(badInput, "%PDF retry later");
 
     const stub = guard("pending-document-job");
+    await holdAlarmForManualDrive(stub);
     expect((await notify(stub)).status).toBe(200);
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
@@ -328,7 +341,9 @@ describe("DropboxChangeGuard", () => {
       providerFailures += 1;
       return new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 });
     });
-    const localAlarm = await holdLocalAlarmForManualDrive(projectGuard);
+    await holdAlarmForManualDrive(stub);
+    await holdAlarmForManualDrive(guard());
+    const localAlarm = await holdAlarmForManualDrive(projectGuard, true);
     try {
       expect((await notify(stub)).status).toBe(200);
       expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -400,7 +415,9 @@ describe("DropboxChangeGuard", () => {
       providerFailures += 1;
       return new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 });
     });
-    const localAlarm = await holdLocalAlarmForManualDrive(projectGuard);
+    await holdAlarmForManualDrive(stub);
+    await holdAlarmForManualDrive(guard());
+    const localAlarm = await holdAlarmForManualDrive(projectGuard, true);
     try {
       expect((await notify(stub)).status).toBe(200);
       expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -433,6 +450,7 @@ describe("DropboxChangeGuard", () => {
       // Exercise an independent fleet pass before reading the current checkpoint.
       // Its deferred slice must not overwrite the captured local failure proof.
       const independentFleet = guard("ci2044-independent-fleet");
+      await holdAlarmForManualDrive(independentFleet);
       expect((await notify(independentFleet)).status).toBe(200);
       expect(await runDurableObjectAlarm(independentFleet)).toBe(true);
       expect(providerFailures).toBe(6);
@@ -516,7 +534,10 @@ describe("DropboxChangeGuard", () => {
       if (providerFailures === 6) winningOrdinal = new ManagedDocumentChangeJobStore(targetStorage).continuation().slice_ordinal;
       return new Response(JSON.stringify({ error_summary: "invalid_arg/persistent_failure" }), { status: 400 });
     });
-    const localAlarm = await holdLocalAlarmForManualDrive(projectGuard);
+    await holdAlarmForManualDrive(stub);
+    await holdAlarmForManualDrive(guard());
+    await holdAlarmForManualDrive(independentFleet);
+    const localAlarm = await holdAlarmForManualDrive(projectGuard, true);
     try {
       expect((await notify(stub)).status).toBe(200);
       expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -527,6 +548,26 @@ describe("DropboxChangeGuard", () => {
         expect(providerFailures).toBe(attempt + 1);
         expect((await status(stub)).failure_count).toBe(attempt + 1);
       }
+      const fiveFailureProof = structuredClone(await status(stub));
+      expect(fiveFailureProof.failure_count).toBe(5);
+      const beforeDeferred = await runInDurableObject(projectGuard, (_instance, state) =>
+        new ManagedDocumentChangeJobStore(state.storage).continuation());
+      // The same real global can acknowledge a deferred local continuation,
+      // clearing its phase counter without consuming another provider attempt.
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(providerFailures).toBe(5);
+      expect(await status(stub)).toMatchObject({
+        requested_generation: 1, completed_generation: 0, failure_count: 0,
+        processing_generation: null, last_error: null, alarm_scheduled: false
+      });
+      const afterDeferred = await runInDurableObject(projectGuard, (_instance, state) =>
+        new ManagedDocumentChangeJobStore(state.storage).continuation());
+      expect(afterDeferred.pending).toBe(true);
+      expect(afterDeferred.last_outcome?.unread_feed).toBe(true);
+      expect(afterDeferred.feed_retry_at).toBe(beforeDeferred.feed_retry_at);
+      expect(afterDeferred.next_wake_at).toBe(beforeDeferred.next_wake_at);
+      expect(fiveFailureProof.failure_count).toBe(5);
+
       await runChangeAlarmNow(stub, projectId);
       winningFleetActive = true;
       try {
@@ -550,10 +591,11 @@ describe("DropboxChangeGuard", () => {
       // A further real deferred fleet pass replaces the current checkpoint
       // before we read it, without overwriting the independent winner proof.
       const deferredFleet = guard("fleet-before-local-deferred-reader");
+      await holdAlarmForManualDrive(deferredFleet);
       expect((await notify(deferredFleet)).status).toBe(200);
       expect(await runDurableObjectAlarm(deferredFleet)).toBe(true);
       expect(providerFailures).toBe(6);
-      expect((await status(stub)).failure_count).toBe(5);
+      expect((await status(stub)).failure_count).toBe(0);
       const fleetAlarm = await runInDurableObject(projectGuard, async (_instance, state) => state.storage.getAlarm());
       expect(await runDurableObjectAlarm(projectGuard)).toBe(true);
       expect(providerFailures).toBe(6);
@@ -594,12 +636,12 @@ describe("DropboxChangeGuard", () => {
     installDropboxMock();
     await createProject("TXN-CHANGE-GUARD-0003", "change-guard-three");
     const stub = guard("generation-snapshot");
+    await holdAlarmForManualDrive(stub);
 
     expect((await notify(stub)).status).toBe(200);
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     const afterFirst = await status(stub);
-    expect(afterFirst).toMatchObject({ requested_generation: 1, processing_generation: null, last_error: null });
-    expect([0, 1]).toContain(afterFirst.completed_generation);
+    expect(afterFirst).toMatchObject({ requested_generation: 1, completed_generation: 1, processing_generation: null, last_error: null });
 
     // The miniflare alarm helper cannot safely drive a second stub request from
     // another DO I/O context while the manual alarm is blocked. The production
@@ -608,18 +650,15 @@ describe("DropboxChangeGuard", () => {
     // and schedules another alarm instead of being retroactively consumed.
     expect((await notify(stub)).status).toBe(200);
     const afterNotify = await status(stub);
-    expect(afterNotify).toMatchObject({ requested_generation: 1, alarm_scheduled: true, processing_generation: null, last_error: null });
+    expect(afterNotify).toMatchObject({ requested_generation: 2, alarm_scheduled: true, processing_generation: null, last_error: null });
     expect(afterNotify.completed_generation).toBe(afterFirst.completed_generation);
 
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     const afterSecond = await status(stub);
-    expect(afterSecond).toMatchObject({ requested_generation: 1, processing_generation: null, last_error: null });
-    expect(afterSecond.completed_generation).toBeLessThanOrEqual(1);
+    expect(afterSecond).toMatchObject({ requested_generation: 2, completed_generation: 2, processing_generation: null, last_error: null });
   });
 
   it("scheduled maintenance performs one bounded due managed-document verification", async () => {
-    await reset();
-    resetAfterMaintenanceFixture = true;
     const mock = installDropboxMock();
     const projectId = await createProject("TXN-CHANGE-GUARD-0004", "change-guard-four");
     const registry = await testEnv.REGISTRY_GUARD.getByName("global").fetch("https://registry-guard.internal/registry", { method: "GET" });

@@ -1329,44 +1329,22 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect(commitReads).toHaveBeenCalledWith(projectId, 9005);
     await runInDurableObject(guard, async (_instance, state) => {
       expect(await state.storage.get("materialization-finalization-work")).toBeUndefined();
-      await state.storage.put("materialization-finalization-work", {
-        coverage_version: 2,
-        head: {
-          target_revision: completed.target_revision,
-          projection_version: completed.projection_version,
-          result_root_hash: completed.result_root_hash,
-          completed_at: completed.completed_at
-        },
-        next_generation: null,
-        previous_child: null,
-        scan_complete: true,
-        candidates: [9101, 9102, 9103, 9104, 9105].map((revision) => ({
-          revision, coverage: "explicit", materialization_revision: completed.target_revision,
-          projection_version: completed.projection_version, result_root_hash: completed.result_root_hash,
-          completed_at: completed.completed_at, source_event_id: completed.source_event_id
-        }))
-      });
     });
+
+    // Deliver a queued wake in the inter-callback gap before the fixture
+    // acquires its assertion lock. Deleting a later alarm cannot undo this.
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    await runInDurableObject(guard, async (_instance, state) => {
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
 
     // Keep the wall-clock abort timer out of this fixture. Force the next
     // provider read to exhaust the slice after the missing candidate is
     // checkpointed, independently of runner scheduling or fake timers.
-    const sliceBudget = await runInDurableObject(guard, instance =>
-      vi.spyOn(instance as any, "materializationFinalizationSliceBudgetMs").mockReturnValue(60_000)
-    );
-    commitReads.mockClear();
-    let sawMissingCandidate = false;
-    commitReads.mockImplementation(async function (this: ProjectRepository, candidateProjectId, revision) {
-      if (candidateProjectId !== projectId || revision < 9101 || revision > 9105) {
-        return originalReadCommitRecord.call(this, candidateProjectId, revision);
-      }
-      if (revision === 9101) {
-        sawMissingCandidate = true;
-        return null;
-      }
-      if (revision === 9102 && sawMissingCandidate) throw new Error("materialization_finalization_slice_budget_exhausted");
-      return null;
-    });
     // The production route and alarm both use this serialized queue. This
     // fixture calls the slice directly, so remove an earlier alarm and avoid
     // installing a new one until the slice itself yields and rearms it.
@@ -1377,23 +1355,60 @@ describe("canonical execution boundary in ProjectGuard", () => {
     await runInDurableObject(guard, (instance, state) => {
       const object = instance as any;
       return object.serialize(async () => {
-        const deadlineResponse = await object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
-        }), false);
-        expect(deadlineResponse.status).toBe(202);
-        // The persisted cursor below proves this invocation consumed exactly
-        // one candidate. A prototype-wide spy can also see unrelated alarms.
-        expect(commitReads).toHaveBeenCalledWith(projectId, 9101);
-        const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
-        expect(work?.candidates.map(({ revision }) => revision)).toEqual([9102, 9103, 9104, 9105]);
-        expect(await state.storage.getAlarm()).not.toBeNull();
+        const sliceBudget = vi.spyOn(object, "materializationFinalizationSliceBudgetMs").mockReturnValue(60_000);
+        commitReads.mockClear();
+        let sawMissingCandidate = false;
+        commitReads.mockImplementation(async function (this: ProjectRepository, candidateProjectId, revision) {
+          if (candidateProjectId !== projectId || revision < 9101 || revision > 9105) {
+            return originalReadCommitRecord.call(this, candidateProjectId, revision);
+          }
+          if (revision === 9101) {
+            sawMissingCandidate = true;
+            return null;
+          }
+          if (revision === 9102 && sawMissingCandidate) throw new Error("materialization_finalization_slice_budget_exhausted");
+          return null;
+        });
+        try {
+          // Publish this slice's candidates only after acquiring the same lock
+          // as the asserted call: a previously dispatched wake cannot consume
+          // fixture work during the inter-callback gap.
+          await state.storage.put("materialization-finalization-work", {
+            coverage_version: 2,
+            head: {
+              target_revision: completed.target_revision,
+              projection_version: completed.projection_version,
+              result_root_hash: completed.result_root_hash,
+              completed_at: completed.completed_at
+            },
+            next_generation: null,
+            previous_child: null,
+            scan_complete: true,
+            candidates: [9101, 9102, 9103, 9104, 9105].map((revision) => ({
+              revision, coverage: "explicit", materialization_revision: completed.target_revision,
+              projection_version: completed.projection_version, result_root_hash: completed.result_root_hash,
+              completed_at: completed.completed_at, source_event_id: completed.source_event_id
+            }))
+          });
+          const deadlineResponse = await object.finalizeCurrentMaterialization(new Request("https://project-guard.internal/finalize-materialization", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ target_revision: 1, projection_version: CURRENT_PROJECTION_VERSION })
+          }), false);
+          expect(deadlineResponse.status).toBe(202);
+          // The persisted cursor below proves this invocation consumed exactly
+          // one candidate. A prototype-wide spy can also see unrelated alarms.
+          expect(commitReads).toHaveBeenCalledWith(projectId, 9101);
+          const work = await state.storage.get<{ candidates: Array<{ revision: number }> }>("materialization-finalization-work");
+          expect(work?.candidates.map(({ revision }) => revision)).toEqual([9102, 9103, 9104, 9105]);
+          expect(await state.storage.getAlarm()).not.toBeNull();
+        } finally {
+          sliceBudget.mockRestore();
+          commitReads.mockRestore();
+        }
       });
     });
 
-    sliceBudget.mockRestore();
-    commitReads.mockRestore();
     expect(await runDurableObjectAlarm(guard)).toBe(true);
     const { providerBudgetResponse, scopedProviderCalls } = await runInDurableObject(guard, (instance, state) => {
       const object = instance as any;

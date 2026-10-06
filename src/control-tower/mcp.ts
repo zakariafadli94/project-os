@@ -444,6 +444,8 @@ async function submitGuarded(env: { PROJECT_GUARD: DurableObjectNamespace; REGIS
       else if (response.status >= 500) {
         if (kind === "document" && request.operation === "working.write") {
           upstreamError = safeWorkingWriteFailure(submissionPayload, response.status, projectId, requestId);
+        } else if (kind === "transaction" && !isProjectCreate) {
+          upstreamError = safeTransactionFailure(submissionPayload, response.status, projectId, requestId);
         }
         throw new SubmissionFailure("submission");
       }
@@ -512,6 +514,19 @@ function safeWorkingWriteFailure(payload: unknown, httpStatus: number, projectId
     || (body.project_id !== undefined && body.project_id !== projectId)
     || (body.request_id !== undefined && body.request_id !== requestId)) return null;
   return { code: body.error, http_status: 503 };
+}
+
+function safeTransactionFailure(payload: unknown, httpStatus: number, projectId: string, transactionId: unknown): { code: string; http_status: 503 } | null {
+  if (typeof transactionId !== "string" || !transactionId || transactionId.length > 512) return null;
+  const diagnostic = safeWorkingWriteFailure(payload, httpStatus, projectId, transactionId);
+  if (!diagnostic) return null;
+  const body = payload as Record<string, unknown>;
+  // Both aliases, when present, must bind to the original transaction. A
+  // contradictory alias must never authenticate a diagnostic for another call.
+  if (Object.hasOwn(body, "transaction_id") && body.transaction_id !== transactionId) return null;
+  if (Object.hasOwn(body, "request_id") && body.request_id !== transactionId) return null;
+  if (Object.hasOwn(body, "project_id") && body.project_id !== projectId) return null;
+  return diagnostic;
 }
 
 const safeAdmissionRefusals = new Set([

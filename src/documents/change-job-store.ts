@@ -151,6 +151,14 @@ interface SelectionControlRow {
   last_ordinal: number | null;
 }
 
+export interface ManagedDocumentJobAttempt {
+  job_id: string;
+  ordinal: number;
+  slice_ordinal: number;
+  result: "selected" | "completed" | "deferred" | "budget_yield" | "failed" | "quarantined";
+  completion_affected_rows?: number;
+}
+
 interface JobFailureStateRow {
   [key: string]: SqlStorageValue;
   job_id: string;
@@ -564,7 +572,7 @@ export class ManagedDocumentChangeJobStore {
     return selected;
   }
 
-  markCompleted(jobId: string): void {
+  markCompleted(jobId: string): number {
     assertJobId(jobId);
     this.storage.sql.exec(
       `UPDATE managed_document_change_jobs
@@ -572,12 +580,15 @@ export class ManagedDocumentChangeJobStore {
        WHERE job_id = ? AND status = 'pending'`,
       jobId
     );
+    // Read immediately: the failure-state UPDATE below has a different row count.
+    const completedRows = this.storage.sql.exec<CountRow>("SELECT changes() AS count").one().count;
     this.storage.sql.exec(
       `UPDATE managed_document_change_job_failure_state
        SET consecutive_failures = 0, next_attempt_at = NULL
        WHERE job_id = ? AND stopped = 0`,
       jobId
     );
+    return completedRows;
   }
 
   markFailed(jobId: string, message: string): void {
@@ -815,6 +826,34 @@ export class ManagedDocumentChangeJobStore {
     const eligibility = this.eligibilityCounts(nowMs);
     const continuation = this.continuation();
     const safeLastOutcome = sanitizeContinuationOutcome(continuation.last_outcome);
+    const selected = this.storage.sql.exec<{ [key: string]: SqlStorageValue; job_id: string; ordinal: number;
+      status: string; attempts: number; classification: string | null; next_attempt_at: number | null; stopped: number | null }>(
+      `SELECT j.job_id,j.ordinal,j.status,j.attempts,f.classification,f.next_attempt_at,f.stopped
+       FROM managed_document_change_selection_control c
+       JOIN managed_document_change_jobs j ON j.ordinal=c.last_ordinal AND j.priority=c.last_priority
+       LEFT JOIN managed_document_change_job_failure_state f ON f.job_id=j.job_id
+       WHERE c.singleton=1 LIMIT 1`
+    ).toArray()[0];
+    const attempt = sanitizeJobAttempt(safeLastOutcome?.last_attempt);
+    const correlated = selected !== undefined && attempt !== undefined
+      && attempt.job_id === selected.job_id && attempt.ordinal === selected.ordinal
+      && attempt.slice_ordinal === continuation.slice_ordinal
+      && typeof safeLastOutcome?.origin_observed_at_ms === "number"
+      && safeLastOutcome?.origin_slice_ordinal === continuation.slice_ordinal;
+    const lastSelectionCheckpoint = selected ? {
+      job_id: assertJobId(selected.job_id), ordinal: safeCount(selected.ordinal),
+      status: ["pending", "completed"].includes(selected.status) ? selected.status : "unknown",
+      attempts: diagnosticAttempts(selected.attempts),
+      failure_classification: ["internal", "unknown", "provider_retryable", "provider_blocked"].includes(selected.classification ?? "")
+        ? selected.classification : null,
+      next_attempt_at: selected.next_attempt_at === null ? null : safeEpoch(selected.next_attempt_at),
+      stopped: selected.stopped === 1,
+      correlation: correlated ? "same_job_and_slice" : "unknown"
+    } : { job_id: null, correlation: "unknown" };
+    if (new TextEncoder().encode(JSON.stringify({last_selection_checkpoint:lastSelectionCheckpoint,
+      origin_slice_ordinal:safeLastOutcome?.origin_slice_ordinal,origin_observed_at_ms:safeLastOutcome?.origin_observed_at_ms,
+      last_attempt:attempt})).byteLength > 2048)
+      throw new Error("Managed document selection checkpoint exceeds limit");
     const counts = {
       pending_jobs: this.pendingCount(),
       pending_jobs_with_error: this.storage.sql.exec<CountRow>(
@@ -837,6 +876,7 @@ export class ManagedDocumentChangeJobStore {
       schedule: { ...schedule, due: nextMs === null || nowMs >= nextMs, overdue_by_ms: nextMs === null ? 0 : Math.max(0, nowMs - nextMs) },
       cursor: { present: cursor !== null, sha256: cursor === null ? null : await sha256Text(cursor) },
       eligibility,
+      last_selection_checkpoint: lastSelectionCheckpoint,
       continuation: {
         slice_ordinal: continuation.slice_ordinal,
         pending: continuation.pending,
@@ -1070,16 +1110,19 @@ function diagnosticAttempts(value: unknown): number {
 const continuationCountFields = new Set([
   "semantic_progress", "jobs_registered", "jobs_completed", "jobs_pending", "job_failures",
   "jobs_quarantined", "drift_findings", "expected_changes", "executable_jobs",
-  "future_eligible_jobs", "stopped_unresolved_jobs"
+  "future_eligible_jobs", "stopped_unresolved_jobs", "origin_slice_ordinal"
 ]);
-const continuationTimestampFields = new Set(["earliest_eligible_at", "feed_retry_at"]);
+const continuationTimestampFields = new Set(["earliest_eligible_at", "feed_retry_at", "origin_observed_at_ms"]);
 const continuationBooleanFields = new Set(["budget_yield", "unread_feed", "verification_completed", "global_notification_owed"]);
 
 function sanitizeContinuationOutcome(value: Record<string, unknown> | null): Record<string, unknown> | null | undefined {
   if (value === null) return null;
   const safe: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (continuationCountFields.has(key)) safe[key] = safeCount(entry);
+    if (key === "last_attempt") {
+      const attempt = sanitizeJobAttempt(entry);
+      if (attempt) safe.last_attempt = attempt;
+    } else if (continuationCountFields.has(key)) safe[key] = safeCount(entry);
     else if (continuationTimestampFields.has(key)) safe[key] = entry === null ? null : safeEpoch(entry);
     else if (continuationBooleanFields.has(key)) {
       if (typeof entry !== "boolean") throw new Error("Invalid managed document continuation outcome");
@@ -1095,4 +1138,19 @@ function sanitizeContinuationOutcome(value: Record<string, unknown> | null): Rec
   // Preserve an actually empty legacy object, but do not turn a non-empty
   // unknown-only object into a fabricated empty or successful outcome.
   return Object.keys(safe).length > 0 || Object.keys(value).length === 0 ? safe : undefined;
+}
+
+function sanitizeJobAttempt(value: unknown): ManagedDocumentJobAttempt | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.job_id !== "string" || !/^CHGJOB-[A-F0-9]{24}$/.test(entry.job_id)
+    || !Number.isSafeInteger(entry.ordinal) || (entry.ordinal as number) < 1
+    || !Number.isSafeInteger(entry.slice_ordinal) || (entry.slice_ordinal as number) < 0
+    || typeof entry.result !== "string"
+    || !["selected", "completed", "deferred", "budget_yield", "failed", "quarantined"].includes(entry.result)
+    || (entry.completion_affected_rows !== undefined && entry.completion_affected_rows !== 0 && entry.completion_affected_rows !== 1))
+    return undefined;
+  return { job_id: entry.job_id, ordinal: entry.ordinal as number, slice_ordinal: entry.slice_ordinal as number,
+    result: entry.result as ManagedDocumentJobAttempt["result"],
+    ...(entry.completion_affected_rows === undefined ? {} : { completion_affected_rows: entry.completion_affected_rows as number }) };
 }

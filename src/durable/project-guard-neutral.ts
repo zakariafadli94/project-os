@@ -544,6 +544,9 @@ export class ProjectGuard extends DurableObject<Env> {
 
   private documentContinuationOutcome(result: Awaited<ReturnType<ManagedDocumentChangeCoordinator["reconcile"]>>): Record<string, unknown> {
     return {
+      ...(result.origin_slice_ordinal === undefined ? {} : { origin_slice_ordinal: result.origin_slice_ordinal }),
+      ...(result.origin_observed_at_ms === undefined ? {} : { origin_observed_at_ms: result.origin_observed_at_ms }),
+      ...(result.last_attempt ? { last_attempt: result.last_attempt } : {}),
       semantic_progress: result.semantic_progress,
       jobs_registered: result.jobs_registered,
       jobs_completed: result.jobs_completed,

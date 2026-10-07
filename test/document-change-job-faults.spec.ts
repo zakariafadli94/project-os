@@ -2868,6 +2868,11 @@ describe("durable managed-document change jobs", () => {
         future_eligible_jobs: 0,
         budget_yield: true
       });
+      expect(afterAlarm.continuation.last_outcome).toMatchObject({
+        origin_slice_ordinal: afterAlarm.continuation.slice_ordinal,
+        last_attempt: {job_id:"CHGJOB-333333333333333333333333",result:"completed",completion_affected_rows:1,
+          slice_ordinal:afterAlarm.continuation.slice_ordinal}
+      });
     } finally {
       vi.useRealTimers();
     }

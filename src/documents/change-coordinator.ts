@@ -23,6 +23,7 @@ import {
   ManagedDocumentChangeJobStore,
   type ManagedDocumentChangeJob,
   type ManagedDocumentChangeJobInput,
+  type ManagedDocumentJobAttempt,
   type ManagedDocumentFailureClassification,
   type ManagedDocumentDetectionSource
 } from "./change-job-store";
@@ -85,6 +86,9 @@ export interface ManagedDocumentChangeSummary extends ManagedDocumentReconcileSu
   earliest_eligible_at: number | null;
   feed_retry_at: number | null;
   safe_errors: string[];
+  last_attempt?: ManagedDocumentJobAttempt;
+  origin_slice_ordinal?: number;
+  origin_observed_at_ms?: number;
 }
 
 export interface ManagedDocumentReconcileOptions {
@@ -181,6 +185,8 @@ export class ManagedDocumentChangeCoordinator {
     if (!this.jobs) return this.reconcileLegacyTestSeam(state);
 
     const summary = emptySummary({ archived: state.status === "archived" }, this.mutationGateMode());
+    summary.origin_slice_ordinal = this.jobs.continuation().slice_ordinal;
+    summary.origin_observed_at_ms = this.clock();
     if (state.status === "archived") return summary;
     if (options.scheduled) {
       const verification = this.jobs.scheduledVerification(options.now ?? new Date().toISOString());
@@ -469,31 +475,40 @@ export class ManagedDocumentChangeCoordinator {
     let attempted = 0;
     let deferred = false;
     let budgetYield = false;
+    const sliceOrdinal = summary.origin_slice_ordinal ?? jobs.continuation().slice_ordinal;
     while (attempted < limit) {
       const job = jobs.selectNextPending(cohortMaxOrdinal, nowMs);
       if (!job) break;
       attempted += 1;
+      summary.last_attempt = { job_id: job.job_id, ordinal: job.ordinal, slice_ordinal: sliceOrdinal, result: "selected" };
       try {
         const actualKind = await this.actualChangeKind(job.change);
         if (actualKind === "folder") {
           if (job.change.kind === "file") {
             jobs.markQuarantined(job, "directory_used_as_file_target");
             summary.jobs_quarantined += 1;
+            summary.last_attempt.result = "quarantined";
           } else {
-            jobs.markCompleted(job.job_id);
-            summary.jobs_completed += 1;
+            const affected = jobs.markCompleted(job.job_id);
+            summary.last_attempt.result = "completed";
+            summary.last_attempt.completion_affected_rows = affected;
+            summary.jobs_completed += affected;
           }
           continue;
         }
         const completed = await this.processJob(state, job, summary);
         if (!completed) {
+          summary.last_attempt.result = "deferred";
           deferred = true;
           continue;
         }
-        jobs.markCompleted(job.job_id);
-        summary.jobs_completed += 1;
+        const affected = jobs.markCompleted(job.job_id);
+        summary.last_attempt.result = "completed";
+        summary.last_attempt.completion_affected_rows = affected;
+        summary.jobs_completed += affected;
       } catch (error) {
         if (isBudgetYield(error)) {
+          summary.last_attempt.result = "budget_yield";
           summary.budget_yield = true;
           budgetYield = true;
           deferred = true;
@@ -505,6 +520,7 @@ export class ManagedDocumentChangeCoordinator {
         // consuming every scheduled slice forever.
         if (error instanceof MutationCandidateEvidenceConflictError) {
           jobs.markQuarantined(job, "mutation_candidate_evidence_conflict");
+          summary.last_attempt.result = "quarantined";
           summary.jobs_quarantined += 1;
           console.error("Project OS managed document change job quarantined", {
             project_id: state.project_id,
@@ -518,6 +534,7 @@ export class ManagedDocumentChangeCoordinator {
         if (error instanceof MissingChangeTargetError) {
           await this.recordArtifactDeletion(state, job.change.path);
           jobs.markQuarantined(job, "file_target_missing");
+          summary.last_attempt.result = "quarantined";
           summary.jobs_quarantined += 1;
           console.warn("Project OS managed document change job quarantined", {
             project_id: state.project_id,
@@ -554,6 +571,7 @@ export class ManagedDocumentChangeCoordinator {
           ...(findingId === undefined ? {} : { finding_id: findingId })
         }, new Date(failureObservedAtMs).toISOString());
         summary.job_failures += 1;
+        summary.last_attempt.result = "failed";
         if (failure.stopped && !hadStopFinding) summary.drift_findings += 1;
         console.error("Project OS managed document change job failed", {
           project_id: state.project_id,

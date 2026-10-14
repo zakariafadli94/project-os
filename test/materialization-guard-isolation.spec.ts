@@ -766,6 +766,7 @@ describe("MaterializationGuard isolation boundary", () => {
   });
 
   it("routes a catalog rebuild to its bounded worker without adopting or publishing an index", async () => {
+    installDropboxMock();
     const projectId = "PRJ-3929";
     const requestId = "DOCREQ-CATALOG-REBUILD-3929001";
     const ref = navigationWorkRefSchema.parse({
@@ -811,6 +812,7 @@ describe("MaterializationGuard isolation boundary", () => {
   });
 
   it("rotates actual navigation slices across nonterminal jobs and skips a backed-off head", async () => {
+    installDropboxMock();
     const projectId = "PRJ-3928";
     const now = Date.now();
     let alarmAt: number | null = null;

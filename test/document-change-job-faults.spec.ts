@@ -638,6 +638,9 @@ describe("durable managed-document change jobs", () => {
     expect(localCheckpoint.eligibility).toEqual({ executable: 2, future: 1, stopped: 1, earliest_eligible_at: Date.parse("2026-10-10T10:00:00.000Z") });
     expect(localCheckpoint.continuation.last_outcome?.verification_completed).toBe(false);
     expect(mock.providerCalls).toHaveLength(providerCallCount);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-03T10:00:00.000Z"));
+    try {
     const response = await guard.fetch("https://project-guard.internal/materialization-diagnostic-status");
     expect(response.status).toBe(200);
     const value = await response.json<any>();
@@ -674,6 +677,7 @@ describe("durable managed-document change jobs", () => {
     expect(repeatedValue.document_change_checkpoint.eligibility).toEqual(value.document_change_checkpoint.eligibility);
     expect(repeatedValue.document_change_checkpoint.continuation).toEqual(value.document_change_checkpoint.continuation);
     expect(await snapshot()).toEqual(before);
+    } finally { vi.useRealTimers(); }
   });
 
   it("persists the safe recovery boundary on provider failure without clearing the original fence", async () => {

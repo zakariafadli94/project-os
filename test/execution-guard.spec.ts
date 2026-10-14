@@ -2801,6 +2801,118 @@ describe("canonical execution boundary in ProjectGuard", () => {
     expect([...mock.files.keys()].some((path) => path.endsWith(`/requests/${request.request_id}/receipt.json`))).toBe(false);
   });
 
+  it.each(["conflict", "committed"] as const)("replays %s navigation after snapshot retirement without recreating the snapshot", async (status) => {
+    const projectId = status === "conflict" ? "PRJ-8491" : "PRJ-8492";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: `DOCREQ-NAV-RETIRED-${projectId.slice(4)}-0001`,
+      project_id: projectId, zone: "WORKING" as const,
+      expected_project_revision: 1, expected_generation: 0, expected_index: null,
+      created_at: "2026-10-14T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const materialization = testEnv.MATERIALIZATION_GUARD.getByName(projectId);
+    let prepared: any;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      prepared = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      if (prepared?.publish) break;
+    }
+    expect(prepared?.publish).toBe(true);
+    if (status === "committed") {
+      let published: any;
+      for (let attempt = 0; attempt < 16; attempt++) {
+        published = await (await guard.fetch("https://project-guard.internal/navigation-publish", {
+          method: "POST", body: JSON.stringify(prepared.ref)
+        })).json();
+        if (published.status !== "pending") break;
+      }
+      expect(published).toMatchObject({ status: "committed" });
+    } else {
+      await runInDurableObject(guard, (instance) => (instance as any).serialize(() =>
+        (instance as any).settleNavigationReceipt(request, {
+          operation: request.operation, project_id: projectId, request_id: request.request_id,
+          status: "conflict", execution_status: "conflict", code: "navigation_snapshot_changed"
+        })
+      ));
+    }
+    const root = `${machineDocumentRoot(projectId)}/requests/${request.request_id}`;
+    const receipt = mock.files.get(`${root}/receipt.json`);
+    const frozen = `${root}/navigation-admitted-state.json`;
+    expect(mock.files.has(frozen)).toBe(true);
+    // Only synthetic provider data is removed: emulate retirement and loss of
+    // the disposable cache, retaining exact durable intent/admission/receipt.
+    mock.files.delete(frozen);
+    await runInDurableObject(guard, (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM document_requests WHERE request_id = ?", request.request_id);
+    });
+    const replay = await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(request)
+    });
+    expect(await replay.json()).toMatchObject({ status });
+    expect(mock.files.has(frozen)).toBe(false);
+    const republish = await guard.fetch("https://project-guard.internal/navigation-publish", {
+      method: "POST", body: JSON.stringify(prepared.ref)
+    });
+    expect(await republish.json()).toMatchObject({ status });
+    expect(mock.files.has(frozen)).toBe(false);
+    const sourceUnavailable = vi.spyOn(ZoneNavigationSources.prototype, "readState").mockRejectedValue(new Error("source unavailable after terminal result"));
+    try {
+      const cachedWork = await runInDurableObject(materialization, (instance) =>
+        (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+      );
+      expect(cachedWork).toMatchObject({ publish: true });
+    } finally {
+      sourceUnavailable.mockRestore();
+    }
+    await runInDurableObject(materialization, (_instance, state) => state.storage.delete(`navigation-context:${request.request_id}`));
+    const work = await runInDurableObject(materialization, (instance) =>
+      (instance as any).serialize(() => (instance as any).runNavigationWorkSlice())
+    );
+    expect(work).toMatchObject({ publish: true });
+    expect(mock.files.has(frozen)).toBe(false);
+    expect(mock.files.get(`${root}/receipt.json`)).toBe(receipt);
+  });
+
+  it("keeps unfinished navigation strict and refuses a mismatched terminal receipt without rebuilding its snapshot", async () => {
+    const projectId = "PRJ-8493";
+    const request = {
+      operation: "navigation.reconcile" as const,
+      request_id: "DOCREQ-NAV-RETIRED-GUARDS-8493",
+      project_id: projectId, zone: "WORKING" as const,
+      expected_project_revision: 1, expected_generation: 0, expected_index: null,
+      created_at: "2026-10-14T10:00:00.000Z"
+    };
+    const { guard, mock } = await setup(projectId);
+    const context = await (await guard.fetch("https://project-guard.internal/mutation-context")).json<{ context: never }>();
+    expect((await guard.fetch("https://project-guard.internal/document", {
+      method: "POST", body: JSON.stringify(encodeAdmission(request, context.context))
+    })).status).toBe(202);
+    const root = `${machineDocumentRoot(projectId)}/requests/${request.request_id}`;
+    const frozen = `${root}/navigation-admitted-state.json`;
+    mock.files.delete(frozen);
+    const requestHash = await executionHash(request);
+    await expect(runInDurableObject(guard, (instance) =>
+      (instance as any).readFrozenNavigationState(request, requestHash, undefined, true)
+    )).rejects.toThrow("navigation_admitted_state_unavailable");
+    expect(mock.files.has(`${root}/receipt.json`)).toBe(false);
+    expect(mock.files.has(frozen)).toBe(false);
+    const intent = JSON.parse(mock.files.get(`${root}/intent.json`)!);
+    mock.files.set(`${root}/receipt.json`, JSON.stringify({ ...intent, request_sha256: "0".repeat(64),
+      receipt_json: JSON.stringify({ operation: request.operation, project_id: projectId,
+        request_id: request.request_id, status: "conflict", execution_status: "conflict" })
+    }));
+    await expect(runInDurableObject(guard, (instance) =>
+      (instance as any).handleNavigationReconcile(request, null)
+    )).rejects.toThrow("navigation_terminal_receipt_binding_invalid");
+    expect(mock.files.has(frozen)).toBe(false);
+  });
+
   it("preserves a terminal navigation conflict while allowing a later governed refresh past its invalidated owner", async () => {
     const projectId = "PRJ-8420";
     const request = {

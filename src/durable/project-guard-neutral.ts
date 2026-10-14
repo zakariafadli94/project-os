@@ -2096,6 +2096,13 @@ export class ProjectGuard extends DurableObject<Env> {
         || existingAdmission.admission.request_hash !== requestHash || existingAdmission.plan !== null) {
         return Response.json({ operation: request.operation, request_id: request.request_id, project_id: request.project_id, status: "conflict", code: "NAVIGATION_ADMISSION_BINDING_MISMATCH" }, { status: 409 });
       }
+      // The immutable bound result survives retirement of the preparation
+      // snapshot. Never reconstruct that snapshot for a terminal replay.
+      const terminal = await this.readBoundTerminalNavigationReceipt(request);
+      if (terminal) {
+        const settled = await this.settleNavigationReceipt(request, terminal);
+        return Response.json(await this.currentNavigationReceipt(request, settled));
+      }
       // Revalidate the immutable journal envelope and recover only a torn
       // navigation admission/progress boundary before the engine's intent.
       await journal.commit(existingAdmission.admission, null);
@@ -2356,6 +2363,19 @@ export class ProjectGuard extends DurableObject<Env> {
       || admitted.admission.resources[0]?.version !== String(ref.expected_generation)) {
       return Response.json({ operation: nav.operation, request_id: nav.request_id, project_id: nav.project_id, status: "conflict", code: "navigation_workref_binding_mismatch" }, { status: 409 });
     }
+    const terminal = await this.readBoundTerminalNavigationReceipt(nav);
+    // Existing snapshots still take the normal physical-publication path,
+    // including reconciliation of a racing source/head. Only an absent
+    // retired snapshot uses the terminal replay shortcut.
+    const terminalSnapshotMissing = terminal && await this.persistence.objects.readText(
+      `${machineDocumentRoot(nav.project_id)}/requests/${nav.request_id}/navigation-admitted-state.json`
+    ) === null;
+    if (terminalSnapshotMissing) {
+      const settled = await this.settleNavigationReceipt(nav, terminal);
+      return Response.json(await this.currentNavigationReceipt(nav, settled), {
+        status: settled.status === "conflict" ? 409 : 200
+      });
+    }
     const frozenState = await this.readFrozenNavigationState(nav, ref.request_hash, budget, true);
     const hasGlobalPostcheck = admitted.admission.deferred_rules.some(reference => reference.scope.kind === "global");
     const global = hasGlobalPostcheck
@@ -2611,6 +2631,20 @@ export class ProjectGuard extends DurableObject<Env> {
       return current;
     }
     throw new Error("navigation_admitted_state_unavailable");
+  }
+
+  private async readBoundTerminalNavigationReceipt(request: NavigationReconcileRequest): Promise<NavigationDocumentReceipt | null> {
+    const durable = await this.managedDocumentRequests.readReceipt(request.project_id, request.request_id);
+    if (!durable) return null;
+    const intent = await this.managedDocumentRequests.readRecoverableIntent(request.project_id, request.request_id);
+    const receipt = JSON.parse(durable.receipt_json) as NavigationDocumentReceipt;
+    if (!intent || intent.request_sha256 !== durable.request_sha256
+      || canonicalJson(JSON.parse(intent.request_json)) !== canonicalJson(request)
+      || receipt.operation !== request.operation || receipt.project_id !== request.project_id
+      || receipt.request_id !== request.request_id || !["committed", "conflict"].includes(receipt.status)) {
+      throw new Error("navigation_terminal_receipt_binding_invalid");
+    }
+    return receipt;
   }
 
   private async settleNavigationReceipt(request: NavigationReconcileRequest, receipt: NavigationDocumentReceipt): Promise<NavigationDocumentReceipt> {

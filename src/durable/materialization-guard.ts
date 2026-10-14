@@ -517,6 +517,21 @@ export class MaterializationGuard extends DurableObject<Env> {
     });
   }
 
+  private async hasBoundTerminalNavigationResult(runtime: ReturnType<typeof createProductionPersistence>, request: NavigationReconcileRequest): Promise<boolean> {
+    const ledger = new ManagedDocumentRequestLedger(runtime.objects);
+    const terminal = await ledger.readReceipt(this.projectId, request.request_id);
+    if (!terminal) return false;
+    const intent = await ledger.readRecoverableIntent(this.projectId, request.request_id);
+    const receipt = JSON.parse(terminal.receipt_json) as Record<string, unknown>;
+    if (!intent || terminal.request_sha256 !== intent.request_sha256
+      || canonicalJson(JSON.parse(intent.request_json)) !== canonicalJson(request)
+      || receipt.operation !== request.operation || receipt.project_id !== this.projectId
+      || receipt.request_id !== request.request_id || !["committed", "conflict"].includes(String(receipt.status))) {
+      throw new Error("navigation_terminal_receipt_binding_invalid");
+    }
+    return true;
+  }
+
   /** One bounded preparation slice. This runs under MG serialization, but the
    * later PG publication callback is deliberately made only after returning. */
   private async runNavigationWorkSlice(): Promise<NavigationWorkSlice | null> {
@@ -549,6 +564,7 @@ export class MaterializationGuard extends DurableObject<Env> {
       request = navigationReconcileSchema.parse(saved.request);
       admission = saved.admission as ExecutionAdmission;
       state = normalizeProjectState(saved.state as ProjectState);
+      if (await this.hasBoundTerminalNavigationResult(runtime, request)) return { ref, publish: true };
     } else {
       budget.beforeHttp();
       const intent = await new ManagedDocumentRequestLedger(runtime.objects).readRecoverableIntent(this.projectId, ref.request_id);
@@ -572,6 +588,11 @@ export class MaterializationGuard extends DurableObject<Env> {
         throw new Error("navigation_work_binding_invalid");
       }
       admission = admitted.admission;
+      // A delayed workref may outlive its preparation snapshot. Send a bound
+      // terminal result back to PG for settlement without reading/recreating
+      // that snapshot; unfinished work retains the strict state requirement.
+      budget.beforeHttp();
+      if (await this.hasBoundTerminalNavigationResult(runtime, request)) return { ref, publish: true };
       const frozenPath = `${machineDocumentRoot(this.projectId)}/requests/${ref.request_id}/navigation-admitted-state.json`;
       budget.beforeHttp();
       const frozenRaw = await runtime.objects.readText(frozenPath);
